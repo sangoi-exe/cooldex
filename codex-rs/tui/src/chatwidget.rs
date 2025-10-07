@@ -260,6 +260,16 @@ pub(crate) struct ChatWidget {
     needs_final_message_separator: bool,
 
     last_rendered_width: std::cell::Cell<Option<usize>>,
+
+    // Latest usage breakdown for prune UI
+    last_context_usage: Option<codex_core::protocol::ConversationUsageEvent>,
+    pending_prune_popup: bool,
+
+    // Advanced prune
+    last_context_items: Option<Vec<codex_core::protocol::ContextItemSummary>>,
+    prune_keep_indices: std::collections::HashSet<usize>,
+    prune_delete_indices: std::collections::HashSet<usize>,
+    pending_prune_advanced: bool,
 }
 
 struct UserMessage {
@@ -295,12 +305,404 @@ impl ChatWidget {
         }
     }
 
+    pub(crate) fn open_prune_by_turn_menu(&mut self) {
+        use codex_core::protocol::PruneCategory as PC;
+        let total_turns = self
+            .last_context_items
+            .as_ref()
+            .map(|list| {
+                list.iter()
+                    .filter(|it| it.category == PC::UserMessage)
+                    .count()
+            })
+            .unwrap_or(0);
+        let mut items: Vec<SelectionItem> = Vec::new();
+        // Only show presets when total_turns > preset (strictly greater). Otherwise only free-form.
+        if total_turns > 5 {
+            // Generate 5,10,15,... < total_turns
+            let mut n = 5usize;
+            while n < total_turns {
+                items.push(SelectionItem {
+                    name: format!("Prune first {n} turns"),
+                    display_shortcut: None,
+                    description: Some("Remove everything from the earliest turns.".to_string()),
+                    is_current: false,
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::ConfirmPruneByTurn { count: n })
+                    })],
+                    delete_actions: Vec::new(),
+                    dismiss_on_select: true,
+                    search_value: None,
+                });
+                n += 5;
+            }
+        }
+        // Free-form via prompt
+        items.push(SelectionItem {
+            name: "Prune first n turns (enter amount)".to_string(),
+            display_shortcut: None,
+            description: Some("Type a number and press Enter".to_string()),
+            is_current: false,
+            actions: vec![Box::new(|tx| tx.send(AppEvent::OpenPruneByTurnPrompt))],
+            delete_actions: Vec::new(),
+            dismiss_on_select: false,
+            search_value: None,
+        });
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Prune by Turn".to_string()),
+            subtitle: Some(if total_turns > 0 {
+                format!("You have ~{total_turns} turns; choose how many to prune")
+            } else {
+                "Choose how many earliest turns to prune".to_string()
+            }),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn show_prune_by_turn_prompt(&mut self) {
+        let tx = self.app_event_tx.clone();
+        let total_turns = self
+            .last_context_items
+            .as_ref()
+            .map(|list| {
+                list.iter()
+                    .filter(|it| it.category == codex_core::protocol::PruneCategory::UserMessage)
+                    .count()
+            })
+            .unwrap_or(0);
+        let context = if total_turns > 0 {
+            Some(format!("You have ~{total_turns} turns"))
+        } else {
+            None
+        };
+        let view = CustomPromptView::new(
+            "Prune first n turns".to_string(),
+            "Enter a number (e.g., 12) and press Enter".to_string(),
+            context,
+            Box::new(move |text: String| {
+                let trimmed = text.trim();
+                if let Ok(mut n) = trimmed.parse::<usize>() {
+                    if n == 0 {
+                        return;
+                    }
+                    if total_turns > 0 {
+                        n = n.min(total_turns);
+                    }
+                    tx.send(AppEvent::ConfirmPruneByTurn { count: n });
+                }
+            }),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
+    pub(crate) fn show_confirm_prune_manual(
+        &mut self,
+        category: codex_core::protocol::PruneCategory,
+    ) {
+        use codex_core::protocol::Op;
+        use codex_core::protocol::PruneRange as PR;
+        let est = self
+            .last_context_usage
+            .as_ref()
+            .and_then(|u| {
+                let total = u.total_bytes as f64;
+                u.by_category
+                    .iter()
+                    .find(|e| e.category == category)
+                    .map(|e| (e.bytes as f64 / total * 100.0).round() as u64)
+            })
+            .unwrap_or(0);
+        let cat_label = format!("{category:?}");
+        let subtitle = if est > 0 {
+            format!("This will remove all {cat_label} (≈{est}% of current context). Proceed?")
+        } else {
+            format!("This will remove all {cat_label}. Proceed?")
+        };
+        let category_for_yes = category;
+        let yes_action = move |tx: &AppEventSender| {
+            tx.send(AppEvent::CodexOp(Op::PruneContext {
+                categories: vec![category_for_yes.clone()],
+                range: PR::All,
+            }));
+        };
+        // Close popup after confirmation; do not reopen menus automatically.
+        self.show_yes_no_confirmation("Confirm Manual Prune", &subtitle, yes_action, None);
+    }
+
+    pub(crate) fn show_confirm_prune_by_turn(&mut self, mut count: usize) {
+        use codex_core::protocol::Op;
+        use codex_core::protocol::PruneCategory as PC;
+        use codex_core::protocol::PruneRange as PR;
+        let total_turns = self
+            .last_context_items
+            .as_ref()
+            .map(|list| {
+                list.iter()
+                    .filter(|it| it.category == PC::UserMessage)
+                    .count()
+            })
+            .unwrap_or(0);
+        if total_turns > 0 {
+            count = count.min(total_turns);
+        }
+        let cats = vec![
+            PC::ToolOutput,
+            PC::ToolCall,
+            PC::Reasoning,
+            PC::AssistantMessage,
+            PC::UserMessage,
+        ];
+        let subtitle = if total_turns > 0 {
+            format!("This will remove the first {count} of ~{total_turns} turns. Proceed?")
+        } else {
+            format!("This will remove the first {count} turns. Proceed?")
+        };
+        let yes = move |tx: &AppEventSender| {
+            tx.send(AppEvent::CodexOp(Op::PruneContext {
+                categories: cats.clone(),
+                range: PR::FirstTurns { count },
+            }));
+        };
+        // Close popup after confirmation; do not reopen menus automatically.
+        self.show_yes_no_confirmation("Confirm Prune by Turn", &subtitle, yes, None);
+    }
+
+    pub(crate) fn show_confirm_prune_max(&mut self) {
+        use codex_core::protocol::Op;
+        use codex_core::protocol::PruneCategory as PC;
+        use codex_core::protocol::PruneRange as PR;
+        let cats = vec![
+            PC::ToolOutput,
+            PC::ToolCall,
+            PC::Reasoning,
+            PC::AssistantMessage,
+            PC::UserMessage,
+        ];
+        let yes = move |tx: &AppEventSender| {
+            tx.send(AppEvent::CodexOp(Op::PruneContext {
+                categories: cats.clone(),
+                range: PR::All,
+            }));
+        };
+        // Close popup after confirmation; do not reopen menus automatically.
+        self.show_yes_no_confirmation(
+            "Confirm Max Prune",
+            "This will clear all categories (non-destructive to rollout). Proceed?",
+            yes,
+            None,
+        );
+    }
+
+    fn open_prune_menu_root(&mut self) {
+        use codex_core::protocol::Op;
+        use codex_core::protocol::PruneCategory as PC;
+        if self.last_context_usage.is_none() {
+            self.pending_prune_popup = true;
+            self.submit_op(Op::GetContextUsage);
+        }
+        if self.last_context_items.is_none() {
+            self.pending_prune_popup = true;
+            self.submit_op(Op::GetContextItems);
+        }
+
+        let header: Box<dyn crate::render::renderable::Renderable> =
+            if let Some(usage) = &self.last_context_usage {
+                let total = usage.total_bytes.max(1);
+                let pct = |cat: PC| -> u64 {
+                    usage
+                        .by_category
+                        .iter()
+                        .find(|e| e.category == cat)
+                        .map(|e| e.bytes.saturating_mul(100) / total)
+                        .unwrap_or(0)
+                };
+                let line = format!(
+                    "Usage: tool_output {}% | tool_call {}% | reasoning {}% | assistant {}%",
+                    pct(PC::ToolOutput),
+                    pct(PC::ToolCall),
+                    pct(PC::Reasoning),
+                    pct(PC::AssistantMessage)
+                );
+                Box::new(ratatui::widgets::Paragraph::new(ratatui::text::Line::from(
+                    line,
+                )))
+            } else {
+                Box::new(ratatui::widgets::Paragraph::new(ratatui::text::Line::from(
+                    "Computing usage…",
+                )))
+            };
+
+        let mut items: Vec<SelectionItem> = Vec::new();
+        items.push(SelectionItem {
+            name: "Manual prune".to_string(),
+            display_shortcut: None,
+            description: Some("Choose a category to remove entirely".to_string()),
+            is_current: false,
+            actions: vec![Box::new(|tx| tx.send(AppEvent::OpenPruneManual))],
+            delete_actions: Vec::new(),
+            dismiss_on_select: true,
+            search_value: None,
+        });
+        items.push(SelectionItem {
+            name: "Advanced prune".to_string(),
+            display_shortcut: None,
+            description: Some("Mark/unmark individual items in context".to_string()),
+            is_current: false,
+            actions: vec![Box::new(|tx| tx.send(AppEvent::OpenPruneAdvanced))],
+            delete_actions: Vec::new(),
+            dismiss_on_select: true,
+            search_value: None,
+        });
+        let total_turns = self
+            .last_context_items
+            .as_ref()
+            .map(|list| {
+                list.iter()
+                    .filter(|it| it.category == PC::UserMessage)
+                    .count()
+            })
+            .unwrap_or(0);
+        items.push(SelectionItem {
+            name: "Prune by turn".to_string(),
+            display_shortcut: None,
+            description: Some(if total_turns > 0 {
+                format!("You have ~{total_turns} turns; remove earliest ones")
+            } else {
+                "Remove earliest turns (count unavailable yet)".to_string()
+            }),
+            is_current: false,
+            actions: vec![Box::new(|tx| tx.send(AppEvent::OpenPruneByTurn))],
+            delete_actions: Vec::new(),
+            dismiss_on_select: true,
+            search_value: None,
+        });
+        items.push(SelectionItem {
+            name: "Max prune (all categories)".to_string(),
+            display_shortcut: None,
+            description: Some("Clear all categories (non-destructive to rollout)".to_string()),
+            is_current: false,
+            actions: vec![Box::new(|tx| tx.send(AppEvent::ConfirmPruneMax))],
+            delete_actions: Vec::new(),
+            dismiss_on_select: true,
+            search_value: None,
+        });
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Prune Context".to_string()),
+            subtitle: Some("Choose a mode. This does not edit rollout files.".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            header,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn open_prune_manual_menu(&mut self) {
+        use codex_core::protocol::PruneCategory as PC;
+        let mut items: Vec<SelectionItem> = Vec::new();
+        let mut push = |n: &str, c: PC, d: &str| {
+            items.push(SelectionItem {
+                name: n.to_string(),
+                display_shortcut: None,
+                description: Some(d.to_string()),
+                is_current: false,
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::ConfirmPruneManual {
+                        category: c.clone(),
+                    })
+                })],
+                delete_actions: Vec::new(),
+                dismiss_on_select: true,
+                search_value: None,
+            });
+        };
+        // Desired order:
+        // 1) tool_call, 2) tool_output, 3) user messages, 4) assistant messages, 5) assistant reasoning
+        push(
+            "Prune all tool_call",
+            PC::ToolCall,
+            "Remove all tool call items (function/local/custom calls)",
+        );
+        push(
+            "Prune all tool_output",
+            PC::ToolOutput,
+            "Remove all tool outputs (stdout/stderr etc.)",
+        );
+        push(
+            "Prune all user messages",
+            PC::UserMessage,
+            "Remove all user messages from context",
+        );
+        push(
+            "Prune all assistant messages",
+            PC::AssistantMessage,
+            "Remove all assistant messages from context",
+        );
+        push(
+            "Prune all assistant reasoning",
+            PC::Reasoning,
+            "Remove all reasoning items from context",
+        );
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Manual Prune".to_string()),
+            subtitle: Some("Remove all items in a category".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
     fn flush_answer_stream_with_separator(&mut self) {
         if let Some(mut controller) = self.stream_controller.take()
             && let Some(cell) = controller.finalize()
         {
             self.add_boxed_history(cell);
         }
+    }
+
+    fn show_yes_no_confirmation<F>(
+        &mut self,
+        title: &str,
+        subtitle: &str,
+        yes_action: F,
+        on_complete: Option<AppEvent>,
+    ) where
+        F: Fn(&AppEventSender) + Send + Sync + 'static,
+    {
+        let items: Vec<SelectionItem> = vec![
+            SelectionItem {
+                name: "No".to_string(),
+                display_shortcut: None,
+                description: Some("Do not prune".to_string()),
+                is_current: true,
+                actions: vec![],
+                delete_actions: Vec::new(),
+                dismiss_on_select: true,
+                search_value: None,
+            },
+            SelectionItem {
+                name: "Yes".to_string(),
+                display_shortcut: None,
+                description: Some("Proceed with prune".to_string()),
+                is_current: false,
+                actions: vec![Box::new(yes_action)],
+                delete_actions: Vec::new(),
+                dismiss_on_select: true,
+                search_value: None,
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some(title.to_string()),
+            subtitle: Some(subtitle.to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            on_complete_event: on_complete,
+            ..Default::default()
+        });
     }
 
     // --- Small event handlers ---
@@ -338,6 +740,11 @@ impl ChatWidget {
         self.flush_answer_stream_with_separator();
         self.handle_stream_finished();
         self.request_redraw();
+    }
+
+    /// Open a popup to prune conversation history by high-level modes.
+    pub(crate) fn open_prune_popup(&mut self) {
+        self.open_prune_menu_root();
     }
 
     fn on_agent_message_delta(&mut self, delta: String) {
@@ -593,19 +1000,6 @@ impl ChatWidget {
             "Searched: {}",
             ev.query
         )));
-    }
-
-    fn on_get_history_entry_response(
-        &mut self,
-        event: codex_core::protocol::GetHistoryEntryResponseEvent,
-    ) {
-        let codex_core::protocol::GetHistoryEntryResponseEvent {
-            offset,
-            log_id,
-            entry,
-        } = event;
-        self.bottom_pane
-            .on_history_entry_response(log_id, offset, entry.map(|e| e.text));
     }
 
     fn on_shutdown_complete(&mut self) {
@@ -938,6 +1332,12 @@ impl ChatWidget {
             ghost_snapshots_disabled: true,
             needs_final_message_separator: false,
             last_rendered_width: std::cell::Cell::new(None),
+            last_context_usage: None,
+            pending_prune_popup: false,
+            last_context_items: None,
+            prune_keep_indices: std::collections::HashSet::new(),
+            prune_delete_indices: std::collections::HashSet::new(),
+            pending_prune_advanced: false,
         }
     }
 
@@ -1001,6 +1401,12 @@ impl ChatWidget {
             ghost_snapshots_disabled: true,
             needs_final_message_separator: false,
             last_rendered_width: std::cell::Cell::new(None),
+            last_context_usage: None,
+            pending_prune_popup: false,
+            last_context_items: None,
+            prune_keep_indices: std::collections::HashSet::new(),
+            prune_delete_indices: std::collections::HashSet::new(),
+            pending_prune_advanced: false,
         }
     }
 
@@ -1439,6 +1845,29 @@ impl ChatWidget {
                     self.on_user_message_event(ev);
                 }
             }
+            EventMsg::ConversationUsage(ev) => {
+                self.last_context_usage = Some(ev);
+                if self.pending_prune_popup {
+                    self.pending_prune_popup = false;
+                    self.open_prune_popup();
+                }
+            }
+            EventMsg::ContextItems(ev) => {
+                self.last_context_items = Some(ev.items);
+                // Initialize keep set to all indices
+                self.prune_keep_indices.clear();
+                self.prune_delete_indices.clear();
+                if let Some(list) = &self.last_context_items {
+                    for it in list.iter() {
+                        if it.included {
+                            self.prune_keep_indices.insert(it.index);
+                        }
+                    }
+                }
+                if self.pending_prune_advanced {
+                    self.render_prune_advanced_view();
+                }
+            }
             EventMsg::ConversationPath(ev) => {
                 self.app_event_tx
                     .send(crate::app_event::AppEvent::ConversationHistory(ev));
@@ -1512,6 +1941,206 @@ impl ChatWidget {
                 }
             }
         }
+    }
+
+    fn on_get_history_entry_response(
+        &mut self,
+        event: codex_core::protocol::GetHistoryEntryResponseEvent,
+    ) {
+        let codex_core::protocol::GetHistoryEntryResponseEvent {
+            offset,
+            log_id,
+            entry,
+        } = event;
+        self.bottom_pane
+            .on_history_entry_response(log_id, offset, entry.map(|e| e.text));
+    }
+
+    /// User requested the non-destructive advanced prune view. Set a pending flag
+    /// so that when the ContextItems event arrives, we render the view.
+    pub(crate) fn open_prune_advanced(&mut self) {
+        self.pending_prune_advanced = true;
+        self.submit_op(Op::GetContextItems);
+    }
+
+    pub(crate) fn on_prune_advanced_closed(&mut self) {
+        self.pending_prune_advanced = false;
+    }
+
+    pub(crate) fn toggle_keep_index(&mut self, idx: usize) {
+        if self.prune_keep_indices.contains(&idx) {
+            self.prune_keep_indices.remove(&idx);
+        } else {
+            self.prune_keep_indices.insert(idx);
+            // If it was marked for delete, unmark delete when toggling keep on
+            self.prune_delete_indices.remove(&idx);
+        }
+        // Update the visible list in place without resetting the view
+        self.update_advanced_item_marker(idx);
+    }
+
+    pub(crate) fn toggle_delete_index(&mut self, idx: usize) {
+        if self.prune_delete_indices.contains(&idx) {
+            self.prune_delete_indices.remove(&idx);
+        } else {
+            self.prune_delete_indices.insert(idx);
+            // When marking delete, it is no longer considered kept
+            self.prune_keep_indices.remove(&idx);
+        }
+        // Update the visible list in place without resetting the view
+        self.update_advanced_item_marker(idx);
+    }
+
+    fn update_advanced_item_marker(&mut self, _idx: usize) {
+        // No-op: the list will refresh on next ContextItems fetch.
+        self.request_redraw();
+    }
+
+    pub(crate) fn confirm_advanced_changes(&mut self) {
+        // Ensure advanced view does not auto-reopen while we're processing the result.
+        self.pending_prune_advanced = false;
+        // Apply staged inclusion toggles and, if present, prune deletions after confirmation.
+        // Compute inclusion diffs once so we can apply them together with deletions.
+        let mut to_include: Vec<usize> = Vec::new();
+        let mut to_exclude: Vec<usize> = Vec::new();
+        if let Some(list) = &self.last_context_items {
+            for it in list.iter() {
+                let desired = self.prune_keep_indices.contains(&it.index);
+                if desired != it.included {
+                    if desired {
+                        to_include.push(it.index);
+                    } else {
+                        to_exclude.push(it.index);
+                    }
+                }
+            }
+        }
+
+        if !self.prune_delete_indices.is_empty() {
+            let count = self.prune_delete_indices.len();
+            let subtitle = if to_include.is_empty() && to_exclude.is_empty() {
+                format!("This will delete {count} selected item(s) from the context. Proceed?")
+            } else {
+                format!(
+                    "This will apply inclusion changes and delete {count} selected item(s). Proceed?"
+                )
+            };
+            let indices: Vec<usize> = self.prune_delete_indices.iter().copied().collect();
+            let yes = move |tx: &AppEventSender| {
+                // First apply inclusion diffs, if any.
+                if !to_include.is_empty() {
+                    tx.send(AppEvent::CodexOp(Op::SetContextInclusion {
+                        indices: to_include.clone(),
+                        included: true,
+                    }));
+                }
+                if !to_exclude.is_empty() {
+                    tx.send(AppEvent::CodexOp(Op::SetContextInclusion {
+                        indices: to_exclude.clone(),
+                        included: false,
+                    }));
+                }
+                // Then prune deletions.
+                tx.send(AppEvent::CodexOp(Op::PruneContextByIndices {
+                    indices: indices.clone(),
+                }));
+                // Refresh the list; keep popup closed after apply.
+                tx.send(AppEvent::CodexOp(Op::GetContextItems));
+            };
+            // Close popup after confirmation; do not reopen Advanced automatically.
+            self.show_yes_no_confirmation("Confirm Advanced Changes", &subtitle, yes, None);
+        } else {
+            // No deletions: inclusion diffs can be applied immediately without confirmation.
+            if !to_include.is_empty() {
+                self.app_event_tx
+                    .send(AppEvent::CodexOp(Op::SetContextInclusion {
+                        indices: to_include,
+                        included: true,
+                    }));
+            }
+            if !to_exclude.is_empty() {
+                self.app_event_tx
+                    .send(AppEvent::CodexOp(Op::SetContextInclusion {
+                        indices: to_exclude,
+                        included: false,
+                    }));
+            }
+            // Refresh listing and close popup.
+            self.submit_op(Op::GetContextItems);
+        }
+    }
+
+    /// Render the advanced prune view listing context items with toggles.
+    fn render_prune_advanced_view(&mut self) {
+        use codex_core::protocol::Op;
+        use codex_core::protocol::PruneCategory as PC;
+        use ratatui::style::Stylize;
+        let mut items: Vec<SelectionItem> = Vec::new();
+
+        // Control actions
+        items.push(SelectionItem {
+            name: "Refresh list".to_string(),
+            display_shortcut: None,
+            description: Some("Re-query current context".to_string()),
+            is_current: false,
+            actions: vec![Box::new(|tx: &AppEventSender| {
+                tx.send(AppEvent::CodexOp(Op::GetContextItems));
+            })],
+            delete_actions: Vec::new(),
+            dismiss_on_select: true,
+            search_value: None,
+        });
+
+        // Build toggle entries (space toggles keep/unkeep; Delete marks/unmarks delete; Enter confirms)
+        if let Some(list) = &self.last_context_items {
+            for it in list.iter() {
+                // Skip items we never want to show in advanced: project/system context
+                if it.category == PC::UserInstructions || it.category == PC::EnvironmentContext {
+                    continue;
+                }
+                let marker = if self.prune_delete_indices.contains(&it.index) {
+                    "[D]"
+                } else if self.prune_keep_indices.contains(&it.index) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                let name = format!("{} {} {:?}", it.index, marker, it.category);
+                let desc = it.preview.clone();
+                let idx = it.index;
+                // Actions on space/delete only update local state; Enter is handled by on_enter_event
+                items.push(SelectionItem {
+                    name,
+                    display_shortcut: None,
+                    description: Some(desc),
+                    // Do not show '(current)' marker; the checkbox already signals state.
+                    is_current: false,
+                    actions: vec![Box::new(move |tx: &AppEventSender| {
+                        tx.send(AppEvent::ToggleKeepIndex { idx });
+                    })],
+                    delete_actions: vec![Box::new(move |tx: &AppEventSender| {
+                        tx.send(AppEvent::ToggleDeleteIndex { idx });
+                    })],
+                    dismiss_on_select: false,
+                    search_value: Some(format!("IDX:{idx}|CAT:{:?}|{}", it.category, it.preview)),
+                });
+            }
+        }
+
+        // Show view
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Prune Context (Advanced)".to_string()),
+            subtitle: None,
+            footer_hint: Some(ratatui::text::Line::from(
+                "space: toggle | del: delete | enter: confirm | esc: back",
+            )),
+            items,
+            is_searchable: true,
+            search_placeholder: Some("Filter context items".to_string()),
+            header: Box::new(ratatui::text::Line::from("Type to filter").dim()),
+            on_complete_event: Some(AppEvent::PruneAdvancedClosed),
+            on_enter_event: Some(AppEvent::ConfirmAdvancedChanges),
+        });
     }
 
     fn request_redraw(&mut self) {

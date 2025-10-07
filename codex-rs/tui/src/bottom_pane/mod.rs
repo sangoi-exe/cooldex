@@ -1,7 +1,9 @@
 //! Bottom pane: shows the ChatComposer or a BottomPaneView, if one is active.
 use std::path::PathBuf;
 
+// use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
+// use crate::bottom_pane::list_selection_view::ListSelectionView;
 use crate::tui::FrameRequester;
 use bottom_pane_view::BottomPaneView;
 use codex_file_search::FileMatch;
@@ -185,12 +187,20 @@ impl BottomPane {
                 && matches!(view.on_ctrl_c(), CancellationEvent::Handled)
                 && view.is_complete()
             {
+                let completion_event = view.take_on_complete_event();
                 self.view_stack.pop();
+                if let Some(ev) = completion_event {
+                    self.app_event_tx.send(ev);
+                }
                 self.on_active_view_complete();
             } else {
                 view.handle_key_event(key_event);
                 if view.is_complete() {
+                    let completion_event = view.take_on_complete_event();
                     self.view_stack.clear();
+                    if let Some(ev) = completion_event {
+                        self.app_event_tx.send(ev);
+                    }
                     self.on_active_view_complete();
                 }
             }
@@ -246,6 +256,11 @@ impl BottomPane {
         if let Some(view) = self.view_stack.last_mut() {
             let needs_redraw = view.handle_paste(pasted);
             if view.is_complete() {
+                let completion_event = view.take_on_complete_event();
+                self.view_stack.pop();
+                if let Some(ev) = completion_event {
+                    self.app_event_tx.send(ev);
+                }
                 self.on_active_view_complete();
             }
             if needs_redraw {
@@ -359,6 +374,8 @@ impl BottomPane {
         self.composer.set_context_window_percent(percent);
         self.request_redraw();
     }
+
+    // with_active_list_selection_mut intentionally omitted in this build.
 
     /// Show a generic list selection view with the provided items.
     pub(crate) fn show_selection_view(&mut self, params: list_selection_view::SelectionViewParams) {

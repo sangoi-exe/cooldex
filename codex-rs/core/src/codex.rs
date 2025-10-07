@@ -118,7 +118,14 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::ContextItemsEvent;
+use codex_protocol::protocol::ConversationUsageByCategory;
+use codex_protocol::protocol::ConversationUsageEvent;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::PruneCategory;
+use codex_protocol::protocol::PruneRange;
+use codex_utils_string::take_bytes_at_char_boundary;
 
 pub mod compact;
 use self::compact::build_compacted_history;
@@ -797,6 +804,285 @@ impl Session {
         }
     }
 
+    pub(crate) async fn compute_context_usage(&self) -> ConversationUsageEvent {
+        let state = self.state.lock().await;
+        let items = state.history_snapshot();
+        let mut totals: std::collections::HashMap<PruneCategory, (u64, u64)> =
+            std::collections::HashMap::new();
+
+        for item in &items {
+            let (category, text) = Self::context_item_category_and_text(item);
+            let bytes = text.len() as u64;
+            let entry = totals.entry(category).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(bytes);
+            entry.1 = entry.1.saturating_add(1);
+        }
+
+        let order = [
+            PruneCategory::ToolOutput,
+            PruneCategory::ToolCall,
+            PruneCategory::Reasoning,
+            PruneCategory::AssistantMessage,
+            PruneCategory::UserMessage,
+            PruneCategory::UserInstructions,
+            PruneCategory::EnvironmentContext,
+        ];
+
+        let mut total_bytes: u64 = 0;
+        let mut by_category = Vec::with_capacity(order.len());
+        for category in order {
+            let (bytes, count) = totals.get(&category).copied().unwrap_or((0, 0));
+            total_bytes = total_bytes.saturating_add(bytes);
+            by_category.push(ConversationUsageByCategory {
+                category,
+                bytes,
+                count: Some(count),
+            });
+        }
+
+        ConversationUsageEvent {
+            total_bytes,
+            by_category,
+        }
+    }
+
+    pub(crate) async fn compute_context_items(&self) -> ContextItemsEvent {
+        let state = self.state.lock().await;
+        let items = state.history_snapshot();
+        let include_mask = state.include_mask.clone();
+        let pinned_start = state
+            .pinned_tail_start_index(state.pinned_tail_turns)
+            .unwrap_or(usize::MAX);
+        let mut out: Vec<crate::protocol::ContextItemSummary> = Vec::with_capacity(items.len());
+
+        for (idx, it) in items.iter().enumerate() {
+            let (category, text) = Self::context_item_category_and_text(it);
+            let text_len = text.len();
+            const CONTEXT_ITEM_PREVIEW_MAX_BYTES: usize = 200;
+            let safe = take_bytes_at_char_boundary(text.as_ref(), CONTEXT_ITEM_PREVIEW_MAX_BYTES);
+            let preview = if safe.len() < text_len {
+                format!("{safe}…")
+            } else {
+                text.into_owned()
+            };
+            out.push(crate::protocol::ContextItemSummary {
+                index: idx,
+                category,
+                preview,
+                included: if idx >= pinned_start {
+                    true
+                } else {
+                    include_mask.get(idx).copied().unwrap_or(true)
+                },
+            });
+        }
+
+        ContextItemsEvent {
+            total: out.len(),
+            items: out,
+        }
+    }
+
+    pub(crate) fn context_item_category_and_text(
+        item: &ResponseItem,
+    ) -> (PruneCategory, std::borrow::Cow<'_, str>) {
+        match item {
+            ResponseItem::Message { role, content, .. } => {
+                let text = content
+                    .iter()
+                    .find_map(|c| match c {
+                        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                let category = if text.starts_with(crate::protocol::USER_INSTRUCTIONS_OPEN_TAG) {
+                    PruneCategory::UserInstructions
+                } else if text.starts_with(crate::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG) {
+                    PruneCategory::EnvironmentContext
+                } else if role == "assistant" {
+                    PruneCategory::AssistantMessage
+                } else {
+                    PruneCategory::UserMessage
+                };
+                (category, std::borrow::Cow::Borrowed(text))
+            }
+            ResponseItem::Reasoning { summary, .. } => {
+                let text = summary
+                    .iter()
+                    .map(|s| match s {
+                        codex_protocol::models::ReasoningItemReasoningSummary::SummaryText {
+                            text,
+                        } => text.as_str(),
+                    })
+                    .next()
+                    .unwrap_or("");
+                (PruneCategory::Reasoning, std::borrow::Cow::Borrowed(text))
+            }
+            ResponseItem::FunctionCall {
+                name, arguments, ..
+            } => (
+                PruneCategory::ToolCall,
+                std::borrow::Cow::Owned(format!("{name} {arguments}")),
+            ),
+            ResponseItem::CustomToolCall { name, input, .. } => (
+                PruneCategory::ToolCall,
+                std::borrow::Cow::Owned(format!("{name} {input}")),
+            ),
+            ResponseItem::LocalShellCall { action, .. } => (
+                PruneCategory::ToolCall,
+                std::borrow::Cow::Owned(format!("{action:?}")),
+            ),
+            ResponseItem::FunctionCallOutput { output, .. } => (
+                PruneCategory::ToolOutput,
+                std::borrow::Cow::Borrowed(&output.content),
+            ),
+            ResponseItem::CustomToolCallOutput { output, .. } => (
+                PruneCategory::ToolOutput,
+                std::borrow::Cow::Borrowed(output),
+            ),
+            ResponseItem::WebSearchCall { action, .. } => {
+                let query = match action {
+                    codex_protocol::models::WebSearchAction::Search { query } => query.as_str(),
+                    _ => "",
+                };
+                (PruneCategory::ToolCall, std::borrow::Cow::Borrowed(query))
+            }
+            ResponseItem::Other => (
+                PruneCategory::AssistantMessage,
+                std::borrow::Cow::Borrowed(""),
+            ),
+        }
+    }
+
+    async fn prune_context(&self, categories: Vec<PruneCategory>, range: PruneRange) -> usize {
+        let mut state = self.state.lock().await;
+        let items = state.history_snapshot();
+
+        let (start_idx, end_idx_exclusive) = match range {
+            PruneRange::All => (0usize, items.len()),
+            PruneRange::FirstTurns { count } => {
+                let mut end = 0usize;
+                for (i, c) in state.turn_item_counts.iter().copied().enumerate() {
+                    if i < count {
+                        end = end.saturating_add(c)
+                    } else {
+                        break;
+                    }
+                }
+                (0, end.min(items.len()))
+            }
+        };
+
+        fn is_user_text_prefixed(content: &[ContentItem], prefix: &str) -> bool {
+            content.iter().any(|c| match c {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                    text.starts_with(prefix)
+                }
+                _ => false,
+            })
+        }
+
+        fn matches_category(item: &ResponseItem, cat: &PruneCategory) -> bool {
+            match (item, cat) {
+                (ResponseItem::FunctionCallOutput { .. }, PruneCategory::ToolOutput)
+                | (ResponseItem::CustomToolCallOutput { .. }, PruneCategory::ToolOutput) => true,
+                (ResponseItem::FunctionCall { .. }, PruneCategory::ToolCall)
+                | (ResponseItem::CustomToolCall { .. }, PruneCategory::ToolCall)
+                | (ResponseItem::LocalShellCall { .. }, PruneCategory::ToolCall) => true,
+                (ResponseItem::Reasoning { .. }, PruneCategory::Reasoning) => true,
+                (ResponseItem::Message { role, .. }, PruneCategory::AssistantMessage) => {
+                    role == "assistant"
+                }
+                (ResponseItem::Message { role, .. }, PruneCategory::UserMessage) => role == "user",
+                (ResponseItem::Message { content, .. }, PruneCategory::UserInstructions) => {
+                    is_user_text_prefixed(content, crate::protocol::USER_INSTRUCTIONS_OPEN_TAG)
+                }
+                (ResponseItem::Message { content, .. }, PruneCategory::EnvironmentContext) => {
+                    is_user_text_prefixed(content, crate::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG)
+                }
+                _ => false,
+            }
+        }
+
+        let cat_set: std::collections::HashSet<PruneCategory> = categories.into_iter().collect();
+
+        let mut kept_mask: Vec<bool> = Vec::with_capacity(items.len());
+        let mut kept: Vec<ResponseItem> = Vec::with_capacity(items.len());
+        for (idx, it) in items.into_iter().enumerate() {
+            let mut drop = false;
+            if idx
+                >= state
+                    .pinned_tail_start_index(state.pinned_tail_turns)
+                    .unwrap_or(usize::MAX)
+            {
+                drop = false;
+            } else if idx >= start_idx
+                && idx < end_idx_exclusive
+                && cat_set.iter().any(|c| matches_category(&it, c))
+            {
+                drop = true;
+            }
+            if drop {
+                kept_mask.push(false);
+            } else {
+                kept_mask.push(true);
+                kept.push(it);
+            }
+        }
+
+        let mut new_counts: Vec<usize> = Vec::with_capacity(state.turn_item_counts.len());
+        let mut turn_start = 0usize;
+        for orig in state.turn_item_counts.clone().into_iter() {
+            let turn_end = turn_start.saturating_add(orig);
+            let remain = kept_mask[turn_start..turn_end]
+                .iter()
+                .filter(|b| **b)
+                .count();
+            new_counts.push(remain);
+            turn_start = turn_end;
+        }
+
+        let removed = state.history_snapshot().len().saturating_sub(kept.len());
+        state.replace_history(kept);
+        state.replace_turn_counts(new_counts);
+        removed
+    }
+
+    async fn prune_context_indices(&self, indices: Vec<usize>) -> usize {
+        let mut state = self.state.lock().await;
+        let items = state.history_snapshot();
+        let pinned_start = state
+            .pinned_tail_start_index(state.pinned_tail_turns)
+            .unwrap_or(usize::MAX);
+        let drop: std::collections::HashSet<usize> =
+            indices.into_iter().filter(|i| *i < pinned_start).collect();
+        let mut kept: Vec<ResponseItem> = Vec::with_capacity(items.len());
+        for (idx, it) in items.into_iter().enumerate() {
+            if drop.contains(&idx) {
+                continue;
+            }
+            kept.push(it);
+        }
+        // Recompute turn counts by subtracting removed items from each original turn.
+        let mut new_counts: Vec<usize> = Vec::with_capacity(state.turn_item_counts.len());
+        let mut turn_start = 0usize;
+        for orig in state.turn_item_counts.iter().copied() {
+            let turn_end = turn_start.saturating_add(orig);
+            let removed_in_turn = drop
+                .iter()
+                .filter(|idx| **idx >= turn_start && **idx < turn_end)
+                .count();
+            let kept_in_turn = orig.saturating_sub(removed_in_turn);
+            new_counts.push(kept_in_turn);
+            turn_start = turn_end;
+        }
+
+        state.replace_history(kept);
+        state.replace_turn_counts(new_counts);
+        drop.len()
+    }
     /// Record a user input item to conversation history and also persist a
     /// corresponding UserMessage EventMsg to rollout.
     async fn record_input_and_rollout_usermsg(&self, response_input: &ResponseInputItem) {
@@ -1439,6 +1725,215 @@ async fn submission_loop(
                     sess.spawn_task(Arc::clone(&turn_context), sub.id, items, CompactTask)
                         .await;
                 }
+            }
+            Op::PruneContext { categories, range } => {
+                let removed = sess.prune_context(categories, range).await;
+                let summary =
+                    format!("Pruned context: removed {removed} items across selected categories.");
+                let event = Event {
+                    id: sub.id.clone(),
+                    msg: EventMsg::AgentMessage(AgentMessageEvent { message: summary }),
+                };
+                sess.send_event(event).await;
+            }
+            Op::GetContextUsage => {
+                let usage = sess.compute_context_usage().await;
+                let event = Event {
+                    id: sub.id.clone(),
+                    msg: EventMsg::ConversationUsage(usage),
+                };
+                sess.send_event(event).await;
+            }
+            Op::GetContextItems => {
+                let items = sess.compute_context_items().await;
+                let event = Event {
+                    id: sub.id.clone(),
+                    msg: EventMsg::ContextItems(items),
+                };
+                sess.send_event(event).await;
+            }
+            Op::FixLastMissingToolCall => {
+                // Best-effort: attempt to restore the last missing tool call from rollout.
+                let mut fixed = false;
+                if let Some(rec) = sess.services.rollout.lock().await.as_ref().cloned() {
+                    let path = rec.get_rollout_path();
+                    match tokio::fs::read_to_string(path).await {
+                        Ok(contents) => {
+                            use std::borrow::Cow;
+                            fn classify(item: &ResponseItem) -> (PruneCategory, Cow<'_, str>) {
+                                match item {
+                                    ResponseItem::Message { role, content, .. } => {
+                                        let text = content
+                                            .iter()
+                                            .find_map(|c| match c {
+                                                ContentItem::InputText { text }
+                                                | ContentItem::OutputText { text } => {
+                                                    Some(text.as_str())
+                                                }
+                                                _ => None,
+                                            })
+                                            .unwrap_or("");
+                                        let category = if text.starts_with(
+                                            crate::protocol::USER_INSTRUCTIONS_OPEN_TAG,
+                                        ) {
+                                            PruneCategory::UserInstructions
+                                        } else if text.starts_with(
+                                            crate::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG,
+                                        ) {
+                                            PruneCategory::EnvironmentContext
+                                        } else if role == "assistant" {
+                                            PruneCategory::AssistantMessage
+                                        } else {
+                                            PruneCategory::UserMessage
+                                        };
+                                        (category, Cow::Borrowed(text))
+                                    }
+                                    ResponseItem::Reasoning { summary, .. } => {
+                                        let text = summary
+                                            .iter()
+                                            .map(|s| match s {
+                                                codex_protocol::models::ReasoningItemReasoningSummary::SummaryText { text } => text.as_str(),
+                                            })
+                                            .next()
+                                            .unwrap_or("");
+                                        (PruneCategory::Reasoning, Cow::Borrowed(text))
+                                    }
+                                    ResponseItem::FunctionCall {
+                                        name, arguments, ..
+                                    } => (
+                                        PruneCategory::ToolCall,
+                                        Cow::Owned(format!("{name} {arguments}")),
+                                    ),
+                                    ResponseItem::CustomToolCall { name, input, .. } => (
+                                        PruneCategory::ToolCall,
+                                        Cow::Owned(format!("{name} {input}")),
+                                    ),
+                                    ResponseItem::LocalShellCall { action, .. } => {
+                                        (PruneCategory::ToolCall, Cow::Owned(format!("{action:?}")))
+                                    }
+                                    ResponseItem::FunctionCallOutput { output, .. } => {
+                                        (PruneCategory::ToolOutput, Cow::Borrowed(&output.content))
+                                    }
+                                    ResponseItem::CustomToolCallOutput { output, .. } => {
+                                        (PruneCategory::ToolOutput, Cow::Borrowed(output))
+                                    }
+                                    ResponseItem::WebSearchCall { action, .. } => {
+                                        let query = match action {
+                                            codex_protocol::models::WebSearchAction::Search {
+                                                query,
+                                            } => query.as_str(),
+                                            _ => "",
+                                        };
+                                        (PruneCategory::ToolCall, Cow::Borrowed(query))
+                                    }
+                                    ResponseItem::Other => {
+                                        (PruneCategory::AssistantMessage, Cow::Borrowed(""))
+                                    }
+                                }
+                            }
+                            // Parse JSONL into RolloutItems.
+                            let rollout_items: Vec<codex_protocol::protocol::RolloutItem> = contents
+                                .lines()
+                                .filter_map(|line| serde_json::from_str::<codex_protocol::protocol::RolloutLine>(line).ok())
+                                .map(|rl| rl.item)
+                                .collect();
+                            let current_tool_calls: std::collections::HashSet<String> = sess
+                                .state
+                                .lock()
+                                .await
+                                .history_snapshot()
+                                .iter()
+                                .filter_map(|it| {
+                                    let (cat, text) = classify(it);
+                                    (cat == PruneCategory::ToolCall).then(|| text.into_owned())
+                                })
+                                .collect();
+                            for i in (0..rollout_items.len()).rev() {
+                                if let codex_protocol::protocol::RolloutItem::ResponseItem(item) =
+                                    &rollout_items[i]
+                                {
+                                    let (cat, text) = classify(item);
+                                    if cat == codex_protocol::protocol::PruneCategory::ToolCall {
+                                        // ensure not immediately followed by ToolOutput in rollout
+                                        let no_immediate_output = rollout_items
+                                            .get(i + 1)
+                                            .map(|next| match next {
+                                                codex_protocol::protocol::RolloutItem::ResponseItem(ri) => {
+                                                let (ncat, _) = classify(ri);
+                                                    ncat != codex_protocol::protocol::PruneCategory::ToolOutput
+                                                }
+                                                _ => true,
+                                            })
+                                            .unwrap_or(true);
+                                        let missing_from_current =
+                                            !current_tool_calls.contains(text.as_ref());
+                                        if missing_from_current && no_immediate_output {
+                                            // Restore just this item by appending to history
+                                            sess.record_into_history(std::slice::from_ref(item))
+                                                .await;
+                                            fixed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("smart fix: failed to read rollout: {e}");
+                        }
+                    }
+                }
+                let message = if fixed {
+                    "Smart fix: restored last missing tool call from rollout.".to_string()
+                } else {
+                    "Smart fix: no missing recent tool call found to restore.".to_string()
+                };
+                sess.send_event(Event {
+                    id: sub.id.clone(),
+                    msg: EventMsg::AgentMessage(AgentMessageEvent { message }),
+                })
+                .await;
+                // Emit fresh usage and list so UI can refresh.
+                let usage = sess.compute_context_usage().await;
+                sess.send_event(Event {
+                    id: sub.id.clone(),
+                    msg: EventMsg::ConversationUsage(usage),
+                })
+                .await;
+                let items = sess.compute_context_items().await;
+                sess.send_event(Event {
+                    id: sub.id.clone(),
+                    msg: EventMsg::ContextItems(items),
+                })
+                .await;
+            }
+            Op::PruneContextByIndices { indices } => {
+                let removed = sess.prune_context_indices(indices).await;
+                let summary = format!("Pruned context: removed {removed} items by selection.");
+                let event = Event {
+                    id: sub.id.clone(),
+                    msg: EventMsg::AgentMessage(AgentMessageEvent { message: summary }),
+                };
+                sess.send_event(event).await;
+            }
+            Op::SetContextInclusion { indices, included } => {
+                {
+                    let mut state = sess.state.lock().await;
+                    state.set_inclusion(&indices, included);
+                }
+                // Send updated usage and list so UI can refresh
+                let usage = sess.compute_context_usage().await;
+                sess.send_event(Event {
+                    id: sub.id.clone(),
+                    msg: EventMsg::ConversationUsage(usage),
+                })
+                .await;
+                let items = sess.compute_context_items().await;
+                sess.send_event(Event {
+                    id: sub.id.clone(),
+                    msg: EventMsg::ContextItems(items),
+                })
+                .await;
             }
             Op::Shutdown => {
                 sess.abort_all_tasks(TurnAbortReason::Interrupted).await;

@@ -176,6 +176,41 @@ pub enum Op {
 
     /// Request to shut down codex instance.
     Shutdown,
+
+    /// Prune items from the in-memory conversation context.
+    /// This does not rewrite past rollout files; it only affects what will be
+    /// sent to the model on subsequent turns.
+    PruneContext {
+        /// Categories to prune from the conversation history.
+        categories: Vec<PruneCategory>,
+        /// Range limiter for pruning.
+        range: PruneRange,
+    },
+
+    /// Request an approximate breakdown of the current context by category.
+    /// Reply is delivered via `EventMsg::ConversationUsage`.
+    GetContextUsage,
+
+    /// Request a list of context items with indices and categories for advanced pruning.
+    GetContextItems,
+
+    /// Prune specific items by zero-based indices into the conversation history.
+    /// Indices outside bounds are ignored.
+    PruneContextByIndices { indices: Vec<usize> },
+
+    /// Non-destructive include/exclude of specific items in the in-memory context.
+    /// When `included` is false, items are kept in the session but not sent to the model.
+    SetContextInclusion { indices: Vec<usize>, included: bool },
+
+    /// Rebuild the in-memory conversation context from the rollout file.
+    /// Useful to recover after an accidental prune.
+    RebuildContextFromRollout,
+
+    /// Attempt a smart fix: from the rollout file, scan backwards to find the
+    /// most recent ToolCall that is missing from the current in-memory
+    /// context and that is not immediately followed by a ToolOutput. Restore
+    /// just that item into the current session.
+    FixLastMissingToolCall,
 }
 
 /// Determines the conditions under which the user is consulted to approve
@@ -515,6 +550,12 @@ pub enum EventMsg {
     /// Notification that the agent is shutting down.
     ShutdownComplete,
 
+    /// Usage snapshot for conversation context.
+    ConversationUsage(ConversationUsageEvent),
+
+    /// Detailed list of context items for advanced prune.
+    ContextItems(ContextItemsEvent),
+
     ConversationPath(ConversationPathResponseEvent),
 
     /// Entered review mode.
@@ -522,6 +563,59 @@ pub enum EventMsg {
 
     /// Exited review mode with an optional final result to apply.
     ExitedReviewMode(ExitedReviewModeEvent),
+}
+
+/// Categories of conversation items that can be pruned from context.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PruneCategory {
+    ToolOutput,
+    ToolCall,
+    Reasoning,
+    AssistantMessage,
+    UserMessage,
+    UserInstructions,
+    EnvironmentContext,
+}
+
+/// Range selector for pruning.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PruneRange {
+    /// Apply to the entire conversation history.
+    All,
+    /// Apply only to the first `count` turns of the conversation.
+    FirstTurns { count: usize },
+}
+
+/// Response payload for `GetContextUsage`.
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct ConversationUsageEvent {
+    pub total_bytes: u64,
+    pub by_category: Vec<ConversationUsageByCategory>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct ConversationUsageByCategory {
+    pub category: PruneCategory,
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct ContextItemSummary {
+    /// Zero-based index in the in-memory conversation history.
+    pub index: usize,
+    pub category: PruneCategory,
+    pub preview: String,
+    pub included: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct ContextItemsEvent {
+    pub total: usize,
+    pub items: Vec<ContextItemSummary>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]

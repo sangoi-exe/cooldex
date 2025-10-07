@@ -40,4 +40,9 @@ pub(crate) trait BottomPaneView: Renderable {
     ) -> Option<ApprovalRequest> {
         Some(request)
     }
+
+    /// Optional completion event for popups that want to signal an AppEvent when they close.
+    fn take_on_complete_event(&mut self) -> Option<crate::app_event::AppEvent> {
+        None
+    }
 }
