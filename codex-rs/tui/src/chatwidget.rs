@@ -305,98 +305,7 @@ impl ChatWidget {
         }
     }
 
-    pub(crate) fn open_prune_by_turn_menu(&mut self) {
-        use codex_core::protocol::PruneCategory as PC;
-        let total_turns = self
-            .last_context_items
-            .as_ref()
-            .map(|list| {
-                list.iter()
-                    .filter(|it| it.category == PC::UserMessage)
-                    .count()
-            })
-            .unwrap_or(0);
-        let mut items: Vec<SelectionItem> = Vec::new();
-        // Only show presets when total_turns > preset (strictly greater). Otherwise only free-form.
-        if total_turns > 5 {
-            // Generate 5,10,15,... < total_turns
-            let mut n = 5usize;
-            while n < total_turns {
-                items.push(SelectionItem {
-                    name: format!("Prune first {n} turns"),
-                    display_shortcut: None,
-                    description: Some("Remove everything from the earliest turns.".to_string()),
-                    is_current: false,
-                    actions: vec![Box::new(move |tx| {
-                        tx.send(AppEvent::ConfirmPruneByTurn { count: n })
-                    })],
-                    delete_actions: Vec::new(),
-                    dismiss_on_select: true,
-                    search_value: None,
-                });
-                n += 5;
-            }
-        }
-        // Free-form via prompt
-        items.push(SelectionItem {
-            name: "Prune first n turns (enter amount)".to_string(),
-            display_shortcut: None,
-            description: Some("Type a number and press Enter".to_string()),
-            is_current: false,
-            actions: vec![Box::new(|tx| tx.send(AppEvent::OpenPruneByTurnPrompt))],
-            delete_actions: Vec::new(),
-            dismiss_on_select: false,
-            search_value: None,
-        });
-
-        self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some("Prune by Turn".to_string()),
-            subtitle: Some(if total_turns > 0 {
-                format!("You have ~{total_turns} turns; choose how many to prune")
-            } else {
-                "Choose how many earliest turns to prune".to_string()
-            }),
-            footer_hint: Some(standard_popup_hint_line()),
-            items,
-            ..Default::default()
-        });
-    }
-
-    pub(crate) fn show_prune_by_turn_prompt(&mut self) {
-        let tx = self.app_event_tx.clone();
-        let total_turns = self
-            .last_context_items
-            .as_ref()
-            .map(|list| {
-                list.iter()
-                    .filter(|it| it.category == codex_core::protocol::PruneCategory::UserMessage)
-                    .count()
-            })
-            .unwrap_or(0);
-        let context = if total_turns > 0 {
-            Some(format!("You have ~{total_turns} turns"))
-        } else {
-            None
-        };
-        let view = CustomPromptView::new(
-            "Prune first n turns".to_string(),
-            "Enter a number (e.g., 12) and press Enter".to_string(),
-            context,
-            Box::new(move |text: String| {
-                let trimmed = text.trim();
-                if let Ok(mut n) = trimmed.parse::<usize>() {
-                    if n == 0 {
-                        return;
-                    }
-                    if total_turns > 0 {
-                        n = n.min(total_turns);
-                    }
-                    tx.send(AppEvent::ConfirmPruneByTurn { count: n });
-                }
-            }),
-        );
-        self.bottom_pane.show_view(Box::new(view));
-    }
+    // Removed prune-by-turn UI.
 
     pub(crate) fn show_confirm_prune_manual(
         &mut self,
@@ -416,11 +325,17 @@ impl ChatWidget {
             })
             .unwrap_or(0);
         let cat_label = format!("{category:?}");
-        let subtitle = if est > 0 {
-            format!("This will remove all {cat_label} (≈{est}% of current context). Proceed?")
+        let base = if est > 0 {
+            format!("This will remove all {cat_label} (≈{est}% of current context).")
         } else {
-            format!("This will remove all {cat_label}. Proceed?")
+            format!("This will remove all {cat_label}.")
         };
+        // Clarify protection semantics: preserve N most recent tool call/output pairs.
+        let n = self.config.protected_tool_pairs;
+        let pair_word = if n == 1 { "pair" } else { "pairs" };
+        let subtitle = format!(
+            "{base} Note: the {n} most recent tool call/output {pair_word} are preserved. Proceed?"
+        );
         let category_for_yes = category;
         let yes_action = move |tx: &AppEventSender| {
             tx.send(AppEvent::CodexOp(Op::PruneContext {
@@ -432,69 +347,7 @@ impl ChatWidget {
         self.show_yes_no_confirmation("Confirm Manual Prune", &subtitle, yes_action, None);
     }
 
-    pub(crate) fn show_confirm_prune_by_turn(&mut self, mut count: usize) {
-        use codex_core::protocol::Op;
-        use codex_core::protocol::PruneCategory as PC;
-        use codex_core::protocol::PruneRange as PR;
-        let total_turns = self
-            .last_context_items
-            .as_ref()
-            .map(|list| {
-                list.iter()
-                    .filter(|it| it.category == PC::UserMessage)
-                    .count()
-            })
-            .unwrap_or(0);
-        if total_turns > 0 {
-            count = count.min(total_turns);
-        }
-        let cats = vec![
-            PC::ToolOutput,
-            PC::ToolCall,
-            PC::Reasoning,
-            PC::AssistantMessage,
-            PC::UserMessage,
-        ];
-        let subtitle = if total_turns > 0 {
-            format!("This will remove the first {count} of ~{total_turns} turns. Proceed?")
-        } else {
-            format!("This will remove the first {count} turns. Proceed?")
-        };
-        let yes = move |tx: &AppEventSender| {
-            tx.send(AppEvent::CodexOp(Op::PruneContext {
-                categories: cats.clone(),
-                range: PR::FirstTurns { count },
-            }));
-        };
-        // Close popup after confirmation; do not reopen menus automatically.
-        self.show_yes_no_confirmation("Confirm Prune by Turn", &subtitle, yes, None);
-    }
-
-    pub(crate) fn show_confirm_prune_max(&mut self) {
-        use codex_core::protocol::Op;
-        use codex_core::protocol::PruneCategory as PC;
-        use codex_core::protocol::PruneRange as PR;
-        let cats = vec![
-            PC::ToolOutput,
-            PC::ToolCall,
-            PC::Reasoning,
-            PC::AssistantMessage,
-            PC::UserMessage,
-        ];
-        let yes = move |tx: &AppEventSender| {
-            tx.send(AppEvent::CodexOp(Op::PruneContext {
-                categories: cats.clone(),
-                range: PR::All,
-            }));
-        };
-        // Close popup after confirmation; do not reopen menus automatically.
-        self.show_yes_no_confirmation(
-            "Confirm Max Prune",
-            "This will clear all categories (non-destructive to rollout). Proceed?",
-            yes,
-            None,
-        );
-    }
+    // Removed prune-by-turn and max-prune confirmations.
 
     fn open_prune_menu_root(&mut self) {
         use codex_core::protocol::Op;
@@ -556,39 +409,7 @@ impl ChatWidget {
             dismiss_on_select: true,
             search_value: None,
         });
-        let total_turns = self
-            .last_context_items
-            .as_ref()
-            .map(|list| {
-                list.iter()
-                    .filter(|it| it.category == PC::UserMessage)
-                    .count()
-            })
-            .unwrap_or(0);
-        items.push(SelectionItem {
-            name: "Prune by turn".to_string(),
-            display_shortcut: None,
-            description: Some(if total_turns > 0 {
-                format!("You have ~{total_turns} turns; remove earliest ones")
-            } else {
-                "Remove earliest turns (count unavailable yet)".to_string()
-            }),
-            is_current: false,
-            actions: vec![Box::new(|tx| tx.send(AppEvent::OpenPruneByTurn))],
-            delete_actions: Vec::new(),
-            dismiss_on_select: true,
-            search_value: None,
-        });
-        items.push(SelectionItem {
-            name: "Max prune (all categories)".to_string(),
-            display_shortcut: None,
-            description: Some("Clear all categories (non-destructive to rollout)".to_string()),
-            is_current: false,
-            actions: vec![Box::new(|tx| tx.send(AppEvent::ConfirmPruneMax))],
-            delete_actions: Vec::new(),
-            dismiss_on_select: true,
-            search_value: None,
-        });
+        // Removed: Prune by turn and Max prune per product direction.
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
             title: Some("Prune Context".to_string()),
@@ -602,6 +423,7 @@ impl ChatWidget {
 
     pub(crate) fn open_prune_manual_menu(&mut self) {
         use codex_core::protocol::PruneCategory as PC;
+        use ratatui::style::Stylize;
         let mut items: Vec<SelectionItem> = Vec::new();
         let mut push = |n: &str, c: PC, d: &str| {
             items.push(SelectionItem {
@@ -647,11 +469,20 @@ impl ChatWidget {
             "Remove all reasoning items from context",
         );
 
+        // Header: expose how many recent tool pairs are preserved by manual prune.
+        let n = self.config.protected_tool_pairs;
+        let pair_word = if n == 1 { "pair" } else { "pairs" };
+        let header_line = ratatui::text::Line::from(format!(
+            "Preserves the last {n} tool call/output {pair_word}"
+        ))
+        .dim();
+
         self.bottom_pane.show_selection_view(SelectionViewParams {
             title: Some("Manual Prune".to_string()),
             subtitle: Some("Remove all items in a category".to_string()),
             footer_hint: Some(standard_popup_hint_line()),
             items,
+            header: Box::new(header_line),
             ..Default::default()
         });
     }

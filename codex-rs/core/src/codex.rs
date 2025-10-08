@@ -480,6 +480,7 @@ impl Session {
                 turn_context.cwd.clone(),
                 config.codex_linux_sandbox_exe.clone(),
             )),
+            protected_tool_pairs: config.protected_tool_pairs,
         };
 
         let sess = Arc::new(Session {
@@ -975,35 +976,85 @@ impl Session {
             }
         };
 
-        fn is_user_text_prefixed(content: &[ContentItem], prefix: &str) -> bool {
-            content.iter().any(|c| match c {
-                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                    text.starts_with(prefix)
+        // Identify last N tool call/output pairs to keep (item-based, not by turn).
+        // This protects recency without depending on turn accounting.
+        let protect_last_tool_pairs: usize = self.services.protected_tool_pairs;
+        let mut protected_tool_indices: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let mut pairs_found = 0usize;
+
+        // Helper: extract an output's call id when present.
+        fn output_call_id_for(item: &ResponseItem) -> Option<&str> {
+            match item {
+                ResponseItem::FunctionCallOutput { call_id, .. }
+                | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            }
+        }
+
+        // Scan from the end to protect the last N tool output pairs.
+        if protect_last_tool_pairs > 0 && !items.is_empty() {
+            let mut i = items.len();
+            while i > 0 && pairs_found < protect_last_tool_pairs {
+                i -= 1;
+                if let Some(out_id) = output_call_id_for(&items[i]) {
+                    // Protect this output
+                    protected_tool_indices.insert(i);
+                    // Find nearest matching call to the left; prefer exact id match, else nearest tool call.
+                    let mut found_call_idx: Option<usize> = None;
+                    let mut j = i;
+                    while j > 0 {
+                        j -= 1;
+                        match &items[j] {
+                            ResponseItem::FunctionCall { call_id, .. } if call_id == out_id => {
+                                found_call_idx = Some(j);
+                                break;
+                            }
+                            ResponseItem::CustomToolCall { call_id, .. } if call_id == out_id => {
+                                found_call_idx = Some(j);
+                                break;
+                            }
+                            // Fallback to the nearest tool call if id linkage is missing.
+                            ResponseItem::FunctionCall { .. }
+                            | ResponseItem::CustomToolCall { .. }
+                            | ResponseItem::LocalShellCall { .. } => {
+                                if found_call_idx.is_none() {
+                                    found_call_idx = Some(j);
+                                    // keep searching for an exact id match; if none, we'll use this.
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(ci) = found_call_idx {
+                        protected_tool_indices.insert(ci);
+                    }
+                    pairs_found += 1;
                 }
-                _ => false,
-            })
+            }
+            // If we didn't find any outputs, still protect the last tool call item.
+            if pairs_found == 0 {
+                let mut j = items.len();
+                while j > 0 {
+                    j -= 1;
+                    match &items[j] {
+                        ResponseItem::FunctionCall { .. }
+                        | ResponseItem::CustomToolCall { .. }
+                        | ResponseItem::LocalShellCall { .. } => {
+                            protected_tool_indices.insert(j);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
 
         fn matches_category(item: &ResponseItem, cat: &PruneCategory) -> bool {
-            match (item, cat) {
-                (ResponseItem::FunctionCallOutput { .. }, PruneCategory::ToolOutput)
-                | (ResponseItem::CustomToolCallOutput { .. }, PruneCategory::ToolOutput) => true,
-                (ResponseItem::FunctionCall { .. }, PruneCategory::ToolCall)
-                | (ResponseItem::CustomToolCall { .. }, PruneCategory::ToolCall)
-                | (ResponseItem::LocalShellCall { .. }, PruneCategory::ToolCall) => true,
-                (ResponseItem::Reasoning { .. }, PruneCategory::Reasoning) => true,
-                (ResponseItem::Message { role, .. }, PruneCategory::AssistantMessage) => {
-                    role == "assistant"
-                }
-                (ResponseItem::Message { role, .. }, PruneCategory::UserMessage) => role == "user",
-                (ResponseItem::Message { content, .. }, PruneCategory::UserInstructions) => {
-                    is_user_text_prefixed(content, crate::protocol::USER_INSTRUCTIONS_OPEN_TAG)
-                }
-                (ResponseItem::Message { content, .. }, PruneCategory::EnvironmentContext) => {
-                    is_user_text_prefixed(content, crate::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG)
-                }
-                _ => false,
-            }
+            // Reuse the same classifier used by advanced view and usage breakdown
+            // to avoid any drift between manual and advanced prune.
+            let (category, _text) = Session::context_item_category_and_text(item);
+            &category == cat
         }
 
         let cat_set: std::collections::HashSet<PruneCategory> = categories.into_iter().collect();
@@ -1012,17 +1063,19 @@ impl Session {
         let mut kept: Vec<ResponseItem> = Vec::with_capacity(items.len());
         for (idx, it) in items.into_iter().enumerate() {
             let mut drop = false;
-            if idx
-                >= state
-                    .pinned_tail_start_index(state.pinned_tail_turns)
-                    .unwrap_or(usize::MAX)
-            {
-                drop = false;
-            } else if idx >= start_idx
-                && idx < end_idx_exclusive
-                && cat_set.iter().any(|c| matches_category(&it, c))
-            {
-                drop = true;
+            if idx >= start_idx && idx < end_idx_exclusive {
+                let matched = cat_set.iter().any(|c| matches_category(&it, c));
+                if matched {
+                    // Do not drop protected recent tool items when pruning tool categories.
+                    let is_tool_cat_selected = cat_set.contains(&PruneCategory::ToolCall)
+                        || cat_set.contains(&PruneCategory::ToolOutput);
+                    let is_tool_item = matches_category(&it, &PruneCategory::ToolCall)
+                        || matches_category(&it, &PruneCategory::ToolOutput);
+                    let is_protected_tool = is_tool_cat_selected
+                        && is_tool_item
+                        && protected_tool_indices.contains(&idx);
+                    drop = !is_protected_tool;
+                }
             }
             if drop {
                 kept_mask.push(false);
@@ -3267,6 +3320,7 @@ mod tests {
                 turn_context.cwd.clone(),
                 None,
             )),
+            protected_tool_pairs: config.protected_tool_pairs,
         };
         let session = Session {
             conversation_id,
@@ -3340,6 +3394,7 @@ mod tests {
                 config.cwd.clone(),
                 None,
             )),
+            protected_tool_pairs: config.protected_tool_pairs,
         };
         let session = Arc::new(Session {
             conversation_id,

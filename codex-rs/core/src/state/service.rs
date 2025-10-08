@@ -15,4 +15,6 @@ pub(crate) struct SessionServices {
     pub(crate) user_shell: crate::shell::Shell,
     pub(crate) show_raw_agent_reasoning: bool,
     pub(crate) executor: Executor,
+    /// Number of most-recent tool call/output pairs to preserve during manual prune
+    pub(crate) protected_tool_pairs: usize,
 }

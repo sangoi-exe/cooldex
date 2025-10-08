@@ -219,6 +219,11 @@ pub struct Config {
 
     /// OTEL configuration (exporter type, endpoint, headers, etc.).
     pub otel: crate::config_types::OtelConfig,
+
+    /// Number of most-recent tool call/output pairs to preserve during manual prune
+    /// for tool-related categories (ToolCall/ToolOutput). Defaults to 2 when unset
+    /// in config.toml.
+    pub protected_tool_pairs: usize,
 }
 
 impl Config {
@@ -767,6 +772,10 @@ pub struct ConfigToml {
 
     /// Tracks whether the Windows onboarding screen has been acknowledged.
     pub windows_wsl_setup_acknowledged: Option<bool>,
+
+    /// Number of most-recent tool call/output pairs to preserve during manual prune
+    /// for tool-related categories (ToolCall/ToolOutput).
+    pub protected_tool_pairs: Option<usize>,
 }
 
 impl From<ConfigToml> for UserSavedConfig {
@@ -1008,6 +1017,9 @@ impl Config {
             .or(cfg.tools.as_ref().and_then(|t| t.view_image))
             .unwrap_or(true);
 
+        // Default to 2 protected pairs when not specified
+        let protected_tool_pairs = cfg.protected_tool_pairs.unwrap_or(2);
+
         let model = model
             .or(config_profile.model)
             .or(cfg.model)
@@ -1145,6 +1157,7 @@ impl Config {
                     exporter,
                 }
             },
+            protected_tool_pairs,
         };
         Ok(config)
     }
@@ -1922,6 +1935,7 @@ model_verbosity = "high"
                 disable_paste_burst: false,
                 tui_notifications: Default::default(),
                 otel: OtelConfig::default(),
+                protected_tool_pairs: 2,
             },
             o3_profile_config
         );
@@ -1984,6 +1998,7 @@ model_verbosity = "high"
             disable_paste_burst: false,
             tui_notifications: Default::default(),
             otel: OtelConfig::default(),
+            protected_tool_pairs: 2,
         };
 
         assert_eq!(expected_gpt3_profile_config, gpt3_profile_config);
@@ -2061,6 +2076,7 @@ model_verbosity = "high"
             disable_paste_burst: false,
             tui_notifications: Default::default(),
             otel: OtelConfig::default(),
+            protected_tool_pairs: 2,
         };
 
         assert_eq!(expected_zdr_profile_config, zdr_profile_config);
@@ -2124,6 +2140,7 @@ model_verbosity = "high"
             disable_paste_burst: false,
             tui_notifications: Default::default(),
             otel: OtelConfig::default(),
+            protected_tool_pairs: 2,
         };
 
         assert_eq!(expected_gpt5_profile_config, gpt5_profile_config);

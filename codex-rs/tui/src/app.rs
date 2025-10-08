@@ -400,20 +400,8 @@ impl App {
             AppEvent::OpenPruneManual => {
                 self.chat_widget.open_prune_manual_menu();
             }
-            AppEvent::OpenPruneByTurn => {
-                self.chat_widget.open_prune_by_turn_menu();
-            }
-            AppEvent::OpenPruneByTurnPrompt => {
-                self.chat_widget.show_prune_by_turn_prompt();
-            }
             AppEvent::ConfirmPruneManual { category } => {
                 self.chat_widget.show_confirm_prune_manual(category);
-            }
-            AppEvent::ConfirmPruneByTurn { count } => {
-                self.chat_widget.show_confirm_prune_by_turn(count);
-            }
-            AppEvent::ConfirmPruneMax => {
-                self.chat_widget.show_confirm_prune_max();
             }
             AppEvent::FullScreenApprovalRequest(request) => match request {
                 ApprovalRequest::ApplyPatch { cwd, changes, .. } => {

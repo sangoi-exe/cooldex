@@ -97,21 +97,11 @@ pub(crate) enum AppEvent {
 
     /// Open the manual prune submenu.
     OpenPruneManual,
-    /// Open the prune-by-turn submenu.
-    OpenPruneByTurn,
-    /// Open prompt to enter number of turns for prune-by-turn.
-    OpenPruneByTurnPrompt,
     /// Show confirmation for manual prune of a single category.
     ConfirmPruneManual {
         category: PruneCategory,
     },
-    /// Show confirmation for prune-by-turn with the given count.
-    ConfirmPruneByTurn {
-        count: usize,
-    },
-    /// Show confirmation for max prune (all categories).
-    ConfirmPruneMax,
-
+    // Removed: by-turn and max-prune events.
     /// Advanced prune: toggle keep/unkeep for an index (space key).
     ToggleKeepIndex {
         idx: usize,
