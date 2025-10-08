@@ -12,6 +12,7 @@ mod view_image;
 pub use plan::PLAN_TOOL;
 
 pub use apply_patch::ApplyPatchHandler;
+// prune tool removed from model tools
 pub use exec_stream::ExecStreamHandler;
 pub use list_dir::ListDirHandler;
 pub use mcp::McpHandler;

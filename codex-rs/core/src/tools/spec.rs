@@ -29,6 +29,7 @@ pub(crate) struct ToolsConfig {
     pub include_view_image_tool: bool,
     pub experimental_unified_exec_tool: bool,
     pub experimental_supported_tools: Vec<String>,
+    // prune tool removed; /prune UI remains via Op routes
 }
 
 pub(crate) struct ToolsConfigParams<'a> {
@@ -39,6 +40,7 @@ pub(crate) struct ToolsConfigParams<'a> {
     pub(crate) use_streamable_shell_tool: bool,
     pub(crate) include_view_image_tool: bool,
     pub(crate) experimental_unified_exec_tool: bool,
+    // prune tool removed
 }
 
 impl ToolsConfig {
@@ -51,6 +53,7 @@ impl ToolsConfig {
             use_streamable_shell_tool,
             include_view_image_tool,
             experimental_unified_exec_tool,
+            // prune tool removed
         } = params;
         let shell_type = if *use_streamable_shell_tool {
             ConfigShellToolType::Streamable
@@ -80,6 +83,7 @@ impl ToolsConfig {
             include_view_image_tool: *include_view_image_tool,
             experimental_unified_exec_tool: *experimental_unified_exec_tool,
             experimental_supported_tools: model_family.experimental_supported_tools.clone(),
+            // prune tool removed
         }
     }
 }
@@ -257,6 +261,8 @@ fn create_view_image_tool() -> ToolSpec {
         },
     })
 }
+
+// prune tool removed from model tools
 
 fn create_test_sync_tool() -> ToolSpec {
     let mut properties = BTreeMap::new();
@@ -609,6 +615,7 @@ pub(crate) fn build_specs(
     use crate::exec_command::create_exec_command_tool_for_responses_api;
     use crate::exec_command::create_write_stdin_tool_for_responses_api;
     use crate::tools::handlers::ApplyPatchHandler;
+    // prune tool removed
     use crate::tools::handlers::ExecStreamHandler;
     use crate::tools::handlers::ListDirHandler;
     use crate::tools::handlers::McpHandler;
@@ -714,6 +721,8 @@ pub(crate) fn build_specs(
         builder.push_spec_with_parallel_support(create_view_image_tool(), true);
         builder.register_handler("view_image", view_image_handler);
     }
+
+    // prune tool removed from model tools
 
     if let Some(mcp_tools) = mcp_tools {
         let mut entries: Vec<(String, mcp_types::Tool)> = mcp_tools.into_iter().collect();
@@ -825,6 +834,7 @@ mod tests {
     }
 
     #[test]
+    // prune tool test removed
     #[ignore]
     fn test_parallel_support_flags() {
         let model_family = find_family_for_model("gpt-5-codex")
