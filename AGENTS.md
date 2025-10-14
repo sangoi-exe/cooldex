@@ -2,20 +2,16 @@
 
 This file provides repo‑specific guidance for agents and contributors working in this project. Keep it concise and actionable.
 
-## Configuration Example (docs/config.toml)
+## Commit & Push Policy (General)
 
-- Canonical example lives at `docs/config.toml`.
-- It lists every TOML key Codex accepts, sets effective defaults where applicable, leaves optional keys commented, and includes short annotations on purpose and valid values.
-- When contributing this example upstream:
-  - Branch from `upstream/main`.
-  - Include only one file in the PR: `docs/config.toml`.
-  - Verify before pushing: `git diff --name-only upstream/main...HEAD` must output exactly `docs/config.toml`.
-
-## PR Hygiene
-
-- Commit and push only what changed; do not mix unrelated edits.
-- Do not add vendored/build artifacts or lockfiles unless the task explicitly requires it.
-- Avoid destructive resets/cleanups that could hide unrelated changes.
+- Always commit and push only the files actually modified for the task — nothing else, under any circumstance.
+- Before committing, verify the staged set is exactly what you intend:
+  - `git diff --cached --name-only` (staged files)
+  - `rg -n "<<<<<<<|=======|>>>>>>>"` (ensure no merge markers)
+- Before opening/updating a PR, verify the delta vs. base contains only the expected files:
+  - `git diff --name-only upstream/main...HEAD`
+- Do not add vendored/build artifacts, lockfiles, or unrelated edits unless explicitly requested.
+- Do not run destructive commands that reset or hide unrelated work (e.g., `git clean`, `git revert`, forced resets). If a clean base is required, branch from `upstream/main` and add only your intended changes.
 
 ## Rust (codex-rs) conventions (abridged)
 
@@ -25,4 +21,4 @@ This file provides repo‑specific guidance for agents and contributors working 
 
 ## Contact
 
-If a task risks touching more than `docs/config.toml` for the config example, stop and ask before proceeding.
+If a task risks touching more files than originally scoped, stop and ask before proceeding.
