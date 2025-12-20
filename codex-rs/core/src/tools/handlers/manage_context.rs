@@ -172,11 +172,11 @@ async fn handle_manage_context(
                     "delete is destructive; deleting a tool call also deletes its outputs.",
                     "If snapshot_id mismatches, re-run retrieve and retry apply."
                 ],
+                "tip": "Use retrieve(include_items=false) to get the bounded breakdown + top offenders without bloating context.",
                 "example_retrieve": {
                     "mode": "retrieve",
-                    "max_items": 120,
+                    "include_items": false,
                     "include_token_usage": true,
-                    "include_pairs": true
                 },
                 "example_apply": {
                     "mode": "apply",

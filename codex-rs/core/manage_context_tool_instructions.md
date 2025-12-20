@@ -10,6 +10,11 @@ Preferred flow (non-interactive, 2 calls)
 2) `mode="apply"` with `snapshot_id` + an ordered batch of `ops` applied atomically.
    - If `snapshot_id` mismatches, re-run `retrieve` and retry with the new snapshot.
 
+Calibration artifact
+- The tool returns a bounded `breakdown` that tells you what is consuming context:
+  - `by_category`: counts + approximate bytes (raw vs effective after replacements)
+  - `top_included_items`: largest included items (use these indices/ids/call_ids as prune targets)
+
 What to do
 - Prefer `exclude` when unsure (non-destructive).
 - Use `replace` to distill large ToolOutput/Reasoning into short, high-signal text.
@@ -19,9 +24,9 @@ What to do
 Hard safety rules
 - `replace` is allowed ONLY for ToolOutput and Reasoning. Never replace user/assistant messages.
 
-Example (retrieve)
+Example (retrieve, minimal)
 ```json
-{"mode":"retrieve","max_items":120,"include_token_usage":true,"include_pairs":true}
+{"mode":"retrieve","include_items":false,"include_token_usage":true}
 ```
 
 Example (apply)
