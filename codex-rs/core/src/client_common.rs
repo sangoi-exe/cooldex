@@ -492,7 +492,7 @@ mod tests {
 
         let expected = format!(
             "{}\n{}\n{}",
-            model_family.clone().base_instructions,
+            model_family.base_instructions,
             APPLY_PATCH_TOOL_INSTRUCTIONS,
             MANAGE_CONTEXT_TOOL_INSTRUCTIONS
         );

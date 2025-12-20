@@ -615,8 +615,7 @@ async fn handle_manage_context(
             })
         }
         _ => Err(FunctionCallError::RespondToModel(format!(
-            "unknown manage_context action: {}",
-            action
+            "unknown manage_context action: {action}"
         ))),
     }
 }
@@ -718,12 +717,12 @@ async fn handle_apply(
         let before_overlay = state.context_overlay_snapshot();
         let current_snapshot_id = snapshot_id_for_context(&before_ev.items, &before_overlay);
 
-        if let Some(expected) = args.snapshot_id.as_deref() {
-            if expected != current_snapshot_id {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "snapshot mismatch (expected {expected}, got {current_snapshot_id}); run manage_context with mode=retrieve again"
-                )));
-            }
+        if let Some(expected) = args.snapshot_id.as_deref()
+            && expected != current_snapshot_id
+        {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "snapshot mismatch (expected {expected}, got {current_snapshot_id}); run manage_context with mode=retrieve again"
+            )));
         }
 
         let snapshot_items = state.history_snapshot();
@@ -923,8 +922,14 @@ fn build_breakdown(
     }
 
     top_included.sort_by(|a, b| {
-        let al = a.get("approx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-        let bl = b.get("approx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+        let al = a
+            .get("approx_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let bl = b
+            .get("approx_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         bl.cmp(&al)
     });
     top_included.truncate(max_top_items);
@@ -1586,18 +1591,17 @@ fn resolve_replacement_target_indices(
 ) -> Result<Vec<usize>, FunctionCallError> {
     let mut out: Vec<usize> = Vec::new();
 
-    if let Some(index) = replacement.index {
-        if index < items.len() {
-            out.push(index);
-        }
+    if let Some(index) = replacement.index
+        && index < items.len()
+    {
+        out.push(index);
     }
 
-    if let Some(id) = &replacement.id {
-        if let Some(rid) = parse_rid(id) {
-            if let Some(idx) = rids.iter().position(|r| *r == rid) {
-                out.push(idx);
-            }
-        }
+    if let Some(id) = &replacement.id
+        && let Some(rid) = parse_rid(id)
+        && let Some(idx) = rids.iter().position(|r| *r == rid)
+    {
+        out.push(idx);
     }
 
     if let Some(call_id) = &replacement.call_id {

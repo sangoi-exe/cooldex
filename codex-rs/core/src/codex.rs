@@ -2872,7 +2872,7 @@ mod tests {
 
         let reconstructed = session.reconstruct_history_from_rollout(&turn_context, &rollout_items);
 
-        assert_eq!(expected, reconstructed);
+        assert_eq!(expected, reconstructed.items);
     }
 
     #[test]

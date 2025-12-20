@@ -532,7 +532,7 @@ fn create_manage_context_tool() -> ToolSpec {
     op_properties.insert(
         "targets".to_string(),
         JsonSchema::Object {
-            properties: match targets_schema.clone() {
+            properties: match targets_schema {
                 JsonSchema::Object { properties, .. } => properties,
                 _ => BTreeMap::new(),
             },

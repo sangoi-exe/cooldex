@@ -48,10 +48,11 @@ pub(crate) fn truncate_grapheme_head(s: &str, max_bytes: usize) -> String {
     // budget) over returning an empty string. This is primarily used for
     // UI previews where a blank result is less useful than a slightly longer
     // but intact glyph.
-    if out.is_empty() && max_bytes > 0 {
-        if let Some(g) = first_grapheme {
-            return g.to_string();
-        }
+    if out.is_empty()
+        && max_bytes > 0
+        && let Some(g) = first_grapheme
+    {
+        return g.to_string();
     }
 
     out
