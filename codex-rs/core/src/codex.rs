@@ -1,4 +1,7 @@
 use std::borrow::Cow;
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,6 +18,7 @@ use async_channel::Receiver;
 use async_channel::Sender;
 use codex_apply_patch::ApplyPatchAction;
 use codex_protocol::ConversationId;
+use codex_protocol::protocol::ContextInclusionItem;
 use codex_protocol::protocol::ConversationPathResponseEvent;
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::ReviewRequest;
@@ -234,6 +238,9 @@ impl Codex {
     }
 }
 
+use crate::rid::parse_rid;
+use crate::rid::rid_to_string;
+use crate::state::ContextOverlay;
 use crate::state::SessionState;
 
 /// Context for an initialized model agent
@@ -242,7 +249,7 @@ use crate::state::SessionState;
 pub(crate) struct Session {
     conversation_id: ConversationId,
     tx_event: Sender<Event>,
-    state: Mutex<SessionState>,
+    pub(crate) state: Mutex<SessionState>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) services: SessionServices,
     next_internal_sub_id: AtomicU64,
@@ -271,6 +278,132 @@ impl TurnContext {
         path.as_ref()
             .map(PathBuf::from)
             .map_or_else(|| self.cwd.clone(), |p| self.cwd.join(p))
+    }
+}
+
+struct ReconstructedHistory {
+    items: Vec<ResponseItem>,
+    rids: Vec<u64>,
+    include_mask: Option<BTreeSet<usize>>,
+    context_overlay: ContextOverlay,
+}
+
+fn resolve_indices_by_ids(ids: &[String], lookup: &HashMap<u64, usize>, label: &str) -> Vec<usize> {
+    let mut indices = Vec::with_capacity(ids.len());
+    let mut missing = 0usize;
+    for raw in ids {
+        match parse_rid(raw) {
+            Some(rid) => {
+                if let Some(idx) = lookup.get(&rid) {
+                    indices.push(*idx);
+                } else {
+                    missing += 1;
+                }
+            }
+            None => missing += 1,
+        }
+    }
+    if missing > 0 {
+        warn!(
+            "rollout replay: {missing} {label} RID(s) were missing from the current history ({} recorded)",
+            ids.len()
+        );
+    }
+    indices
+}
+
+fn resolve_deleted_indices(
+    include: &ContextInclusionItem,
+    lookup: &HashMap<u64, usize>,
+    current_len: usize,
+) -> Vec<usize> {
+    if !include.deleted_ids.is_empty() {
+        let indices = resolve_indices_by_ids(&include.deleted_ids, lookup, "deleted");
+        if !indices.is_empty() {
+            return indices;
+        }
+        debug!(
+            "rollout replay: falling back to deleted_indices because deleted_ids did not resolve"
+        );
+    }
+    let mut out = Vec::with_capacity(include.deleted_indices.len());
+    let mut invalid = 0usize;
+    for &idx in &include.deleted_indices {
+        if idx < current_len {
+            out.push(idx);
+        } else {
+            invalid += 1;
+        }
+    }
+    if invalid > 0 {
+        warn!(
+            "rollout replay: ignored {invalid} out-of-range deleted_indices entries (history_len={current_len})"
+        );
+    }
+    out
+}
+
+fn rebuild_inclusion_mask(
+    include: &ContextInclusionItem,
+    lookup: &HashMap<u64, usize>,
+    total_len: usize,
+) -> Option<BTreeSet<usize>> {
+    if total_len == 0 {
+        return None;
+    }
+
+    if !include.included_ids.is_empty() {
+        let mut mask = BTreeSet::new();
+        let mut missing = 0usize;
+        for raw in &include.included_ids {
+            match parse_rid(raw) {
+                Some(rid) => {
+                    if let Some(idx) = lookup.get(&rid) {
+                        mask.insert(*idx);
+                    } else {
+                        missing += 1;
+                    }
+                }
+                None => missing += 1,
+            }
+        }
+        if missing > 0 {
+            warn!(
+                "rollout replay: {missing} included RID(s) missing from current history ({} recorded)",
+                include.included_ids.len()
+            );
+        }
+        if mask.len() == total_len {
+            return None;
+        }
+        return Some(mask);
+    }
+
+    if !include.included_indices.is_empty() {
+        let mut mask = BTreeSet::new();
+        let mut invalid = 0usize;
+        for &idx in &include.included_indices {
+            if idx < total_len {
+                mask.insert(idx);
+            } else {
+                invalid += 1;
+            }
+        }
+        if invalid > 0 {
+            warn!(
+                "rollout replay: ignored {invalid} out-of-range included_indices (history_len={total_len})"
+            );
+        }
+        if mask.len() == total_len {
+            return None;
+        }
+        return Some(mask);
+    }
+
+    if total_len > 0 {
+        Some(BTreeSet::new())
+    } else {
+        None
     }
 }
 
@@ -540,11 +673,15 @@ impl Session {
                 let persist = matches!(conversation_history, InitialHistory::Forked(_));
 
                 // Always add response items to conversation history
-                let reconstructed_history =
-                    self.reconstruct_history_from_rollout(turn_context, &rollout_items);
-                if !reconstructed_history.is_empty() {
-                    self.record_into_history(&reconstructed_history).await;
-                }
+                let ReconstructedHistory {
+                    items,
+                    rids,
+                    include_mask,
+                    context_overlay,
+                } = self.reconstruct_history_from_rollout(turn_context, &rollout_items);
+                self.replace_history_with_rids(items, rids).await;
+                self.set_include_mask(include_mask).await;
+                self.set_context_overlay(context_overlay).await;
 
                 // If persisting, persist all rollout items as-is (recorder filters)
                 if persist && !rollout_items.is_empty() {
@@ -677,12 +814,28 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
-    ) -> Vec<ResponseItem> {
+    ) -> ReconstructedHistory {
         let mut history = ConversationHistory::new();
+        let mut history_rids: Vec<u64> = Vec::new();
+        let mut include_mask: Option<BTreeSet<usize>> = None;
+        let mut context_overlay = ContextOverlay::default();
+        let mut next_rid: u64 = 0;
+
         for item in rollout_items {
             match item {
                 RolloutItem::ResponseItem(response_item) => {
+                    let before = history.len();
                     history.record_items(std::iter::once(response_item));
+                    let after = history.len();
+                    if after > before {
+                        for idx in before..after {
+                            history_rids.push(next_rid);
+                            if let Some(mask) = &mut include_mask {
+                                mask.insert(idx);
+                            }
+                            next_rid = next_rid.saturating_add(1);
+                        }
+                    }
                 }
                 RolloutItem::Compacted(compacted) => {
                     let snapshot = history.contents();
@@ -692,12 +845,94 @@ impl Session {
                         &user_messages,
                         &compacted.message,
                     );
+                    let rebuilt_len = rebuilt.len();
                     history.replace(rebuilt);
+                    history_rids.clear();
+                    include_mask = None;
+                    for _ in 0..rebuilt_len {
+                        history_rids.push(next_rid);
+                        next_rid = next_rid.saturating_add(1);
+                    }
+                }
+                RolloutItem::ContextInclusion(include) => {
+                    if history.len() == 0 {
+                        continue;
+                    }
+                    let current_items = history.contents();
+                    if current_items.is_empty() {
+                        continue;
+                    }
+
+                    let rid_lookup: HashMap<u64, usize> = history_rids
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, rid)| (*rid, idx))
+                        .collect();
+
+                    let mut delete_indices =
+                        resolve_deleted_indices(include, &rid_lookup, history_rids.len());
+                    delete_indices.sort_unstable();
+                    delete_indices.dedup();
+                    let delete_set: HashSet<usize> = delete_indices.iter().copied().collect();
+
+                    let mut new_items =
+                        Vec::with_capacity(current_items.len().saturating_sub(delete_set.len()));
+                    let mut new_rids =
+                        Vec::with_capacity(current_items.len().saturating_sub(delete_set.len()));
+                    for (idx, (item, rid)) in current_items
+                        .into_iter()
+                        .zip(history_rids.iter().copied())
+                        .enumerate()
+                    {
+                        if delete_set.contains(&idx) {
+                            continue;
+                        }
+                        new_items.push(item);
+                        new_rids.push(rid);
+                    }
+                    history.replace(new_items);
+                    history_rids = new_rids;
+
+                    let mut updated_lookup: HashMap<u64, usize> = HashMap::new();
+                    for (idx, rid) in history_rids.iter().copied().enumerate() {
+                        updated_lookup.insert(rid, idx);
+                    }
+                    include_mask = rebuild_inclusion_mask(include, &updated_lookup, history.len());
+                    if let Some(mask) = &include_mask {
+                        trace!(
+                            "rollout replay: rebuilt inclusion mask with {} entries (history_len={})",
+                            mask.len(),
+                            history.len()
+                        );
+                    } else {
+                        trace!(
+                            "rollout replay: inclusion mask reset (all {} items included)",
+                            history.len()
+                        );
+                    }
+                }
+                RolloutItem::ContextOverlay(overlay) => {
+                    let mut replacements_by_rid = std::collections::BTreeMap::new();
+                    for replacement in &overlay.replacements {
+                        if let Some(rid) = parse_rid(&replacement.id) {
+                            replacements_by_rid.insert(rid, replacement.text.clone());
+                        }
+                    }
+                    context_overlay = ContextOverlay {
+                        replacements_by_rid,
+                        notes: overlay.notes.clone(),
+                    };
                 }
                 _ => {}
             }
         }
-        history.contents()
+
+        ReconstructedHistory {
+            items: history.contents(),
+            rids: history_rids,
+            include_mask,
+            context_overlay,
+        }
     }
 
     /// Append ResponseItems to the in-memory conversation history only.
@@ -709,6 +944,21 @@ impl Session {
     async fn replace_history(&self, items: Vec<ResponseItem>) {
         let mut state = self.state.lock().await;
         state.replace_history(items);
+    }
+
+    async fn replace_history_with_rids(&self, items: Vec<ResponseItem>, rids: Vec<u64>) {
+        let mut state = self.state.lock().await;
+        state.replace_history_with_rids(items, rids);
+    }
+
+    async fn set_include_mask(&self, mask: Option<BTreeSet<usize>>) {
+        let mut state = self.state.lock().await;
+        state.set_include_mask(mask);
+    }
+
+    async fn set_context_overlay(&self, overlay: ContextOverlay) {
+        let mut state = self.state.lock().await;
+        state.set_context_overlay(overlay);
     }
 
     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
@@ -734,7 +984,7 @@ impl Session {
         items
     }
 
-    async fn persist_rollout_items(&self, items: &[RolloutItem]) {
+    pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
         let recorder = {
             let guard = self.services.rollout.lock().await;
             guard.clone()
@@ -1002,7 +1252,7 @@ impl Session {
     pub async fn turn_input_with_history(&self, extra: Vec<ResponseItem>) -> Vec<ResponseItem> {
         let history = {
             let state = self.state.lock().await;
-            state.history_snapshot()
+            state.filtered_history()
         };
         [history, extra].concat()
     }
@@ -1432,6 +1682,145 @@ async fn submission_loop(
                     }),
                 };
                 sess.send_event(event).await;
+            }
+            // --- Context prune (experimental) ---
+            Op::GetContextItems => {
+                let sub_id = sub.id.clone();
+                let event = {
+                    let state = sess.state.lock().await;
+                    let ev = state.build_context_items_event();
+                    Event {
+                        id: sub_id,
+                        msg: EventMsg::ContextItems(ev),
+                    }
+                };
+                sess.send_event(event).await;
+            }
+            Op::SetContextInclusion { indices, included } => {
+                let (context_items_event, included_snapshot, included_ids) = {
+                    let mut state = sess.state.lock().await;
+                    state.set_context_inclusion(&indices, included);
+                    let ev = state.build_context_items_event();
+                    let rid_snapshot = state.history_rids_snapshot();
+                    let mut included_indices = Vec::new();
+                    let mut included_rids = Vec::new();
+                    for item in &ev.items {
+                        if item.included {
+                            included_indices.push(item.index);
+                            if let Some(id) = &item.id {
+                                included_rids.push(id.clone());
+                            } else if let Some(rid) = rid_snapshot.get(item.index) {
+                                included_rids.push(rid_to_string(*rid));
+                            }
+                        }
+                    }
+                    (ev, included_indices, included_rids)
+                };
+                let sub_id = sub.id.clone();
+                sess.send_event(Event {
+                    id: sub_id,
+                    msg: EventMsg::ContextItems(context_items_event),
+                })
+                .await;
+
+                let record = RolloutItem::ContextInclusion(ContextInclusionItem {
+                    included_indices: included_snapshot,
+                    deleted_indices: Vec::new(),
+                    included_ids,
+                    deleted_ids: Vec::new(),
+                });
+                sess.persist_rollout_items(std::slice::from_ref(&record))
+                    .await;
+            }
+            Op::PruneContextByIndices { indices } => {
+                let (
+                    context_items_event,
+                    included_snapshot,
+                    included_ids,
+                    deleted_snapshot,
+                    deleted_ids,
+                ) = {
+                    let mut state = sess.state.lock().await;
+                    let prune = state.prune_by_indices(indices.clone());
+                    let deleted_ids: Vec<String> = prune
+                        .deleted_rids
+                        .iter()
+                        .copied()
+                        .map(rid_to_string)
+                        .collect();
+                    let ev = state.build_context_items_event();
+                    let rid_after = state.history_rids_snapshot();
+                    let mut included_indices = Vec::new();
+                    let mut included_rids = Vec::new();
+                    for item in &ev.items {
+                        if item.included {
+                            included_indices.push(item.index);
+                            if let Some(id) = &item.id {
+                                included_rids.push(id.clone());
+                            } else if let Some(rid) = rid_after.get(item.index) {
+                                included_rids.push(rid_to_string(*rid));
+                            }
+                        }
+                    }
+                    (
+                        ev,
+                        included_indices,
+                        included_rids,
+                        prune.deleted_indices,
+                        deleted_ids,
+                    )
+                };
+                let sub_id = sub.id.clone();
+                sess.send_event(Event {
+                    id: sub_id,
+                    msg: EventMsg::ContextItems(context_items_event),
+                })
+                .await;
+
+                let record = RolloutItem::ContextInclusion(ContextInclusionItem {
+                    included_indices: included_snapshot,
+                    deleted_indices: deleted_snapshot,
+                    included_ids,
+                    deleted_ids,
+                });
+                sess.persist_rollout_items(std::slice::from_ref(&record))
+                    .await;
+            }
+            Op::PruneContext { categories, range } => {
+                let (context_items_event, included_snapshot, included_ids) = {
+                    let mut state = sess.state.lock().await;
+                    state.prune_by_categories(&categories, &range);
+                    let ev = state.build_context_items_event();
+                    let rid_snapshot = state.history_rids_snapshot();
+                    let mut included_indices = Vec::new();
+                    let mut included_rids = Vec::new();
+                    for item in &ev.items {
+                        if item.included {
+                            included_indices.push(item.index);
+                            if let Some(id) = &item.id {
+                                included_rids.push(id.clone());
+                            } else if let Some(rid) = rid_snapshot.get(item.index) {
+                                included_rids.push(rid_to_string(*rid));
+                            }
+                        }
+                    }
+                    (ev, included_indices, included_rids)
+                };
+                let sub_id = sub.id.clone();
+                sess.send_event(Event {
+                    id: sub_id,
+                    msg: EventMsg::ContextItems(context_items_event.clone()),
+                })
+                .await;
+
+                let record = RolloutItem::ContextInclusion(ContextInclusionItem {
+                    included_indices: included_snapshot,
+                    deleted_indices: Vec::new(),
+                    included_ids,
+                    deleted_ids: Vec::new(),
+                });
+                sess.persist_rollout_items(std::slice::from_ref(&record))
+                    .await;
             }
             Op::Compact => {
                 // Attempt to inject input into current task

@@ -234,6 +234,12 @@ impl RolloutRecorder {
                     RolloutItem::Compacted(item) => {
                         items.push(RolloutItem::Compacted(item));
                     }
+                    RolloutItem::ContextInclusion(item) => {
+                        items.push(RolloutItem::ContextInclusion(item));
+                    }
+                    RolloutItem::ContextOverlay(item) => {
+                        items.push(RolloutItem::ContextOverlay(item));
+                    }
                     RolloutItem::TurnContext(item) => {
                         items.push(RolloutItem::TurnContext(item));
                     }

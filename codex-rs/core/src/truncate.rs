@@ -1,5 +1,61 @@
-//! Utilities for truncating large chunks of output while preserving a prefix
-//! and suffix on UTF-8 boundaries.
+//! Utilities for truncating output while preserving UTF-8 validity and, when needed,
+//! grapheme cluster boundaries for better UI rendering.
+
+use unicode_segmentation::UnicodeSegmentation;
+
+/// Return a prefix of `s` with at most `max_bytes` bytes, cutting only on
+/// UTF-8 character boundaries. If `s` is shorter than `max_bytes`, returns
+/// `s` unchanged. The returned slice borrows from the original string.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn truncate_head(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    if let Some(head) = s.get(..max_bytes) {
+        return head;
+    }
+    let mut end = max_bytes.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Truncate the head of a string to at most `max_bytes` bytes without
+/// splitting grapheme clusters (user-perceived characters). Returns an owned
+/// String because we may need to allocate to respect cluster boundaries.
+pub(crate) fn truncate_grapheme_head(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    let mut first_grapheme: Option<&str> = None;
+    for g in s.graphemes(true) {
+        if first_grapheme.is_none() {
+            first_grapheme = Some(g);
+        }
+        let gl = g.len();
+        if used + gl > max_bytes {
+            break;
+        }
+        out.push_str(g);
+        used += gl;
+    }
+
+    // If the budget is too small to fit even a single grapheme cluster,
+    // prefer returning the first complete grapheme (even if it exceeds the
+    // budget) over returning an empty string. This is primarily used for
+    // UI previews where a blank result is less useful than a slightly longer
+    // but intact glyph.
+    if out.is_empty() && max_bytes > 0 {
+        if let Some(g) = first_grapheme {
+            return g.to_string();
+        }
+    }
+
+    out
+}
 
 /// Truncate the middle of a UTF-8 string to at most `max_bytes` bytes,
 /// preserving the beginning and the end. Returns the possibly truncated
@@ -105,6 +161,8 @@ pub(crate) fn truncate_middle(s: &str, max_bytes: usize) -> (String, Option<u64>
 
 #[cfg(test)]
 mod tests {
+    use super::truncate_grapheme_head;
+    use super::truncate_head;
     use super::truncate_middle;
 
     #[test]
@@ -143,6 +201,39 @@ mod tests {
         assert!(out.contains("tokens truncated"));
         assert!(!out.contains('\u{fffd}'));
         assert_eq!(tokens, Some((s.len() as u64).div_ceil(4)));
+    }
+
+    #[test]
+    fn truncate_head_honors_char_boundaries() {
+        // 😀 is 4 bytes in UTF-8
+        let s = "😀😀😀abc"; // length = 4*3 + 3 = 15
+        assert_eq!(truncate_head(s, 0), "");
+        assert_eq!(truncate_head(s, 1), "");
+        assert_eq!(truncate_head(s, 4), "😀");
+        assert_eq!(truncate_head(s, 5), "😀");
+        assert_eq!(truncate_head(s, 8), "😀😀");
+        assert_eq!(truncate_head(s, 9), "😀😀");
+        assert_eq!(truncate_head(s, 12), "😀😀😀");
+        assert_eq!(truncate_head(s, 13), "😀😀😀a");
+        assert_eq!(truncate_head(s, 14), "😀😀😀ab");
+        assert_eq!(truncate_head(s, 15), s);
+        assert_eq!(truncate_head(s, 16), s);
+    }
+
+    #[test]
+    fn truncate_grapheme_head_preserves_clusters() {
+        // Woman technologist is a ZWJ sequence (👩‍💻)
+        let s = "👩‍💻👩‍💻X";
+        let bytes = s.as_bytes();
+        assert!(bytes.len() > 8);
+        // Choose a cap that would split inside the second grapheme if naive
+        let capped = truncate_grapheme_head(s, 6);
+        // Expect only the first full grapheme preserved
+        assert_eq!(capped, "👩‍💻");
+
+        // Larger cap fits two graphemes but not the trailing X
+        let capped2 = truncate_grapheme_head(s, 22);
+        assert_eq!(capped2, "👩‍💻👩‍💻");
     }
 
     #[test]

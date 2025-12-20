@@ -457,6 +457,275 @@ fn create_list_dir_tool() -> ToolSpec {
         },
     })
 }
+
+fn create_manage_context_tool() -> ToolSpec {
+    let mut replacement_properties = BTreeMap::new();
+    replacement_properties.insert(
+        "id".to_string(),
+        JsonSchema::String {
+            description: Some("History item id (e.g. \"r42\").".to_string()),
+        },
+    );
+    replacement_properties.insert(
+        "index".to_string(),
+        JsonSchema::Number {
+            description: Some("History item index (0-based).".to_string()),
+        },
+    );
+    replacement_properties.insert(
+        "call_id".to_string(),
+        JsonSchema::String {
+            description: Some("Tool call id (targets tool outputs).".to_string()),
+        },
+    );
+    replacement_properties.insert(
+        "text".to_string(),
+        JsonSchema::String {
+            description: Some("Replacement text to keep in context.".to_string()),
+        },
+    );
+
+    let replacement_item_schema = JsonSchema::Object {
+        properties: replacement_properties,
+        required: Some(vec!["text".to_string()]),
+        additional_properties: Some(false.into()),
+    };
+
+    let mut targets_properties = BTreeMap::new();
+    targets_properties.insert(
+        "ids".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String { description: None }),
+            description: Some("Target history item ids, e.g. [\"r42\", \"r43\"].".to_string()),
+        },
+    );
+    targets_properties.insert(
+        "indices".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::Number { description: None }),
+            description: Some("Target history indices (0-based).".to_string()),
+        },
+    );
+    targets_properties.insert(
+        "call_ids".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String { description: None }),
+            description: Some("Target tool call ids.".to_string()),
+        },
+    );
+    let targets_schema = JsonSchema::Object {
+        properties: targets_properties,
+        required: None,
+        additional_properties: Some(false.into()),
+    };
+
+    let mut op_properties = BTreeMap::new();
+    op_properties.insert(
+        "op".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Operation name: include | exclude | delete | replace | clear_replace | clear_replace_all | include_all | add_note | remove_note | clear_notes."
+                    .to_string(),
+            ),
+        },
+    );
+    op_properties.insert(
+        "targets".to_string(),
+        JsonSchema::Object {
+            properties: match targets_schema.clone() {
+                JsonSchema::Object { properties, .. } => properties,
+                _ => BTreeMap::new(),
+            },
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    );
+    op_properties.insert(
+        "cascade".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "For delete ops: cascade behavior. Currently only supports \"tool_outputs\"."
+                    .to_string(),
+            ),
+        },
+    );
+    op_properties.insert(
+        "text".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "For replace ops: replacement text to keep in context (only tool outputs and reasoning)."
+                    .to_string(),
+            ),
+        },
+    );
+    op_properties.insert(
+        "notes".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String { description: None }),
+            description: Some("For add_note ops: notes to append.".to_string()),
+        },
+    );
+    op_properties.insert(
+        "note_indices".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::Number { description: None }),
+            description: Some("For remove_note ops: indices to remove (0-based).".to_string()),
+        },
+    );
+
+    let op_schema = JsonSchema::Object {
+        properties: op_properties,
+        required: Some(vec!["op".to_string()]),
+        additional_properties: Some(false.into()),
+    };
+
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "mode".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "v2 non-interactive API: mode=retrieve returns a single JSON snapshot; mode=apply applies a batch of ops atomically. If mode is omitted, the legacy action-based API is used."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "include_items".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "mode=retrieve only: include the items array in the response (default true)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "include_notes".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "mode=retrieve only: include pinned notes in the response (default true)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "include_token_usage".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "mode=retrieve only: include token usage summary in the response (default true)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "include_pairs".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "mode=retrieve only: include best-effort tool call/output pairing metadata (default true)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "max_items".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "mode=retrieve only: maximum number of items to return (most recent N)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "snapshot_id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "mode=apply only: snapshot id from retrieve; if provided and mismatched, apply is rejected (anti-drift)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ops".to_string(),
+        JsonSchema::Array {
+            items: Box::new(op_schema),
+            description: Some(
+                "mode=apply only: ordered batch of operations to execute atomically. Validate all ops up-front; no interactive retries."
+                    .to_string(),
+            ),
+        },
+    );
+
+    properties.insert(
+        "action".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Legacy (v1) API: action=status | list | include | exclude | include_all | delete | replace | clear_replace | add_note | remove_note | clear_notes. Use dry_run=true to preview changes."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ids".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String { description: None }),
+            description: Some("Target history item ids, e.g. [\"r42\", \"r43\"].".to_string()),
+        },
+    );
+    properties.insert(
+        "indices".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::Number { description: None }),
+            description: Some("Target history indices (0-based).".to_string()),
+        },
+    );
+    properties.insert(
+        "call_ids".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String { description: None }),
+            description: Some("Target tool call ids.".to_string()),
+        },
+    );
+    properties.insert(
+        "replacements".to_string(),
+        JsonSchema::Array {
+            items: Box::new(replacement_item_schema),
+            description: Some(
+                "Replacement specs for action=replace. Replace is allowed only for tool outputs and reasoning."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "notes".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String { description: None }),
+            description: Some("Notes for action=add_note.".to_string()),
+        },
+    );
+    properties.insert(
+        "note_indices".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::Number { description: None }),
+            description: Some("Note indices for action=remove_note.".to_string()),
+        },
+    );
+    properties.insert(
+        "dry_run".to_string(),
+        JsonSchema::Boolean {
+            description: Some("If true, do not mutate; just return what would change.".to_string()),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "manage_context".to_string(),
+        description: "Inspect and manage the current conversation context. v2 supports a non-interactive retrieve/apply contract with snapshot_id anti-drift and atomic batched ops; legacy v1 action-based operations remain available.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
 /// TODO(dylan): deprecate once we get rid of json tool
 #[derive(Serialize, Deserialize)]
 pub(crate) struct ApplyPatchToolArgs {
@@ -669,6 +938,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::ExecStreamHandler;
     use crate::tools::handlers::GrepFilesHandler;
     use crate::tools::handlers::ListDirHandler;
+    use crate::tools::handlers::ManageContextHandler;
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::PlanHandler;
     use crate::tools::handlers::ReadFileHandler;
@@ -687,6 +957,7 @@ pub(crate) fn build_specs(
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
+    let manage_context_handler = Arc::new(ManageContextHandler);
 
     if config.experimental_unified_exec_tool {
         builder.push_spec(create_unified_exec_tool());
@@ -732,6 +1003,14 @@ pub(crate) fn build_specs(
             }
         }
         builder.register_handler("apply_patch", apply_patch_handler);
+    }
+
+    if config
+        .experimental_supported_tools
+        .contains(&"manage_context".to_string())
+    {
+        builder.push_spec(create_manage_context_tool());
+        builder.register_handler("manage_context", manage_context_handler);
     }
 
     if config
@@ -1171,6 +1450,7 @@ mod tests {
             &[
                 "unified_exec",
                 "apply_patch",
+                "manage_context",
                 "web_search",
                 "view_image",
                 "dash/search",
@@ -1178,7 +1458,7 @@ mod tests {
         );
 
         assert_eq!(
-            tools[4].spec,
+            tools[5].spec,
             ToolSpec::Function(ResponsesApiTool {
                 name: "dash/search".to_string(),
                 parameters: JsonSchema::Object {
@@ -1238,13 +1518,14 @@ mod tests {
             &[
                 "unified_exec",
                 "apply_patch",
+                "manage_context",
                 "web_search",
                 "view_image",
                 "dash/paginate",
             ],
         );
         assert_eq!(
-            tools[4].spec,
+            tools[5].spec,
             ToolSpec::Function(ResponsesApiTool {
                 name: "dash/paginate".to_string(),
                 parameters: JsonSchema::Object {
@@ -1302,13 +1583,14 @@ mod tests {
             &[
                 "unified_exec",
                 "apply_patch",
+                "manage_context",
                 "web_search",
                 "view_image",
                 "dash/tags",
             ],
         );
         assert_eq!(
-            tools[4].spec,
+            tools[5].spec,
             ToolSpec::Function(ResponsesApiTool {
                 name: "dash/tags".to_string(),
                 parameters: JsonSchema::Object {
@@ -1369,13 +1651,14 @@ mod tests {
             &[
                 "unified_exec",
                 "apply_patch",
+                "manage_context",
                 "web_search",
                 "view_image",
                 "dash/value",
             ],
         );
         assert_eq!(
-            tools[4].spec,
+            tools[5].spec,
             ToolSpec::Function(ResponsesApiTool {
                 name: "dash/value".to_string(),
                 parameters: JsonSchema::Object {
@@ -1473,6 +1756,7 @@ mod tests {
             &[
                 "unified_exec",
                 "apply_patch",
+                "manage_context",
                 "web_search",
                 "view_image",
                 "test_server/do_something_cool",
@@ -1480,7 +1764,7 @@ mod tests {
         );
 
         assert_eq!(
-            tools[4].spec,
+            tools[5].spec,
             ToolSpec::Function(ResponsesApiTool {
                 name: "test_server/do_something_cool".to_string(),
                 parameters: JsonSchema::Object {

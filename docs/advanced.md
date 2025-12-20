@@ -79,5 +79,5 @@ The Advanced mode of `/prune` lets you stage exactly what goes into the next tur
 
 Notes:
 - System items — UserInstructions and EnvironmentContext — are omitted from the Advanced list.
-- "Deletion" affects only the in‑memory context; rollout files on disk remain unchanged.
-- The main `/prune` menu also includes a "Fix context" option that attempts a smart repair by restoring the most recent missing tool call from the rollout (with confirmation).
+- "Deletion" affects the in‑memory context and is persisted via rollout snapshots so it survives resume; rollout history is not rewritten.
+- There is no `.bak` restore flow; to revert include/exclude changes, re-open Advanced and toggle items back on. Deletions are permanent for the session.

@@ -1092,6 +1092,11 @@ pub enum RolloutItem {
     SessionMeta(SessionMetaLine),
     ResponseItem(ResponseItem),
     Compacted(CompactedItem),
+    /// Snapshot of context inclusion/deletion after a prune operation.
+    /// Indices are zero-based into the conversation history at the time of recording.
+    ContextInclusion(ContextInclusionItem),
+    /// Snapshot of context overlays (replacements + pinned notes) applied to the prompt.
+    ContextOverlay(ContextOverlayItem),
     TurnContext(TurnContextItem),
     EventMsg(EventMsg),
 }
@@ -1124,6 +1129,30 @@ pub struct TurnContextItem {
     pub summary: ReasoningSummaryConfig,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, TS)]
+pub struct ContextInclusionItem {
+    pub included_indices: Vec<usize>,
+    #[serde(default)]
+    pub deleted_indices: Vec<usize>,
+    #[serde(default)]
+    pub included_ids: Vec<String>,
+    #[serde(default)]
+    pub deleted_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, TS)]
+pub struct ContextOverlayItem {
+    #[serde(default)]
+    pub replacements: Vec<ContextOverlayReplacement>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, TS)]
+pub struct ContextOverlayReplacement {
+    pub id: String,
+    pub text: String,
+}
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RolloutLine {
     pub timestamp: String,
