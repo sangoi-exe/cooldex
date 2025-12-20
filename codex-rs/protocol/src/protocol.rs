@@ -647,6 +647,9 @@ pub struct ContextItemSummary {
     pub category: PruneCategory,
     pub preview: String,
     pub included: bool,
+    /// Stable history id (RID), e.g. "r42". Optional for backward compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]

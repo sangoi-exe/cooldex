@@ -71,6 +71,7 @@ tree-sitter-bash = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
 which = { workspace = true }
 wildmatch = { workspace = true }
+unicode-segmentation = { workspace = true }
 
 
 [target.'cfg(target_os = "linux")'.dependencies]
