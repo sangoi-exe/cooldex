@@ -23,6 +23,9 @@ use tokio::sync::mpsc;
 /// Review thread system prompt. Edit `core/src/review_prompt.md` to customize.
 pub const REVIEW_PROMPT: &str = include_str!("../review_prompt.md");
 
+const MANAGE_CONTEXT_TOOL_INSTRUCTIONS: &str =
+    include_str!("../manage_context_tool_instructions.md");
+
 /// API request payload for a single model turn
 #[derive(Default, Debug, Clone)]
 pub struct Prompt {
@@ -58,11 +61,30 @@ impl Prompt {
             ToolSpec::Freeform(f) => f.name == "apply_patch",
             _ => false,
         });
-        if self.base_instructions_override.is_none()
+
+        let needs_apply_patch_instructions = self.base_instructions_override.is_none()
             && model.needs_special_apply_patch_instructions
-            && !is_apply_patch_tool_present
-        {
-            Cow::Owned(format!("{base}\n{APPLY_PATCH_TOOL_INSTRUCTIONS}"))
+            && !is_apply_patch_tool_present;
+
+        let is_manage_context_tool_present = self
+            .tools
+            .iter()
+            .any(|tool| tool.name() == "manage_context");
+        let needs_manage_context_instructions =
+            self.base_instructions_override.is_none() && is_manage_context_tool_present;
+
+        if needs_apply_patch_instructions || needs_manage_context_instructions {
+            let mut out = String::new();
+            out.push_str(base);
+            if needs_apply_patch_instructions {
+                out.push('\n');
+                out.push_str(APPLY_PATCH_TOOL_INSTRUCTIONS);
+            }
+            if needs_manage_context_instructions {
+                out.push('\n');
+                out.push_str(MANAGE_CONTEXT_TOOL_INSTRUCTIONS);
+            }
+            Cow::Owned(out)
         } else {
             Cow::Borrowed(base)
         }
@@ -392,6 +414,18 @@ mod tests {
 
     use super::*;
 
+    fn manage_context_tool_spec() -> ToolSpec {
+        ToolSpec::Freeform(crate::client_common::tools::FreeformTool {
+            name: "manage_context".to_string(),
+            description: "test".to_string(),
+            format: crate::client_common::tools::FreeformToolFormat {
+                r#type: "text".to_string(),
+                syntax: "text".to_string(),
+                definition: "test".to_string(),
+            },
+        })
+    }
+
     struct InstructionsTestCase {
         pub slug: &'static str,
         pub expects_apply_patch_instructions: bool,
@@ -446,6 +480,25 @@ mod tests {
             let full = prompt.get_full_instructions(&model_family);
             assert_eq!(full, expected);
         }
+    }
+
+    #[test]
+    fn get_full_instructions_includes_manage_context_when_tool_present() {
+        let model_family = find_family_for_model("gpt-5").expect("known model slug");
+        let prompt = Prompt {
+            tools: vec![manage_context_tool_spec()],
+            ..Default::default()
+        };
+
+        let expected = format!(
+            "{}\n{}\n{}",
+            model_family.clone().base_instructions,
+            APPLY_PATCH_TOOL_INSTRUCTIONS,
+            MANAGE_CONTEXT_TOOL_INSTRUCTIONS
+        );
+
+        let full = prompt.get_full_instructions(&model_family);
+        assert_eq!(full, expected);
     }
 
     #[test]

@@ -1,5 +1,15 @@
 # Handoff — Lean Template (first person)
 
+Date (UTC‑3): 2025-12-20T14:05  •  Author: Codex  •  Anchor: `.sangoi/task-logs/2025-12-20_manage-context-instructions-and-breakdown.md`
+
+## 0) TL;DR (3–5 lines)
+- Objective I was pursuing: tratar `manage_context` como `apply_patch` (tool interna; usuário não precisa aprender/usar).
+- Delivered: instruções embutidas do `manage_context` injetadas automaticamente no system prompt quando a tool está disponível.
+- Delivered: `manage_context status`/`retrieve` agora retornam um breakdown bounded do que está “ocupando espaço” (approx bytes por categoria + top included items) pra guiar pruning automático.
+- Delivered: `manage_context action=help` como fallback explícito com exemplos JSON.
+
+---
+
 Date (UTC‑3): 2025-12-20T13:25  •  Author: Codex  •  Anchor: `.sangoi/planning/2025-12-20_manage-context-v2.md`
 
 ## 0) TL;DR (3–5 lines)

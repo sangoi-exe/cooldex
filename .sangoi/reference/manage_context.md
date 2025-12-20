@@ -18,6 +18,7 @@ Model tool: `manage_context`
 - Location: `codex-rs/core/src/tools/handlers/manage_context.rs`
 - Schema: `codex-rs/core/src/tools/spec.rs`
 - Enabled for model families that include `"manage_context"` in `experimental_supported_tools`
+- Prompt guidance: when the tool is present, core appends `codex-rs/core/manage_context_tool_instructions.md` to the system instructions (same pattern as `apply_patch` instructions). The user should not need to learn the tool.
 
 v2: non-interactive retrieve/apply
 - Motivation: avoid chatty/iterative “menus” under context pressure.
@@ -31,8 +32,10 @@ v2: non-interactive retrieve/apply
   - `delete` cascades tool call -> tool outputs (same invariant as v1).
 
 Actions
+- `help`
+  - Returns a concise usage guide + JSON examples (fallback; ideally the injected tool instructions are enough).
 - `status`
-  - Returns current token usage info and overlay counts (replacements, notes).
+  - Returns token usage summary + overlay counts and a bounded breakdown of what’s occupying context (by category + top included items, approx bytes).
 - `list`
   - Returns context item summaries including `index`, `id` (RID), `category`, `included`, `preview`, and best-effort tool `call_id`.
 - `include` / `exclude`

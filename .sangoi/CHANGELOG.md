@@ -1,6 +1,8 @@
 2025-12-20
 - Feature: Added `manage_context` tool for smart context management (list/status + include/exclude/delete + replace for tool outputs/reasoning + pinned notes).
 - Feature: Extended `manage_context` with a non-interactive v2 `mode=retrieve|apply` contract (snapshot_id anti-drift, atomic batched ops, real dry-run simulation).
+- Core: When `manage_context` is available, Codex appends built-in tool usage instructions to the system prompt (same pattern as `apply_patch`).
+- UX: `manage_context status` / `retrieve` now include a bounded “what’s taking space” breakdown (approx bytes by category + top included items) to guide pruning decisions.
 - Core: Persisted context overlays (replacements + notes) in rollout via `RolloutItem::ContextOverlay` and replayed them on resume.
 - Fix: Pruning tool calls now also prunes their corresponding outputs; prompt construction additionally normalizes call/output pairs to avoid orphan-output session errors.
 - Docs: Added `.sangoi/reference/manage_context.md` and a task log for the implementation.

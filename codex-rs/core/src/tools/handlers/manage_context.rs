@@ -13,14 +13,19 @@ use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use async_trait::async_trait;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsageInfo;
 use serde::Deserialize;
 use serde_json::json;
 use sha1::Digest;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+
+const MAX_TOP_ITEMS: usize = 10;
 
 pub struct ManageContextHandler;
 
@@ -155,23 +160,58 @@ async fn handle_manage_context(
     };
 
     match action {
+        "help" => Ok(ManageContextResult {
+            json: json!({
+                "action": "help",
+                "summary": [
+                    "manage_context is an internal tool for the agent to keep long sessions healthy without /compact.",
+                    "Preferred flow: mode=retrieve (snapshot) then mode=apply (atomic ops) using snapshot_id (anti-drift)."
+                ],
+                "rules": [
+                    "replace is allowed ONLY for ToolOutput and Reasoning (never user/assistant messages).",
+                    "delete is destructive; deleting a tool call also deletes its outputs.",
+                    "If snapshot_id mismatches, re-run retrieve and retry apply."
+                ],
+                "example_retrieve": {
+                    "mode": "retrieve",
+                    "max_items": 120,
+                    "include_token_usage": true,
+                    "include_pairs": true
+                },
+                "example_apply": {
+                    "mode": "apply",
+                    "snapshot_id": "<from retrieve>",
+                    "ops": [
+                        {"op":"replace","targets":{"call_ids":["call_123"]},"text":"Key results: ..."},
+                        {"op":"exclude","targets":{"indices":[0,1,2]}},
+                        {"op":"add_note","notes":["Decision: ...","Constraint: ..."]}
+                    ]
+                }
+            }),
+        }),
         "status" => {
-            let (token_info, overlay, history_len, included_len) = {
+            let (token_info, overlay, history_len, included_len, summaries, items) = {
                 let state = session.state.lock().await;
                 let token_info = state.token_info.clone();
                 let overlay = state.context_overlay_snapshot();
                 let history_len = state.history_snapshot().len();
-                let included_len = state
-                    .build_context_items_event()
-                    .items
-                    .iter()
-                    .filter(|it| it.included)
-                    .count();
-                (token_info, overlay, history_len, included_len)
+                let ev = state.build_context_items_event();
+                let included_len = ev.items.iter().filter(|it| it.included).count();
+                let items = state.history_snapshot();
+                (
+                    token_info,
+                    overlay,
+                    history_len,
+                    included_len,
+                    ev.items,
+                    items,
+                )
             };
 
             let (context_window, context_left_percent, tokens_in_context) =
                 token_window_summary(token_info.as_ref());
+
+            let breakdown = build_breakdown(&summaries, &items, &overlay, MAX_TOP_ITEMS);
 
             Ok(ManageContextResult {
                 json: json!({
@@ -183,6 +223,7 @@ async fn handle_manage_context(
                     "included_len": included_len,
                     "replacements": overlay.replacements_by_rid.len(),
                     "notes": overlay.notes.len(),
+                    "breakdown": breakdown,
                 }),
             })
         }
@@ -602,15 +643,19 @@ async fn handle_retrieve(
     let max_items = args.max_items.unwrap_or(summaries.len());
     let slice_start = summaries.len().saturating_sub(max_items);
 
+    let breakdown = build_breakdown(&summaries, &items, &overlay, MAX_TOP_ITEMS);
+
     let mut out_items = Vec::new();
     if include_items {
         out_items.reserve(summaries.len().saturating_sub(slice_start));
-        for summary in summaries.into_iter().skip(slice_start) {
+        for summary in summaries.iter().skip(slice_start) {
             let item = items.get(summary.index);
             let (call_id, tool_name, pair) = describe_pair(item, include_pairs);
 
             let rid = summary.id.as_ref().and_then(|id| parse_rid(id));
             let replacement = rid.and_then(|rid| overlay.replacements_by_rid.get(&rid));
+            let raw_bytes = item.map(estimate_item_bytes).unwrap_or(0);
+            let effective_bytes = replacement.map(|t| t.len() as u64).unwrap_or(raw_bytes);
 
             out_items.push(json!({
                 "index": summary.index,
@@ -623,6 +668,10 @@ async fn handle_retrieve(
                 "pair": pair,
                 "replaced": replacement.is_some(),
                 "effective_preview": replacement.map(|text| preview_text(text)),
+                "approx_bytes": {
+                    "raw": raw_bytes,
+                    "effective": effective_bytes,
+                },
             }));
         }
     }
@@ -644,6 +693,7 @@ async fn handle_retrieve(
             "mode": "retrieve",
             "snapshot_id": snapshot_id,
             "token_usage": token_usage,
+            "breakdown": breakdown,
             "items": if include_items { Some(out_items) } else { None },
             "notes": if include_notes { Some(overlay.notes) } else { None },
         }),
@@ -814,6 +864,194 @@ fn prune_category_tag(category: &crate::protocol::PruneCategory) -> &'static str
         PruneCategory::UserMessage => "user_message",
         PruneCategory::UserInstructions => "user_instructions",
         PruneCategory::EnvironmentContext => "environment_context",
+    }
+}
+
+#[derive(Default)]
+struct CategoryBreakdown {
+    total_items: usize,
+    included_items: usize,
+    raw_bytes_total: u64,
+    effective_bytes_total: u64,
+    raw_bytes_included: u64,
+    effective_bytes_included: u64,
+}
+
+fn build_breakdown(
+    summaries: &[crate::protocol::ContextItemSummary],
+    items: &[ResponseItem],
+    overlay: &ContextOverlay,
+    max_top_items: usize,
+) -> serde_json::Value {
+    let mut by_category: HashMap<crate::protocol::PruneCategory, CategoryBreakdown> =
+        HashMap::new();
+    let mut top_included: Vec<serde_json::Value> = Vec::new();
+
+    for summary in summaries {
+        let item = items.get(summary.index);
+        let raw_bytes = item.map(estimate_item_bytes).unwrap_or(0);
+
+        let rid = summary.id.as_ref().and_then(|id| parse_rid(id));
+        let replacement = rid.and_then(|rid| overlay.replacements_by_rid.get(&rid));
+        let effective_bytes = replacement.map(|t| t.len() as u64).unwrap_or(raw_bytes);
+
+        let entry = by_category.entry(summary.category.clone()).or_default();
+        entry.total_items += 1;
+        entry.raw_bytes_total = entry.raw_bytes_total.saturating_add(raw_bytes);
+        entry.effective_bytes_total = entry.effective_bytes_total.saturating_add(effective_bytes);
+        if summary.included {
+            entry.included_items += 1;
+            entry.raw_bytes_included = entry.raw_bytes_included.saturating_add(raw_bytes);
+            entry.effective_bytes_included = entry
+                .effective_bytes_included
+                .saturating_add(effective_bytes);
+        }
+
+        if summary.included && max_top_items > 0 {
+            let (call_id, tool_name, _pair) = describe_pair(item, false);
+            top_included.push(json!({
+                "approx_bytes": effective_bytes,
+                "index": summary.index,
+                "id": summary.id,
+                "category": summary.category,
+                "preview": summary.preview,
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "replaced": replacement.is_some(),
+            }));
+        }
+    }
+
+    top_included.sort_by(|a, b| {
+        let al = a.get("approx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+        let bl = b.get("approx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+        bl.cmp(&al)
+    });
+    top_included.truncate(max_top_items);
+
+    let mut ordered: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for category in [
+        crate::protocol::PruneCategory::EnvironmentContext,
+        crate::protocol::PruneCategory::UserInstructions,
+        crate::protocol::PruneCategory::UserMessage,
+        crate::protocol::PruneCategory::AssistantMessage,
+        crate::protocol::PruneCategory::ToolCall,
+        crate::protocol::PruneCategory::ToolOutput,
+        crate::protocol::PruneCategory::Reasoning,
+    ] {
+        if let Some(stats) = by_category.get(&category) {
+            ordered.insert(
+                prune_category_tag(&category).to_string(),
+                json!({
+                    "total_items": stats.total_items,
+                    "included_items": stats.included_items,
+                    "approx_bytes": {
+                        "raw_total": stats.raw_bytes_total,
+                        "effective_total": stats.effective_bytes_total,
+                        "raw_included": stats.raw_bytes_included,
+                        "effective_included": stats.effective_bytes_included,
+                    }
+                }),
+            );
+        }
+    }
+
+    json!({
+        "by_category": ordered,
+        "top_included_items": top_included,
+    })
+}
+
+fn estimate_item_bytes(item: &ResponseItem) -> u64 {
+    match item {
+        ResponseItem::Message { role, content, .. } => {
+            let mut total = role.len() as u64;
+            for c in content {
+                match c {
+                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                        total = total.saturating_add(text.len() as u64);
+                    }
+                    ContentItem::InputImage { image_url } => {
+                        total = total.saturating_add(image_url.len() as u64);
+                    }
+                }
+            }
+            total
+        }
+        ResponseItem::Reasoning {
+            summary,
+            content,
+            encrypted_content,
+            ..
+        } => {
+            let mut total = 0u64;
+            for s in summary {
+                match s {
+                    codex_protocol::models::ReasoningItemReasoningSummary::SummaryText { text } => {
+                        total = total.saturating_add(text.len() as u64);
+                    }
+                }
+            }
+            if let Some(content) = content {
+                for c in content {
+                    match c {
+                        ReasoningItemContent::ReasoningText { text }
+                        | ReasoningItemContent::Text { text } => {
+                            total = total.saturating_add(text.len() as u64);
+                        }
+                    }
+                }
+            }
+            if let Some(enc) = encrypted_content {
+                total = total.saturating_add(enc.len() as u64);
+            }
+            total
+        }
+        ResponseItem::LocalShellCall {
+            call_id, action, ..
+        } => {
+            let mut total = call_id.as_ref().map(|s| s.len() as u64).unwrap_or(0);
+            match action {
+                codex_protocol::models::LocalShellAction::Exec(exec) => {
+                    for part in &exec.command {
+                        total = total.saturating_add(part.len() as u64);
+                    }
+                    if let Some(wd) = &exec.working_directory {
+                        total = total.saturating_add(wd.len() as u64);
+                    }
+                    if let Some(env) = &exec.env {
+                        for (k, v) in env {
+                            total = total.saturating_add(k.len() as u64);
+                            total = total.saturating_add(v.len() as u64);
+                        }
+                    }
+                }
+            }
+            total
+        }
+        ResponseItem::FunctionCall {
+            name,
+            arguments,
+            call_id,
+            ..
+        } => (name.len() + arguments.len() + call_id.len()) as u64,
+        ResponseItem::FunctionCallOutput { call_id, output } => {
+            (call_id.len() + output.content.len()) as u64
+        }
+        ResponseItem::CustomToolCall {
+            call_id,
+            name,
+            input,
+            ..
+        } => (call_id.len() + name.len() + input.len()) as u64,
+        ResponseItem::CustomToolCallOutput { call_id, output } => {
+            (call_id.len() + output.len()) as u64
+        }
+        ResponseItem::WebSearchCall { action, .. } => match action {
+            codex_protocol::models::WebSearchAction::Search { query } => query.len() as u64,
+            codex_protocol::models::WebSearchAction::Other => 0,
+        },
+        ResponseItem::Other => 0,
     }
 }
 

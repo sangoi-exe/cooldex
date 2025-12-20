@@ -658,7 +658,7 @@ fn create_manage_context_tool() -> ToolSpec {
         "action".to_string(),
         JsonSchema::String {
             description: Some(
-                "Legacy (v1) API: action=status | list | include | exclude | include_all | delete | replace | clear_replace | add_note | remove_note | clear_notes. Use dry_run=true to preview changes."
+                "Legacy (v1) API: action=help | status | list | include | exclude | include_all | delete | replace | clear_replace | add_note | remove_note | clear_notes. Use dry_run=true to preview changes."
                     .to_string(),
             ),
         },
