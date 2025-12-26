@@ -3233,6 +3233,10 @@ impl ChatWidget {
                 self.clear_token_usage();
                 self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
             }
+            SlashCommand::Sanitize => {
+                self.app_event_tx
+                    .send(AppEvent::CodexOp(Op::SanitizeFirstTurnReasoning));
+            }
             SlashCommand::Review => {
                 self.open_review_popup();
             }

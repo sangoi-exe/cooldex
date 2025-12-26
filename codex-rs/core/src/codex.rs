@@ -2767,6 +2767,9 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::SetThreadName { name } => {
                 handlers::set_thread_name(&sess, sub.id.clone(), name).await;
             }
+            Op::SanitizeFirstTurnReasoning => {
+                handlers::sanitize_first_turn_reasoning(&sess, sub.id.clone()).await;
+            }
             Op::RunUserShellCommand { command } => {
                 handlers::run_user_shell_command(
                     &sess,
@@ -2820,6 +2823,7 @@ mod handlers {
     use crate::tasks::execute_user_shell_command;
     use codex_protocol::custom_prompts::CustomPrompt;
     use codex_protocol::protocol::CodexErrorInfo;
+    use codex_protocol::protocol::ContextInclusionItem;
     use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::Event;
     use codex_protocol::protocol::EventMsg;
@@ -2832,6 +2836,7 @@ mod handlers {
     use codex_protocol::protocol::RemoteSkillSummary;
     use codex_protocol::protocol::ReviewDecision;
     use codex_protocol::protocol::ReviewRequest;
+    use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::SkillsListEntry;
     use codex_protocol::protocol::ThreadNameUpdatedEvent;
     use codex_protocol::protocol::ThreadRolledBackEvent;
@@ -2852,6 +2857,8 @@ mod handlers {
     use std::sync::Arc;
     use tracing::info;
     use tracing::warn;
+
+    use crate::state::PruneCategory;
 
     pub async fn interrupt(sess: &Arc<Session>) {
         sess.interrupt_task().await;
@@ -3274,6 +3281,111 @@ mod handlers {
                 sess.send_event_raw(event).await;
             }
         }
+    }
+
+    pub async fn sanitize_first_turn_reasoning(sess: &Arc<Session>, sub_id: String) {
+        struct Outcome {
+            message: String,
+            rollout_item: Option<RolloutItem>,
+        }
+
+        let Outcome {
+            message,
+            rollout_item,
+        } = {
+            let mut state = sess.state.lock().await;
+            let ev = state.build_context_items_event();
+
+            match ev
+                .items
+                .iter()
+                .position(|item| item.category == PruneCategory::UserMessage)
+            {
+                None => Outcome {
+                    message: "Sanitize: no user messages found in the current transcript."
+                        .to_string(),
+                    rollout_item: None,
+                },
+                Some(first_user_index) => {
+                    let second_user_index = ev
+                        .items
+                        .iter()
+                        .skip(first_user_index + 1)
+                        .position(|item| item.category == PruneCategory::UserMessage)
+                        .map(|offset| first_user_index + 1 + offset)
+                        .unwrap_or(ev.items.len());
+
+                    let mut reasoning_indices = Vec::new();
+                    let mut newly_excluded = 0usize;
+                    for item in &ev.items {
+                        if item.category != PruneCategory::Reasoning {
+                            continue;
+                        }
+                        if item.index <= first_user_index || item.index >= second_user_index {
+                            continue;
+                        }
+                        if item.included {
+                            newly_excluded += 1;
+                        }
+                        reasoning_indices.push(item.index);
+                    }
+
+                    if reasoning_indices.is_empty() {
+                        Outcome {
+                            message: "Sanitize: no reasoning items found in the first user turn."
+                                .to_string(),
+                            rollout_item: None,
+                        }
+                    } else if newly_excluded == 0 {
+                        Outcome {
+                            message: format!(
+                                "Sanitize: first-turn reasoning already excluded ({} item(s)).",
+                                reasoning_indices.len()
+                            ),
+                            rollout_item: None,
+                        }
+                    } else {
+                        state.set_context_inclusion(&reasoning_indices, false);
+
+                        let after_ev = state.build_context_items_event();
+                        let mut included_indices = Vec::new();
+                        let mut included_ids = Vec::new();
+                        for item in &after_ev.items {
+                            if item.included {
+                                included_indices.push(item.index);
+                                if let Some(id) = &item.id {
+                                    included_ids.push(id.clone());
+                                }
+                            }
+                        }
+
+                        Outcome {
+                            message: format!(
+                                "Sanitize: excluded {newly_excluded} reasoning item(s) from the first user turn."
+                            ),
+                            rollout_item: Some(RolloutItem::ContextInclusion(
+                                ContextInclusionItem {
+                                    included_indices,
+                                    deleted_indices: Vec::new(),
+                                    included_ids,
+                                    deleted_ids: Vec::new(),
+                                },
+                            )),
+                        }
+                    }
+                }
+            }
+        };
+
+        if let Some(item) = rollout_item {
+            sess.persist_rollout_items(&[item]).await;
+        }
+
+        sess.send_event_raw(Event {
+            id: sub_id,
+            msg: EventMsg::BackgroundEvent(crate::protocol::BackgroundEventEvent { message }),
+        })
+        .await;
     }
 
     pub async fn undo(sess: &Arc<Session>, sub_id: String) {
@@ -4553,14 +4665,148 @@ async fn handle_assistant_item_done_in_plan_mode(
     false
 }
 
+fn maybe_prefix_tool_output_with_context_left(
+    tool_name_by_call_id: &std::collections::HashMap<String, String>,
+    call_id: &str,
+    content: &mut String,
+    context_left_percent: i64,
+) {
+    if call_id.is_empty() {
+        return;
+    }
+    if content.trim_start().starts_with("Context left:") {
+        return;
+    }
+    if tool_name_by_call_id
+        .get(call_id)
+        .is_some_and(|name| name == "manage_context")
+    {
+        return;
+    }
+
+    *content = format!("Context left: {context_left_percent}%\n{content}");
+}
+
+fn tool_name_by_call_id_for_history(
+    history: &[ResponseItem],
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for item in history {
+        match item {
+            ResponseItem::FunctionCall { call_id, name, .. } => {
+                out.insert(call_id.clone(), name.clone());
+            }
+            ResponseItem::CustomToolCall { call_id, name, .. } => {
+                out.insert(call_id.clone(), name.clone());
+            }
+            ResponseItem::LocalShellCall {
+                call_id: Some(call_id),
+                ..
+            } => {
+                out.insert(call_id.clone(), "local_shell".to_string());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 async fn drain_in_flight(
     in_flight: &mut FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
 ) -> CodexResult<()> {
+    let (tool_name_by_call_id, context_left_percent) = {
+        let state = sess.state.lock().await;
+        let mut history = state.clone_history();
+        let tool_name_by_call_id = tool_name_by_call_id_for_history(&history.get_history());
+        let info = state.token_info();
+        let context_window = info
+            .as_ref()
+            .and_then(|info| info.model_context_window)
+            .or(turn_context.client.get_model_context_window());
+
+        let context_left_percent = info
+            .as_ref()
+            .and_then(|info| {
+                context_window.map(|window| {
+                    info.last_token_usage
+                        .percent_of_context_window_remaining(window)
+                })
+            })
+            .unwrap_or(100);
+
+        (tool_name_by_call_id, context_left_percent)
+    };
+
     while let Some(res) = in_flight.next().await {
         match res {
             Ok(response_input) => {
+                let response_input = match response_input {
+                    ResponseInputItem::FunctionCallOutput {
+                        call_id,
+                        mut output,
+                    } => {
+                        maybe_prefix_tool_output_with_context_left(
+                            &tool_name_by_call_id,
+                            &call_id,
+                            &mut output.content,
+                            context_left_percent,
+                        );
+                        ResponseInputItem::FunctionCallOutput { call_id, output }
+                    }
+                    ResponseInputItem::CustomToolCallOutput {
+                        call_id,
+                        mut output,
+                    } => {
+                        maybe_prefix_tool_output_with_context_left(
+                            &tool_name_by_call_id,
+                            &call_id,
+                            &mut output,
+                            context_left_percent,
+                        );
+                        ResponseInputItem::CustomToolCallOutput { call_id, output }
+                    }
+                    ResponseInputItem::McpToolCallOutput {
+                        call_id,
+                        mut result,
+                    } => {
+                        match &mut result {
+                            Ok(ok) => {
+                                let mut content_prefix = String::new();
+                                maybe_prefix_tool_output_with_context_left(
+                                    &tool_name_by_call_id,
+                                    &call_id,
+                                    &mut content_prefix,
+                                    context_left_percent,
+                                );
+                                if content_prefix.trim_start().starts_with("Context left:") {
+                                    ok.content.insert(
+                                        0,
+                                        mcp_types::ContentBlock::TextContent(
+                                            mcp_types::TextContent {
+                                                annotations: None,
+                                                text: content_prefix.trim_end().to_string(),
+                                                r#type: "text".to_string(),
+                                            },
+                                        ),
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                maybe_prefix_tool_output_with_context_left(
+                                    &tool_name_by_call_id,
+                                    &call_id,
+                                    err,
+                                    context_left_percent,
+                                );
+                            }
+                        }
+                        ResponseInputItem::McpToolCallOutput { call_id, result }
+                    }
+                    other => other,
+                };
+
                 sess.record_conversation_items(&turn_context, &[response_input.into()])
                     .await;
             }
@@ -5435,6 +5681,98 @@ mod tests {
 
         let history = sess.clone_history().await;
         assert_eq!(initial_context, history.raw_items());
+    }
+
+    #[tokio::test]
+    async fn sanitize_first_turn_reasoning_excludes_only_first_turn() {
+        use codex_protocol::models::ReasoningItemReasoningSummary;
+
+        let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
+
+        let items = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "user 1".to_string(),
+                }],
+            },
+            ResponseItem::Reasoning {
+                id: String::new(),
+                summary: vec![ReasoningItemReasoningSummary::SummaryText {
+                    text: "first turn reasoning 1".to_string(),
+                }],
+                content: None,
+                encrypted_content: Some("x".repeat(2048)),
+            },
+            ResponseItem::Reasoning {
+                id: String::new(),
+                summary: vec![ReasoningItemReasoningSummary::SummaryText {
+                    text: "first turn reasoning 2".to_string(),
+                }],
+                content: None,
+                encrypted_content: Some("x".repeat(2048)),
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "assistant 1".to_string(),
+                }],
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "user 2".to_string(),
+                }],
+            },
+            ResponseItem::Reasoning {
+                id: String::new(),
+                summary: vec![ReasoningItemReasoningSummary::SummaryText {
+                    text: "second turn reasoning".to_string(),
+                }],
+                content: None,
+                encrypted_content: Some("x".repeat(2048)),
+            },
+        ];
+
+        session
+            .record_conversation_items(turn_context.as_ref(), &items)
+            .await;
+
+        let before = session.state.lock().await.prompt_snapshot();
+        let before_reasoning = before
+            .iter()
+            .filter(|item| matches!(item, ResponseItem::Reasoning { .. }))
+            .count();
+        assert_eq!(before_reasoning, 3);
+
+        handlers::sanitize_first_turn_reasoning(&session, "sanitize-turn".to_string()).await;
+
+        let after = session.state.lock().await.prompt_snapshot();
+        let after_reasoning = after
+            .iter()
+            .filter(|item| matches!(item, ResponseItem::Reasoning { .. }))
+            .count();
+        assert_eq!(after_reasoning, 1);
+
+        let mut background_message = None;
+        for _ in 0..50 {
+            let next = tokio::time::timeout(Duration::from_millis(200), rx_event.recv()).await;
+            let Ok(Ok(event)) = next else {
+                continue;
+            };
+            if let EventMsg::BackgroundEvent(ev) = event.msg {
+                background_message = Some(ev.message);
+                break;
+            }
+        }
+        let message = background_message.expect("expected background event after sanitize");
+        assert!(
+            message.contains("excluded"),
+            "unexpected message: {message}"
+        );
     }
 
     #[tokio::test]

@@ -188,6 +188,34 @@ fn non_last_reasoning_tokens_ignore_entries_after_last_user() {
     assert_eq!(history.get_non_last_reasoning_items_tokens(), 32);
 }
 
+#[tokio::test]
+async fn estimate_token_count_scales_reasoning_bytes_to_tokens() {
+    let (_session, turn_context) = crate::codex::make_session_and_context().await;
+
+    let mut history = ContextManager::new();
+    let item = reasoning_with_encrypted_content(1_000);
+    history.record_items([&item], TruncationPolicy::Tokens(10_000));
+
+    let got = history
+        .estimate_token_count(&turn_context)
+        .expect("expected token estimate");
+
+    let base_tokens = i64::try_from(truncate::approx_token_count(
+        turn_context
+            .client
+            .get_model_family()
+            .base_instructions
+            .as_str(),
+    ))
+    .unwrap_or(i64::MAX);
+
+    let reasoning_bytes = estimate_reasoning_length(1_000);
+    let reasoning_tokens =
+        i64::try_from(truncate::approx_tokens_from_byte_count(reasoning_bytes)).unwrap_or(i64::MAX);
+
+    assert_eq!(got, base_tokens.saturating_add(reasoning_tokens));
+}
+
 #[test]
 fn trailing_codex_generated_tokens_stop_at_first_non_generated_item() {
     let earlier_output = function_call_output("call-earlier", "earlier output");

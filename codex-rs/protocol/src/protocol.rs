@@ -288,6 +288,16 @@ pub enum Op {
     /// involve the model.
     SetThreadName { name: String },
 
+    /// Manually prune context to recover space.
+    ///
+    /// This is a local, non-destructive operation that excludes reasoning items from the
+    /// first user turn from the prompt. It is intended as a fallback when the model fails
+    /// to self-sanitize (e.g., via `manage_context`).
+    ///
+    /// The operation is reversible by restoring the full inclusion mask (for example via
+    /// `manage_context` `include_all`).
+    SanitizeFirstTurnReasoning,
+
     /// Request Codex to undo a turn (turn are stacked so it is the same effect as CMD + Z).
     Undo,
 

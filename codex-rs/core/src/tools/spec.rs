@@ -948,6 +948,188 @@ fn create_list_dir_tool() -> ToolSpec {
     })
 }
 
+fn create_manage_context_tool() -> ToolSpec {
+    let mut targets_properties = BTreeMap::new();
+    targets_properties.insert(
+        "ids".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String { description: None }),
+            description: Some("Target by RID(s), e.g. [\"r42\",\"r100\"].".to_string()),
+        },
+    );
+    targets_properties.insert(
+        "indices".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::Number { description: None }),
+            description: Some("Target by history index (0-based).".to_string()),
+        },
+    );
+    targets_properties.insert(
+        "call_ids".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String { description: None }),
+            description: Some("Target by tool call_id(s).".to_string()),
+        },
+    );
+
+    let targets_schema = JsonSchema::Object {
+        properties: targets_properties,
+        required: None,
+        additional_properties: Some(false.into()),
+    };
+
+    let mut op_properties = BTreeMap::new();
+    op_properties.insert(
+        "op".to_string(),
+        JsonSchema::String {
+            description: Some("Operation name (e.g. exclude, replace, add_note).".to_string()),
+        },
+    );
+    op_properties.insert("targets".to_string(), targets_schema);
+    // NOTE: `targets` is an object; we keep this permissive to avoid requiring oneOf-like schemas.
+    op_properties.insert(
+        "cascade".to_string(),
+        JsonSchema::String {
+            description: Some("Delete cascade mode (currently: tool_outputs).".to_string()),
+        },
+    );
+    op_properties.insert(
+        "text".to_string(),
+        JsonSchema::String {
+            description: Some("Replacement text (for replace op).".to_string()),
+        },
+    );
+    op_properties.insert(
+        "notes".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String { description: None }),
+            description: Some("Notes (for add_note op).".to_string()),
+        },
+    );
+    op_properties.insert(
+        "note_indices".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::Number { description: None }),
+            description: Some("Note indices (for remove_note op).".to_string()),
+        },
+    );
+    // Intentionally no "one-shot" derived operations; ops require explicit targets when needed.
+
+    let op_schema = JsonSchema::Object {
+        properties: op_properties,
+        required: Some(vec!["op".to_string()]),
+        additional_properties: Some(true.into()),
+    };
+
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "mode".to_string(),
+        JsonSchema::String {
+            description: Some("Mode: retrieve | apply | help.".to_string()),
+        },
+    );
+    properties.insert(
+        "include_items".to_string(),
+        JsonSchema::Boolean {
+            description: Some("When retrieving, include a bounded list of items.".to_string()),
+        },
+    );
+    properties.insert(
+        "include_notes".to_string(),
+        JsonSchema::Boolean {
+            description: Some("When retrieving, include pinned notes.".to_string()),
+        },
+    );
+    properties.insert(
+        "include_token_usage".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "Deprecated (ignored): token_usage summary is always included.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "include_pairs".to_string(),
+        JsonSchema::Boolean {
+            description: Some("When retrieving, include call/output pairing info.".to_string()),
+        },
+    );
+    properties.insert(
+        "include_internal".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "When retrieving, include internal bookkeeping items (default: false).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "max_items".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Maximum number of items to include when include_items=true.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "max_top_items".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Maximum number of top offenders to include in breakdown (default: 10)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "snapshot_id".to_string(),
+        JsonSchema::String {
+            description: Some("Anti-drift snapshot id from retrieve.".to_string()),
+        },
+    );
+    properties.insert(
+        "ops".to_string(),
+        JsonSchema::Array {
+            items: Box::new(op_schema),
+            description: Some("v2 apply ops (atomic).".to_string()),
+        },
+    );
+    properties.insert(
+        "dry_run".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "When true, validate and preview changes without persisting.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "include_prompt_preview".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "When applying, include a truncated prompt preview in the response.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "allow_recent".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "When true, allow targeting the most recent user/assistant messages with exclude/delete."
+                    .to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "manage_context".to_string(),
+        description: "Manage long-session context by retrieving a snapshot and applying include/exclude/delete/replace operations.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_list_mcp_resources_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
