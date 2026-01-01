@@ -50,12 +50,11 @@ For a short checklist, see `docs/manage_context_cheatsheet.md`. For an overview,
 
 ### Step 0: check pressure (cheap)
 
-Call `retrieve` with `include_items=false` to get a bounded summary:
+Call `retrieve` to get a bounded summary:
 
 ```json
 {
-  "mode": "retrieve",
-  "include_items": false
+  "mode": "retrieve"
 }
 ```
 

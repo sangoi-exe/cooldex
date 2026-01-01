@@ -18,7 +18,7 @@ Use this when you see context pressure (low "context left") and want targeted cl
 Call `manage_context`:
 
 ```json
-{"mode":"retrieve","include_items":false}
+{"mode":"retrieve"}
 ```
 
 If context is tight, do a bounded inspect:
@@ -101,10 +101,10 @@ Then apply (same ops, without `dry_run`):
 Verify:
 
 ```json
-{"mode":"retrieve","include_items":false}
+{"mode":"retrieve"}
 ```
 
-Tip: `apply` responses also include `token_usage` and `affected_ids`/`missing_ids` (use `retrieve` when you need the breakdown/items list).
+Tip: `apply` responses also include `token_usage` and `affected_ids`/`missing_ids` (use `retrieve` when you need the breakdown).
 
 If you get `snapshot mismatch`, re-run `retrieve` and retry.
 

@@ -11,9 +11,6 @@ window, you have two options:
 For in-session guidance aimed at agents/models, see `docs/manage_context_model.md`.
 For a short checklist, see `docs/manage_context_cheatsheet.md`.
 
-> [!NOTE]
-> The older offline script (`scripts/manage_context.py`) was removed; `manage_context` is now the supported workflow.
-
 ### In-session workflow (v2: retrieve → apply)
 
 #### Retrieve a snapshot
@@ -21,7 +18,7 @@ For a short checklist, see `docs/manage_context_cheatsheet.md`.
 Start cheap:
 
 ```json
-{"mode":"retrieve","include_items":false}
+{"mode":"retrieve"}
 ```
 
 If you need targets, ask for a bounded items list:

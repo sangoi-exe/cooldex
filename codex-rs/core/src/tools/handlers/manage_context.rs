@@ -33,7 +33,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 const DEFAULT_MAX_TOP_ITEMS: usize = 10;
-const DEFAULT_MAX_ITEMS: usize = 200;
 
 pub struct ManageContextHandler;
 
@@ -41,18 +40,6 @@ pub struct ManageContextHandler;
 struct ManageContextToolArgs {
     #[serde(default)]
     mode: Option<String>,
-    #[serde(default)]
-    include_items: Option<bool>,
-    #[serde(default)]
-    include_notes: Option<bool>,
-    #[serde(default)]
-    include_token_usage: Option<bool>,
-    #[serde(default)]
-    include_pairs: Option<bool>,
-    #[serde(default)]
-    include_internal: Option<bool>,
-    #[serde(default)]
-    max_items: Option<usize>,
     #[serde(default)]
     max_top_items: Option<usize>,
 
@@ -149,13 +136,7 @@ async fn handle_manage_context(
         None => {}
     }
 
-    if args.include_items.is_some()
-        || args.include_notes.is_some()
-        || args.include_token_usage.is_some()
-        || args.include_pairs.is_some()
-        || args.include_internal.is_some()
-        || args.max_items.is_some()
-        || args.max_top_items.is_some()
+    if args.max_top_items.is_some()
         || args.snapshot_id.is_some()
         || !args.ops.is_empty()
         || args.dry_run
@@ -182,15 +163,13 @@ fn help_json() -> serde_json::Value {
             "delete is destructive; deleting a tool call also deletes its outputs.",
             "If snapshot_id mismatches, re-run retrieve and retry apply."
         ],
-        "tip": "Start with retrieve(include_items=false) to get breakdown + top offenders without bloating context.",
+        "tip": "Start with retrieve() to get breakdown + top offenders without bloating context.",
         "example_retrieve": {
             "mode": "retrieve",
-            "include_items": false,
         },
         "example_apply": {
             "mode": "apply",
             "snapshot_id": "<from retrieve>",
-            "dry_run": true,
             "ops": [
                 {"op":"replace","targets":{"call_ids":["call_123"]},"text":"Key results: ..."},
                 {"op":"exclude","targets":{"indices":[0,1,2]}},
@@ -205,10 +184,6 @@ async fn handle_retrieve(
     turn: &TurnContext,
     args: &ManageContextToolArgs,
 ) -> Result<ManageContextResult, FunctionCallError> {
-    let include_items = args.include_items.unwrap_or(false);
-    let include_notes = args.include_notes.unwrap_or(true);
-    let include_pairs = args.include_pairs.unwrap_or(true);
-
     let (context_window, overlay, summaries, items, prompt_items, snapshot_id) = {
         let state = session.state_lock().await;
         let context_window = state
@@ -230,73 +205,9 @@ async fn handle_retrieve(
         )
     };
 
-    let max_items = args.max_items.unwrap_or(DEFAULT_MAX_ITEMS);
-    let slice_start = if include_items {
-        summaries.len().saturating_sub(max_items)
-    } else {
-        summaries.len()
-    };
-
-    let include_internal = args.include_internal.unwrap_or(false);
     let max_top_items = args.max_top_items.unwrap_or(DEFAULT_MAX_TOP_ITEMS);
 
-    let breakdown = build_breakdown(
-        &summaries,
-        &items,
-        &overlay,
-        max_top_items,
-        include_internal,
-    );
-
-    let manage_context_call_ids = manage_context_call_ids(&items);
-    let tool_name_by_call_id = tool_name_by_call_id(&items);
-    let tool_args_preview_by_call_id = tool_args_preview_by_call_id(&items);
-
-    let mut out_items = Vec::new();
-    if include_items {
-        out_items.reserve(summaries.len().saturating_sub(slice_start));
-        for summary in summaries.iter().skip(slice_start) {
-            let item = items.get(summary.index);
-            if !include_internal && is_manage_context_item(item, &manage_context_call_ids) {
-                continue;
-            }
-
-            let (call_id, mut tool_name, pair) = describe_pair(item, include_pairs);
-            if tool_name.is_none()
-                && let Some(cid) = call_id.as_deref()
-                && let Some(name) = tool_name_by_call_id.get(cid)
-            {
-                tool_name = Some((*name).to_string());
-            }
-            let tool_args_preview = call_id
-                .as_deref()
-                .and_then(|cid| tool_args_preview_by_call_id.get(cid))
-                .cloned();
-
-            let rid = summary.id.as_ref().and_then(|id| parse_rid(id));
-            let replacement = rid.and_then(|rid| overlay.replacements_by_rid.get(&rid));
-            let raw_bytes = item.map(estimate_item_bytes).unwrap_or(0);
-            let effective_bytes = replacement.map(|t| t.len() as u64).unwrap_or(raw_bytes);
-
-            out_items.push(json!({
-                "index": summary.index,
-                "id": summary.id,
-                "category": prune_category_tag(summary.category),
-                "included": summary.included,
-                "preview": summary.preview,
-                "call_id": call_id,
-                "tool_name": tool_name,
-                "tool_args_preview": tool_args_preview,
-                "pair": pair,
-                "replaced": replacement.is_some(),
-                "effective_preview": replacement.map(|text| preview_text(text)),
-                "approx_bytes": {
-                    "raw": raw_bytes,
-                    "effective": effective_bytes,
-                },
-            }));
-        }
-    }
+    let breakdown = build_breakdown(&summaries, &items, &overlay, max_top_items);
 
     let (context_window, context_left_percent, tokens_in_context) =
         estimate_token_window(turn, context_window, prompt_items.as_deref().unwrap_or(&[]));
@@ -312,8 +223,7 @@ async fn handle_retrieve(
             "snapshot_id": snapshot_id,
             "token_usage": token_usage,
             "breakdown": breakdown,
-            "items": if include_items { Some(out_items) } else { None },
-            "notes": if include_notes { Some(overlay.notes) } else { None },
+            "notes": overlay.notes,
         }),
     })
 }
@@ -639,7 +549,6 @@ fn build_breakdown(
     items: &[ResponseItem],
     overlay: &ContextOverlay,
     max_top_items: usize,
-    include_internal: bool,
 ) -> serde_json::Value {
     let manage_context_call_ids = manage_context_call_ids(items);
     let tool_name_by_call_id = tool_name_by_call_id(items);
@@ -652,7 +561,7 @@ fn build_breakdown(
 
     for summary in summaries {
         let item = items.get(summary.index);
-        if !include_internal && is_manage_context_item(item, &manage_context_call_ids) {
+        if is_manage_context_item(item, &manage_context_call_ids) {
             continue;
         }
         let raw_bytes = item.map(estimate_item_bytes).unwrap_or(0);
@@ -674,7 +583,7 @@ fn build_breakdown(
         }
 
         if summary.included && max_top_items > 0 {
-            let (call_id, mut tool_name, pair) = describe_pair(item, true);
+            let (call_id, mut tool_name, pair) = describe_pair(item);
             let tool_args_preview = call_id
                 .as_deref()
                 .and_then(|cid| tool_args_preview_by_call_id.get(cid))
@@ -1116,7 +1025,6 @@ fn estimate_item_bytes(item: &ResponseItem) -> u64 {
 
 fn describe_pair(
     item: Option<&ResponseItem>,
-    include_pairs: bool,
 ) -> (Option<String>, Option<String>, Option<serde_json::Value>) {
     let Some(item) = item else {
         return (None, None, None);
@@ -1159,16 +1067,12 @@ fn describe_pair(
         _ => (None, None, None, None),
     };
 
-    let pair = if include_pairs {
-        pair_kind.map(|kind| {
-            json!({
-                "kind": kind,
-                "pair_call_id": pair_call_id,
-            })
+    let pair = pair_kind.map(|kind| {
+        json!({
+            "kind": kind,
+            "pair_call_id": pair_call_id,
         })
-    } else {
-        None
-    };
+    });
 
     (call_id, tool_name, pair)
 }
@@ -2023,7 +1927,7 @@ mod tests {
             .replacements_by_rid
             .insert(3, "replacement".to_string());
 
-        let breakdown = build_breakdown(&summaries, &items, &overlay, 10, false);
+        let breakdown = build_breakdown(&summaries, &items, &overlay, 10);
         let top = breakdown
             .get("top_included_items")
             .and_then(serde_json::Value::as_array)
@@ -2101,7 +2005,7 @@ mod tests {
             .replacements_by_rid
             .insert(1, format!("effective preview\n{}", "x".repeat(200)));
 
-        let breakdown = build_breakdown(&summaries, &items, &overlay, 1, true);
+        let breakdown = build_breakdown(&summaries, &items, &overlay, 1);
         let top = breakdown
             .get("top_included_items")
             .and_then(serde_json::Value::as_array)

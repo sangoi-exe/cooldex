@@ -1029,48 +1029,6 @@ fn create_manage_context_tool() -> ToolSpec {
         },
     );
     properties.insert(
-        "include_items".to_string(),
-        JsonSchema::Boolean {
-            description: Some("When retrieving, include a bounded list of items.".to_string()),
-        },
-    );
-    properties.insert(
-        "include_notes".to_string(),
-        JsonSchema::Boolean {
-            description: Some("When retrieving, include pinned notes.".to_string()),
-        },
-    );
-    properties.insert(
-        "include_token_usage".to_string(),
-        JsonSchema::Boolean {
-            description: Some(
-                "Deprecated (ignored): token_usage summary is always included.".to_string(),
-            ),
-        },
-    );
-    properties.insert(
-        "include_pairs".to_string(),
-        JsonSchema::Boolean {
-            description: Some("When retrieving, include call/output pairing info.".to_string()),
-        },
-    );
-    properties.insert(
-        "include_internal".to_string(),
-        JsonSchema::Boolean {
-            description: Some(
-                "When retrieving, include internal bookkeeping items (default: false).".to_string(),
-            ),
-        },
-    );
-    properties.insert(
-        "max_items".to_string(),
-        JsonSchema::Number {
-            description: Some(
-                "Maximum number of items to include when include_items=true.".to_string(),
-            ),
-        },
-    );
-    properties.insert(
         "max_top_items".to_string(),
         JsonSchema::Number {
             description: Some(
