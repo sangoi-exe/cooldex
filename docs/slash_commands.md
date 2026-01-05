@@ -19,7 +19,8 @@ Control Codex’s behavior during an interactive session with slash commands.
 | `/resume`       | resume an old chat                                                         |
 | `/init`         | create an AGENTS.md file with instructions for Codex                       |
 | `/compact`      | summarize conversation to prevent hitting the context limit                |
-| `/sanitize`     | prune first-turn reasoning to recover context (manual fallback)            |
+| `/sanitize`     | sanitize context using manage_context (sub-agent)                          |
+| `/hygiene`      | toggle context hygiene after each completed turn                           |
 | `/diff`         | show git diff (including untracked files)                                  |
 | `/mention`      | mention a file                                                             |
 | `/status`       | show current session configuration and token usage                         |

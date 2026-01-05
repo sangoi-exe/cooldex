@@ -99,6 +99,39 @@ pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
+pub const AUTO_SANITIZE_CONFIG_KEY: &str = "auto_sanitize";
+
+pub fn auto_sanitize_enabled(codex_home: &Path, active_profile: Option<&str>) -> bool {
+    fn item_as_bool(item: &toml_edit::Item) -> Option<bool> {
+        item.as_value().and_then(toml_edit::Value::as_bool)
+    }
+
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return false,
+    };
+
+    let doc = match content.parse::<DocumentMut>() {
+        Ok(doc) => doc,
+        Err(_) => return false,
+    };
+
+    if let Some(profile) = active_profile
+        && let Some(enabled) = doc
+            .get("profiles")
+            .and_then(|profiles| profiles.get(profile))
+            .and_then(|profile| profile.get(AUTO_SANITIZE_CONFIG_KEY))
+            .and_then(item_as_bool)
+    {
+        return enabled;
+    }
+
+    doc.get(AUTO_SANITIZE_CONFIG_KEY)
+        .and_then(item_as_bool)
+        .unwrap_or(false)
+}
 
 #[cfg(test)]
 pub(crate) fn test_config() -> Config {

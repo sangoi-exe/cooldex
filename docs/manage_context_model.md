@@ -42,7 +42,7 @@ For a short checklist, see `docs/manage_context_cheatsheet.md`. For an overview,
   - environment context (`<environment_context>...`) and user instructions (AGENTS.md block) are treated as protected.
 - Tool calls and outputs have pairing invariants:
   - If you keep a call but drop its output (or vice-versa), the prompt may be normalized to avoid orphaned items.
-  - Prefer targeting by `call_id` when you want a tool call + its output(s) treated together.
+  - Prefer targeting by tool `call_id` (pass it in `targets.ids`) when you want a call + its output(s) treated together.
 - Keep outputs small:
   - A "cleanup" operation that emits huge JSON or a full transcript defeats the purpose.
 
@@ -60,86 +60,51 @@ Call `retrieve` to get a bounded summary:
 
 Use this to decide whether cleanup is needed. A common trigger is low remaining context (for example, <20% left).
 
-### Step 1: inspect a bounded window (optional)
+### Step 1: pick targets from the summary
 
-If you need to identify targets, ask for a bounded item list:
+Use the cheap `retrieve` breakdown to pick a *small* set of targets:
 
-```json
-{
-  "mode": "retrieve",
-  "include_items": true,
-  "max_items": 200,
-  "include_pairs": true
-}
-```
+- `breakdown.top_calls` for the biggest tool call/output pairs (target by tool `call_id` via `targets.ids`).
+- `breakdown.top_included_items` for oversized reasoning/tool outputs (target with `ids`).
 
-Use:
+Avoid pulling full item lists just to find targets. If the summary isn't enough to target what you need, prefer `/compact` over repeatedly expanding context.
 
-- `breakdown.top_calls` to quickly spot the biggest tool invocations grouped by `call_id` (includes `tool_name` and `tool_args_preview`).
-- `breakdown.top_included_items` and per-item `approx_bytes.effective` to find the biggest offenders.
-- `breakdown.by_category` to see which category is dominating (commonly: `reasoning`).
+### Emergency: recover from ~0% context left
 
-If you need to operate across the full transcript (not just the most recent window), raise `max_items` (for example to `5000`).
+When the context is effectively full, do one high-leverage, reversible `apply`:
 
-### Emergency: recover from ~0% context left (reasoning purge)
+- Replace the largest tool outputs / reasoning shown in the `retrieve` breakdown.
+- If needed, exclude a few old tool `call_id`s (noise) and add a tiny pinned note with the current state.
 
-When the context is effectively full, a fast, reversible win is often to **exclude all included `reasoning` items** (reasoning can dwarf tool output).
-
-1. `retrieve` with items included (and a large `max_items`).
-2. Collect indices of items where `category=="reasoning"` and `included==true`.
-3. `apply` an `exclude` op for those indices.
-4. Add short pinned notes with the state you must retain.
-5. Verify `context_left_percent` increased.
-
-This is reversible via `include_all`. In one long session, excluding ~200 reasoning items raised context left from ~0% to ~70%.
+If you still can't recover enough space, prefer `/compact` over repeated `manage_context` cycles.
 
 ### Step 2: plan operations (prefer non-destructive first)
 
 Recommended order:
 
-1. `replace` the largest tool outputs/reasoning with short distilled summaries (target by `call_ids` or `ids`).
-2. `exclude` older, low-value items (prefer targeting by `call_ids` if you are excluding tool noise).
-3. `add_note` for the few facts that must remain visible (decisions, constraints, TODOs).
-4. `delete` only when necessary (and prefer deleting by `call_ids` so pairs are removed cleanly).
+1. `consolidate_reasoning` when reasoning dominates (extracts included reasoning summaries under `extracted.reasoning.items` and excludes the original reasoning items).
+2. `replace` the largest tool outputs/reasoning with short distilled summaries (target by tool `call_id` via `targets.ids`, or by RID via `targets.ids`).
+3. `exclude` older, low-value items (prefer targeting by tool `call_id` via `targets.ids` if you are excluding tool noise).
+4. `add_note` for the few facts that must remain visible (decisions, constraints, TODOs).
+5. `delete` only when necessary (and prefer deleting by tool `call_id` via `targets.ids` so pairs are removed cleanly).
 
-### Step 3: dry-run (anti-drift)
-
-Always dry-run first when possible:
-
-```json
-{
-  "mode": "apply",
-  "snapshot_id": "<from retrieve>",
-  "dry_run": true,
-  "ops": [
-    { "op": "replace", "targets": { "call_ids": ["call_123"] }, "text": "Key results: ..." },
-    { "op": "exclude", "targets": { "ids": ["r10", "r11"] } },
-    { "op": "add_note", "notes": ["Decision: ...", "Constraint: ...", "Next: ..."] }
-  ]
-}
-```
-
-Optional: set `include_prompt_preview=true` to get a truncated preview of the prompt after applying the ops.
-
-If you get a `snapshot mismatch`, re-run `retrieve` and rebuild the plan.
-
-### Step 4: apply for real
-
-Repeat the same payload with `dry_run=false` (or omit it):
+### Step 3: apply (atomic)
 
 ```json
 {
   "mode": "apply",
   "snapshot_id": "<from retrieve>",
   "ops": [
-    { "op": "replace", "targets": { "call_ids": ["call_123"] }, "text": "Key results: ..." },
+    { "op": "replace", "targets": { "ids": ["call_123"] }, "text": "Key results: ..." },
     { "op": "exclude", "targets": { "ids": ["r10", "r11"] } },
     { "op": "add_note", "notes": ["Decision: ...", "Constraint: ...", "Next: ..."] }
   ]
 }
 ```
 
-### Step 5: verify
+If you get a `snapshot mismatch`, re-run `retrieve` and retry once.
+
+### Step 4: verify
 
 Check `token_usage` in the `apply` response (it should improve).
 
@@ -170,11 +135,11 @@ Avoid:
 
 - `snapshot mismatch` (manage_context v2):
   - The transcript changed between `retrieve` and `apply`; run `retrieve` again.
-  - If it repeats even immediately after `retrieve`, omit `snapshot_id` (use `dry_run`).
+  - If it repeats even immediately after `retrieve`, omit `snapshot_id`.
 - `skipped_missing_targets`:
   - Target RID/index/call_id was not present; re-retrieve and retarget.
 - `replace only supports tool outputs and reasoning`:
-  - You targeted a call or a message; target the output via `call_ids` or pick the output RID.
+  - You targeted a call or a message; target the output via a tool `call_id` in `targets.ids`, or pick the output RID.
 - `targets recent message id(s)`:
   - By default, `exclude`/`delete` refuse to target the most recent user/assistant messages.
   - Set `allow_recent=true` to override.

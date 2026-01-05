@@ -1,5 +1,6 @@
 Use /compact when the conversation gets long to summarize history and free up context.
-Try /sanitize to prune first-turn reasoning when you're stuck near the context limit.
+Try /sanitize to sanitize context when you're stuck near the context limit.
+Use /hygiene to toggle automatic context hygiene after each turn.
 Start a fresh idea with /new; the previous session stays in history.
 Use /feedback to send logs to the maintainers when something looks off.
 Switch models or reasoning effort quickly with /model.

@@ -140,6 +140,11 @@ pub(crate) enum AppEvent {
         personality: Personality,
     },
 
+    /// Persist the auto-sanitize (context hygiene) toggle to config.toml.
+    PersistAutoSanitize {
+        enabled: bool,
+    },
+
     /// Open the reasoning selection popup after picking a model.
     OpenReasoningPopup {
         model: ModelPreset,

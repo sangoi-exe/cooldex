@@ -3234,8 +3234,10 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
             }
             SlashCommand::Sanitize => {
-                self.app_event_tx
-                    .send(AppEvent::CodexOp(Op::SanitizeFirstTurnReasoning));
+                self.app_event_tx.send(AppEvent::CodexOp(Op::Sanitize));
+            }
+            SlashCommand::Hygiene => {
+                self.open_hygiene_popup();
             }
             SlashCommand::Review => {
                 self.open_review_popup();
@@ -5154,6 +5156,52 @@ impl ChatWidget {
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "default".to_string())
         );
+    }
+
+    /// Open a popup to toggle automatic context hygiene after each completed turn.
+    pub(crate) fn open_hygiene_popup(&mut self) {
+        let enabled = codex_core::config::auto_sanitize_enabled(
+            &self.config.codex_home,
+            self.config.active_profile.as_deref(),
+        );
+
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from("Context hygiene".bold()));
+        header.push(Line::from(
+            "When enabled, Codex summarizes last-turn tools, consolidates reasoning, and deletes tool outputs.".dim(),
+        ));
+
+        let actions_on: Vec<SelectionAction> = vec![Box::new(|tx| {
+            tx.send(AppEvent::PersistAutoSanitize { enabled: true });
+        })];
+        let actions_off: Vec<SelectionAction> = vec![Box::new(|tx| {
+            tx.send(AppEvent::PersistAutoSanitize { enabled: false });
+        })];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items: vec![
+                SelectionItem {
+                    name: "On".to_string(),
+                    description: Some("Auto-run context hygiene after each turn.".to_string()),
+                    is_current: enabled,
+                    actions: actions_on,
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Off".to_string(),
+                    description: Some("Never auto-run context hygiene.".to_string()),
+                    is_current: !enabled,
+                    actions: actions_off,
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+            ],
+            initial_selected_idx: Some(if enabled { 0 } else { 1 }),
+            ..Default::default()
+        });
     }
 
     /// Open a popup to choose the approvals mode (ask for approval policy + sandbox policy).

@@ -954,21 +954,10 @@ fn create_manage_context_tool() -> ToolSpec {
         "ids".to_string(),
         JsonSchema::Array {
             items: Box::new(JsonSchema::String { description: None }),
-            description: Some("Target by RID(s), e.g. [\"r42\",\"r100\"].".to_string()),
-        },
-    );
-    targets_properties.insert(
-        "indices".to_string(),
-        JsonSchema::Array {
-            items: Box::new(JsonSchema::Number { description: None }),
-            description: Some("Target by history index (0-based).".to_string()),
-        },
-    );
-    targets_properties.insert(
-        "call_ids".to_string(),
-        JsonSchema::Array {
-            items: Box::new(JsonSchema::String { description: None }),
-            description: Some("Target by tool call_id(s).".to_string()),
+            description: Some(
+                "Target selectors: RID(s) like \"r42\" and/or tool call_id(s) like \"call_123\"."
+                    .to_string(),
+            ),
         },
     );
 
@@ -987,12 +976,6 @@ fn create_manage_context_tool() -> ToolSpec {
     );
     op_properties.insert("targets".to_string(), targets_schema);
     // NOTE: `targets` is an object; we keep this permissive to avoid requiring oneOf-like schemas.
-    op_properties.insert(
-        "cascade".to_string(),
-        JsonSchema::String {
-            description: Some("Delete cascade mode (currently: tool_outputs).".to_string()),
-        },
-    );
     op_properties.insert(
         "text".to_string(),
         JsonSchema::String {
@@ -1018,14 +1001,14 @@ fn create_manage_context_tool() -> ToolSpec {
     let op_schema = JsonSchema::Object {
         properties: op_properties,
         required: Some(vec!["op".to_string()]),
-        additional_properties: Some(true.into()),
+        additional_properties: Some(false.into()),
     };
 
     let mut properties = BTreeMap::new();
     properties.insert(
         "mode".to_string(),
         JsonSchema::String {
-            description: Some("Mode: retrieve | apply | help.".to_string()),
+            description: Some("Mode: retrieve | apply.".to_string()),
         },
     );
     properties.insert(
@@ -1048,14 +1031,6 @@ fn create_manage_context_tool() -> ToolSpec {
         JsonSchema::Array {
             items: Box::new(op_schema),
             description: Some("v2 apply ops (atomic).".to_string()),
-        },
-    );
-    properties.insert(
-        "dry_run".to_string(),
-        JsonSchema::Boolean {
-            description: Some(
-                "When true, validate and preview changes without persisting.".to_string(),
-            ),
         },
     );
     properties.insert(
@@ -1082,7 +1057,7 @@ fn create_manage_context_tool() -> ToolSpec {
         strict: false,
         parameters: JsonSchema::Object {
             properties,
-            required: None,
+            required: Some(vec!["mode".to_string()]),
             additional_properties: Some(false.into()),
         },
     })

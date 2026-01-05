@@ -201,6 +201,7 @@ use crate::state::SessionState;
 use crate::state_db;
 use crate::tasks::GhostSnapshotTask;
 use crate::tasks::ReviewTask;
+use crate::tasks::SanitizeTask;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
@@ -2770,6 +2771,9 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::SanitizeFirstTurnReasoning => {
                 handlers::sanitize_first_turn_reasoning(&sess, sub.id.clone()).await;
             }
+            Op::Sanitize => {
+                handlers::sanitize(&sess, &config, sub.id.clone()).await;
+            }
             Op::RunUserShellCommand { command } => {
                 handlers::run_user_shell_command(
                     &sess,
@@ -3388,6 +3392,12 @@ mod handlers {
         .await;
     }
 
+    pub async fn sanitize(sess: &Arc<Session>, config: &Arc<Config>, sub_id: String) {
+        let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
+        super::spawn_sanitize_task(Arc::clone(sess), Arc::clone(config), turn_context, sub_id)
+            .await;
+    }
+
     pub async fn undo(sess: &Arc<Session>, sub_id: String) {
         let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
         sess.spawn_task(turn_context, Vec::new(), UndoTask::new())
@@ -3698,6 +3708,79 @@ async fn spawn_review_thread(
     };
     sess.send_event(&tc, EventMsg::EnteredReviewMode(review_request))
         .await;
+}
+
+async fn spawn_sanitize_task(
+    sess: Arc<Session>,
+    config: Arc<Config>,
+    parent_turn_context: Arc<TurnContext>,
+    sub_id: String,
+) {
+    let mut sanitize_features = sess.features.clone();
+    sanitize_features
+        .disable(crate::features::Feature::ShellTool)
+        .disable(crate::features::Feature::UnifiedExec)
+        .disable(crate::features::Feature::ApplyPatchFreeform)
+        .disable(crate::features::Feature::WebSearchRequest)
+        .disable(crate::features::Feature::WebSearchCached)
+        .disable(crate::features::Feature::ViewImageTool);
+    let sanitize_web_search_mode = WebSearchMode::Disabled;
+
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &parent_turn_context.model_info,
+        features: &sanitize_features,
+        web_search_mode: Some(sanitize_web_search_mode),
+    });
+
+    let otel_manager = parent_turn_context
+        .otel_manager
+        .clone()
+        .with_model(
+            parent_turn_context.model_info.slug.as_str(),
+            parent_turn_context.model_info.slug.as_str(),
+        );
+
+    let mut per_turn_config = (*config).clone();
+    per_turn_config.model_reasoning_effort = Some(ReasoningEffortConfig::None);
+    per_turn_config.model_reasoning_summary = ReasoningSummaryConfig::None;
+    per_turn_config.features = sanitize_features.clone();
+    per_turn_config.web_search_mode = Some(sanitize_web_search_mode);
+    let reasoning_effort = per_turn_config.model_reasoning_effort;
+    let reasoning_summary = per_turn_config.model_reasoning_summary.clone();
+    let per_turn_config = Arc::new(per_turn_config);
+
+    let tc = Arc::new(TurnContext {
+        sub_id: sub_id.to_string(),
+        config: per_turn_config,
+        auth_manager: parent_turn_context.auth_manager.clone(),
+        model_info: parent_turn_context.model_info.clone(),
+        tools_config,
+        ghost_snapshot: parent_turn_context.ghost_snapshot.clone(),
+        developer_instructions: None,
+        compact_prompt: parent_turn_context.compact_prompt.clone(),
+        user_instructions: None,
+        collaboration_mode: parent_turn_context.collaboration_mode.clone(),
+        personality: parent_turn_context.personality,
+        approval_policy: parent_turn_context.approval_policy,
+        sandbox_policy: parent_turn_context.sandbox_policy.clone(),
+        windows_sandbox_level: parent_turn_context.windows_sandbox_level,
+        shell_environment_policy: parent_turn_context.shell_environment_policy.clone(),
+        cwd: parent_turn_context.cwd.clone(),
+        otel_manager,
+        provider: parent_turn_context.provider.clone(),
+        reasoning_effort,
+        reasoning_summary,
+        session_source: parent_turn_context.session_source.clone(),
+        features: parent_turn_context.features.clone(),
+        final_output_json_schema: None,
+        codex_linux_sandbox_exe: parent_turn_context.codex_linux_sandbox_exe.clone(),
+        tool_call_gate: Arc::new(ReadinessFlag::new()),
+        truncation_policy: parent_turn_context.model_info.truncation_policy.into(),
+        dynamic_tools: parent_turn_context.dynamic_tools.clone(),
+        turn_metadata_header: parent_turn_context.turn_metadata_header.clone(),
+    });
+
+    sess.spawn_task(tc, Vec::new(), SanitizeTask::new()).await;
 }
 
 fn skills_to_info(

@@ -4,7 +4,8 @@ Long Codex sessions can accumulate large tool outputs and reasoning. When you st
 window, you have two options:
 
 - Use `/compact` to summarize the session and drop older details.
-- Use `/sanitize` to prune first-turn reasoning (manual fallback when the model can't make progress near the context limit).
+- Use `/sanitize` to sanitize context (sub-agent that uses `manage_context` to reclaim space).
+- Use `/hygiene` to toggle automatic post-turn hygiene (deletes last-turn tool call/output history, updates `<tool_context>`, and consolidates reasoning into `<reasoning_context>`).
 - Use `manage_context` for targeted pruning: selectively include/exclude/delete history items, replace very large tool
   outputs/reasoning with a short distilled summary, and add pinned notes that should stay visible across turns.
 
@@ -21,22 +22,16 @@ Start cheap:
 {"mode":"retrieve"}
 ```
 
-If you need targets, ask for a bounded items list:
+Prefer targeting from the summary (`breakdown.top_calls` / `breakdown.top_included_items`). If you can't identify what to prune without pulling full item lists, prefer `/compact` over expanding context.
 
-```json
-{"mode":"retrieve","include_items":true,"max_items":200,"include_pairs":true}
-```
-
-#### Apply operations (dry-run recommended)
+#### Apply operations
 
 ```json
 {
   "mode":"apply",
   "snapshot_id":"<from retrieve>",
-  "dry_run":true,
-  "include_prompt_preview": true,
   "ops":[
-    {"op":"replace","targets":{"call_ids":["call_123"]},"text":"Key results: ..."},
+    {"op":"replace","targets":{"ids":["call_123"]},"text":"Key results: ..."},
     {"op":"exclude","targets":{"ids":["r10","r11"]}},
     {"op":"add_note","notes":["Decision: ...","Constraint: ...","Next: ..."]}
   ]
@@ -49,6 +44,7 @@ The `apply` response includes `token_usage` (a best-effort estimate) so you can 
 ### Supported ops
 
 - `include`, `exclude`, `include_all`
-- `delete` (cascade is `tool_outputs`)
+- `consolidate_reasoning` (extract included reasoning summaries under `extracted.reasoning.items` and exclude the original reasoning items)
+- `delete` (deletes targeted items; tool call/output pairs are removed together)
 - `replace` (tool outputs + reasoning only), `clear_replace`, `clear_replace_all`
 - `add_note`, `remove_note`, `clear_notes`

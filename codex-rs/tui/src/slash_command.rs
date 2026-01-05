@@ -27,6 +27,7 @@ pub enum SlashCommand {
     Init,
     Compact,
     Sanitize,
+    Hygiene,
     Plan,
     Collab,
     Agent,
@@ -56,9 +57,8 @@ impl SlashCommand {
             SlashCommand::New => "start a new chat during a conversation",
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
-            SlashCommand::Sanitize => {
-                "prune first-turn reasoning to recover context (manual fallback)"
-            }
+            SlashCommand::Sanitize => "sanitize context using manage_context (sub-agent)",
+            SlashCommand::Hygiene => "toggle automatic context hygiene after each turn",
             SlashCommand::Review => "review my current changes and find issues",
             SlashCommand::Rename => "rename the current thread",
             SlashCommand::Resume => "resume a saved chat",
@@ -112,6 +112,7 @@ impl SlashCommand {
             | SlashCommand::Init
             | SlashCommand::Compact
             | SlashCommand::Sanitize
+            | SlashCommand::Hygiene
             // | SlashCommand::Undo
             | SlashCommand::Model
             | SlashCommand::Personality

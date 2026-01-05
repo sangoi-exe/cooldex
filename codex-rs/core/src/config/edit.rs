@@ -1,3 +1,4 @@
+use crate::config::AUTO_SANITIZE_CONFIG_KEY;
 use crate::config::CONFIG_TOML_FILE;
 use crate::config::types::McpServerConfig;
 use crate::config::types::Notice;
@@ -27,6 +28,8 @@ pub enum ConfigEdit {
     },
     /// Update the active (or default) model personality.
     SetModelPersonality { personality: Option<Personality> },
+    /// Toggle automatic context hygiene after turns (scoped to the active profile when set).
+    SetAutoSanitize(bool),
     /// Toggle the acknowledgement flag under `[notice]`.
     SetNoticeHideFullAccessWarning(bool),
     /// Toggle the Windows world-writable directories warning acknowledgement flag.
@@ -302,6 +305,9 @@ impl ConfigDocument {
                 &["personality"],
                 personality.map(|personality| value(personality.to_string())),
             )),
+            ConfigEdit::SetAutoSanitize(enabled) => {
+                Ok(self.write_value(Scope::Profile, &[AUTO_SANITIZE_CONFIG_KEY], value(*enabled)))
+            }
             ConfigEdit::SetNoticeHideFullAccessWarning(acknowledged) => Ok(self.write_value(
                 Scope::Global,
                 &[Notice::TABLE_KEY, "hide_full_access_warning"],
@@ -746,8 +752,12 @@ impl ConfigEditsBuilder {
     }
 
     pub fn set_personality(mut self, personality: Option<Personality>) -> Self {
-        self.edits
-            .push(ConfigEdit::SetModelPersonality { personality });
+        self.edits.push(ConfigEdit::SetModelPersonality { personality });
+        self
+    }
+
+    pub fn set_auto_sanitize_enabled(mut self, enabled: bool) -> Self {
+        self.edits.push(ConfigEdit::SetAutoSanitize(enabled));
         self
     }
 

@@ -1939,6 +1939,35 @@ impl App {
                     }
                 }
             }
+            AppEvent::PersistAutoSanitize { enabled } => {
+                let profile = self.active_profile.as_deref();
+                match ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_profile(profile)
+                    .set_auto_sanitize_enabled(enabled)
+                    .apply()
+                    .await
+                {
+                    Ok(()) => {
+                        let mut message = if enabled {
+                            "Enabled context hygiene (auto cleanup after each turn).".to_string()
+                        } else {
+                            "Disabled context hygiene (auto cleanup after each turn).".to_string()
+                        };
+                        if let Some(profile) = profile {
+                            message.push_str(" (");
+                            message.push_str(profile);
+                            message.push(')');
+                        }
+                        self.chat_widget.add_info_message(message, None);
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to persist auto sanitize toggle");
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to save context hygiene preference: {err}"
+                        ));
+                    }
+                }
+            }
             AppEvent::UpdateAskForApprovalPolicy(policy) => {
                 self.runtime_approval_policy_override = Some(policy);
                 if let Err(err) = self.config.approval_policy.set(policy) {

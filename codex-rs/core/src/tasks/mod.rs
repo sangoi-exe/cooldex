@@ -2,6 +2,7 @@ mod compact;
 mod ghost_snapshot;
 mod regular;
 mod review;
+mod sanitize;
 mod undo;
 mod user_shell;
 
@@ -13,6 +14,7 @@ use tokio::select;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
+use tracing::debug;
 use tracing::Instrument;
 use tracing::Span;
 use tracing::trace;
@@ -21,25 +23,42 @@ use tracing::warn;
 use crate::AuthManager;
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::config;
 use crate::models_manager::manager::ModelsManager;
+use crate::protocol::ContextInclusionItem;
+use crate::protocol::ContextOverlayItem;
+use crate::protocol::ContextOverlayReplacement;
 use crate::protocol::EventMsg;
+use crate::protocol::REASONING_CONTEXT_CLOSE_TAG;
+use crate::protocol::REASONING_CONTEXT_OPEN_TAG;
+use crate::protocol::TOOL_CONTEXT_CLOSE_TAG;
+use crate::protocol::TOOL_CONTEXT_OPEN_TAG;
 use crate::protocol::TurnAbortReason;
 use crate::protocol::TurnAbortedEvent;
 use crate::protocol::TurnCompleteEvent;
+use crate::rid;
 use crate::session_prefix::TURN_ABORTED_OPEN_TAG;
 use crate::state::ActiveTurn;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
+use crate::truncate::TruncationPolicy;
+use crate::truncate::truncate_text;
+use crate::user_instructions::SkillInstructions;
+use crate::user_instructions::UserInstructions;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::WebSearchAction;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::user_input::UserInput;
+use serde_json::Value as JsonValue;
 
 pub(crate) use compact::CompactTask;
 pub(crate) use ghost_snapshot::GhostSnapshotTask;
 pub(crate) use regular::RegularTask;
 pub(crate) use review::ReviewTask;
+pub(crate) use sanitize::SanitizeTask;
 pub(crate) use undo::UndoTask;
 pub(crate) use user_shell::UserShellCommandMode;
 pub(crate) use user_shell::UserShellCommandTask;
@@ -189,20 +208,25 @@ impl Session {
         turn_context: Arc<TurnContext>,
         last_agent_message: Option<String>,
     ) {
-        let mut active = self.active_turn.lock().await;
+        let mut finished_kind = None;
         let mut pending_input = Vec::<ResponseInputItem>::new();
         let mut should_close_processes = false;
-        if let Some(at) = active.as_mut()
-            && at.remove_task(&turn_context.sub_id)
+
         {
-            let mut ts = at.turn_state.lock().await;
-            pending_input = ts.take_pending_input();
-            should_close_processes = true;
+            let mut active = self.active_turn.lock().await;
+            if let Some(at) = active.as_mut()
+                && let Some(task) = at.remove_task(&turn_context.sub_id)
+            {
+                finished_kind = Some(task.kind);
+                should_close_processes = at.tasks.is_empty();
+                if should_close_processes {
+                    let mut ts = at.turn_state.lock().await;
+                    pending_input = ts.take_pending_input();
+                    *active = None;
+                }
+            }
         }
-        if should_close_processes {
-            *active = None;
-        }
-        drop(active);
+
         if !pending_input.is_empty() {
             let pending_response_items = pending_input
                 .into_iter()
@@ -214,8 +238,24 @@ impl Session {
         if should_close_processes {
             self.close_unified_exec_processes().await;
         }
+
+        let should_auto_hygiene =
+            finished_kind == Some(TaskKind::Regular) && last_agent_message.is_some();
         let event = EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message });
         self.send_event(turn_context.as_ref(), event).await;
+
+        if should_auto_hygiene {
+            let cfg = turn_context.client.config();
+            if config::auto_sanitize_enabled(&cfg.codex_home, cfg.active_profile.as_deref()) {
+                let sess = Arc::clone(self);
+                tokio::spawn(async move {
+                    if sess.active_turn.lock().await.is_some() {
+                        return;
+                    }
+                    run_context_hygiene_pass(sess).await;
+                });
+            }
+        }
     }
 
     async fn register_new_active_task(&self, task: RunningTask) {
@@ -293,6 +333,444 @@ impl Session {
         let event = EventMsg::TurnAborted(TurnAbortedEvent { reason });
         self.send_event(task.turn_context.as_ref(), event).await;
     }
+}
+
+async fn run_context_hygiene_pass(sess: Arc<Session>) {
+    let mut rollout_items = Vec::new();
+
+    {
+        let mut state = sess.state_lock().await;
+        let (items, rids) = state.history_snapshot_with_rids_lenient();
+
+        let Some(last_user_idx) = last_user_message_index(&items) else {
+            return;
+        };
+        let Some(last_assistant_idx) = last_assistant_message_index(&items) else {
+            return;
+        };
+        if last_user_idx >= last_assistant_idx {
+            return;
+        }
+
+        // Build a tool-context summary from the tool calls in the last turn.
+        let (tool_summaries, tool_indices) =
+            summarize_tool_calls(&items, last_user_idx + 1..last_assistant_idx);
+
+        // Consolidate included reasoning into a single note and exclude originals.
+        let mut included_reasoning_indices = Vec::new();
+        let mut included_reasoning_rids = Vec::new();
+        for item in state.build_context_items_event().items {
+            if item.category != crate::state::PruneCategory::Reasoning || !item.included {
+                continue;
+            }
+            included_reasoning_indices.push(item.index);
+            if let Some(id) = item.id.as_deref()
+                && let Some(rid) = crate::rid::parse_rid(id)
+            {
+                included_reasoning_rids.push(rid);
+            }
+        }
+
+        if tool_indices.is_empty() && included_reasoning_indices.is_empty() {
+            return;
+        }
+
+        let tool_note = upsert_tagged_note(
+            state.context_overlay_snapshot().notes.as_slice(),
+            TOOL_CONTEXT_OPEN_TAG,
+            TOOL_CONTEXT_CLOSE_TAG,
+            tool_summaries.as_slice(),
+            TruncationPolicy::Tokens(1_024),
+        );
+
+        let reasoning_note = if !included_reasoning_indices.is_empty() {
+            let reasoning_note = build_reasoning_context_note(
+                &items,
+                &rids,
+                &included_reasoning_rids,
+                TruncationPolicy::Tokens(1_024),
+            );
+            state.set_context_inclusion(&included_reasoning_indices, false);
+            Some(reasoning_note)
+        } else {
+            None
+        };
+
+        // Upsert notes (keep other notes intact).
+        if let Some(tool_note) = tool_note {
+            remove_notes_with_prefix(&mut state, TOOL_CONTEXT_OPEN_TAG);
+            state.add_context_notes(vec![tool_note]);
+        }
+        if let Some(reasoning_note) = reasoning_note {
+            remove_notes_with_prefix(&mut state, REASONING_CONTEXT_OPEN_TAG);
+            state.add_context_notes(vec![reasoning_note]);
+        }
+
+        // Delete tool calls + outputs from the last turn (cascade by call_id).
+        let prune = state.prune_by_indices_lenient(tool_indices);
+
+        // Persist inclusion/deletion changes.
+        let after_ev = state.build_context_items_event();
+        let mut included_indices = Vec::new();
+        let mut included_ids = Vec::new();
+        for item in &after_ev.items {
+            if item.included {
+                included_indices.push(item.index);
+                if let Some(id) = item.id.as_deref() {
+                    included_ids.push(id.to_string());
+                }
+            }
+        }
+
+        if !prune.deleted_rids.is_empty() || !included_reasoning_indices.is_empty() {
+            let deleted_ids = prune
+                .deleted_rids
+                .iter()
+                .copied()
+                .map(rid::rid_to_string)
+                .collect();
+            rollout_items.push(crate::protocol::RolloutItem::ContextInclusion(
+                ContextInclusionItem {
+                    included_indices,
+                    included_ids,
+                    deleted_indices: Vec::new(),
+                    deleted_ids,
+                },
+            ));
+        }
+
+        // Persist overlay (notes).
+        let overlay = state.context_overlay_snapshot();
+        let mut replacements = Vec::new();
+        for (rid, text) in &overlay.replacements_by_rid {
+            replacements.push(ContextOverlayReplacement {
+                id: rid::rid_to_string(*rid),
+                text: text.clone(),
+            });
+        }
+        rollout_items.push(crate::protocol::RolloutItem::ContextOverlay(
+            ContextOverlayItem {
+                replacements,
+                notes: overlay.notes,
+            },
+        ));
+
+        debug!(
+            deleted = prune.deleted_rids.len(),
+            "auto hygiene deleted tool items"
+        );
+
+        prune
+    };
+
+    if !rollout_items.is_empty() {
+        sess.persist_rollout_items(&rollout_items).await;
+    }
+}
+
+fn last_user_message_index(items: &[ResponseItem]) -> Option<usize> {
+    items.iter().enumerate().rev().find_map(|(idx, item)| {
+        let ResponseItem::Message { role, content, .. } = item else {
+            return None;
+        };
+        if role != "user" {
+            return None;
+        }
+        if UserInstructions::is_user_instructions(content)
+            || SkillInstructions::is_skill_instructions(content)
+        {
+            return None;
+        }
+        if is_environment_context_message(content) {
+            return None;
+        }
+        Some(idx)
+    })
+}
+
+fn last_assistant_message_index(items: &[ResponseItem]) -> Option<usize> {
+    items
+        .iter()
+        .rposition(|item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"))
+}
+
+fn is_environment_context_message(content: &[ContentItem]) -> bool {
+    let Some(text) = first_text(content) else {
+        return false;
+    };
+    text.trim()
+        .get(..crate::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG.len())
+        .is_some_and(|head| {
+            head.eq_ignore_ascii_case(crate::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG)
+        })
+}
+
+fn first_text(content: &[ContentItem]) -> Option<&str> {
+    content.iter().find_map(|item| match item {
+        ContentItem::InputText { text } | ContentItem::OutputText { text } => Some(text.as_str()),
+        ContentItem::InputImage { .. } => None,
+    })
+}
+
+fn summarize_tool_calls(
+    items: &[ResponseItem],
+    range: std::ops::Range<usize>,
+) -> (Vec<String>, Vec<usize>) {
+    let mut summaries = Vec::new();
+    let mut indices = Vec::new();
+
+    for idx in range {
+        let Some(item) = items.get(idx) else {
+            continue;
+        };
+        match item {
+            ResponseItem::FunctionCall {
+                name, arguments, ..
+            } => {
+                indices.push(idx);
+                if let Some(summary) = summarize_function_call(name, arguments) {
+                    summaries.push(summary);
+                }
+            }
+            ResponseItem::CustomToolCall { name, input, .. } => {
+                indices.push(idx);
+                summaries.push(summarize_custom_tool_call(name, input));
+            }
+            ResponseItem::LocalShellCall { action, .. } => {
+                indices.push(idx);
+                summaries.push(summarize_local_shell_call(action));
+            }
+            ResponseItem::WebSearchCall { action, .. } => {
+                indices.push(idx);
+                summaries.push(summarize_web_search_call(action));
+            }
+            ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. } => {
+                indices.push(idx);
+            }
+            _ => {}
+        }
+    }
+
+    summaries.sort();
+    summaries.dedup();
+    indices.sort_unstable();
+    indices.dedup();
+
+    (summaries, indices)
+}
+
+fn summarize_function_call(name: &str, arguments: &str) -> Option<String> {
+    match name {
+        "exec_command" => {
+            let JsonValue::Object(obj) = serde_json::from_str(arguments).ok()? else {
+                return Some("exec_command".to_string());
+            };
+            let cmd = obj.get("cmd").and_then(JsonValue::as_str).unwrap_or("");
+            if cmd.trim().is_empty() {
+                Some("exec_command".to_string())
+            } else {
+                Some(format!("exec_command: {}", cmd.trim()))
+            }
+        }
+        "apply_patch" => {
+            let files = patch_touched_files(arguments);
+            if files.is_empty() {
+                Some("apply_patch".to_string())
+            } else {
+                Some(format!("apply_patch: {}", files.join(", ")))
+            }
+        }
+        other => Some(other.to_string()),
+    }
+}
+
+fn summarize_custom_tool_call(name: &str, input: &str) -> String {
+    match name {
+        "apply_patch" => {
+            let files = patch_touched_files(input);
+            if files.is_empty() {
+                "apply_patch".to_string()
+            } else {
+                format!("apply_patch: {}", files.join(", "))
+            }
+        }
+        other => format!("custom_tool: {other}"),
+    }
+}
+
+fn summarize_local_shell_call(action: &LocalShellAction) -> String {
+    match action {
+        LocalShellAction::Exec(exec) => {
+            if exec.command.is_empty() {
+                "local_shell".to_string()
+            } else {
+                format!("local_shell: {}", exec.command.join(" "))
+            }
+        }
+    }
+}
+
+fn summarize_web_search_call(action: &WebSearchAction) -> String {
+    match action {
+        WebSearchAction::Search { query } => {
+            if let Some(query) = query.as_deref()
+                && !query.trim().is_empty()
+            {
+                format!("web_search: {}", query.trim())
+            } else {
+                "web_search".to_string()
+            }
+        }
+        WebSearchAction::OpenPage { url } => {
+            if let Some(url) = url.as_deref()
+                && !url.trim().is_empty()
+            {
+                format!("web_search_open: {}", url.trim())
+            } else {
+                "web_search_open".to_string()
+            }
+        }
+        WebSearchAction::FindInPage { url, pattern } => {
+            let url = url.as_deref().unwrap_or("").trim();
+            let pattern = pattern.as_deref().unwrap_or("").trim();
+            if !url.is_empty() && !pattern.is_empty() {
+                format!("web_search_find: {pattern} in {url}")
+            } else if !pattern.is_empty() {
+                format!("web_search_find: {pattern}")
+            } else if !url.is_empty() {
+                format!("web_search_find in {url}")
+            } else {
+                "web_search_find".to_string()
+            }
+        }
+        WebSearchAction::Other => "web_search".to_string(),
+    }
+}
+
+fn patch_touched_files(patch: &str) -> Vec<String> {
+    const PREFIXES: [&str; 4] = [
+        "*** Update File: ",
+        "*** Add File: ",
+        "*** Delete File: ",
+        "*** Move to: ",
+    ];
+
+    let mut files = Vec::new();
+    for line in patch.lines() {
+        let line = line.trim();
+        if let Some(prefix) = PREFIXES.iter().find(|prefix| line.starts_with(**prefix)) {
+            let path = line.trim_start_matches(*prefix).trim();
+            if !path.is_empty() {
+                files.push(path.to_string());
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn upsert_tagged_note(
+    notes: &[String],
+    open_tag: &str,
+    close_tag: &str,
+    new_lines: &[String],
+    policy: TruncationPolicy,
+) -> Option<String> {
+    if new_lines.is_empty() {
+        return None;
+    }
+
+    let mut existing_body = notes
+        .iter()
+        .find_map(|note| extract_tagged_body(note, open_tag, close_tag))
+        .unwrap_or_default();
+
+    if !existing_body.trim().is_empty() {
+        existing_body.push_str("\n\n");
+    }
+
+    existing_body.push_str("Turn tools:\n");
+    for line in new_lines {
+        existing_body.push_str("- ");
+        existing_body.push_str(line.trim());
+        existing_body.push('\n');
+    }
+
+    let body = truncate_text(existing_body.trim(), policy);
+    Some(format!("{open_tag}\n{body}\n{close_tag}"))
+}
+
+fn extract_tagged_body(note: &str, open_tag: &str, close_tag: &str) -> Option<String> {
+    let trimmed = note.trim();
+    if !trimmed.starts_with(open_tag) {
+        return None;
+    }
+    let without_open = trimmed.trim_start_matches(open_tag).trim();
+    let body = without_open
+        .strip_suffix(close_tag)
+        .unwrap_or(without_open)
+        .trim();
+    Some(body.to_string())
+}
+
+fn remove_notes_with_prefix(state: &mut crate::state::SessionState, open_tag: &str) {
+    let indices: Vec<usize> = state
+        .context_overlay_snapshot()
+        .notes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, note)| {
+            if note.trim().starts_with(open_tag) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if indices.is_empty() {
+        return;
+    }
+    state.remove_context_notes(&indices);
+}
+
+fn build_reasoning_context_note(
+    snapshot_items: &[ResponseItem],
+    snapshot_rids: &[u64],
+    included_reasoning_rids: &[u64],
+    policy: TruncationPolicy,
+) -> String {
+    let rid_set: std::collections::HashSet<u64> = included_reasoning_rids.iter().copied().collect();
+    let mut parts: Vec<String> = Vec::new();
+
+    for (item, rid) in snapshot_items.iter().zip(snapshot_rids.iter().copied()) {
+        if !rid_set.contains(&rid) {
+            continue;
+        }
+        let ResponseItem::Reasoning { summary, .. } = item else {
+            continue;
+        };
+        for entry in summary {
+            let codex_protocol::models::ReasoningItemReasoningSummary::SummaryText { text } = entry;
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            parts.push(trimmed.to_string());
+        }
+    }
+
+    let body = if parts.is_empty() {
+        "No reasoning summaries found.".to_string()
+    } else {
+        parts.join("\n\n")
+    };
+
+    let truncated = truncate_text(&body, policy);
+    format!(
+        "{REASONING_CONTEXT_OPEN_TAG}\n{}\n{REASONING_CONTEXT_CLOSE_TAG}",
+        truncated.trim()
+    )
 }
 
 #[cfg(test)]

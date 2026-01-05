@@ -28,7 +28,6 @@ use serde::Deserialize;
 use serde_json::json;
 use sha1::Digest;
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -37,6 +36,7 @@ const DEFAULT_MAX_TOP_ITEMS: usize = 10;
 pub struct ManageContextHandler;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManageContextToolArgs {
     #[serde(default)]
     mode: Option<String>,
@@ -49,20 +49,17 @@ struct ManageContextToolArgs {
     ops: Vec<ManageContextOp>,
 
     #[serde(default)]
-    dry_run: bool,
-    #[serde(default)]
     include_prompt_preview: Option<bool>,
     #[serde(default)]
     allow_recent: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManageContextOp {
     op: String,
     #[serde(default)]
     targets: Option<ManageContextTargets>,
-    #[serde(default)]
-    cascade: Option<String>,
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
@@ -72,13 +69,10 @@ struct ManageContextOp {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManageContextTargets {
     #[serde(default)]
     ids: Vec<String>,
-    #[serde(default)]
-    indices: Vec<usize>,
-    #[serde(default)]
-    call_ids: Vec<String>,
 }
 
 #[async_trait]
@@ -127,7 +121,6 @@ async fn handle_manage_context(
     match args.mode.as_deref() {
         Some("retrieve") => return handle_retrieve(session, turn, args).await,
         Some("apply") => return handle_apply(session, turn, args).await,
-        Some("help") => return Ok(ManageContextResult { json: help_json() }),
         Some(other) => {
             return Err(FunctionCallError::RespondToModel(format!(
                 "unknown manage_context mode: {other}"
@@ -136,47 +129,10 @@ async fn handle_manage_context(
         None => {}
     }
 
-    if args.max_top_items.is_some()
-        || args.snapshot_id.is_some()
-        || !args.ops.is_empty()
-        || args.dry_run
-        || args.include_prompt_preview.is_some()
-        || args.allow_recent.is_some()
-    {
-        return Err(FunctionCallError::RespondToModel(
-            "manage_context requires mode: retrieve | apply | help".to_string(),
-        ));
-    }
-
-    Ok(ManageContextResult { json: help_json() })
-}
-
-fn help_json() -> serde_json::Value {
-    json!({
-        "mode": "help",
-        "summary": [
-            "manage_context is an internal tool for the agent to keep long sessions healthy without /compact.",
-            "Preferred flow: mode=retrieve (snapshot) then mode=apply (atomic ops) using snapshot_id (anti-drift)."
-        ],
-        "rules": [
-            "replace is allowed ONLY for ToolOutput and Reasoning (never user/assistant messages).",
-            "delete is destructive; deleting a tool call also deletes its outputs.",
-            "If snapshot_id mismatches, re-run retrieve and retry apply."
-        ],
-        "tip": "Start with retrieve() to get breakdown + top offenders without bloating context.",
-        "example_retrieve": {
-            "mode": "retrieve",
-        },
-        "example_apply": {
-            "mode": "apply",
-            "snapshot_id": "<from retrieve>",
-            "ops": [
-                {"op":"replace","targets":{"call_ids":["call_123"]},"text":"Key results: ..."},
-                {"op":"exclude","targets":{"indices":[0,1,2]}},
-                {"op":"add_note","notes":["Decision: ...","Constraint: ..."]}
-            ]
-        }
-    })
+    let _ = (session, turn);
+    Err(FunctionCallError::RespondToModel(
+        "manage_context requires mode: retrieve | apply".to_string(),
+    ))
 }
 
 async fn handle_retrieve(
@@ -217,11 +173,62 @@ async fn handle_retrieve(
         "context_left_percent": context_left_percent,
     }));
 
+    let included_reasoning = summaries
+        .iter()
+        .filter(|item| item.category == PruneCategory::Reasoning && item.included)
+        .count();
+
+    let mut header_lines = vec![
+        "Counts in breakdown include excluded transcript items; use included_items + approx_bytes.effective to see what is currently in the prompt."
+            .to_string(),
+        "Targets: use targets.ids with RID(s) like r42 and/or tool call_id(s) like call_123; prefer call_id for tool call/output pairs (for replace, call_id selects outputs).".to_string(),
+        "Safety: replace only tool outputs + reasoning (never user/assistant messages).".to_string(),
+        "Protected: <environment_context> and user instructions are protected and cannot be excluded/deleted."
+            .to_string(),
+        "Workflow: retrieve → apply → retrieve; use snapshot_id from retrieve; if snapshot mismatch, retrieve again."
+            .to_string(),
+        "Preference: replace > exclude > delete; exclude low-value bulk by call_id when needed."
+            .to_string(),
+    ];
+
+    if let Some(percent) = context_left_percent {
+        if percent >= 80 {
+            header_lines
+                .push(format!("Context left: {percent}% (>=80%). Cleanup usually unnecessary; skip apply unless user asked."));
+        } else if percent <= 10 {
+            header_lines.push(format!(
+                "Context left: {percent}% (<=10%). EMERGENCY: stop and run apply now (prioritize consolidate_reasoning, replace top offenders, add a 3-line note: Decision/State/Next)."
+            ));
+        }
+    }
+
+    let mut header: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    if included_reasoning > 0 {
+        header_lines.push(
+            "Reasoning: run consolidate_reasoning to extract ALL included reasoning summaries (returned under extracted.reasoning.items) and exclude originals; then add your own <reasoning_context> note with the few key findings."
+                .to_string(),
+        );
+        header_lines.push(
+            "If you only need outcomes, add a short pinned note with the key decisions/constraints/next steps and avoid keeping raw reasoning."
+                .to_string(),
+        );
+        header.insert(
+            "suggested_apply".to_string(),
+            json!({
+                "mode": "apply",
+                "snapshot_id": snapshot_id,
+                "ops": [{"op":"consolidate_reasoning"}],
+            }),
+        );
+    }
+    header.insert("notes".to_string(), json!(header_lines));
+
     Ok(ManageContextResult {
         json: json!({
             "mode": "retrieve",
             "snapshot_id": snapshot_id,
             "token_usage": token_usage,
+            "header": header,
             "breakdown": breakdown,
             "notes": overlay.notes,
         }),
@@ -241,9 +248,8 @@ async fn handle_apply(
 
     let mut rollout_items: Vec<RolloutItem> = Vec::new();
 
-    let (apply_result, new_snapshot_id, prompt_items, context_window) = {
+    let (apply_result, new_snapshot_id, prompt_items, context_window, extracted) = {
         let mut state = session.state_lock().await;
-        let session_configuration = state.session_configuration.clone();
         let before_ev = state.build_context_items_event();
         let before_overlay = state.context_overlay_snapshot();
         let snapshot_items = state.history_snapshot_lenient();
@@ -266,50 +272,14 @@ async fn handle_apply(
         } else {
             recent_message_rids(&snapshot_items, &snapshot_rids)
         };
-        let resolved_ops = resolve_ops(
+        let (resolved_ops, extracted) = resolve_ops(
+            &before_ev,
             &snapshot_items,
             &snapshot_rids,
             &args.ops,
             &protected_rids,
             &protected_recent_rids,
         )?;
-
-        if args.dry_run {
-            let include_prompt_preview = args.include_prompt_preview.unwrap_or(false);
-            let context_window = state
-                .token_info()
-                .and_then(|info| info.model_context_window)
-                .or(turn.client.get_model_context_window());
-            let outcome = simulate_apply(
-                turn,
-                context_window,
-                SimulateApplyParams {
-                    session_configuration: &session_configuration,
-                    snapshot_summaries: &before_ev,
-                    snapshot_items: &snapshot_items,
-                    snapshot_rids: &snapshot_rids,
-                    snapshot_overlay: &before_overlay,
-                    ops: &resolved_ops,
-                    include_prompt_preview,
-                },
-            )?;
-            let (context_window, context_left_percent, tokens_in_context) = outcome.token_window;
-            return Ok(ManageContextResult {
-                json: json!({
-                    "mode": "apply",
-                    "dry_run": true,
-                    "ok": true,
-                    "applied": outcome.applied,
-                    "new_snapshot_id": outcome.new_snapshot_id,
-                    "token_usage": {
-                        "model_context_window": context_window,
-                        "tokens_in_context": tokens_in_context,
-                        "context_left_percent": context_left_percent,
-                    },
-                    "prompt_preview": outcome.prompt_preview,
-                }),
-            });
-        }
 
         let (summary, include_changed, overlay_changed, deleted_rids) =
             apply_resolved_ops(&mut state, &resolved_ops)?;
@@ -341,7 +311,13 @@ async fn handle_apply(
             .token_info()
             .and_then(|info| info.model_context_window)
             .or(turn.client.get_model_context_window());
-        (summary, new_snapshot_id, prompt_items, context_window)
+        (
+            summary,
+            new_snapshot_id,
+            prompt_items,
+            context_window,
+            extracted,
+        )
     };
 
     if !rollout_items.is_empty() {
@@ -360,10 +336,10 @@ async fn handle_apply(
     Ok(ManageContextResult {
         json: json!({
             "mode": "apply",
-            "dry_run": false,
             "ok": true,
             "applied": apply_result,
             "new_snapshot_id": new_snapshot_id,
+            "extracted": extracted,
             "token_usage": {
                 "model_context_window": context_window,
                 "tokens_in_context": tokens_in_context,
@@ -1310,13 +1286,15 @@ fn context_overlay_rollout_item(overlay: &ContextOverlay) -> RolloutItem {
 }
 
 fn resolve_ops(
+    snapshot_summaries: &ContextItemsEvent,
     snapshot_items: &[ResponseItem],
     snapshot_rids: &[u64],
     ops: &[ManageContextOp],
     protected_rids: &HashSet<u64>,
     protected_recent_rids: &HashSet<u64>,
-) -> Result<Vec<ResolvedOp>, FunctionCallError> {
+) -> Result<(Vec<ResolvedOp>, serde_json::Value), FunctionCallError> {
     let mut resolved = Vec::with_capacity(ops.len());
+    let mut extracted_reasoning: Vec<serde_json::Value> = Vec::new();
 
     for (idx, op) in ops.iter().enumerate() {
         let op_index = idx + 1;
@@ -1362,15 +1340,7 @@ fn resolve_ops(
                 match op.op.as_str() {
                     "include" => resolved.push(ResolvedOp::Include { rids }),
                     "exclude" => resolved.push(ResolvedOp::Exclude { rids }),
-                    "delete" => {
-                        let cascade = op.cascade.as_deref().unwrap_or("tool_outputs");
-                        if cascade != "tool_outputs" {
-                            return Err(FunctionCallError::RespondToModel(format!(
-                                "op {op_index} (delete) only supports cascade=tool_outputs"
-                            )));
-                        }
-                        resolved.push(ResolvedOp::Delete { rids });
-                    }
+                    "delete" => resolved.push(ResolvedOp::Delete { rids }),
                     "replace" => {
                         let Some(text) = op.text.as_deref() else {
                             return Err(FunctionCallError::RespondToModel(format!(
@@ -1407,6 +1377,48 @@ fn resolve_ops(
                     _ => unreachable!(),
                 }
             }
+            "consolidate_reasoning" => {
+                let included_reasoning_rids =
+                    included_rids_for_category(snapshot_summaries, PruneCategory::Reasoning);
+                let included_reasoning_set: HashSet<u64> =
+                    included_reasoning_rids.iter().copied().collect();
+
+                let mut rids = if let Some(targets) = op.targets.as_ref() {
+                    resolve_target_rids(snapshot_items, snapshot_rids, targets)
+                        .into_iter()
+                        .filter(|rid| included_reasoning_set.contains(rid))
+                        .collect()
+                } else {
+                    included_reasoning_rids
+                };
+                rids.sort_unstable();
+                rids.dedup();
+
+                if rids.is_empty() {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "op {op_index} (consolidate_reasoning) found 0 included reasoning items"
+                    )));
+                }
+
+                for rid in &rids {
+                    if let Some(pos) = snapshot_rids.iter().position(|r| r == rid)
+                        && let Some(item) = snapshot_items.get(pos)
+                        && !matches!(item, ResponseItem::Reasoning { .. })
+                    {
+                        return Err(FunctionCallError::RespondToModel(format!(
+                            "op {op_index} (consolidate_reasoning) only supports reasoning items (id={})",
+                            rid_to_string(*rid)
+                        )));
+                    }
+                }
+
+                extracted_reasoning.extend(extract_reasoning_summaries(
+                    snapshot_items,
+                    snapshot_rids,
+                    &rids,
+                ));
+                resolved.push(ResolvedOp::Exclude { rids });
+            }
             "clear_replace_all" => resolved.push(ResolvedOp::ClearReplaceAll),
             "include_all" => resolved.push(ResolvedOp::IncludeAll),
             "add_note" => {
@@ -1438,7 +1450,67 @@ fn resolve_ops(
         }
     }
 
-    Ok(resolved)
+    let extracted = if extracted_reasoning.is_empty() {
+        serde_json::Value::Null
+    } else {
+        json!({
+            "reasoning": {
+                "items": extracted_reasoning,
+            },
+        })
+    };
+
+    Ok((resolved, extracted))
+}
+
+fn included_rids_for_category(ev: &ContextItemsEvent, category: PruneCategory) -> Vec<u64> {
+    let mut out = Vec::new();
+    for item in &ev.items {
+        if item.category != category || !item.included {
+            continue;
+        }
+        if let Some(id) = item.id.as_deref()
+            && let Some(rid) = parse_rid(id)
+        {
+            out.push(rid);
+        }
+    }
+    out
+}
+
+fn extract_reasoning_summaries(
+    snapshot_items: &[ResponseItem],
+    snapshot_rids: &[u64],
+    rids: &[u64],
+) -> Vec<serde_json::Value> {
+    let rid_set: HashSet<u64> = rids.iter().copied().collect();
+    let mut out: Vec<serde_json::Value> = Vec::new();
+
+    for (item, rid) in snapshot_items.iter().zip(snapshot_rids.iter().copied()) {
+        if !rid_set.contains(&rid) {
+            continue;
+        }
+        let ResponseItem::Reasoning { summary, .. } = item else {
+            continue;
+        };
+
+        let mut parts: Vec<&str> = Vec::new();
+        for entry in summary {
+            let codex_protocol::models::ReasoningItemReasoningSummary::SummaryText { text } = entry;
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            parts.push(trimmed);
+        }
+
+        out.push(json!({
+            "id": rid_to_string(rid),
+            "text": parts.join("\n"),
+        }));
+    }
+
+    out
 }
 
 fn validate_recent_rids(
@@ -1544,19 +1616,24 @@ fn resolve_target_rids(
 ) -> Vec<u64> {
     let mut out: Vec<u64> = Vec::new();
 
-    let mut call_set: HashSet<String> = targets.call_ids.iter().cloned().collect();
-
-    for &idx in &targets.indices {
-        if let Some(rid) = snapshot_rids.get(idx).copied() {
-            out.push(rid);
-        }
-    }
-
     for raw in &targets.ids {
-        if let Some(rid) = parse_rid(raw) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rid) = parse_rid(trimmed) {
             out.push(rid);
         }
     }
+
+    let mut call_set: HashSet<String> = targets
+        .ids
+        .iter()
+        .map(|raw| raw.trim())
+        .filter(|raw| !raw.is_empty())
+        .filter(|raw| parse_rid(raw).is_none())
+        .map(ToOwned::to_owned)
+        .collect();
 
     if !out.is_empty() {
         let mut rid_lookup: HashMap<u64, usize> = HashMap::new();
@@ -1693,25 +1770,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manage_context_no_args_returns_help() {
+    async fn manage_context_no_args_requires_mode() {
         let (session, turn) = crate::codex::make_session_and_context().await;
         let args: ManageContextToolArgs = serde_json::from_str("{}").expect("parse args");
+        let err = match handle_manage_context(&session, &turn, &args).await {
+            Ok(_) => panic!("expected error"),
+            Err(err) => err,
+        };
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("expected RespondToModel error");
+        };
+        assert!(
+            message.contains("mode: retrieve | apply"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manage_context_retrieve_includes_reasoning_hint_when_reasoning_included() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        {
+            let mut state = session.state_lock().await;
+            state.record_items(
+                [
+                    &user_message("u1"),
+                    &reasoning("r1"),
+                    &assistant_message("a1"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let args: ManageContextToolArgs =
+            serde_json::from_str(r#"{"mode":"retrieve"}"#).expect("parse args");
         let result = handle_manage_context(&session, &turn, &args)
             .await
             .expect("manage_context");
+
+        let header = result.json.get("header").expect("header");
+        let notes = header
+            .get("notes")
+            .and_then(serde_json::Value::as_array)
+            .expect("header.notes");
+        assert!(
+            notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|text| text.contains("consolidate_reasoning"))),
+            "expected header hint about consolidate_reasoning"
+        );
+
+        let suggested = header
+            .get("suggested_apply")
+            .expect("header.suggested_apply");
         assert_eq!(
-            result.json.get("mode").and_then(|v| v.as_str()),
-            Some("help")
+            suggested.get("mode").and_then(serde_json::Value::as_str),
+            Some("apply")
+        );
+        assert!(
+            suggested
+                .get("snapshot_id")
+                .is_some_and(serde_json::Value::is_string)
+        );
+        assert!(
+            suggested
+                .get("ops")
+                .is_some_and(serde_json::Value::is_array)
         );
     }
 
     #[tokio::test]
     async fn manage_context_apply_returns_token_usage() {
         let (session, turn) = crate::codex::make_session_and_context().await;
-        let args: ManageContextToolArgs = serde_json::from_str(
-            r#"{"mode":"apply","dry_run":true,"ops":[{"op":"add_note","notes":["x"]}]}"#,
-        )
-        .expect("parse args");
+        let args: ManageContextToolArgs =
+            serde_json::from_str(r#"{"mode":"apply","ops":[{"op":"add_note","notes":["x"]}]}"#)
+                .expect("parse args");
         let result = handle_manage_context(&session, &turn, &args)
             .await
             .expect("manage_context");
@@ -1719,13 +1851,6 @@ mod tests {
         assert_eq!(
             result.json.get("mode").and_then(|v| v.as_str()),
             Some("apply")
-        );
-        assert_eq!(
-            result
-                .json
-                .get("dry_run")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
         );
         assert!(
             result
@@ -1747,7 +1872,7 @@ mod tests {
     async fn manage_context_apply_prompt_preview_when_requested() {
         let (session, turn) = crate::codex::make_session_and_context().await;
         let args: ManageContextToolArgs = serde_json::from_str(
-            r#"{"mode":"apply","dry_run":true,"include_prompt_preview":true,"ops":[{"op":"add_note","notes":["x"]}]}"#,
+            r#"{"mode":"apply","include_prompt_preview":true,"ops":[{"op":"add_note","notes":["x"]}]}"#,
         )
         .expect("parse args");
         let result = handle_manage_context(&session, &turn, &args)
@@ -1778,7 +1903,7 @@ mod tests {
         }
 
         let args: ManageContextToolArgs = serde_json::from_str(
-            r#"{"mode":"apply","dry_run":true,"ops":[{"op":"exclude","targets":{"indices":[0]}}]}"#,
+            r#"{"mode":"apply","ops":[{"op":"exclude","targets":{"ids":["r0"]}}]}"#,
         )
         .expect("parse args");
         let err = match handle_manage_context(&session, &turn, &args).await {
@@ -1794,13 +1919,105 @@ mod tests {
         );
 
         let args: ManageContextToolArgs = serde_json::from_str(
-            r#"{"mode":"apply","dry_run":true,"allow_recent":true,"ops":[{"op":"exclude","targets":{"indices":[0]}}]}"#,
+            r#"{"mode":"apply","allow_recent":true,"ops":[{"op":"exclude","targets":{"ids":["r0"]}}]}"#,
         )
         .expect("parse args");
         let ok = handle_manage_context(&session, &turn, &args)
             .await
             .expect("manage_context");
         assert_eq!(ok.json.get("mode").and_then(|v| v.as_str()), Some("apply"));
+    }
+
+    #[tokio::test]
+    async fn manage_context_consolidate_reasoning_excludes_reasoning_and_returns_extracted() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        {
+            let mut state = session.state_lock().await;
+            state.record_items(
+                [
+                    &user_message("u1"),
+                    &reasoning("r1"),
+                    &assistant_message("a1"),
+                    &reasoning("r2"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let args: ManageContextToolArgs = serde_json::from_str(
+            r#"{"mode":"apply","include_prompt_preview":true,"ops":[{"op":"consolidate_reasoning"}]}"#,
+        )
+        .expect("parse args");
+        let result = handle_manage_context(&session, &turn, &args)
+            .await
+            .expect("manage_context");
+
+        assert_eq!(
+            result.json.get("mode").and_then(|v| v.as_str()),
+            Some("apply")
+        );
+        assert_eq!(
+            result
+                .json
+                .pointer("/applied/excluded")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            result
+                .json
+                .pointer("/applied/notes_added")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+
+        let extracted = result.json.get("extracted").expect("extracted");
+        let reasoning = extracted
+            .get("reasoning")
+            .expect("extracted.reasoning")
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .expect("extracted.reasoning.items");
+        assert_eq!(reasoning.len(), 2);
+        assert!(reasoning.iter().any(|item| {
+            item.get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains("r1"))
+        }));
+        assert!(reasoning.iter().any(|item| {
+            item.get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains("r2"))
+        }));
+
+        let preview = result.json.get("prompt_preview").expect("prompt_preview");
+        let text = preview
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .expect("prompt_preview.text");
+        assert!(!text.contains("<reasoning_context>"));
+        assert!(text.contains("user: u1"));
+        assert!(text.contains("assistant: a1"));
+        assert!(!text.contains("reasoning:"));
+    }
+
+    #[tokio::test]
+    async fn manage_context_consolidate_reasoning_errors_when_empty() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let args: ManageContextToolArgs =
+            serde_json::from_str(r#"{"mode":"apply","ops":[{"op":"consolidate_reasoning"}]}"#)
+                .expect("parse args");
+        let err = match handle_manage_context(&session, &turn, &args).await {
+            Ok(_) => panic!("expected error"),
+            Err(err) => err,
+        };
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("expected RespondToModel error");
+        };
+        assert!(
+            message.contains("consolidate_reasoning"),
+            "unexpected message: {message}"
+        );
     }
 
     #[test]
@@ -2188,31 +2405,34 @@ fn resolve_target_rids_for_replace(
 ) -> Vec<u64> {
     let mut out: Vec<u64> = Vec::new();
 
-    for &idx in &targets.indices {
-        if let Some(rid) = snapshot_rids.get(idx).copied() {
-            out.push(rid);
-        }
-    }
-
     for raw in &targets.ids {
-        if let Some(rid) = parse_rid(raw) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rid) = parse_rid(trimmed) {
             out.push(rid);
         }
     }
 
-    if !targets.call_ids.is_empty() {
-        let call_set: HashSet<&str> = targets.call_ids.iter().map(String::as_str).collect();
-        for (idx, item) in snapshot_items.iter().enumerate() {
-            let call_id = match item {
-                ResponseItem::FunctionCallOutput { call_id, .. }
-                | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
-                _ => None,
-            };
-            if call_id.is_some_and(|cid| call_set.contains(cid))
-                && let Some(rid) = snapshot_rids.get(idx).copied()
-            {
-                out.push(rid);
-            }
+    let call_set: HashSet<&str> = targets
+        .ids
+        .iter()
+        .map(|raw| raw.trim())
+        .filter(|raw| !raw.is_empty())
+        .filter(|raw| parse_rid(raw).is_none())
+        .collect();
+
+    for (idx, item) in snapshot_items.iter().enumerate() {
+        let call_id = match item {
+            ResponseItem::FunctionCallOutput { call_id, .. }
+            | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        };
+        if call_id.is_some_and(|cid| call_set.contains(cid))
+            && let Some(rid) = snapshot_rids.get(idx).copied()
+        {
+            out.push(rid);
         }
     }
 
@@ -2233,65 +2453,6 @@ enum ResolvedOp {
     AddNote { notes: Vec<String> },
     RemoveNote { note_indices: Vec<usize> },
     ClearNotes,
-}
-
-struct SimulateApplyParams<'a> {
-    session_configuration: &'a crate::codex::SessionConfiguration,
-    snapshot_summaries: &'a ContextItemsEvent,
-    snapshot_items: &'a [ResponseItem],
-    snapshot_rids: &'a [u64],
-    snapshot_overlay: &'a ContextOverlay,
-    ops: &'a [ResolvedOp],
-    include_prompt_preview: bool,
-}
-
-struct SimulateApplyOutcome {
-    applied: serde_json::Value,
-    new_snapshot_id: String,
-    token_window: (Option<i64>, Option<i64>, Option<i64>),
-    prompt_preview: Option<serde_json::Value>,
-}
-
-fn simulate_apply(
-    turn_context: &TurnContext,
-    context_window: Option<i64>,
-    params: SimulateApplyParams<'_>,
-) -> Result<SimulateApplyOutcome, FunctionCallError> {
-    let mut temp = crate::state::SessionState::new(params.session_configuration.clone());
-    temp.replace_history_with_rids(
-        params.snapshot_items.to_vec(),
-        params.snapshot_rids.to_vec(),
-    );
-
-    let mut included: BTreeSet<usize> = BTreeSet::new();
-    for item in &params.snapshot_summaries.items {
-        if item.included {
-            included.insert(item.index);
-        }
-    }
-    temp.set_include_mask_from_rids(Some(included), params.snapshot_rids);
-    temp.set_context_overlay(params.snapshot_overlay.clone());
-
-    let (summary, _include_changed, _overlay_changed, _deleted_rids) =
-        apply_resolved_ops(&mut temp, params.ops)?;
-
-    let after_ev = temp.build_context_items_event();
-    let after_overlay = temp.context_overlay_snapshot();
-    let after_items = temp.history_snapshot_lenient();
-    let new_snapshot_id = snapshot_id_for_context(&after_ev, &after_overlay, &after_items);
-
-    let prompt_items = temp.prompt_snapshot_lenient();
-    let token_window = estimate_token_window(turn_context, context_window, &prompt_items);
-    let prompt_preview = params
-        .include_prompt_preview
-        .then(|| prompt_preview_json(&prompt_items));
-
-    Ok(SimulateApplyOutcome {
-        applied: summary,
-        new_snapshot_id,
-        token_window,
-        prompt_preview,
-    })
 }
 
 fn apply_resolved_ops(

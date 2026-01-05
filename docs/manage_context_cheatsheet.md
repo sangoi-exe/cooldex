@@ -7,11 +7,10 @@ Use this when you see context pressure (low "context left") and want targeted cl
 - Prefer `replace` over `delete`.
 - `replace` is allowed ONLY for: tool outputs + reasoning (never user/assistant messages).
 - Tool outputs may be prefixed with `Context left: NN%` (matches the footer; based on the last known token usage); treat it as an early-warning signal.
-- `include_items=true` can itself add a lot of text; start with `include_items=false` unless you need to target items.
 - Avoid touching protected items:
   - `<environment_context>...` (environment context)
   - user instructions (AGENTS.md block)
-- Prefer targeting by `call_id` to keep call/output pairs consistent.
+- Prefer targeting by tool `call_id` (pass it in `targets.ids`) to keep call/output pairs consistent.
 
 ## 1) Fast diagnosis (cheap)
 
@@ -19,12 +18,6 @@ Call `manage_context`:
 
 ```json
 {"mode":"retrieve"}
-```
-
-If context is tight, do a bounded inspect:
-
-```json
-{"mode":"retrieve","include_items":true,"max_items":200,"include_pairs":true}
 ```
 
 Look at:
@@ -35,63 +28,39 @@ Look at:
 
 ## 2) Preferred cleanup plan (order)
 
-1. `replace` the biggest tool outputs / reasoning with a short distilled summary
-2. `exclude` older low-value noise (use `call_ids` if possible)
-3. `add_note` with the few decisions/constraints that must stay visible
-4. `delete` only if necessary (prefer by `call_ids`)
+1. `consolidate_reasoning` when reasoning dominates (extract included reasoning summaries under `extracted.reasoning.items` and exclude the original reasoning items)
+2. `replace` the biggest tool outputs / reasoning with a short distilled summary
+3. `exclude` older low-value noise (target by tool `call_id` via `targets.ids` when possible)
+4. `add_note` with the few decisions/constraints that must stay visible
+5. `delete` only if necessary (prefer by tool `call_id` via `targets.ids`)
 
 ## 2a) Emergency: context_left ~0% (fastest win)
 
-If you're basically out of context, a high-leverage, reversible move is to **exclude all included `reasoning` items** (they can be hundreds of items and dwarf tool output).
-
-- Reversible: `include_all` brings them back.
-- Always follow up by setting a small `notes` block with the current state (repo, constraints, what's done, what's next).
-- This can recover a lot of space quickly (e.g. ~0% → ~70% in a long session).
-
-Pseudo-apply (agent/model computes the reasoning indices from `retrieve`):
+If you're basically out of context, do a single, high-leverage `apply` (replace the biggest tool outputs/reasoning from `breakdown.top_calls` / `breakdown.top_included_items`). If that doesn't recover enough space, prefer `/compact` over repeated `manage_context` cycles.
 
 ```json
 {
   "mode":"apply",
   "snapshot_id":"<from retrieve>",
   "ops":[
-    {"op":"exclude","targets":{"indices":[/* all included reasoning indices */]}},
-    {"op":"add_note","notes":[
-      "Repo: ...",
-      "Decision: ...",
-      "Constraint: ...",
-      "Next: ..."
-    ]}
+    {"op":"consolidate_reasoning"},
+    {"op":"replace","targets":{"ids":["call_123"]},"text":"Key results: ..."},
+    {"op":"replace","targets":{"ids":["r42"]},"text":"Conclusion: ..."},
+    {"op":"add_note","notes":["Decision: ...","State: ...","Next: ..."]}
   ]
 }
 ```
 
-## 3) Apply changes (v2, atomic + anti-drift)
+## 3) Apply changes (v2, atomic)
 
-Dry-run first:
-
-```json
-{
-  "mode":"apply",
-  "snapshot_id":"<from retrieve>",
-  "dry_run":true,
-  "include_prompt_preview": true,
-  "ops":[
-    {"op":"replace","targets":{"call_ids":["call_123"]},"text":"Key results: ..."},
-    {"op":"exclude","targets":{"ids":["r10","r11"]}},
-    {"op":"add_note","notes":["Decision: ...","Constraint: ...","Next: ..."]}
-  ]
-}
-```
-
-Then apply (same ops, without `dry_run`):
+Apply directly:
 
 ```json
 {
   "mode":"apply",
   "snapshot_id":"<from retrieve>",
   "ops":[
-    {"op":"replace","targets":{"call_ids":["call_123"]},"text":"Key results: ..."},
+    {"op":"replace","targets":{"ids":["call_123"]},"text":"Key results: ..."},
     {"op":"exclude","targets":{"ids":["r10","r11"]}},
     {"op":"add_note","notes":["Decision: ...","Constraint: ...","Next: ..."]}
   ]
@@ -110,18 +79,5 @@ If you get `snapshot mismatch`, re-run `retrieve` and retry.
 
 If you repeatedly get `snapshot mismatch` even right after `retrieve`, use a fallback:
 
-- Omit `snapshot_id` (still supports `dry_run`), or
+- Omit `snapshot_id`, or
 - Retry after a fresh `retrieve`.
-
-Example (v2 apply without `snapshot_id`):
-
-```json
-{
-  "mode":"apply",
-  "dry_run":true,
-  "ops":[
-    {"op":"replace","targets":{"call_ids":["call_123"]},"text":"Key results: ..."},
-    {"op":"add_note","notes":["Decision: ...","Constraint: ...","Next: ..."]}
-  ]
-}
-```
