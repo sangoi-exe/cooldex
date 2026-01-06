@@ -3857,7 +3857,21 @@ async fn spawn_sanitize_task(
         );
 
     let mut per_turn_config = (*config).clone();
-    per_turn_config.model_reasoning_effort = Some(ReasoningEffortConfig::None);
+    let fallback_effort = model_family
+        .default_reasoning_effort
+        .unwrap_or(ReasoningEffortConfig::Low);
+    let mut sanitize_effort = crate::config::sanitize_reasoning_effort(
+        &config.codex_home,
+        config.active_profile.as_deref(),
+    )
+    .unwrap_or(fallback_effort);
+    if matches!(
+        sanitize_effort,
+        ReasoningEffortConfig::None | ReasoningEffortConfig::Minimal
+    ) {
+        sanitize_effort = fallback_effort;
+    }
+    per_turn_config.model_reasoning_effort = Some(sanitize_effort);
     per_turn_config.model_reasoning_summary = ReasoningSummaryConfig::None;
     per_turn_config.features = sanitize_features.clone();
     per_turn_config.web_search_mode = Some(sanitize_web_search_mode);

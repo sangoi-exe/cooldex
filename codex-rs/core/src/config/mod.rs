@@ -100,6 +100,7 @@ pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 pub const AUTO_SANITIZE_CONFIG_KEY: &str = "auto_sanitize";
+pub const SANITIZE_REASONING_EFFORT_CONFIG_KEY: &str = "sanitize_reasoning_effort";
 
 pub fn auto_sanitize_enabled(codex_home: &Path, active_profile: Option<&str>) -> bool {
     fn item_as_bool(item: &toml_edit::Item) -> Option<bool> {
@@ -131,6 +132,41 @@ pub fn auto_sanitize_enabled(codex_home: &Path, active_profile: Option<&str>) ->
     doc.get(AUTO_SANITIZE_CONFIG_KEY)
         .and_then(item_as_bool)
         .unwrap_or(false)
+}
+
+pub fn sanitize_reasoning_effort(
+    codex_home: &Path,
+    active_profile: Option<&str>,
+) -> Option<ReasoningEffort> {
+    fn item_as_effort(item: &toml_edit::Item) -> Option<ReasoningEffort> {
+        let value = item.as_value()?.as_str()?.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "none" => Some(ReasoningEffort::None),
+            "minimal" => Some(ReasoningEffort::Minimal),
+            "low" => Some(ReasoningEffort::Low),
+            "medium" => Some(ReasoningEffort::Medium),
+            "high" => Some(ReasoningEffort::High),
+            "xhigh" => Some(ReasoningEffort::XHigh),
+            _ => None,
+        }
+    }
+
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let content = std::fs::read_to_string(&config_path).ok()?;
+    let doc = content.parse::<DocumentMut>().ok()?;
+
+    if let Some(profile) = active_profile
+        && let Some(value) = doc
+            .get("profiles")
+            .and_then(|profiles| profiles.get(profile))
+            .and_then(|profile| profile.get(SANITIZE_REASONING_EFFORT_CONFIG_KEY))
+            .and_then(item_as_effort)
+    {
+        return Some(value);
+    }
+
+    doc.get(SANITIZE_REASONING_EFFORT_CONFIG_KEY)
+        .and_then(item_as_effort)
 }
 
 #[cfg(test)]

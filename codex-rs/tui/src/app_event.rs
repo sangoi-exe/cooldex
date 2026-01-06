@@ -144,6 +144,10 @@ pub(crate) enum AppEvent {
     PersistAutoSanitize {
         enabled: bool,
     },
+    /// Persist the reasoning effort used by /sanitize to config.toml.
+    PersistSanitizeReasoningEffort {
+        effort: Option<ReasoningEffort>,
+    },
 
     /// Open the reasoning selection popup after picking a model.
     OpenReasoningPopup {

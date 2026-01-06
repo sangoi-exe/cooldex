@@ -5164,11 +5164,20 @@ impl ChatWidget {
             &self.config.codex_home,
             self.config.active_profile.as_deref(),
         );
+        let sanitize_effort = codex_core::config::sanitize_reasoning_effort(
+            &self.config.codex_home,
+            self.config.active_profile.as_deref(),
+        );
 
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Context hygiene".bold()));
         header.push(Line::from(
             "When enabled, Codex summarizes last-turn tools, consolidates reasoning, and deletes tool outputs.".dim(),
+        ));
+        header.push(Line::from(""));
+        header.push(Line::from("Sanitize reasoning effort".bold()));
+        header.push(Line::from(
+            "Used by /sanitize. Pick a supported level for your model.".dim(),
         ));
 
         let actions_on: Vec<SelectionAction> = vec![Box::new(|tx| {
@@ -5177,28 +5186,62 @@ impl ChatWidget {
         let actions_off: Vec<SelectionAction> = vec![Box::new(|tx| {
             tx.send(AppEvent::PersistAutoSanitize { enabled: false });
         })];
+        let action_default: Vec<SelectionAction> = vec![Box::new(|tx| {
+            tx.send(AppEvent::PersistSanitizeReasoningEffort { effort: None });
+        })];
+
+        let mut items = vec![
+            SelectionItem {
+                name: "On".to_string(),
+                description: Some("Auto-run context hygiene after each turn.".to_string()),
+                is_current: enabled,
+                actions: actions_on,
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Off".to_string(),
+                description: Some("Never auto-run context hygiene.".to_string()),
+                is_current: !enabled,
+                actions: actions_off,
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Sanitize reasoning: Default".to_string(),
+                description: Some("Use the model default effort for /sanitize.".to_string()),
+                is_current: sanitize_effort.is_none(),
+                actions: action_default,
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        for effort in [
+            ReasoningEffortConfig::Low,
+            ReasoningEffortConfig::Medium,
+            ReasoningEffortConfig::High,
+            ReasoningEffortConfig::XHigh,
+        ] {
+            let label = effort.to_string();
+            items.push(SelectionItem {
+                name: format!("Sanitize reasoning: {label}"),
+                description: Some(format!("Use {label} effort for /sanitize.")),
+                is_current: sanitize_effort == Some(effort),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::PersistSanitizeReasoningEffort {
+                        effort: Some(effort),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
             header: Box::new(header),
             footer_hint: Some(standard_popup_hint_line()),
-            items: vec![
-                SelectionItem {
-                    name: "On".to_string(),
-                    description: Some("Auto-run context hygiene after each turn.".to_string()),
-                    is_current: enabled,
-                    actions: actions_on,
-                    dismiss_on_select: true,
-                    ..Default::default()
-                },
-                SelectionItem {
-                    name: "Off".to_string(),
-                    description: Some("Never auto-run context hygiene.".to_string()),
-                    is_current: !enabled,
-                    actions: actions_off,
-                    dismiss_on_select: true,
-                    ..Default::default()
-                },
-            ],
+            items,
             initial_selected_idx: Some(if enabled { 0 } else { 1 }),
             ..Default::default()
         });

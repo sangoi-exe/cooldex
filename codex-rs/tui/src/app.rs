@@ -1968,6 +1968,38 @@ impl App {
                     }
                 }
             }
+            AppEvent::PersistSanitizeReasoningEffort { effort } => {
+                let profile = self.active_profile.as_deref();
+                match ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_profile(profile)
+                    .set_sanitize_reasoning_effort(effort)
+                    .apply()
+                    .await
+                {
+                    Ok(()) => {
+                        let effort_label = effort
+                            .map(|effort| effort.to_string())
+                            .unwrap_or_else(|| "default".to_string());
+                        let mut message =
+                            format!("Sanitize reasoning effort set to {effort_label}.");
+                        if let Some(profile) = profile {
+                            message.push_str(" (");
+                            message.push_str(profile);
+                            message.push(')');
+                        }
+                        self.chat_widget.add_info_message(message, None);
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            error = %err,
+                            "failed to persist sanitize reasoning effort"
+                        );
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to save sanitize reasoning effort: {err}"
+                        ));
+                    }
+                }
+            }
             AppEvent::UpdateAskForApprovalPolicy(policy) => {
                 self.runtime_approval_policy_override = Some(policy);
                 if let Err(err) = self.config.approval_policy.set(policy) {

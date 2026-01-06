@@ -1,5 +1,6 @@
 use crate::config::AUTO_SANITIZE_CONFIG_KEY;
 use crate::config::CONFIG_TOML_FILE;
+use crate::config::SANITIZE_REASONING_EFFORT_CONFIG_KEY;
 use crate::config::types::McpServerConfig;
 use crate::config::types::Notice;
 use crate::path_utils::resolve_symlink_write_paths;
@@ -30,6 +31,8 @@ pub enum ConfigEdit {
     SetModelPersonality { personality: Option<Personality> },
     /// Toggle automatic context hygiene after turns (scoped to the active profile when set).
     SetAutoSanitize(bool),
+    /// Set the reasoning effort used by /sanitize (scoped to the active profile when set).
+    SetSanitizeReasoningEffort(Option<ReasoningEffort>),
     /// Toggle the acknowledgement flag under `[notice]`.
     SetNoticeHideFullAccessWarning(bool),
     /// Toggle the Windows world-writable directories warning acknowledgement flag.
@@ -308,6 +311,10 @@ impl ConfigDocument {
             ConfigEdit::SetAutoSanitize(enabled) => {
                 Ok(self.write_value(Scope::Profile, &[AUTO_SANITIZE_CONFIG_KEY], value(*enabled)))
             }
+            ConfigEdit::SetSanitizeReasoningEffort(effort) => Ok(self.write_profile_value(
+                &[SANITIZE_REASONING_EFFORT_CONFIG_KEY],
+                effort.map(|effort| value(effort.to_string())),
+            )),
             ConfigEdit::SetNoticeHideFullAccessWarning(acknowledged) => Ok(self.write_value(
                 Scope::Global,
                 &[Notice::TABLE_KEY, "hide_full_access_warning"],
@@ -758,6 +765,12 @@ impl ConfigEditsBuilder {
 
     pub fn set_auto_sanitize_enabled(mut self, enabled: bool) -> Self {
         self.edits.push(ConfigEdit::SetAutoSanitize(enabled));
+        self
+    }
+
+    pub fn set_sanitize_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.edits
+            .push(ConfigEdit::SetSanitizeReasoningEffort(effort));
         self
     }
 
