@@ -24,6 +24,8 @@ use std::ops::Deref;
 pub(crate) struct ContextManager {
     /// The oldest items are at the beginning of the vector.
     items: Vec<ResponseItem>,
+    rids: Vec<u64>,
+    next_rid: u64,
     token_info: Option<TokenUsageInfo>,
 }
 
@@ -31,6 +33,8 @@ impl ContextManager {
     pub(crate) fn new() -> Self {
         Self {
             items: Vec::new(),
+            rids: Vec::new(),
+            next_rid: 0,
             token_info: TokenUsageInfo::new_or_append(&None, &None, None),
         }
     }
@@ -66,7 +70,10 @@ impl ContextManager {
             }
 
             let processed = self.process_item(item_ref, policy);
+            let rid = self.next_rid;
+            self.next_rid = self.next_rid.saturating_add(1);
             self.items.push(processed);
+            self.rids.push(rid);
         }
     }
 
@@ -82,6 +89,25 @@ impl ContextManager {
     /// Returns raw items in the history.
     pub(crate) fn raw_items(&self) -> &[ResponseItem] {
         &self.items
+    }
+
+    pub(crate) fn get_history_for_prompt_with_rids(&mut self) -> (Vec<ResponseItem>, Vec<u64>) {
+        self.normalize_history();
+        let items = self.items.clone();
+        let rids = self.rids.clone();
+        remove_ghost_snapshots_with_rids(items, rids)
+    }
+
+    pub(crate) fn get_history_for_prompt_with_rids_lenient(&self) -> (Vec<ResponseItem>, Vec<u64>) {
+        remove_ghost_snapshots_with_rids(self.items.clone(), self.rids.clone())
+    }
+
+    pub(crate) fn get_history_for_prompt(&mut self) -> Vec<ResponseItem> {
+        self.get_history_for_prompt_with_rids().0
+    }
+
+    pub(crate) fn get_history_for_prompt_lenient(&self) -> Vec<ResponseItem> {
+        self.get_history_for_prompt_with_rids_lenient().0
     }
 
     // Estimate token usage using byte-based heuristics from the truncation helpers.
@@ -114,10 +140,11 @@ impl ContextManager {
             // Remove the oldest item (front of the list). Items are ordered from
             // oldest → newest, so index 0 is the first entry recorded.
             let removed = self.items.remove(0);
+            self.rids.remove(0);
             // If the removed item participates in a call/output pair, also remove
             // its corresponding counterpart to keep the invariants intact without
             // running a full normalization pass.
-            normalize::remove_corresponding_for(&mut self.items, &removed);
+            normalize::remove_corresponding_for(&mut self.items, &mut self.rids, &removed);
         }
     }
 
@@ -132,6 +159,28 @@ impl ContextManager {
 
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
         self.items = items;
+        self.rids = (0..self.items.len()).map(|idx| idx as u64).collect();
+        self.next_rid = self.items.len() as u64;
+    }
+
+    pub(crate) fn replace_with_rids(&mut self, items: Vec<ResponseItem>, rids: Vec<u64>) {
+        self.items = items;
+        self.rids = rids;
+        self.next_rid = self
+            .rids
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+    }
+
+    pub(crate) fn rids_len(&self) -> usize {
+        self.rids.len()
+    }
+
+    pub(crate) fn items_with_rids(&self) -> (&[ResponseItem], &[u64]) {
+        (&self.items, &self.rids)
     }
 
     /// Replace image content in the last turn if it originated from a tool output.
@@ -270,10 +319,15 @@ impl ContextManager {
     /// 2. every output has a corresponding call entry
     fn normalize_history(&mut self) {
         // all function/tool calls must have a corresponding output
-        normalize::ensure_call_outputs_present(&mut self.items);
+        normalize::ensure_call_outputs_present(&mut self.items, &mut self.rids, &mut self.next_rid);
 
         // all outputs must have a corresponding function/tool call
-        normalize::remove_orphan_outputs(&mut self.items);
+        normalize::remove_orphan_outputs(&mut self.items, &mut self.rids);
+    }
+
+    /// Returns a clone of the contents in the transcript.
+    fn contents(&self) -> Vec<ResponseItem> {
+        self.items.clone()
     }
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
@@ -319,6 +373,24 @@ impl ContextManager {
             | ResponseItem::Other => item.clone(),
         }
     }
+}
+
+fn remove_ghost_snapshots_with_rids(
+    items: Vec<ResponseItem>,
+    rids: Vec<u64>,
+) -> (Vec<ResponseItem>, Vec<u64>) {
+    let mut out_items = Vec::with_capacity(items.len());
+    let mut out_rids = Vec::with_capacity(rids.len());
+
+    for (item, rid) in items.into_iter().zip(rids) {
+        if matches!(item, ResponseItem::GhostSnapshot { .. }) {
+            continue;
+        }
+        out_items.push(item);
+        out_rids.push(rid);
+    }
+
+    (out_items, out_rids)
 }
 
 /// API messages include every non-system item (user/assistant messages, reasoning,

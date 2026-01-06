@@ -457,6 +457,12 @@ impl RolloutRecorder {
                     RolloutItem::EventMsg(_ev) => {
                         items.push(RolloutItem::EventMsg(_ev));
                     }
+                    RolloutItem::ContextInclusion(item) => {
+                        items.push(RolloutItem::ContextInclusion(item));
+                    }
+                    RolloutItem::ContextOverlay(item) => {
+                        items.push(RolloutItem::ContextOverlay(item));
+                    }
                 },
                 Err(e) => {
                     trace!("failed to parse rollout line: {e}");

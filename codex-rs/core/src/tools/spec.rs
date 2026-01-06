@@ -1371,6 +1371,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::GetMemoryHandler;
     use crate::tools::handlers::GrepFilesHandler;
     use crate::tools::handlers::ListDirHandler;
+    use crate::tools::handlers::ManageContextHandler;
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::McpResourceHandler;
     use crate::tools::handlers::PlanHandler;
@@ -1391,6 +1392,7 @@ pub(crate) fn build_specs(
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let dynamic_tool_handler = Arc::new(DynamicToolHandler);
     let get_memory_handler = Arc::new(GetMemoryHandler);
+    let manage_context_handler = Arc::new(ManageContextHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
@@ -1454,6 +1456,8 @@ pub(crate) fn build_specs(
         builder.push_spec(create_get_memory_tool());
         builder.register_handler("get_memory", get_memory_handler);
     }
+    builder.push_spec(create_manage_context_tool());
+    builder.register_handler("manage_context", manage_context_handler);
 
     if let Some(apply_patch_tool_type) = &config.apply_patch_tool_type {
         match apply_patch_tool_type {

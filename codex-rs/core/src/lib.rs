@@ -86,6 +86,7 @@ pub type ConversationManager = ThreadManager;
 pub type NewConversation = NewThread;
 #[deprecated(note = "use CodexThread")]
 pub type CodexConversation = CodexThread;
+mod rid;
 // Re-export common auth types for workspace consumers
 pub use auth::AuthManager;
 pub use auth::CodexAuth;

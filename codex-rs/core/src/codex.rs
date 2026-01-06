@@ -1261,13 +1261,16 @@ impl Session {
                     state.pending_resume_previous_model = Some(prev.to_string());
                 }
 
-                // Always add response items to conversation history
-                let reconstructed_history = self
-                    .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-                    .await;
-                if !reconstructed_history.is_empty() {
-                    self.record_into_history(&reconstructed_history, &turn_context)
-                        .await;
+                // Restore in-memory state from the recorded rollout (history + context overlay/inclusion).
+                let initial_context = self.build_initial_context(&turn_context).await;
+                {
+                    let mut state = self.state.lock().await;
+                    self.restore_state_from_rollout(
+                        &turn_context,
+                        &rollout_items,
+                        &initial_context,
+                        &mut state,
+                    );
                 }
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
@@ -1282,13 +1285,15 @@ impl Session {
                 self.flush_rollout().await;
             }
             InitialHistory::Forked(rollout_items) => {
-                // Always add response items to conversation history
-                let reconstructed_history = self
-                    .reconstruct_history_from_rollout(&turn_context, &rollout_items)
-                    .await;
-                if !reconstructed_history.is_empty() {
-                    self.record_into_history(&reconstructed_history, &turn_context)
-                        .await;
+                let initial_context = self.build_initial_context(&turn_context).await;
+                {
+                    let mut state = self.state.lock().await;
+                    self.restore_state_from_rollout(
+                        &turn_context,
+                        &rollout_items,
+                        &initial_context,
+                        &mut state,
+                    );
                 }
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
@@ -1304,7 +1309,6 @@ impl Session {
                 }
 
                 // Append the current session's initial context after the reconstructed history.
-                let initial_context = self.build_initial_context(&turn_context).await;
                 self.record_conversation_items(&turn_context, &initial_context)
                     .await;
                 {
@@ -1993,6 +1997,114 @@ impl Session {
         self.send_raw_response_items(turn_context, items).await;
     }
 
+    fn restore_state_from_rollout(
+        &self,
+        turn_context: &TurnContext,
+        rollout_items: &[RolloutItem],
+        initial_context: &[ResponseItem],
+        state: &mut SessionState,
+    ) {
+        use crate::rid::parse_rid;
+        use std::collections::BTreeMap;
+        use std::collections::BTreeSet;
+        use std::collections::HashMap;
+
+        state.replace_history(Vec::new());
+        state.set_context_overlay(crate::state::ContextOverlay::default());
+        state.set_include_mask(None);
+
+        for item in rollout_items {
+            match item {
+                RolloutItem::ResponseItem(response_item) => {
+                    state.record_items(
+                        std::iter::once(response_item),
+                        turn_context.truncation_policy,
+                    );
+                }
+                RolloutItem::Compacted(compacted) => {
+                    let snapshot = state.history_snapshot();
+                    if let Some(replacement) = &compacted.replacement_history {
+                        state.replace_history(replacement.clone());
+                    } else {
+                        let user_messages = collect_user_messages(&snapshot);
+                        let rebuilt = compact::build_compacted_history(
+                            initial_context.to_vec(),
+                            &user_messages,
+                            &compacted.message,
+                        );
+                        state.replace_history(rebuilt);
+                    }
+                }
+                RolloutItem::ContextOverlay(overlay) => {
+                    let mut replacements_by_rid = BTreeMap::new();
+                    for replacement in &overlay.replacements {
+                        if let Some(rid) = parse_rid(&replacement.id) {
+                            replacements_by_rid.insert(rid, replacement.text.clone());
+                        }
+                    }
+                    state.set_context_overlay(crate::state::ContextOverlay {
+                        replacements_by_rid,
+                        notes: overlay.notes.clone(),
+                    });
+                }
+                RolloutItem::ContextInclusion(inclusion) => {
+                    // Apply deletions first.
+                    if !inclusion.deleted_ids.is_empty() || !inclusion.deleted_indices.is_empty() {
+                        let snapshot_rids = state.history_rids_snapshot();
+                        let mut rid_lookup: HashMap<u64, usize> = HashMap::new();
+                        for (idx, rid) in snapshot_rids.iter().copied().enumerate() {
+                            rid_lookup.insert(rid, idx);
+                        }
+
+                        let mut indices: Vec<usize> = Vec::new();
+                        if !inclusion.deleted_ids.is_empty() {
+                            for raw in &inclusion.deleted_ids {
+                                if let Some(rid) = parse_rid(raw)
+                                    && let Some(idx) = rid_lookup.get(&rid).copied()
+                                {
+                                    indices.push(idx);
+                                }
+                            }
+                        } else {
+                            indices.extend(inclusion.deleted_indices.iter().copied());
+                        }
+
+                        indices.sort_unstable();
+                        indices.dedup();
+                        if !indices.is_empty() {
+                            state.prune_by_indices(indices);
+                        }
+                    }
+
+                    // Apply include mask snapshot.
+                    if !inclusion.included_ids.is_empty() {
+                        let snapshot_rids = state.history_rids_snapshot();
+                        let mut rid_lookup: HashMap<u64, usize> = HashMap::new();
+                        for (idx, rid) in snapshot_rids.iter().copied().enumerate() {
+                            rid_lookup.insert(rid, idx);
+                        }
+
+                        let mut included: BTreeSet<usize> = BTreeSet::new();
+                        for raw in &inclusion.included_ids {
+                            if let Some(rid) = parse_rid(raw)
+                                && let Some(idx) = rid_lookup.get(&rid).copied()
+                            {
+                                included.insert(idx);
+                            }
+                        }
+                        state.set_include_mask(Some(included));
+                    } else if !inclusion.included_indices.is_empty() {
+                        state.set_include_mask(Some(
+                            inclusion.included_indices.iter().copied().collect(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[cfg(test)]
     async fn reconstruct_history_from_rollout(
         &self,
         turn_context: &TurnContext,
@@ -2036,6 +2148,10 @@ impl Session {
     ) -> Vec<ResponseItem> {
         let initial_context = self.build_initial_context(turn_context).await;
         compact::process_compacted_history(compacted_history, &initial_context)
+    }
+
+    pub(crate) async fn state_lock(&self) -> tokio::sync::MutexGuard<'_, SessionState> {
+        self.state.lock().await
     }
 
     /// Append ResponseItems to the in-memory conversation history only.
@@ -4006,7 +4122,10 @@ pub(crate) async fn run_turn(
         }
 
         // Construct the input that we will send to the model.
-        let sampling_request_input: Vec<ResponseItem> = { sess.clone_history().await.for_prompt() };
+        let sampling_request_input: Vec<ResponseItem> = {
+            let state = sess.state_lock().await;
+            state.prompt_snapshot()
+        };
 
         let sampling_request_input_messages = sampling_request_input
             .iter()

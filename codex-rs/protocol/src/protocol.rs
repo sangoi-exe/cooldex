@@ -1714,6 +1714,8 @@ pub enum RolloutItem {
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
     EventMsg(EventMsg),
+    ContextInclusion(ContextInclusionItem),
+    ContextOverlay(ContextOverlayItem),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
@@ -1758,6 +1760,31 @@ pub struct TurnContextItem {
     pub final_output_json_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation_policy: Option<TruncationPolicy>,
+}
+
+/// Tracks which conversation history items are included (non-destructive) and which are deleted
+/// (destructive) for context management.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
+pub struct ContextInclusionItem {
+    pub included_indices: Vec<usize>,
+    pub deleted_indices: Vec<usize>,
+    pub included_ids: Vec<String>,
+    pub deleted_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
+pub struct ContextOverlayReplacement {
+    pub id: String,
+    pub text: String,
+}
+
+/// Prompt-only transformations applied to the conversation history:
+/// - replacements: short text keyed by item id (RID) to replace large tool outputs/reasoning
+/// - notes: pinned notes inserted near the start of the prompt
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
+pub struct ContextOverlayItem {
+    pub replacements: Vec<ContextOverlayReplacement>,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
