@@ -33,6 +33,7 @@ pub(crate) struct ToolsConfig {
     pub collaboration_modes_tools: bool,
     pub memory_tools: bool,
     pub request_rule_enabled: bool,
+    pub include_agent_run_tool: bool,
     pub experimental_supported_tools: Vec<String>,
 }
 
@@ -54,6 +55,7 @@ impl ToolsConfig {
         let include_collaboration_modes_tools = features.enabled(Feature::CollaborationModes);
         let include_memory_tools = features.enabled(Feature::MemoryTool);
         let request_rule_enabled = features.enabled(Feature::RequestRule);
+        let include_agent_run_tool = features.enabled(Feature::MultiAgent);
 
         let shell_type = if !features.enabled(Feature::ShellTool) {
             ConfigShellToolType::Disabled
@@ -88,6 +90,7 @@ impl ToolsConfig {
             collaboration_modes_tools: include_collaboration_modes_tools,
             memory_tools: include_memory_tools,
             request_rule_enabled,
+            include_agent_run_tool,
             experimental_supported_tools: model_info.experimental_supported_tools.clone(),
         }
     }
@@ -1063,6 +1066,53 @@ fn create_manage_context_tool() -> ToolSpec {
     })
 }
 
+fn create_agent_run_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "prompt".to_string(),
+        JsonSchema::String {
+            description: Some("Task prompt for the background agent.".to_string()),
+        },
+    );
+    properties.insert(
+        "result_schema".to_string(),
+        JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(true.into()),
+        },
+    );
+    properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional timeout in milliseconds for the agent run (default: 600000).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "max_result_bytes".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional maximum size (in bytes) of the returned JSON result (default: 32768)."
+                    .to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "agent_run".to_string(),
+        description: "Run a background sub-agent in a separate conversation and return a compact JSON result."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["prompt".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_list_mcp_resources_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
@@ -1365,6 +1415,7 @@ pub(crate) fn build_specs(
     mcp_tools: Option<HashMap<String, rmcp::model::Tool>>,
     dynamic_tools: &[DynamicToolSpec],
 ) -> ToolRegistryBuilder {
+    use crate::tools::handlers::AgentRunHandler;
     use crate::tools::handlers::ApplyPatchHandler;
     use crate::tools::handlers::CollabHandler;
     use crate::tools::handlers::DynamicToolHandler;
@@ -1393,6 +1444,7 @@ pub(crate) fn build_specs(
     let dynamic_tool_handler = Arc::new(DynamicToolHandler);
     let get_memory_handler = Arc::new(GetMemoryHandler);
     let manage_context_handler = Arc::new(ManageContextHandler);
+    let agent_run_handler = Arc::new(AgentRunHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
@@ -1458,6 +1510,11 @@ pub(crate) fn build_specs(
     }
     builder.push_spec(create_manage_context_tool());
     builder.register_handler("manage_context", manage_context_handler);
+
+    if config.include_agent_run_tool {
+        builder.push_spec(create_agent_run_tool());
+        builder.register_handler("agent_run", agent_run_handler);
+    }
 
     if let Some(apply_patch_tool_type) = &config.apply_patch_tool_type {
         match apply_patch_tool_type {

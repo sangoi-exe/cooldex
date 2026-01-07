@@ -107,6 +107,12 @@ pub enum Feature {
     MemoryTool,
     /// Append additional AGENTS.md guidance to user instructions.
     ChildAgentsMd,
+    /// Experimental TUI v2 (viewport) implementation.
+    Tui2,
+    /// Enable discovery and injection of skills.
+    Skills,
+    /// Spawn and coordinate background sub-agents.
+    MultiAgent,
     /// Enforce UTF8 output in Powershell.
     PowershellUtf8,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
@@ -496,6 +502,18 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "remote_models",
         stage: Stage::UnderDevelopment,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::Skills,
+        key: "skills",
+        stage: Stage::Experimental,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::MultiAgent,
+        key: "multi_agent",
+        stage: Stage::Experimental,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::PowershellUtf8,

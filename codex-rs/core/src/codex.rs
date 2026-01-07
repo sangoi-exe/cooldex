@@ -274,6 +274,12 @@ impl Codex {
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
+        // Disable multi-agent orchestration in sub-agent sessions to prevent runaway recursion
+        // (sub-agents spawning more sub-agents).
+        if matches!(session_source, SessionSource::SubAgent(_)) {
+            config.features.disable(Feature::MultiAgent);
+        }
+
         let loaded_skills = skills_manager.skills_for_config(&config);
 
         for err in &loaded_skills.errors {
@@ -291,7 +297,11 @@ impl Codex {
         }
 
         let enabled_skills = loaded_skills.enabled_skills();
-        let user_instructions = get_user_instructions(&config, Some(&enabled_skills)).await;
+        let user_instructions = if config.features.enabled(Feature::Skills) {
+            get_user_instructions(&config, Some(&enabled_skills)).await
+        } else {
+            get_user_instructions(&config, None).await
+        };
 
         let exec_policy = ExecPolicyManager::load(&config.config_layer_stack)
             .await
@@ -745,6 +755,11 @@ impl Session {
     pub(crate) async fn codex_home(&self) -> PathBuf {
         let state = self.state.lock().await;
         state.session_configuration.codex_home().clone()
+    }
+
+    pub(crate) async fn original_config(&self) -> Arc<Config> {
+        let state = self.state.lock().await;
+        Arc::clone(&state.session_configuration.original_config_do_not_use)
     }
 
     fn start_file_watcher_listener(self: &Arc<Self>) {
@@ -3837,6 +3852,7 @@ async fn spawn_sanitize_task(
         .disable(crate::features::Feature::ShellTool)
         .disable(crate::features::Feature::UnifiedExec)
         .disable(crate::features::Feature::ApplyPatchFreeform)
+        .disable(crate::features::Feature::MultiAgent)
         .disable(crate::features::Feature::WebSearchRequest)
         .disable(crate::features::Feature::WebSearchCached)
         .disable(crate::features::Feature::ViewImageTool);
@@ -4895,7 +4911,7 @@ fn maybe_prefix_tool_output_with_context_left(
     }
     if tool_name_by_call_id
         .get(call_id)
-        .is_some_and(|name| name == "manage_context")
+        .is_some_and(|name| matches!(name.as_str(), "manage_context" | "agent_run"))
     {
         return;
     }
