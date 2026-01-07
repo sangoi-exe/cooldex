@@ -169,6 +169,7 @@ mod tests {
     use crate::unified_exec::ExecCommandRequest;
     use crate::unified_exec::WriteStdinRequest;
     use core_test_support::skip_if_sandbox;
+    use std::fs::OpenOptions;
     use std::sync::Arc;
     use tokio::time::Duration;
 
@@ -177,6 +178,14 @@ mod tests {
         turn.approval_policy = AskForApproval::Never;
         turn.sandbox_policy = SandboxPolicy::DangerFullAccess;
         (Arc::new(session), Arc::new(turn))
+    }
+
+    fn ptmx_available() -> bool {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/ptmx")
+            .is_ok()
     }
 
     async fn exec_command(
@@ -267,6 +276,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
         skip_if_sandbox!(Ok(()));
+        if !ptmx_available() {
+            return Ok(());
+        }
 
         let (session, turn) = test_session_and_turn().await;
 
@@ -303,6 +315,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn multi_unified_exec_sessions() -> anyhow::Result<()> {
         skip_if_sandbox!(Ok(()));
+        if !ptmx_available() {
+            return Ok(());
+        }
 
         let (session, turn) = test_session_and_turn().await;
 
@@ -355,6 +370,9 @@ mod tests {
     #[tokio::test]
     async fn unified_exec_timeouts() -> anyhow::Result<()> {
         skip_if_sandbox!(Ok(()));
+        if !ptmx_available() {
+            return Ok(());
+        }
 
         const TEST_VAR_VALUE: &str = "unified_exec_var_123";
 
@@ -441,6 +459,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<()> {
         skip_if_sandbox!(Ok(()));
+        if !ptmx_available() {
+            return Ok(());
+        }
 
         let (session, turn) = test_session_and_turn().await;
 

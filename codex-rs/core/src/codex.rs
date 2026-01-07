@@ -4934,8 +4934,9 @@ async fn drain_in_flight(
 ) -> CodexResult<()> {
     let (tool_name_by_call_id, context_left_percent) = {
         let state = sess.state.lock().await;
-        let mut history = state.clone_history();
-        let tool_name_by_call_id = tool_name_by_call_id_for_history(&history.get_history());
+        let history = state.clone_history();
+        let tool_name_by_call_id =
+            tool_name_by_call_id_for_history(&history.get_history_for_prompt_lenient());
         let info = state.token_info();
         let context_window = info
             .as_ref()
@@ -5631,6 +5632,53 @@ mod tests {
         session.seed_initial_context_if_needed(&turn_context).await;
         let history_after_second_seed = session.clone_history().await;
         assert_eq!(expected, history_after_second_seed.raw_items());
+    }
+
+    #[tokio::test]
+    async fn drain_in_flight_does_not_require_outputs_in_history_upfront() {
+        let (session, turn_context) = make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+
+        session
+            .record_into_history(
+                &[ResponseItem::CustomToolCall {
+                    id: None,
+                    status: None,
+                    call_id: "call-1".to_string(),
+                    name: "apply_patch".to_string(),
+                    input: "*** Begin Patch\n*** End Patch".to_string(),
+                }],
+                turn_context.as_ref(),
+            )
+            .await;
+
+        let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
+            FuturesOrdered::new();
+        in_flight.push_back(Box::pin(async {
+            Ok(ResponseInputItem::CustomToolCallOutput {
+                call_id: "call-1".to_string(),
+                output: "ok".to_string(),
+            })
+        }));
+
+        drain_in_flight(
+            &mut in_flight,
+            Arc::clone(&session),
+            Arc::clone(&turn_context),
+        )
+        .await
+        .unwrap();
+
+        let history = session
+            .state
+            .lock()
+            .await
+            .clone_history()
+            .get_history_for_prompt_lenient();
+        assert!(history.iter().any(|item| {
+            matches!(item, ResponseItem::CustomToolCallOutput { call_id, .. } if call_id == "call-1")
+        }));
     }
 
     #[tokio::test]
