@@ -82,7 +82,7 @@ As of 2026-01-07:
 - [x] Implement a cross-conversation lock shared across sessions (e.g. an `Arc<RwLock<()>>` in the conversation manager / services layer):
   - [x] Mutating tool calls acquire the write lock.
   - [x] Non-mutating tool calls acquire the read lock.
-- [ ] Update tool handlers’ `is_mutating()` classifications (or add a new “workspace mutating” trait) to ensure correctness.
+- [x] Update tool handlers’ `is_mutating()` classifications (or add a new “workspace mutating” trait) to ensure correctness.
 - [ ] Add fail-fast errors when policy is violated (no silent fallback).
 
 ### M5 — Schema validation + result size discipline
