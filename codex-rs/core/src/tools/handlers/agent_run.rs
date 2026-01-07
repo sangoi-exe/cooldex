@@ -19,9 +19,10 @@ use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::InitialHistory;
 use crate::protocol::Op;
-use crate::protocol::ReviewDecision;
 use crate::protocol::SessionSource;
 use crate::protocol::SubAgentSource;
+use crate::subagent_runner::maybe_route_subagent_approval;
+use crate::subagent_runner::shutdown_subagent;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -124,6 +125,8 @@ impl ToolHandler for AgentRunHandler {
         let cancel_token = parent_cancel.child_token();
 
         let mut config = (*session.original_config().await).clone();
+        inherit_effective_turn_settings(&mut config, turn.as_ref())?;
+
         // Prevent runaway recursion (sub-agents spawning more sub-agents).
         config.features.disable(Feature::MultiAgent);
 
@@ -184,6 +187,37 @@ impl ToolHandler for AgentRunHandler {
             success: Some(matches!(output.status, AgentRunStatus::Completed)),
         })
     }
+}
+
+fn inherit_effective_turn_settings(
+    config: &mut crate::config::Config,
+    turn: &crate::codex::TurnContext,
+) -> Result<(), FunctionCallError> {
+    config.cwd = turn.cwd.clone();
+    config.model = Some(turn.client.get_model());
+    config.model_provider = turn.client.get_provider();
+    config.model_reasoning_effort = turn.client.get_reasoning_effort();
+    config.model_reasoning_summary = turn.client.get_reasoning_summary();
+
+    config
+        .approval_policy
+        .set(turn.approval_policy)
+        .map_err(|err| {
+            FunctionCallError::Fatal(format!(
+                "agent_run: failed to inherit approval_policy: {err}"
+            ))
+        })?;
+
+    config
+        .sandbox_policy
+        .set(turn.sandbox_policy.clone())
+        .map_err(|err| {
+            FunctionCallError::Fatal(format!(
+                "agent_run: failed to inherit sandbox_policy: {err}"
+            ))
+        })?;
+
+    Ok(())
 }
 
 async fn parent_turn_cancellation_token(
@@ -284,42 +318,24 @@ async fn run_one_shot_agent(
                             return (AgentRunStatus::Errored, None, Some(format!("failed to receive sub-agent event: {err}")));
                         }
                     };
+                    if let EventMsg::SessionConfigured(ev) = &event.msg {
+                        rollout_path = Some(ev.rollout_path.clone());
+                        continue;
+                    }
+
+                    if maybe_route_subagent_approval(
+                        codex,
+                        parent_session,
+                        parent_turn,
+                        cancel_token,
+                        &event,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+
                     match event.msg {
-                        EventMsg::SessionConfigured(ev) => {
-                            rollout_path = Some(ev.rollout_path.clone());
-                        }
-                        EventMsg::ExecApprovalRequest(ev) => {
-                            let decision = await_approval_with_cancel(
-                                parent_session.request_command_approval(
-                                    parent_turn,
-                                    ev.call_id,
-                                    ev.command,
-                                    ev.cwd,
-                                    ev.reason,
-                                    ev.proposed_execpolicy_amendment,
-                                ),
-                                parent_session,
-                                &parent_turn.sub_id,
-                                cancel_token,
-                            ).await;
-                            let _ = codex.submit(Op::ExecApproval { id: event.id, decision }).await;
-                        }
-                        EventMsg::ApplyPatchApprovalRequest(ev) => {
-                            let decision_rx = parent_session.request_patch_approval(
-                                parent_turn,
-                                ev.call_id,
-                                ev.changes,
-                                ev.reason,
-                                ev.grant_root,
-                            ).await;
-                            let decision = await_approval_with_cancel(
-                                async move { decision_rx.await.unwrap_or_default() },
-                                parent_session,
-                                &parent_turn.sub_id,
-                                cancel_token,
-                            ).await;
-                            let _ = codex.submit(Op::PatchApproval { id: event.id, decision }).await;
-                        }
                         EventMsg::TurnComplete(ev) => {
                             return (AgentRunStatus::Completed, ev.last_agent_message, None);
                         }
@@ -393,37 +409,4 @@ async fn run_one_shot_agent(
     shutdown_subagent(codex).await;
 
     (status, rollout_path, result, error)
-}
-
-async fn shutdown_subagent(codex: &Codex) {
-    let _ = codex.submit(Op::Interrupt).await;
-    let _ = codex.submit(Op::Shutdown).await;
-
-    let _ = timeout(Duration::from_millis(500), async {
-        while let Ok(event) = codex.next_event().await {
-            if matches!(event.msg, EventMsg::ShutdownComplete) {
-                break;
-            }
-        }
-    })
-    .await;
-}
-
-async fn await_approval_with_cancel<F>(
-    fut: F,
-    parent_session: &crate::codex::Session,
-    sub_id: &str,
-    cancel_token: &CancellationToken,
-) -> ReviewDecision
-where
-    F: core::future::Future<Output = ReviewDecision>,
-{
-    tokio::select! {
-        biased;
-        _ = cancel_token.cancelled() => {
-            parent_session.notify_approval(sub_id, ReviewDecision::Abort).await;
-            ReviewDecision::Abort
-        }
-        decision = fut => decision,
-    }
 }

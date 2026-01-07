@@ -5,10 +5,8 @@ use std::sync::atomic::AtomicU64;
 use async_channel::Receiver;
 use async_channel::Sender;
 use codex_async_utils::OrCancelExt;
-use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RequestUserInputEvent;
 use codex_protocol::protocol::SessionSource;
@@ -17,8 +15,6 @@ use codex_protocol::protocol::Submission;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
-use std::time::Duration;
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::AuthManager;
@@ -30,6 +26,8 @@ use crate::codex::TurnContext;
 use crate::config::Config;
 use crate::error::CodexErr;
 use crate::models_manager::manager::ModelsManager;
+use crate::subagent_runner::maybe_route_subagent_approval;
+use crate::subagent_runner::shutdown_subagent;
 use codex_protocol::protocol::InitialHistory;
 
 /// Start an interactive sub-Codex thread and return IO channels.
@@ -145,12 +143,12 @@ pub(crate) async fn run_codex_thread_one_shot(
                 event.msg,
                 EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
             );
-            let _ = tx_bridge.send(event).await;
+                let _ = tx_bridge.send(event).await;
             if should_shutdown {
                 let _ = ops_tx
                     .send(Submission {
                         id: "shutdown".to_string(),
-                        op: Op::Shutdown {},
+                        op: Op::Shutdown,
                     })
                     .await;
                 child_cancel.cancel();
@@ -187,7 +185,7 @@ async fn forward_events(
     loop {
         tokio::select! {
             _ = &mut cancelled => {
-                shutdown_delegate(&codex).await;
+                shutdown_subagent(codex.as_ref()).await;
                 break;
             }
             event = codex.next_event() => {
@@ -195,98 +193,40 @@ async fn forward_events(
                     Ok(event) => event,
                     Err(_) => break,
                 };
-                match event {
-                    // ignore all legacy delta events
-                    Event {
-                        id: _,
-                        msg: EventMsg::AgentMessageDelta(_) | EventMsg::AgentReasoningDelta(_),
-                    } => {}
-                    Event {
-                        id: _,
-                        msg: EventMsg::TokenCount(_),
-                    } => {}
-                    Event {
-                        id: _,
-                        msg: EventMsg::SessionConfigured(_),
-                    } => {}
-                    Event {
-                        id: _,
-                        msg: EventMsg::ThreadNameUpdated(_),
-                    } => {}
-                    Event {
-                        id,
-                        msg: EventMsg::ExecApprovalRequest(event),
-                    } => {
-                        // Initiate approval via parent session; do not surface to consumer.
-                        handle_exec_approval(
-                            &codex,
-                            id,
-                            &parent_session,
-                            &parent_ctx,
-                            event,
-                            &cancel_token,
-                        )
-                        .await;
-                    }
-                    Event {
-                        id,
-                        msg: EventMsg::ApplyPatchApprovalRequest(event),
-                    } => {
-                        handle_patch_approval(
-                            &codex,
-                            id,
-                            &parent_session,
-                            &parent_ctx,
-                            event,
-                            &cancel_token,
-                        )
-                        .await;
-                    }
-                    Event {
-                        id,
-                        msg: EventMsg::RequestUserInput(event),
-                    } => {
-                        handle_request_user_input(
-                            &codex,
-                            id,
-                            &parent_session,
-                            &parent_ctx,
-                            event,
-                            &cancel_token,
-                        )
-                        .await;
-                    }
-                    other => {
-                        match tx_sub.send(other).or_cancel(&cancel_token).await {
-                            Ok(Ok(())) => {}
-                            _ => {
-                                shutdown_delegate(&codex).await;
-                                break;
-                            }
-                        }
+                // Ignore all legacy delta events and internal bookkeeping.
+                if matches!(
+                    &event.msg,
+                    EventMsg::AgentMessageDelta(_)
+                        | EventMsg::AgentReasoningDelta(_)
+                        | EventMsg::TokenCount(_)
+                        | EventMsg::SessionConfigured(_)
+                ) {
+                    continue;
+                }
+
+                // Route approvals via parent session; do not surface to consumer.
+                if maybe_route_subagent_approval(
+                    codex.as_ref(),
+                    parent_session.as_ref(),
+                    parent_ctx.as_ref(),
+                    &cancel_token,
+                    &event,
+                )
+                .await
+                {
+                    continue;
+                }
+
+                match tx_sub.send(event).or_cancel(&cancel_token).await {
+                    Ok(Ok(())) => {}
+                    _ => {
+                        shutdown_subagent(codex.as_ref()).await;
+                        break;
                     }
                 }
             }
         }
     }
-}
-
-/// Ask the delegate to stop and drain its events so background sends do not hit a closed channel.
-async fn shutdown_delegate(codex: &Codex) {
-    let _ = codex.submit(Op::Interrupt).await;
-    let _ = codex.submit(Op::Shutdown {}).await;
-
-    let _ = timeout(Duration::from_millis(500), async {
-        while let Ok(event) = codex.next_event().await {
-            if matches!(
-                event.msg,
-                EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
-            ) {
-                break;
-            }
-        }
-    })
-    .await;
 }
 
 /// Forward ops from a caller to a sub-agent, respecting cancellation.
@@ -303,146 +243,6 @@ async fn forward_ops(
         let _ = codex.submit(op).await;
     }
 }
-
-/// Handle an ExecApprovalRequest by consulting the parent session and replying.
-async fn handle_exec_approval(
-    codex: &Codex,
-    id: String,
-    parent_session: &Session,
-    parent_ctx: &TurnContext,
-    event: ExecApprovalRequestEvent,
-    cancel_token: &CancellationToken,
-) {
-    let ExecApprovalRequestEvent {
-        call_id,
-        command,
-        cwd,
-        reason,
-        proposed_execpolicy_amendment,
-        ..
-    } = event;
-    // Race approval with cancellation and timeout to avoid hangs.
-    let approval_fut = parent_session.request_command_approval(
-        parent_ctx,
-        call_id,
-        command,
-        cwd,
-        reason,
-        proposed_execpolicy_amendment,
-    );
-    let decision = await_approval_with_cancel(
-        approval_fut,
-        parent_session,
-        &parent_ctx.sub_id,
-        cancel_token,
-    )
-    .await;
-
-    let _ = codex.submit(Op::ExecApproval { id, decision }).await;
-}
-
-/// Handle an ApplyPatchApprovalRequest by consulting the parent session and replying.
-async fn handle_patch_approval(
-    codex: &Codex,
-    id: String,
-    parent_session: &Session,
-    parent_ctx: &TurnContext,
-    event: ApplyPatchApprovalRequestEvent,
-    cancel_token: &CancellationToken,
-) {
-    let ApplyPatchApprovalRequestEvent {
-        call_id,
-        changes,
-        reason,
-        grant_root,
-        ..
-    } = event;
-    let decision_rx = parent_session
-        .request_patch_approval(parent_ctx, call_id, changes, reason, grant_root)
-        .await;
-    let decision = await_approval_with_cancel(
-        async move { decision_rx.await.unwrap_or_default() },
-        parent_session,
-        &parent_ctx.sub_id,
-        cancel_token,
-    )
-    .await;
-    let _ = codex.submit(Op::PatchApproval { id, decision }).await;
-}
-
-async fn handle_request_user_input(
-    codex: &Codex,
-    id: String,
-    parent_session: &Session,
-    parent_ctx: &TurnContext,
-    event: RequestUserInputEvent,
-    cancel_token: &CancellationToken,
-) {
-    let args = RequestUserInputArgs {
-        questions: event.questions,
-    };
-    let response_fut =
-        parent_session.request_user_input(parent_ctx, parent_ctx.sub_id.clone(), args);
-    let response = await_user_input_with_cancel(
-        response_fut,
-        parent_session,
-        &parent_ctx.sub_id,
-        cancel_token,
-    )
-    .await;
-    let _ = codex.submit(Op::UserInputAnswer { id, response }).await;
-}
-
-async fn await_user_input_with_cancel<F>(
-    fut: F,
-    parent_session: &Session,
-    sub_id: &str,
-    cancel_token: &CancellationToken,
-) -> RequestUserInputResponse
-where
-    F: core::future::Future<Output = Option<RequestUserInputResponse>>,
-{
-    tokio::select! {
-        biased;
-        _ = cancel_token.cancelled() => {
-            let empty = RequestUserInputResponse {
-                answers: HashMap::new(),
-            };
-            parent_session
-                .notify_user_input_response(sub_id, empty.clone())
-                .await;
-            empty
-        }
-        response = fut => response.unwrap_or_else(|| RequestUserInputResponse {
-            answers: HashMap::new(),
-        }),
-    }
-}
-
-/// Await an approval decision, aborting on cancellation.
-async fn await_approval_with_cancel<F>(
-    fut: F,
-    parent_session: &Session,
-    sub_id: &str,
-    cancel_token: &CancellationToken,
-) -> codex_protocol::protocol::ReviewDecision
-where
-    F: core::future::Future<Output = codex_protocol::protocol::ReviewDecision>,
-{
-    tokio::select! {
-        biased;
-        _ = cancel_token.cancelled() => {
-            parent_session
-                .notify_approval(sub_id, codex_protocol::protocol::ReviewDecision::Abort)
-                .await;
-            codex_protocol::protocol::ReviewDecision::Abort
-        }
-        decision = fut => {
-            decision
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +254,7 @@ mod tests {
     use codex_protocol::protocol::TurnAbortedEvent;
     use pretty_assertions::assert_eq;
     use tokio::sync::watch;
+    use tokio::time::timeout;
 
     #[tokio::test]
     async fn forward_events_cancelled_while_send_blocked_shuts_down_delegate() {
