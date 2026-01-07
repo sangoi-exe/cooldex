@@ -2,6 +2,15 @@
 
 This document is a task plan to evolve the current experimental `agent_run` tool into a more robust, reusable, and “background-friendly” multi-agent feature, without relying on `base_instructions`/`developer_instructions` overrides (rubrics must be passed via `UserInput::Text` + `final_output_json_schema`).
 
+## Status
+
+As of 2026-01-07:
+
+- M1 is done (shared approval routing + shutdown helper extracted; call sites refactored).
+- M2 is partially done (`agent_run` inherits the effective turn settings; still needs generalization + explicit overrides).
+- M3 is partially done (agent_spawn/wait/status/cancel implemented + registry; lifecycle cleanup still pending).
+- M4 is in progress (shared workspace lock wired into tool dispatch; policy refinement pending).
+
 ## Goals
 
 - Reuse shared sub-agent wiring across `agent_run`, `/sanitize`, review, and compact.
@@ -20,28 +29,31 @@ This document is a task plan to evolve the current experimental `agent_run` tool
 
 ### M1 — Extract a shared “sub-agent runner”
 
-- [ ] Create a reusable sub-agent runner module (e.g. `core/src/subagent_runner.rs`) that encapsulates:
-  - [ ] Spawning a sub-agent conversation with a `SessionSource::SubAgent(SubAgentSource::Other(...))`
-  - [ ] Routing `ExecApprovalRequest` / `ApplyPatchApprovalRequest` to the parent session
-  - [ ] Shutdown + drain logic (interrupt → shutdown → wait)
-  - [ ] Timeout + cancellation behavior
-- [ ] Refactor existing call sites to use it:
-  - [ ] Review/compact path (currently in `codex_delegate.rs`)
-  - [ ] `agent_run` tool handler
-- [ ] Add unit tests for the runner:
-  - [ ] Approval routing is wired to the parent (no deadlocks)
-  - [ ] Timeout always leads to a clean shutdown
-  - [ ] Cancelled parent turn aborts the sub-agent promptly
+- [x] Create a reusable sub-agent runner module (`core/src/subagent_runner.rs`) that encapsulates:
+  - [x] Routing `ExecApprovalRequest` / `ApplyPatchApprovalRequest` to the parent session
+  - [x] Shutdown + drain logic (interrupt → shutdown → wait)
+  - [x] Cancellation-aware approval routing (abort on cancellation)
+  - [ ] Spawning a sub-agent conversation (still owned by call sites for now)
+  - [ ] Shared “run until completion” loop (still owned by call sites for now)
+- [x] Refactor existing call sites to use it:
+  - [x] Review/compact path (currently in `codex_delegate.rs`)
+  - [x] `agent_run` tool handler
+- [x] Add unit tests for the runner:
+  - [x] Approval routing is wired to the parent (no deadlocks)
+  - [x] Cancelled parent turn aborts sub-agent approvals promptly
+  - [ ] Timeout always leads to a clean shutdown (nice-to-have: add a deterministic test)
 
 ### M2 — Correct config inheritance (“effective turn”)
 
 - [ ] Define exactly what should be inherited by default:
-  - [ ] `cwd`
-  - [ ] `approval_policy`
-  - [ ] `sandbox_policy`
-  - [ ] `model` / provider selection
-  - [ ] enabled features (with explicit exclusions for recursion)
-- [ ] Implement “effective config” derivation (prefer cloning `SessionConfiguration` + any active overrides) and pass it into sub-agent spawn.
+  - [x] `cwd`
+  - [x] `approval_policy`
+  - [x] `sandbox_policy`
+  - [x] `model` / provider selection
+  - [ ] enabled features (with explicit exclusions for recursion; currently we only hard-disable `multi_agent` in sub-agents)
+- [ ] Implement “effective config” derivation (prefer cloning `SessionConfiguration` + any active overrides) and pass it into sub-agent spawn:
+  - [x] `agent_run`: inherit effective turn settings (cwd/model/provider/policies) with fail-fast validation
+  - [ ] Generalize inheritance for all sub-agents (sanitize/review/compact) via a shared helper
 - [ ] Add an explicit `agent_run` argument surface for overrides (optional, but explicit):
   - [ ] `cwd` override
   - [ ] `model` override
@@ -52,24 +64,24 @@ This document is a task plan to evolve the current experimental `agent_run` tool
 
 ### M3 — True background mode (spawn → poll/wait)
 
-- [ ] Add new tools (still model-only; experimental flag):
-  - [ ] `agent_spawn`: returns `{ agent_id, rollout_path? }`
-  - [ ] `agent_wait`: waits for completion with timeout, returns `{ status, result }`
-  - [ ] `agent_status`: returns `{ status, last_message? }`
-  - [ ] `agent_cancel`: aborts a running agent
-- [ ] Maintain a parent-scoped registry of spawned agents (in memory) so the model can reference them by id.
+- [x] Add new tools (still model-only; experimental flag):
+  - [x] `agent_spawn`: returns `{ agent_id }`
+  - [x] `agent_wait`: waits for completion with timeout, returns `{ status, snapshot }`
+  - [x] `agent_status`: returns `{ snapshot }`
+  - [x] `agent_cancel`: aborts a running agent
+- [x] Maintain a parent-scoped registry of spawned agents (in memory) so the model can reference them by id.
 - [ ] Ensure non-leaky lifecycle:
-  - [ ] Agents are removed after `shutdown` unless explicitly retained
-  - [ ] Headless event draining is always active for background agents
+  - [x] Agents are removed after `shutdown` unless explicitly retained
+  - [x] Headless event draining is always active for background agents
 
 ### M4 — Concurrency and workspace safety
 
 - [ ] Define a concurrency policy:
   - [ ] “Research” agents may run concurrently.
   - [ ] “Execute/mutate” agents require exclusive access to the workspace.
-- [ ] Implement a cross-conversation lock shared across sessions (e.g. an `Arc<RwLock<()>>` in the conversation manager / services layer):
-  - [ ] Mutating tool calls acquire the write lock.
-  - [ ] Non-mutating tool calls acquire the read lock.
+- [x] Implement a cross-conversation lock shared across sessions (e.g. an `Arc<RwLock<()>>` in the conversation manager / services layer):
+  - [x] Mutating tool calls acquire the write lock.
+  - [x] Non-mutating tool calls acquire the read lock.
 - [ ] Update tool handlers’ `is_mutating()` classifications (or add a new “workspace mutating” trait) to ensure correctness.
 - [ ] Add fail-fast errors when policy is violated (no silent fallback).
 
@@ -99,4 +111,3 @@ This document is a task plan to evolve the current experimental `agent_run` tool
 - A sub-agent can be spawned, run tools (including approvals), and return a JSON result without polluting the parent context.
 - Background agents do not accumulate unbounded event queues.
 - Concurrency rules prevent two agents from mutating the same workspace at the same time.
-

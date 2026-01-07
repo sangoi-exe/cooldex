@@ -110,6 +110,7 @@ pub(crate) struct ThreadManagerState {
     skills_manager: Arc<SkillsManager>,
     file_watcher: Arc<FileWatcher>,
     session_source: SessionSource,
+    pub(crate) workspace_lock: Arc<RwLock<()>>,
     #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
     // Captures submitted ops for testing purpose.
@@ -134,6 +135,7 @@ impl ThreadManager {
                 file_watcher,
                 auth_manager,
                 session_source,
+                workspace_lock: Arc::new(RwLock::new(())),
                 #[cfg(any(test, feature = "test-support"))]
                 ops_log: Arc::new(std::sync::Mutex::new(Vec::new())),
             }),
@@ -178,6 +180,7 @@ impl ThreadManager {
                 file_watcher,
                 auth_manager,
                 session_source: SessionSource::Exec,
+                workspace_lock: Arc::new(RwLock::new(())),
                 #[cfg(any(test, feature = "test-support"))]
                 ops_log: Arc::new(std::sync::Mutex::new(Vec::new())),
             }),

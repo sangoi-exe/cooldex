@@ -15,6 +15,7 @@ use crate::codex::Codex;
 use crate::codex::CodexSpawnOk;
 use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
+use crate::protocol::AskForApproval;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::InitialHistory;
@@ -81,6 +82,10 @@ impl ToolHandler for AgentRunHandler {
         ToolKind::Function
     }
 
+    fn uses_workspace_lock(&self, _invocation: &ToolInvocation) -> bool {
+        false
+    }
+
     async fn is_mutating(&self, _invocation: &ToolInvocation) -> bool {
         // The spawned agent may run arbitrary tools (including filesystem writes), so treat this as
         // mutating to respect the turn tool gate.
@@ -113,6 +118,8 @@ impl ToolHandler for AgentRunHandler {
                 "agent_run requires non-empty prompt".to_string(),
             ));
         }
+
+        ensure_approval_policy_never(turn.as_ref())?;
 
         let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let timeout_duration = Duration::from_millis(timeout_ms);
@@ -189,7 +196,7 @@ impl ToolHandler for AgentRunHandler {
     }
 }
 
-fn inherit_effective_turn_settings(
+pub(crate) fn inherit_effective_turn_settings(
     config: &mut crate::config::Config,
     turn: &crate::codex::TurnContext,
 ) -> Result<(), FunctionCallError> {
@@ -220,6 +227,17 @@ fn inherit_effective_turn_settings(
     Ok(())
 }
 
+pub(crate) fn ensure_approval_policy_never(
+    turn: &crate::codex::TurnContext,
+) -> Result<(), FunctionCallError> {
+    if turn.approval_policy != AskForApproval::Never {
+        return Err(FunctionCallError::RespondToModel(
+            "agent_run requires approval_policy=never for sub-agent execution.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn parent_turn_cancellation_token(
     session: &crate::codex::Session,
     sub_id: &str,
@@ -238,7 +256,7 @@ async fn parent_turn_cancellation_token(
     Ok(task.cancellation_token.clone())
 }
 
-fn default_agent_run_result_schema() -> Value {
+pub(crate) fn default_agent_run_result_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,

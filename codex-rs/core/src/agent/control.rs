@@ -8,6 +8,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use std::sync::Arc;
 use std::sync::Weak;
+use tokio::sync::RwLock;
 use tokio::sync::watch;
 
 /// Control-plane handle for multi-agent operations.
@@ -101,7 +102,7 @@ impl AgentControl {
     /// Submit a shutdown request to an existing agent thread.
     pub(crate) async fn shutdown_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
         let state = self.upgrade()?;
-        let result = state.send_op(agent_id, Op::Shutdown {}).await;
+        let result = state.send_op(agent_id, Op::Shutdown).await;
         let _ = state.remove_thread(&agent_id).await;
         self.state.release_spawned_thread(agent_id);
         result
@@ -127,6 +128,13 @@ impl AgentControl {
         let state = self.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
         Ok(thread.subscribe_status())
+    }
+
+    pub(crate) fn workspace_lock(&self) -> Arc<RwLock<()>> {
+        self.manager
+            .upgrade()
+            .map(|state| Arc::clone(&state.workspace_lock))
+            .unwrap_or_else(|| Arc::new(RwLock::new(())))
     }
 
     fn upgrade(&self) -> CodexResult<Arc<ThreadManagerState>> {

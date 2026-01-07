@@ -199,6 +199,7 @@ use crate::state::ActiveTurn;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 use crate::state_db;
+use crate::subagent_runner::AgentRegistry;
 use crate::tasks::GhostSnapshotTask;
 use crate::tasks::ReviewTask;
 use crate::tasks::SanitizeTask;
@@ -1050,6 +1051,7 @@ impl Session {
         session_configuration.thread_name = thread_name.clone();
         let state = SessionState::new(session_configuration.clone());
 
+        let workspace_lock = agent_control.workspace_lock();
         let services = SessionServices {
             mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
             mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
@@ -1084,6 +1086,8 @@ impl Session {
                 config.features.enabled(Feature::RuntimeMetrics),
                 Self::build_model_client_beta_features_header(config.as_ref()),
             ),
+            agent_registry: Arc::new(AgentRegistry::default()),
+            workspace_lock,
         };
 
         let sess = Arc::new(Session {
@@ -4909,10 +4913,17 @@ fn maybe_prefix_tool_output_with_context_left(
     if content.trim_start().starts_with("Context left:") {
         return;
     }
-    if tool_name_by_call_id
-        .get(call_id)
-        .is_some_and(|name| matches!(name.as_str(), "manage_context" | "agent_run"))
-    {
+    if tool_name_by_call_id.get(call_id).is_some_and(|name| {
+        matches!(
+            name.as_str(),
+            "manage_context"
+                | "agent_run"
+                | "agent_spawn"
+                | "agent_wait"
+                | "agent_status"
+                | "agent_cancel"
+        )
+    }) {
         return;
     }
 
@@ -6467,6 +6478,7 @@ mod tests {
         let skills_manager = Arc::new(SkillsManager::new(config.codex_home.clone()));
 
         let file_watcher = Arc::new(FileWatcher::noop());
+        let workspace_lock = agent_control.workspace_lock();
         let services = SessionServices {
             mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
             mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
@@ -6501,6 +6513,8 @@ mod tests {
                 config.features.enabled(Feature::RuntimeMetrics),
                 Session::build_model_client_beta_features_header(config.as_ref()),
             ),
+            agent_registry: Arc::new(AgentRegistry::default()),
+            workspace_lock,
         };
 
         let turn_context = Session::make_turn_context(
@@ -6599,6 +6613,7 @@ mod tests {
         let skills_manager = Arc::new(SkillsManager::new(config.codex_home.clone()));
 
         let file_watcher = Arc::new(FileWatcher::noop());
+        let workspace_lock = agent_control.workspace_lock();
         let services = SessionServices {
             mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
             mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
@@ -6633,6 +6648,8 @@ mod tests {
                 config.features.enabled(Feature::RuntimeMetrics),
                 Session::build_model_client_beta_features_header(config.as_ref()),
             ),
+            agent_registry: Arc::new(AgentRegistry::default()),
+            workspace_lock,
         };
 
         let turn_context = Arc::new(Session::make_turn_context(

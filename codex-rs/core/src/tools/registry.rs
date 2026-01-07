@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::ResponseInputItem;
 use codex_utils_readiness::Readiness;
+use tokio_util::either::Either;
 use tracing::warn;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -40,6 +41,10 @@ pub trait ToolHandler: Send + Sync {
     /// exact effect of a ToolInvocation.
     async fn is_mutating(&self, _invocation: &ToolInvocation) -> bool {
         false
+    }
+
+    fn uses_workspace_lock(&self, _invocation: &ToolInvocation) -> bool {
+        true
     }
 
     /// Perform the actual [ToolInvocation] and returns a [ToolOutput] containing
@@ -136,11 +141,23 @@ impl ToolRegistry {
                     let output_cell = &output_cell;
                     let invocation = invocation;
                     async move {
-                        if handler.is_mutating(&invocation).await {
+                        let workspace_lock =
+                            Arc::clone(&invocation.session.services.workspace_lock);
+                        let is_mutating = handler.is_mutating(&invocation).await;
+                        if is_mutating {
                             tracing::trace!("waiting for tool gate");
                             invocation.turn.tool_call_gate.wait_ready().await;
                             tracing::trace!("tool gate released");
                         }
+                        let _workspace_guard = if handler.uses_workspace_lock(&invocation) {
+                            if is_mutating {
+                                Some(Either::Left(workspace_lock.write().await))
+                            } else {
+                                Some(Either::Right(workspace_lock.read().await))
+                            }
+                        } else {
+                            None
+                        };
                         match handler.handle(invocation).await {
                             Ok(output) => {
                                 let preview = output.log_preview();

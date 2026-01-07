@@ -1,11 +1,20 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
+use codex_protocol::ConversationId;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
+use serde::Serialize;
+use serde_json::Value;
+use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -52,6 +61,283 @@ pub(crate) async fn maybe_route_subagent_approval(
         }
         _ => false,
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BackgroundAgentStatus {
+    Running,
+    Completed,
+    Errored,
+    Aborted,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct BackgroundAgentSnapshot {
+    pub(crate) status: BackgroundAgentStatus,
+    pub(crate) result: Option<Value>,
+    pub(crate) error: Option<String>,
+    pub(crate) rollout_path: Option<String>,
+    pub(crate) elapsed_ms: u128,
+    pub(crate) last_message: Option<String>,
+}
+
+#[derive(Debug)]
+struct BackgroundAgentState {
+    status: BackgroundAgentStatus,
+    result: Option<Value>,
+    error: Option<String>,
+    rollout_path: Option<PathBuf>,
+    last_message: Option<String>,
+    started_at: Instant,
+    finished_at: Option<Instant>,
+}
+
+impl BackgroundAgentState {
+    fn snapshot(&self) -> BackgroundAgentSnapshot {
+        let end = self.finished_at.unwrap_or_else(Instant::now);
+        BackgroundAgentSnapshot {
+            status: self.status,
+            result: self.result.clone(),
+            error: self.error.clone(),
+            rollout_path: self.rollout_path.as_ref().map(|p| p.display().to_string()),
+            elapsed_ms: end.duration_since(self.started_at).as_millis(),
+            last_message: self.last_message.clone(),
+        }
+    }
+}
+
+pub(crate) struct BackgroundAgentHandle {
+    codex: Arc<Codex>,
+    state: Arc<Mutex<BackgroundAgentState>>,
+    done: Arc<Notify>,
+    cancel_token: CancellationToken,
+    max_result_bytes: usize,
+}
+
+impl BackgroundAgentHandle {
+    pub(crate) fn new(codex: Arc<Codex>, max_result_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            codex,
+            state: Arc::new(Mutex::new(BackgroundAgentState {
+                status: BackgroundAgentStatus::Running,
+                result: None,
+                error: None,
+                rollout_path: None,
+                last_message: None,
+                started_at: Instant::now(),
+                finished_at: None,
+            })),
+            done: Arc::new(Notify::new()),
+            cancel_token: CancellationToken::new(),
+            max_result_bytes,
+        })
+    }
+
+    pub(crate) async fn snapshot(&self) -> BackgroundAgentSnapshot {
+        let state = self.state.lock().await;
+        state.snapshot()
+    }
+
+    pub(crate) async fn wait_for_done(&self, timeout_duration: Duration) -> bool {
+        let is_done = {
+            let state = self.state.lock().await;
+            !matches!(state.status, BackgroundAgentStatus::Running)
+        };
+        if is_done {
+            return true;
+        }
+        timeout(timeout_duration, self.done.notified())
+            .await
+            .is_ok()
+    }
+
+    pub(crate) async fn cancel(&self) {
+        self.cancel_token.cancel();
+        shutdown_subagent(self.codex.as_ref()).await;
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct AgentRegistry {
+    agents: Arc<Mutex<HashMap<ConversationId, Arc<BackgroundAgentHandle>>>>,
+}
+
+impl AgentRegistry {
+    pub(crate) async fn insert(&self, id: ConversationId, handle: Arc<BackgroundAgentHandle>) {
+        let mut agents = self.agents.lock().await;
+        agents.insert(id, handle);
+    }
+
+    pub(crate) async fn get(&self, id: &ConversationId) -> Option<Arc<BackgroundAgentHandle>> {
+        let agents = self.agents.lock().await;
+        agents.get(id).cloned()
+    }
+
+    pub(crate) async fn remove(&self, id: &ConversationId) -> Option<Arc<BackgroundAgentHandle>> {
+        let mut agents = self.agents.lock().await;
+        agents.remove(id)
+    }
+}
+
+pub(crate) async fn spawn_background_agent_loop(
+    handle: Arc<BackgroundAgentHandle>,
+    registry: Arc<AgentRegistry>,
+    agent_id: ConversationId,
+) {
+    let codex = Arc::clone(&handle.codex);
+    let cancel_token = handle.cancel_token.child_token();
+    let cancelled = cancel_token.cancelled();
+    tokio::pin!(cancelled);
+
+    loop {
+        tokio::select! {
+            _ = &mut cancelled => {
+                update_agent_state(&handle, BackgroundAgentStatus::Aborted, None, Some("cancelled".to_string()), None).await;
+                shutdown_subagent(codex.as_ref()).await;
+                handle.done.notify_waiters();
+                registry.remove(&agent_id).await;
+                break;
+            }
+            event = codex.next_event() => {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(err) => {
+                        update_agent_state(&handle, BackgroundAgentStatus::Errored, None, Some(format!("failed to receive sub-agent event: {err}")), None).await;
+                        shutdown_subagent(codex.as_ref()).await;
+                        handle.done.notify_waiters();
+                        registry.remove(&agent_id).await;
+                        break;
+                    }
+                };
+
+                if let EventMsg::SessionConfigured(ev) = &event.msg {
+                    let mut state = handle.state.lock().await;
+                    state.rollout_path = Some(ev.rollout_path.clone());
+                    continue;
+                }
+
+                if matches!(
+                    event.msg,
+                    EventMsg::ExecApprovalRequest(_)
+                        | EventMsg::ApplyPatchApprovalRequest(_)
+                        | EventMsg::ElicitationRequest(_)
+                ) {
+                    update_agent_state(
+                        &handle,
+                        BackgroundAgentStatus::Errored,
+                        None,
+                        Some("background agent requested approval/elicitation; approval_policy=never is required".to_string()),
+                        None,
+                    )
+                    .await;
+                    shutdown_subagent(codex.as_ref()).await;
+                    handle.done.notify_waiters();
+                    break;
+                }
+
+                match event.msg {
+                    EventMsg::TaskComplete(ev) => {
+                        let last_message = ev.last_agent_message;
+                        let (result, error) = parse_agent_result(
+                            last_message.clone(),
+                            handle.max_result_bytes,
+                        );
+                        let status = if error.is_some() {
+                            BackgroundAgentStatus::Errored
+                        } else {
+                            BackgroundAgentStatus::Completed
+                        };
+                        update_agent_state(&handle, status, result, error, last_message).await;
+                        shutdown_subagent(codex.as_ref()).await;
+                        handle.done.notify_waiters();
+                        registry.remove(&agent_id).await;
+                        break;
+                    }
+                    EventMsg::TurnAborted(ev) => {
+                        update_agent_state(
+                            &handle,
+                            BackgroundAgentStatus::Aborted,
+                            None,
+                            Some(format!("{:?}", ev.reason)),
+                            None,
+                        )
+                        .await;
+                        shutdown_subagent(codex.as_ref()).await;
+                        handle.done.notify_waiters();
+                        registry.remove(&agent_id).await;
+                        break;
+                    }
+                    EventMsg::Error(ev) => {
+                        update_agent_state(
+                            &handle,
+                            BackgroundAgentStatus::Errored,
+                            None,
+                            Some(ev.message),
+                            None,
+                        )
+                        .await;
+                        shutdown_subagent(codex.as_ref()).await;
+                        handle.done.notify_waiters();
+                        registry.remove(&agent_id).await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn update_agent_state(
+    handle: &BackgroundAgentHandle,
+    status: BackgroundAgentStatus,
+    result: Option<Value>,
+    error: Option<String>,
+    last_message: Option<String>,
+) {
+    let mut state = handle.state.lock().await;
+    state.status = status;
+    state.result = result;
+    state.error = error;
+    state.last_message = last_message;
+    state.finished_at = Some(Instant::now());
+}
+
+fn parse_agent_result(
+    last_message: Option<String>,
+    max_result_bytes: usize,
+) -> (Option<Value>, Option<String>) {
+    let Some(text) = last_message else {
+        return (
+            None,
+            Some("sub-agent completed without a final message".to_string()),
+        );
+    };
+    let value = match serde_json::from_str::<Value>(&text) {
+        Ok(value) => value,
+        Err(err) => {
+            let truncated = text.chars().take(2048).collect::<String>();
+            return (
+                None,
+                Some(format!(
+                    "sub-agent returned non-JSON output: {err}; output (truncated): {truncated}"
+                )),
+            );
+        }
+    };
+    let serialized = serde_json::to_string(&value).unwrap_or_default();
+    if serialized.len() > max_result_bytes {
+        return (
+            None,
+            Some(format!(
+                "sub-agent result too large: {} bytes (limit: {max_result_bytes}); re-run with a more compact summary",
+                serialized.len()
+            )),
+        );
+    }
+    (Some(value), None)
 }
 
 /// Ask the sub-agent to stop and drain its events so background sends do not hit a closed channel.

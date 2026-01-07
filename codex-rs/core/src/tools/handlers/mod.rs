@@ -1,3 +1,4 @@
+mod agent_background;
 mod agent_run;
 pub mod apply_patch;
 pub(crate) mod collab;
@@ -20,6 +21,10 @@ pub use plan::PLAN_TOOL;
 use serde::Deserialize;
 
 use crate::function_tool::FunctionCallError;
+pub use agent_background::AgentCancelHandler;
+pub use agent_background::AgentSpawnHandler;
+pub use agent_background::AgentStatusHandler;
+pub use agent_background::AgentWaitHandler;
 pub use agent_run::AgentRunHandler;
 pub use apply_patch::ApplyPatchHandler;
 pub use collab::CollabHandler;

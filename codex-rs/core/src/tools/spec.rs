@@ -1113,6 +1113,119 @@ fn create_agent_run_tool() -> ToolSpec {
     })
 }
 
+fn create_agent_spawn_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "prompt".to_string(),
+        JsonSchema::String {
+            description: Some("Task prompt for the background agent.".to_string()),
+        },
+    );
+    properties.insert(
+        "result_schema".to_string(),
+        JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(true.into()),
+        },
+    );
+    properties.insert(
+        "max_result_bytes".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional maximum size (in bytes) of the returned JSON result (default: 32768)."
+                    .to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "agent_spawn".to_string(),
+        description:
+            "Spawn a background sub-agent in a separate conversation and return its agent_id."
+                .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["prompt".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_agent_wait_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "agent_id".to_string(),
+        JsonSchema::String {
+            description: Some("The agent_id returned by agent_spawn.".to_string()),
+        },
+    );
+    properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional timeout in milliseconds to wait for completion (default: 600000)."
+                    .to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "agent_wait".to_string(),
+        description: "Wait for a background agent to finish, or return a timeout status."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["agent_id".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_agent_status_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "agent_id".to_string(),
+        JsonSchema::String {
+            description: Some("The agent_id returned by agent_spawn.".to_string()),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "agent_status".to_string(),
+        description: "Get the current status and last snapshot for a background agent.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["agent_id".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_agent_cancel_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "agent_id".to_string(),
+        JsonSchema::String {
+            description: Some("The agent_id returned by agent_spawn.".to_string()),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "agent_cancel".to_string(),
+        description: "Cancel a background agent and return its final snapshot.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["agent_id".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_list_mcp_resources_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
@@ -1415,7 +1528,11 @@ pub(crate) fn build_specs(
     mcp_tools: Option<HashMap<String, rmcp::model::Tool>>,
     dynamic_tools: &[DynamicToolSpec],
 ) -> ToolRegistryBuilder {
+    use crate::tools::handlers::AgentCancelHandler;
     use crate::tools::handlers::AgentRunHandler;
+    use crate::tools::handlers::AgentSpawnHandler;
+    use crate::tools::handlers::AgentStatusHandler;
+    use crate::tools::handlers::AgentWaitHandler;
     use crate::tools::handlers::ApplyPatchHandler;
     use crate::tools::handlers::CollabHandler;
     use crate::tools::handlers::DynamicToolHandler;
@@ -1445,6 +1562,10 @@ pub(crate) fn build_specs(
     let get_memory_handler = Arc::new(GetMemoryHandler);
     let manage_context_handler = Arc::new(ManageContextHandler);
     let agent_run_handler = Arc::new(AgentRunHandler);
+    let agent_spawn_handler = Arc::new(AgentSpawnHandler);
+    let agent_wait_handler = Arc::new(AgentWaitHandler);
+    let agent_status_handler = Arc::new(AgentStatusHandler);
+    let agent_cancel_handler = Arc::new(AgentCancelHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
@@ -1513,7 +1634,15 @@ pub(crate) fn build_specs(
 
     if config.include_agent_run_tool {
         builder.push_spec(create_agent_run_tool());
+        builder.push_spec(create_agent_spawn_tool());
+        builder.push_spec(create_agent_wait_tool());
+        builder.push_spec(create_agent_status_tool());
+        builder.push_spec(create_agent_cancel_tool());
         builder.register_handler("agent_run", agent_run_handler);
+        builder.register_handler("agent_spawn", agent_spawn_handler);
+        builder.register_handler("agent_wait", agent_wait_handler);
+        builder.register_handler("agent_status", agent_status_handler);
+        builder.register_handler("agent_cancel", agent_cancel_handler);
     }
 
     if let Some(apply_patch_tool_type) = &config.apply_patch_tool_type {

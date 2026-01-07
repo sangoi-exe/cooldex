@@ -12,6 +12,7 @@ use crate::mcp_connection_manager::McpConnectionManager;
 use crate::models_manager::manager::ModelsManager;
 use crate::skills::SkillsManager;
 use crate::state_db::StateDbHandle;
+use crate::subagent_runner::AgentRegistry;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::unified_exec::UnifiedExecProcessManager;
 use codex_otel::OtelManager;
@@ -39,4 +40,6 @@ pub(crate) struct SessionServices {
     pub(crate) state_db: Option<StateDbHandle>,
     /// Session-scoped model client shared across turns.
     pub(crate) model_client: ModelClient,
+    pub(crate) agent_registry: Arc<AgentRegistry>,
+    pub(crate) workspace_lock: Arc<RwLock<()>>,
 }
