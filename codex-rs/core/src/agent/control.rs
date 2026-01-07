@@ -24,6 +24,7 @@ pub(crate) struct AgentControl {
     /// `ThreadManagerState -> CodexThread -> Session -> SessionServices -> ThreadManagerState`.
     manager: Weak<ThreadManagerState>,
     state: Arc<Guards>,
+    fallback_workspace_lock: Arc<RwLock<()>>,
 }
 
 impl AgentControl {
@@ -134,7 +135,7 @@ impl AgentControl {
         self.manager
             .upgrade()
             .map(|state| Arc::clone(&state.workspace_lock))
-            .unwrap_or_else(|| Arc::new(RwLock::new(())))
+            .unwrap_or_else(|| Arc::clone(&self.fallback_workspace_lock))
     }
 
     fn upgrade(&self) -> CodexResult<Arc<ThreadManagerState>> {

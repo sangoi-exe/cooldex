@@ -8,7 +8,7 @@ As of 2026-01-07:
 
 - M1 is done (shared approval routing + shutdown helper extracted; call sites refactored).
 - M2 is partially done (`agent_run` inherits the effective turn settings; still needs generalization + explicit overrides).
-- M3 is partially done (agent_spawn/wait/status/cancel implemented + registry; lifecycle cleanup still pending).
+- M3 is done (agent_spawn/wait/status/cancel implemented + registry + lifecycle cleanup).
 - M4 is in progress (shared workspace lock wired into tool dispatch; policy refinement pending).
 
 ## Goals
