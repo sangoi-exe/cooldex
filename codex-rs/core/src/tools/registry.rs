@@ -151,9 +151,25 @@ impl ToolRegistry {
                         }
                         let _workspace_guard = if handler.uses_workspace_lock(&invocation) {
                             if is_mutating {
-                                Some(Either::Left(workspace_lock.write().await))
+                                match workspace_lock.try_write() {
+                                    Ok(guard) => Some(Either::Left(guard)),
+                                    Err(_) => {
+                                        return Err(FunctionCallError::RespondToModel(
+                                            "workspace busy: another tool is running; retry after it finishes"
+                                                .to_string(),
+                                        ));
+                                    }
+                                }
                             } else {
-                                Some(Either::Right(workspace_lock.read().await))
+                                match workspace_lock.try_read() {
+                                    Ok(guard) => Some(Either::Right(guard)),
+                                    Err(_) => {
+                                        return Err(FunctionCallError::RespondToModel(
+                                            "workspace busy: mutating tool in progress; retry later"
+                                                .to_string(),
+                                        ));
+                                    }
+                                }
                             }
                         } else {
                             None

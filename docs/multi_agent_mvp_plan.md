@@ -83,7 +83,7 @@ As of 2026-01-07:
   - [x] Mutating tool calls acquire the write lock.
   - [x] Non-mutating tool calls acquire the read lock.
 - [x] Update tool handlers’ `is_mutating()` classifications (or add a new “workspace mutating” trait) to ensure correctness.
-- [ ] Add fail-fast errors when policy is violated (no silent fallback).
+- [x] Add fail-fast errors when policy is violated (no silent fallback).
 
 ### M5 — Schema validation + result size discipline
 
