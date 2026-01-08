@@ -1632,18 +1632,16 @@ pub(crate) fn build_specs(
     builder.push_spec(create_manage_context_tool());
     builder.register_handler("manage_context", manage_context_handler);
 
-    if config.include_agent_run_tool {
-        builder.push_spec(create_agent_run_tool());
-        builder.push_spec(create_agent_spawn_tool());
-        builder.push_spec(create_agent_wait_tool());
-        builder.push_spec(create_agent_status_tool());
-        builder.push_spec(create_agent_cancel_tool());
-        builder.register_handler("agent_run", agent_run_handler);
-        builder.register_handler("agent_spawn", agent_spawn_handler);
-        builder.register_handler("agent_wait", agent_wait_handler);
-        builder.register_handler("agent_status", agent_status_handler);
-        builder.register_handler("agent_cancel", agent_cancel_handler);
-    }
+    builder.push_spec(create_agent_run_tool());
+    builder.push_spec(create_agent_spawn_tool());
+    builder.push_spec(create_agent_wait_tool());
+    builder.push_spec(create_agent_status_tool());
+    builder.push_spec(create_agent_cancel_tool());
+    builder.register_handler("agent_run", agent_run_handler);
+    builder.register_handler("agent_spawn", agent_spawn_handler);
+    builder.register_handler("agent_wait", agent_wait_handler);
+    builder.register_handler("agent_status", agent_status_handler);
+    builder.register_handler("agent_cancel", agent_cancel_handler);
 
     if let Some(apply_patch_tool_type) = &config.apply_patch_tool_type {
         match apply_patch_tool_type {
