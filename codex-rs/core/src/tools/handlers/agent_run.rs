@@ -264,16 +264,112 @@ pub(crate) fn validate_result_schema(schema: &Value) -> Result<(), FunctionCallE
         ));
     }
 
-    let properties = obj.get("properties");
-    if properties.is_none() {
-        return Err(FunctionCallError::RespondToModel(
-            "result_schema must define \"properties\" for object schemas".to_string(),
-        ));
+    validate_strict_json_schema(schema, "$")?;
+
+    Ok(())
+}
+
+fn validate_strict_json_schema(schema: &Value, path: &str) -> Result<(), FunctionCallError> {
+    let Some(obj) = schema.as_object() else {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "result_schema at {path} must be a JSON object"
+        )));
+    };
+
+    if let Some(Value::Object(defs)) = obj.get("$defs") {
+        for (name, schema) in defs {
+            validate_strict_json_schema(schema, &format!("{path}.$defs.{name}"))?;
+        }
     }
-    if !matches!(properties, Some(Value::Object(_))) {
-        return Err(FunctionCallError::RespondToModel(
-            "result_schema \"properties\" must be an object".to_string(),
-        ));
+    if let Some(Value::Object(defs)) = obj.get("definitions") {
+        for (name, schema) in defs {
+            validate_strict_json_schema(schema, &format!("{path}.definitions.{name}"))?;
+        }
+    }
+
+    for combiner in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(value) = obj.get(combiner) {
+            let Some(entries) = value.as_array() else {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "result_schema at {path}.{combiner} must be an array"
+                )));
+            };
+            for (idx, schema) in entries.iter().enumerate() {
+                validate_strict_json_schema(schema, &format!("{path}.{combiner}.{idx}"))?;
+            }
+        }
+    }
+
+    if let Some(value) = obj.get("not") {
+        validate_strict_json_schema(value, &format!("{path}.not"))?;
+    }
+
+    let ty = match obj.get("type") {
+        Some(Value::String(ty)) => Some(ty.as_str()),
+        Some(Value::Array(_)) => {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "result_schema at {path}.type must be a string (union types are not supported)"
+            )));
+        }
+        Some(_) => {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "result_schema at {path}.type must be a string"
+            )));
+        }
+        None => {
+            if obj.contains_key("properties")
+                || obj.contains_key("required")
+                || obj.contains_key("additionalProperties")
+            {
+                Some("object")
+            } else if obj.contains_key("items") || obj.contains_key("prefixItems") {
+                Some("array")
+            } else {
+                None
+            }
+        }
+    };
+
+    match ty {
+        Some("object") => {
+            let properties = obj.get("properties").ok_or_else(|| {
+                FunctionCallError::RespondToModel(format!(
+                    "result_schema at {path} must define \"properties\" for object schemas"
+                ))
+            })?;
+            let Some(properties) = properties.as_object() else {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "result_schema at {path}.properties must be an object"
+                )));
+            };
+
+            match obj.get("additionalProperties") {
+                Some(Value::Bool(false)) => {}
+                Some(_) => {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "result_schema at {path} must set \"additionalProperties\": false for object schemas"
+                    )));
+                }
+                None => {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "result_schema at {path} must set \"additionalProperties\": false for object schemas"
+                    )));
+                }
+            }
+
+            for (name, schema) in properties {
+                validate_strict_json_schema(schema, &format!("{path}.properties.{name}"))?;
+            }
+        }
+        Some("array") => {
+            let items = obj.get("items").ok_or_else(|| {
+                FunctionCallError::RespondToModel(format!(
+                    "result_schema at {path} must define \"items\" for array schemas"
+                ))
+            })?;
+            validate_strict_json_schema(items, &format!("{path}.items"))?;
+        }
+        _ => {}
     }
 
     Ok(())
@@ -310,7 +406,7 @@ pub(crate) fn default_agent_run_result_schema() -> Value {
             "files": { "type": "array", "items": { "type": "string" } },
             "open_questions": { "type": "array", "items": { "type": "string" } },
             "risks": { "type": "array", "items": { "type": "string" } },
-            "extra": { "type": "object", "additionalProperties": true },
+            "extra": { "type": "array", "items": { "type": "string" } },
         }
     })
 }
@@ -468,4 +564,57 @@ async fn run_one_shot_agent(
     shutdown_subagent(codex).await;
 
     (status, rollout_path, result, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_schema_is_valid_strict_schema() {
+        validate_result_schema(&default_agent_run_result_schema()).expect("valid schema");
+    }
+
+    #[test]
+    fn rejects_object_with_additional_properties_true() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "extra": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {},
+                }
+            }
+        });
+
+        let err = validate_result_schema(&schema).expect_err("expected invalid schema");
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("expected RespondToModel error, got: {err:?}");
+        };
+        assert!(message.contains("$.properties.extra"), "{message}");
+        assert!(message.contains("additionalProperties"), "{message}");
+    }
+
+    #[test]
+    fn rejects_object_missing_additional_properties() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "nested": {
+                    "type": "object",
+                    "properties": {},
+                }
+            },
+            "additionalProperties": false,
+        });
+
+        let err = validate_result_schema(&schema).expect_err("expected invalid schema");
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("expected RespondToModel error, got: {err:?}");
+        };
+        assert!(message.contains("$.properties.nested"), "{message}");
+        assert!(message.contains("additionalProperties"), "{message}");
+    }
 }
