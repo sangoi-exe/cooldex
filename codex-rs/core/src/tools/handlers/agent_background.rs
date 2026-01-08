@@ -26,6 +26,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::handlers::agent_run::default_agent_run_result_schema;
 use crate::tools::handlers::agent_run::ensure_approval_policy_never;
 use crate::tools::handlers::agent_run::inherit_effective_turn_settings;
+use crate::tools::handlers::agent_run::validate_result_schema;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use codex_protocol::ConversationId;
@@ -161,6 +162,7 @@ impl ToolHandler for AgentSpawnHandler {
         let result_schema = args
             .result_schema
             .unwrap_or_else(default_agent_run_result_schema);
+        validate_result_schema(&result_schema)?;
 
         let input = vec![codex_protocol::user_input::UserInput::Text {
             text: format!("{AGENT_RUN_PROMPT}\n\n## Task\n{}", args.prompt),

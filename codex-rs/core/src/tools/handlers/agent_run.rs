@@ -29,6 +29,7 @@ use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
+use crate::tools::spec::JsonSchema;
 
 const DEFAULT_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const DEFAULT_MAX_RESULT_BYTES: usize = 32 * 1024;
@@ -140,6 +141,7 @@ impl ToolHandler for AgentRunHandler {
         let result_schema = args
             .result_schema
             .unwrap_or_else(default_agent_run_result_schema);
+        validate_result_schema(&result_schema)?;
 
         let input = vec![codex_protocol::user_input::UserInput::Text {
             text: format!("{AGENT_RUN_PROMPT}\n\n## Task\n{}", args.prompt),
@@ -235,6 +237,35 @@ pub(crate) fn ensure_approval_policy_never(
             "agent_run requires approval_policy=never for sub-agent execution.".to_string(),
         ));
     }
+    Ok(())
+}
+
+pub(crate) fn validate_result_schema(schema: &Value) -> Result<(), FunctionCallError> {
+    let Some(obj) = schema.as_object() else {
+        return Err(FunctionCallError::RespondToModel(
+            "result_schema must be a JSON object".to_string(),
+        ));
+    };
+
+    let ty = obj.get("type").and_then(|value| value.as_str());
+    if ty != Some("object") {
+        return Err(FunctionCallError::RespondToModel(
+            "result_schema must have top-level \"type\": \"object\"".to_string(),
+        ));
+    }
+
+    if !obj.contains_key("properties") {
+        return Err(FunctionCallError::RespondToModel(
+            "result_schema must define \"properties\" for object schemas".to_string(),
+        ));
+    }
+
+    serde_json::from_value::<JsonSchema>(schema.clone()).map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "result_schema is not supported by Codex (JSON Schema subset only): {err}"
+        ))
+    })?;
+
     Ok(())
 }
 

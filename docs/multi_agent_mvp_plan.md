@@ -9,7 +9,8 @@ As of 2026-01-07:
 - M1 is done (shared approval routing + shutdown helper extracted; call sites refactored).
 - M2 is partially done (`agent_run` inherits the effective turn settings; still needs generalization + explicit overrides).
 - M3 is done (agent_spawn/wait/status/cancel implemented + registry + lifecycle cleanup).
-- M4 is in progress (shared workspace lock wired into tool dispatch; policy refinement pending).
+- M4 is done (shared workspace lock + automatic policy via tool mutability).
+- M5 is done (schema validation + result size discipline).
 
 ## Goals
 
@@ -76,9 +77,8 @@ As of 2026-01-07:
 
 ### M4 — Concurrency and workspace safety
 
-- [ ] Define a concurrency policy:
-  - [ ] “Research” agents may run concurrently.
-  - [ ] “Execute/mutate” agents require exclusive access to the workspace.
+- [x] Define a concurrency policy:
+  - [x] Policy is automatic: “read-only” tools take read lock; mutating tools take write lock.
 - [x] Implement a cross-conversation lock shared across sessions (e.g. an `Arc<RwLock<()>>` in the conversation manager / services layer):
   - [x] Mutating tool calls acquire the write lock.
   - [x] Non-mutating tool calls acquire the read lock.
@@ -87,12 +87,12 @@ As of 2026-01-07:
 
 ### M5 — Schema validation + result size discipline
 
-- [ ] Validate/sanitize `result_schema` before sending it to the provider:
-  - [ ] Reject empty or invalid schemas with a clear error
-  - [ ] Run the existing schema sanitizer where appropriate
-- [ ] Make `max_result_bytes` enforceable in a predictable way:
-  - [ ] Reject oversized results with guidance to re-run with a tighter schema
-  - [ ] Optionally support truncation only if it remains valid JSON (prefer fail-fast)
+- [x] Validate `result_schema` before sending it to the provider (fail-fast; no silent coercion):
+  - [x] Reject empty or invalid schemas with a clear error
+  - [x] Require top-level `type: object` and `properties` for output schemas
+- [x] Enforce size discipline:
+  - [x] Reject oversized results with guidance to re-run with a tighter schema
+  - [x] Truncate raw `last_message` snapshots to keep agent_status/wait outputs small
 
 ### M6 — Observability + UX for the parent session
 

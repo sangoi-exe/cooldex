@@ -11,6 +11,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
+use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -244,6 +245,8 @@ pub(crate) async fn spawn_background_agent_loop(
                             last_message.clone(),
                             handle.max_result_bytes,
                         );
+                        let last_message =
+                            truncate_last_message(last_message, handle.max_result_bytes);
                         let status = if error.is_some() {
                             BackgroundAgentStatus::Errored
                         } else {
@@ -338,6 +341,17 @@ fn parse_agent_result(
         );
     }
     (Some(value), None)
+}
+
+fn truncate_last_message(message: Option<String>, max_result_bytes: usize) -> Option<String> {
+    message.map(|text| {
+        let truncated = take_bytes_at_char_boundary(&text, max_result_bytes);
+        if truncated.len() < text.len() {
+            format!("{truncated}…")
+        } else {
+            text
+        }
+    })
 }
 
 /// Ask the sub-agent to stop and drain its events so background sends do not hit a closed channel.
