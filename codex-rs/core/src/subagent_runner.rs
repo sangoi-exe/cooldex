@@ -189,7 +189,6 @@ impl AgentRegistry {
 
 pub(crate) async fn spawn_background_agent_loop(
     handle: Arc<BackgroundAgentHandle>,
-    registry: Arc<AgentRegistry>,
     agent_id: ConversationId,
     parent_session: Arc<Session>,
     parent_turn: Arc<TurnContext>,
@@ -211,7 +210,14 @@ pub(crate) async fn spawn_background_agent_loop(
     loop {
         tokio::select! {
             _ = &mut cancelled => {
-                update_agent_state(&handle, BackgroundAgentStatus::Aborted, None, Some("cancelled".to_string()), None).await;
+                update_agent_state(
+                    &handle,
+                    BackgroundAgentStatus::Aborted,
+                    None,
+                    Some("cancelled".to_string()),
+                    None,
+                )
+                .await;
                 shutdown_subagent(codex.as_ref()).await;
                 handle.done.notify_waiters();
                 parent_session
@@ -222,7 +228,6 @@ pub(crate) async fn spawn_background_agent_loop(
                         }),
                     )
                     .await;
-                registry.remove(&agent_id).await;
                 break;
             }
             event = codex.next_event() => {
@@ -240,7 +245,6 @@ pub(crate) async fn spawn_background_agent_loop(
                                 }),
                             )
                             .await;
-                        registry.remove(&agent_id).await;
                         break;
                     }
                 };
@@ -275,7 +279,6 @@ pub(crate) async fn spawn_background_agent_loop(
                             }),
                         )
                         .await;
-                    registry.remove(&agent_id).await;
                     break;
                 }
 
@@ -309,7 +312,6 @@ pub(crate) async fn spawn_background_agent_loop(
                                 }),
                             )
                             .await;
-                        registry.remove(&agent_id).await;
                         break;
                     }
                     EventMsg::TurnAborted(ev) => {
@@ -331,7 +333,6 @@ pub(crate) async fn spawn_background_agent_loop(
                                 }),
                             )
                             .await;
-                        registry.remove(&agent_id).await;
                         break;
                     }
                     EventMsg::Error(ev) => {
@@ -353,7 +354,6 @@ pub(crate) async fn spawn_background_agent_loop(
                                 }),
                             )
                             .await;
-                        registry.remove(&agent_id).await;
                         break;
                     }
                     _ => {}

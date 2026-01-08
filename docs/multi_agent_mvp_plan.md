@@ -73,7 +73,7 @@ As of 2026-01-07:
   - [x] `agent_cancel`: aborts a running agent
 - [x] Maintain a parent-scoped registry of spawned agents (in memory) so the model can reference them by id.
 - [ ] Ensure non-leaky lifecycle:
-  - [x] Agents are removed after `shutdown` unless explicitly retained
+  - [x] Agents are retained until `agent_wait` consumes them (cancel removes immediately)
   - [x] Headless event draining is always active for background agents
 
 ### M4 — Concurrency and workspace safety
@@ -105,6 +105,33 @@ As of 2026-01-07:
   - [x] `elapsed_ms`
   - [x] `rollout_path` (debug)
   - [x] `model` used (if override is supported)
+
+## Review notes / follow-ups (post-MVP)
+
+These are observations after building M1–M6, to guide future hardening.
+
+### Registry semantics (race / UX)
+
+- [x] Avoid “agent not found” races by retaining completed agents until explicitly consumed.
+  - [x] Option A: keep completed agents in registry until `agent_wait` returns (and remove there).
+  - [ ] Option B: keep a “tombstone snapshot” (final snapshot only) with TTL/size limits.
+
+### Approval gating scope
+
+- [x] Narrow `approval_policy=never` gating:
+  - [x] Require `never` for `agent_spawn` (and maybe `agent_run`) only.
+  - [x] Allow `agent_status` / `agent_wait` / `agent_cancel` even when policy changes mid-session (cleanup/observability should not get blocked).
+
+### Workspace lock policy coverage
+
+- [x] Audit which tools should bypass the workspace lock (e.g. pure UI/meta tools) to avoid unnecessary “workspace busy” failures.
+  - [x] Document the bypass policy explicitly.
+  - Current bypass list: `manage_context`, `update_plan`, `agent_run`, `agent_spawn`, `agent_wait`, `agent_status`, `agent_cancel`.
+
+### Result schema validation scope
+
+- [x] Consider separating “tool spec schema subset” vs “model output schema subset”.
+  - [x] Keep fail-fast but support a wider subset for `final_output_json_schema`, or relax validation to only critical constraints (`type: object`, `properties`).
 
 ## Acceptance criteria (provisional)
 

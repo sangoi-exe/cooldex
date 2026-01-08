@@ -208,7 +208,6 @@ impl ToolHandler for AgentSpawnHandler {
 
         tokio::spawn(spawn_background_agent_loop(
             Arc::clone(&handle),
-            Arc::clone(&session.services.agent_registry),
             conversation_id,
             Arc::clone(&session),
             Arc::clone(&turn),
@@ -243,10 +242,7 @@ impl ToolHandler for AgentWaitHandler {
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
         let ToolInvocation {
-            session,
-            turn,
-            payload,
-            ..
+            session, payload, ..
         } = invocation;
 
         let arguments = match payload {
@@ -261,8 +257,6 @@ impl ToolHandler for AgentWaitHandler {
         let args = serde_json::from_str::<AgentWaitArgs>(&arguments).map_err(|err| {
             FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
         })?;
-
-        ensure_approval_policy_never(turn.as_ref())?;
 
         let agent_id = parse_agent_id(&args.agent_id)?;
         let handle = get_agent_handle(&session.services.agent_registry, &agent_id).await?;
@@ -283,6 +277,10 @@ impl ToolHandler for AgentWaitHandler {
         } else {
             AgentWaitStatus::Timeout
         };
+
+        if finished && !matches!(snapshot.status, BackgroundAgentStatus::Running) {
+            session.services.agent_registry.remove(&agent_id).await;
+        }
 
         let output = AgentWaitOutput {
             status,
@@ -314,10 +312,7 @@ impl ToolHandler for AgentStatusHandler {
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
         let ToolInvocation {
-            session,
-            turn,
-            payload,
-            ..
+            session, payload, ..
         } = invocation;
 
         let arguments = match payload {
@@ -332,8 +327,6 @@ impl ToolHandler for AgentStatusHandler {
         let args = serde_json::from_str::<AgentIdArgs>(&arguments).map_err(|err| {
             FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
         })?;
-
-        ensure_approval_policy_never(turn.as_ref())?;
 
         let agent_id = parse_agent_id(&args.agent_id)?;
         let handle = get_agent_handle(&session.services.agent_registry, &agent_id).await?;
@@ -372,10 +365,7 @@ impl ToolHandler for AgentCancelHandler {
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
         let ToolInvocation {
-            session,
-            turn,
-            payload,
-            ..
+            session, payload, ..
         } = invocation;
 
         let arguments = match payload {
@@ -390,8 +380,6 @@ impl ToolHandler for AgentCancelHandler {
         let args = serde_json::from_str::<AgentIdArgs>(&arguments).map_err(|err| {
             FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
         })?;
-
-        ensure_approval_policy_never(turn.as_ref())?;
 
         let agent_id = parse_agent_id(&args.agent_id)?;
         let handle = get_agent_handle(&session.services.agent_registry, &agent_id).await?;

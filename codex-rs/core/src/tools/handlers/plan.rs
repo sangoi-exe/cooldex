@@ -67,6 +67,10 @@ impl ToolHandler for PlanHandler {
         ToolKind::Function
     }
 
+    fn uses_workspace_lock(&self, _invocation: &ToolInvocation) -> bool {
+        false
+    }
+
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
         let ToolInvocation {
             session,

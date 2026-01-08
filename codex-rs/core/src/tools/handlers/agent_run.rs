@@ -30,7 +30,6 @@ use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
-use crate::tools::spec::JsonSchema;
 
 const DEFAULT_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const DEFAULT_MAX_RESULT_BYTES: usize = 32 * 1024;
@@ -245,7 +244,7 @@ pub(crate) fn ensure_approval_policy_never(
 ) -> Result<(), FunctionCallError> {
     if turn.approval_policy != AskForApproval::Never {
         return Err(FunctionCallError::RespondToModel(
-            "agent_run requires approval_policy=never for sub-agent execution.".to_string(),
+            "sub-agent execution requires approval_policy=never.".to_string(),
         ));
     }
     Ok(())
@@ -265,17 +264,17 @@ pub(crate) fn validate_result_schema(schema: &Value) -> Result<(), FunctionCallE
         ));
     }
 
-    if !obj.contains_key("properties") {
+    let properties = obj.get("properties");
+    if properties.is_none() {
         return Err(FunctionCallError::RespondToModel(
             "result_schema must define \"properties\" for object schemas".to_string(),
         ));
     }
-
-    serde_json::from_value::<JsonSchema>(schema.clone()).map_err(|err| {
-        FunctionCallError::RespondToModel(format!(
-            "result_schema is not supported by Codex (JSON Schema subset only): {err}"
-        ))
-    })?;
+    if !matches!(properties, Some(Value::Object(_))) {
+        return Err(FunctionCallError::RespondToModel(
+            "result_schema \"properties\" must be an object".to_string(),
+        ));
+    }
 
     Ok(())
 }
