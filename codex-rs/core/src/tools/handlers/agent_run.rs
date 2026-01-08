@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -67,6 +68,8 @@ enum AgentRunStatus {
 struct AgentRunOutput {
     status: AgentRunStatus,
     conversation_id: String,
+    model: String,
+    elapsed_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
     rollout_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -154,6 +157,11 @@ impl ToolHandler for AgentRunHandler {
             result_schema,
         };
 
+        let model = config
+            .model
+            .clone()
+            .unwrap_or_else(|| turn.client.get_model());
+
         let CodexSpawnOk {
             codex,
             conversation_id,
@@ -169,6 +177,7 @@ impl ToolHandler for AgentRunHandler {
         .await
         .map_err(|err| FunctionCallError::Fatal(format!("failed to spawn sub-agent: {err}")))?;
 
+        let start = Instant::now();
         let (status, rollout_path, result, error) = run_one_shot_agent(
             &codex,
             session.as_ref(),
@@ -181,6 +190,8 @@ impl ToolHandler for AgentRunHandler {
         let output = AgentRunOutput {
             status,
             conversation_id: conversation_id.to_string(),
+            model,
+            elapsed_ms: start.elapsed().as_millis(),
             rollout_path: rollout_path.map(|p| p.display().to_string()),
             result,
             error,

@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use codex_protocol::ConversationId;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
+use codex_protocol::protocol::BackgroundEventEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
@@ -77,6 +78,7 @@ pub(crate) enum BackgroundAgentStatus {
 #[serde(rename_all = "snake_case")]
 pub(crate) struct BackgroundAgentSnapshot {
     pub(crate) status: BackgroundAgentStatus,
+    pub(crate) model: String,
     pub(crate) result: Option<Value>,
     pub(crate) error: Option<String>,
     pub(crate) rollout_path: Option<String>,
@@ -87,6 +89,7 @@ pub(crate) struct BackgroundAgentSnapshot {
 #[derive(Debug)]
 struct BackgroundAgentState {
     status: BackgroundAgentStatus,
+    model: String,
     result: Option<Value>,
     error: Option<String>,
     rollout_path: Option<PathBuf>,
@@ -100,6 +103,7 @@ impl BackgroundAgentState {
         let end = self.finished_at.unwrap_or_else(Instant::now);
         BackgroundAgentSnapshot {
             status: self.status,
+            model: self.model.clone(),
             result: self.result.clone(),
             error: self.error.clone(),
             rollout_path: self.rollout_path.as_ref().map(|p| p.display().to_string()),
@@ -118,11 +122,12 @@ pub(crate) struct BackgroundAgentHandle {
 }
 
 impl BackgroundAgentHandle {
-    pub(crate) fn new(codex: Arc<Codex>, max_result_bytes: usize) -> Arc<Self> {
+    pub(crate) fn new(codex: Arc<Codex>, model: String, max_result_bytes: usize) -> Arc<Self> {
         Arc::new(Self {
             codex,
             state: Arc::new(Mutex::new(BackgroundAgentState {
                 status: BackgroundAgentStatus::Running,
+                model,
                 result: None,
                 error: None,
                 rollout_path: None,
@@ -186,11 +191,22 @@ pub(crate) async fn spawn_background_agent_loop(
     handle: Arc<BackgroundAgentHandle>,
     registry: Arc<AgentRegistry>,
     agent_id: ConversationId,
+    parent_session: Arc<Session>,
+    parent_turn: Arc<TurnContext>,
 ) {
     let codex = Arc::clone(&handle.codex);
     let cancel_token = handle.cancel_token.child_token();
     let cancelled = cancel_token.cancelled();
     tokio::pin!(cancelled);
+
+    parent_session
+        .send_event(
+            &parent_turn,
+            EventMsg::BackgroundEvent(BackgroundEventEvent {
+                message: format!("Background agent started: {agent_id}"),
+            }),
+        )
+        .await;
 
     loop {
         tokio::select! {
@@ -198,6 +214,14 @@ pub(crate) async fn spawn_background_agent_loop(
                 update_agent_state(&handle, BackgroundAgentStatus::Aborted, None, Some("cancelled".to_string()), None).await;
                 shutdown_subagent(codex.as_ref()).await;
                 handle.done.notify_waiters();
+                parent_session
+                    .send_event(
+                        &parent_turn,
+                        EventMsg::BackgroundEvent(BackgroundEventEvent {
+                            message: format!("Background agent aborted: {agent_id}"),
+                        }),
+                    )
+                    .await;
                 registry.remove(&agent_id).await;
                 break;
             }
@@ -208,6 +232,14 @@ pub(crate) async fn spawn_background_agent_loop(
                         update_agent_state(&handle, BackgroundAgentStatus::Errored, None, Some(format!("failed to receive sub-agent event: {err}")), None).await;
                         shutdown_subagent(codex.as_ref()).await;
                         handle.done.notify_waiters();
+                        parent_session
+                            .send_event(
+                                &parent_turn,
+                                EventMsg::BackgroundEvent(BackgroundEventEvent {
+                                    message: format!("Background agent errored: {agent_id}"),
+                                }),
+                            )
+                            .await;
                         registry.remove(&agent_id).await;
                         break;
                     }
@@ -235,6 +267,15 @@ pub(crate) async fn spawn_background_agent_loop(
                     .await;
                     shutdown_subagent(codex.as_ref()).await;
                     handle.done.notify_waiters();
+                    parent_session
+                        .send_event(
+                            &parent_turn,
+                            EventMsg::BackgroundEvent(BackgroundEventEvent {
+                                message: format!("Background agent errored: {agent_id}"),
+                            }),
+                        )
+                        .await;
+                    registry.remove(&agent_id).await;
                     break;
                 }
 
@@ -255,6 +296,19 @@ pub(crate) async fn spawn_background_agent_loop(
                         update_agent_state(&handle, status, result, error, last_message).await;
                         shutdown_subagent(codex.as_ref()).await;
                         handle.done.notify_waiters();
+                        let snapshot = handle.snapshot().await;
+                        parent_session
+                            .send_event(
+                                &parent_turn,
+                                EventMsg::BackgroundEvent(BackgroundEventEvent {
+                                    message: format!(
+                                        "Background agent {agent_id} finished: {:?} ({} ms)",
+                                        snapshot.status,
+                                        snapshot.elapsed_ms
+                                    ),
+                                }),
+                            )
+                            .await;
                         registry.remove(&agent_id).await;
                         break;
                     }
@@ -269,6 +323,14 @@ pub(crate) async fn spawn_background_agent_loop(
                         .await;
                         shutdown_subagent(codex.as_ref()).await;
                         handle.done.notify_waiters();
+                        parent_session
+                            .send_event(
+                                &parent_turn,
+                                EventMsg::BackgroundEvent(BackgroundEventEvent {
+                                    message: format!("Background agent aborted: {agent_id}"),
+                                }),
+                            )
+                            .await;
                         registry.remove(&agent_id).await;
                         break;
                     }
@@ -283,6 +345,14 @@ pub(crate) async fn spawn_background_agent_loop(
                         .await;
                         shutdown_subagent(codex.as_ref()).await;
                         handle.done.notify_waiters();
+                        parent_session
+                            .send_event(
+                                &parent_turn,
+                                EventMsg::BackgroundEvent(BackgroundEventEvent {
+                                    message: format!("Background agent errored: {agent_id}"),
+                                }),
+                            )
+                            .await;
                         registry.remove(&agent_id).await;
                         break;
                     }

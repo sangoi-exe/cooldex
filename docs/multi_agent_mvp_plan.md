@@ -11,6 +11,7 @@ As of 2026-01-07:
 - M3 is done (agent_spawn/wait/status/cancel implemented + registry + lifecycle cleanup).
 - M4 is done (shared workspace lock + automatic policy via tool mutability).
 - M5 is done (schema validation + result size discipline).
+- M6 is done (background start/finish events + timing metadata in outputs).
 
 ## Goals
 
@@ -96,14 +97,14 @@ As of 2026-01-07:
 
 ### M6 — Observability + UX for the parent session
 
-- [ ] Emit parent-visible events (non-spammy):
-  - [ ] `BackgroundEvent`: “agent started” (id + label)
-  - [ ] `BackgroundEvent`: “agent finished” (status + duration)
+- [x] Emit parent-visible events (non-spammy):
+  - [x] `BackgroundEvent`: “agent started” (id + label)
+  - [x] `BackgroundEvent`: “agent finished” (status + duration)
   - [ ] Optionally: periodic heartbeats for very long runs
-- [ ] Include timing + metadata in tool outputs:
-  - [ ] `elapsed_ms`
-  - [ ] `rollout_path` (debug)
-  - [ ] `model` used (if override is supported)
+- [x] Include timing + metadata in tool outputs:
+  - [x] `elapsed_ms`
+  - [x] `rollout_path` (debug)
+  - [x] `model` used (if override is supported)
 
 ## Acceptance criteria (provisional)
 

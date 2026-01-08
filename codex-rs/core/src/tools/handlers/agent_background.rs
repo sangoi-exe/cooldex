@@ -168,6 +168,11 @@ impl ToolHandler for AgentSpawnHandler {
             text: format!("{AGENT_RUN_PROMPT}\n\n## Task\n{}", args.prompt),
         }];
 
+        let model = config
+            .model
+            .clone()
+            .unwrap_or_else(|| turn.client.get_model());
+
         let CodexSpawnOk {
             codex,
             conversation_id,
@@ -194,7 +199,7 @@ impl ToolHandler for AgentSpawnHandler {
                 FunctionCallError::Fatal(format!("failed to submit input to sub-agent: {err}"))
             })?;
 
-        let handle = BackgroundAgentHandle::new(Arc::clone(&codex), max_result_bytes);
+        let handle = BackgroundAgentHandle::new(Arc::clone(&codex), model, max_result_bytes);
         session
             .services
             .agent_registry
@@ -205,6 +210,8 @@ impl ToolHandler for AgentSpawnHandler {
             Arc::clone(&handle),
             Arc::clone(&session.services.agent_registry),
             conversation_id,
+            Arc::clone(&session),
+            Arc::clone(&turn),
         ));
 
         let output = AgentSpawnOutput {
