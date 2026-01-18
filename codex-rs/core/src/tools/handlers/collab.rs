@@ -878,7 +878,7 @@ mod tests {
 
         let _ = thread
             .thread
-            .submit(Op::Shutdown {})
+            .submit(Op::Shutdown)
             .await
             .expect("shutdown should submit");
     }
@@ -1031,7 +1031,7 @@ mod tests {
 
         let _ = thread
             .thread
-            .submit(Op::Shutdown {})
+            .submit(Op::Shutdown)
             .await
             .expect("shutdown should submit");
     }
@@ -1083,7 +1083,7 @@ mod tests {
 
         let _ = thread
             .thread
-            .submit(Op::Shutdown {})
+            .submit(Op::Shutdown)
             .await
             .expect("shutdown should submit");
         let _ = timeout(Duration::from_secs(1), status_rx.changed())

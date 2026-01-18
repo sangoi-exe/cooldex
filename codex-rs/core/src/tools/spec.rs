@@ -2301,12 +2301,13 @@ mod tests {
     #[test]
     fn includes_agent_tools_when_multi_agent_enabled() {
         let config = test_config();
-        let model_family = ModelsManager::construct_model_family_offline("gpt-5-codex", &config);
+        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::MultiAgent);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_family: &model_family,
+            model_info: &model_info,
             features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
         });
         let (tools, _) = build_specs(&tools_config, Some(HashMap::new())).build();
 

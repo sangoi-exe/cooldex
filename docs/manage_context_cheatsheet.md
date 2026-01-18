@@ -1,12 +1,14 @@
 # manage_context - cheat sheet (agent/model)
 
-Use this when you see context pressure (low "context left") and want targeted cleanup instead of `/compact`.
+Use this when the session accumulates large tool outputs/reasoning and you want a mechanical sanitization pass instead of `/compact`.
 
 ## Golden rules
 
 - Prefer `replace` over `delete`.
 - `replace` is allowed ONLY for: tool outputs + reasoning (never user/assistant messages).
-- Tool outputs may be prefixed with `Context left: NN%` (matches the footer; based on the last known token usage); treat it as an early-warning signal.
+- Tool outputs may be prefixed with `Context left: NN%` (matches the footer; based on the last known token usage); treat it as a rough signal, not a goal.
+- Don’t chase a target `context_left_percent`; sanitize by keeping only decision-focused summaries and small essential excerpts.
+- When sanitizing, be mechanical: `retrieve` → `apply` → `retrieve`.
 - Avoid touching protected items:
   - `<environment_context>...` (environment context)
   - user instructions (AGENTS.md block)
@@ -34,9 +36,9 @@ Look at:
 4. `add_note` with the few decisions/constraints that must stay visible
 5. `delete` only if necessary (prefer by tool `call_id` via `targets.ids`)
 
-## 2a) Emergency: context_left ~0% (fastest win)
+## 2a) Emergency: blocked by context (fastest win)
 
-If you're basically out of context, do a single, high-leverage `apply` (replace the biggest tool outputs/reasoning from `breakdown.top_calls` / `breakdown.top_included_items`). If that doesn't recover enough space, prefer `/compact` over repeated `manage_context` cycles.
+If you can’t proceed due to context pressure, do a single, high-leverage `apply` (replace the biggest tool outputs/reasoning from `breakdown.top_calls` / `breakdown.top_included_items`). If that doesn’t recover enough space, prefer `/compact` over repeated `manage_context` cycles.
 
 ```json
 {

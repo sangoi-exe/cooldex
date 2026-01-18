@@ -3851,6 +3851,8 @@ async fn spawn_sanitize_task(
     parent_turn_context: Arc<TurnContext>,
     sub_id: String,
 ) {
+    let model_info = parent_turn_context.model_info.clone();
+
     let mut sanitize_features = sess.features.clone();
     sanitize_features
         .disable(crate::features::Feature::ShellTool)
@@ -3862,23 +3864,14 @@ async fn spawn_sanitize_task(
         .disable(crate::features::Feature::ViewImageTool);
     let sanitize_web_search_mode = WebSearchMode::Disabled;
 
-    let tools_config = ToolsConfig::new(&ToolsConfigParams {
-        model_info: &parent_turn_context.model_info,
-        features: &sanitize_features,
-        web_search_mode: Some(sanitize_web_search_mode),
-    });
-
     let otel_manager = parent_turn_context
         .otel_manager
         .clone()
-        .with_model(
-            parent_turn_context.model_info.slug.as_str(),
-            parent_turn_context.model_info.slug.as_str(),
-        );
+        .with_model(model_info.slug.as_str(), model_info.slug.as_str());
 
     let mut per_turn_config = (*config).clone();
-    let fallback_effort = model_family
-        .default_reasoning_effort
+    let fallback_effort = model_info
+        .default_reasoning_level
         .unwrap_or(ReasoningEffortConfig::Low);
     let mut sanitize_effort = crate::config::sanitize_reasoning_effort(
         &config.codex_home,
@@ -3899,13 +3892,23 @@ async fn spawn_sanitize_task(
     let reasoning_summary = per_turn_config.model_reasoning_summary.clone();
     let per_turn_config = Arc::new(per_turn_config);
 
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        features: &per_turn_config.features,
+        web_search_mode: per_turn_config.web_search_mode,
+    });
+
     let tc = Arc::new(TurnContext {
         sub_id: sub_id.to_string(),
         config: per_turn_config,
         auth_manager: parent_turn_context.auth_manager.clone(),
-        model_info: parent_turn_context.model_info.clone(),
-        tools_config,
-        ghost_snapshot: parent_turn_context.ghost_snapshot.clone(),
+        model_info: model_info.clone(),
+        otel_manager,
+        provider: parent_turn_context.provider.clone(),
+        reasoning_effort,
+        reasoning_summary,
+        session_source: parent_turn_context.session_source.clone(),
+        cwd: parent_turn_context.cwd.clone(),
         developer_instructions: None,
         compact_prompt: parent_turn_context.compact_prompt.clone(),
         user_instructions: None,
@@ -3915,17 +3918,13 @@ async fn spawn_sanitize_task(
         sandbox_policy: parent_turn_context.sandbox_policy.clone(),
         windows_sandbox_level: parent_turn_context.windows_sandbox_level,
         shell_environment_policy: parent_turn_context.shell_environment_policy.clone(),
-        cwd: parent_turn_context.cwd.clone(),
-        otel_manager,
-        provider: parent_turn_context.provider.clone(),
-        reasoning_effort,
-        reasoning_summary,
-        session_source: parent_turn_context.session_source.clone(),
+        tools_config,
         features: parent_turn_context.features.clone(),
+        ghost_snapshot: parent_turn_context.ghost_snapshot.clone(),
         final_output_json_schema: None,
         codex_linux_sandbox_exe: parent_turn_context.codex_linux_sandbox_exe.clone(),
         tool_call_gate: Arc::new(ReadinessFlag::new()),
-        truncation_policy: parent_turn_context.model_info.truncation_policy.into(),
+        truncation_policy: model_info.truncation_policy.into(),
         dynamic_tools: parent_turn_context.dynamic_tools.clone(),
         turn_metadata_header: parent_turn_context.turn_metadata_header.clone(),
     });
@@ -4384,7 +4383,7 @@ struct SamplingRequestToolSelection<'a> {
         cwd = %turn_context.cwd.display()
     )
 )]
-async fn run_sampling_request(
+pub(crate) async fn run_sampling_request(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     turn_diff_tracker: SharedTurnDiffTracker,
@@ -4520,9 +4519,9 @@ async fn run_sampling_request(
 }
 
 #[derive(Debug)]
-struct SamplingRequestResult {
-    needs_follow_up: bool,
-    last_agent_message: Option<String>,
+pub(crate) struct SamplingRequestResult {
+    pub(crate) needs_follow_up: bool,
+    pub(crate) last_agent_message: Option<String>,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.

@@ -147,6 +147,7 @@ impl ToolHandler for AgentRunHandler {
 
         let input = vec![codex_protocol::user_input::UserInput::Text {
             text: format!("{AGENT_RUN_PROMPT}\n\n## Task\n{}", args.prompt),
+            text_elements: Vec::new(),
         }];
 
         let run_params = AgentRunRunParams {
@@ -162,8 +163,7 @@ impl ToolHandler for AgentRunHandler {
             .unwrap_or_else(|| turn.client.get_model());
 
         let CodexSpawnOk {
-            codex,
-            conversation_id,
+            codex, thread_id, ..
         } = Codex::spawn(
             config,
             Arc::clone(&session.services.auth_manager),
@@ -175,6 +175,8 @@ impl ToolHandler for AgentRunHandler {
         )
         .await
         .map_err(|err| FunctionCallError::Fatal(format!("failed to spawn sub-agent: {err}")))?;
+
+        let conversation_id = thread_id;
 
         let start = Instant::now();
         let (status, rollout_path, result, error) = run_one_shot_agent(

@@ -283,7 +283,7 @@ pub(crate) async fn spawn_background_agent_loop(
                 }
 
                 match event.msg {
-                    EventMsg::TaskComplete(ev) => {
+                    EventMsg::TurnComplete(ev) => {
                         let last_message = ev.last_agent_message;
                         let (result, error) = parse_agent_result(
                             last_message.clone(),
@@ -427,7 +427,7 @@ fn truncate_last_message(message: Option<String>, max_result_bytes: usize) -> Op
 /// Ask the sub-agent to stop and drain its events so background sends do not hit a closed channel.
 pub(crate) async fn shutdown_subagent(codex: &Codex) {
     let _ = codex.submit(Op::Interrupt).await;
-    let _ = codex.submit(Op::Shutdown {}).await;
+    let _ = codex.submit(Op::Shutdown).await;
 
     let _ = timeout(Duration::from_millis(500), async {
         while let Ok(event) = codex.next_event().await {
@@ -531,21 +531,24 @@ where
 mod tests {
     use super::*;
     use async_channel::bounded;
+    use codex_protocol::protocol::AgentStatus;
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
     use pretty_assertions::assert_eq;
     use std::sync::atomic::AtomicU64;
+    use tokio::sync::watch;
 
     #[tokio::test]
     async fn shutdown_subagent_sends_interrupt_and_shutdown() {
         let (tx_sub, rx_sub) = bounded(crate::codex::SUBMISSION_CHANNEL_CAPACITY);
         let (tx_events, rx_events) = bounded(1);
+        let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
 
         let codex = Codex {
             next_id: AtomicU64::new(0),
             tx_sub,
             rx_event: rx_events,
-            agent_status: Default::default(),
+            agent_status,
         };
 
         tx_events
@@ -577,12 +580,13 @@ mod tests {
     async fn maybe_route_subagent_approval_aborts_on_cancelled_parent() {
         let (tx_sub, rx_sub) = bounded(crate::codex::SUBMISSION_CHANNEL_CAPACITY);
         let (_tx_events, rx_events) = bounded(1);
+        let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
 
         let codex = Codex {
             next_id: AtomicU64::new(0),
             tx_sub,
             rx_event: rx_events,
-            agent_status: Default::default(),
+            agent_status,
         };
 
         let (parent_session, parent_turn, _rx_evt) =
@@ -632,12 +636,13 @@ mod tests {
     async fn maybe_route_subagent_approval_ignores_non_approval_events() {
         let (tx_sub, _rx_sub) = bounded(crate::codex::SUBMISSION_CHANNEL_CAPACITY);
         let (_tx_events, rx_events) = bounded(1);
+        let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
 
         let codex = Codex {
             next_id: AtomicU64::new(0),
             tx_sub,
             rx_event: rx_events,
-            agent_status: Default::default(),
+            agent_status,
         };
 
         let (parent_session, parent_turn, _rx_evt) =

@@ -347,7 +347,7 @@ mod tests {
         assert_eq!(status_rx.borrow().clone(), AgentStatus::PendingInit);
 
         let _ = thread
-            .submit(Op::Shutdown {})
+            .submit(Op::Shutdown)
             .await
             .expect("shutdown should submit");
 

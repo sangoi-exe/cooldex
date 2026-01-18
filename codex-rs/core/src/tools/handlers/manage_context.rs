@@ -2,6 +2,8 @@ use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::context_manager::ContextManager;
 use crate::function_tool::FunctionCallError;
+use crate::instructions::SkillInstructions;
+use crate::instructions::UserInstructions;
 use crate::protocol::ContextInclusionItem;
 use crate::protocol::ContextOverlayItem;
 use crate::protocol::ContextOverlayReplacement;
@@ -17,8 +19,6 @@ use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
-use crate::user_instructions::SkillInstructions;
-use crate::user_instructions::UserInstructions;
 use async_trait::async_trait;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ReasoningItemContent;
@@ -193,18 +193,9 @@ async fn handle_retrieve(
             .to_string(),
         "Preference: replace > exclude > delete; exclude low-value bulk by call_id when needed."
             .to_string(),
+        "Sanitize: do not chase a target context_left_percent; keep the prompt small by replacing tool outputs/reasoning with short, decision-focused summaries and excluding low-value noise."
+            .to_string(),
     ];
-
-    if let Some(percent) = context_left_percent {
-        if percent >= 80 {
-            header_lines
-                .push(format!("Context left: {percent}% (>=80%). Cleanup usually unnecessary; skip apply unless user asked."));
-        } else if percent <= 10 {
-            header_lines.push(format!(
-                "Context left: {percent}% (<=10%). EMERGENCY: stop and run apply now (prioritize consolidate_reasoning, replace top offenders, add a 3-line note: Decision/State/Next)."
-            ));
-        }
-    }
 
     let mut header: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     if included_reasoning > 0 {

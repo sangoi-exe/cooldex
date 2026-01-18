@@ -12,7 +12,7 @@ For a short checklist, see `docs/manage_context_cheatsheet.md`. For an overview,
 
 ## Signals to watch
 
-- Tool outputs may be prefixed with `Context left: NN%` (matches the footer; based on the last known token usage); use it as an early-warning signal.
+- Tool outputs may be prefixed with `Context left: NN%` (matches the footer; based on the last known token usage); treat it as a rough signal, not a target.
 - The most reliable view is `manage_context` `mode=retrieve` (token_usage is included).
 
 ## Glossary
@@ -58,7 +58,7 @@ Call `retrieve` to get a bounded summary:
 }
 ```
 
-Use this to decide whether cleanup is needed. A common trigger is low remaining context (for example, <20% left).
+Use this to decide whether a sanitization pass is worthwhile (for example, after a tool-heavy step or before starting a new large task).
 
 ### Step 1: pick targets from the summary
 
@@ -69,9 +69,9 @@ Use the cheap `retrieve` breakdown to pick a *small* set of targets:
 
 Avoid pulling full item lists just to find targets. If the summary isn't enough to target what you need, prefer `/compact` over repeatedly expanding context.
 
-### Emergency: recover from ~0% context left
+### Emergency: blocked by context
 
-When the context is effectively full, do one high-leverage, reversible `apply`:
+When you’re blocked by context pressure, do one high-leverage, reversible `apply`:
 
 - Replace the largest tool outputs / reasoning shown in the `retrieve` breakdown.
 - If needed, exclude a few old tool `call_id`s (noise) and add a tiny pinned note with the current state.
@@ -113,7 +113,7 @@ If you see `skipped_missing_targets > 0`, check `missing_ids` to see which RIDs 
 Then run `retrieve` again and confirm:
 
 - the new `snapshot_id` changed
-- `tokens_in_context` dropped (or `context_left_percent` increased)
+- `tokens_in_context` dropped
 - the notes look correct and minimal
 
 ## Writing good replacement text

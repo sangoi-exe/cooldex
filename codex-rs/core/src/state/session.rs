@@ -10,6 +10,8 @@ use std::collections::HashSet;
 
 use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
+use crate::instructions::SkillInstructions;
+use crate::instructions::UserInstructions;
 use crate::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 use crate::protocol::REASONING_CONTEXT_CLOSE_TAG;
 use crate::protocol::REASONING_CONTEXT_OPEN_TAG;
@@ -23,8 +25,6 @@ use crate::state::ContextItemsEvent;
 use crate::state::ContextOverlay;
 use crate::state::PruneCategory;
 use crate::truncate::TruncationPolicy;
-use crate::user_instructions::SkillInstructions;
-use crate::user_instructions::UserInstructions;
 
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {

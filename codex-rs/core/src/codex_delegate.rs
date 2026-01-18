@@ -143,7 +143,7 @@ pub(crate) async fn run_codex_thread_one_shot(
                 event.msg,
                 EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
             );
-                let _ = tx_bridge.send(event).await;
+            let _ = tx_bridge.send(event).await;
             if should_shutdown {
                 let _ = ops_tx
                     .send(Submission {

@@ -203,7 +203,7 @@ async fn estimate_token_count_scales_reasoning_bytes_to_tokens() {
     let base_tokens = i64::try_from(truncate::approx_token_count(
         turn_context
             .client
-            .get_model_family()
+            .get_model_info()
             .base_instructions
             .as_str(),
     ))
