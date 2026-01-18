@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use codex_protocol::ConversationId;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::BackgroundEventEvent;
 use codex_protocol::protocol::Event;
@@ -167,21 +167,21 @@ impl BackgroundAgentHandle {
 
 #[derive(Default)]
 pub(crate) struct AgentRegistry {
-    agents: Arc<Mutex<HashMap<ConversationId, Arc<BackgroundAgentHandle>>>>,
+    agents: Arc<Mutex<HashMap<ThreadId, Arc<BackgroundAgentHandle>>>>,
 }
 
 impl AgentRegistry {
-    pub(crate) async fn insert(&self, id: ConversationId, handle: Arc<BackgroundAgentHandle>) {
+    pub(crate) async fn insert(&self, id: ThreadId, handle: Arc<BackgroundAgentHandle>) {
         let mut agents = self.agents.lock().await;
         agents.insert(id, handle);
     }
 
-    pub(crate) async fn get(&self, id: &ConversationId) -> Option<Arc<BackgroundAgentHandle>> {
+    pub(crate) async fn get(&self, id: &ThreadId) -> Option<Arc<BackgroundAgentHandle>> {
         let agents = self.agents.lock().await;
         agents.get(id).cloned()
     }
 
-    pub(crate) async fn remove(&self, id: &ConversationId) -> Option<Arc<BackgroundAgentHandle>> {
+    pub(crate) async fn remove(&self, id: &ThreadId) -> Option<Arc<BackgroundAgentHandle>> {
         let mut agents = self.agents.lock().await;
         agents.remove(id)
     }
@@ -189,7 +189,7 @@ impl AgentRegistry {
 
 pub(crate) async fn spawn_background_agent_loop(
     handle: Arc<BackgroundAgentHandle>,
-    agent_id: ConversationId,
+    agent_id: ThreadId,
     parent_session: Arc<Session>,
     parent_turn: Arc<TurnContext>,
 ) {

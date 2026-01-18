@@ -29,7 +29,7 @@ use crate::tools::handlers::agent_run::inherit_effective_turn_settings;
 use crate::tools::handlers::agent_run::validate_result_schema;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
-use codex_protocol::ConversationId;
+use codex_protocol::ThreadId;
 
 const DEFAULT_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const DEFAULT_MAX_RESULT_BYTES: usize = 32 * 1024;
@@ -175,7 +175,9 @@ impl ToolHandler for AgentSpawnHandler {
             .unwrap_or_else(|| turn.client.get_model());
 
         let CodexSpawnOk {
-            codex, thread_id, ..
+            codex,
+            thread_id: agent_id,
+            ..
         } = Codex::spawn(
             config,
             Arc::clone(&session.services.auth_manager),
@@ -188,7 +190,6 @@ impl ToolHandler for AgentSpawnHandler {
         .await
         .map_err(|err| FunctionCallError::Fatal(format!("failed to spawn sub-agent: {err}")))?;
 
-        let conversation_id = thread_id;
         let codex = Arc::new(codex);
         codex
             .submit(Op::UserInput {
@@ -204,19 +205,19 @@ impl ToolHandler for AgentSpawnHandler {
         session
             .services
             .agent_registry
-            .insert(conversation_id, Arc::clone(&handle))
+            .insert(agent_id, Arc::clone(&handle))
             .await;
 
         tokio::spawn(spawn_background_agent_loop(
             Arc::clone(&handle),
-            conversation_id,
+            agent_id,
             Arc::clone(&session),
             Arc::clone(&turn),
         ));
 
         let output = AgentSpawnOutput {
             status: "spawned",
-            agent_id: conversation_id.to_string(),
+            agent_id: agent_id.to_string(),
         };
 
         Ok(ToolOutput::Function {
@@ -405,14 +406,14 @@ impl ToolHandler for AgentCancelHandler {
     }
 }
 
-fn parse_agent_id(agent_id: &str) -> Result<ConversationId, FunctionCallError> {
-    ConversationId::from_string(agent_id)
+fn parse_agent_id(agent_id: &str) -> Result<ThreadId, FunctionCallError> {
+    ThreadId::from_string(agent_id)
         .map_err(|err| FunctionCallError::RespondToModel(format!("invalid agent_id: {err}")))
 }
 
 async fn get_agent_handle(
     registry: &AgentRegistry,
-    agent_id: &ConversationId,
+    agent_id: &ThreadId,
 ) -> Result<Arc<BackgroundAgentHandle>, FunctionCallError> {
     registry
         .get(agent_id)
