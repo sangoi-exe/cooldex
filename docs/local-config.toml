@@ -9,43 +9,6 @@ model_reasoning_summary = "detailed"
 model_reasoning_summary_format = "experimental"
 exec_timeout_ms = 900000
 model_auto_compact_token_limit = 1_000_000_000
-
-[features]
-web_search_request = true
-view_image_tool = true
-streamable_shell = true
-apply_patch_freeform = true
-unified_exec = true
-skills = true
-multi_agent = true
-
-[sandbox_workspace_write]
-network_access = true
-writable_roots = [
-  "/home/lucas/.netsuite",
-  "/home/lucas/.venv",
-  "/home/lucas/.codex",
-  "/home/lucas/.config/git",
-  "/home/lucas/.docker",
-  "/home/lucas/.cloudflared",
-  "/home/lucas/.config/cloudflare",
-  "/home/lucas/work/ab-ns",
-  "/home/lucas/.cargo",
-  "/home/lucas/.rustup",
-  "/home/lucas/.cache",
-  "/home/lucas/.ssh",
-]
-
-[notice]
-hide_rate_limit_model_nudge = true
-"hide_gpt-5.1-codex-max_migration_prompt" = true
-
-[notice.model_migrations]
-"gpt-5.2" = "gpt-5.2-codex"
-
-[shell_environment_policy]
-inherit = "all"
-
 auto_sanitize = false
 sanitize_reasoning_effort = "xhigh"
 
@@ -77,6 +40,7 @@ Plans are not static.
 If, mid-task, you discover a missing step, a better sequence, a new risk, or new work that clearly belongs:
 - Update the plan immediately (`update_plan`) while you’re already in motion.
 - Add/adjust the relevant step(s) and statuses so the plan matches reality.
+- If you notice a real issue or improvement but it’s out of scope, you don’t hide behind “unrelated”. Add a plan item (or follow-up), and surface it.
 - If there is a human plan in a Markdown file for this work (a `*.md` plan you’re using in-repo), update it in parallel so it stays in sync with `update_plan`.
 - Re-align execution so the current work accounts for the new step(s) (do the right next thing, not “whatever you were doing before”).
 
@@ -85,3 +49,40 @@ Before you close the turn, zoom out.
 After the task is done and you have the full picture, include follow-ups in your final response (1–3, highest leverage first):
 - What you would improve or do differently now (refactor, tighten scope, rename, add a missing guard/test, clarify docs).
 """
+
+[features]
+web_search_request = true
+view_image_tool = true
+streamable_shell = true
+apply_patch_freeform = true
+unified_exec = true
+skills = true
+multi_agent = true
+steer = true
+
+[sandbox_workspace_write]
+network_access = true
+writable_roots = [
+  "/home/lucas/.netsuite",
+  "/home/lucas/.venv",
+  "/home/lucas/.codex",
+  "/home/lucas/.config/git",
+  "/home/lucas/.docker",
+  "/home/lucas/.cloudflared",
+  "/home/lucas/.config/cloudflare",
+  "/home/lucas/work/ab-ns",
+  "/home/lucas/.cargo",
+  "/home/lucas/.rustup",
+  "/home/lucas/.cache",
+  "/home/lucas/.ssh",
+]
+
+[notice]
+hide_rate_limit_model_nudge = true
+"hide_gpt-5.1-codex-max_migration_prompt" = true
+
+[notice.model_migrations]
+"gpt-5.2" = "gpt-5.2-codex"
+
+[shell_environment_policy]
+inherit = "all"
