@@ -1,0 +1,87 @@
+# Backup copy of `~/.codex/config.toml` (tracked here for versioning).
+# To use it locally:
+#   cp docs/local-config.toml ~/.codex/config.toml
+model = "gpt-5.2"
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+model_reasoning_effort = "xhigh"
+model_reasoning_summary = "detailed"
+model_reasoning_summary_format = "experimental"
+exec_timeout_ms = 900000
+model_auto_compact_token_limit = 1_000_000_000
+
+[features]
+web_search_request = true
+view_image_tool = true
+streamable_shell = true
+apply_patch_freeform = true
+unified_exec = true
+skills = true
+multi_agent = true
+
+[sandbox_workspace_write]
+network_access = true
+writable_roots = [
+  "/home/lucas/.netsuite",
+  "/home/lucas/.venv",
+  "/home/lucas/.codex",
+  "/home/lucas/.config/git",
+  "/home/lucas/.docker",
+  "/home/lucas/.cloudflared",
+  "/home/lucas/.config/cloudflare",
+  "/home/lucas/work/ab-ns",
+  "/home/lucas/.cargo",
+  "/home/lucas/.rustup",
+  "/home/lucas/.cache",
+  "/home/lucas/.ssh",
+]
+
+[notice]
+hide_rate_limit_model_nudge = true
+"hide_gpt-5.1-codex-max_migration_prompt" = true
+
+[notice.model_migrations]
+"gpt-5.2" = "gpt-5.2-codex"
+
+[shell_environment_policy]
+inherit = "all"
+
+auto_sanitize = false
+sanitize_reasoning_effort = "xhigh"
+
+developer_instructions = """
+If my request is underspecified, don't guess. Ask. Give options, your recommendation, and what you'll do next.
+
+User preference: OCD/perfectionism + ADHD/TDAH (hyperfocus on IT).
+Sloppy work is not acceptable. Anywhere. I mean it: structure, naming, conventions, noisy diffs, hacks/compat shims/migué.
+If it's messy, you clean it up. If it's broken, you make it fail loud so the real problem shows its face.
+
+## Tool guide: manage_context
+Cheat sheet: `~/.codex/manage_context_cheatsheet.md`.
+Use `manage_context` (functions.manage_context) for prompt sanitization.
+
+## Tool output hygiene
+You do not hoard tool output.
+
+If you run any command/tool and its output is heavy (>100 tokens), you clean it up immediately:
+- Extract the signal (errors, facts, paths, decisions, next actions).
+- Then use `manage_context` with `mode="apply"` to `replace` that tool output (target by `call_id`) with your extracted summary.
+
+If the output has no signal, you still don't keep the blob:
+- Add a note with the command you ran, what you were trying to confirm/find, and a few keywords describing what the output *did* contain.
+- Replace the tool output with a 1–2 line stub that points to that note.
+
+## Plan is a living thing
+Plans are not static.
+
+If, mid-task, you discover a missing step, a better sequence, a new risk, or new work that clearly belongs:
+- Update the plan immediately (`update_plan`) while you’re already in motion.
+- Add/adjust the relevant step(s) and statuses so the plan matches reality.
+- If there is a human plan in a Markdown file for this work (a `*.md` plan you’re using in-repo), update it in parallel so it stays in sync with `update_plan`.
+- Re-align execution so the current work accounts for the new step(s) (do the right next thing, not “whatever you were doing before”).
+
+## Follow-up value
+Before you close the turn, zoom out.
+After the task is done and you have the full picture, include follow-ups in your final response (1–3, highest leverage first):
+- What you would improve or do differently now (refactor, tighten scope, rename, add a missing guard/test, clarify docs).
+"""
