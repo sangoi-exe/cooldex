@@ -1305,6 +1305,8 @@ impl Session {
                         &mut state,
                     );
                 }
+                self.restore_context_state_from_rollout(&rollout_items)
+                    .await;
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
@@ -4890,57 +4892,50 @@ async fn handle_assistant_item_done_in_plan_mode(
     false
 }
 
-fn maybe_prefix_tool_output_with_context_left(
-    tool_name_by_call_id: &std::collections::HashMap<String, String>,
-    call_id: &str,
-    content: &mut String,
-    context_left_percent: i64,
-) {
+fn maybe_inject_tool_output_call_id(call_id: &str, content: &mut String) {
     if call_id.is_empty() {
         return;
     }
-    if content.trim_start().starts_with("Context left:") {
-        return;
-    }
-    if tool_name_by_call_id.get(call_id).is_some_and(|name| {
-        matches!(
-            name.as_str(),
-            "manage_context"
-                | "agent_run"
-                | "agent_spawn"
-                | "agent_wait"
-                | "agent_status"
-                | "agent_cancel"
-        )
-    }) {
+    if content.trim_start().starts_with("call_id:") {
         return;
     }
 
-    *content = format!("Context left: {context_left_percent}%\n{content}");
-}
+    // Some tool outputs are machine-parsed JSON. Do not prefix those with a
+    // plaintext header. For exec outputs specifically, safely inject `call_id`
+    // into the JSON object so downstream reserialization can preserve it.
+    let trimmed = content.trim_start();
+    if matches!(
+        trimmed.chars().next(),
+        Some('{' | '[' | '"' | 't' | 'f' | 'n' | '-' | '0'..='9')
+    ) && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(trimmed)
+    {
+        let is_exec_output = value
+            .as_object()
+            .is_some_and(|obj| obj.get("output").is_some_and(serde_json::Value::is_string))
+            && value.as_object().is_some_and(|obj| {
+                obj.get("metadata")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|metadata| metadata.contains_key("exit_code"))
+            });
 
-fn tool_name_by_call_id_for_history(
-    history: &[ResponseItem],
-) -> std::collections::HashMap<String, String> {
-    let mut out = std::collections::HashMap::new();
-    for item in history {
-        match item {
-            ResponseItem::FunctionCall { call_id, name, .. } => {
-                out.insert(call_id.clone(), name.clone());
+        if is_exec_output
+            && let Some(obj) = value.as_object_mut()
+            && !obj.contains_key("call_id")
+        {
+            obj.insert(
+                "call_id".to_string(),
+                serde_json::Value::String(call_id.to_string()),
+            );
+            if let Ok(serialized) = serde_json::to_string(&value) {
+                *content = serialized;
             }
-            ResponseItem::CustomToolCall { call_id, name, .. } => {
-                out.insert(call_id.clone(), name.clone());
-            }
-            ResponseItem::LocalShellCall {
-                call_id: Some(call_id),
-                ..
-            } => {
-                out.insert(call_id.clone(), "local_shell".to_string());
-            }
-            _ => {}
         }
+
+        // If it's JSON but not our exec-output shape, leave it unchanged.
+        return;
     }
-    out
+
+    *content = format!("call_id: {call_id}\n{content}");
 }
 
 async fn drain_in_flight(
@@ -4948,30 +4943,6 @@ async fn drain_in_flight(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
 ) -> CodexResult<()> {
-    let (tool_name_by_call_id, context_left_percent) = {
-        let state = sess.state.lock().await;
-        let history = state.clone_history();
-        let tool_name_by_call_id =
-            tool_name_by_call_id_for_history(&history.get_history_for_prompt_lenient());
-        let info = state.token_info();
-        let context_window = info
-            .as_ref()
-            .and_then(|info| info.model_context_window)
-            .or(turn_context.client.get_model_context_window());
-
-        let context_left_percent = info
-            .as_ref()
-            .and_then(|info| {
-                context_window.map(|window| {
-                    info.last_token_usage
-                        .percent_of_context_window_remaining(window)
-                })
-            })
-            .unwrap_or(100);
-
-        (tool_name_by_call_id, context_left_percent)
-    };
-
     while let Some(res) = in_flight.next().await {
         match res {
             Ok(response_input) => {
@@ -4980,24 +4951,14 @@ async fn drain_in_flight(
                         call_id,
                         mut output,
                     } => {
-                        maybe_prefix_tool_output_with_context_left(
-                            &tool_name_by_call_id,
-                            &call_id,
-                            &mut output.content,
-                            context_left_percent,
-                        );
+                        maybe_inject_tool_output_call_id(&call_id, &mut output.content);
                         ResponseInputItem::FunctionCallOutput { call_id, output }
                     }
                     ResponseInputItem::CustomToolCallOutput {
                         call_id,
                         mut output,
                     } => {
-                        maybe_prefix_tool_output_with_context_left(
-                            &tool_name_by_call_id,
-                            &call_id,
-                            &mut output,
-                            context_left_percent,
-                        );
+                        maybe_inject_tool_output_call_id(&call_id, &mut output);
                         ResponseInputItem::CustomToolCallOutput { call_id, output }
                     }
                     ResponseInputItem::McpToolCallOutput {
@@ -5005,34 +4966,9 @@ async fn drain_in_flight(
                         mut result,
                     } => {
                         match &mut result {
-                            Ok(ok) => {
-                                let mut content_prefix = String::new();
-                                maybe_prefix_tool_output_with_context_left(
-                                    &tool_name_by_call_id,
-                                    &call_id,
-                                    &mut content_prefix,
-                                    context_left_percent,
-                                );
-                                if content_prefix.trim_start().starts_with("Context left:") {
-                                    ok.content.insert(
-                                        0,
-                                        mcp_types::ContentBlock::TextContent(
-                                            mcp_types::TextContent {
-                                                annotations: None,
-                                                text: content_prefix.trim_end().to_string(),
-                                                r#type: "text".to_string(),
-                                            },
-                                        ),
-                                    );
-                                }
-                            }
+                            Ok(_ok) => {}
                             Err(err) => {
-                                maybe_prefix_tool_output_with_context_left(
-                                    &tool_name_by_call_id,
-                                    &call_id,
-                                    err,
-                                    context_left_percent,
-                                );
+                                maybe_inject_tool_output_call_id(&call_id, err);
                             }
                         }
                         ResponseInputItem::McpToolCallOutput { call_id, result }
@@ -5692,9 +5628,16 @@ mod tests {
             .await
             .clone_history()
             .get_history_for_prompt_lenient();
-        assert!(history.iter().any(|item| {
-            matches!(item, ResponseItem::CustomToolCallOutput { call_id, .. } if call_id == "call-1")
-        }));
+        let output = history
+            .iter()
+            .find_map(|item| match item {
+                ResponseItem::CustomToolCallOutput { call_id, output } if call_id == "call-1" => {
+                    Some(output.as_str())
+                }
+                _ => None,
+            })
+            .expect("expected CustomToolCallOutput to be recorded");
+        assert_eq!(output, "call_id: call-1\nok");
     }
 
     #[tokio::test]
@@ -7338,11 +7281,27 @@ mod tests {
             metadata: ResponseExecMetadata,
         }
 
-        let exec_output: ResponseExecOutput =
-            serde_json::from_str(&output).expect("valid exec output json");
-
-        pretty_assertions::assert_eq!(exec_output.metadata, ResponseExecMetadata { exit_code: 0 });
-        assert!(exec_output.output.contains("hi"));
+        if let Ok(exec_output) = serde_json::from_str::<ResponseExecOutput>(&output) {
+            pretty_assertions::assert_eq!(
+                exec_output.metadata,
+                ResponseExecMetadata { exit_code: 0 }
+            );
+            assert!(exec_output.output.contains("hi"));
+        } else {
+            assert!(
+                output.starts_with("Exit code: 0\n"),
+                "expected freeform exec output to start with exit code, got {output:?}"
+            );
+            assert!(
+                output.contains("\nWall time: "),
+                "expected freeform exec output to include wall time, got {output:?}"
+            );
+            assert!(
+                output.contains("\nOutput:\n"),
+                "expected freeform exec output to include Output section, got {output:?}"
+            );
+            assert!(output.contains("hi"));
+        }
     }
     #[tokio::test]
     async fn unified_exec_rejects_escalated_permissions_when_policy_not_on_request() {

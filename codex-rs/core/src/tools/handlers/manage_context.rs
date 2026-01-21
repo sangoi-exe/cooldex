@@ -1256,6 +1256,7 @@ fn tool_output_preview_line(text: &str) -> &str {
 fn is_tool_output_boilerplate_line(line: &str) -> bool {
     line == "Output:"
         || line.starts_with("Chunk ID:")
+        || line.starts_with("call_id:")
         || line.starts_with("Context left:")
         || line.starts_with("Exit code:")
         || line.starts_with("Wall time:")

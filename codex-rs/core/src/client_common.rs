@@ -118,6 +118,8 @@ fn is_shell_tool_name(name: &str) -> bool {
 
 #[derive(Deserialize)]
 struct ExecOutputJson {
+    #[serde(default)]
+    call_id: Option<String>,
     output: String,
     metadata: ExecOutputMetadataJson,
 }
@@ -135,6 +137,9 @@ fn parse_structured_shell_output(raw: &str) -> Option<String> {
 
 fn build_structured_output(parsed: &ExecOutputJson) -> String {
     let mut sections = Vec::new();
+    if let Some(call_id) = parsed.call_id.as_deref() {
+        sections.push(format!("call_id: {call_id}"));
+    }
     sections.push(format!("Exit code: {}", parsed.metadata.exit_code));
     sections.push(format!(
         "Wall time: {} seconds",

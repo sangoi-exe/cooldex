@@ -3,6 +3,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ShellCommandToolCallParams;
 use codex_protocol::models::ShellToolCallParams;
+use codex_protocol::openai_models::ApplyPatchToolType;
 use std::sync::Arc;
 
 use crate::codex::TurnContext;
@@ -124,6 +125,11 @@ impl ToolHandler for ShellHandler {
             payload,
         } = invocation;
 
+        let freeform_shell_output = matches!(
+            turn.client.get_model_info().apply_patch_tool_type,
+            Some(ApplyPatchToolType::Freeform)
+        );
+
         match payload {
             ToolPayload::Function { arguments } => {
                 let params: ShellToolCallParams = parse_arguments(&arguments)?;
@@ -138,8 +144,8 @@ impl ToolHandler for ShellHandler {
                     turn,
                     tracker,
                     call_id,
-                    freeform: false,
-                })
+                    freeform_shell_output,
+                )
                 .await
             }
             ToolPayload::LocalShell { params } => {
@@ -153,8 +159,8 @@ impl ToolHandler for ShellHandler {
                     turn,
                     tracker,
                     call_id,
-                    freeform: false,
-                })
+                    freeform_shell_output,
+                )
                 .await
             }
             _ => Err(FunctionCallError::RespondToModel(format!(
