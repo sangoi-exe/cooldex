@@ -322,7 +322,10 @@ impl ContextManager {
     }
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
-        let policy_with_serialization_budget = policy * 1.2;
+        const TOOL_OUTPUT_SERIALIZATION_OVERHEAD_BYTES: usize = 64;
+        let policy_with_serialization_budget = policy
+            .mul(1.2)
+            .add_bytes(TOOL_OUTPUT_SERIALIZATION_OVERHEAD_BYTES);
         match item {
             ResponseItem::FunctionCallOutput { call_id, output } => {
                 let body = match &output.body {

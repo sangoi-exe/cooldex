@@ -59,6 +59,23 @@ impl TruncationPolicy {
             TruncationPolicy::Tokens(tokens) => approx_bytes_for_tokens(*tokens),
         }
     }
+
+    /// Adds a byte overhead to the policy budget.
+    ///
+    /// This is useful when callers need to reserve space for formatting or
+    /// metadata that sits alongside a truncated payload.
+    pub fn add_bytes(self, bytes: usize) -> Self {
+        match self {
+            TruncationPolicy::Bytes(existing) => {
+                TruncationPolicy::Bytes(existing.saturating_add(bytes))
+            }
+            TruncationPolicy::Tokens(existing) => {
+                let overhead =
+                    usize::try_from(approx_tokens_from_byte_count(bytes)).unwrap_or(usize::MAX);
+                TruncationPolicy::Tokens(existing.saturating_add(overhead))
+            }
+        }
+    }
 }
 
 impl std::ops::Mul<f64> for TruncationPolicy {
