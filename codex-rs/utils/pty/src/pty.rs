@@ -33,6 +33,30 @@ pub fn conpty_supported() -> bool {
     true
 }
 
+/// Returns true when PTY support is available on this platform.
+///
+/// On non-Windows this checks whether we can successfully create a PTY pair.
+/// Some sandboxed or restricted environments expose `/dev/ptmx` but still
+/// reject `openpty` with EPERM.
+#[cfg(not(windows))]
+pub fn pty_supported() -> bool {
+    let pty_system = native_pty_system();
+    pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .is_ok()
+}
+
+/// Returns true when PTY support is available on this platform.
+#[cfg(windows)]
+pub fn pty_supported() -> bool {
+    conpty_supported()
+}
+
 struct PtyChildTerminator {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
 }

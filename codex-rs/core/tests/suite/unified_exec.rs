@@ -24,6 +24,7 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_no_pty;
 use core_test_support::skip_if_sandbox;
 use core_test_support::skip_if_windows;
 use core_test_support::test_codex::TestCodex;
@@ -801,6 +802,7 @@ async fn unified_exec_emits_terminal_interaction_for_write_stdin() -> Result<()>
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
     skip_if_windows!(Ok(()));
+    skip_if_no_pty!(Ok(()));
 
     let server = start_mock_server().await;
 
@@ -904,6 +906,7 @@ async fn unified_exec_terminal_interaction_captures_delayed_output() -> Result<(
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
     skip_if_windows!(Ok(()));
+    skip_if_no_pty!(Ok(()));
 
     let server = start_mock_server().await;
 
@@ -1417,6 +1420,7 @@ async fn unified_exec_can_enable_tty() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
     skip_if_windows!(Ok(()));
+    skip_if_no_pty!(Ok(()));
 
     let python = match which("python").or_else(|_| which("python3")) {
         Ok(path) => path,
@@ -1603,6 +1607,7 @@ async fn write_stdin_returns_exit_metadata_and_clears_session() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
     skip_if_windows!(Ok(()));
+    skip_if_no_pty!(Ok(()));
 
     let server = start_mock_server().await;
 
@@ -1768,6 +1773,7 @@ async fn unified_exec_emits_end_event_when_session_dies_via_stdin() -> Result<()
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
     skip_if_windows!(Ok(()));
+    skip_if_no_pty!(Ok(()));
 
     let server = start_mock_server().await;
 
@@ -1985,6 +1991,7 @@ async fn unified_exec_reuses_session_via_stdin() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
     skip_if_windows!(Ok(()));
+    skip_if_no_pty!(Ok(()));
 
     let server = start_mock_server().await;
 
@@ -2100,6 +2107,7 @@ async fn unified_exec_streams_after_lagged_output() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
     skip_if_windows!(Ok(()));
+    skip_if_no_pty!(Ok(()));
 
     let server = start_mock_server().await;
 
