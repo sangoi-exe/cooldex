@@ -199,7 +199,6 @@ use crate::state::ActiveTurn;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 use crate::state_db;
-use crate::subagent_runner::AgentRegistry;
 use crate::tasks::GhostSnapshotTask;
 use crate::tasks::ReviewTask;
 use crate::tasks::SanitizeTask;
@@ -262,7 +261,7 @@ impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn(
-        mut config: Config,
+        config: Config,
         auth_manager: Arc<AuthManager>,
         models_manager: Arc<ModelsManager>,
         skills_manager: Arc<SkillsManager>,
@@ -274,12 +273,6 @@ impl Codex {
     ) -> CodexResult<CodexSpawnOk> {
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
-
-        // Disable multi-agent orchestration in sub-agent sessions to prevent runaway recursion
-        // (sub-agents spawning more sub-agents).
-        if matches!(session_source, SessionSource::SubAgent(_)) {
-            config.features.disable(Feature::MultiAgent);
-        }
 
         let loaded_skills = skills_manager.skills_for_config(&config);
 
@@ -785,7 +778,6 @@ impl Session {
             }
         });
     }
-
     #[allow(clippy::too_many_arguments)]
     fn make_turn_context(
         auth_manager: Option<Arc<AuthManager>>,
@@ -1086,7 +1078,6 @@ impl Session {
                 config.features.enabled(Feature::RuntimeMetrics),
                 Self::build_model_client_beta_features_header(config.as_ref()),
             ),
-            agent_registry: Arc::new(AgentRegistry::default()),
             workspace_lock,
         };
 
@@ -3858,7 +3849,6 @@ async fn spawn_sanitize_task(
         .disable(crate::features::Feature::ShellTool)
         .disable(crate::features::Feature::UnifiedExec)
         .disable(crate::features::Feature::ApplyPatchFreeform)
-        .disable(crate::features::Feature::MultiAgent)
         .disable(crate::features::Feature::WebSearchRequest)
         .disable(crate::features::Feature::WebSearchCached)
         .disable(crate::features::Feature::ViewImageTool);
@@ -6512,7 +6502,6 @@ mod tests {
                 config.features.enabled(Feature::RuntimeMetrics),
                 Session::build_model_client_beta_features_header(config.as_ref()),
             ),
-            agent_registry: Arc::new(AgentRegistry::default()),
             workspace_lock,
         };
 
@@ -6647,7 +6636,6 @@ mod tests {
                 config.features.enabled(Feature::RuntimeMetrics),
                 Session::build_model_client_beta_features_header(config.as_ref()),
             ),
-            agent_registry: Arc::new(AgentRegistry::default()),
             workspace_lock,
         };
 
