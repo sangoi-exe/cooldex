@@ -4,6 +4,7 @@ use anyhow::Result;
 use core_test_support::responses::mount_function_call_agent_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::strip_call_id_prefix_line;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use std::collections::HashSet;
@@ -63,13 +64,14 @@ async fn grep_files_tool_collects_matches() -> Result<()> {
         .function_call_output_content_and_success(call_id)
         .expect("tool output present");
     let content = content_opt.expect("content present");
+    let content = strip_call_id_prefix_line(&content);
     let success = success_opt.unwrap_or(true);
     assert!(
         success,
         "expected success for matches, got content={content}"
     );
 
-    let entries = collect_file_names(&content);
+    let entries = collect_file_names(content);
     assert_eq!(entries.len(), 2, "content: {content}");
     assert!(
         entries.contains("alpha.rs"),
@@ -116,6 +118,7 @@ async fn grep_files_tool_reports_empty_results() -> Result<()> {
         .function_call_output_content_and_success(call_id)
         .expect("tool output present");
     let content = content_opt.expect("content present");
+    let content = strip_call_id_prefix_line(&content);
     if let Some(success) = success_opt {
         assert!(!success, "expected success=false content={content}");
     }

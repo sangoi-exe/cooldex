@@ -23,6 +23,7 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::strip_call_id_prefix_line;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -185,6 +186,7 @@ async fn update_plan_tool_emits_plan_update_event() -> anyhow::Result<()> {
 
     let req = second_mock.single_request();
     let (output_text, _success_flag) = call_output(&req, call_id);
+    let output_text = strip_call_id_prefix_line(&output_text);
     assert_eq!(output_text, "Plan updated");
 
     Ok(())
@@ -361,7 +363,7 @@ async fn apply_patch_tool_executes_and_emits_patch_events() -> anyhow::Result<()
     let (output_text, _success_flag) = call_output(&req, call_id);
 
     let expected_pattern = format!(
-        r"(?s)^Exit code: 0
+        r"(?s)^(?:call_id: [^\n]+\n)?Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Output:
 Success. Updated the following files:

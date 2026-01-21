@@ -22,6 +22,7 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::strip_call_id_prefix_line;
 use core_test_support::test_codex::test_codex;
 use regex_lite::Regex;
 use serde_json::Value;
@@ -85,6 +86,7 @@ async fn custom_tool_unknown_returns_custom_output_error() -> Result<()> {
         .get("output")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let output = strip_call_id_prefix_line(output);
     let expected = format!("unsupported custom tool call: {tool_name}");
     assert_eq!(output, expected);
 
@@ -165,6 +167,7 @@ async fn shell_escalated_permissions_rejected_then_ok() -> Result<()> {
         .function_call_output_content_and_success(call_id_blocked)
         .and_then(|(content, _)| content)
         .expect("blocked output string");
+    let blocked_output = strip_call_id_prefix_line(&blocked_output);
     assert_eq!(
         blocked_output, expected_message,
         "unexpected rejection message"
@@ -237,10 +240,17 @@ async fn sandbox_denied_shell_returns_original_output() -> Result<()> {
     let output_text = mock
         .function_call_output_text(call_id)
         .context("shell output present")?;
-    let exit_code_line = output_text
-        .lines()
+    let mut output_lines = output_text.lines();
+    let first_line = output_lines
         .next()
-        .context("exit code line present")?;
+        .context("tool output has at least one line")?;
+    let exit_code_line = if first_line.starts_with("call_id: ") {
+        output_lines
+            .next()
+            .context("exit code line present after call_id line")?
+    } else {
+        first_line
+    };
     let exit_code = exit_code_line
         .strip_prefix("Exit code: ")
         .context("exit code prefix present")?
@@ -563,11 +573,11 @@ async fn shell_spawn_failure_truncates_exec_error() -> Result<()> {
         .and_then(Value::as_str)
         .expect("spawn failure output string");
 
-    let spawn_error_pattern = r#"(?s)^Exit code: -?\d+
+    let spawn_error_pattern = r#"(?s)^(?:call_id: [^\n]+\n)?Exit code: -?\d+
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Output:
 execution error: .*$"#;
-    let spawn_truncated_pattern = r#"(?s)^Exit code: -?\d+
+    let spawn_truncated_pattern = r#"(?s)^(?:call_id: [^\n]+\n)?Exit code: -?\d+
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Total output lines: \d+
 Output:
@@ -576,7 +586,7 @@ execution error: .*$"#;
     let spawn_error_regex = Regex::new(spawn_error_pattern)?;
     let spawn_truncated_regex = Regex::new(spawn_truncated_pattern)?;
     if !spawn_error_regex.is_match(output) && !spawn_truncated_regex.is_match(output) {
-        let fallback_pattern = r"(?s)^execution error: .*$";
+        let fallback_pattern = r"(?s)^(?:call_id: [^\n]+\n)?execution error: .*$";
         assert_regex_match(fallback_pattern, output);
     }
     assert!(output.len() <= 10 * 1024);

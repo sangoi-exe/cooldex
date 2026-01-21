@@ -521,9 +521,11 @@ fn parse_result(item: &Value) -> CommandResult {
             CommandResult { exit_code, stdout }
         }
         Err(_) => {
-            let structured = Regex::new(r"(?s)^Exit code:\s*(-?\d+).*?Output:\n(.*)$").unwrap();
+            let structured =
+                Regex::new(r"(?s)^(?:call_id: [^\n]+\n)?Exit code:\s*(-?\d+).*?Output:\n(.*)$")
+                    .unwrap();
             let regex =
-                Regex::new(r"(?s)^.*?Process exited with code (\d+)\n.*?Output:\n(.*)$").unwrap();
+                Regex::new(r"(?s)^.*?Process exited with code (-?\d+)\n.*?Output:\n(.*)$").unwrap();
             // parse freeform output
             if let Some(captures) = structured.captures(output_str) {
                 let exit_code = captures.get(1).unwrap().as_str().parse::<i64>().unwrap();

@@ -227,7 +227,10 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
         .function_call_output_content_and_success(call_id)
         .and_then(|(content, _)| content)
         .expect("output text present");
-    assert_eq!(output_text, "attached local image path");
+    assert_eq!(
+        output_text,
+        format!("call_id: {call_id}\nattached local image path")
+    );
 
     let image_message =
         find_image_message(&body).expect("pending input image message not included in request");
@@ -338,7 +341,10 @@ async fn view_image_tool_errors_when_path_is_directory() -> anyhow::Result<()> {
         .function_call_output_content_and_success(call_id)
         .and_then(|(content, _)| content)
         .expect("output text present");
-    let expected_message = format!("image path `{}` is not a file", abs_path.display());
+    let expected_message = format!(
+        "call_id: {call_id}\nimage path `{}` is not a file",
+        abs_path.display()
+    );
     assert_eq!(output_text, expected_message);
 
     assert!(
@@ -442,7 +448,10 @@ async fn view_image_tool_placeholder_for_non_image_files() -> anyhow::Result<()>
         .function_call_output_content_and_success(call_id)
         .and_then(|(content, _)| content)
         .expect("output text present");
-    assert_eq!(output_text, "attached local image path");
+    assert_eq!(
+        output_text,
+        format!("call_id: {call_id}\nattached local image path")
+    );
 
     Ok(())
 }
@@ -507,7 +516,10 @@ async fn view_image_tool_errors_when_file_missing() -> anyhow::Result<()> {
         .function_call_output_content_and_success(call_id)
         .and_then(|(content, _)| content)
         .expect("output text present");
-    let expected_prefix = format!("unable to locate image at `{}`:", abs_path.display());
+    let expected_prefix = format!(
+        "call_id: {call_id}\nunable to locate image at `{}`:",
+        abs_path.display()
+    );
     assert!(
         output_text.starts_with(&expected_prefix),
         "expected error to start with `{expected_prefix}` but got `{output_text}`"

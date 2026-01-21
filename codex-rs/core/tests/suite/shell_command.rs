@@ -85,7 +85,7 @@ async fn mount_shell_responses_with_timeout(
     .await;
 }
 
-fn assert_shell_command_output(output: &str, expected: &str) -> Result<()> {
+fn assert_shell_command_output(call_id: &str, output: &str, expected: &str) -> Result<()> {
     let normalized_output = output
         .replace("\r\n", "\n")
         .replace('\r', "\n")
@@ -93,7 +93,7 @@ fn assert_shell_command_output(output: &str, expected: &str) -> Result<()> {
         .to_string();
 
     let expected_pattern = format!(
-        r"(?s)^Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n{expected}\n?$"
+        r"(?s)^call_id: {call_id}\nExit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n{expected}\n?$"
     );
 
     assert_regex_match(&expected_pattern, &normalized_output);
@@ -111,7 +111,7 @@ async fn shell_command_works() -> anyhow::Result<()> {
     harness.submit("run the echo command").await?;
 
     let output = harness.function_call_stdout(call_id).await;
-    assert_shell_command_output(&output, "hello, world")?;
+    assert_shell_command_output(call_id, &output, "hello, world")?;
 
     Ok(())
 }
@@ -127,7 +127,7 @@ async fn output_with_login() -> anyhow::Result<()> {
     harness.submit("run the echo command with login").await?;
 
     let output = harness.function_call_stdout(call_id).await;
-    assert_shell_command_output(&output, "hello, world")?;
+    assert_shell_command_output(call_id, &output, "hello, world")?;
 
     Ok(())
 }
@@ -143,7 +143,7 @@ async fn output_without_login() -> anyhow::Result<()> {
     harness.submit("run the echo command without login").await?;
 
     let output = harness.function_call_stdout(call_id).await;
-    assert_shell_command_output(&output, "hello, world")?;
+    assert_shell_command_output(call_id, &output, "hello, world")?;
 
     Ok(())
 }
@@ -165,7 +165,7 @@ async fn multi_line_output_with_login() -> anyhow::Result<()> {
     harness.submit("run the command with login").await?;
 
     let output = harness.function_call_stdout(call_id).await;
-    assert_shell_command_output(&output, "first line\nsecond line")?;
+    assert_shell_command_output(call_id, &output, "first line\nsecond line")?;
 
     Ok(())
 }
@@ -182,7 +182,7 @@ async fn pipe_output_with_login() -> anyhow::Result<()> {
     harness.submit("run the command without login").await?;
 
     let output = harness.function_call_stdout(call_id).await;
-    assert_shell_command_output(&output, "hello, world")?;
+    assert_shell_command_output(call_id, &output, "hello, world")?;
 
     Ok(())
 }
@@ -199,7 +199,7 @@ async fn pipe_output_without_login() -> anyhow::Result<()> {
     harness.submit("run the command without login").await?;
 
     let output = harness.function_call_stdout(call_id).await;
-    assert_shell_command_output(&output, "hello, world")?;
+    assert_shell_command_output(call_id, &output, "hello, world")?;
 
     Ok(())
 }
@@ -233,8 +233,10 @@ async fn shell_command_times_out_with_timeout_ms() -> anyhow::Result<()> {
         .replace('\r', "\n")
         .trim_end_matches('\n')
         .to_string();
-    let expected_pattern = r"(?s)^Exit code: 124\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\ncommand timed out after [0-9]+ milliseconds\n?$";
-    assert_regex_match(expected_pattern, &normalized_output);
+    let expected_pattern = format!(
+        r"(?s)^call_id: {call_id}\nExit code: 124\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\ncommand timed out after [0-9]+ milliseconds\n?$"
+    );
+    assert_regex_match(&expected_pattern, &normalized_output);
 
     Ok(())
 }
@@ -264,7 +266,7 @@ async fn unicode_output(login: bool) -> anyhow::Result<()> {
     harness.submit("run the command without login").await?;
 
     let output = harness.function_call_stdout(call_id).await;
-    assert_shell_command_output(&output, "naïve_café")?;
+    assert_shell_command_output(call_id, &output, "naïve_café")?;
 
     Ok(())
 }
@@ -294,7 +296,7 @@ async fn unicode_output_with_newlines(login: bool) -> anyhow::Result<()> {
     harness.submit("run the command without login").await?;
 
     let output = harness.function_call_stdout(call_id).await;
-    assert_shell_command_output(&output, "line1\\nnaïve café\\nline3")?;
+    assert_shell_command_output(call_id, &output, "line1\\nnaïve café\\nline3")?;
 
     Ok(())
 }

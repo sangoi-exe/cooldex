@@ -27,6 +27,13 @@ pub fn assert_regex_match<'s>(pattern: &str, actual: &'s str) -> regex_lite::Cap
         .unwrap_or_else(|| panic!("regex {pattern:?} did not match {actual:?}"))
 }
 
+/// Removes a leading `call_id: ...` line (if present) from plain-text tool outputs.
+pub fn strip_call_id_prefix_line(text: &str) -> &str {
+    text.strip_prefix("call_id: ")
+        .and_then(|rest| rest.split_once('\n').map(|(_, after)| after))
+        .unwrap_or(text)
+}
+
 pub fn test_path_buf_with_windows(unix_path: &str, windows_path: Option<&str>) -> PathBuf {
     if cfg!(windows) {
         if let Some(windows) = windows_path {

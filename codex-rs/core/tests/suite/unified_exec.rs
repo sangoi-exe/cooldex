@@ -63,7 +63,8 @@ fn parse_unified_exec_output(raw: &str) -> Result<ParsedUnifiedExecOutput> {
     static OUTPUT_REGEX: OnceLock<Regex> = OnceLock::new();
     let regex = OUTPUT_REGEX.get_or_init(|| {
         Regex::new(concat!(
-            r#"(?s)^(?:Total output lines: \d+\n\n)?"#,
+            r#"(?s)^(?:call_id: [^\n]+\n)?"#,
+            r#"(?:Total output lines: \d+\n\n)?"#,
             r#"(?:Chunk ID: (?P<chunk_id>[^\n]+)\n)?"#,
             r#"Wall time: (?P<wall_time>-?\d+(?:\.\d+)?) seconds\n"#,
             r#"(?:Process exited with code (?P<exit_code>-?\d+)\n)?"#,
@@ -1178,13 +1179,21 @@ async fn unified_exec_emits_one_begin_and_one_end_event() -> Result<()> {
 
     let mut begin_events = Vec::new();
     let mut end_events = Vec::new();
+    let mut turn_complete = false;
     loop {
-        let event_msg = wait_for_event(&codex, |_| true).await;
+        let event_msg =
+            wait_for_event_with_timeout(&codex, |_| true, Duration::from_secs(10)).await;
         match event_msg {
             EventMsg::ExecCommandBegin(event) => begin_events.push(event),
             EventMsg::ExecCommandEnd(event) => end_events.push(event),
-            EventMsg::TurnComplete(_) => break,
+            EventMsg::TurnComplete(_) => {
+                turn_complete = true;
+            }
             _ => {}
+        }
+
+        if turn_complete && !end_events.is_empty() {
+            break;
         }
     }
 

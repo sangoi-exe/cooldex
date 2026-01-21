@@ -203,12 +203,15 @@ async fn shell_output_is_structured_with_freeform_apply_patch(
         serde_json::from_str::<Value>(output).is_err(),
         "expected structured shell output to be plain text",
     );
-    let expected_pattern = r"(?s)^Exit code: 0
+    let expected_pattern = format!(
+        r"(?s)^call_id: {call_id}
+Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Output:
 freeform shell
-?$";
-    assert_regex_match(expected_pattern, output);
+?$"
+    );
+    assert_regex_match(&expected_pattern, output);
 
     Ok(())
 }
@@ -323,10 +326,9 @@ async fn shell_output_structures_fixture_with_serialization(
     let (header, body) = output
         .split_once("Output:\n")
         .expect("structured output contains an Output section");
-    assert_regex_match(
-        r"(?s)^Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds$",
-        header.trim_end(),
-    );
+    let header_pattern =
+        format!(r"(?s)^call_id: {call_id}\nExit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds$");
+    assert_regex_match(&header_pattern, header.trim_end());
     assert_eq!(
         body, FIXTURE_JSON,
         "expected Output section to include the fixture contents"
@@ -367,11 +369,14 @@ async fn shell_output_for_freeform_tool_records_duration(
         .and_then(Value::as_str)
         .expect("structured output string");
 
-    let expected_pattern = r#"(?s)^Exit code: 0
+    let expected_pattern = format!(
+        r#"(?s)^call_id: {call_id}
+Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Output:
-$"#;
-    assert_regex_match(expected_pattern, output);
+$"#
+    );
+    assert_regex_match(&expected_pattern, output);
 
     let wall_time_regex = Regex::new(r"(?m)^Wall (?:time|Clock): ([0-9]+(?:\.[0-9]+)?) seconds$")
         .expect("compile wall time regex");
@@ -424,7 +429,9 @@ async fn shell_output_reserializes_truncated_content(output_type: ShellModelOutp
         serde_json::from_str::<Value>(output).is_err(),
         "expected truncated shell output to be plain text",
     );
-    let truncated_pattern = r#"(?s)^Exit code: 0
+    let truncated_pattern = format!(
+        r#"(?s)^call_id: {call_id}
+Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Total output lines: 400
 Output:
@@ -434,14 +441,15 @@ Output:
 4
 5
 6
-.*…46 tokens truncated….*
+.*…[0-9]+ tokens truncated….*
 396
 397
 398
 399
 400
-$"#;
-    assert_regex_match(truncated_pattern, output);
+$"#
+    );
+    assert_regex_match(&truncated_pattern, output);
 
     Ok(())
 }
@@ -480,7 +488,8 @@ async fn apply_patch_custom_tool_output_is_structured(
     let output = harness.apply_patch_output(call_id, output_type).await;
 
     let expected_pattern = format!(
-        r"(?s)^Exit code: 0
+        r"(?s)^call_id: {call_id}
+Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Output:
 Success. Updated the following files:
@@ -522,7 +531,8 @@ async fn apply_patch_custom_tool_call_creates_file(
     let output = harness.apply_patch_output(call_id, output_type).await;
 
     let expected_pattern = format!(
-        r"(?s)^Exit code: 0
+        r"(?s)^call_id: {call_id}
+Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Output:
 Success. Updated the following files:
@@ -580,7 +590,8 @@ async fn apply_patch_custom_tool_call_updates_existing_file(
     let output = harness.apply_patch_output(call_id, output_type).await;
 
     let expected_pattern = format!(
-        r"(?s)^Exit code: 0
+        r"(?s)^call_id: {call_id}
+Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Output:
 Success. Updated the following files:
@@ -632,7 +643,7 @@ async fn apply_patch_custom_tool_call_reports_failure_output(
     let output = harness.apply_patch_output(call_id, output_type).await;
 
     let expected_output = format!(
-        "apply_patch verification failed: Failed to read file to update {}/{missing_file}: No such file or directory (os error 2)",
+        "call_id: {call_id}\napply_patch verification failed: Failed to read file to update {}/{missing_file}: No such file or directory (os error 2)",
         harness.cwd().to_string_lossy()
     );
     assert_eq!(output, expected_output.as_str());
@@ -674,7 +685,8 @@ async fn apply_patch_function_call_output_is_structured(
 
     let output = harness.apply_patch_output(call_id, output_type).await;
     let expected_pattern = format!(
-        r"(?s)^Exit code: 0
+        r"(?s)^call_id: {call_id}
+Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Output:
 Success. Updated the following files:
@@ -718,11 +730,14 @@ async fn shell_output_is_structured_for_nonzero_exit(output_type: ShellModelOutp
         .and_then(Value::as_str)
         .expect("shell output string");
 
-    let expected_pattern = r"(?s)^Exit code: 42
+    let expected_pattern = format!(
+        r"(?s)^call_id: {call_id}
+Exit code: 42
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Output:
-?$";
-    assert_regex_match(expected_pattern, output);
+?$"
+    );
+    assert_regex_match(&expected_pattern, output);
 
     Ok(())
 }
@@ -770,12 +785,15 @@ async fn shell_command_output_is_freeform() -> Result<()> {
         .and_then(Value::as_str)
         .expect("shell_command output string");
 
-    let expected_pattern = r"(?s)^Exit code: 0
+    let expected_pattern = format!(
+        r"(?s)^call_id: {call_id}
+Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Output:
 shell command
-?$";
-    assert_regex_match(expected_pattern, output);
+?$"
+    );
+    assert_regex_match(&expected_pattern, output);
 
     Ok(())
 }
@@ -821,11 +839,14 @@ async fn shell_command_output_is_not_truncated_under_10k_bytes() -> Result<()> {
         .and_then(Value::as_str)
         .expect("shell_command output string");
 
-    let expected_pattern = r"(?s)^Exit code: 0
+    let expected_pattern = format!(
+        r"(?s)^call_id: {call_id}
+Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Output:
-1{10000}$";
-    assert_regex_match(expected_pattern, output);
+1{{10000}}$"
+    );
+    assert_regex_match(&expected_pattern, output);
 
     Ok(())
 }
@@ -871,11 +892,14 @@ async fn shell_command_output_is_not_truncated_over_10k_bytes() -> Result<()> {
         .and_then(Value::as_str)
         .expect("shell_command output string");
 
-    let expected_pattern = r"(?s)^Exit code: 0
+    let expected_pattern = format!(
+        r"(?s)^call_id: {call_id}
+Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Output:
-1*…1 chars truncated…1*$";
-    assert_regex_match(expected_pattern, output);
+1*…1 chars truncated…1*$"
+    );
+    assert_regex_match(&expected_pattern, output);
 
     Ok(())
 }
@@ -921,12 +945,15 @@ async fn local_shell_call_output_is_structured() -> Result<()> {
         .and_then(Value::as_str)
         .expect("local shell output string");
 
-    let expected_pattern = r"(?s)^Exit code: 0
+    let expected_pattern = format!(
+        r"(?s)^call_id: {call_id}
+Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Output:
 local shell
-?$";
-    assert_regex_match(expected_pattern, output);
+?$"
+    );
+    assert_regex_match(&expected_pattern, output);
 
     Ok(())
 }

@@ -111,7 +111,7 @@ async fn apply_patch_cli_multiple_operations_integration(
 
     let out = harness.apply_patch_output(call_id, output_type).await;
 
-    let expected = r"(?s)^Exit code: 0
+    let expected = r"(?s)^(?:call_id: [^\n]+\n)?Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Output:
 Success. Updated the following files:

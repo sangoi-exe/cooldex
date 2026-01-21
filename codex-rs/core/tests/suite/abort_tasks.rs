@@ -12,6 +12,7 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
+use core_test_support::strip_call_id_prefix_line;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use regex_lite::Regex;
@@ -143,9 +144,10 @@ async fn interrupt_tool_records_history_entries() {
     let output = response_mock
         .function_call_output_text(call_id)
         .expect("missing function_call_output text");
+    let output = strip_call_id_prefix_line(&output);
     let re = Regex::new(r"^Wall time: ([0-9]+(?:\.[0-9])?) seconds\naborted by user$")
         .expect("compile regex");
-    let captures = re.captures(&output);
+    let captures = re.captures(output);
     assert_matches!(
         captures.as_ref(),
         Some(caps) if caps.get(1).is_some(),

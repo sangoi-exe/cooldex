@@ -23,6 +23,7 @@ use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::stdio_server_bin;
+use core_test_support::strip_call_id_prefix_line;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use serde_json::Value;
@@ -69,12 +70,13 @@ async fn truncate_function_error_trims_respond_to_model() -> Result<()> {
     let output = mock
         .function_call_output_text(call_id)
         .context("function error output present")?;
+    let output = strip_call_id_prefix_line(&output);
 
     tracing::debug!(output = %output, "truncated function error output");
 
     // Expect plaintext with token-based truncation marker and no omitted-lines marker
     assert!(
-        serde_json::from_str::<serde_json::Value>(&output).is_err(),
+        serde_json::from_str::<serde_json::Value>(output).is_err(),
         "expected error output to be plain text",
     );
     assert!(
@@ -82,7 +84,7 @@ async fn truncate_function_error_trims_respond_to_model() -> Result<()> {
         "error output should not include line-based truncation header: {output}",
     );
     let truncated_pattern = r"(?s)^unable to access `.*tokens truncated.*$";
-    assert_regex_match(truncated_pattern, &output);
+    assert_regex_match(truncated_pattern, output);
     assert!(
         !output.contains("omitted"),
         "line omission marker should not appear when no lines were dropped: {output}"
@@ -228,13 +230,13 @@ async fn tool_call_output_exceeds_limit_truncated_chars_limit() -> Result<()> {
         "expected truncated shell output to be plain text"
     );
 
-    let truncated_pattern = r#"(?s)^Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nTotal output lines: 100000\nOutput:\n.*?…\d+ chars truncated….*$"#;
+    let truncated_pattern = r#"(?s)^(?:call_id: [^\n]+\n)?Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nTotal output lines: 100000\nOutput:\n.*?…\d+ chars truncated….*$"#;
 
     assert_regex_match(truncated_pattern, &output);
 
     let len = output.len();
     assert!(
-        (9_900..=10_100).contains(&len),
+        (9_900..=10_200).contains(&len),
         "expected ~10k chars after truncation, got {len}"
     );
 
@@ -300,7 +302,7 @@ async fn tool_call_output_exceeds_limit_truncated_for_model() -> Result<()> {
         serde_json::from_str::<Value>(&output).is_err(),
         "expected truncated shell output to be plain text"
     );
-    let truncated_pattern = r#"(?s)^Exit code: 0
+    let truncated_pattern = r#"(?s)^(?:call_id: [^\n]+\n)?Exit code: 0
 Wall time: [0-9]+(?:\.[0-9]+)? seconds
 Total output lines: 100000
 Output:
@@ -310,7 +312,7 @@ Output:
 4
 5
 6
-.*…137224 tokens truncated.*
+.*…[0-9]+ tokens truncated.*
 99999
 100000
 $"#;
@@ -618,7 +620,7 @@ async fn token_policy_marker_reports_tokens() -> Result<()> {
         .function_call_output_text(call_id)
         .context("shell output present")?;
 
-    let pattern = r"(?s)^Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nTotal output lines: 150\nOutput:\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19.*tokens truncated.*129\n130\n131\n132\n133\n134\n135\n136\n137\n138\n139\n140\n141\n142\n143\n144\n145\n146\n147\n148\n149\n150\n$";
+    let pattern = r"(?s)^(?:call_id: [^\n]+\n)?Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nTotal output lines: 150\nOutput:\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19.*tokens truncated.*129\n130\n131\n132\n133\n134\n135\n136\n137\n138\n139\n140\n141\n142\n143\n144\n145\n146\n147\n148\n149\n150\n$";
 
     assert_regex_match(pattern, &output);
 
@@ -669,7 +671,7 @@ async fn byte_policy_marker_reports_bytes() -> Result<()> {
         .function_call_output_text(call_id)
         .context("shell output present")?;
 
-    let pattern = r"(?s)^Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nTotal output lines: 150\nOutput:\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19.*chars truncated.*129\n130\n131\n132\n133\n134\n135\n136\n137\n138\n139\n140\n141\n142\n143\n144\n145\n146\n147\n148\n149\n150\n$";
+    let pattern = r"(?s)^(?:call_id: [^\n]+\n)?Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nTotal output lines: 150\nOutput:\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19.*chars truncated.*129\n130\n131\n132\n133\n134\n135\n136\n137\n138\n139\n140\n141\n142\n143\n144\n145\n146\n147\n148\n149\n150\n$";
 
     assert_regex_match(pattern, &output);
 

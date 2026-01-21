@@ -146,6 +146,7 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         "list_mcp_resource_templates",
         "read_mcp_resource",
         "update_plan",
+        "manage_context",
         "request_user_input",
         "apply_patch",
         "web_search",
