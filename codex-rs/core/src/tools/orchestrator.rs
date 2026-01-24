@@ -52,6 +52,7 @@ impl ToolOrchestrator {
 
         // 1) Approval
         let mut already_approved = false;
+        let mut bypass_sandbox_first_attempt = false;
 
         let requirement = tool.exec_approval_requirement(req).unwrap_or_else(|| {
             default_exec_approval_requirement(approval_policy, &turn_ctx.sandbox_policy)
@@ -82,18 +83,25 @@ impl ToolOrchestrator {
                     | ReviewDecision::ApprovedExecpolicyAmendment { .. }
                     | ReviewDecision::ApprovedForSession => {}
                 }
+                if matches!(decision, ReviewDecision::ApprovedExecpolicyAmendment { .. }) {
+                    bypass_sandbox_first_attempt = true;
+                }
                 already_approved = true;
             }
         }
 
         // 2) First attempt under the selected sandbox.
-        let initial_sandbox = match tool.sandbox_mode_for_first_attempt(req) {
-            SandboxOverride::BypassSandboxFirstAttempt => crate::exec::SandboxType::None,
-            SandboxOverride::NoOverride => self.sandbox.select_initial(
-                &turn_ctx.sandbox_policy,
-                tool.sandbox_preference(),
-                turn_ctx.windows_sandbox_level,
-            ),
+        let initial_sandbox = if bypass_sandbox_first_attempt {
+            crate::exec::SandboxType::None
+        } else {
+            match tool.sandbox_mode_for_first_attempt(req) {
+                SandboxOverride::BypassSandboxFirstAttempt => crate::exec::SandboxType::None,
+                SandboxOverride::NoOverride => self.sandbox.select_initial(
+                    &turn_ctx.sandbox_policy,
+                    tool.sandbox_preference(),
+                    turn_ctx.windows_sandbox_level,
+                ),
+            }
         };
 
         // Platform-specific flag gating is handled by SandboxManager::select_initial

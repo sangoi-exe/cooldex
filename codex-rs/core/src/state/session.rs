@@ -358,6 +358,11 @@ impl SessionState {
         }
 
         crate::context_manager::remove_orphan_outputs_lenient(&mut out);
+        if self.context_inclusion_mask.is_some()
+            || !self.context_overlay.replacements_by_rid.is_empty()
+        {
+            crate::context_manager::ensure_call_outputs_present_lenient(&mut out);
+        }
 
         if !self.context_overlay.notes.is_empty() {
             let note_item = build_notes_item(&self.context_overlay.notes);
@@ -400,6 +405,11 @@ impl SessionState {
         }
 
         crate::context_manager::remove_orphan_outputs_lenient(&mut out);
+        if self.context_inclusion_mask.is_some()
+            || !self.context_overlay.replacements_by_rid.is_empty()
+        {
+            crate::context_manager::ensure_call_outputs_present_lenient(&mut out);
+        }
 
         if !self.context_overlay.notes.is_empty() {
             let note_item = build_notes_item(&self.context_overlay.notes);

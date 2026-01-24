@@ -109,6 +109,90 @@ pub(crate) fn ensure_call_outputs_present(
     }
 }
 
+/// Ensure every tool call in `items` has a corresponding output item.
+///
+/// This is a *prompt-level* safety net. It is intended for situations where
+/// context pruning excludes tool outputs but keeps their call item, which
+/// would otherwise produce invalid input for the Responses API.
+pub(crate) fn ensure_call_outputs_present_lenient(items: &mut Vec<ResponseItem>) {
+    const PLACEHOLDER: &str = "[codex] tool output omitted";
+
+    let mut function_call_output_ids: HashSet<String> = HashSet::new();
+    let mut custom_tool_call_output_ids: HashSet<String> = HashSet::new();
+
+    for item in items.iter() {
+        match item {
+            ResponseItem::FunctionCallOutput { call_id, .. } => {
+                function_call_output_ids.insert(call_id.clone());
+            }
+            ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                custom_tool_call_output_ids.insert(call_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // Store the insertion position (index of call) alongside the item so
+    // we can insert in reverse order and avoid index shifting.
+    let mut missing_outputs_to_insert: Vec<(usize, ResponseItem)> = Vec::new();
+
+    for (idx, item) in items.iter().enumerate() {
+        match item {
+            ResponseItem::FunctionCall { call_id, .. } => {
+                if !function_call_output_ids.contains(call_id) {
+                    function_call_output_ids.insert(call_id.clone());
+                    missing_outputs_to_insert.push((
+                        idx,
+                        ResponseItem::FunctionCallOutput {
+                            call_id: call_id.clone(),
+                            output: FunctionCallOutputPayload {
+                                content: PLACEHOLDER.to_string(),
+                                ..Default::default()
+                            },
+                        },
+                    ));
+                }
+            }
+            ResponseItem::CustomToolCall { call_id, .. } => {
+                if !custom_tool_call_output_ids.contains(call_id) {
+                    custom_tool_call_output_ids.insert(call_id.clone());
+                    missing_outputs_to_insert.push((
+                        idx,
+                        ResponseItem::CustomToolCallOutput {
+                            call_id: call_id.clone(),
+                            output: PLACEHOLDER.to_string(),
+                        },
+                    ));
+                }
+            }
+            // LocalShellCall is represented in upstream streams by a FunctionCallOutput
+            ResponseItem::LocalShellCall {
+                call_id: Some(call_id),
+                ..
+            } => {
+                if !function_call_output_ids.contains(call_id) {
+                    function_call_output_ids.insert(call_id.clone());
+                    missing_outputs_to_insert.push((
+                        idx,
+                        ResponseItem::FunctionCallOutput {
+                            call_id: call_id.clone(),
+                            output: FunctionCallOutputPayload {
+                                content: PLACEHOLDER.to_string(),
+                                ..Default::default()
+                            },
+                        },
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (idx, output_item) in missing_outputs_to_insert.into_iter().rev() {
+        items.insert(idx + 1, output_item);
+    }
+}
+
 pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>, rids: &mut Vec<u64>) {
     let function_call_ids: HashSet<String> = items
         .iter()
@@ -278,5 +362,131 @@ where
     if let Some(pos) = items.iter().position(predicate) {
         items.remove(pos);
         rids.remove(pos);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::LocalShellAction;
+    use codex_protocol::models::LocalShellExecAction;
+    use codex_protocol::models::LocalShellStatus;
+    use pretty_assertions::assert_eq;
+
+    fn assistant_message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn ensure_call_outputs_present_lenient_inserts_missing_function_call_output() {
+        let call_id = "call-1".to_string();
+        let mut items = vec![
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                arguments: "{}".to_string(),
+                call_id: call_id.clone(),
+            },
+            assistant_message("after"),
+        ];
+
+        ensure_call_outputs_present_lenient(&mut items);
+
+        assert_eq!(items.len(), 3);
+        assert!(matches!(
+            &items[1],
+            ResponseItem::FunctionCallOutput {
+                call_id: output_call_id,
+                output
+            } if output_call_id == &call_id && output.content == "[codex] tool output omitted"
+        ));
+    }
+
+    #[test]
+    fn ensure_call_outputs_present_lenient_inserts_missing_custom_tool_output() {
+        let call_id = "call-2".to_string();
+        let mut items = vec![
+            ResponseItem::CustomToolCall {
+                id: None,
+                status: None,
+                call_id: call_id.clone(),
+                name: "apply_patch".to_string(),
+                input: "*** Begin Patch\n*** End Patch".to_string(),
+            },
+            assistant_message("after"),
+        ];
+
+        ensure_call_outputs_present_lenient(&mut items);
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items[1],
+            ResponseItem::CustomToolCallOutput {
+                call_id,
+                output: "[codex] tool output omitted".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn ensure_call_outputs_present_lenient_inserts_missing_local_shell_output() {
+        let call_id = "call-3".to_string();
+        let mut items = vec![
+            ResponseItem::LocalShellCall {
+                id: None,
+                call_id: Some(call_id.clone()),
+                status: LocalShellStatus::Completed,
+                action: LocalShellAction::Exec(LocalShellExecAction {
+                    command: vec!["echo".to_string(), "hello".to_string()],
+                    timeout_ms: None,
+                    working_directory: None,
+                    env: None,
+                    user: None,
+                }),
+            },
+            assistant_message("after"),
+        ];
+
+        ensure_call_outputs_present_lenient(&mut items);
+
+        assert_eq!(items.len(), 3);
+        assert!(matches!(
+            &items[1],
+            ResponseItem::FunctionCallOutput {
+                call_id: output_call_id,
+                output
+            } if output_call_id == &call_id && output.content == "[codex] tool output omitted"
+        ));
+    }
+
+    #[test]
+    fn ensure_call_outputs_present_lenient_does_not_insert_when_output_is_present() {
+        let call_id = "call-4".to_string();
+        let mut items = vec![
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                arguments: "{}".to_string(),
+                call_id: call_id.clone(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id,
+                output: FunctionCallOutputPayload {
+                    content: "ok".to_string(),
+                    ..Default::default()
+                },
+            },
+        ];
+
+        ensure_call_outputs_present_lenient(&mut items);
+
+        assert_eq!(items.len(), 2);
     }
 }

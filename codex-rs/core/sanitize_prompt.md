@@ -17,9 +17,10 @@ Hard constraints:
 - Never delete/exclude the protected sections: environment context and user instructions.
 - Prefer `replace`/`exclude` over `delete`. Minimize churn and avoid “busywork” edits.
 - Don’t chase a target `context_left_percent`; focus on keeping the prompt small and high-signal.
+- Common drift: “bloat came back” usually means it was never removed (the long tail of medium tool outputs/calls stayed included).
 
 Procedure:
-1) Call `manage_context` with `mode="retrieve"` and `max_top_items=20`.
+1) Call `manage_context` with `mode="retrieve"` and `max_top_items=20` (bump to 50 only if you need more targets to cut many medium tool outputs).
 2) Run a single high-leverage `apply` that sanitizes broadly across the session.
 3) Call `retrieve` again to confirm the biggest offenders were reduced/replaced. If there are still a few obvious oversized items, do one more `apply` focused only on those, then `retrieve` again.
 
@@ -28,8 +29,12 @@ What to do in `apply`:
 - Always prioritize reasoning first:
   - If there are any included reasoning items, run `consolidate_reasoning` (this extracts all included reasoning summaries under `extracted.reasoning.items` and excludes the original reasoning items).
   - Then add a short `<reasoning_context>...</reasoning_context>` note with the key findings you want to keep.
+  - Don’t copy `extracted.reasoning` verbatim into the prompt; keep only your short summary note.
+  - If the `manage_context` *apply output* becomes a top offender after `consolidate_reasoning` (common), do a follow-up `apply` to `replace`/`exclude` that tool output by its `call_id`.
 - Then tackle large tool outputs:
   - Use `breakdown.top_calls` / `breakdown.top_included_items` to find the biggest tool outputs.
+  - Prefer excluding low-value, high-volume shell output (`exec_command` logs, file dumps, repeated `rg`/`nl`/`sed` output). Replace only when it contains decisions/errors you must preserve.
+  - If you’re still low on headroom after removing the biggest offenders, do 2–3 more cycles of: `retrieve(max_top_items=50)` → exclude the next batch of big `exec_command` call_ids → `retrieve`.
   - Prefer `replace` for outputs that contain important conclusions (keep: what ran, key result, file paths/ids, next step).
   - Prefer `exclude` for low-value bulk (long logs, repeated build output, file dumps that can be regenerated).
 - Keep ops efficient:
