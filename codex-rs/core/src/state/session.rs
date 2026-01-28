@@ -727,6 +727,7 @@ fn apply_replacement(item: &ResponseItem, replacement: &str) -> Option<ResponseI
                     "{REASONING_CONTEXT_OPEN_TAG}\n{trimmed}\n{REASONING_CONTEXT_CLOSE_TAG}"
                 ),
             }],
+            end_turn: None,
         }),
         _ => None,
     }
@@ -778,6 +779,7 @@ fn build_notes_item(notes: &[String]) -> ResponseItem {
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText { text }],
+        end_turn: None,
     }
 }
 

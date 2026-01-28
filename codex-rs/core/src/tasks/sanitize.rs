@@ -57,6 +57,7 @@ impl SessionTask for SanitizeTask {
             content: vec![ContentItem::InputText {
                 text: SANITIZE_PROMPT.to_string(),
             }],
+            end_turn: None,
         };
 
         let turn_diff_tracker: SharedTurnDiffTracker =

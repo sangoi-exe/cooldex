@@ -977,17 +977,17 @@ fn estimate_item_bytes(item: &ResponseItem) -> u64 {
             (call_id.len() + output.len()) as u64
         }
         ResponseItem::WebSearchCall { action, .. } => match action {
-            codex_protocol::models::WebSearchAction::Search { query } => {
+            Some(codex_protocol::models::WebSearchAction::Search { query }) => {
                 query.as_ref().map(|s| s.len() as u64).unwrap_or(0)
             }
-            codex_protocol::models::WebSearchAction::OpenPage { url } => {
+            Some(codex_protocol::models::WebSearchAction::OpenPage { url }) => {
                 url.as_ref().map(|s| s.len() as u64).unwrap_or(0)
             }
-            codex_protocol::models::WebSearchAction::FindInPage { url, pattern } => {
+            Some(codex_protocol::models::WebSearchAction::FindInPage { url, pattern }) => {
                 url.as_ref().map(|s| s.len() as u64).unwrap_or(0)
                     + pattern.as_ref().map(|s| s.len() as u64).unwrap_or(0)
             }
-            codex_protocol::models::WebSearchAction::Other => 0,
+            Some(codex_protocol::models::WebSearchAction::Other) | None => 0,
         },
         ResponseItem::Compaction { encrypted_content } => encrypted_content.len() as u64,
         ResponseItem::GhostSnapshot { .. } | ResponseItem::Other => 0,
@@ -1201,20 +1201,20 @@ fn prompt_preview_line(item: &ResponseItem, max_lines: usize, max_chars: usize) 
         ResponseItem::WebSearchCall { action, .. } => {
             use codex_protocol::models::WebSearchAction;
             match action {
-                WebSearchAction::Search { query } => format!(
+                Some(WebSearchAction::Search { query }) => format!(
                     "web_search: {}",
                     query
                         .as_deref()
                         .map(|q| preview_text_lines(q, max_lines, max_chars))
                         .unwrap_or_else(|| "search".to_string())
                 ),
-                WebSearchAction::OpenPage { url } => format!(
+                Some(WebSearchAction::OpenPage { url }) => format!(
                     "web_search: open {}",
                     url.as_deref()
                         .map(|u| preview_text_lines(u, max_lines, max_chars))
                         .unwrap_or_default()
                 ),
-                WebSearchAction::FindInPage { url, pattern } => format!(
+                Some(WebSearchAction::FindInPage { url, pattern }) => format!(
                     "web_search: find {} {}",
                     url.as_deref()
                         .map(|u| preview_text_lines(u, max_lines, max_chars))
@@ -1224,7 +1224,7 @@ fn prompt_preview_line(item: &ResponseItem, max_lines: usize, max_chars: usize) 
                         .map(|p| preview_text_lines(p, max_lines, max_chars))
                         .unwrap_or_default()
                 ),
-                WebSearchAction::Other => "web_search".to_string(),
+                Some(WebSearchAction::Other) | None => "web_search".to_string(),
             }
         }
         ResponseItem::Compaction { encrypted_content } => {
@@ -1702,6 +1702,7 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: text.to_string(),
             }],
+            end_turn: None,
         }
     }
 
@@ -1712,6 +1713,7 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: text.to_string(),
             }],
+            end_turn: None,
         }
     }
 

@@ -542,7 +542,12 @@ fn summarize_tool_calls(
             }
             ResponseItem::WebSearchCall { action, .. } => {
                 indices.push(idx);
-                summaries.push(summarize_web_search_call(action));
+                summaries.push(
+                    action
+                        .as_ref()
+                        .map(summarize_web_search_call)
+                        .unwrap_or_else(|| "web_search".to_string()),
+                );
             }
             ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. } => {
                 indices.push(idx);

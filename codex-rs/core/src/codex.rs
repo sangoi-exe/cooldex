@@ -1271,17 +1271,8 @@ impl Session {
                     state.pending_resume_previous_model = Some(prev.to_string());
                 }
 
-                // Restore in-memory state from the recorded rollout (history + context overlay/inclusion).
-                let initial_context = self.build_initial_context(&turn_context).await;
-                {
-                    let mut state = self.state.lock().await;
-                    self.restore_state_from_rollout(
-                        &turn_context,
-                        &rollout_items,
-                        &initial_context,
-                        &mut state,
-                    );
-                }
+                self.replay_rollout_items_into_state(&turn_context, &rollout_items)
+                    .await;
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
@@ -1296,16 +1287,7 @@ impl Session {
             }
             InitialHistory::Forked(rollout_items) => {
                 let initial_context = self.build_initial_context(&turn_context).await;
-                {
-                    let mut state = self.state.lock().await;
-                    self.restore_state_from_rollout(
-                        &turn_context,
-                        &rollout_items,
-                        &initial_context,
-                        &mut state,
-                    );
-                }
-                self.restore_context_state_from_rollout(&rollout_items)
+                self.replay_rollout_items_into_state(&turn_context, &rollout_items)
                     .await;
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
@@ -2009,110 +1991,160 @@ impl Session {
         self.send_raw_response_items(turn_context, items).await;
     }
 
-    fn restore_state_from_rollout(
+    async fn replay_rollout_items_into_state(
         &self,
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
-        initial_context: &[ResponseItem],
-        state: &mut SessionState,
     ) {
         use crate::rid::parse_rid;
+        use crate::state::ContextOverlay;
+        use codex_protocol::protocol::ContextInclusionItem;
+        use codex_protocol::protocol::ContextOverlayItem;
         use std::collections::BTreeMap;
         use std::collections::BTreeSet;
         use std::collections::HashMap;
 
-        state.replace_history(Vec::new());
-        state.set_context_overlay(crate::state::ContextOverlay::default());
-        state.set_include_mask(None);
+        fn apply_context_overlay(state: &mut SessionState, overlay: &ContextOverlayItem) {
+            let mut replacements_by_rid = BTreeMap::new();
+            for replacement in &overlay.replacements {
+                if let Some(rid) = parse_rid(&replacement.id) {
+                    replacements_by_rid.insert(rid, replacement.text.clone());
+                }
+            }
+            state.set_context_overlay(ContextOverlay {
+                replacements_by_rid,
+                notes: overlay.notes.clone(),
+            });
+        }
+
+        fn apply_context_inclusion(state: &mut SessionState, inclusion: &ContextInclusionItem) {
+            // Apply deletions first.
+            if !inclusion.deleted_ids.is_empty() || !inclusion.deleted_indices.is_empty() {
+                let snapshot_rids = state.history_rids_snapshot();
+                let mut rid_lookup: HashMap<u64, usize> = HashMap::new();
+                for (idx, rid) in snapshot_rids.iter().copied().enumerate() {
+                    rid_lookup.insert(rid, idx);
+                }
+
+                let mut indices: Vec<usize> = Vec::new();
+                if !inclusion.deleted_ids.is_empty() {
+                    for raw in &inclusion.deleted_ids {
+                        if let Some(rid) = parse_rid(raw)
+                            && let Some(idx) = rid_lookup.get(&rid).copied()
+                        {
+                            indices.push(idx);
+                        }
+                    }
+                } else {
+                    indices.extend(inclusion.deleted_indices.iter().copied());
+                }
+
+                indices.sort_unstable();
+                indices.dedup();
+                if !indices.is_empty() {
+                    state.prune_by_indices(indices);
+                }
+            }
+
+            // Apply include mask snapshot.
+            let included_indices: BTreeSet<usize> = if !inclusion.included_ids.is_empty() {
+                let snapshot_rids = state.history_rids_snapshot();
+                let mut rid_lookup: HashMap<u64, usize> = HashMap::new();
+                for (idx, rid) in snapshot_rids.iter().copied().enumerate() {
+                    rid_lookup.insert(rid, idx);
+                }
+
+                let mut included: BTreeSet<usize> = BTreeSet::new();
+                for raw in &inclusion.included_ids {
+                    if let Some(rid) = parse_rid(raw)
+                        && let Some(idx) = rid_lookup.get(&rid).copied()
+                    {
+                        included.insert(idx);
+                    }
+                }
+                included
+            } else {
+                inclusion.included_indices.iter().copied().collect()
+            };
+
+            let history_len = state.history_rids_snapshot().len();
+            if included_indices.len() == history_len {
+                state.set_include_mask(None);
+            } else {
+                state.set_include_mask(Some(included_indices));
+            }
+        }
+
+        let mut pending: Vec<&ResponseItem> = Vec::new();
 
         for item in rollout_items {
             match item {
                 RolloutItem::ResponseItem(response_item) => {
-                    state.record_items(
-                        std::iter::once(response_item),
-                        turn_context.truncation_policy,
-                    );
+                    pending.push(response_item);
                 }
                 RolloutItem::Compacted(compacted) => {
-                    let snapshot = state.history_snapshot();
+                    if !pending.is_empty() {
+                        let mut state = self.state.lock().await;
+                        state.record_items(pending.iter().copied(), turn_context.truncation_policy);
+                        pending.clear();
+                    }
+
                     if let Some(replacement) = &compacted.replacement_history {
-                        state.replace_history(replacement.clone());
-                    } else {
-                        let user_messages = collect_user_messages(&snapshot);
-                        let rebuilt = compact::build_compacted_history(
-                            initial_context.to_vec(),
-                            &user_messages,
-                            &compacted.message,
-                        );
-                        state.replace_history(rebuilt);
+                        self.replace_history(replacement.clone()).await;
+                        continue;
                     }
+
+                    let user_messages = {
+                        let state = self.state.lock().await;
+                        collect_user_messages(state.clone_history().raw_items())
+                    };
+                    let rebuilt = compact::build_compacted_history(
+                        self.build_initial_context(turn_context).await,
+                        &user_messages,
+                        &compacted.message,
+                    );
+                    self.replace_history(rebuilt).await;
                 }
-                RolloutItem::ContextOverlay(overlay) => {
-                    let mut replacements_by_rid = BTreeMap::new();
-                    for replacement in &overlay.replacements {
-                        if let Some(rid) = parse_rid(&replacement.id) {
-                            replacements_by_rid.insert(rid, replacement.text.clone());
-                        }
+                RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                    if !pending.is_empty() {
+                        let mut state = self.state.lock().await;
+                        state.record_items(pending.iter().copied(), turn_context.truncation_policy);
+                        pending.clear();
                     }
-                    state.set_context_overlay(crate::state::ContextOverlay {
-                        replacements_by_rid,
-                        notes: overlay.notes.clone(),
-                    });
+
+                    let next_history = {
+                        let state = self.state.lock().await;
+                        let mut history = state.clone_history();
+                        history.drop_last_n_user_turns(rollback.num_turns);
+                        history.raw_items().to_vec()
+                    };
+                    self.replace_history(next_history).await;
                 }
                 RolloutItem::ContextInclusion(inclusion) => {
-                    // Apply deletions first.
-                    if !inclusion.deleted_ids.is_empty() || !inclusion.deleted_indices.is_empty() {
-                        let snapshot_rids = state.history_rids_snapshot();
-                        let mut rid_lookup: HashMap<u64, usize> = HashMap::new();
-                        for (idx, rid) in snapshot_rids.iter().copied().enumerate() {
-                            rid_lookup.insert(rid, idx);
-                        }
-
-                        let mut indices: Vec<usize> = Vec::new();
-                        if !inclusion.deleted_ids.is_empty() {
-                            for raw in &inclusion.deleted_ids {
-                                if let Some(rid) = parse_rid(raw)
-                                    && let Some(idx) = rid_lookup.get(&rid).copied()
-                                {
-                                    indices.push(idx);
-                                }
-                            }
-                        } else {
-                            indices.extend(inclusion.deleted_indices.iter().copied());
-                        }
-
-                        indices.sort_unstable();
-                        indices.dedup();
-                        if !indices.is_empty() {
-                            state.prune_by_indices(indices);
-                        }
+                    if !pending.is_empty() {
+                        let mut state = self.state.lock().await;
+                        state.record_items(pending.iter().copied(), turn_context.truncation_policy);
+                        pending.clear();
                     }
-
-                    // Apply include mask snapshot.
-                    if !inclusion.included_ids.is_empty() {
-                        let snapshot_rids = state.history_rids_snapshot();
-                        let mut rid_lookup: HashMap<u64, usize> = HashMap::new();
-                        for (idx, rid) in snapshot_rids.iter().copied().enumerate() {
-                            rid_lookup.insert(rid, idx);
-                        }
-
-                        let mut included: BTreeSet<usize> = BTreeSet::new();
-                        for raw in &inclusion.included_ids {
-                            if let Some(rid) = parse_rid(raw)
-                                && let Some(idx) = rid_lookup.get(&rid).copied()
-                            {
-                                included.insert(idx);
-                            }
-                        }
-                        state.set_include_mask(Some(included));
-                    } else if !inclusion.included_indices.is_empty() {
-                        state.set_include_mask(Some(
-                            inclusion.included_indices.iter().copied().collect(),
-                        ));
+                    let mut state = self.state.lock().await;
+                    apply_context_inclusion(&mut state, inclusion);
+                }
+                RolloutItem::ContextOverlay(overlay) => {
+                    if !pending.is_empty() {
+                        let mut state = self.state.lock().await;
+                        state.record_items(pending.iter().copied(), turn_context.truncation_policy);
+                        pending.clear();
                     }
+                    let mut state = self.state.lock().await;
+                    apply_context_overlay(&mut state, overlay);
                 }
                 _ => {}
             }
+        }
+
+        if !pending.is_empty() {
+            let mut state = self.state.lock().await;
+            state.record_items(pending.iter().copied(), turn_context.truncation_policy);
         }
     }
 
@@ -4935,7 +4967,8 @@ fn maybe_inject_tool_output_call_id(call_id: &str, content: &mut String) {
         return;
     }
 
-    *content = format!("call_id: {call_id}\n{content}");
+    let prev = std::mem::take(content);
+    *content = format!("call_id: {call_id}\n{prev}");
 }
 
 async fn drain_in_flight(
@@ -5561,6 +5594,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resumed_history_preserves_items_after_manage_context_snapshot() {
+        use codex_protocol::protocol::ContextInclusionItem;
+
+        let (session, _turn_context) = make_session_and_context().await;
+
+        let user_1 = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "USER_1".to_string(),
+            }],
+            end_turn: None,
+        };
+        let assistant_1 = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "ASSISTANT_1".to_string(),
+            }],
+            end_turn: None,
+        };
+        let user_2 = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "USER_2".to_string(),
+            }],
+            end_turn: None,
+        };
+        let assistant_2 = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "ASSISTANT_2".to_string(),
+            }],
+            end_turn: None,
+        };
+
+        let rollout_items = vec![
+            RolloutItem::ResponseItem(user_1),
+            RolloutItem::ResponseItem(assistant_1),
+            RolloutItem::ContextInclusion(ContextInclusionItem {
+                included_indices: vec![0, 1],
+                deleted_indices: Vec::new(),
+                included_ids: vec![crate::rid::rid_to_string(0), crate::rid::rid_to_string(1)],
+                deleted_ids: Vec::new(),
+            }),
+            RolloutItem::ResponseItem(user_2),
+            RolloutItem::ResponseItem(assistant_2),
+        ];
+
+        session
+            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+                conversation_id: ThreadId::default(),
+                history: rollout_items,
+                rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+            }))
+            .await;
+
+        let prompt = session.state.lock().await.prompt_snapshot_lenient();
+        let user_texts: Vec<String> = prompt
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::Message { role, content, .. } if role == "user" => {
+                    crate::compact::content_items_to_text(content)
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            user_texts.iter().any(|text| text == "USER_2"),
+            "expected resumed prompt to include items recorded after manage_context snapshots, got: {user_texts:?}",
+        );
+    }
+
+    #[tokio::test]
     async fn resumed_history_seeds_initial_context_on_first_turn_only() {
         let (session, turn_context) = make_session_and_context().await;
         let (rollout_items, mut expected) = sample_rollout(&session, &turn_context).await;
@@ -5919,6 +6029,7 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "user 1".to_string(),
                 }],
+                end_turn: None,
             },
             ResponseItem::Reasoning {
                 id: String::new(),
@@ -5942,6 +6053,7 @@ mod tests {
                 content: vec![ContentItem::OutputText {
                     text: "assistant 1".to_string(),
                 }],
+                end_turn: None,
             },
             ResponseItem::Message {
                 id: None,
@@ -5949,6 +6061,7 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "user 2".to_string(),
                 }],
+                end_turn: None,
             },
             ResponseItem::Reasoning {
                 id: String::new(),
