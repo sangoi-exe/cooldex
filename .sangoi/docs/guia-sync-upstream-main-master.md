@@ -8,7 +8,7 @@ Este é o **procedimento padrão** pra eu executar sempre que tu pedir pra:
 
 ## Defaults (fixos)
 
-- `main` é espelho: **`reset --hard upstream/main`**.
+- `main` é espelho: **ponteiro forçado pra `upstream/main`**.
 - `master` recebe upstream via **merge**: **`git merge main`** (sem reescrever histórico).
 - WIP: **branch WIP + commit** (sem stash; sem revert/delete).
 - Push: **`origin/main` e `origin/master`**.
@@ -69,21 +69,7 @@ git switch master
 
 ```bash
 git fetch --all --prune
-git switch main
-git status --porcelain=v1
-```
-
-Se `main` não estiver limpa, para e salva o que existir ali **numa WIP** (isso não deveria acontecer num branch espelho):
-
-```bash
-git switch -c "wip/main-${stamp}"
-git add -u
-# Se tiver arquivo novo (??), adiciona explicitamente:
-# git add path/to/file
-git commit -m "WIP (main): ${stamp}"
-git switch main
-
-git reset --hard upstream/main
+git branch -f main upstream/main
 git rev-parse main upstream/main
 ```
 
@@ -142,8 +128,7 @@ Tu sempre tem os `backup/*` gerados na etapa 0.
 Exemplos (destrutivo; usa só se tu entende o impacto):
 
 ```bash
-git switch main
-git reset --hard "backup/main-before-upstream-sync-${stamp}"
+git branch -f main "backup/main-before-upstream-sync-${stamp}"
 
 git switch master
 git reset --hard "backup/master-before-upstream-sync-${stamp}"
@@ -152,4 +137,4 @@ git reset --hard "backup/master-before-upstream-sync-${stamp}"
 ## Observações
 
 - `git clean` é proibido nesse workflow (é assim que se perde coisa sem querer).
-- `main` não é lugar de trabalho; qualquer commit “tua mão” ali vira problema — por isso o reset + `--force-with-lease`.
+- `main` não é lugar de trabalho; qualquer commit “tua mão” ali vira problema — por isso o `git branch -f` + `--force-with-lease`.
