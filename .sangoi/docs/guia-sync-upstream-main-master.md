@@ -79,6 +79,8 @@ Push do espelho pro teu fork:
 git push --force-with-lease origin main
 ```
 
+Se isso falhar por proteção de branch em `origin/main`, não tem milagre: ou tu libera force‑push nessa branch, ou tu aceita que `origin/main` não vai ser espelho (e daí pula esse push).
+
 ### 3) Trazer `main` pra `master` (merge, sem reescrever histórico)
 
 ```bash
