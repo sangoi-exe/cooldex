@@ -25,7 +25,8 @@ Ter **um único guia** (curto, previsível e “fail loud”) pra eu executar se
   - [ ] **rebase** (histórico linear; exige `push --force-with-lease`).
 - [ ] `main` deve ser atualizada via:
   - [ ] **ff-only** (recomendado; falha alto se divergir), ou
-  - [x] **reset --hard** (força igualdade com upstream; destrutivo se alguém commitou em `main`).
+  - [x] **reset --hard** (força igualdade com upstream; destrutivo se alguém commitou em `main`).  
+        Implementação recomendada: `git branch -f main upstream/main` (não precisa dar checkout na `main`).
 - [x] Push em `origin/main` e `origin/master`.
 - [ ] Como tu prefere salvar WIP quando a working tree não está limpa:
   - [x] **branch WIP + commit** (recomendado).
@@ -42,7 +43,7 @@ Ter **um único guia** (curto, previsível e “fail loud”) pra eu executar se
 - [ ] “Checagens fail loud” (ex.: `rev-parse`, `merge-base`, `rev-list --count`).
 - [ ] Como resolver conflitos (merge/rebase) e como abortar.
 - [ ] Rollback (via `backup/*` e/ou `git reflog`).
-- [ ] Cleanup opcional (apagar `backup/*` e/ou dropar stash quando tudo estiver ok).
+- [ ] Cleanup opcional (apagar `backup/*` e/ou branches `wip/*` quando tudo estiver ok).
 
 ### 4) Verificar o guia (sem executar o sync)
 
