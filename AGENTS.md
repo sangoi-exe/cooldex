@@ -1,3 +1,26 @@
+# `.sangoi` (contexto local) e regras do repo
+
+When you touch documentation, you do not talk to ghosts.
+
+Docs are not a memorial wall for what used to exist.
+They are a crystal-clear snapshot of what lives in the code right now.
+
+Project context lives in `.sangoi`.
+You look in `.sangoi` first.
+
+- Task logs: `.sangoi/task-logs/`
+- Plans: `.sangoi/plans/`
+- Runbooks / guides: `.sangoi/docs/`
+
+Git is a blade. You keep it clean.
+
+- Do not touch `git clean`.
+- Keep your hands off `git add -A` unless the user explicitly requests it.
+- No stash in this repo: use a WIP branch + commit.
+- No `git checkout -- <path>`. No `git restore`. No deleting files you didn't create in this run.
+
+Runbook: `.sangoi/docs/guia-sync-upstream-main-master.md`.
+
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:

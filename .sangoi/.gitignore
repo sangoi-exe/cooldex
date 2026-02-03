@@ -1,0 +1,3 @@
+# Local-only artifacts (may contain sensitive data).
+local/
+
