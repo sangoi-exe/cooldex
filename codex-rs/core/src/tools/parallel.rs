@@ -8,12 +8,14 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 use tracing::instrument;
 use tracing::trace_span;
+use tracing::warn;
 
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::error::CodexErr;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolRouter;
@@ -72,22 +74,47 @@ impl ToolCallRuntime {
         let handle: AbortOnDropHandle<Result<ResponseInputItem, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(async move {
                 tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        let secs = started.elapsed().as_secs_f32().max(0.1);
-                        dispatch_span.record("aborted", true);
-                        Ok(Self::aborted_response(&call, secs))
-                    },
-                    res = async {
-                        let _guard = if supports_parallel {
-                            Either::Left(lock.read().await)
-                        } else {
-                            Either::Right(lock.write().await)
-                        };
+                        _ = cancellation_token.cancelled() => {
+                            let secs = started.elapsed().as_secs_f32().max(0.1);
+                            dispatch_span.record("aborted", true);
+                            Ok(Self::aborted_response(&call, secs))
+                        },
+                            res = async {
+                                let is_mutating = if supports_parallel {
+                                    match router.handler(call.tool_name.as_str()) {
+                                        Some(handler) => {
+                                            let invocation = ToolInvocation::new(
+                                                Arc::clone(&session),
+                                                Arc::clone(&turn),
+                                                Arc::clone(&tracker),
+                                                call.call_id.clone(),
+                                                call.tool_name.clone(),
+                                                call.payload.clone(),
+                                            );
+                                            handler.is_mutating(&invocation).await
+                                        }
+                                        None => {
+                                            warn!(
+                                                tool_name = call.tool_name.as_str(),
+                                                "Missing tool handler; treating tool call as mutating"
+                                            );
+                                            true
+                                        }
+                                    }
+                                } else {
+                                    true
+                                };
 
-                        router
-                            .dispatch_tool_call(session, turn, tracker, call.clone())
-                            .instrument(dispatch_span.clone())
-                            .await
+                            let _guard = if supports_parallel && !is_mutating {
+                                Either::Left(lock.read().await)
+                            } else {
+                                Either::Right(lock.write().await)
+                            };
+
+                            router
+                                .dispatch_tool_call(session, turn, tracker, call.clone())
+                                .instrument(dispatch_span.clone())
+                                .await
                     } => res,
                 }
             }));

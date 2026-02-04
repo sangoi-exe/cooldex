@@ -26,6 +26,26 @@ pub struct ToolInvocation {
     pub payload: ToolPayload,
 }
 
+impl ToolInvocation {
+    pub fn new(
+        session: Arc<Session>,
+        turn: Arc<TurnContext>,
+        tracker: SharedTurnDiffTracker,
+        call_id: String,
+        tool_name: String,
+        payload: ToolPayload,
+    ) -> Self {
+        Self {
+            session,
+            turn,
+            tracker,
+            call_id,
+            tool_name,
+            payload,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ToolPayload {
     Function {

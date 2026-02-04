@@ -175,8 +175,27 @@ impl UnifiedExecProcessManager {
 
         let text = String::from_utf8_lossy(&collected).to_string();
         let output = formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens));
-        let exit_code = process.exit_code();
-        let has_exited = process.has_exited() || exit_code.is_some();
+        let (exit_code, has_exited) = {
+            let mut exit_code = process.exit_code();
+            let mut has_exited = process.has_exited() || exit_code.is_some();
+
+            // Avoid flakiness when a short-lived process exits right around the
+            // yield deadline but the async wait task hasn't published the exit
+            // status yet. A few cooperative yields are cheap and make exit
+            // metadata deterministic under load.
+            if !has_exited {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                    exit_code = process.exit_code();
+                    has_exited = process.has_exited() || exit_code.is_some();
+                    if has_exited {
+                        break;
+                    }
+                }
+            }
+
+            (exit_code, has_exited)
+        };
         let chunk_id = generate_chunk_id();
         let process_id = request.process_id.clone();
         if has_exited {

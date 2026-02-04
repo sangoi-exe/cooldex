@@ -7,6 +7,7 @@ use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ConfiguredToolSpec;
+use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::spec::ToolsConfig;
 use crate::tools::spec::build_specs;
@@ -57,6 +58,10 @@ impl ToolRouter {
             .iter()
             .filter(|config| config.supports_parallel_tool_calls)
             .any(|config| config.spec.name() == tool_name)
+    }
+
+    pub(crate) fn handler(&self, tool_name: &str) -> Option<Arc<dyn ToolHandler>> {
+        self.registry.handler(tool_name)
     }
 
     #[instrument(level = "trace", skip_all, err)]
@@ -147,14 +152,7 @@ impl ToolRouter {
         let payload_outputs_custom = matches!(payload, ToolPayload::Custom { .. });
         let failure_call_id = call_id.clone();
 
-        let invocation = ToolInvocation {
-            session,
-            turn,
-            tracker,
-            call_id,
-            tool_name,
-            payload,
-        };
+        let invocation = ToolInvocation::new(session, turn, tracker, call_id, tool_name, payload);
 
         match self.registry.dispatch(invocation).await {
             Ok(response) => Ok(response),
