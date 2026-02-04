@@ -56,3 +56,22 @@ Log written (UTC-3): 2026-02-04T14:27:17-03:00
 - Pushed + verified:
   - `git push origin master`
   - `git ls-remote origin refs/heads/master` == `git rev-parse HEAD`
+
+## Follow-up (2026-02-04): full workspace tests + sandbox hardening
+
+After the initial sync push, we ran the full workspace suite in this sandboxed environment
+and fixed a few environment-sensitive tests so they only run when prerequisites exist.
+
+### Additional commits on `master`
+
+- `139b62199` test(app-server): tolerate call_id-prefixed tool output
+- `d52dbe6b5` test(core): keep temp cwd alive for user shell interrupt
+- `1f50df9c7` test(exec): skip python semaphore test when /dev/shm unwritable
+- `6d0b8caa0` test(exec-server): skip dotslash-dependent tests when missing
+- `5f1abf110` test(linux-sandbox): relax timeout for NoNewPrivs check
+- `5b2d18c9d` test(utils-pty): skip PTY tests when unsupported
+
+### Validation (post-follow-up)
+
+- `cd codex-rs && cargo test --all-features -- --quiet`
+- `cd codex-rs && cargo test -p codex-core --all-features suite::auth_refresh::unauthorized_recovery_skips_reload_on_account_mismatch -- --nocapture`
