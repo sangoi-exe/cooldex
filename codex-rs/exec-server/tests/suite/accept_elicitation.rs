@@ -34,6 +34,15 @@ const USE_LOGIN_SHELL: bool = false;
 /// command should be run privileged outside the sandbox.
 #[tokio::test(flavor = "current_thread")]
 async fn accept_elicitation_for_prompt_rule() -> Result<()> {
+    if std::process::Command::new("dotslash")
+        .arg("--version")
+        .status()
+        .is_err()
+    {
+        eprintln!("dotslash not found in PATH, skipping test.");
+        return Ok(());
+    }
+
     // Configure a stdio transport that will launch the MCP server using
     // $CODEX_HOME with an execpolicy that prompts for `git init` commands.
     let codex_home = TempDir::new()?;

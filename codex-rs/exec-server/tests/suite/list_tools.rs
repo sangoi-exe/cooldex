@@ -15,6 +15,15 @@ use tempfile::TempDir;
 /// Verify the list_tools call to the MCP server returns the expected response.
 #[tokio::test(flavor = "current_thread")]
 async fn list_tools() -> Result<()> {
+    if std::process::Command::new("dotslash")
+        .arg("--version")
+        .status()
+        .is_err()
+    {
+        eprintln!("dotslash not found in PATH, skipping test.");
+        return Ok(());
+    }
+
     let codex_home = TempDir::new()?;
     let policy_dir = codex_home.path().join("rules");
     fs::create_dir_all(&policy_dir)?;
