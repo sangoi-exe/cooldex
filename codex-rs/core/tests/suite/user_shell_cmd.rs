@@ -25,6 +25,7 @@ use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use regex_lite::escape;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::time::Duration;
 use tokio::time::timeout;
@@ -99,11 +100,11 @@ async fn user_shell_cmd_can_be_interrupted() {
     // Set up isolated config and conversation.
     let server = start_mock_server().await;
     let mut builder = test_codex();
-    let codex = builder
+    let test = builder
         .build(&server)
         .await
-        .expect("create new conversation")
-        .codex;
+        .expect("create new conversation");
+    let codex = Arc::clone(&test.codex);
 
     // Start a long-running command and then interrupt it.
     let sleep_cmd = "sleep 5".to_string();
