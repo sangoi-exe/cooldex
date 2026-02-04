@@ -599,7 +599,7 @@ LIMIT ?
             return Ok(());
         }
         let thread_id = thread_id.to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.as_ref().begin().await?;
         for (idx, tool) in tools.iter().enumerate() {
             let position = i64::try_from(idx).unwrap_or(i64::MAX);
             let input_schema = serde_json::to_string(&tool.input_schema)?;
