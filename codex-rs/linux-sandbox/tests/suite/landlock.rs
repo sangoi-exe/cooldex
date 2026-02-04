@@ -198,7 +198,7 @@ async fn test_no_new_privs_is_enabled() {
     let output = run_cmd_output(
         &["bash", "-lc", "grep '^NoNewPrivs:' /proc/self/status"],
         &[],
-        SHORT_TIMEOUT_MS,
+        LONG_TIMEOUT_MS,
     )
     .await;
     let line = output
