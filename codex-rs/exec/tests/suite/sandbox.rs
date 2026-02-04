@@ -120,6 +120,11 @@ async fn python_multiprocessing_lock_works_under_sandbox() {
     };
     #[cfg(not(target_os = "linux"))]
     let sandbox_env = HashMap::new();
+    #[cfg(target_os = "linux")]
+    if !dev_shm_is_writable() {
+        eprintln!("/dev/shm is not writable in this environment, skipping.");
+        return;
+    }
     #[cfg(target_os = "macos")]
     let writable_roots = Vec::<AbsolutePathBuf>::new();
 
@@ -170,6 +175,25 @@ if __name__ == '__main__':
 
     let status = child.wait().await.expect("should wait for child process");
     assert!(status.success(), "python exited with {status:?}");
+}
+
+#[cfg(target_os = "linux")]
+fn dev_shm_is_writable() -> bool {
+    use std::fs::OpenOptions;
+
+    let test_path =
+        Path::new("/dev/shm").join(format!("codex-sandbox-test-{}.tmp", std::process::id()));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&test_path);
+    match file {
+        Ok(_file) => {
+            let _ = std::fs::remove_file(&test_path);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 #[tokio::test]
