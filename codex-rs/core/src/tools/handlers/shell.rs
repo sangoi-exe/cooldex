@@ -145,7 +145,7 @@ impl ToolHandler for ShellHandler {
                     tracker,
                     call_id,
                     freeform_shell_output,
-                )
+                })
                 .await
             }
             ToolPayload::LocalShell { params } => {
@@ -160,7 +160,7 @@ impl ToolHandler for ShellHandler {
                     tracker,
                     call_id,
                     freeform_shell_output,
-                )
+                })
                 .await
             }
             _ => Err(FunctionCallError::RespondToModel(format!(

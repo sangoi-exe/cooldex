@@ -22,6 +22,8 @@ pub fn apply_rollout_item(
         RolloutItem::TurnContext(turn_ctx) => apply_turn_context(metadata, turn_ctx),
         RolloutItem::EventMsg(event) => apply_event_msg(metadata, event),
         RolloutItem::ResponseItem(item) => apply_response_item(metadata, item),
+        RolloutItem::ContextInclusion(_) => {}
+        RolloutItem::ContextOverlay(_) => {}
         RolloutItem::Compacted(_) => {}
     }
     if metadata.model_provider.is_empty() {

@@ -800,6 +800,8 @@ fn extract_dynamic_tools(items: &[RolloutItem]) -> Option<Option<Vec<DynamicTool
         RolloutItem::ResponseItem(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
+        | RolloutItem::ContextInclusion(_)
+        | RolloutItem::ContextOverlay(_)
         | RolloutItem::EventMsg(_) => None,
     })
 }

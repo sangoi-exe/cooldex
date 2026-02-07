@@ -14,9 +14,9 @@ use tokio::select;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
-use tracing::debug;
 use tracing::Instrument;
 use tracing::Span;
+use tracing::debug;
 use tracing::trace;
 use tracing::warn;
 

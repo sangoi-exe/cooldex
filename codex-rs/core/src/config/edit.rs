@@ -759,7 +759,8 @@ impl ConfigEditsBuilder {
     }
 
     pub fn set_personality(mut self, personality: Option<Personality>) -> Self {
-        self.edits.push(ConfigEdit::SetModelPersonality { personality });
+        self.edits
+            .push(ConfigEdit::SetModelPersonality { personality });
         self
     }
 
