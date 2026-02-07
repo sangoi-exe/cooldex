@@ -548,7 +548,7 @@ fn create_wait_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "wait".to_string(),
-        description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out."
+        description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns the latest status for every requested agent; `timed_out` is true when none of the requested agents are in a final status when the tool returns."
             .to_string(),
         strict: false,
         parameters: JsonSchema::Object {

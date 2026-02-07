@@ -246,6 +246,10 @@ pub struct Config {
     /// Base instructions override.
     pub base_instructions: Option<String>,
 
+    /// Base instructions override for sub-agent threads spawned via the collab
+    /// `spawn_agent` tool.
+    pub subagent_base_instructions: Option<String>,
+
     /// Developer instructions override injected as a separate message.
     pub developer_instructions: Option<String>,
 
@@ -950,6 +954,13 @@ pub struct ConfigToml {
     /// DISCOURAGED from using this field, as deviating from the instructions
     /// sanctioned by Codex will likely degrade model performance.
     pub model_instructions_file: Option<AbsolutePathBuf>,
+
+    /// Optional path to a file containing model instructions for sub-agent
+    /// threads spawned via the collab `spawn_agent` tool. When set, Codex will
+    /// use these base instructions for the spawned sub-agent instead of the
+    /// parent session base instructions. This is useful for keeping sub-agents
+    /// focused and avoiding prompt bloat.
+    pub subagent_instructions_file: Option<AbsolutePathBuf>,
 
     /// Compact prompt used for history compaction.
     pub compact_prompt: Option<String>,
@@ -1656,6 +1667,17 @@ impl Config {
         let file_base_instructions =
             Self::try_read_non_empty_file(model_instructions_path, "model instructions file")?;
         let base_instructions = base_instructions.or(file_base_instructions);
+
+        // Load sub-agent base instructions override from a file if specified.
+        let subagent_instructions_path = config_profile
+            .subagent_instructions_file
+            .as_ref()
+            .or(cfg.subagent_instructions_file.as_ref());
+        let subagent_base_instructions = Self::try_read_non_empty_file(
+            subagent_instructions_path,
+            "sub-agent instructions file",
+        )?;
+
         let developer_instructions = developer_instructions.or(cfg.developer_instructions);
         let personality = personality
             .or(config_profile.personality)
@@ -1734,6 +1756,7 @@ impl Config {
             notify: cfg.notify,
             user_instructions,
             base_instructions,
+            subagent_base_instructions,
             personality,
             developer_instructions,
             compact_prompt,
@@ -4049,6 +4072,7 @@ model_verbosity = "high"
                 personality: Some(Personality::Pragmatic),
                 chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
                 base_instructions: None,
+                subagent_base_instructions: None,
                 developer_instructions: None,
                 compact_prompt: None,
                 forced_chatgpt_workspace_id: None,
@@ -4137,6 +4161,7 @@ model_verbosity = "high"
             personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            subagent_base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,
@@ -4240,6 +4265,7 @@ model_verbosity = "high"
             personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            subagent_base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,
@@ -4329,6 +4355,7 @@ model_verbosity = "high"
             personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            subagent_base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,

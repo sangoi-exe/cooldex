@@ -282,7 +282,6 @@ mod send_input {
 mod wait {
     use super::*;
     use crate::agent::status::is_final;
-    use futures::FutureExt;
     use futures::StreamExt;
     use futures::stream::FuturesUnordered;
     use std::collections::HashMap;
@@ -349,22 +348,19 @@ mod wait {
             .await;
 
         let mut status_rxs = Vec::with_capacity(receiver_thread_ids.len());
-        let mut initial_final_statuses = Vec::new();
+        let mut has_initial_final_status = false;
         for id in &receiver_thread_ids {
             match session.services.agent_control.subscribe_status(*id).await {
                 Ok(rx) => {
                     let status = rx.borrow().clone();
-                    if is_final(&status) {
-                        initial_final_statuses.push((*id, status));
-                    }
+                    has_initial_final_status |= is_final(&status);
                     status_rxs.push((*id, rx));
                 }
                 Err(CodexErr::ThreadNotFound(_)) => {
-                    initial_final_statuses.push((*id, AgentStatus::NotFound));
+                    has_initial_final_status = true;
                 }
                 Err(err) => {
-                    let mut statuses = HashMap::with_capacity(1);
-                    statuses.insert(*id, session.services.agent_control.get_status(*id).await);
+                    let statuses = collect_latest_statuses(&session, &receiver_thread_ids).await;
                     session
                         .send_event(
                             &turn,
@@ -381,45 +377,28 @@ mod wait {
             }
         }
 
-        let statuses = if !initial_final_statuses.is_empty() {
-            initial_final_statuses
-        } else {
+        if !has_initial_final_status {
             // Wait for the first agent to reach a final status.
             let mut futures = FuturesUnordered::new();
             for (id, rx) in status_rxs.into_iter() {
-                let session = session.clone();
-                futures.push(wait_for_final_status(session, id, rx));
+                futures.push(wait_for_final_status(Arc::clone(&session), id, rx));
             }
-            let mut results = Vec::new();
+
             let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
             loop {
                 match timeout_at(deadline, futures.next()).await {
-                    Ok(Some(Some(result))) => {
-                        results.push(result);
-                        break;
-                    }
+                    Ok(Some(Some(_result))) => break,
                     Ok(Some(None)) => continue,
                     Ok(None) | Err(_) => break,
                 }
             }
-            if !results.is_empty() {
-                // Drain the unlikely last elements to prevent race.
-                loop {
-                    match futures.next().now_or_never() {
-                        Some(Some(Some(result))) => results.push(result),
-                        Some(Some(None)) => continue,
-                        Some(None) | None => break,
-                    }
-                }
-            }
-            results
-        };
+        }
 
-        // Convert payload.
-        let statuses_map = statuses.clone().into_iter().collect::<HashMap<_, _>>();
+        let statuses_map = collect_latest_statuses(&session, &receiver_thread_ids).await;
+        let timed_out = statuses_map.values().all(|status| !is_final(status));
         let result = WaitResult {
             status: statuses_map.clone(),
-            timed_out: statuses.is_empty(),
+            timed_out,
         };
 
         // Final event emission.
@@ -443,6 +422,17 @@ mod wait {
             body: FunctionCallOutputBody::Text(content),
             success: None,
         })
+    }
+
+    async fn collect_latest_statuses(
+        session: &Session,
+        receiver_thread_ids: &[ThreadId],
+    ) -> HashMap<ThreadId, AgentStatus> {
+        let mut statuses = HashMap::with_capacity(receiver_thread_ids.len());
+        for id in receiver_thread_ids {
+            statuses.insert(*id, session.services.agent_control.get_status(*id).await);
+        }
+        statuses
     }
 
     async fn wait_for_final_status(
@@ -592,12 +582,28 @@ fn build_agent_spawn_config(
 ) -> Result<Config, FunctionCallError> {
     let base_config = turn.config.clone();
     let mut config = (*base_config).clone();
-    config.base_instructions = Some(base_instructions.text.clone());
+
+    let subagent_instructions = config.subagent_base_instructions.clone();
+    let using_subagent_instructions = subagent_instructions.is_some();
+    config.base_instructions =
+        Some(subagent_instructions.unwrap_or_else(|| base_instructions.text.clone()));
     config.model = Some(turn.model_info.slug.clone());
     config.model_provider = turn.provider.clone();
     config.model_reasoning_effort = turn.reasoning_effort;
     config.model_reasoning_summary = turn.reasoning_summary;
-    config.developer_instructions = turn.developer_instructions.clone();
+
+    // When a dedicated sub-agent prompt is configured, keep the spawned agent focused:
+    // avoid inheriting developer/project docs instructions which can bloat the prompt and
+    // distract from the delegated task.
+    if using_subagent_instructions {
+        config.developer_instructions = None;
+        config.user_instructions = None;
+        config.project_doc_max_bytes = 0;
+        config.features.disable(Feature::Skills);
+        config.features.disable(Feature::ChildAgentsMd);
+    } else {
+        config.developer_instructions = turn.developer_instructions.clone();
+    }
     config.compact_prompt = turn.compact_prompt.clone();
     config.shell_environment_policy = turn.shell_environment_policy.clone();
     config.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
@@ -632,6 +638,7 @@ mod tests {
     use crate::built_in_model_providers;
     use crate::codex::make_session_and_context;
     use crate::config::types::ShellEnvironmentPolicy;
+    use crate::features::Feature;
     use crate::function_tool::FunctionCallError;
     use crate::protocol::AskForApproval;
     use crate::protocol::Op;
@@ -1023,7 +1030,7 @@ mod tests {
         assert_eq!(
             result,
             WaitResult {
-                status: HashMap::new(),
+                status: HashMap::from([(agent_id, AgentStatus::PendingInit)]),
                 timed_out: true
             }
         );
@@ -1121,6 +1128,81 @@ mod tests {
             }
         );
         assert_eq!(success, None);
+    }
+
+    #[tokio::test]
+    async fn wait_returns_latest_status_for_every_requested_agent() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.client.config().as_ref().clone();
+
+        let thread_a = manager
+            .start_thread(config.clone())
+            .await
+            .expect("start thread");
+        let agent_a = thread_a.thread_id;
+        let mut status_rx = manager
+            .agent_control()
+            .subscribe_status(agent_a)
+            .await
+            .expect("subscribe should succeed");
+
+        let thread_b = manager.start_thread(config).await.expect("start thread");
+        let agent_b = thread_b.thread_id;
+
+        let _ = thread_a
+            .thread
+            .submit(Op::Shutdown)
+            .await
+            .expect("shutdown should submit");
+        let _ = timeout(Duration::from_secs(1), async {
+            loop {
+                if status_rx.borrow().clone() == AgentStatus::Shutdown {
+                    break;
+                }
+                status_rx.changed().await.expect("status should update");
+            }
+        })
+        .await
+        .expect("shutdown status should arrive");
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait",
+            function_payload(json!({
+                "ids": [agent_a.to_string(), agent_b.to_string()],
+                "timeout_ms": 1000
+            })),
+        );
+        let output = CollabHandler
+            .handle(invocation)
+            .await
+            .expect("wait should succeed");
+        let ToolOutput::Function {
+            content, success, ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: WaitResult =
+            serde_json::from_str(&content).expect("wait result should be json");
+        assert_eq!(result.timed_out, false);
+        assert_eq!(result.status.len(), 2);
+        assert_eq!(result.status.get(&agent_a), Some(&AgentStatus::Shutdown));
+        let status_b = result
+            .status
+            .get(&agent_b)
+            .expect("wait result should include every requested agent id");
+        assert!(!status_b.is_final());
+        assert_eq!(success, None);
+
+        let _ = thread_b
+            .thread
+            .submit(Op::Shutdown)
+            .await
+            .expect("shutdown should submit");
     }
 
     #[tokio::test]
@@ -1258,5 +1340,43 @@ mod tests {
         let config = build_agent_spawn_config(&base_instructions, &turn, 0).expect("spawn config");
 
         assert_eq!(config.user_instructions, base_config.user_instructions);
+    }
+
+    #[tokio::test]
+    async fn build_agent_spawn_config_uses_subagent_instructions_and_strips_bloat() {
+        let (session, mut turn) = make_session_and_context().await;
+        let session_source = turn.client.get_session_source();
+        let mut base_config = (*turn.client.config()).clone();
+        base_config.subagent_base_instructions = Some("subagent-base".to_string());
+        base_config.user_instructions = Some("base-user".to_string());
+        base_config.project_doc_max_bytes = 4096;
+        turn.developer_instructions = Some("dev".to_string());
+        turn.user_instructions = Some("resolved-user".to_string());
+
+        let transport_manager = turn.client.transport_manager();
+        turn.client = ModelClient::new(
+            Arc::new(base_config.clone()),
+            Some(session.services.auth_manager.clone()),
+            turn.client.get_model_info(),
+            turn.client.get_otel_manager(),
+            turn.client.get_provider(),
+            turn.client.get_reasoning_effort(),
+            turn.client.get_reasoning_summary(),
+            session.conversation_id,
+            session_source,
+            transport_manager,
+        );
+
+        let base_instructions = BaseInstructions {
+            text: "parent-base".to_string(),
+        };
+        let config = build_agent_spawn_config(&base_instructions, &turn, 0).expect("spawn config");
+
+        assert_eq!(config.base_instructions.as_deref(), Some("subagent-base"));
+        assert_eq!(config.developer_instructions, None);
+        assert_eq!(config.user_instructions, None);
+        assert_eq!(config.project_doc_max_bytes, 0);
+        assert_eq!(config.features.enabled(Feature::Skills), false);
+        assert_eq!(config.features.enabled(Feature::ChildAgentsMd), false);
     }
 }

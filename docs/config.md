@@ -24,6 +24,10 @@ Codex can run a notification hook when the agent finishes a turn. See the config
 
 - https://developers.openai.com/codex/config-reference
 
+## Sub-agents
+
+To use a dedicated base prompt for collab-spawned sub-agents (the `spawn_agent` tool), set `subagent_instructions_file` in `~/.codex/config.toml` (or under a profile). When set, spawned sub-agents use that base prompt instead of inheriting the parent session base prompt, and Codex strips extra user/developer instructions to keep sub-agent prompts focused.
+
 ## JSON Schema
 
 The generated JSON Schema for `config.toml` lives at `codex-rs/core/config.schema.json`.

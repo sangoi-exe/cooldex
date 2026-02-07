@@ -970,6 +970,12 @@ pub enum AgentStatus {
     NotFound,
 }
 
+impl AgentStatus {
+    pub fn is_final(&self) -> bool {
+        !matches!(self, Self::PendingInit | Self::Running)
+    }
+}
+
 /// Codex errors that we expose to clients.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]

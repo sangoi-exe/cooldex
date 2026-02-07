@@ -77,9 +77,20 @@ pub(crate) fn waiting_end(ev: CollabWaitingEndEvent) -> PlainHistoryCell {
         sender_thread_id: _,
         statuses,
     } = ev;
+    let timed_out = statuses.values().all(|status| !status.is_final());
     let mut details = vec![detail_line("call", call_id)];
+    if timed_out {
+        details.push(detail_line("result", Span::from("timed out").yellow()));
+    }
     details.extend(wait_complete_lines(&statuses));
-    collab_event("Wait complete", details)
+    collab_event(
+        if timed_out {
+            "Wait timed out"
+        } else {
+            "Wait returned"
+        },
+        details,
+    )
 }
 
 pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
@@ -262,4 +273,72 @@ fn detail_line_spans(label: &str, mut value: Vec<Span<'static>>) -> Line<'static
     spans.push(Span::from(format!("{label}: ")).dim());
     spans.append(&mut value);
     spans.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history_cell::HistoryCell;
+    use pretty_assertions::assert_eq;
+
+    fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn waiting_end_marks_timeout_when_no_agent_is_final() {
+        let sender_thread_id =
+            ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap();
+        let running_id = ThreadId::from_string("3f76d2a0-943e-4f43-8a38-b289c9c6c3d1").unwrap();
+        let pending_id = ThreadId::from_string("c1dfd96e-1f0c-4f26-9b4f-1aa02c2d3c4d").unwrap();
+        let statuses = HashMap::from([
+            (running_id, AgentStatus::Running),
+            (pending_id, AgentStatus::PendingInit),
+        ]);
+        let cell = waiting_end(CollabWaitingEndEvent {
+            sender_thread_id,
+            call_id: "call-1".to_string(),
+            statuses,
+        });
+
+        let rendered = render_lines(&cell.display_lines(200));
+        assert_eq!(rendered[0], "• Wait timed out");
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("result: timed out"))
+        );
+        assert!(rendered.iter().any(|line| line.contains("running")));
+        assert!(rendered.iter().any(|line| line.contains("pending init")));
+    }
+
+    #[test]
+    fn waiting_end_reports_returned_when_any_agent_is_final() {
+        let sender_thread_id =
+            ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap();
+        let shutdown_id = ThreadId::from_string("3f76d2a0-943e-4f43-8a38-b289c9c6c3d1").unwrap();
+        let running_id = ThreadId::from_string("c1dfd96e-1f0c-4f26-9b4f-1aa02c2d3c4d").unwrap();
+        let statuses = HashMap::from([
+            (shutdown_id, AgentStatus::Shutdown),
+            (running_id, AgentStatus::Running),
+        ]);
+        let cell = waiting_end(CollabWaitingEndEvent {
+            sender_thread_id,
+            call_id: "call-1".to_string(),
+            statuses,
+        });
+
+        let rendered = render_lines(&cell.display_lines(200));
+        assert_eq!(rendered[0], "• Wait returned");
+        assert!(rendered.iter().any(|line| line.contains("shutdown")));
+        assert!(rendered.iter().any(|line| line.contains("running")));
+    }
 }

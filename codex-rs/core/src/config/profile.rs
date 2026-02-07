@@ -29,6 +29,9 @@ pub struct ConfigProfile {
     pub chatgpt_base_url: Option<String>,
     /// Optional path to a file containing model instructions.
     pub model_instructions_file: Option<AbsolutePathBuf>,
+    /// Optional path to a file containing model instructions for sub-agent
+    /// threads spawned via the collab `spawn_agent` tool.
+    pub subagent_instructions_file: Option<AbsolutePathBuf>,
     /// Deprecated: ignored. Use `model_instructions_file`.
     #[schemars(skip)]
     pub experimental_instructions_file: Option<AbsolutePathBuf>,

@@ -701,23 +701,25 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 call_id,
                 statuses,
             }) => {
-                if statuses.is_empty() {
+                let timed_out = statuses.values().all(|status| !status.is_final());
+                if timed_out {
                     ts_msg!(
                         self,
                         "{} {}:",
                         format_collab_invocation("wait", &call_id, None),
                         "timed out".style(self.yellow)
                     );
-                    return CodexStatus::Running;
+                } else {
+                    let success = !statuses.values().any(is_collab_status_failure);
+                    let title_style = if success { self.green } else { self.red };
+                    let invocation = format_collab_invocation("wait", &call_id, None);
+                    let agents = statuses.len();
+                    let title = format!(
+                        "{invocation} {agents} agent{}:",
+                        if agents == 1 { "" } else { "s" }
+                    );
+                    ts_msg!(self, "{}", title.style(title_style));
                 }
-                let success = !statuses.values().any(is_collab_status_failure);
-                let title_style = if success { self.green } else { self.red };
-                let title = format!(
-                    "{} {} agents complete:",
-                    format_collab_invocation("wait", &call_id, None),
-                    statuses.len()
-                );
-                ts_msg!(self, "{}", title.style(title_style));
                 let mut sorted = statuses
                     .into_iter()
                     .map(|(thread_id, status)| (thread_id.to_string(), status))

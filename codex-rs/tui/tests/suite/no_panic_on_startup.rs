@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::select;
 use tokio::time::timeout;
@@ -56,7 +57,7 @@ async fn run_codex_cli(
     codex_home: impl AsRef<Path>,
     cwd: impl AsRef<Path>,
 ) -> anyhow::Result<CodexCliOutput> {
-    let codex_cli = codex_utils_cargo_bin::cargo_bin("codex")?;
+    let codex_cli = ensure_codex_cli_binary()?;
     let mut env = HashMap::new();
     env.insert(
         "CODEX_HOME".to_string(),
@@ -116,4 +117,40 @@ async fn run_codex_cli(
         exit_code,
         output: output.to_string(),
     })
+}
+
+fn ensure_codex_cli_binary() -> anyhow::Result<PathBuf> {
+    if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codex") {
+        return Ok(path);
+    }
+
+    // Under Bazel, `cargo_bin()` should succeed via runfiles. If it doesn't,
+    // bail rather than attempting to build inside the Bazel sandbox.
+    if codex_utils_cargo_bin::runfiles_available() {
+        anyhow::bail!("could not locate codex CLI binary via runfiles");
+    }
+
+    let codex_rs_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("CARGO_MANIFEST_DIR should be codex-rs/tui")
+        .to_path_buf();
+    let binary_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let binary_path = codex_rs_root.join("target").join("debug").join(binary_name);
+    if binary_path.exists() {
+        return Ok(binary_path);
+    }
+
+    let status = std::process::Command::new("cargo")
+        .current_dir(&codex_rs_root)
+        .args(["build", "-p", "codex-cli", "--bin", "codex"])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build codex CLI binary with cargo");
+    }
+
+    if !binary_path.exists() {
+        let display = binary_path.display();
+        anyhow::bail!("codex CLI binary not found at {display} after cargo build");
+    }
+    Ok(binary_path)
 }

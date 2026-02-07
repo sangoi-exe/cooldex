@@ -268,6 +268,14 @@
         "sandbox_mode": {
           "$ref": "#/definitions/SandboxMode"
         },
+        "subagent_instructions_file": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "description": "Optional path to a file containing model instructions for sub-agent threads spawned via the collab `spawn_agent` tool."
+        },
         "tools_view_image": {
           "type": "boolean"
         },
@@ -1489,6 +1497,14 @@
         }
       ],
       "description": "User-level skill config entries keyed by SKILL.md path."
+    },
+    "subagent_instructions_file": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      ],
+      "description": "Optional path to a file containing model instructions for sub-agent threads spawned via the collab `spawn_agent` tool. When set, Codex will use these base instructions for the spawned sub-agent instead of the parent session base instructions. This is useful for keeping sub-agents focused and avoiding prompt bloat."
     },
     "suppress_unstable_features_warning": {
       "description": "Suppress warnings about unstable (under development) features.",
