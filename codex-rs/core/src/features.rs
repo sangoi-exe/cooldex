@@ -111,6 +111,8 @@ pub enum Feature {
     Tui2,
     /// Enable discovery and injection of skills.
     Skills,
+    /// Spawn and coordinate background sub-agents.
+    MultiAgent,
     /// Enforce UTF8 output in Powershell.
     PowershellUtf8,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
@@ -504,12 +506,14 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Skills,
         key: "skills",
-        stage: Stage::Experimental {
-            name: "Skills",
-            menu_description: "Enable discovery and injection of skills.",
-            announcement: "NEW! Skills let Codex adapt to your workflows. Enable in /experimental!",
-        },
+        stage: Stage::Experimental,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::MultiAgent,
+        key: "multi_agent",
+        stage: Stage::Experimental,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::PowershellUtf8,

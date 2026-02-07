@@ -57,8 +57,7 @@ streamable_shell = true
 apply_patch_freeform = true
 unified_exec = true
 skills = true
-collab = true
-collaboration_modes = true
+multi_agent = true
 steer = true
 
 [sandbox_workspace_write]

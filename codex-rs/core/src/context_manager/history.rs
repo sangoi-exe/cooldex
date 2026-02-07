@@ -102,6 +102,10 @@ impl ContextManager {
         remove_ghost_snapshots_with_rids(self.items.clone(), self.rids.clone())
     }
 
+    pub(crate) fn get_history_for_prompt(&mut self) -> Vec<ResponseItem> {
+        self.get_history_for_prompt_with_rids().0
+    }
+
     pub(crate) fn get_history_for_prompt_lenient(&self) -> Vec<ResponseItem> {
         self.get_history_for_prompt_with_rids_lenient().0
     }

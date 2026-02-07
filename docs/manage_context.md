@@ -4,8 +4,9 @@ Long Codex sessions can accumulate large tool outputs and reasoning. When you st
 window, you have two options:
 
 - Use `/compact` to summarize the session and drop older details.
-- Use `/sanitize` to sanitize context (uses `manage_context` to reclaim space).
+- Use `/sanitize` to sanitize context (sub-agent that uses `manage_context` to reclaim space).
 - Use `/hygiene` to toggle automatic post-turn hygiene (deletes last-turn tool call/output history, updates `<tool_context>`, and consolidates reasoning into `<reasoning_context>`).
+- Use `agent_run` (experimental; enable `multi_agent`) to offload heavy work to a background sub-agent conversation and return only a compact JSON summary.
 - Use `manage_context` for targeted pruning: selectively include/exclude/delete history items, replace very large tool
   outputs/reasoning with a short distilled summary, and add pinned notes that should stay visible across turns.
 

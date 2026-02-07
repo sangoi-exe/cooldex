@@ -187,8 +187,10 @@ impl SessionState {
     }
 
     pub(crate) fn history_snapshot(&self) -> Vec<ResponseItem> {
-        self.history.get_history_for_prompt_lenient()
+        let mut history = self.history.clone();
+        history.get_history_for_prompt()
     }
+
     pub(crate) fn history_snapshot_lenient(&self) -> Vec<ResponseItem> {
         self.history.get_history_for_prompt_lenient()
     }

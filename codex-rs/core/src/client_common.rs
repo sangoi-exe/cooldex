@@ -20,6 +20,9 @@ pub const REVIEW_PROMPT: &str = include_str!("../review_prompt.md");
 /// Context sanitizer rubric. Edit `core/sanitize_prompt.md` to customize.
 pub const SANITIZE_PROMPT: &str = include_str!("../sanitize_prompt.md");
 
+/// Background agent rubric. Edit `core/agent_run_prompt.md` to customize.
+pub const AGENT_RUN_PROMPT: &str = include_str!("../agent_run_prompt.md");
+
 // Centralized templates for review-related user messages
 pub const REVIEW_EXIT_SUCCESS_TMPL: &str = include_str!("../templates/review/exit_success.xml");
 pub const REVIEW_EXIT_INTERRUPTED_TMPL: &str =
