@@ -214,15 +214,18 @@ impl Session {
 
         {
             let mut active = self.active_turn.lock().await;
-            if let Some(at) = active.as_mut()
-                && let Some(task) = at.remove_task(&turn_context.sub_id)
-            {
-                finished_kind = Some(task.kind);
-                should_close_processes = at.tasks.is_empty();
-                if should_close_processes {
-                    let mut ts = at.turn_state.lock().await;
-                    pending_input = ts.take_pending_input();
-                    *active = None;
+            if let Some(mut at) = active.take() {
+                if let Some(task) = at.remove_task(&turn_context.sub_id) {
+                    finished_kind = Some(task.kind);
+                    should_close_processes = at.tasks.is_empty();
+                    if should_close_processes {
+                        let mut ts = at.turn_state.lock().await;
+                        pending_input = ts.take_pending_input();
+                    } else {
+                        *active = Some(at);
+                    }
+                } else {
+                    *active = Some(at);
                 }
             }
         }
@@ -245,7 +248,7 @@ impl Session {
         self.send_event(turn_context.as_ref(), event).await;
 
         if should_auto_hygiene {
-            let cfg = turn_context.client.config();
+            let cfg = &turn_context.config;
             if config::auto_sanitize_enabled(&cfg.codex_home, cfg.active_profile.as_deref()) {
                 let sess = Arc::clone(self);
                 tokio::spawn(async move {
@@ -617,13 +620,43 @@ fn summarize_local_shell_call(action: &LocalShellAction) -> String {
 
 fn summarize_web_search_call(action: &WebSearchAction) -> String {
     match action {
-        WebSearchAction::Search { query } => {
-            if let Some(query) = query.as_deref()
-                && !query.trim().is_empty()
-            {
-                format!("web_search: {}", query.trim())
-            } else {
+        WebSearchAction::Search { query, queries } => {
+            let trimmed_query = query
+                .as_deref()
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    let first = queries
+                        .as_ref()
+                        .and_then(|items| {
+                            items
+                                .iter()
+                                .map(String::as_str)
+                                .map(str::trim)
+                                .find(|item| !item.is_empty())
+                        })
+                        .unwrap_or_default()
+                        .to_string();
+                    if queries.as_ref().is_some_and(|items| {
+                        items
+                            .iter()
+                            .map(String::as_str)
+                            .map(str::trim)
+                            .filter(|item| !item.is_empty())
+                            .nth(1)
+                            .is_some()
+                    }) && !first.is_empty()
+                    {
+                        format!("{first} ...")
+                    } else {
+                        first
+                    }
+                });
+            if trimmed_query.is_empty() {
                 "web_search".to_string()
+            } else {
+                format!("web_search: {trimmed_query}")
             }
         }
         WebSearchAction::OpenPage { url } => {

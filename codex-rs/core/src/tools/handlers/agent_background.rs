@@ -172,7 +172,7 @@ impl ToolHandler for AgentSpawnHandler {
         let model = config
             .model
             .clone()
-            .unwrap_or_else(|| turn.client.get_model());
+            .unwrap_or_else(|| turn.model_info.slug.clone());
 
         let CodexSpawnOk {
             codex,
@@ -183,9 +183,11 @@ impl ToolHandler for AgentSpawnHandler {
             Arc::clone(&session.services.auth_manager),
             Arc::clone(&session.services.models_manager),
             Arc::clone(&session.services.skills_manager),
+            Arc::clone(&session.services.file_watcher),
             InitialHistory::New,
             SessionSource::SubAgent(SubAgentSource::Other("agent_spawn".to_string())),
             session.services.agent_control.clone(),
+            Vec::new(),
         )
         .await
         .map_err(|err| FunctionCallError::Fatal(format!("failed to spawn sub-agent: {err}")))?;
@@ -221,12 +223,13 @@ impl ToolHandler for AgentSpawnHandler {
         };
 
         Ok(ToolOutput::Function {
-            content: serde_json::to_string(&output).unwrap_or_else(|err| {
-                format!(
-                    "{{\"status\":\"errored\",\"error\":\"failed to serialize agent_spawn output: {err}\"}}"
-                )
-            }),
-            content_items: None,
+            body: codex_protocol::models::FunctionCallOutputBody::Text(
+                serde_json::to_string(&output).unwrap_or_else(|err| {
+                    format!(
+                        "{{\"status\":\"errored\",\"error\":\"failed to serialize agent_spawn output: {err}\"}}"
+                    )
+                }),
+            ),
             success: Some(true),
         })
     }
@@ -291,12 +294,13 @@ impl ToolHandler for AgentWaitHandler {
         };
 
         Ok(ToolOutput::Function {
-            content: serde_json::to_string(&output).unwrap_or_else(|err| {
-                format!(
-                    "{{\"status\":\"errored\",\"error\":\"failed to serialize agent_wait output: {err}\"}}"
-                )
-            }),
-            content_items: None,
+            body: codex_protocol::models::FunctionCallOutputBody::Text(
+                serde_json::to_string(&output).unwrap_or_else(|err| {
+                    format!(
+                        "{{\"status\":\"errored\",\"error\":\"failed to serialize agent_wait output: {err}\"}}"
+                    )
+                }),
+            ),
             success: Some(matches!(status, AgentWaitStatus::Completed)),
         })
     }
@@ -340,12 +344,13 @@ impl ToolHandler for AgentStatusHandler {
         };
 
         Ok(ToolOutput::Function {
-            content: serde_json::to_string(&output).unwrap_or_else(|err| {
-                format!(
-                    "{{\"status\":\"errored\",\"error\":\"failed to serialize agent_status output: {err}\"}}"
-                )
-            }),
-            content_items: None,
+            body: codex_protocol::models::FunctionCallOutputBody::Text(
+                serde_json::to_string(&output).unwrap_or_else(|err| {
+                    format!(
+                        "{{\"status\":\"errored\",\"error\":\"failed to serialize agent_status output: {err}\"}}"
+                    )
+                }),
+            ),
             success: Some(true),
         })
     }
@@ -395,12 +400,13 @@ impl ToolHandler for AgentCancelHandler {
         };
 
         Ok(ToolOutput::Function {
-            content: serde_json::to_string(&output).unwrap_or_else(|err| {
-                format!(
-                    "{{\"status\":\"errored\",\"error\":\"failed to serialize agent_cancel output: {err}\"}}"
-                )
-            }),
-            content_items: None,
+            body: codex_protocol::models::FunctionCallOutputBody::Text(
+                serde_json::to_string(&output).unwrap_or_else(|err| {
+                    format!(
+                        "{{\"status\":\"errored\",\"error\":\"failed to serialize agent_cancel output: {err}\"}}"
+                    )
+                }),
+            ),
             success: Some(true),
         })
     }

@@ -5,7 +5,6 @@ use std::collections::HashMap;
 
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
-use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::codex::SessionConfiguration;
@@ -553,7 +552,8 @@ fn preview_for_item(item: &ResponseItem) -> String {
         ResponseItem::LocalShellCall { .. } => "tool call: local_shell".to_string(),
         ResponseItem::WebSearchCall { .. } => "tool call: web_search".to_string(),
         ResponseItem::FunctionCallOutput { output, .. } => {
-            tool_output_preview_line(&output.content).to_string()
+            let text = output.body.to_text().unwrap_or_default();
+            tool_output_preview_line(&text).to_string()
         }
         ResponseItem::CustomToolCallOutput { output, .. } => {
             tool_output_preview_line(output).to_string()
@@ -709,8 +709,7 @@ fn apply_replacement(item: &ResponseItem, replacement: &str) -> Option<ResponseI
             Some(ResponseItem::FunctionCallOutput {
                 call_id: call_id.clone(),
                 output: codex_protocol::models::FunctionCallOutputPayload {
-                    content: trimmed.to_string(),
-                    content_items: None,
+                    body: codex_protocol::models::FunctionCallOutputBody::Text(trimmed.to_string()),
                     success: output.success,
                 },
             })
@@ -730,6 +729,7 @@ fn apply_replacement(item: &ResponseItem, replacement: &str) -> Option<ResponseI
                 ),
             }],
             end_turn: None,
+            phase: None,
         }),
         _ => None,
     }
@@ -782,6 +782,7 @@ fn build_notes_item(notes: &[String]) -> ResponseItem {
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText { text }],
         end_turn: None,
+        phase: None,
     }
 }
 

@@ -150,7 +150,7 @@ impl ContextManager {
 
     pub(crate) fn remove_last_item(&mut self) -> bool {
         if let Some(removed) = self.items.pop() {
-            normalize::remove_corresponding_for(&mut self.items, &removed);
+            normalize::remove_corresponding_for(&mut self.items, &mut self.rids, &removed);
             true
         } else {
             false
@@ -327,9 +327,8 @@ impl ContextManager {
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
         const TOOL_OUTPUT_SERIALIZATION_OVERHEAD_BYTES: usize = 64;
-        let policy_with_serialization_budget = policy
-            .mul(1.2)
-            .add_bytes(TOOL_OUTPUT_SERIALIZATION_OVERHEAD_BYTES);
+        let policy_with_serialization_budget =
+            (policy * 1.2).add_bytes(TOOL_OUTPUT_SERIALIZATION_OVERHEAD_BYTES);
         match item {
             ResponseItem::FunctionCallOutput { call_id, output } => {
                 let body = match &output.body {

@@ -146,7 +146,7 @@ pub(crate) fn ensure_call_outputs_present_lenient(items: &mut Vec<ResponseItem>)
                         ResponseItem::FunctionCallOutput {
                             call_id: call_id.clone(),
                             output: FunctionCallOutputPayload {
-                                content: PLACEHOLDER.to_string(),
+                                body: FunctionCallOutputBody::Text(PLACEHOLDER.to_string()),
                                 ..Default::default()
                             },
                         },
@@ -177,7 +177,7 @@ pub(crate) fn ensure_call_outputs_present_lenient(items: &mut Vec<ResponseItem>)
                         ResponseItem::FunctionCallOutput {
                             call_id: call_id.clone(),
                             output: FunctionCallOutputPayload {
-                                content: PLACEHOLDER.to_string(),
+                                body: FunctionCallOutputBody::Text(PLACEHOLDER.to_string()),
                                 ..Default::default()
                             },
                         },
@@ -381,6 +381,7 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: text.to_string(),
             }],
+            phase: None,
             end_turn: None,
         }
     }
@@ -406,7 +407,12 @@ mod tests {
             ResponseItem::FunctionCallOutput {
                 call_id: output_call_id,
                 output
-            } if output_call_id == &call_id && output.content == "[codex] tool output omitted"
+            } if output_call_id == &call_id
+                && output
+                    .body
+                    .to_text()
+                    .as_deref()
+                    == Some("[codex] tool output omitted")
         ));
     }
 
@@ -463,7 +469,12 @@ mod tests {
             ResponseItem::FunctionCallOutput {
                 call_id: output_call_id,
                 output
-            } if output_call_id == &call_id && output.content == "[codex] tool output omitted"
+            } if output_call_id == &call_id
+                && output
+                    .body
+                    .to_text()
+                    .as_deref()
+                    == Some("[codex] tool output omitted")
         ));
     }
 
@@ -480,7 +491,7 @@ mod tests {
             ResponseItem::FunctionCallOutput {
                 call_id,
                 output: FunctionCallOutputPayload {
-                    content: "ok".to_string(),
+                    body: FunctionCallOutputBody::Text("ok".to_string()),
                     ..Default::default()
                 },
             },

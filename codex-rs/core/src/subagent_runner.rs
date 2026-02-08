@@ -251,7 +251,7 @@ pub(crate) async fn spawn_background_agent_loop(
 
                 if let EventMsg::SessionConfigured(ev) = &event.msg {
                     let mut state = handle.state.lock().await;
-                    state.rollout_path = Some(ev.rollout_path.clone());
+                    state.rollout_path = ev.rollout_path.clone();
                     continue;
                 }
 
@@ -535,6 +535,7 @@ mod tests {
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
     use pretty_assertions::assert_eq;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
     use tokio::sync::watch;
 
@@ -543,12 +544,14 @@ mod tests {
         let (tx_sub, rx_sub) = bounded(crate::codex::SUBMISSION_CHANNEL_CAPACITY);
         let (tx_events, rx_events) = bounded(1);
         let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+        let (session, _turn_context) = crate::codex::make_session_and_context().await;
 
         let codex = Codex {
             next_id: AtomicU64::new(0),
             tx_sub,
             rx_event: rx_events,
             agent_status,
+            session: Arc::new(session),
         };
 
         tx_events
@@ -581,16 +584,16 @@ mod tests {
         let (tx_sub, rx_sub) = bounded(crate::codex::SUBMISSION_CHANNEL_CAPACITY);
         let (_tx_events, rx_events) = bounded(1);
         let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+        let (parent_session, parent_turn, _rx_evt) =
+            crate::codex::make_session_and_context_with_rx().await;
 
         let codex = Codex {
             next_id: AtomicU64::new(0),
             tx_sub,
             rx_event: rx_events,
             agent_status,
+            session: Arc::clone(&parent_session),
         };
-
-        let (parent_session, parent_turn, _rx_evt) =
-            crate::codex::make_session_and_context_with_rx().await;
 
         let cancel = CancellationToken::new();
         cancel.cancel();
@@ -637,16 +640,16 @@ mod tests {
         let (tx_sub, _rx_sub) = bounded(crate::codex::SUBMISSION_CHANNEL_CAPACITY);
         let (_tx_events, rx_events) = bounded(1);
         let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+        let (parent_session, parent_turn, _rx_evt) =
+            crate::codex::make_session_and_context_with_rx().await;
 
         let codex = Codex {
             next_id: AtomicU64::new(0),
             tx_sub,
             rx_event: rx_events,
             agent_status,
+            session: Arc::clone(&parent_session),
         };
-
-        let (parent_session, parent_turn, _rx_evt) =
-            crate::codex::make_session_and_context_with_rx().await;
 
         let cancel = CancellationToken::new();
 

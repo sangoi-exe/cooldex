@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -8,12 +7,9 @@ use codex_async_utils::OrCancelExt;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RequestUserInputEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::Submission;
-use codex_protocol::request_user_input::RequestUserInputArgs;
-use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;
 

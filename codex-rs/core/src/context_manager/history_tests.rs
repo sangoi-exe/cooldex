@@ -200,14 +200,10 @@ async fn estimate_token_count_scales_reasoning_bytes_to_tokens() {
         .estimate_token_count(&turn_context)
         .expect("expected token estimate");
 
-    let base_tokens = i64::try_from(truncate::approx_token_count(
-        turn_context
-            .client
-            .get_model_info()
-            .base_instructions
-            .as_str(),
-    ))
-    .unwrap_or(i64::MAX);
+    let personality = turn_context.personality.or(turn_context.config.personality);
+    let base_instructions = turn_context.model_info.get_model_instructions(personality);
+    let base_tokens =
+        i64::try_from(truncate::approx_token_count(base_instructions.as_str())).unwrap_or(i64::MAX);
 
     let reasoning_bytes = estimate_reasoning_length(1_000);
     let reasoning_tokens =

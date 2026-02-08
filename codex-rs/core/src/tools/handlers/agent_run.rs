@@ -160,7 +160,7 @@ impl ToolHandler for AgentRunHandler {
         let model = config
             .model
             .clone()
-            .unwrap_or_else(|| turn.client.get_model());
+            .unwrap_or_else(|| turn.model_info.slug.clone());
 
         let CodexSpawnOk {
             codex, thread_id, ..
@@ -169,9 +169,11 @@ impl ToolHandler for AgentRunHandler {
             Arc::clone(&session.services.auth_manager),
             Arc::clone(&session.services.models_manager),
             Arc::clone(&session.services.skills_manager),
+            Arc::clone(&session.services.file_watcher),
             InitialHistory::New,
             SessionSource::SubAgent(SubAgentSource::Other("agent_run".to_string())),
             session.services.agent_control.clone(),
+            Vec::new(),
         )
         .await
         .map_err(|err| FunctionCallError::Fatal(format!("failed to spawn sub-agent: {err}")))?;
@@ -199,12 +201,13 @@ impl ToolHandler for AgentRunHandler {
         };
 
         Ok(ToolOutput::Function {
-            content: serde_json::to_string(&output).unwrap_or_else(|err| {
-                format!(
-                    "{{\"status\":\"errored\",\"error\":\"failed to serialize agent_run output: {err}\"}}"
-                )
-            }),
-            content_items: None,
+            body: codex_protocol::models::FunctionCallOutputBody::Text(
+                serde_json::to_string(&output).unwrap_or_else(|err| {
+                    format!(
+                        "{{\"status\":\"errored\",\"error\":\"failed to serialize agent_run output: {err}\"}}"
+                    )
+                }),
+            ),
             success: Some(matches!(output.status, AgentRunStatus::Completed)),
         })
     }
@@ -215,10 +218,10 @@ pub(crate) fn inherit_effective_turn_settings(
     turn: &crate::codex::TurnContext,
 ) -> Result<(), FunctionCallError> {
     config.cwd = turn.cwd.clone();
-    config.model = Some(turn.client.get_model());
-    config.model_provider = turn.client.get_provider();
-    config.model_reasoning_effort = turn.client.get_reasoning_effort();
-    config.model_reasoning_summary = turn.client.get_reasoning_summary();
+    config.model = Some(turn.model_info.slug.clone());
+    config.model_provider = turn.provider.clone();
+    config.model_reasoning_effort = turn.reasoning_effort;
+    config.model_reasoning_summary = turn.reasoning_summary;
 
     config
         .approval_policy
@@ -439,7 +442,7 @@ async fn run_one_shot_agent(
         msg: EventMsg::SessionConfigured(ev),
     }) = codex.next_event().await
     {
-        rollout_path = Some(ev.rollout_path);
+        rollout_path = ev.rollout_path;
     }
 
     if let Err(err) = codex
@@ -476,7 +479,7 @@ async fn run_one_shot_agent(
                         }
                     };
                     if let EventMsg::SessionConfigured(ev) = &event.msg {
-                        rollout_path = Some(ev.rollout_path.clone());
+                        rollout_path = ev.rollout_path.clone();
                         continue;
                     }
 

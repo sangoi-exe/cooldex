@@ -506,13 +506,21 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Skills,
         key: "skills",
-        stage: Stage::Experimental,
+        stage: Stage::Experimental {
+            name: "Skills",
+            menu_description: "Enable discovery and injection of reusable skills from `$CODEX_HOME/skills`.",
+            announcement: "NEW: Skills can extend Codex with reusable instructions and tooling. Enable in /experimental and restart Codex!",
+        },
         default_enabled: true,
     },
     FeatureSpec {
         id: Feature::MultiAgent,
         key: "multi_agent",
-        stage: Stage::Experimental,
+        stage: Stage::Experimental {
+            name: "Multi-agent tools",
+            menu_description: "Enable multi-agent tool surfaces for spawning and coordinating background sub-agents.",
+            announcement: "NEW: Multi-agent tools can spawn and coordinate background sub-agents. Enable in /experimental and restart Codex!",
+        },
         default_enabled: false,
     },
     FeatureSpec {

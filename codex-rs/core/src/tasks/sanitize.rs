@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;
 
 use crate::client_common::SANITIZE_PROMPT;
+use crate::codex::SamplingRequestToolSelection;
 use crate::codex::TurnContext;
 use crate::codex::run_sampling_request;
 use crate::error::CodexErr;
@@ -47,7 +49,8 @@ impl SessionTask for SanitizeTask {
         let sess = session.clone_session();
 
         let started = EventMsg::TurnStarted(TurnStartedEvent {
-            model_context_window: ctx.client.get_model_context_window(),
+            model_context_window: ctx.model_context_window(),
+            collaboration_mode_kind: ctx.collaboration_mode.mode,
         });
         sess.send_event(ctx.as_ref(), started).await;
 
@@ -58,11 +61,15 @@ impl SessionTask for SanitizeTask {
                 text: SANITIZE_PROMPT.to_string(),
             }],
             end_turn: None,
+            phase: None,
         };
 
         let turn_diff_tracker: SharedTurnDiffTracker =
             Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-        let mut client_session = ctx.client.new_session();
+        let mut client_session = sess.services.model_client.new_session();
+        let turn_metadata_header = ctx.resolve_turn_metadata_header().await;
+        let explicit_app_paths = Vec::<String>::new();
+        let skill_name_counts_lower = HashMap::<String, usize>::new();
 
         loop {
             if cancellation_token.is_cancelled() {
@@ -84,7 +91,9 @@ impl SessionTask for SanitizeTask {
                 Arc::clone(&ctx),
                 Arc::clone(&turn_diff_tracker),
                 &mut client_session,
+                turn_metadata_header.as_deref(),
                 input,
+                SamplingRequestToolSelection::new(&explicit_app_paths, &skill_name_counts_lower),
                 cancellation_token.child_token(),
             )
             .await

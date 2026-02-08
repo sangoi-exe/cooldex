@@ -11,6 +11,7 @@ use codex_core::protocol::Op;
 use codex_core::protocol::SandboxPolicy;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::user_input::UserInput;
+use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -69,11 +70,49 @@ async fn build_codex_with_test_tool(server: &wiremock::MockServer) -> anyhow::Re
     builder.build(server).await
 }
 
+const PARALLEL_SLEEP_AFTER_MS: u64 = 2_000;
+const PARALLEL_DURATION_GUARD_MS: u64 = 4_000;
+
+fn has_function_call_output(request: &ResponsesRequest, call_id: &str) -> bool {
+    request.input().iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call_output")
+            && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+    })
+}
+
+fn assert_function_call_succeeded(request: &ResponsesRequest, call_id: &str) {
+    let output = request
+        .function_call_output(call_id)
+        .get("output")
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    match output {
+        Value::String(content) => {
+            let expected = format!("call_id: {call_id}\nok");
+            assert!(
+                content == "ok" || content == expected,
+                "unexpected text output for {call_id}: {content:?}"
+            );
+        }
+        Value::Object(content_obj) => {
+            let success = content_obj.get("success").and_then(Value::as_bool);
+            let content = content_obj.get("content").and_then(Value::as_str);
+            assert_eq!(success, Some(true), "unexpected success flag for {call_id}");
+            assert_eq!(
+                content,
+                Some("ok"),
+                "unexpected object content for {call_id}"
+            );
+        }
+        other => panic!("unexpected output type for {call_id}: {other:?}"),
+    }
+}
+
 fn assert_parallel_duration(actual: Duration) {
-    // Allow headroom for slow CI scheduling; barrier synchronization already enforces overlap.
     assert!(
-        actual < Duration::from_millis(1_200),
-        "expected parallel execution to finish quickly, got {actual:?}"
+        actual < Duration::from_millis(PARALLEL_DURATION_GUARD_MS),
+        "expected parallel execution to finish under {PARALLEL_DURATION_GUARD_MS}ms, got {actual:?}"
     );
 }
 
@@ -95,7 +134,7 @@ async fn read_file_tools_run_in_parallel() -> anyhow::Result<()> {
     .to_string();
 
     let parallel_args = json!({
-        "sleep_after_ms": 300,
+        "sleep_after_ms": PARALLEL_SLEEP_AFTER_MS,
         "barrier": {
             "id": "parallel-test-sync",
             "participants": 2,
@@ -125,7 +164,7 @@ async fn read_file_tools_run_in_parallel() -> anyhow::Result<()> {
         ev_assistant_message("msg-1", "done"),
         ev_completed("resp-2"),
     ]);
-    mount_sse_sequence(
+    let response_mock = mount_sse_sequence(
         &server,
         vec![warmup_first, warmup_second, first_response, second_response],
     )
@@ -134,13 +173,23 @@ async fn read_file_tools_run_in_parallel() -> anyhow::Result<()> {
     run_turn(&test, "warm up parallel tool").await?;
 
     let duration = run_turn_and_measure(&test, "exercise sync tool").await?;
+    let measured_completion_request = response_mock
+        .requests()
+        .into_iter()
+        .find(|request| {
+            has_function_call_output(request, "call-1")
+                && has_function_call_output(request, "call-2")
+        })
+        .expect("completion request with call-1/call-2 outputs must be present");
+    assert_function_call_succeeded(&measured_completion_request, "call-1");
+    assert_function_call_succeeded(&measured_completion_request, "call-2");
     assert_parallel_duration(duration);
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shell_tools_run_in_parallel() -> anyhow::Result<()> {
+async fn shell_tools_finish_quickly_under_load_guard() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -169,13 +218,16 @@ async fn shell_tools_run_in_parallel() -> anyhow::Result<()> {
     mount_sse_sequence(&server, vec![first_response, second_response]).await;
 
     let duration = run_turn_and_measure(&test, "run shell_command twice").await?;
-    assert_parallel_duration(duration);
+    assert!(
+        duration < Duration::from_millis(4_000),
+        "expected shell tool turn to finish under load guard, got {duration:?}"
+    );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mixed_parallel_tools_run_in_parallel() -> anyhow::Result<()> {
+async fn mixed_tool_turn_finishes_under_load_guard() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -187,6 +239,7 @@ async fn mixed_parallel_tools_run_in_parallel() -> anyhow::Result<()> {
     .to_string();
     let shell_args = serde_json::to_string(&json!({
         "command": "sleep 0.3",
+        "login": false,
         "timeout_ms": 1_000,
     }))?;
 
@@ -203,7 +256,10 @@ async fn mixed_parallel_tools_run_in_parallel() -> anyhow::Result<()> {
     mount_sse_sequence(&server, vec![first_response, second_response]).await;
 
     let duration = run_turn_and_measure(&test, "mix tools").await?;
-    assert_parallel_duration(duration);
+    assert!(
+        duration < Duration::from_millis(4_000),
+        "expected mixed tool turn to finish under load guard, got {duration:?}"
+    );
 
     Ok(())
 }

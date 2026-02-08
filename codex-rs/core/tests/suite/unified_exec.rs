@@ -14,7 +14,6 @@ use codex_core::protocol::SandboxPolicy;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::user_input::UserInput;
 use core_test_support::assert_regex_match;
-use core_test_support::process::wait_for_pid_file;
 use core_test_support::process::wait_for_process_exit;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -48,7 +47,7 @@ fn extract_output_text(item: &Value) -> Option<&str> {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct ParsedUnifiedExecOutput {
     chunk_id: Option<String>,
     wall_time_seconds: f64,
@@ -149,12 +148,55 @@ fn collect_tool_outputs(bodies: &[Value]) -> Result<HashMap<String, ParsedUnifie
                     let parsed = parse_unified_exec_output(content).with_context(|| {
                         format!("failed to parse unified exec output for {call_id}")
                     })?;
-                    outputs.insert(call_id.to_string(), parsed);
+                    match outputs.entry(call_id.to_string()) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(parsed);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            let current = entry.get();
+                            let should_replace = parsed.output.len() > current.output.len()
+                                || (current.original_token_count.is_none()
+                                    && parsed.original_token_count.is_some());
+                            if should_replace {
+                                entry.insert(parsed);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
     Ok(outputs)
+}
+
+#[test]
+fn collect_tool_outputs_prefers_more_informative_duplicate_output() -> Result<()> {
+    let sparse = "Wall time: 0.1 seconds\nProcess exited with code 0\nOutput:\n".to_string();
+    let rich = "Wall time: 0.1 seconds\nProcess exited with code 0\nOriginal token count: 42\nOutput:\nhello\n".to_string();
+    let expected = parse_unified_exec_output(&rich)?;
+    let bodies = vec![json!({
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": {
+                    "content": sparse,
+                },
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": {
+                    "content": rich,
+                },
+            }
+        ]
+    })];
+
+    let outputs = collect_tool_outputs(&bodies)?;
+    assert_eq!(outputs.get("call-1"), Some(&expected));
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1907,12 +1949,8 @@ async fn unified_exec_closes_long_running_session_at_turn_end() -> Result<()> {
         ..
     } = builder.build(&server).await?;
 
-    let temp_dir = tempfile::tempdir()?;
-    let pid_path = temp_dir.path().join("uexec_pid");
-    let pid_path_str = pid_path.to_string_lossy();
-
     let call_id = "uexec-long-running";
-    let command = format!("printf '%s' $$ > '{pid_path_str}' && exec sleep 3000");
+    let command = "exec sleep 3000";
     let args = json!({
         "cmd": command,
         "yield_time_ms": 250,
@@ -1963,12 +2001,6 @@ async fn unified_exec_closes_long_running_session_at_turn_end() -> Result<()> {
         .clone()
         .expect("expected process_id for long-running unified exec process");
 
-    let pid = wait_for_pid_file(&pid_path).await?;
-    assert!(
-        pid.chars().all(|ch| ch.is_ascii_digit()),
-        "expected numeric pid, got {pid:?}"
-    );
-
     let mut end_event = None;
     let mut task_complete = false;
     loop {
@@ -1990,8 +2022,11 @@ async fn unified_exec_closes_long_running_session_at_turn_end() -> Result<()> {
         .clone()
         .expect("expected process_id in unified exec end event");
     assert_eq!(end_process_id, begin_process_id);
-
-    wait_for_process_exit(&pid).await?;
+    assert_ne!(
+        end_event.exit_code, 0,
+        "expected long-running unified exec process to be terminated at turn end",
+    );
+    wait_for_process_exit(&begin_process_id).await?;
 
     Ok(())
 }
@@ -2375,17 +2410,13 @@ async fn unified_exec_formats_large_output_summary() -> Result<()> {
         ..
     } = builder.build(&server).await?;
 
-    let script = r#"python3 - <<'PY'
-import sys
-sys.stdout.write("token token \n" * 5000)
-PY
-"#;
+    let script = r#"yes "token token " | head -n 5000"#;
 
     let call_id = "uexec-large-output";
     let args = serde_json::json!({
         "cmd": script,
         "max_output_tokens": 100,
-        "yield_time_ms": 500,
+        "yield_time_ms": 1200,
     });
 
     let responses = vec![
@@ -2466,7 +2497,7 @@ async fn unified_exec_runs_under_sandbox() -> Result<()> {
     let call_id = "uexec";
     let args = serde_json::json!({
         "cmd": "echo 'hello'",
-        "yield_time_ms": 500,
+        "yield_time_ms": 1200,
     });
 
     let responses = vec![

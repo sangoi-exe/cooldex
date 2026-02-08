@@ -126,7 +126,7 @@ impl ToolHandler for ShellHandler {
         } = invocation;
 
         let freeform_shell_output = matches!(
-            turn.client.get_model_info().apply_patch_tool_type,
+            turn.model_info.apply_patch_tool_type,
             Some(ApplyPatchToolType::Freeform)
         );
 
@@ -144,7 +144,7 @@ impl ToolHandler for ShellHandler {
                     turn,
                     tracker,
                     call_id,
-                    freeform_shell_output,
+                    freeform: freeform_shell_output,
                 })
                 .await
             }
@@ -159,7 +159,7 @@ impl ToolHandler for ShellHandler {
                     turn,
                     tracker,
                     call_id,
-                    freeform_shell_output,
+                    freeform: freeform_shell_output,
                 })
                 .await
             }

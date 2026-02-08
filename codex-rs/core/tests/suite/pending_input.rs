@@ -14,6 +14,8 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+const STREAM_COMPLETION_TIMEOUT_SECS: u64 = 30;
+
 fn ev_message_item_done(id: &str, text: &str) -> Value {
     serde_json::json!({
         "type": "response.output_item.done",
@@ -86,8 +88,19 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
         },
     ];
 
-    let (server, _completions) =
+    let (server, completion_receivers) =
         start_streaming_sse_server(vec![first_chunks, second_chunks]).await;
+    let mut completion_iter = completion_receivers.into_iter();
+    let first_completion = completion_iter
+        .next()
+        .expect("first completion receiver missing");
+    let second_completion = completion_iter
+        .next()
+        .expect("second completion receiver missing");
+    assert!(
+        completion_iter.next().is_none(),
+        "unexpected extra completion receiver"
+    );
 
     let codex = test_codex()
         .with_model("gpt-5.1")
@@ -108,29 +121,44 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
         .unwrap();
 
     wait_for_event(&codex, |event| {
-        matches!(event, EventMsg::AgentMessageContentDelta(_))
+        // Under load, delta events may be coalesced; accept any assistant-message
+        // event as evidence the first turn started streaming before injecting input.
+        matches!(
+            event,
+            EventMsg::AgentMessageContentDelta(_)
+                | EventMsg::AgentMessageDelta(_)
+                | EventMsg::AgentMessage(_)
+        )
     })
     .await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .steer_input(
+            vec![UserInput::Text {
                 text: "second prompt".into(),
                 text_elements: Vec::new(),
             }],
-            final_output_json_schema: None,
-        })
+            None,
+        )
         .await
         .unwrap();
 
     let _ = gate_completed_tx.send(());
 
-    let _ = wait_for_event(&codex, |event| {
-        matches!(event, EventMsg::UserMessage(message) if message.message == "second prompt")
-    })
-    .await;
-
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(STREAM_COMPLETION_TIMEOUT_SECS),
+        first_completion,
+    )
+    .await
+    .expect("first response stream did not complete in time")
+    .expect("first completion timestamp missing");
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(STREAM_COMPLETION_TIMEOUT_SECS),
+        second_completion,
+    )
+    .await
+    .expect("second response stream did not complete in time")
+    .expect("second completion timestamp missing");
 
     let requests = server.requests().await;
     assert_eq!(requests.len(), 2);

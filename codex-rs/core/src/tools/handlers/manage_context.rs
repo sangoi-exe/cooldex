@@ -106,8 +106,9 @@ impl ToolHandler for ManageContextHandler {
         let result = handle_manage_context(session.as_ref(), turn.as_ref(), &args).await?;
 
         Ok(ToolOutput::Function {
-            content: serde_json::to_string(&result.json).unwrap_or_else(|_| "{}".to_string()),
-            content_items: None,
+            body: codex_protocol::models::FunctionCallOutputBody::Text(
+                serde_json::to_string(&result.json).unwrap_or_else(|_| "{}".to_string()),
+            ),
             success: Some(true),
         })
     }
@@ -149,7 +150,7 @@ async fn handle_retrieve(
         let context_window = state
             .token_info()
             .and_then(|info| info.model_context_window)
-            .or(turn.client.get_model_context_window());
+            .or(turn.model_context_window());
         let overlay = state.context_overlay_snapshot();
         let ev = state.build_context_items_event();
         let items = state.history_snapshot_lenient();
@@ -305,7 +306,7 @@ async fn handle_apply(
         let context_window = state
             .token_info()
             .and_then(|info| info.model_context_window)
-            .or(turn.client.get_model_context_window());
+            .or(turn.model_context_window());
         (
             summary,
             new_snapshot_id,
@@ -948,24 +949,25 @@ fn estimate_item_bytes(item: &ResponseItem) -> u64 {
             ..
         } => (name.len() + arguments.len() + call_id.len()) as u64,
         ResponseItem::FunctionCallOutput { call_id, output } => {
-            let mut total = (call_id.len() + output.content.len()) as u64;
-            if let Some(items) = &output.content_items {
-                for it in items {
-                    match it {
-                        codex_protocol::models::FunctionCallOutputContentItem::InputText {
-                            text,
-                        } => {
-                            total = total.saturating_add(text.len() as u64);
-                        }
-                        codex_protocol::models::FunctionCallOutputContentItem::InputImage {
-                            image_url,
-                        } => {
-                            total = total.saturating_add(image_url.len() as u64);
-                        }
-                    }
+            let body_len = match &output.body {
+                codex_protocol::models::FunctionCallOutputBody::Text(content) => {
+                    content.len() as u64
                 }
-            }
-            total
+                codex_protocol::models::FunctionCallOutputBody::ContentItems(items) => {
+                    items.iter().fold(0_u64, |total, item| {
+                        let item_len = match item {
+                            codex_protocol::models::FunctionCallOutputContentItem::InputText {
+                                text,
+                            } => text.len() as u64,
+                            codex_protocol::models::FunctionCallOutputContentItem::InputImage {
+                                image_url,
+                            } => image_url.len() as u64,
+                        };
+                        total.saturating_add(item_len)
+                    })
+                }
+            };
+            body_len.saturating_add(call_id.len() as u64)
         }
         ResponseItem::CustomToolCall {
             call_id,
@@ -977,9 +979,16 @@ fn estimate_item_bytes(item: &ResponseItem) -> u64 {
             (call_id.len() + output.len()) as u64
         }
         ResponseItem::WebSearchCall { action, .. } => match action {
-            Some(codex_protocol::models::WebSearchAction::Search { query }) => {
-                query.as_ref().map(|s| s.len() as u64).unwrap_or(0)
-            }
+            Some(codex_protocol::models::WebSearchAction::Search { query, queries }) => query
+                .as_ref()
+                .map(|text| text.len() as u64)
+                .unwrap_or(0)
+                .saturating_add(
+                    queries
+                        .as_ref()
+                        .map(|items| items.iter().map(|text| text.len() as u64).sum())
+                        .unwrap_or(0),
+                ),
             Some(codex_protocol::models::WebSearchAction::OpenPage { url }) => {
                 url.as_ref().map(|s| s.len() as u64).unwrap_or(0)
             }
@@ -1167,7 +1176,8 @@ fn prompt_preview_line(item: &ResponseItem, max_lines: usize, max_chars: usize) 
             }
         }
         ResponseItem::FunctionCallOutput { call_id, output } => {
-            let preview_line = tool_output_preview_line(&output.content);
+            let content = output.body.to_text().unwrap_or_default();
+            let preview_line = tool_output_preview_line(&content);
             format!(
                 "tool output ({call_id}): {}",
                 preview_text_lines(preview_line, max_lines, max_chars)
@@ -1201,13 +1211,15 @@ fn prompt_preview_line(item: &ResponseItem, max_lines: usize, max_chars: usize) 
         ResponseItem::WebSearchCall { action, .. } => {
             use codex_protocol::models::WebSearchAction;
             match action {
-                Some(WebSearchAction::Search { query }) => format!(
-                    "web_search: {}",
-                    query
-                        .as_deref()
-                        .map(|q| preview_text_lines(q, max_lines, max_chars))
-                        .unwrap_or_else(|| "search".to_string())
-                ),
+                Some(WebSearchAction::Search { query, queries }) => {
+                    let detail = web_search_search_detail(query.as_deref(), queries.as_deref());
+                    let preview = if detail.is_empty() {
+                        "search".to_string()
+                    } else {
+                        preview_text_lines(&detail, max_lines, max_chars)
+                    };
+                    format!("web_search: {preview}")
+                }
                 Some(WebSearchAction::OpenPage { url }) => format!(
                     "web_search: open {}",
                     url.as_deref()
@@ -1233,6 +1245,39 @@ fn prompt_preview_line(item: &ResponseItem, max_lines: usize, max_chars: usize) 
         ResponseItem::GhostSnapshot { .. } => "ghost snapshot".to_string(),
         ResponseItem::Other => String::new(),
     }
+}
+
+fn web_search_search_detail(query: Option<&str>, queries: Option<&[String]>) -> String {
+    query
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let first = queries
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .map(String::as_str)
+                        .map(str::trim)
+                        .find(|item| !item.is_empty())
+                })
+                .map(str::to_owned)
+                .unwrap_or_default();
+            if queries.is_some_and(|items| {
+                items
+                    .iter()
+                    .map(String::as_str)
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .nth(1)
+                    .is_some()
+            }) && !first.is_empty()
+            {
+                format!("{first} ...")
+            } else {
+                first
+            }
+        })
 }
 
 fn tool_output_preview_line(text: &str) -> &str {
@@ -1702,6 +1747,7 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: text.to_string(),
             }],
+            phase: None,
             end_turn: None,
         }
     }
@@ -1713,6 +1759,7 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: text.to_string(),
             }],
+            phase: None,
             end_turn: None,
         }
     }
@@ -1753,8 +1800,7 @@ mod tests {
         ResponseItem::FunctionCallOutput {
             call_id: call_id.to_string(),
             output: codex_protocol::models::FunctionCallOutputPayload {
-                content: content.to_string(),
-                content_items: None,
+                body: codex_protocol::models::FunctionCallOutputBody::Text(content.to_string()),
                 success: Some(true),
             },
         }
@@ -2393,6 +2439,74 @@ mod tests {
         let extended = snapshot_id_for_context(&ev_with_trailing, &overlay, &items_with_trailing);
 
         assert_eq!(base, extended);
+    }
+
+    #[test]
+    fn estimate_item_bytes_function_call_output_content_items_no_double_count() {
+        let item = ResponseItem::FunctionCallOutput {
+            call_id: "call1".to_string(),
+            output: codex_protocol::models::FunctionCallOutputPayload {
+                body: codex_protocol::models::FunctionCallOutputBody::ContentItems(vec![
+                    codex_protocol::models::FunctionCallOutputContentItem::InputText {
+                        text: "abc".to_string(),
+                    },
+                    codex_protocol::models::FunctionCallOutputContentItem::InputImage {
+                        image_url: "img".to_string(),
+                    },
+                ]),
+                success: None,
+            },
+        };
+
+        assert_eq!(estimate_item_bytes(&item), 11);
+    }
+
+    #[test]
+    fn estimate_item_bytes_web_search_uses_queries_when_query_missing() {
+        let item = ResponseItem::WebSearchCall {
+            id: None,
+            status: None,
+            action: Some(codex_protocol::models::WebSearchAction::Search {
+                query: None,
+                queries: Some(vec!["alpha".to_string(), "beta".to_string()]),
+            }),
+        };
+
+        assert_eq!(estimate_item_bytes(&item), 9);
+    }
+
+    #[test]
+    fn prompt_preview_line_web_search_uses_queries_fallback() {
+        let item = ResponseItem::WebSearchCall {
+            id: None,
+            status: None,
+            action: Some(codex_protocol::models::WebSearchAction::Search {
+                query: None,
+                queries: Some(vec!["alpha".to_string(), "beta".to_string()]),
+            }),
+        };
+
+        assert_eq!(
+            prompt_preview_line(&item, 3, 80),
+            "web_search: alpha ...".to_string()
+        );
+    }
+
+    #[test]
+    fn prompt_preview_line_web_search_prefers_query_over_queries() {
+        let item = ResponseItem::WebSearchCall {
+            id: None,
+            status: None,
+            action: Some(codex_protocol::models::WebSearchAction::Search {
+                query: Some("  preferred query  ".to_string()),
+                queries: Some(vec!["alpha".to_string(), "beta".to_string()]),
+            }),
+        };
+
+        assert_eq!(
+            prompt_preview_line(&item, 3, 80),
+            "web_search: preferred query".to_string()
+        );
     }
 }
 

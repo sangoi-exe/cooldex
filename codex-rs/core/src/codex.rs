@@ -3894,8 +3894,7 @@ async fn spawn_sanitize_task(
         .disable(crate::features::Feature::ApplyPatchFreeform)
         .disable(crate::features::Feature::MultiAgent)
         .disable(crate::features::Feature::WebSearchRequest)
-        .disable(crate::features::Feature::WebSearchCached)
-        .disable(crate::features::Feature::ViewImageTool);
+        .disable(crate::features::Feature::WebSearchCached);
     let sanitize_web_search_mode = WebSearchMode::Disabled;
 
     let otel_manager = parent_turn_context
@@ -3923,7 +3922,7 @@ async fn spawn_sanitize_task(
     per_turn_config.features = sanitize_features.clone();
     per_turn_config.web_search_mode = Some(sanitize_web_search_mode);
     let reasoning_effort = per_turn_config.model_reasoning_effort;
-    let reasoning_summary = per_turn_config.model_reasoning_summary.clone();
+    let reasoning_summary = per_turn_config.model_reasoning_summary;
     let per_turn_config = Arc::new(per_turn_config);
 
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
@@ -4202,10 +4201,8 @@ pub(crate) async fn run_turn(
             })
             .map(|user_message| user_message.message())
             .collect::<Vec<String>>();
-        let tool_selection = SamplingRequestToolSelection {
-            explicit_app_paths: &explicit_app_paths,
-            skill_name_counts_lower: &skill_name_counts_lower,
-        };
+        let tool_selection =
+            SamplingRequestToolSelection::new(&explicit_app_paths, &skill_name_counts_lower);
         match run_sampling_request(
             Arc::clone(&sess),
             Arc::clone(&turn_context),
@@ -4403,9 +4400,21 @@ fn codex_apps_connector_id(tool: &crate::mcp_connection_manager::ToolInfo) -> Op
     tool.connector_id.as_deref()
 }
 
-struct SamplingRequestToolSelection<'a> {
+pub(crate) struct SamplingRequestToolSelection<'a> {
     explicit_app_paths: &'a [String],
     skill_name_counts_lower: &'a HashMap<String, usize>,
+}
+
+impl<'a> SamplingRequestToolSelection<'a> {
+    pub(crate) fn new(
+        explicit_app_paths: &'a [String],
+        skill_name_counts_lower: &'a HashMap<String, usize>,
+    ) -> Self {
+        Self {
+            explicit_app_paths,
+            skill_name_counts_lower,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4994,7 +5003,11 @@ async fn drain_in_flight(
                         call_id,
                         mut output,
                     } => {
-                        maybe_inject_tool_output_call_id(&call_id, &mut output.content);
+                        if let codex_protocol::models::FunctionCallOutputBody::Text(text) =
+                            &mut output.body
+                        {
+                            maybe_inject_tool_output_call_id(&call_id, text);
+                        }
                         ResponseInputItem::FunctionCallOutput { call_id, output }
                     }
                     ResponseInputItem::CustomToolCallOutput {
@@ -5615,6 +5628,7 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "USER_1".to_string(),
             }],
+            phase: None,
             end_turn: None,
         };
         let assistant_1 = ResponseItem::Message {
@@ -5623,6 +5637,7 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "ASSISTANT_1".to_string(),
             }],
+            phase: None,
             end_turn: None,
         };
         let user_2 = ResponseItem::Message {
@@ -5631,6 +5646,7 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "USER_2".to_string(),
             }],
+            phase: None,
             end_turn: None,
         };
         let assistant_2 = ResponseItem::Message {
@@ -5639,6 +5655,7 @@ mod tests {
             content: vec![ContentItem::OutputText {
                 text: "ASSISTANT_2".to_string(),
             }],
+            phase: None,
             end_turn: None,
         };
 
@@ -6039,6 +6056,7 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "user 1".to_string(),
                 }],
+                phase: None,
                 end_turn: None,
             },
             ResponseItem::Reasoning {
@@ -6063,6 +6081,7 @@ mod tests {
                 content: vec![ContentItem::OutputText {
                     text: "assistant 1".to_string(),
                 }],
+                phase: None,
                 end_turn: None,
             },
             ResponseItem::Message {
@@ -6071,6 +6090,7 @@ mod tests {
                 content: vec![ContentItem::InputText {
                     text: "user 2".to_string(),
                 }],
+                phase: None,
                 end_turn: None,
             },
             ResponseItem::Reasoning {

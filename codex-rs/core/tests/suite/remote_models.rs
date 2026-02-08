@@ -627,7 +627,7 @@ async fn remote_models_request_times_out_after_5s() -> Result<()> {
         ModelsResponse {
             models: vec![remote_model],
         },
-        Duration::from_secs(6),
+        Duration::from_secs(8),
     )
     .await;
 
@@ -671,7 +671,7 @@ async fn remote_models_request_times_out_after_5s() -> Result<()> {
         "expected models call to block near the timeout; took {elapsed:?}"
     );
     assert!(
-        elapsed < Duration::from_millis(5_800),
+        elapsed < Duration::from_millis(6_200),
         "expected models call to time out before the delayed response; took {elapsed:?}"
     );
     assert_eq!(

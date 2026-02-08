@@ -1135,7 +1135,7 @@ mod tests {
         let (mut session, turn) = make_session_and_context().await;
         let manager = thread_manager();
         session.services.agent_control = manager.agent_control();
-        let config = turn.client.config().as_ref().clone();
+        let config = turn.config.as_ref().clone();
 
         let thread_a = manager
             .start_thread(config.clone())
@@ -1156,7 +1156,7 @@ mod tests {
             .submit(Op::Shutdown)
             .await
             .expect("shutdown should submit");
-        let _ = timeout(Duration::from_secs(1), async {
+        timeout(Duration::from_secs(1), async {
             loop {
                 if status_rx.borrow().clone() == AgentStatus::Shutdown {
                     break;
@@ -1181,7 +1181,9 @@ mod tests {
             .await
             .expect("wait should succeed");
         let ToolOutput::Function {
-            content, success, ..
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
         } = output
         else {
             panic!("expected function output");
@@ -1344,28 +1346,14 @@ mod tests {
 
     #[tokio::test]
     async fn build_agent_spawn_config_uses_subagent_instructions_and_strips_bloat() {
-        let (session, mut turn) = make_session_and_context().await;
-        let session_source = turn.client.get_session_source();
-        let mut base_config = (*turn.client.config()).clone();
+        let (_session, mut turn) = make_session_and_context().await;
+        let mut base_config = (*turn.config).clone();
         base_config.subagent_base_instructions = Some("subagent-base".to_string());
         base_config.user_instructions = Some("base-user".to_string());
         base_config.project_doc_max_bytes = 4096;
         turn.developer_instructions = Some("dev".to_string());
         turn.user_instructions = Some("resolved-user".to_string());
-
-        let transport_manager = turn.client.transport_manager();
-        turn.client = ModelClient::new(
-            Arc::new(base_config.clone()),
-            Some(session.services.auth_manager.clone()),
-            turn.client.get_model_info(),
-            turn.client.get_otel_manager(),
-            turn.client.get_provider(),
-            turn.client.get_reasoning_effort(),
-            turn.client.get_reasoning_summary(),
-            session.conversation_id,
-            session_source,
-            transport_manager,
-        );
+        turn.config = Arc::new(base_config);
 
         let base_instructions = BaseInstructions {
             text: "parent-base".to_string(),

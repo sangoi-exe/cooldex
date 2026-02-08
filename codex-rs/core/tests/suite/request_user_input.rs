@@ -23,6 +23,7 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::strip_call_id_prefix_line;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -43,7 +44,7 @@ fn call_output(req: &ResponsesRequest, call_id: &str) -> String {
         None => panic!("function_call_output present"),
     };
     match content_opt {
-        Some(content) => content,
+        Some(content) => strip_call_id_prefix_line(&content).to_string(),
         None => panic!("function_call_output content present"),
     }
 }
@@ -66,7 +67,7 @@ fn call_output_content_and_success(
         Some(content) => content,
         None => panic!("function_call_output content present"),
     };
-    (content, success)
+    (strip_call_id_prefix_line(&content).to_string(), success)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

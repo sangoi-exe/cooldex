@@ -64,6 +64,8 @@ pub(crate) fn builder_from_items(
         RolloutItem::ResponseItem(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
+        | RolloutItem::ContextInclusion(_)
+        | RolloutItem::ContextOverlay(_)
         | RolloutItem::EventMsg(_) => None,
     }) && let Some(builder) = builder_from_session_meta(session_meta, rollout_path)
     {

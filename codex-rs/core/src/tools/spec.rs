@@ -2309,7 +2309,7 @@ mod tests {
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
         });
-        let (tools, _) = build_specs(&tools_config, Some(HashMap::new())).build();
+        let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), &[]).build();
 
         assert_contains_tool_names(
             &tools,
