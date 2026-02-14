@@ -4,17 +4,24 @@ use std::fs;
 
 use anyhow::Result;
 use codex_core::CodexAuth;
+use codex_core::features::Feature;
+use codex_core::protocol::AskForApproval;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::ItemCompletedEvent;
 use codex_core::protocol::ItemStartedEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::RolloutItem;
 use codex_core::protocol::RolloutLine;
+use codex_core::protocol::SandboxPolicy;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
+use core_test_support::responses::mount_models_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
@@ -37,6 +44,20 @@ fn estimate_compact_input_tokens(request: &responses::ResponsesRequest) -> i64 {
 fn estimate_compact_payload_tokens(request: &responses::ResponsesRequest) -> i64 {
     estimate_compact_input_tokens(request)
         .saturating_add(approx_token_count(&request.instructions_text()))
+}
+
+const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status.";
+
+fn model_info_with_context_window(slug: &str, context_window: i64) -> ModelInfo {
+    let models_response: ModelsResponse =
+        serde_json::from_str(include_str!("../../models.json")).expect("valid models.json");
+    let mut model_info = models_response
+        .models
+        .into_iter()
+        .find(|model| model.slug == slug)
+        .unwrap_or_else(|| panic!("model `{slug}` missing from models.json"));
+    model_info.context_window = Some(context_window);
+    model_info
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -224,6 +245,247 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     let follow_up_body = responses_mock.single_request().body_json().to_string();
     assert!(follow_up_body.contains("REMOTE_COMPACTED_SUMMARY"));
     assert!(follow_up_body.contains("ENCRYPTED_COMPACTION_SUMMARY"));
+    assert!(
+        follow_up_body.contains(AUTO_COMPACT_RECON_WARNING),
+        "expected follow-up request to include hard auto-compact recon warning"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_auto_compact_warning_is_emitted_after_each_compaction() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = TestCodexHarness::with_builder(
+        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+
+    let responses_mock = responses::mount_sse_sequence(
+        harness.server(),
+        vec![
+            responses::sse(vec![
+                responses::ev_shell_command_call("m1", "echo 'first'"),
+                responses::ev_completed_with_tokens("resp-1", 100_000_000),
+            ]),
+            responses::sse(vec![
+                responses::ev_shell_command_call("m2", "echo 'second'"),
+                responses::ev_completed_with_tokens("resp-2", 100_000_000),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("m3", "ONE_SHOT_DONE"),
+                responses::ev_completed("resp-3"),
+            ]),
+        ],
+    )
+    .await;
+
+    let compacted_history = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "REMOTE_COMPACTED_SUMMARY".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        },
+        ResponseItem::Compaction {
+            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
+        },
+    ];
+    let compact_mock_1 = responses::mount_compact_json_once(
+        harness.server(),
+        serde_json::json!({ "output": compacted_history.clone() }),
+    )
+    .await;
+    let compact_mock_2 = responses::mount_compact_json_once(
+        harness.server(),
+        serde_json::json!({ "output": compacted_history }),
+    )
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "trigger one-shot auto-compact warning".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    assert_eq!(compact_mock_1.requests().len(), 1);
+    assert_eq!(compact_mock_2.requests().len(), 1);
+    let requests = responses_mock.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected three responses requests: before compact + two follow-ups"
+    );
+
+    let first_request_body = requests[0].body_json().to_string();
+    let second_request_body = requests[1].body_json().to_string();
+    let third_request_body = requests[2].body_json().to_string();
+
+    assert!(
+        !first_request_body.contains(AUTO_COMPACT_RECON_WARNING),
+        "request before auto-compact should not include recon warning"
+    );
+    assert!(
+        second_request_body.contains(AUTO_COMPACT_RECON_WARNING),
+        "first request after auto-compact should include recon warning"
+    );
+    assert!(
+        third_request_body.contains(AUTO_COMPACT_RECON_WARNING),
+        "second request after second auto-compact should include recon warning"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_pre_sampling_auto_compact_emits_warning_after_model_switch() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let previous_model = "gpt-5.2-codex";
+    let next_model = "gpt-5.1-codex-max";
+
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_model(previous_model)
+            .with_config(|config| {
+                config.features.enable(Feature::RemoteModels);
+                config.model_auto_compact_token_limit = Some(100_000);
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+
+    let _models_mock = mount_models_once(
+        harness.server(),
+        ModelsResponse {
+            models: vec![
+                model_info_with_context_window(previous_model, 273_000),
+                model_info_with_context_window(next_model, 125_000),
+            ],
+        },
+    )
+    .await;
+
+    let responses_mock = responses::mount_sse_sequence(
+        harness.server(),
+        vec![
+            responses::sse(vec![
+                responses::ev_assistant_message("m1", "before switch"),
+                responses::ev_completed_with_tokens("r1", 120_000),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("m2", "after switch"),
+                responses::ev_completed_with_tokens("r2", 100),
+            ]),
+        ],
+    )
+    .await;
+
+    let compacted_history = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "REMOTE_PRE_SAMPLING_COMPACTED_SUMMARY".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        },
+        ResponseItem::Compaction {
+            encrypted_content: "ENCRYPTED_PRE_SAMPLING_SUMMARY".to_string(),
+        },
+    ];
+    let compact_mock = responses::mount_compact_json_once(
+        harness.server(),
+        serde_json::json!({ "output": compacted_history }),
+    )
+    .await;
+
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "before switch".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: harness.test().cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: previous_model.to_string(),
+            effort: None,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "after switch".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: harness.test().cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: next_model.to_string(),
+            effort: None,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    assert_eq!(compact_mock.requests().len(), 1);
+
+    let requests = responses_mock.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected two responses requests: before and after pre-sampling remote compact"
+    );
+    assert_eq!(
+        requests[1]
+            .body_json()
+            .get("model")
+            .and_then(|value| value.as_str()),
+        Some(next_model),
+        "follow-up request should use the switched model"
+    );
+
+    let first_request_body = requests[0].body_json().to_string();
+    let second_request_body = requests[1].body_json().to_string();
+
+    assert!(
+        !first_request_body.contains(AUTO_COMPACT_RECON_WARNING),
+        "request before pre-sampling auto-compact should not include warning"
+    );
+    assert!(
+        second_request_body.contains("REMOTE_PRE_SAMPLING_COMPACTED_SUMMARY"),
+        "request after pre-sampling auto-compact should include compacted history"
+    );
+    assert!(
+        second_request_body.contains("ENCRYPTED_PRE_SAMPLING_SUMMARY"),
+        "request after pre-sampling auto-compact should include compaction item"
+    );
+    assert!(
+        second_request_body.contains(AUTO_COMPACT_RECON_WARNING),
+        "request after pre-sampling remote auto-compact should include warning"
+    );
 
     Ok(())
 }
@@ -505,7 +767,7 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
     let post_compact_turn_mock = mount_sse_once(
         harness.server(),
         sse(vec![
-            responses::ev_assistant_message("post-compact-assistant", "should not run"),
+            responses::ev_assistant_message("post-compact-assistant", "recovery turn ran"),
             responses::ev_completed("post-compact-response"),
         ]),
     )
@@ -543,6 +805,11 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
         error_message.contains("Error running remote compact task"),
         "expected compact failure error, got {error_message}"
     );
+    let compact_request_body = compact_mock.single_request().body_json().to_string();
+    assert!(
+        !compact_request_body.contains(AUTO_COMPACT_RECON_WARNING),
+        "failed compaction should not inject hard auto-compact recon warning"
+    );
     assert_eq!(
         compact_mock.requests().len(),
         1,
@@ -551,6 +818,31 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
     assert!(
         post_compact_turn_mock.requests().is_empty(),
         "expected agent loop to stop after compaction failure"
+    );
+
+    let manual_compact_mock = responses::mount_compact_json_once(
+        harness.server(),
+        serde_json::json!({
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        { "type": "output_text", "text": "manual compact summary after failure" }
+                    ]
+                }
+            ]
+        }),
+    )
+    .await;
+
+    codex.submit(Op::Compact).await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let recovery_request_body = manual_compact_mock.single_request().body_json().to_string();
+    assert!(
+        !recovery_request_body.contains(AUTO_COMPACT_RECON_WARNING),
+        "manual compact request after failed auto-compact should not inherit recon warning"
     );
 
     Ok(())

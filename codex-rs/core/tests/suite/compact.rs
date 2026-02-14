@@ -66,6 +66,7 @@ const FUNCTION_CALL_LIMIT_MSG: &str = "function call limit push";
 const POST_AUTO_USER_MSG: &str = "post auto follow-up";
 
 pub(super) const COMPACT_WARNING_MESSAGE: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
+const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status.";
 
 fn auto_summary(summary: &str) -> String {
     summary.to_string()
@@ -424,6 +425,11 @@ async fn manual_compact_uses_custom_prompt() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let body = response_mock.single_request().body_json();
+    let body_text = body.to_string();
+    assert!(
+        !body_contains_text(&body_text, AUTO_COMPACT_RECON_WARNING),
+        "manual /compact request should not include hard auto-compact recon warning"
+    );
 
     let input = body
         .get("input")
@@ -1412,6 +1418,90 @@ async fn auto_compact_emits_context_compaction_items() {
     let completed_item = completed_item.expect("context compaction item completed");
     assert_eq!(started_item.id, completed_item.id);
     assert!(legacy_event);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_auto_compact_does_not_emit_remote_warning() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let first_turn = sse(vec![
+        ev_local_shell_call("r1-shell", "completed", vec!["echo", "first"]),
+        ev_completed_with_tokens("r1", 270_000),
+    ]);
+    let compact_turn = sse(vec![
+        ev_assistant_message("m2", "LOCAL_AUTO_SUMMARY"),
+        ev_completed_with_tokens("r2", 100),
+    ]);
+    let post_compact_turn_1 = sse(vec![
+        ev_local_shell_call("r3-shell", "completed", vec!["echo", "second"]),
+        ev_completed_with_tokens("r3", 100),
+    ]);
+    let post_compact_turn_2 = sse(vec![
+        ev_assistant_message("m4", "LOCAL_ONE_SHOT_DONE"),
+        ev_completed_with_tokens("r4", 120),
+    ]);
+
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            first_turn,
+            compact_turn,
+            post_compact_turn_1,
+            post_compact_turn_2,
+        ],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_auto_compact_token_limit = Some(200_000);
+    });
+    let codex = builder.build(&server).await.unwrap().codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "trigger local one-shot auto-compact warning".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "expected four requests: first turn, compact turn, and two post-compact follow-ups"
+    );
+
+    let first_request_body = requests[0].body_json().to_string();
+    let compact_request_body = requests[1].body_json().to_string();
+    let post_compact_request_1_body = requests[2].body_json().to_string();
+    let post_compact_request_2_body = requests[3].body_json().to_string();
+
+    assert!(
+        !body_contains_text(&first_request_body, AUTO_COMPACT_RECON_WARNING),
+        "request before auto-compact should not include recon warning"
+    );
+    assert!(
+        !body_contains_text(&compact_request_body, AUTO_COMPACT_RECON_WARNING),
+        "auto-compact request itself should not include recon warning"
+    );
+    assert!(
+        !body_contains_text(&post_compact_request_1_body, AUTO_COMPACT_RECON_WARNING),
+        "local auto-compact should not include remote auto-compact warning"
+    );
+    assert!(
+        !body_contains_text(&post_compact_request_2_body, AUTO_COMPACT_RECON_WARNING),
+        "local auto-compact should not include remote auto-compact warning"
+    );
 }
 
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.

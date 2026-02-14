@@ -270,6 +270,7 @@ pub struct CodexSpawnOk {
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 64;
+const AUTO_COMPACT_RECON_WARNING_BODY: &str = "auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status.";
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
@@ -505,7 +506,7 @@ pub(crate) struct Session {
     pub(crate) conversation_id: ThreadId,
     tx_event: Sender<Event>,
     agent_status: watch::Sender<AgentStatus>,
-    state: Mutex<SessionState>,
+    pub(crate) state: Mutex<SessionState>,
     /// The set of enabled features should be invariant for the lifetime of the
     /// session.
     features: Features,
@@ -1386,7 +1387,11 @@ impl Session {
         turn_context: &TurnContext,
     ) -> Option<i64> {
         let state = self.state.lock().await;
-        state.history.estimate_token_count(turn_context)
+        let prompt_items =
+            state.prompt_snapshot_for_model(&turn_context.model_info.input_modalities);
+        let mut history = ContextManager::new();
+        history.replace(prompt_items);
+        history.estimate_token_count(turn_context)
     }
 
     pub(crate) async fn get_base_instructions(&self) -> BaseInstructions {
@@ -3033,6 +3038,9 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::Compact => {
                 handlers::compact(&sess, sub.id.clone()).await;
             }
+            Op::Sanitize => {
+                handlers::sanitize(&sess, sub.id.clone()).await;
+            }
             Op::DropMemories => {
                 handlers::drop_memories(&sess, &config, sub.id.clone()).await;
             }
@@ -3091,6 +3099,7 @@ mod handlers {
     use crate::review_prompts::resolve_review_request;
     use crate::rollout::session_index;
     use crate::tasks::CompactTask;
+    use crate::tasks::SanitizeTask;
     use crate::tasks::UndoTask;
     use crate::tasks::UserShellCommandMode;
     use crate::tasks::UserShellCommandTask;
@@ -3588,6 +3597,12 @@ mod handlers {
         .await;
     }
 
+    pub async fn sanitize(sess: &Arc<Session>, sub_id: String) {
+        let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+        sess.spawn_task(turn_context, Vec::new(), SanitizeTask::new())
+            .await;
+    }
+
     pub async fn drop_memories(sess: &Arc<Session>, config: &Arc<Config>, sub_id: String) {
         let mut errors = Vec::new();
 
@@ -4041,11 +4056,8 @@ pub(crate) async fn run_turn(
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, event).await;
-    if run_pre_sampling_compact(&sess, &turn_context)
-        .await
-        .is_err()
-    {
-        error!("Failed to run pre-sampling compact");
+    if let Err(err) = run_pre_sampling_compact(&sess, &turn_context).await {
+        error!("Failed to run pre-sampling compact: {err}");
         return None;
     }
 
@@ -4175,9 +4187,8 @@ pub(crate) async fn run_turn(
 
         // Construct the input that we will send to the model.
         let sampling_request_input: Vec<ResponseItem> = {
-            sess.clone_history()
-                .await
-                .for_prompt(&turn_context.model_info.input_modalities)
+            let state = sess.state.lock().await;
+            state.prompt_snapshot_for_model(&turn_context.model_info.input_modalities)
         };
 
         let sampling_request_input_messages = sampling_request_input
@@ -4197,6 +4208,7 @@ pub(crate) async fn run_turn(
             sampling_request_input,
             &explicitly_enabled_connectors,
             skills_outcome.as_ref(),
+            None,
             cancellation_token.child_token(),
         )
         .await
@@ -4343,6 +4355,8 @@ async fn maybe_run_previous_model_inline_compact(
 async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) -> CodexResult<()> {
     if should_use_remote_compact_task(&turn_context.provider) {
         run_inline_remote_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await?;
+        sess.record_model_warning(AUTO_COMPACT_RECON_WARNING_BODY, turn_context)
+            .await;
     } else {
         run_inline_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await?;
     }
@@ -4451,7 +4465,7 @@ fn codex_apps_connector_id(tool: &crate::mcp_connection_manager::ToolInfo) -> Op
         cwd = %turn_context.cwd.display()
     )
 )]
-async fn run_sampling_request(
+pub(crate) async fn run_sampling_request(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     turn_diff_tracker: SharedTurnDiffTracker,
@@ -4460,6 +4474,7 @@ async fn run_sampling_request(
     input: Vec<ResponseItem>,
     explicitly_enabled_connectors: &HashSet<String>,
     skills_outcome: Option<&SkillLoadOutcome>,
+    allowed_tool_names: Option<&HashSet<String>>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     let router = built_tools(
@@ -4474,8 +4489,16 @@ async fn run_sampling_request(
 
     let model_supports_parallel = turn_context.model_info.supports_parallel_tool_calls;
 
-    let tools =
+    let mut tools =
         crate::tools::spec::filter_tools_for_model(router.specs(), &turn_context.tools_config);
+    if let Some(allowed_tool_names) = allowed_tool_names {
+        tools.retain(|tool| allowed_tool_names.contains(tool_name(tool)));
+        if !allowed_tool_names.is_empty() && tools.is_empty() {
+            return Err(CodexErr::InvalidRequest(
+                "no allowed tools are available for this request".to_string(),
+            ));
+        }
+    }
     let base_instructions = sess.get_base_instructions().await;
 
     let prompt = Prompt {
@@ -4497,6 +4520,7 @@ async fn run_sampling_request(
             turn_metadata_header,
             Arc::clone(&turn_diff_tracker),
             &prompt,
+            allowed_tool_names,
             cancellation_token.child_token(),
         )
         .await
@@ -4577,6 +4601,19 @@ async fn run_sampling_request(
     }
 }
 
+fn tool_name(tool: &crate::client_common::tools::ToolSpec) -> &str {
+    match tool {
+        crate::client_common::tools::ToolSpec::Function(function_tool) => {
+            function_tool.name.as_str()
+        }
+        crate::client_common::tools::ToolSpec::LocalShell {} => "local_shell",
+        crate::client_common::tools::ToolSpec::WebSearch { .. } => "web_search",
+        crate::client_common::tools::ToolSpec::Freeform(freeform_tool) => {
+            freeform_tool.name.as_str()
+        }
+    }
+}
+
 async fn built_tools(
     sess: &Session,
     turn_context: &TurnContext,
@@ -4640,9 +4677,9 @@ async fn built_tools(
 }
 
 #[derive(Debug)]
-struct SamplingRequestResult {
-    needs_follow_up: bool,
-    last_agent_message: Option<String>,
+pub(crate) struct SamplingRequestResult {
+    pub(crate) needs_follow_up: bool,
+    pub(crate) last_agent_message: Option<String>,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -5056,6 +5093,7 @@ async fn try_run_sampling_request(
     turn_metadata_header: Option<&str>,
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
+    allowed_tool_names: Option<&HashSet<String>>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     let collaboration_mode = sess.current_collaboration_mode().await;
@@ -5103,6 +5141,7 @@ async fn try_run_sampling_request(
         Arc::clone(&sess),
         Arc::clone(&turn_context),
         Arc::clone(&turn_diff_tracker),
+        allowed_tool_names.cloned(),
     );
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
