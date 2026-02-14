@@ -1078,6 +1078,85 @@ fn create_js_repl_reset_tool() -> ToolSpec {
     })
 }
 
+fn create_manage_context_tool() -> ToolSpec {
+    let mut chunk_summary_properties = BTreeMap::new();
+    chunk_summary_properties.insert(
+        "chunk_id".to_string(),
+        JsonSchema::String {
+            description: Some("Identifier for a chunk from chunk_manifest.".to_string()),
+        },
+    );
+    chunk_summary_properties.insert(
+        "tool_context".to_string(),
+        JsonSchema::String {
+            description: Some("Condensed tool-facing context for this chunk.".to_string()),
+        },
+    );
+    chunk_summary_properties.insert(
+        "reasoning_context".to_string(),
+        JsonSchema::String {
+            description: Some("Condensed reasoning context for this chunk.".to_string()),
+        },
+    );
+    let chunk_summary_schema = JsonSchema::Object {
+        properties: chunk_summary_properties,
+        required: Some(vec![
+            "chunk_id".to_string(),
+            "tool_context".to_string(),
+            "reasoning_context".to_string(),
+        ]),
+        additional_properties: Some(false.into()),
+    };
+
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "mode".to_string(),
+        JsonSchema::String {
+            description: Some("Mode: retrieve | apply.".to_string()),
+        },
+    );
+    properties.insert(
+        "policy_id".to_string(),
+        JsonSchema::String {
+            description: Some("Required policy identifier for retrieve/apply.".to_string()),
+        },
+    );
+    properties.insert(
+        "plan_id".to_string(),
+        JsonSchema::String {
+            description: Some("Required for apply; obtained from retrieve.".to_string()),
+        },
+    );
+    properties.insert(
+        "state_hash".to_string(),
+        JsonSchema::String {
+            description: Some("Required for apply; anti-drift hash from retrieve.".to_string()),
+        },
+    );
+    properties.insert(
+        "chunk_summaries".to_string(),
+        JsonSchema::Array {
+            items: Box::new(chunk_summary_schema),
+            description: Some(
+                "Required for apply; one condensed summary object per selected chunk.".to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "manage_context".to_string(),
+        description:
+            "Manage long-session context using manage_context v2 retrieve/apply chunk contract."
+                .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["mode".to_string(), "policy_id".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_list_mcp_resources_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
@@ -1388,6 +1467,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::JsReplHandler;
     use crate::tools::handlers::JsReplResetHandler;
     use crate::tools::handlers::ListDirHandler;
+    use crate::tools::handlers::ManageContextHandler;
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::McpResourceHandler;
     use crate::tools::handlers::PlanHandler;
@@ -1409,6 +1489,7 @@ pub(crate) fn build_specs(
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let dynamic_tool_handler = Arc::new(DynamicToolHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
+    let manage_context_handler = Arc::new(ManageContextHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
     let shell_command_handler = Arc::new(ShellCommandHandler);
@@ -1547,6 +1628,8 @@ pub(crate) fn build_specs(
 
     builder.push_spec_with_parallel_support(create_view_image_tool(), true);
     builder.register_handler("view_image", view_image_handler);
+    builder.push_spec(create_manage_context_tool());
+    builder.register_handler("manage_context", manage_context_handler);
 
     if config.collab_tools {
         let collab_handler = Arc::new(CollabHandler);
@@ -1652,6 +1735,59 @@ mod tests {
         let parameters = serde_json::to_value(openai_tool.parameters).expect("serialize schema");
 
         assert_eq!(parameters.get("properties"), Some(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn manage_context_tool_contract_is_v2_only() {
+        let tool = create_manage_context_tool();
+        let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = tool else {
+            panic!("manage_context must be a function tool");
+        };
+
+        let JsonSchema::Object {
+            properties,
+            required,
+            additional_properties,
+        } = parameters
+        else {
+            panic!("manage_context parameters must be object schema");
+        };
+
+        for required_key in ["mode", "policy_id"] {
+            assert!(
+                required
+                    .as_ref()
+                    .is_some_and(|keys| keys.contains(&required_key.to_string())),
+                "missing required key: {required_key}"
+            );
+        }
+
+        for key in [
+            "mode",
+            "policy_id",
+            "plan_id",
+            "state_hash",
+            "chunk_summaries",
+        ] {
+            assert!(properties.contains_key(key), "missing v2 field: {key}");
+        }
+
+        for legacy_key in [
+            "snapshot_id",
+            "ops",
+            "allow_recent",
+            "include_prompt_preview",
+        ] {
+            assert!(
+                !properties.contains_key(legacy_key),
+                "legacy field should not exist: {legacy_key}"
+            );
+        }
+
+        assert_eq!(
+            additional_properties,
+            Some(AdditionalProperties::Boolean(false))
+        );
     }
 
     fn tool_name(tool: &ToolSpec) -> &str {
@@ -1796,6 +1932,7 @@ mod tests {
                 external_web_access: Some(true),
             },
             create_view_image_tool(),
+            create_manage_context_tool(),
         ] {
             expected.insert(tool_name(&spec).to_string(), spec);
         }
@@ -2007,6 +2144,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "manage_context",
             ],
         );
     }
@@ -2029,6 +2167,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "manage_context",
             ],
         );
     }
@@ -2053,6 +2192,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "manage_context",
             ],
         );
     }
@@ -2077,6 +2217,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "manage_context",
             ],
         );
     }
@@ -2099,6 +2240,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "manage_context",
             ],
         );
     }
@@ -2121,6 +2263,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "manage_context",
             ],
         );
     }
@@ -2142,6 +2285,7 @@ mod tests {
                 "request_user_input",
                 "web_search",
                 "view_image",
+                "manage_context",
             ],
         );
     }
@@ -2164,6 +2308,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "manage_context",
             ],
         );
     }
@@ -2188,6 +2333,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "manage_context",
             ],
         );
     }

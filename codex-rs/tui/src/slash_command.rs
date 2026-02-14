@@ -26,6 +26,7 @@ pub enum SlashCommand {
     Fork,
     Init,
     Compact,
+    Sanitize,
     Plan,
     Collab,
     Agent,
@@ -37,6 +38,7 @@ pub enum SlashCommand {
     Statusline,
     Mcp,
     Apps,
+    Accounts,
     Logout,
     Quit,
     Exit,
@@ -61,6 +63,7 @@ impl SlashCommand {
             SlashCommand::New => "start a new chat during a conversation",
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
+            SlashCommand::Sanitize => "sanitize context using manage_context",
             SlashCommand::Review => "review my current changes and find issues",
             SlashCommand::Rename => "rename the current thread",
             SlashCommand::Resume => "resume a saved chat",
@@ -88,6 +91,7 @@ impl SlashCommand {
             SlashCommand::Experimental => "toggle experimental features",
             SlashCommand::Mcp => "list configured MCP tools",
             SlashCommand::Apps => "manage apps",
+            SlashCommand::Accounts => "manage ChatGPT accounts",
             SlashCommand::Logout => "log out of Codex",
             SlashCommand::Rollout => "print the rollout file path",
             SlashCommand::TestApproval => "test approval request",
@@ -116,6 +120,7 @@ impl SlashCommand {
             | SlashCommand::Fork
             | SlashCommand::Init
             | SlashCommand::Compact
+            | SlashCommand::Sanitize
             // | SlashCommand::Undo
             | SlashCommand::Model
             | SlashCommand::Personality
@@ -125,7 +130,9 @@ impl SlashCommand {
             | SlashCommand::Experimental
             | SlashCommand::Review
             | SlashCommand::Plan
+            | SlashCommand::Accounts
             | SlashCommand::Logout
+            | SlashCommand::Statusline
             | SlashCommand::MemoryDrop
             | SlashCommand::MemoryUpdate => false,
             SlashCommand::Diff
@@ -145,7 +152,6 @@ impl SlashCommand {
             SlashCommand::TestApproval => true,
             SlashCommand::Collab => true,
             SlashCommand::Agent => true,
-            SlashCommand::Statusline => false,
         }
     }
 
@@ -163,4 +169,19 @@ pub fn built_in_slash_commands() -> Vec<(&'static str, SlashCommand)> {
         .filter(|command| command.is_visible())
         .map(|c| (c.command(), c))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SlashCommand;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn task_availability_preserves_existing_commands() {
+        assert_eq!(SlashCommand::DebugConfig.available_during_task(), true);
+        assert_eq!(SlashCommand::Clean.available_during_task(), true);
+        assert_eq!(SlashCommand::Sanitize.available_during_task(), false);
+        assert_eq!(SlashCommand::Accounts.available_during_task(), false);
+        assert_eq!(SlashCommand::Logout.available_during_task(), false);
+    }
 }

@@ -62,6 +62,12 @@ pub const USER_INSTRUCTIONS_OPEN_TAG: &str = "<user_instructions>";
 pub const USER_INSTRUCTIONS_CLOSE_TAG: &str = "</user_instructions>";
 pub const ENVIRONMENT_CONTEXT_OPEN_TAG: &str = "<environment_context>";
 pub const ENVIRONMENT_CONTEXT_CLOSE_TAG: &str = "</environment_context>";
+pub const TOOL_CONTEXT_OPEN_TAG: &str = "<tool_context>";
+pub const TOOL_CONTEXT_CLOSE_TAG: &str = "</tool_context>";
+pub const REASONING_CONTEXT_OPEN_TAG: &str = "<reasoning_context>";
+pub const REASONING_CONTEXT_CLOSE_TAG: &str = "</reasoning_context>";
+pub const PINNED_NOTES_OPEN_TAG: &str = "<pinned_notes>";
+pub const PINNED_NOTES_CLOSE_TAG: &str = "</pinned_notes>";
 pub const COLLABORATION_MODE_OPEN_TAG: &str = "<collaboration_mode>";
 pub const COLLABORATION_MODE_CLOSE_TAG: &str = "</collaboration_mode>";
 pub const USER_MESSAGE_BEGIN: &str = "## My request for Codex:";
@@ -289,6 +295,9 @@ pub enum Op {
     /// The agent will use its existing context (either conversation history or previous response id)
     /// to generate a summary which will be returned as an AgentMessage event.
     Compact,
+
+    /// Run an automated context sanitizer sub-agent.
+    Sanitize,
 
     /// Drop all persisted memory artifacts and memory-tracking DB rows.
     DropMemories,

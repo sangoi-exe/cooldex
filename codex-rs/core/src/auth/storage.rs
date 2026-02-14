@@ -6,6 +6,7 @@ use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -13,17 +14,24 @@ use std::io::Read;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
+use tempfile::NamedTempFile;
 use tracing::warn;
 
+use crate::protocol::RateLimitSnapshot;
 use crate::token_data::TokenData;
 use codex_app_server_protocol::AuthMode;
 use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
 use once_cell::sync::Lazy;
+use uuid::Uuid;
 
 /// Determine where Codex should store CLI auth credentials.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -40,7 +48,7 @@ pub enum AuthCredentialsStoreMode {
     Ephemeral,
 }
 
-/// Expected structure for $CODEX_HOME/auth.json.
+/// Legacy structure for `$CODEX_HOME/auth.json`.
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct AuthDotJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,8 +64,186 @@ pub struct AuthDotJson {
     pub last_refresh: Option<DateTime<Utc>>,
 }
 
+pub const AUTH_STORE_VERSION: u32 = 1;
+const AUTH_STORE_LOCKFILE_NAME: &str = "auth.json.lock";
+const AUTH_STORE_LOCK_MAX_RETRIES: usize = 20;
+const AUTH_STORE_LOCK_RETRY_SLEEP: Duration = Duration::from_millis(100);
+
+/// Versioned auth store for `$CODEX_HOME/auth.json`.
+///
+/// The legacy `AuthDotJson` format is still accepted on load and is migrated
+/// into this structure in-memory.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+pub struct AuthStore {
+    pub version: u32,
+
+    #[serde(
+        rename = "OPENAI_API_KEY",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub openai_api_key: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_account_id: Option<String>,
+
+    #[serde(default)]
+    pub accounts: Vec<StoredAccount>,
+}
+
+impl Default for AuthStore {
+    fn default() -> Self {
+        Self {
+            version: AUTH_STORE_VERSION,
+            openai_api_key: None,
+            active_account_id: None,
+            accounts: Vec::new(),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+pub struct StoredAccount {
+    pub id: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+
+    pub tokens: TokenData,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refresh: Option<DateTime<Utc>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AccountUsageCache>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Default)]
+pub struct AccountUsageCache {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rate_limits: Option<RateLimitSnapshot>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted_until: Option<DateTime<Utc>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<DateTime<Utc>>,
+}
+
+impl AuthStore {
+    pub fn validate(&self) -> std::io::Result<()> {
+        if self.version != AUTH_STORE_VERSION {
+            return Err(std::io::Error::other(format!(
+                "unsupported auth store version {} (expected {AUTH_STORE_VERSION})",
+                self.version
+            )));
+        }
+
+        let mut ids = HashSet::with_capacity(self.accounts.len());
+        for account in &self.accounts {
+            if !ids.insert(account.id.as_str()) {
+                return Err(std::io::Error::other(format!(
+                    "duplicate auth account id '{}'",
+                    account.id
+                )));
+            }
+        }
+
+        match self.active_account_id.as_deref() {
+            Some(active) => {
+                if !ids.contains(active) {
+                    return Err(std::io::Error::other(format!(
+                        "active_account_id '{active}' does not exist in stored accounts",
+                    )));
+                }
+            }
+            None => {
+                if !self.accounts.is_empty() {
+                    return Err(std::io::Error::other(
+                        "active_account_id must be set when accounts are present",
+                    ));
+                }
+            }
+        }
+
+        if self.accounts.is_empty() && self.active_account_id.is_some() {
+            return Err(std::io::Error::other(
+                "active_account_id must be unset when accounts are empty",
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn from_legacy(legacy: AuthDotJson) -> Self {
+        let mut store = AuthStore {
+            version: AUTH_STORE_VERSION,
+            openai_api_key: legacy.openai_api_key,
+            active_account_id: None,
+            accounts: Vec::new(),
+        };
+
+        if let Some(tokens) = legacy.tokens {
+            let id = tokens
+                .account_id
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            store.accounts.push(StoredAccount {
+                id: id.clone(),
+                label: None,
+                tokens,
+                last_refresh: legacy.last_refresh,
+                usage: None,
+            });
+            store.active_account_id = Some(id);
+        }
+
+        store
+    }
+}
+
 pub(super) fn get_auth_file(codex_home: &Path) -> PathBuf {
     codex_home.join("auth.json")
+}
+
+#[derive(Debug)]
+pub(super) struct AuthStoreLock {
+    _file: File,
+}
+
+pub(super) fn lock_auth_store(codex_home: &Path) -> std::io::Result<AuthStoreLock> {
+    std::fs::create_dir_all(codex_home)?;
+    let canonical = codex_home
+        .canonicalize()
+        .unwrap_or_else(|_| codex_home.to_path_buf());
+    let lock_file_path = canonical.join(AUTH_STORE_LOCKFILE_NAME);
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+
+    let lock_file = options.open(&lock_file_path)?;
+
+    for _ in 0..AUTH_STORE_LOCK_MAX_RETRIES {
+        match lock_file.try_lock() {
+            Ok(()) => return Ok(AuthStoreLock { _file: lock_file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                thread::sleep(AUTH_STORE_LOCK_RETRY_SLEEP);
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!(
+            "could not acquire exclusive lock on auth store after multiple attempts (lock file: {})",
+            lock_file_path.display()
+        ),
+    ))
 }
 
 pub(super) fn delete_file_if_exists(codex_home: &Path) -> std::io::Result<bool> {
@@ -70,8 +256,8 @@ pub(super) fn delete_file_if_exists(codex_home: &Path) -> std::io::Result<bool> 
 }
 
 pub(super) trait AuthStorageBackend: Debug + Send + Sync {
-    fn load(&self) -> std::io::Result<Option<AuthDotJson>>;
-    fn save(&self, auth: &AuthDotJson) -> std::io::Result<()>;
+    fn load(&self) -> std::io::Result<Option<AuthStore>>;
+    fn save(&self, auth: &AuthStore) -> std::io::Result<()>;
     fn delete(&self) -> std::io::Result<bool>;
 }
 
@@ -86,44 +272,45 @@ impl FileAuthStorage {
     }
 
     /// Attempt to read and parse the `auth.json` file in the given `CODEX_HOME` directory.
-    /// Returns the full AuthDotJson structure.
-    pub(super) fn try_read_auth_json(&self, auth_file: &Path) -> std::io::Result<AuthDotJson> {
+    pub(super) fn try_read_auth_store(&self, auth_file: &Path) -> std::io::Result<AuthStore> {
         let mut file = File::open(auth_file)?;
         let mut contents = String::new();
         file.read_to_string(&mut contents)?;
-        let auth_dot_json: AuthDotJson = serde_json::from_str(&contents)?;
-
-        Ok(auth_dot_json)
+        parse_auth_store(&contents)
     }
 }
 
 impl AuthStorageBackend for FileAuthStorage {
-    fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
+    fn load(&self) -> std::io::Result<Option<AuthStore>> {
         let auth_file = get_auth_file(&self.codex_home);
-        let auth_dot_json = match self.try_read_auth_json(&auth_file) {
+        let store = match self.try_read_auth_store(&auth_file) {
             Ok(auth) => auth,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
-        Ok(Some(auth_dot_json))
+        Ok(Some(store))
     }
 
-    fn save(&self, auth_dot_json: &AuthDotJson) -> std::io::Result<()> {
+    fn save(&self, store: &AuthStore) -> std::io::Result<()> {
         let auth_file = get_auth_file(&self.codex_home);
 
-        if let Some(parent) = auth_file.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let json_data = serde_json::to_string_pretty(auth_dot_json)?;
-        let mut options = OpenOptions::new();
-        options.truncate(true).write(true).create(true);
+        let parent = auth_file.parent().ok_or(std::io::Error::other(format!(
+            "auth file path '{}' has no parent directory",
+            auth_file.display()
+        )))?;
+        std::fs::create_dir_all(parent)?;
+        let json_data = serde_json::to_string_pretty(store)?;
+
+        let mut tmp = NamedTempFile::new_in(parent)?;
         #[cfg(unix)]
         {
-            options.mode(0o600);
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600))?;
         }
-        let mut file = options.open(auth_file)?;
-        file.write_all(json_data.as_bytes())?;
-        file.flush()?;
+
+        tmp.as_file_mut().write_all(json_data.as_bytes())?;
+        tmp.as_file_mut().flush()?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&auth_file)?;
         Ok(())
     }
 
@@ -162,13 +349,9 @@ impl KeyringAuthStorage {
         }
     }
 
-    fn load_from_keyring(&self, key: &str) -> std::io::Result<Option<AuthDotJson>> {
+    fn load_from_keyring(&self, key: &str) -> std::io::Result<Option<AuthStore>> {
         match self.keyring_store.load(KEYRING_SERVICE, key) {
-            Ok(Some(serialized)) => serde_json::from_str(&serialized).map(Some).map_err(|err| {
-                std::io::Error::other(format!(
-                    "failed to deserialize CLI auth from keyring: {err}"
-                ))
-            }),
+            Ok(Some(serialized)) => parse_auth_store(&serialized).map(Some),
             Ok(None) => Ok(None),
             Err(error) => Err(std::io::Error::other(format!(
                 "failed to load CLI auth from keyring: {}",
@@ -193,15 +376,15 @@ impl KeyringAuthStorage {
 }
 
 impl AuthStorageBackend for KeyringAuthStorage {
-    fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
+    fn load(&self) -> std::io::Result<Option<AuthStore>> {
         let key = compute_store_key(&self.codex_home)?;
         self.load_from_keyring(&key)
     }
 
-    fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
+    fn save(&self, store: &AuthStore) -> std::io::Result<()> {
         let key = compute_store_key(&self.codex_home)?;
         // Simpler error mapping per style: prefer method reference over closure
-        let serialized = serde_json::to_string(auth).map_err(std::io::Error::other)?;
+        let serialized = serde_json::to_string(store).map_err(std::io::Error::other)?;
         self.save_to_keyring(&key, &serialized)?;
         if let Err(err) = delete_file_if_exists(&self.codex_home) {
             warn!("failed to remove CLI auth fallback file: {err}");
@@ -238,7 +421,7 @@ impl AutoAuthStorage {
 }
 
 impl AuthStorageBackend for AutoAuthStorage {
-    fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
+    fn load(&self) -> std::io::Result<Option<AuthStore>> {
         match self.keyring_storage.load() {
             Ok(Some(auth)) => Ok(Some(auth)),
             Ok(None) => self.file_storage.load(),
@@ -249,7 +432,7 @@ impl AuthStorageBackend for AutoAuthStorage {
         }
     }
 
-    fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
+    fn save(&self, auth: &AuthStore) -> std::io::Result<()> {
         match self.keyring_storage.save(auth) {
             Ok(()) => Ok(()),
             Err(err) => {
@@ -265,8 +448,8 @@ impl AuthStorageBackend for AutoAuthStorage {
     }
 }
 
-// A global in-memory store for mapping codex_home -> AuthDotJson.
-static EPHEMERAL_AUTH_STORE: Lazy<Mutex<HashMap<String, AuthDotJson>>> =
+// A global in-memory store for mapping codex_home -> AuthStore.
+static EPHEMERAL_AUTH_STORE: Lazy<Mutex<HashMap<String, AuthStore>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Debug)]
@@ -281,7 +464,7 @@ impl EphemeralAuthStorage {
 
     fn with_store<F, T>(&self, action: F) -> std::io::Result<T>
     where
-        F: FnOnce(&mut HashMap<String, AuthDotJson>, String) -> std::io::Result<T>,
+        F: FnOnce(&mut HashMap<String, AuthStore>, String) -> std::io::Result<T>,
     {
         let key = compute_store_key(&self.codex_home)?;
         let mut store = EPHEMERAL_AUTH_STORE
@@ -292,11 +475,11 @@ impl EphemeralAuthStorage {
 }
 
 impl AuthStorageBackend for EphemeralAuthStorage {
-    fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
+    fn load(&self) -> std::io::Result<Option<AuthStore>> {
         self.with_store(|store, key| Ok(store.get(&key).cloned()))
     }
 
-    fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
+    fn save(&self, auth: &AuthStore) -> std::io::Result<()> {
         self.with_store(|store, key| {
             store.insert(key, auth.clone());
             Ok(())
@@ -314,6 +497,21 @@ pub(super) fn create_auth_storage(
 ) -> Arc<dyn AuthStorageBackend> {
     let keyring_store: Arc<dyn KeyringStore> = Arc::new(DefaultKeyringStore);
     create_auth_storage_with_keyring_store(codex_home, mode, keyring_store)
+}
+
+fn parse_auth_store(contents: &str) -> std::io::Result<AuthStore> {
+    match serde_json::from_str::<AuthStore>(contents) {
+        Ok(store) => {
+            store.validate()?;
+            Ok(store)
+        }
+        Err(_) => {
+            let legacy: AuthDotJson = serde_json::from_str(contents).map_err(|err| {
+                std::io::Error::other(format!("failed to parse auth.json: {err}"))
+            })?;
+            Ok(AuthStore::from_legacy(legacy))
+        }
+    }
 }
 
 fn create_auth_storage_with_keyring_store(
@@ -334,70 +532,86 @@ fn create_auth_storage_with_keyring_store(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::token_data::IdTokenInfo;
     use anyhow::Context;
-    use base64::Engine;
     use pretty_assertions::assert_eq;
-    use serde_json::json;
     use tempfile::tempdir;
 
     use codex_keyring_store::tests::MockKeyringStore;
     use keyring::Error as KeyringError;
 
     #[tokio::test]
-    async fn file_storage_load_returns_auth_dot_json() -> anyhow::Result<()> {
+    async fn file_storage_load_returns_auth_store() -> anyhow::Result<()> {
         let codex_home = tempdir()?;
         let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
-        let auth_dot_json = AuthDotJson {
-            auth_mode: Some(AuthMode::ApiKey),
+        let store = AuthStore {
             openai_api_key: Some("test-key".to_string()),
-            tokens: None,
-            last_refresh: Some(Utc::now()),
+            ..AuthStore::default()
         };
 
-        storage
-            .save(&auth_dot_json)
-            .context("failed to save auth file")?;
+        storage.save(&store).context("failed to save auth file")?;
 
         let loaded = storage.load().context("failed to load auth file")?;
-        assert_eq!(Some(auth_dot_json), loaded);
+        assert_eq!(Some(store), loaded);
         Ok(())
     }
 
     #[tokio::test]
-    async fn file_storage_save_persists_auth_dot_json() -> anyhow::Result<()> {
+    async fn file_storage_save_persists_auth_store() -> anyhow::Result<()> {
         let codex_home = tempdir()?;
         let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
-        let auth_dot_json = AuthDotJson {
-            auth_mode: Some(AuthMode::ApiKey),
+        let store = AuthStore {
             openai_api_key: Some("test-key".to_string()),
-            tokens: None,
+            ..AuthStore::default()
+        };
+
+        let file = get_auth_file(codex_home.path());
+        storage.save(&store).context("failed to save auth file")?;
+
+        let same_store = storage
+            .try_read_auth_store(&file)
+            .context("failed to read auth file after save")?;
+        assert_eq!(store, same_store);
+        Ok(())
+    }
+
+    #[test]
+    fn file_storage_load_migrates_legacy_auth_dot_json() -> anyhow::Result<()> {
+        let codex_home = tempdir()?;
+        let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+        let id_token_raw = "e30.eyJzdWIiOiJ1c2VyIn0.sig";
+        let id_token = crate::token_data::parse_chatgpt_jwt_claims(id_token_raw)
+            .expect("minimal JWT should parse");
+        let legacy = AuthDotJson {
+            auth_mode: None,
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token,
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("acct".to_string()),
+            }),
             last_refresh: Some(Utc::now()),
         };
 
         let file = get_auth_file(codex_home.path());
-        storage
-            .save(&auth_dot_json)
-            .context("failed to save auth file")?;
+        std::fs::write(&file, serde_json::to_string_pretty(&legacy)?)?;
 
-        let same_auth_dot_json = storage
-            .try_read_auth_json(&file)
-            .context("failed to read auth file after save")?;
-        assert_eq!(auth_dot_json, same_auth_dot_json);
+        let loaded = storage.load()?.context("store should load")?;
+        assert_eq!(loaded.active_account_id.as_deref(), Some("acct"));
+        assert_eq!(loaded.accounts.len(), 1);
+        assert_eq!(loaded.accounts[0].tokens.access_token, "access");
         Ok(())
     }
 
     #[test]
     fn file_storage_delete_removes_auth_file() -> anyhow::Result<()> {
         let dir = tempdir()?;
-        let auth_dot_json = AuthDotJson {
-            auth_mode: Some(AuthMode::ApiKey),
+        let store = AuthStore {
             openai_api_key: Some("sk-test-key".to_string()),
-            tokens: None,
-            last_refresh: None,
+            ..AuthStore::default()
         };
         let storage = create_auth_storage(dir.path().to_path_buf(), AuthCredentialsStoreMode::File);
-        storage.save(&auth_dot_json)?;
+        storage.save(&store)?;
         assert!(dir.path().join("auth.json").exists());
         let storage = FileAuthStorage::new(dir.path().to_path_buf());
         let removed = storage.delete()?;
@@ -413,16 +627,14 @@ mod tests {
             dir.path().to_path_buf(),
             AuthCredentialsStoreMode::Ephemeral,
         );
-        let auth_dot_json = AuthDotJson {
-            auth_mode: Some(AuthMode::ApiKey),
+        let store = AuthStore {
             openai_api_key: Some("sk-ephemeral".to_string()),
-            tokens: None,
-            last_refresh: Some(Utc::now()),
+            ..AuthStore::default()
         };
 
-        storage.save(&auth_dot_json)?;
+        storage.save(&store)?;
         let loaded = storage.load()?;
-        assert_eq!(Some(auth_dot_json), loaded);
+        assert_eq!(Some(store), loaded);
 
         let removed = storage.delete()?;
         assert!(removed);
@@ -450,13 +662,13 @@ mod tests {
     fn seed_keyring_with_auth<F>(
         mock_keyring: &MockKeyringStore,
         compute_key: F,
-        auth: &AuthDotJson,
+        store: &AuthStore,
     ) -> anyhow::Result<()>
     where
         F: FnOnce() -> std::io::Result<String>,
     {
         let key = compute_key()?;
-        let serialized = serde_json::to_string(auth)?;
+        let serialized = serde_json::to_string(store)?;
         mock_keyring.save(KEYRING_SERVICE, &key, &serialized)?;
         Ok(())
     }
@@ -465,7 +677,7 @@ mod tests {
         mock_keyring: &MockKeyringStore,
         key: &str,
         codex_home: &Path,
-        expected: &AuthDotJson,
+        expected: &AuthStore,
     ) {
         let saved_value = mock_keyring
             .saved_value(key)
@@ -479,43 +691,10 @@ mod tests {
         );
     }
 
-    fn id_token_with_prefix(prefix: &str) -> IdTokenInfo {
-        #[derive(Serialize)]
-        struct Header {
-            alg: &'static str,
-            typ: &'static str,
-        }
-
-        let header = Header {
-            alg: "none",
-            typ: "JWT",
-        };
-        let payload = json!({
-            "email": format!("{prefix}@example.com"),
-            "https://api.openai.com/auth": {
-                "chatgpt_account_id": format!("{prefix}-account"),
-            },
-        });
-        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-        let header_b64 = encode(&serde_json::to_vec(&header).expect("serialize header"));
-        let payload_b64 = encode(&serde_json::to_vec(&payload).expect("serialize payload"));
-        let signature_b64 = encode(b"sig");
-        let fake_jwt = format!("{header_b64}.{payload_b64}.{signature_b64}");
-
-        crate::token_data::parse_chatgpt_jwt_claims(&fake_jwt).expect("fake JWT should parse")
-    }
-
-    fn auth_with_prefix(prefix: &str) -> AuthDotJson {
-        AuthDotJson {
-            auth_mode: Some(AuthMode::ApiKey),
+    fn store_with_prefix(prefix: &str) -> AuthStore {
+        AuthStore {
             openai_api_key: Some(format!("{prefix}-api-key")),
-            tokens: Some(TokenData {
-                id_token: id_token_with_prefix(prefix),
-                access_token: format!("{prefix}-access"),
-                refresh_token: format!("{prefix}-refresh"),
-                account_id: Some(format!("{prefix}-account-id")),
-            }),
-            last_refresh: None,
+            ..AuthStore::default()
         }
     }
 
@@ -527,11 +706,9 @@ mod tests {
             codex_home.path().to_path_buf(),
             Arc::new(mock_keyring.clone()),
         );
-        let expected = AuthDotJson {
-            auth_mode: Some(AuthMode::ApiKey),
+        let expected = AuthStore {
             openai_api_key: Some("sk-test".to_string()),
-            tokens: None,
-            last_refresh: None,
+            ..AuthStore::default()
         };
         seed_keyring_with_auth(
             &mock_keyring,
@@ -564,16 +741,22 @@ mod tests {
         );
         let auth_file = get_auth_file(codex_home.path());
         std::fs::write(&auth_file, "stale")?;
-        let auth = AuthDotJson {
-            auth_mode: Some(AuthMode::Chatgpt),
+        let auth = AuthStore {
             openai_api_key: None,
-            tokens: Some(TokenData {
-                id_token: Default::default(),
-                access_token: "access".to_string(),
-                refresh_token: "refresh".to_string(),
-                account_id: Some("account".to_string()),
-            }),
-            last_refresh: Some(Utc::now()),
+            active_account_id: Some("account".to_string()),
+            accounts: vec![StoredAccount {
+                id: "account".to_string(),
+                label: None,
+                tokens: TokenData {
+                    id_token: Default::default(),
+                    access_token: "access".to_string(),
+                    refresh_token: "refresh".to_string(),
+                    account_id: Some("account".to_string()),
+                },
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            }],
+            ..AuthStore::default()
         };
 
         storage.save(&auth)?;
@@ -624,14 +807,14 @@ mod tests {
             codex_home.path().to_path_buf(),
             Arc::new(mock_keyring.clone()),
         );
-        let keyring_auth = auth_with_prefix("keyring");
+        let keyring_auth = store_with_prefix("keyring");
         seed_keyring_with_auth(
             &mock_keyring,
             || compute_store_key(codex_home.path()),
             &keyring_auth,
         )?;
 
-        let file_auth = auth_with_prefix("file");
+        let file_auth = store_with_prefix("file");
         storage.file_storage.save(&file_auth)?;
 
         let loaded = storage.load()?;
@@ -645,7 +828,7 @@ mod tests {
         let mock_keyring = MockKeyringStore::default();
         let storage = AutoAuthStorage::new(codex_home.path().to_path_buf(), Arc::new(mock_keyring));
 
-        let expected = auth_with_prefix("file-only");
+        let expected = store_with_prefix("file-only");
         storage.file_storage.save(&expected)?;
 
         let loaded = storage.load()?;
@@ -664,7 +847,7 @@ mod tests {
         let key = compute_store_key(codex_home.path())?;
         mock_keyring.set_error(&key, KeyringError::Invalid("error".into(), "load".into()));
 
-        let expected = auth_with_prefix("fallback");
+        let expected = store_with_prefix("fallback");
         storage.file_storage.save(&expected)?;
 
         let loaded = storage.load()?;
@@ -682,10 +865,10 @@ mod tests {
         );
         let key = compute_store_key(codex_home.path())?;
 
-        let stale = auth_with_prefix("stale");
+        let stale = store_with_prefix("stale");
         storage.file_storage.save(&stale)?;
 
-        let expected = auth_with_prefix("to-save");
+        let expected = store_with_prefix("to-save");
         storage.save(&expected)?;
 
         assert_keyring_saved_auth_and_removed_fallback(
@@ -708,7 +891,7 @@ mod tests {
         let key = compute_store_key(codex_home.path())?;
         mock_keyring.set_error(&key, KeyringError::Invalid("error".into(), "save".into()));
 
-        let auth = auth_with_prefix("fallback");
+        let auth = store_with_prefix("fallback");
         storage.save(&auth)?;
 
         let auth_file = get_auth_file(codex_home.path());

@@ -64,6 +64,7 @@ pub(crate) struct MentionBinding {
 }
 mod chat_composer;
 mod chat_composer_history;
+mod chatgpt_add_account_view;
 mod command_popup;
 pub mod custom_prompt_view;
 mod experimental_features_view;
@@ -125,6 +126,8 @@ pub(crate) enum CancellationEvent {
 pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::ChatComposerConfig;
 pub(crate) use chat_composer::InputResult;
+pub(crate) use chatgpt_add_account_view::ChatGptAddAccountSharedState;
+pub(crate) use chatgpt_add_account_view::ChatGptAddAccountView;
 use codex_protocol::custom_prompts::CustomPrompt;
 
 use crate::status_indicator_widget::StatusIndicatorWidget;

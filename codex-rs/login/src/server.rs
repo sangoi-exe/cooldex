@@ -14,10 +14,9 @@ use crate::pkce::PkceCodes;
 use crate::pkce::generate_pkce;
 use base64::Engine;
 use chrono::Utc;
-use codex_app_server_protocol::AuthMode;
 use codex_core::auth::AuthCredentialsStoreMode;
-use codex_core::auth::AuthDotJson;
-use codex_core::auth::save_auth;
+use codex_core::auth::StoredAccount;
+use codex_core::auth::update_auth_store;
 use codex_core::default_client::originator;
 use codex_core::token_data::TokenData;
 use codex_core::token_data::parse_chatgpt_jwt_claims;
@@ -559,13 +558,38 @@ pub(crate) async fn persist_tokens_async(
         {
             tokens.account_id = Some(acc.to_string());
         }
-        let auth = AuthDotJson {
-            auth_mode: Some(AuthMode::Chatgpt),
-            openai_api_key: api_key,
-            tokens: Some(tokens),
-            last_refresh: Some(Utc::now()),
-        };
-        save_auth(&codex_home, &auth, auth_credentials_store_mode)
+        let account_id = tokens
+            .account_id
+            .clone()
+            .unwrap_or_else(|| format!("account-{}", Utc::now().timestamp_millis()));
+        let now = Utc::now();
+
+        update_auth_store(&codex_home, auth_credentials_store_mode, move |store| {
+            store.openai_api_key = api_key.clone();
+
+            match store
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == account_id)
+            {
+                Some(account) => {
+                    account.tokens = tokens.clone();
+                    account.last_refresh = Some(now);
+                }
+                None => {
+                    store.accounts.push(StoredAccount {
+                        id: account_id.clone(),
+                        label: None,
+                        tokens: tokens.clone(),
+                        last_refresh: Some(now),
+                        usage: None,
+                    });
+                }
+            }
+
+            store.active_account_id = Some(account_id.clone());
+            Ok(())
+        })
     })
     .await
     .map_err(|e| io::Error::other(format!("persist task failed: {e}")))?
@@ -720,4 +744,115 @@ pub(crate) async fn obtain_api_key(
     }
     let body: ExchangeResp = resp.json().await.map_err(io::Error::other)?;
     Ok(body.access_token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuthCredentialsStoreMode;
+    use super::persist_tokens_async;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use codex_core::auth::load_auth_store;
+    use tempfile::tempdir;
+
+    fn id_token(email: &str, account_id: &str) -> String {
+        let header = serde_json::json!({"alg":"HS256","typ":"JWT"});
+        let payload = serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+            }
+        });
+        format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(header.to_string()),
+            URL_SAFE_NO_PAD.encode(payload.to_string()),
+            URL_SAFE_NO_PAD.encode("sig")
+        )
+    }
+
+    #[tokio::test]
+    async fn persist_tokens_async_preserves_existing_accounts() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path();
+        let mode = AuthCredentialsStoreMode::File;
+
+        persist_tokens_async(
+            codex_home,
+            None,
+            id_token("work@example.com", "acc-work"),
+            "access-work".to_string(),
+            "refresh-work".to_string(),
+            mode,
+        )
+        .await
+        .expect("persist first account");
+
+        persist_tokens_async(
+            codex_home,
+            None,
+            id_token("personal@example.com", "acc-personal"),
+            "access-personal".to_string(),
+            "refresh-personal".to_string(),
+            mode,
+        )
+        .await
+        .expect("persist second account");
+
+        let store = load_auth_store(codex_home, mode)
+            .expect("load auth store")
+            .expect("auth store should exist");
+
+        assert_eq!(store.accounts.len(), 2);
+        assert_eq!(store.active_account_id.as_deref(), Some("acc-personal"));
+        assert!(
+            store
+                .accounts
+                .iter()
+                .any(|account| account.id == "acc-work")
+        );
+        assert!(
+            store
+                .accounts
+                .iter()
+                .any(|account| account.id == "acc-personal")
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_tokens_async_clears_stale_api_key_when_missing() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path();
+        let mode = AuthCredentialsStoreMode::File;
+
+        persist_tokens_async(
+            codex_home,
+            Some("sk-test".to_string()),
+            id_token("work@example.com", "acc-work"),
+            "access-work".to_string(),
+            "refresh-work".to_string(),
+            mode,
+        )
+        .await
+        .expect("persist first account");
+
+        persist_tokens_async(
+            codex_home,
+            None,
+            id_token("personal@example.com", "acc-personal"),
+            "access-personal".to_string(),
+            "refresh-personal".to_string(),
+            mode,
+        )
+        .await
+        .expect("persist second account");
+
+        let store = load_auth_store(codex_home, mode)
+            .expect("load auth store")
+            .expect("auth store should exist");
+
+        assert_eq!(store.openai_api_key, None);
+        assert_eq!(store.accounts.len(), 2);
+        assert_eq!(store.active_account_id.as_deref(), Some("acc-personal"));
+    }
 }

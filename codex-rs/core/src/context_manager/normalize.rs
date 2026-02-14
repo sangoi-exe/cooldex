@@ -101,6 +101,84 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
     }
 }
 
+/// Prompt-level invariant repair: insert lightweight placeholder outputs for
+/// call items that were kept while their outputs were excluded.
+pub(crate) fn ensure_call_outputs_present_lenient(items: &mut Vec<ResponseItem>) {
+    const PLACEHOLDER: &str = "[codex] tool output omitted";
+
+    let mut function_call_output_ids: HashSet<String> = HashSet::new();
+    let mut custom_tool_call_output_ids: HashSet<String> = HashSet::new();
+
+    for item in items.iter() {
+        match item {
+            ResponseItem::FunctionCallOutput { call_id, .. } => {
+                function_call_output_ids.insert(call_id.clone());
+            }
+            ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                custom_tool_call_output_ids.insert(call_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    let mut missing_outputs_to_insert: Vec<(usize, ResponseItem)> = Vec::new();
+
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            ResponseItem::FunctionCall { call_id, .. } => {
+                if !function_call_output_ids.contains(call_id) {
+                    function_call_output_ids.insert(call_id.clone());
+                    missing_outputs_to_insert.push((
+                        index,
+                        ResponseItem::FunctionCallOutput {
+                            call_id: call_id.clone(),
+                            output: FunctionCallOutputPayload {
+                                body: FunctionCallOutputBody::Text(PLACEHOLDER.to_string()),
+                                ..Default::default()
+                            },
+                        },
+                    ));
+                }
+            }
+            ResponseItem::CustomToolCall { call_id, .. } => {
+                if !custom_tool_call_output_ids.contains(call_id) {
+                    custom_tool_call_output_ids.insert(call_id.clone());
+                    missing_outputs_to_insert.push((
+                        index,
+                        ResponseItem::CustomToolCallOutput {
+                            call_id: call_id.clone(),
+                            output: PLACEHOLDER.to_string(),
+                        },
+                    ));
+                }
+            }
+            ResponseItem::LocalShellCall {
+                call_id: Some(call_id),
+                ..
+            } => {
+                if !function_call_output_ids.contains(call_id) {
+                    function_call_output_ids.insert(call_id.clone());
+                    missing_outputs_to_insert.push((
+                        index,
+                        ResponseItem::FunctionCallOutput {
+                            call_id: call_id.clone(),
+                            output: FunctionCallOutputPayload {
+                                body: FunctionCallOutputBody::Text(PLACEHOLDER.to_string()),
+                                ..Default::default()
+                            },
+                        },
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (index, output_item) in missing_outputs_to_insert.into_iter().rev() {
+        items.insert(index + 1, output_item);
+    }
+}
+
 pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
     let function_call_ids: HashSet<String> = items
         .iter()
@@ -148,6 +226,46 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
                 ));
             }
             has_match
+        }
+        _ => true,
+    });
+}
+
+/// Prompt-level orphan cleanup: drop outputs whose call is not present.
+pub(crate) fn remove_orphan_outputs_lenient(items: &mut Vec<ResponseItem>) {
+    let function_call_ids: HashSet<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::FunctionCall { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let local_shell_call_ids: HashSet<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::LocalShellCall {
+                call_id: Some(call_id),
+                ..
+            } => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let custom_tool_call_ids: HashSet<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    items.retain(|item| match item {
+        ResponseItem::FunctionCallOutput { call_id, .. } => {
+            function_call_ids.contains(call_id) || local_shell_call_ids.contains(call_id)
+        }
+        ResponseItem::CustomToolCallOutput { call_id, .. } => {
+            custom_tool_call_ids.contains(call_id)
         }
         _ => true,
     });

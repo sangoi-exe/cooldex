@@ -862,11 +862,11 @@ fn format_collab_status(status: &AgentStatus) -> String {
         AgentStatus::PendingInit => "pending init".to_string(),
         AgentStatus::Running => "running".to_string(),
         AgentStatus::Completed(Some(message)) => {
-            let preview = truncate_preview(message.trim(), 120);
-            if preview.is_empty() {
+            let message = message.trim();
+            if message.is_empty() {
                 "completed".to_string()
             } else {
-                format!("completed: \"{preview}\"")
+                format!("completed: \"{message}\"")
             }
         }
         AgentStatus::Completed(None) => "completed".to_string(),
@@ -933,5 +933,32 @@ fn format_mcp_invocation(invocation: &McpInvocation) -> String {
         format!("{fq_tool_name}()")
     } else {
         format!("{fq_tool_name}({args_str})")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AgentStatus;
+    use super::format_collab_status;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn completed_status_message_is_not_truncated() {
+        let message = "x".repeat(140);
+        let status = AgentStatus::Completed(Some(message.clone()));
+
+        let formatted = format_collab_status(&status);
+
+        assert_eq!(formatted, format!("completed: \"{message}\""));
+        assert_eq!(formatted.chars().filter(|ch| *ch == '…').count(), 0);
+    }
+
+    #[test]
+    fn completed_status_message_is_trimmed() {
+        let status = AgentStatus::Completed(Some("  done  ".to_string()));
+
+        let formatted = format_collab_status(&status);
+
+        assert_eq!(formatted, "completed: \"done\"");
     }
 }

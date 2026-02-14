@@ -64,7 +64,8 @@ async fn run_remote_compact_task_inner_impl(
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
-    let mut history = sess.clone_history().await;
+    let (mut history, ghost_snapshots) =
+        prompt_snapshot_history_for_remote_compact(sess, turn_context.as_ref()).await;
     let base_instructions = sess.get_base_instructions().await;
     let deleted_items = trim_function_call_history_to_fit_context_window(
         &mut history,
@@ -79,16 +80,10 @@ async fn run_remote_compact_task_inner_impl(
         );
     }
 
-    // Required to keep `/undo` available after compaction
-    let ghost_snapshots: Vec<ResponseItem> = history
-        .raw_items()
-        .iter()
-        .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
-        .cloned()
-        .collect();
-
+    let prompt_input = history.raw_items().to_vec();
     let prompt = Prompt {
-        input: history.for_prompt(&turn_context.model_info.input_modalities),
+        // `prompt_snapshot_for_model` already produced model-ready input.
+        input: prompt_input,
         tools: vec![],
         parallel_tool_calls: false,
         base_instructions,
@@ -137,6 +132,24 @@ async fn run_remote_compact_task_inner_impl(
     sess.emit_turn_item_completed(turn_context, compaction_item)
         .await;
     Ok(())
+}
+
+async fn prompt_snapshot_history_for_remote_compact(
+    sess: &Arc<Session>,
+    turn_context: &TurnContext,
+) -> (ContextManager, Vec<ResponseItem>) {
+    let (prompt_items, ghost_snapshots) = {
+        let state = sess.state.lock().await;
+        (
+            state.prompt_snapshot_for_model(&turn_context.model_info.input_modalities),
+            // Required to keep `/undo` available after compaction.
+            state.ghost_snapshots(),
+        )
+    };
+
+    let mut history = ContextManager::new();
+    history.replace(prompt_items);
+    (history, ghost_snapshots)
 }
 
 #[derive(Debug)]

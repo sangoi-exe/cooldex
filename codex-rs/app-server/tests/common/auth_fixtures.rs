@@ -9,6 +9,7 @@ use chrono::Utc;
 use codex_app_server_protocol::AuthMode;
 use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::auth::AuthDotJson;
+use codex_core::auth::AuthStore;
 use codex_core::auth::save_auth;
 use codex_core::token_data::TokenData;
 use codex_core::token_data::parse_chatgpt_jwt_claims;
@@ -165,5 +166,6 @@ pub fn write_chatgpt_auth(
         last_refresh,
     };
 
-    save_auth(codex_home, &auth, cli_auth_credentials_store_mode).context("write auth.json")
+    let store = AuthStore::from_legacy(auth);
+    save_auth(codex_home, &store, cli_auth_credentials_store_mode).context("write auth.json")
 }

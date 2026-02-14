@@ -1,5 +1,6 @@
 use crate::app_backtrack::BacktrackState;
 use crate::app_event::AppEvent;
+use crate::app_event::ChatGptAddAccountOutcome;
 use crate::app_event::ExitMode;
 #[cfg(target_os = "windows")]
 use crate::app_event::WindowsSandboxEnableMode;
@@ -33,10 +34,12 @@ use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
 use codex_ansi_escape::ansi_escape_line;
+use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::ThreadManager;
+use codex_core::auth::CLIENT_ID;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -59,6 +62,8 @@ use codex_core::protocol::SkillErrorInfo;
 use codex_core::protocol::TokenUsage;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
+use codex_login::ServerOptions;
+use codex_login::run_login_server;
 use codex_otel::OtelManager;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
@@ -100,6 +105,15 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::unbounded_channel;
 use toml::Value as TomlValue;
+
+fn format_account_display(label: Option<&str>, email: Option<&str>, fallback: &str) -> String {
+    match (label, email) {
+        (Some(label), Some(email)) => format!("{label} — {email}"),
+        (Some(label), None) => label.to_string(),
+        (None, Some(email)) => email.to_string(),
+        (None, None) => fallback.to_string(),
+    }
+}
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
@@ -1645,6 +1659,291 @@ impl App {
             AppEvent::UpdatePersonality(personality) => {
                 self.on_update_personality(personality);
             }
+            AppEvent::StartOpenAccountsPopup => {
+                if let Err(err) = self.auth_manager.reload_strict() {
+                    self.chat_widget
+                        .add_error_message(format!("Failed to reload auth store: {err}"));
+                    return Ok(AppRunControl::Continue);
+                }
+
+                if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
+                    self.chat_widget.open_accounts_popup();
+                    return Ok(AppRunControl::Continue);
+                }
+
+                let base_url = self.config.chatgpt_base_url.clone();
+                let auth_manager = self.auth_manager.clone();
+                let app_event_tx = self.app_event_tx.clone();
+                let account_ids = auth_manager
+                    .list_accounts()
+                    .into_iter()
+                    .map(|account| account.id)
+                    .collect::<Vec<_>>();
+
+                tokio::spawn(async move {
+                    const MAX_IN_FLIGHT: usize = 4;
+                    let mut updates = Vec::new();
+                    let mut join_set = tokio::task::JoinSet::new();
+                    let mut pending = account_ids.into_iter();
+
+                    for _ in 0..MAX_IN_FLIGHT {
+                        let Some(store_account_id) = pending.next() else {
+                            break;
+                        };
+                        let Some(auth) =
+                            auth_manager.chatgpt_auth_for_store_account_id(&store_account_id)
+                        else {
+                            continue;
+                        };
+                        let base_url = base_url.clone();
+                        join_set.spawn(async move {
+                            (
+                                store_account_id,
+                                crate::chatwidget::fetch_rate_limits(base_url, auth).await,
+                            )
+                        });
+                    }
+
+                    while let Some(result) = join_set.join_next().await {
+                        if let Ok((store_account_id, snapshots)) = result
+                            && let Some(snapshot) = snapshots.into_iter().next()
+                        {
+                            updates.push((store_account_id, snapshot));
+                        }
+
+                        let Some(store_account_id) = pending.next() else {
+                            continue;
+                        };
+                        let Some(auth) =
+                            auth_manager.chatgpt_auth_for_store_account_id(&store_account_id)
+                        else {
+                            continue;
+                        };
+                        let base_url = base_url.clone();
+                        join_set.spawn(async move {
+                            (
+                                store_account_id,
+                                crate::chatwidget::fetch_rate_limits(base_url, auth).await,
+                            )
+                        });
+                    }
+
+                    if !updates.is_empty()
+                        && let Err(err) = auth_manager.update_rate_limits_for_accounts(updates)
+                    {
+                        tracing::warn!("failed to update cached rate limits for accounts: {err}");
+                    }
+
+                    app_event_tx.send(AppEvent::OpenAccountsPopup);
+                });
+            }
+            AppEvent::OpenAccountsPopup => {
+                self.chat_widget.open_accounts_popup();
+            }
+            AppEvent::SetActiveAccount { account_id } => {
+                match self.auth_manager.set_active_account(&account_id) {
+                    Ok(()) => {
+                        let accounts = self.auth_manager.list_accounts();
+                        let display = accounts
+                            .iter()
+                            .find(|account| account.id == account_id)
+                            .map(|account| {
+                                format_account_display(
+                                    account.label.as_deref(),
+                                    account.email.as_deref(),
+                                    &account_id,
+                                )
+                            })
+                            .unwrap_or_else(|| account_id.clone());
+                        self.chat_widget.on_active_account_changed();
+                        self.chat_widget
+                            .add_info_message(format!("Active account: {display}"), None);
+                    }
+                    Err(err) => {
+                        self.chat_widget
+                            .add_error_message(format!("Failed to set active account: {err}"));
+                    }
+                }
+            }
+            AppEvent::RemoveAccount {
+                account_id,
+                exit_after,
+            } => {
+                let accounts_before = self.auth_manager.list_accounts();
+                let removed = accounts_before
+                    .iter()
+                    .find(|account| account.id == account_id);
+                let was_active = removed.is_some_and(|account| account.is_active);
+                let removed_display = removed
+                    .map(|account| {
+                        format_account_display(
+                            account.label.as_deref(),
+                            account.email.as_deref(),
+                            &account_id,
+                        )
+                    })
+                    .unwrap_or_else(|| account_id.clone());
+
+                match self.auth_manager.remove_account(&account_id) {
+                    Ok(true) => {
+                        if exit_after {
+                            self.app_event_tx
+                                .send(AppEvent::Exit(ExitMode::ShutdownFirst));
+                        } else {
+                            let accounts_after = self.auth_manager.list_accounts();
+                            if accounts_after.is_empty() {
+                                self.chat_widget.on_active_account_changed();
+                                self.chat_widget.add_info_message(
+                                    format!(
+                                        "Removed account: {removed_display}. You are now logged out."
+                                    ),
+                                    None,
+                                );
+                            } else if was_active {
+                                let active_display = accounts_after
+                                    .iter()
+                                    .find(|account| account.is_active)
+                                    .map(|account| {
+                                        format_account_display(
+                                            account.label.as_deref(),
+                                            account.email.as_deref(),
+                                            &account.id,
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "<unknown>".to_string());
+                                self.chat_widget.on_active_account_changed();
+                                self.chat_widget.add_info_message(
+                                    format!(
+                                        "Removed account: {removed_display}. Active account: {active_display}"
+                                    ),
+                                    None,
+                                );
+                            } else {
+                                self.chat_widget.add_info_message(
+                                    format!("Removed account: {removed_display}"),
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to remove account: account '{account_id}' not found",
+                        ));
+                    }
+                    Err(err) => {
+                        self.chat_widget
+                            .add_error_message(format!("Failed to remove account: {err}"));
+                    }
+                }
+            }
+            AppEvent::LogoutAllAccounts => match self.auth_manager.logout() {
+                Ok(true) => {
+                    self.app_event_tx
+                        .send(AppEvent::Exit(ExitMode::ShutdownFirst));
+                }
+                Ok(false) => {
+                    self.chat_widget
+                        .add_error_message("No accounts were removed.".to_string());
+                }
+                Err(err) => {
+                    self.chat_widget
+                        .add_error_message(format!("Failed to logout all accounts: {err}"));
+                }
+            },
+            AppEvent::StartChatGptAddAccount => {
+                if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
+                    self.chat_widget.add_error_message(
+                        "'/accounts' add requires ChatGPT authentication.".to_string(),
+                    );
+                    return Ok(AppRunControl::Continue);
+                }
+
+                let opts = ServerOptions::new(
+                    self.config.codex_home.clone(),
+                    CLIENT_ID.to_string(),
+                    self.config.forced_chatgpt_workspace_id.clone(),
+                    self.config.cli_auth_credentials_store_mode,
+                );
+                let child = match run_login_server(opts) {
+                    Ok(child) => child,
+                    Err(err) => {
+                        self.chat_widget
+                            .add_error_message(format!("Failed to start ChatGPT login: {err}"));
+                        return Ok(AppRunControl::Continue);
+                    }
+                };
+
+                let shared_state =
+                    Arc::new(crate::bottom_pane::ChatGptAddAccountSharedState::new());
+                let auth_url = child.auth_url.clone();
+                self.chat_widget.open_chatgpt_add_account_view(
+                    auth_url,
+                    Arc::clone(&shared_state),
+                    child.cancel_handle(),
+                );
+
+                let frame_requester = tui.frame_requester();
+                let app_event_tx = self.app_event_tx.clone();
+                let auth_manager = self.auth_manager.clone();
+                tokio::spawn(async move {
+                    let result = child.block_until_done().await;
+                    let outcome = match result {
+                        Ok(()) => {
+                            auth_manager.reload();
+                            let active_account_display = auth_manager
+                                .list_accounts()
+                                .iter()
+                                .find(|account| account.is_active)
+                                .map(|account| {
+                                    format_account_display(
+                                        account.label.as_deref(),
+                                        account.email.as_deref(),
+                                        &account.id,
+                                    )
+                                });
+                            shared_state.set_success(active_account_display.clone());
+                            ChatGptAddAccountOutcome::Success {
+                                active_account_display,
+                            }
+                        }
+                        Err(err) => {
+                            if shared_state.cancelled_by_user() {
+                                shared_state.set_cancelled();
+                                ChatGptAddAccountOutcome::Cancelled
+                            } else {
+                                let message = err.to_string();
+                                shared_state.set_failed(message.clone());
+                                ChatGptAddAccountOutcome::Failed { message }
+                            }
+                        }
+                    };
+                    frame_requester.schedule_frame();
+                    app_event_tx.send(AppEvent::ChatGptAddAccountFinished(outcome));
+                });
+            }
+            AppEvent::ChatGptAddAccountFinished(outcome) => match outcome {
+                ChatGptAddAccountOutcome::Success {
+                    active_account_display,
+                } => {
+                    self.chat_widget.on_active_account_changed();
+                    if let Some(display) = active_account_display {
+                        self.chat_widget
+                            .add_info_message(format!("Active account: {display}"), None);
+                    } else {
+                        self.chat_widget
+                            .add_info_message("Added ChatGPT account.".to_string(), None);
+                    }
+                }
+                ChatGptAddAccountOutcome::Cancelled => {
+                    self.chat_widget
+                        .add_info_message("ChatGPT login cancelled.".to_string(), None);
+                }
+                ChatGptAddAccountOutcome::Failed { message } => {
+                    self.chat_widget
+                        .add_error_message(format!("ChatGPT login failed: {message}"));
+                }
+            },
             AppEvent::OpenReasoningPopup { model } => {
                 self.chat_widget.open_reasoning_popup(model);
             }

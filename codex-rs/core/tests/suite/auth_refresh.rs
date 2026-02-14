@@ -3,13 +3,13 @@ use anyhow::Result;
 use base64::Engine;
 use chrono::Duration;
 use chrono::Utc;
-use codex_app_server_protocol::AuthMode;
 use codex_core::AuthManager;
 use codex_core::auth::AuthCredentialsStoreMode;
-use codex_core::auth::AuthDotJson;
+use codex_core::auth::AuthStore;
 use codex_core::auth::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_core::auth::RefreshTokenError;
-use codex_core::auth::load_auth_dot_json;
+use codex_core::auth::StoredAccount;
+use codex_core::auth::load_auth_store;
 use codex_core::auth::save_auth;
 use codex_core::error::RefreshTokenFailedReason;
 use codex_core::token_data::IdTokenInfo;
@@ -50,13 +50,8 @@ async fn refresh_token_succeeds_updates_storage() -> Result<()> {
     let ctx = RefreshTokenTestContext::new(&server)?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
-    let initial_auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
-        tokens: Some(initial_tokens.clone()),
-        last_refresh: Some(initial_last_refresh),
-    };
-    ctx.write_auth(&initial_auth)?;
+    let initial_store = auth_store_with_account(initial_tokens.clone(), Some(initial_last_refresh));
+    ctx.write_auth(&initial_store)?;
 
     ctx.auth_manager
         .refresh_token()
@@ -69,9 +64,9 @@ async fn refresh_token_succeeds_updates_storage() -> Result<()> {
         ..initial_tokens.clone()
     };
     let stored = ctx.load_auth()?;
-    let tokens = stored.tokens.as_ref().context("tokens should exist")?;
-    assert_eq!(tokens, &refreshed_tokens);
-    let refreshed_at = stored
+    let account = store_active_account(&stored).context("tokens should exist")?;
+    assert_eq!(&account.tokens, &refreshed_tokens);
+    let refreshed_at = account
         .last_refresh
         .as_ref()
         .context("last_refresh should be recorded")?;
@@ -112,13 +107,8 @@ async fn returns_fresh_tokens_as_is() -> Result<()> {
     let ctx = RefreshTokenTestContext::new(&server)?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
-    let initial_auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
-        tokens: Some(initial_tokens.clone()),
-        last_refresh: Some(initial_last_refresh),
-    };
-    ctx.write_auth(&initial_auth)?;
+    let initial_store = auth_store_with_account(initial_tokens.clone(), Some(initial_last_refresh));
+    ctx.write_auth(&initial_store)?;
 
     let cached_auth = ctx
         .auth_manager
@@ -131,7 +121,7 @@ async fn returns_fresh_tokens_as_is() -> Result<()> {
     assert_eq!(cached, initial_tokens);
 
     let stored = ctx.load_auth()?;
-    assert_eq!(stored, initial_auth);
+    assert_eq!(stored, initial_store);
 
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(requests.is_empty(), "expected no refresh token requests");
@@ -158,13 +148,8 @@ async fn refreshes_token_when_last_refresh_is_stale() -> Result<()> {
     let ctx = RefreshTokenTestContext::new(&server)?;
     let stale_refresh = Utc::now() - Duration::days(9);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
-    let initial_auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
-        tokens: Some(initial_tokens.clone()),
-        last_refresh: Some(stale_refresh),
-    };
-    ctx.write_auth(&initial_auth)?;
+    let initial_store = auth_store_with_account(initial_tokens.clone(), Some(stale_refresh));
+    ctx.write_auth(&initial_store)?;
 
     let cached_auth = ctx
         .auth_manager
@@ -182,9 +167,9 @@ async fn refreshes_token_when_last_refresh_is_stale() -> Result<()> {
     assert_eq!(cached, refreshed_tokens);
 
     let stored = ctx.load_auth()?;
-    let tokens = stored.tokens.as_ref().context("tokens should exist")?;
-    assert_eq!(tokens, &refreshed_tokens);
-    let refreshed_at = stored
+    let account = store_active_account(&stored).context("tokens should exist")?;
+    assert_eq!(&account.tokens, &refreshed_tokens);
+    let refreshed_at = account
         .last_refresh
         .as_ref()
         .context("last_refresh should be recorded")?;
@@ -217,13 +202,8 @@ async fn refresh_token_returns_permanent_error_for_expired_refresh_token() -> Re
     let ctx = RefreshTokenTestContext::new(&server)?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
-    let initial_auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
-        tokens: Some(initial_tokens.clone()),
-        last_refresh: Some(initial_last_refresh),
-    };
-    ctx.write_auth(&initial_auth)?;
+    let initial_store = auth_store_with_account(initial_tokens.clone(), Some(initial_last_refresh));
+    ctx.write_auth(&initial_store)?;
 
     let err = ctx
         .auth_manager
@@ -234,7 +214,7 @@ async fn refresh_token_returns_permanent_error_for_expired_refresh_token() -> Re
     assert_eq!(err.failed_reason(), Some(RefreshTokenFailedReason::Expired));
 
     let stored = ctx.load_auth()?;
-    assert_eq!(stored, initial_auth);
+    assert_eq!(stored, initial_store);
     let cached_auth = ctx
         .auth_manager
         .auth()
@@ -267,13 +247,8 @@ async fn refresh_token_returns_transient_error_on_server_failure() -> Result<()>
     let ctx = RefreshTokenTestContext::new(&server)?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
-    let initial_auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
-        tokens: Some(initial_tokens.clone()),
-        last_refresh: Some(initial_last_refresh),
-    };
-    ctx.write_auth(&initial_auth)?;
+    let initial_store = auth_store_with_account(initial_tokens.clone(), Some(initial_last_refresh));
+    ctx.write_auth(&initial_store)?;
 
     let err = ctx
         .auth_manager
@@ -285,7 +260,7 @@ async fn refresh_token_returns_transient_error_on_server_failure() -> Result<()>
     assert_eq!(err.failed_reason(), None);
 
     let stored = ctx.load_auth()?;
-    assert_eq!(stored, initial_auth);
+    assert_eq!(stored, initial_store);
     let cached_auth = ctx
         .auth_manager
         .auth()
@@ -319,21 +294,11 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
     let ctx = RefreshTokenTestContext::new(&server)?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
-    let initial_auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
-        tokens: Some(initial_tokens.clone()),
-        last_refresh: Some(initial_last_refresh),
-    };
-    ctx.write_auth(&initial_auth)?;
+    let initial_store = auth_store_with_account(initial_tokens.clone(), Some(initial_last_refresh));
+    ctx.write_auth(&initial_store)?;
 
     let disk_tokens = build_tokens("disk-access-token", "disk-refresh-token");
-    let disk_auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
-        tokens: Some(disk_tokens.clone()),
-        last_refresh: Some(initial_last_refresh),
-    };
+    let disk_auth = auth_store_with_account(disk_tokens.clone(), Some(initial_last_refresh));
     save_auth(
         ctx.codex_home.path(),
         &disk_auth,
@@ -374,8 +339,8 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
         ..disk_tokens.clone()
     };
     let stored = ctx.load_auth()?;
-    let tokens = stored.tokens.as_ref().context("tokens should exist")?;
-    assert_eq!(tokens, &refreshed_tokens);
+    let account = store_active_account(&stored).context("tokens should exist")?;
+    assert_eq!(&account.tokens, &refreshed_tokens);
 
     let cached_auth = ctx
         .auth_manager
@@ -411,26 +376,36 @@ async fn unauthorized_recovery_skips_reload_on_account_mismatch() -> Result<()> 
     let ctx = RefreshTokenTestContext::new(&server)?;
     let initial_last_refresh = Utc::now() - Duration::days(1);
     let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
-    let initial_auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
-        tokens: Some(initial_tokens.clone()),
-        last_refresh: Some(initial_last_refresh),
-    };
-    ctx.write_auth(&initial_auth)?;
+    let initial_store = auth_store_with_account(initial_tokens.clone(), Some(initial_last_refresh));
+    ctx.write_auth(&initial_store)?;
 
-    let mut disk_tokens = build_tokens("disk-access-token", "disk-refresh-token");
-    disk_tokens.account_id = Some("other-account".to_string());
+    let mut other_tokens = build_tokens("disk-access-token", "disk-refresh-token");
+    other_tokens.account_id = Some("other-account".to_string());
     let expected_tokens = TokenData {
         access_token: "recovered-access-token".to_string(),
         refresh_token: "recovered-refresh-token".to_string(),
-        ..disk_tokens.clone()
+        ..initial_tokens.clone()
     };
-    let disk_auth = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
+    let disk_auth = AuthStore {
         openai_api_key: None,
-        tokens: Some(disk_tokens),
-        last_refresh: Some(initial_last_refresh),
+        active_account_id: Some("other-account".to_string()),
+        accounts: vec![
+            StoredAccount {
+                id: "account-id".to_string(),
+                label: None,
+                tokens: initial_tokens.clone(),
+                last_refresh: Some(initial_last_refresh),
+                usage: None,
+            },
+            StoredAccount {
+                id: "other-account".to_string(),
+                label: None,
+                tokens: other_tokens,
+                last_refresh: Some(initial_last_refresh),
+                usage: None,
+            },
+        ],
+        ..AuthStore::default()
     };
     save_auth(
         ctx.codex_home.path(),
@@ -453,8 +428,8 @@ async fn unauthorized_recovery_skips_reload_on_account_mismatch() -> Result<()> 
     recovery.next().await?;
 
     let stored = ctx.load_auth()?;
-    let tokens = stored.tokens.as_ref().context("tokens should exist")?;
-    assert_eq!(tokens, &expected_tokens);
+    let account = store_account_by_id(&stored, "account-id").context("tokens should exist")?;
+    assert_eq!(&account.tokens, &expected_tokens);
 
     let requests = server.received_requests().await.unwrap_or_default();
     let request = requests
@@ -490,11 +465,9 @@ async fn unauthorized_recovery_requires_chatgpt_auth() -> Result<()> {
 
     let server = MockServer::start().await;
     let ctx = RefreshTokenTestContext::new(&server)?;
-    let auth = AuthDotJson {
-        auth_mode: Some(AuthMode::ApiKey),
+    let auth = AuthStore {
         openai_api_key: Some("sk-test".to_string()),
-        tokens: None,
-        last_refresh: None,
+        ..AuthStore::default()
     };
     ctx.write_auth(&auth)?;
 
@@ -540,16 +513,16 @@ impl RefreshTokenTestContext {
         })
     }
 
-    fn load_auth(&self) -> Result<AuthDotJson> {
-        load_auth_dot_json(self.codex_home.path(), AuthCredentialsStoreMode::File)
+    fn load_auth(&self) -> Result<AuthStore> {
+        load_auth_store(self.codex_home.path(), AuthCredentialsStoreMode::File)
             .context("load auth.json")?
             .context("auth.json should exist")
     }
 
-    fn write_auth(&self, auth_dot_json: &AuthDotJson) -> Result<()> {
+    fn write_auth(&self, store: &AuthStore) -> Result<()> {
         save_auth(
             self.codex_home.path(),
-            auth_dot_json,
+            store,
             AuthCredentialsStoreMode::File,
         )?;
         self.auth_manager.reload();
@@ -625,4 +598,38 @@ fn build_tokens(access_token: &str, refresh_token: &str) -> TokenData {
         refresh_token: refresh_token.to_string(),
         account_id: Some("account-id".to_string()),
     }
+}
+
+fn auth_store_with_account(
+    tokens: TokenData,
+    last_refresh: Option<chrono::DateTime<Utc>>,
+) -> AuthStore {
+    let account_id = tokens
+        .account_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    AuthStore {
+        openai_api_key: None,
+        active_account_id: Some(account_id.clone()),
+        accounts: vec![StoredAccount {
+            id: account_id,
+            label: None,
+            tokens,
+            last_refresh,
+            usage: None,
+        }],
+        ..AuthStore::default()
+    }
+}
+
+fn store_active_account(store: &AuthStore) -> Option<&StoredAccount> {
+    let active_id = store.active_account_id.as_deref()?;
+    store
+        .accounts
+        .iter()
+        .find(|account| account.id == active_id)
+}
+
+fn store_account_by_id<'a>(store: &'a AuthStore, id: &str) -> Option<&'a StoredAccount> {
+    store.accounts.iter().find(|account| account.id == id)
 }

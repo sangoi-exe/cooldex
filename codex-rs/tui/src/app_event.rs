@@ -47,6 +47,17 @@ pub(crate) struct ConnectorsSnapshot {
     pub(crate) connectors: Vec<AppInfo>,
 }
 
+#[derive(Debug)]
+pub(crate) enum ChatGptAddAccountOutcome {
+    Success {
+        active_account_display: Option<String>,
+    },
+    Cancelled,
+    Failed {
+        message: String,
+    },
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AppEvent {
@@ -150,6 +161,32 @@ pub(crate) enum AppEvent {
 
     /// Update the current personality in the running app and widget.
     UpdatePersonality(Personality),
+
+    /// Fetch per-account rate limits (best-effort) and then open the `/accounts` popup.
+    StartOpenAccountsPopup,
+
+    /// Open the `/accounts` popup.
+    OpenAccountsPopup,
+
+    /// Switch the active ChatGPT account in the auth store.
+    SetActiveAccount {
+        account_id: String,
+    },
+
+    /// Remove a stored ChatGPT account from the auth store.
+    RemoveAccount {
+        account_id: String,
+        exit_after: bool,
+    },
+
+    /// Log out from all stored accounts.
+    LogoutAllAccounts,
+
+    /// Start a ChatGPT login flow to add another stored account.
+    StartChatGptAddAccount,
+
+    /// Result of running the ChatGPT add-account login flow.
+    ChatGptAddAccountFinished(ChatGptAddAccountOutcome),
 
     /// Persist the selected model and reasoning effort to the appropriate config.
     PersistModelSelection {

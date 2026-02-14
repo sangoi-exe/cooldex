@@ -792,7 +792,16 @@ fn build_agent_spawn_config(
     child_depth: i32,
 ) -> Result<Config, FunctionCallError> {
     let mut config = build_agent_shared_config(turn, child_depth)?;
-    config.base_instructions = Some(base_instructions.text.clone());
+    let subagent_instructions = config.subagent_base_instructions.clone();
+    let using_subagent_instructions = subagent_instructions.is_some();
+    config.base_instructions =
+        Some(subagent_instructions.unwrap_or_else(|| base_instructions.text.clone()));
+    if using_subagent_instructions {
+        config.developer_instructions = None;
+        config.user_instructions = None;
+        config.project_doc_max_bytes = 0;
+        config.features.disable(Feature::ChildAgentsMd);
+    }
     Ok(config)
 }
 
@@ -847,6 +856,7 @@ mod tests {
     use crate::built_in_model_providers;
     use crate::codex::make_session_and_context;
     use crate::config::types::ShellEnvironmentPolicy;
+    use crate::features::Feature;
     use crate::function_tool::FunctionCallError;
     use crate::protocol::AskForApproval;
     use crate::protocol::Op;
@@ -855,6 +865,7 @@ mod tests {
     use crate::protocol::SubAgentSource;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_protocol::ThreadId;
+    use codex_protocol::models::BaseInstructions;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
     use codex_protocol::protocol::InitialHistory;
@@ -896,6 +907,32 @@ mod tests {
             CodexAuth::from_api_key("dummy"),
             built_in_model_providers()["openai"].clone(),
         )
+    }
+
+    #[tokio::test]
+    async fn spawn_config_prefers_subagent_base_instructions_when_present() {
+        let (_session, mut turn) = make_session_and_context().await;
+        let mut config = (*turn.config).clone();
+        config.subagent_base_instructions = Some("subagent-only instructions".to_string());
+        turn.config = Arc::new(config);
+
+        let spawn_config = build_agent_spawn_config(
+            &BaseInstructions {
+                text: "parent instructions".to_string(),
+            },
+            &turn,
+            0,
+        )
+        .expect("spawn config");
+
+        assert_eq!(
+            spawn_config.base_instructions,
+            Some("subagent-only instructions".to_string())
+        );
+        assert_eq!(spawn_config.developer_instructions, None);
+        assert_eq!(spawn_config.user_instructions, None);
+        assert_eq!(spawn_config.project_doc_max_bytes, 0);
+        assert!(!spawn_config.features.enabled(Feature::ChildAgentsMd));
     }
 
     #[tokio::test]

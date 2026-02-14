@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,6 +29,7 @@ pub(crate) struct ToolCallRuntime {
     turn_context: Arc<TurnContext>,
     tracker: SharedTurnDiffTracker,
     parallel_execution: Arc<RwLock<()>>,
+    allowed_tool_names: Option<HashSet<String>>,
 }
 
 impl ToolCallRuntime {
@@ -36,6 +38,7 @@ impl ToolCallRuntime {
         session: Arc<Session>,
         turn_context: Arc<TurnContext>,
         tracker: SharedTurnDiffTracker,
+        allowed_tool_names: Option<HashSet<String>>,
     ) -> Self {
         Self {
             router,
@@ -43,15 +46,22 @@ impl ToolCallRuntime {
             turn_context,
             tracker,
             parallel_execution: Arc::new(RwLock::new(())),
+            allowed_tool_names,
         }
     }
 
     #[instrument(level = "trace", skip_all, fields(call = ?call))]
-    pub(crate) fn handle_tool_call(
+    pub(crate) async fn handle_tool_call(
         self,
         call: ToolCall,
         cancellation_token: CancellationToken,
-    ) -> impl std::future::Future<Output = Result<ResponseInputItem, CodexErr>> {
+    ) -> Result<ResponseInputItem, CodexErr> {
+        if let Some(allowed_tool_names) = self.allowed_tool_names.as_ref()
+            && !allowed_tool_names.contains(call.tool_name.as_str())
+        {
+            return Ok(Self::disallowed_response(&call));
+        }
+
         let supports_parallel = self.router.tool_supports_parallel(&call.tool_name);
 
         let router = Arc::clone(&self.router);
@@ -92,17 +102,14 @@ impl ToolCallRuntime {
                 }
             }));
 
-        async move {
-            match handle.await {
-                Ok(Ok(response)) => Ok(response),
-                Ok(Err(FunctionCallError::Fatal(message))) => Err(CodexErr::Fatal(message)),
-                Ok(Err(other)) => Err(CodexErr::Fatal(other.to_string())),
-                Err(err) => Err(CodexErr::Fatal(format!(
-                    "tool task failed to receive: {err:?}"
-                ))),
-            }
+        match handle.await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(FunctionCallError::Fatal(message))) => Err(CodexErr::Fatal(message)),
+            Ok(Err(other)) => Err(CodexErr::Fatal(other.to_string())),
+            Err(err) => Err(CodexErr::Fatal(format!(
+                "tool task failed to receive: {err:?}"
+            ))),
         }
-        .in_current_span()
     }
 }
 
@@ -133,6 +140,30 @@ impl ToolCallRuntime {
                 format!("Wall time: {secs:.1} seconds\naborted by user")
             }
             _ => format!("aborted by user after {secs:.1}s"),
+        }
+    }
+
+    fn disallowed_response(call: &ToolCall) -> ResponseInputItem {
+        let message = format!(
+            "tool call blocked: {} is not allowed in this task",
+            call.tool_name
+        );
+        match &call.payload {
+            ToolPayload::Custom { .. } => ResponseInputItem::CustomToolCallOutput {
+                call_id: call.call_id.clone(),
+                output: message,
+            },
+            ToolPayload::Mcp { .. } => ResponseInputItem::McpToolCallOutput {
+                call_id: call.call_id.clone(),
+                result: Err(message),
+            },
+            _ => ResponseInputItem::FunctionCallOutput {
+                call_id: call.call_id.clone(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text(message),
+                    success: Some(false),
+                },
+            },
         }
     }
 }

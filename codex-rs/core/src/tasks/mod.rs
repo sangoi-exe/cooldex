@@ -2,6 +2,7 @@ mod compact;
 mod ghost_snapshot;
 mod regular;
 mod review;
+mod sanitize;
 mod undo;
 mod user_shell;
 
@@ -40,6 +41,7 @@ pub(crate) use compact::CompactTask;
 pub(crate) use ghost_snapshot::GhostSnapshotTask;
 pub(crate) use regular::RegularTask;
 pub(crate) use review::ReviewTask;
+pub(crate) use sanitize::SanitizeTask;
 pub(crate) use undo::UndoTask;
 pub(crate) use user_shell::UserShellCommandMode;
 pub(crate) use user_shell::UserShellCommandTask;

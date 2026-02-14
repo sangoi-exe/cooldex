@@ -1,0 +1,1519 @@
+use crate::codex::Session;
+use crate::codex::TurnContext;
+use crate::function_tool::FunctionCallError;
+use crate::protocol::REASONING_CONTEXT_CLOSE_TAG;
+use crate::protocol::REASONING_CONTEXT_OPEN_TAG;
+use crate::protocol::TOOL_CONTEXT_CLOSE_TAG;
+use crate::protocol::TOOL_CONTEXT_OPEN_TAG;
+use crate::rid::parse_rid;
+use crate::state::ContextItemsEvent;
+use crate::state::ContextOverlay;
+use crate::state::PruneCategory;
+use crate::tools::context::ToolInvocation;
+use crate::tools::context::ToolOutput;
+use crate::tools::context::ToolPayload;
+use crate::tools::registry::ToolHandler;
+use crate::tools::registry::ToolKind;
+use async_trait::async_trait;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::ResponseItem;
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::json;
+use sha1::Digest;
+use std::collections::HashMap;
+use std::collections::HashSet;
+
+pub struct ManageContextHandler;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManageContextToolArgs {
+    mode: String,
+    #[serde(default)]
+    policy_id: Option<String>,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    state_hash: Option<String>,
+    #[serde(default)]
+    chunk_summaries: Option<Vec<ChunkSummaryInput>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChunkSummaryInput {
+    chunk_id: String,
+    tool_context: String,
+    reasoning_context: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StopReason {
+    TargetReached,
+    FixedPointReached,
+    InvalidSummarySchema,
+    InvalidContract,
+    StateHashMismatch,
+    PlanIdInvalid,
+}
+
+impl StopReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TargetReached => "target_reached",
+            Self::FixedPointReached => "fixed_point_reached",
+            Self::InvalidSummarySchema => "invalid_summary_schema",
+            Self::InvalidContract => "invalid_contract",
+            Self::StateHashMismatch => "state_hash_mismatch",
+            Self::PlanIdInvalid => "plan_id_invalid",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TopOffender {
+    index: usize,
+    id: Option<String>,
+    category: String,
+    approx_bytes: u64,
+    preview: String,
+    call_id: Option<String>,
+    tool_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChunkManifestEntry {
+    chunk_id: String,
+    source_id: Option<String>,
+    index: usize,
+    category: String,
+    call_id: Option<String>,
+    approx_bytes: u64,
+    preview: String,
+}
+
+#[derive(Debug, Clone)]
+struct RetrievePlan {
+    state_hash: String,
+    plan_id: String,
+    chunk_manifest: Vec<ChunkManifestEntry>,
+    top_offenders: Vec<TopOffender>,
+}
+
+#[derive(Debug)]
+struct ManageContextResult {
+    json: serde_json::Value,
+}
+
+#[async_trait]
+impl ToolHandler for ManageContextHandler {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Function
+    }
+
+    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
+        let ToolInvocation {
+            session,
+            payload,
+            turn,
+            ..
+        } = invocation;
+
+        let ToolPayload::Function { arguments } = payload else {
+            return Err(contract_error(
+                StopReason::InvalidContract,
+                "manage_context handler received unsupported payload",
+            ));
+        };
+
+        let args: ManageContextToolArgs = serde_json::from_str(&arguments).map_err(|e| {
+            contract_error(
+                StopReason::InvalidContract,
+                format!("failed to parse function arguments: {e}"),
+            )
+        })?;
+
+        let result = handle_manage_context(session.as_ref(), turn.as_ref(), &args).await?;
+
+        Ok(ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(
+                serde_json::to_string(&result.json).unwrap_or_else(|_| "{}".to_string()),
+            ),
+            success: Some(true),
+        })
+    }
+}
+
+async fn handle_manage_context(
+    session: &Session,
+    turn: &TurnContext,
+    args: &ManageContextToolArgs,
+) -> Result<ManageContextResult, FunctionCallError> {
+    match args.mode.as_str() {
+        "retrieve" => handle_retrieve(session, turn, args).await,
+        "apply" => handle_apply(session, turn, args).await,
+        other => Err(contract_error(
+            StopReason::InvalidContract,
+            format!("manage_context.mode must be 'retrieve' or 'apply' (got '{other}')"),
+        )),
+    }
+}
+
+async fn handle_retrieve(
+    session: &Session,
+    turn: &TurnContext,
+    args: &ManageContextToolArgs,
+) -> Result<ManageContextResult, FunctionCallError> {
+    if args.plan_id.is_some() || args.state_hash.is_some() || args.chunk_summaries.is_some() {
+        return Err(contract_error(
+            StopReason::InvalidContract,
+            "manage_context.retrieve accepts only mode and policy_id",
+        ));
+    }
+
+    let policy_id = required_non_empty_str("policy_id", args.policy_id.as_ref())?;
+    validate_policy_id(&policy_id, turn)?;
+
+    let max_chunks = turn.config.manage_context_policy.max_chunks_per_apply;
+    let plan = {
+        let state = session.state.lock().await;
+        build_retrieve_plan(&state, &policy_id)
+    };
+    let remaining_apply_batches = if max_chunks == 0 {
+        0
+    } else {
+        plan.chunk_manifest.len().div_ceil(max_chunks)
+    };
+
+    Ok(ManageContextResult {
+        json: json!({
+            "mode": "retrieve",
+            "plan_id": plan.plan_id,
+            "state_hash": plan.state_hash,
+            "policy_id": policy_id,
+            "chunk_manifest": plan.chunk_manifest,
+            "convergence_policy": {
+                "fixed_point_k": turn.config.manage_context_policy.fixed_point_k,
+                "stalled_signature_threshold": turn.config.manage_context_policy.stalled_signature_threshold,
+                "max_chunks_per_apply": turn.config.manage_context_policy.max_chunks_per_apply,
+                "quality_rubric_id": turn.config.manage_context_policy.quality_rubric_id,
+            },
+            "top_offenders": plan.top_offenders,
+            "progress_report": {
+                "manifest_chunk_count": plan.chunk_manifest.len(),
+                "remaining_apply_batches": remaining_apply_batches,
+                "max_chunks_per_apply": max_chunks,
+            }
+        }),
+    })
+}
+
+async fn handle_apply(
+    session: &Session,
+    turn: &TurnContext,
+    args: &ManageContextToolArgs,
+) -> Result<ManageContextResult, FunctionCallError> {
+    let policy_id = required_non_empty_str("policy_id", args.policy_id.as_ref())?;
+    validate_policy_id(&policy_id, turn)?;
+
+    let plan_id = required_non_empty_str("plan_id", args.plan_id.as_ref())?;
+    let expected_state_hash = required_non_empty_str("state_hash", args.state_hash.as_ref())?;
+    let chunk_summaries = args.chunk_summaries.clone().ok_or_else(|| {
+        contract_error(
+            StopReason::InvalidContract,
+            "manage_context.apply requires chunk_summaries",
+        )
+    })?;
+
+    if chunk_summaries.is_empty() {
+        return Err(contract_error(
+            StopReason::InvalidContract,
+            "manage_context.apply requires non-empty chunk_summaries",
+        ));
+    }
+
+    let max_chunks_per_apply = turn.config.manage_context_policy.max_chunks_per_apply;
+    if chunk_summaries.len() > max_chunks_per_apply {
+        return Err(contract_error(
+            StopReason::InvalidContract,
+            format!(
+                "manage_context.apply chunk_summaries exceeds max_chunks_per_apply ({})",
+                max_chunks_per_apply
+            ),
+        ));
+    }
+
+    let (applied_events, new_state_hash, progress_report, stop_reason) = {
+        let mut state = session.state.lock().await;
+
+        let current_plan = build_retrieve_plan(&state, &policy_id);
+
+        if expected_state_hash != current_plan.state_hash {
+            return Err(contract_error(
+                StopReason::StateHashMismatch,
+                format!(
+                    "state_hash mismatch (expected {}, got {})",
+                    expected_state_hash, current_plan.state_hash
+                ),
+            ));
+        }
+
+        if plan_id != current_plan.plan_id {
+            return Err(contract_error(
+                StopReason::PlanIdInvalid,
+                format!(
+                    "plan_id mismatch (expected {}, got {})",
+                    current_plan.plan_id, plan_id
+                ),
+            ));
+        }
+
+        validate_chunk_summaries(&chunk_summaries, &current_plan.chunk_manifest)?;
+        let manifest_by_chunk_id: HashMap<&str, &ChunkManifestEntry> = current_plan
+            .chunk_manifest
+            .iter()
+            .map(|entry| (entry.chunk_id.as_str(), entry))
+            .collect();
+
+        let mut generated_notes = Vec::with_capacity(chunk_summaries.len() * 2);
+        let mut applied_events = Vec::with_capacity(chunk_summaries.len());
+        let mut indices_to_exclude = Vec::with_capacity(chunk_summaries.len());
+        let mut replacement_updates = Vec::with_capacity(chunk_summaries.len());
+
+        for chunk in &chunk_summaries {
+            let chunk_id = chunk.chunk_id.trim();
+            let manifest_entry = manifest_by_chunk_id.get(chunk_id).ok_or_else(|| {
+                contract_error(
+                    StopReason::InvalidSummarySchema,
+                    format!("chunk_id '{chunk_id}' is not present in current chunk_manifest"),
+                )
+            })?;
+
+            let tool_context_note = build_tool_context_note(chunk, &plan_id);
+            let reasoning_context_note = build_reasoning_context_note(chunk, &plan_id);
+
+            generated_notes.push(tool_context_note.clone());
+            generated_notes.push(reasoning_context_note.clone());
+
+            let replacement_text = chunk_replacement_text(chunk, &plan_id);
+            let replacement_rid = manifest_entry.source_id.as_deref().and_then(parse_rid);
+            let replacement_applied = replacement_rid
+                .filter(|_| replacement_text.len() as u64 <= manifest_entry.approx_bytes)
+                .map(|rid| {
+                    replacement_updates.push((rid, replacement_text));
+                    true
+                })
+                .unwrap_or(false);
+            let excluded = if replacement_applied {
+                false
+            } else {
+                indices_to_exclude.push(manifest_entry.index);
+                true
+            };
+
+            applied_events.push(json!({
+                "chunk_id": chunk_id,
+                "source_id": manifest_entry.source_id,
+                "index": manifest_entry.index,
+                "excluded": excluded,
+                "replacement_applied": replacement_applied,
+                "tool_context": tool_context_note,
+                "reasoning_context": reasoning_context_note,
+            }));
+        }
+
+        debug_assert_eq!(generated_notes.len(), chunk_summaries.len() * 2);
+
+        indices_to_exclude.sort_unstable();
+        indices_to_exclude.dedup();
+        if !indices_to_exclude.is_empty() {
+            state.set_context_inclusion(&indices_to_exclude, false);
+        }
+        let replaced_chunks = replacement_updates.len();
+        if !replacement_updates.is_empty() {
+            state.upsert_context_replacements(replacement_updates);
+        }
+
+        let notes_added = generated_notes.len();
+        state.add_context_notes(generated_notes);
+        materialize_prompt_snapshot_after_apply(&mut state);
+
+        let final_plan = build_retrieve_plan(&state, &policy_id);
+        let new_state_hash = final_plan.state_hash;
+        let remaining_manifest_chunks = final_plan.chunk_manifest.len();
+        let stop_reason = if remaining_manifest_chunks == 0 {
+            StopReason::FixedPointReached
+        } else {
+            StopReason::TargetReached
+        };
+
+        let progress_report = json!({
+            "requested_chunks": chunk_summaries.len(),
+            "applied_chunks": applied_events.len(),
+            "excluded_chunks": indices_to_exclude.len(),
+            "replaced_chunks": replaced_chunks,
+            "notes_added": notes_added,
+            "manifest_chunk_count_before": current_plan.chunk_manifest.len(),
+            "remaining_manifest_chunks": remaining_manifest_chunks,
+            "manifest_chunk_count_after": remaining_manifest_chunks,
+            "max_chunks_per_apply": max_chunks_per_apply,
+        });
+
+        (applied_events, new_state_hash, progress_report, stop_reason)
+    };
+
+    Ok(ManageContextResult {
+        json: json!({
+            "mode": "apply",
+            "applied_events": applied_events,
+            "new_state_hash": new_state_hash,
+            "progress_report": progress_report,
+            "stop_reason": stop_reason.as_str(),
+        }),
+    })
+}
+
+fn validate_policy_id(policy_id: &str, turn: &TurnContext) -> Result<(), FunctionCallError> {
+    let expected = turn.config.manage_context_policy.quality_rubric_id.trim();
+    if policy_id != expected {
+        return Err(contract_error(
+            StopReason::InvalidContract,
+            format!("policy_id mismatch (expected '{expected}', got '{policy_id}')"),
+        ));
+    }
+    Ok(())
+}
+
+fn required_non_empty_str(
+    field_name: &str,
+    value: Option<&String>,
+) -> Result<String, FunctionCallError> {
+    let value = value.ok_or_else(|| {
+        contract_error(
+            StopReason::InvalidContract,
+            format!("manage_context.{field_name} is required"),
+        )
+    })?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(contract_error(
+            StopReason::InvalidContract,
+            format!("manage_context.{field_name} must be non-empty"),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_chunk_summaries(
+    chunk_summaries: &[ChunkSummaryInput],
+    chunk_manifest: &[ChunkManifestEntry],
+) -> Result<(), FunctionCallError> {
+    let manifest_ids: HashSet<&str> = chunk_manifest
+        .iter()
+        .map(|entry| entry.chunk_id.as_str())
+        .collect();
+    let mut seen_chunk_ids: HashSet<&str> = HashSet::new();
+
+    for chunk in chunk_summaries {
+        let chunk_id = chunk.chunk_id.trim();
+        if chunk_id.is_empty() {
+            return Err(contract_error(
+                StopReason::InvalidSummarySchema,
+                "manage_context.apply chunk_summaries[].chunk_id must be non-empty",
+            ));
+        }
+        if chunk.tool_context.trim().is_empty() {
+            return Err(contract_error(
+                StopReason::InvalidSummarySchema,
+                format!(
+                    "manage_context.apply chunk_summaries[{chunk_id}].tool_context must be non-empty"
+                ),
+            ));
+        }
+        if chunk.reasoning_context.trim().is_empty() {
+            return Err(contract_error(
+                StopReason::InvalidSummarySchema,
+                format!(
+                    "manage_context.apply chunk_summaries[{chunk_id}].reasoning_context must be non-empty"
+                ),
+            ));
+        }
+        if !manifest_ids.contains(chunk_id) {
+            return Err(contract_error(
+                StopReason::InvalidSummarySchema,
+                format!("chunk_id '{chunk_id}' is not present in current chunk_manifest"),
+            ));
+        }
+        if !seen_chunk_ids.insert(chunk_id) {
+            return Err(contract_error(
+                StopReason::InvalidSummarySchema,
+                format!("chunk_id '{chunk_id}' appears more than once in apply payload"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn chunk_replacement_text(chunk: &ChunkSummaryInput, plan_id: &str) -> String {
+    format!(
+        "chunk_id={}\nplan_id={}\n{}\n{}",
+        chunk.chunk_id.trim(),
+        plan_id,
+        chunk.tool_context.trim(),
+        chunk.reasoning_context.trim()
+    )
+}
+
+fn build_tool_context_note(chunk: &ChunkSummaryInput, plan_id: &str) -> String {
+    format!(
+        "{TOOL_CONTEXT_OPEN_TAG}\nchunk_id={}\nplan_id={plan_id}\n{}\n{TOOL_CONTEXT_CLOSE_TAG}",
+        chunk.chunk_id.trim(),
+        chunk.tool_context.trim(),
+    )
+}
+
+fn build_reasoning_context_note(chunk: &ChunkSummaryInput, plan_id: &str) -> String {
+    format!(
+        "{REASONING_CONTEXT_OPEN_TAG}\nchunk_id={}\nplan_id={plan_id}\n{}\n{REASONING_CONTEXT_CLOSE_TAG}",
+        chunk.chunk_id.trim(),
+        chunk.reasoning_context.trim(),
+    )
+}
+
+fn build_retrieve_plan(state: &crate::state::SessionState, policy_id: &str) -> RetrievePlan {
+    let ev = state.build_context_items_event();
+    let overlay = state.context_overlay_snapshot();
+    let items = state.history_snapshot_lenient();
+
+    let state_hash = state_hash_for_context(&ev, &overlay, &items);
+    let top_offenders = collect_top_offenders(&ev.items, &items, &overlay);
+    let chunk_manifest = top_offenders
+        .iter()
+        .enumerate()
+        .map(|(idx, offender)| ChunkManifestEntry {
+            chunk_id: format!("chunk_{:03}", idx + 1),
+            source_id: offender.id.clone(),
+            index: offender.index,
+            category: offender.category.clone(),
+            call_id: offender.call_id.clone(),
+            approx_bytes: offender.approx_bytes,
+            preview: offender.preview.clone(),
+        })
+        .collect::<Vec<_>>();
+    let plan_id = plan_id_for(policy_id, &state_hash, &chunk_manifest);
+
+    RetrievePlan {
+        state_hash,
+        plan_id,
+        chunk_manifest,
+        top_offenders,
+    }
+}
+
+fn collect_top_offenders(
+    summaries: &[crate::state::ContextItemSummary],
+    items: &[ResponseItem],
+    overlay: &ContextOverlay,
+) -> Vec<TopOffender> {
+    let manage_context_call_ids = manage_context_call_ids(items);
+    let tool_name_by_call_id = tool_name_by_call_id(items);
+
+    let mut top_offenders = Vec::new();
+
+    for summary in summaries {
+        if !summary.included {
+            continue;
+        }
+        if !matches!(
+            summary.category,
+            PruneCategory::ToolOutput | PruneCategory::Reasoning
+        ) {
+            continue;
+        }
+
+        let item = items.get(summary.index);
+        if is_manage_context_item(item, &manage_context_call_ids) {
+            continue;
+        }
+
+        let raw_bytes = item.map(estimate_item_bytes).unwrap_or(0);
+        let effective_bytes = summary
+            .id
+            .as_deref()
+            .and_then(parse_rid)
+            .and_then(|rid| overlay.replacements_by_rid.get(&rid))
+            .map(|replacement| replacement.len() as u64)
+            .unwrap_or(raw_bytes);
+
+        let call_id = item.and_then(call_id_for_item).map(ToString::to_string);
+        let tool_name = call_id
+            .as_deref()
+            .and_then(|call_id| tool_name_by_call_id.get(call_id))
+            .map(|name| (*name).to_string());
+
+        top_offenders.push(TopOffender {
+            index: summary.index,
+            id: summary.id.clone(),
+            category: prune_category_tag(summary.category).to_string(),
+            approx_bytes: effective_bytes,
+            preview: summary.preview.clone(),
+            call_id,
+            tool_name,
+        });
+    }
+
+    top_offenders.sort_by(|lhs, rhs| {
+        rhs.approx_bytes
+            .cmp(&lhs.approx_bytes)
+            .then_with(|| lhs.index.cmp(&rhs.index))
+    });
+    top_offenders
+}
+
+fn materialize_prompt_snapshot_after_apply(state: &mut crate::state::SessionState) {
+    let current_history = state.history_snapshot_lenient();
+    let mut prompt_snapshot = state.prompt_snapshot_lenient();
+    strip_completed_manage_context_pairs(&mut prompt_snapshot);
+
+    if prompt_snapshot == current_history {
+        return;
+    }
+
+    state.replace_history(prompt_snapshot);
+}
+
+fn strip_completed_manage_context_pairs(items: &mut Vec<ResponseItem>) {
+    let mut manage_context_call_ids: HashSet<String> = HashSet::new();
+    let mut manage_context_output_ids: HashSet<String> = HashSet::new();
+
+    for item in items.iter() {
+        match item {
+            ResponseItem::FunctionCall { name, call_id, .. }
+            | ResponseItem::CustomToolCall { name, call_id, .. }
+                if name == "manage_context" =>
+            {
+                manage_context_call_ids.insert(call_id.clone());
+            }
+            ResponseItem::FunctionCallOutput { call_id, .. }
+            | ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                manage_context_output_ids.insert(call_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    let completed_call_ids: HashSet<String> = manage_context_call_ids
+        .into_iter()
+        .filter(|call_id| manage_context_output_ids.contains(call_id))
+        .collect();
+
+    if completed_call_ids.is_empty() {
+        return;
+    }
+
+    items.retain(|item| match item {
+        ResponseItem::FunctionCall { name, call_id, .. }
+        | ResponseItem::CustomToolCall { name, call_id, .. } => {
+            !(name == "manage_context" && completed_call_ids.contains(call_id))
+        }
+        ResponseItem::FunctionCallOutput { call_id, .. }
+        | ResponseItem::CustomToolCallOutput { call_id, .. } => {
+            !completed_call_ids.contains(call_id)
+        }
+        _ => true,
+    });
+}
+
+fn manage_context_call_ids(items: &[ResponseItem]) -> HashSet<&str> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::FunctionCall { name, call_id, .. } if name == "manage_context" => {
+                Some(call_id.as_str())
+            }
+            ResponseItem::CustomToolCall { name, call_id, .. } if name == "manage_context" => {
+                Some(call_id.as_str())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_manage_context_item(
+    item: Option<&ResponseItem>,
+    manage_context_call_ids: &HashSet<&str>,
+) -> bool {
+    match item {
+        Some(ResponseItem::FunctionCall { name, .. })
+        | Some(ResponseItem::CustomToolCall { name, .. }) => name == "manage_context",
+        Some(ResponseItem::FunctionCallOutput { call_id, .. })
+        | Some(ResponseItem::CustomToolCallOutput { call_id, .. }) => {
+            manage_context_call_ids.contains(call_id.as_str())
+        }
+        _ => false,
+    }
+}
+
+fn tool_name_by_call_id(items: &[ResponseItem]) -> HashMap<&str, &str> {
+    let mut out: HashMap<&str, &str> = HashMap::new();
+    for item in items {
+        match item {
+            ResponseItem::FunctionCall { call_id, name, .. }
+            | ResponseItem::CustomToolCall { call_id, name, .. } => {
+                out.insert(call_id.as_str(), name.as_str());
+            }
+            ResponseItem::LocalShellCall {
+                call_id: Some(call_id),
+                ..
+            } => {
+                out.insert(call_id.as_str(), "local_shell");
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn call_id_for_item(item: &ResponseItem) -> Option<&str> {
+    match item {
+        ResponseItem::FunctionCall { call_id, .. }
+        | ResponseItem::FunctionCallOutput { call_id, .. }
+        | ResponseItem::CustomToolCall { call_id, .. }
+        | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
+        ResponseItem::LocalShellCall {
+            call_id: Some(call_id),
+            ..
+        } => Some(call_id.as_str()),
+        _ => None,
+    }
+}
+
+fn estimate_item_bytes(item: &ResponseItem) -> u64 {
+    serde_json::to_vec(item)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(0)
+}
+
+fn prune_category_tag(category: PruneCategory) -> &'static str {
+    match category {
+        PruneCategory::ToolOutput => "tool_output",
+        PruneCategory::ToolCall => "tool_call",
+        PruneCategory::Reasoning => "reasoning",
+        PruneCategory::AssistantMessage => "assistant_message",
+        PruneCategory::UserMessage => "user_message",
+        PruneCategory::UserInstructions => "user_instructions",
+        PruneCategory::EnvironmentContext => "environment_context",
+    }
+}
+
+fn state_hash_for_context(
+    ev: &ContextItemsEvent,
+    overlay: &ContextOverlay,
+    items: &[ResponseItem],
+) -> String {
+    let manage_context_call_ids = manage_context_call_ids(items);
+
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(b"items\n");
+    for item in &ev.items {
+        if let Some(raw_item) = items.get(item.index)
+            && matches!(
+                raw_item,
+                ResponseItem::FunctionCall { name, .. } | ResponseItem::CustomToolCall { name, .. }
+                    if name == "manage_context"
+            )
+        {
+            continue;
+        }
+        if let Some(raw_item) = items.get(item.index)
+            && matches!(
+                raw_item,
+                ResponseItem::FunctionCallOutput { call_id, .. }
+                    | ResponseItem::CustomToolCallOutput { call_id, .. }
+                    if manage_context_call_ids.contains(call_id.as_str())
+            )
+        {
+            continue;
+        }
+
+        hasher.update((item.index as u64).to_le_bytes());
+        hasher.update(b"\n");
+        if let Some(id) = &item.id {
+            hasher.update(id.as_bytes());
+        }
+        hasher.update(b"\n");
+        hasher.update(prune_category_tag(item.category).as_bytes());
+        hasher.update(b"\n");
+        hasher.update([if item.included { 1 } else { 0 }]);
+        hasher.update(b"\n");
+    }
+
+    hasher.update(b"replacements\n");
+    for (rid, text) in &overlay.replacements_by_rid {
+        hasher.update(rid.to_le_bytes());
+        hasher.update(b"\n");
+        hasher.update(text.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    hasher.update(b"notes\n");
+    for note in &overlay.notes {
+        hasher.update(note.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    format!("{:x}", hasher.finalize())
+}
+
+fn plan_id_for(policy_id: &str, state_hash: &str, chunk_manifest: &[ChunkManifestEntry]) -> String {
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(b"policy\n");
+    hasher.update(policy_id.as_bytes());
+    hasher.update(b"\nstate_hash\n");
+    hasher.update(state_hash.as_bytes());
+    hasher.update(b"\nchunks\n");
+
+    for chunk in chunk_manifest {
+        hasher.update(chunk.chunk_id.as_bytes());
+        hasher.update(b"\n");
+        if let Some(source_id) = &chunk.source_id {
+            hasher.update(source_id.as_bytes());
+        }
+        hasher.update(b"\n");
+        hasher.update((chunk.index as u64).to_le_bytes());
+        hasher.update(b"\n");
+        hasher.update(chunk.category.as_bytes());
+        hasher.update(b"\n");
+        if let Some(call_id) = &chunk.call_id {
+            hasher.update(call_id.as_bytes());
+        }
+        hasher.update(b"\n");
+        hasher.update(chunk.approx_bytes.to_le_bytes());
+        hasher.update(b"\n");
+    }
+
+    format!("{:x}", hasher.finalize())
+}
+
+fn contract_error(reason: StopReason, message: impl Into<String>) -> FunctionCallError {
+    FunctionCallError::RespondToModel(
+        json!({
+            "stop_reason": reason.as_str(),
+            "message": message.into(),
+        })
+        .to_string(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::models::ContentItem;
+    use serde_json::Value;
+
+    fn user_message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
+    fn assistant_message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
+    fn tool_call(call_id: &str) -> ResponseItem {
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "exec_command".to_string(),
+            arguments: r#"{"cmd":"echo test"}"#.to_string(),
+            call_id: call_id.to_string(),
+        }
+    }
+
+    fn tool_output(call_id: &str, text: &str) -> ResponseItem {
+        ResponseItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: codex_protocol::models::FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text(text.to_string()),
+                success: Some(true),
+            },
+        }
+    }
+
+    fn parse_error_stop_reason(err: FunctionCallError) -> String {
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("expected RespondToModel error");
+        };
+        let parsed: Value =
+            serde_json::from_str(&message).expect("structured manage_context error");
+        parsed
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .expect("stop_reason")
+            .to_string()
+    }
+
+    #[test]
+    fn manage_context_stop_reason_contract_matches_v2_set() {
+        let actual = [
+            StopReason::TargetReached.as_str(),
+            StopReason::FixedPointReached.as_str(),
+            StopReason::InvalidSummarySchema.as_str(),
+            StopReason::StateHashMismatch.as_str(),
+            StopReason::PlanIdInvalid.as_str(),
+            StopReason::InvalidContract.as_str(),
+        ];
+        let expected = [
+            "target_reached",
+            "fixed_point_reached",
+            "invalid_summary_schema",
+            "state_hash_mismatch",
+            "plan_id_invalid",
+            "invalid_contract",
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn manage_context_retrieve_requires_policy_id() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let args: ManageContextToolArgs =
+            serde_json::from_str(r#"{"mode":"retrieve"}"#).expect("parse args");
+
+        let err = handle_manage_context(&session, &turn, &args)
+            .await
+            .expect_err("must reject missing policy_id");
+
+        assert_eq!(
+            parse_error_stop_reason(err),
+            StopReason::InvalidContract.as_str()
+        );
+    }
+
+    #[test]
+    fn manage_context_contract_rejects_legacy_fields() {
+        for payload in [
+            r#"{"mode":"retrieve","policy_id":"p","snapshot_id":"legacy"}"#,
+            r#"{"mode":"retrieve","policy_id":"p","new_snapshot_id":"legacy"}"#,
+            r#"{"mode":"retrieve","policy_id":"p","max_top_items":10}"#,
+            r#"{"mode":"retrieve","policy_id":"p","include_prompt_preview":true}"#,
+            r#"{"mode":"retrieve","policy_id":"p","allow_recent":true}"#,
+            r#"{"mode":"apply","policy_id":"p","plan_id":"x","state_hash":"h","ops":[]}"#,
+        ] {
+            let parsed: Result<ManageContextToolArgs, _> = serde_json::from_str(payload);
+            assert!(
+                parsed.is_err(),
+                "legacy fields must fail strict contract parsing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manage_context_retrieve_rejects_apply_only_fields() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": turn.config.manage_context_policy.quality_rubric_id,
+            "plan_id": "legacy-plan",
+        }))
+        .expect("parse args");
+
+        let err = handle_manage_context(&session, &turn, &args)
+            .await
+            .expect_err("must reject apply-only fields in retrieve mode");
+
+        assert_eq!(
+            parse_error_stop_reason(err),
+            StopReason::InvalidContract.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn manage_context_retrieve_returns_required_fields() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
+
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &user_message("recent user ask"),
+                    &assistant_message("recent assistant reply"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": policy_id,
+        }))
+        .expect("parse args");
+
+        let result = handle_manage_context(&session, &turn, &args)
+            .await
+            .expect("retrieve must succeed");
+
+        assert_eq!(
+            result.json.get("mode").and_then(Value::as_str),
+            Some("retrieve")
+        );
+        assert!(result.json.get("plan_id").is_some_and(Value::is_string));
+        assert!(result.json.get("state_hash").is_some_and(Value::is_string));
+        assert!(result.json.get("policy_id").is_some_and(Value::is_string));
+        assert!(
+            result
+                .json
+                .get("chunk_manifest")
+                .is_some_and(Value::is_array)
+        );
+        assert!(
+            result
+                .json
+                .get("convergence_policy")
+                .is_some_and(Value::is_object)
+        );
+        assert!(
+            result
+                .json
+                .get("top_offenders")
+                .is_some_and(Value::is_array)
+        );
+    }
+
+    #[tokio::test]
+    async fn manage_context_apply_requires_chunk_summaries() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
+
+        let args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "apply",
+            "policy_id": policy_id,
+            "plan_id": "p",
+            "state_hash": "h",
+        }))
+        .expect("parse args");
+
+        let err = handle_manage_context(&session, &turn, &args)
+            .await
+            .expect_err("must reject missing chunk_summaries");
+
+        assert_eq!(
+            parse_error_stop_reason(err),
+            StopReason::InvalidContract.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn manage_context_apply_rejects_state_hash_mismatch() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
+
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &user_message("u1"),
+                    &tool_call("call_tool_1"),
+                    &tool_output("call_tool_1", "tool output payload"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let retrieve_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": policy_id,
+        }))
+        .expect("parse retrieve args");
+
+        let retrieve = handle_manage_context(&session, &turn, &retrieve_args)
+            .await
+            .expect("retrieve");
+
+        let plan_id = retrieve
+            .json
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .expect("plan_id")
+            .to_string();
+        let chunk_id = retrieve
+            .json
+            .pointer("/chunk_manifest/0/chunk_id")
+            .and_then(Value::as_str)
+            .expect("first chunk id")
+            .to_string();
+
+        let apply_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "apply",
+            "policy_id": turn.config.manage_context_policy.quality_rubric_id,
+            "plan_id": plan_id,
+            "state_hash": "mismatch",
+            "chunk_summaries": [{
+                "chunk_id": chunk_id,
+                "tool_context": "tool summary",
+                "reasoning_context": "reasoning summary"
+            }]
+        }))
+        .expect("parse apply args");
+
+        let err = handle_manage_context(&session, &turn, &apply_args)
+            .await
+            .expect_err("must fail on stale hash");
+
+        assert_eq!(
+            parse_error_stop_reason(err),
+            StopReason::StateHashMismatch.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn manage_context_apply_rejects_plan_id_mismatch() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &user_message("u1"),
+                    &tool_call("call_tool_1"),
+                    &tool_output("call_tool_1", "tool output payload"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let retrieve_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": policy_id,
+        }))
+        .expect("parse retrieve args");
+
+        let retrieve = handle_manage_context(&session, &turn, &retrieve_args)
+            .await
+            .expect("retrieve");
+
+        let state_hash = retrieve
+            .json
+            .get("state_hash")
+            .and_then(Value::as_str)
+            .expect("state_hash")
+            .to_string();
+        let chunk_id = retrieve
+            .json
+            .pointer("/chunk_manifest/0/chunk_id")
+            .and_then(Value::as_str)
+            .expect("first chunk id")
+            .to_string();
+
+        let apply_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "apply",
+            "policy_id": turn.config.manage_context_policy.quality_rubric_id,
+            "plan_id": "bad-plan-id",
+            "state_hash": state_hash,
+            "chunk_summaries": [{
+                "chunk_id": chunk_id,
+                "tool_context": "tool summary",
+                "reasoning_context": "reasoning summary"
+            }]
+        }))
+        .expect("parse apply args");
+
+        let err = handle_manage_context(&session, &turn, &apply_args)
+            .await
+            .expect_err("must fail on invalid plan_id");
+
+        assert_eq!(
+            parse_error_stop_reason(err),
+            StopReason::PlanIdInvalid.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn manage_context_apply_generates_one_context_pair_per_chunk() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
+
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &user_message("u1"),
+                    &tool_call("call_tool_1"),
+                    &tool_output("call_tool_1", "tool output payload 1"),
+                    &tool_call("call_tool_2"),
+                    &tool_output("call_tool_2", "tool output payload 2"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let retrieve_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": policy_id,
+        }))
+        .expect("parse retrieve args");
+
+        let retrieve = handle_manage_context(&session, &turn, &retrieve_args)
+            .await
+            .expect("retrieve");
+
+        let plan_id = retrieve
+            .json
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .expect("plan_id")
+            .to_string();
+        let state_hash = retrieve
+            .json
+            .get("state_hash")
+            .and_then(Value::as_str)
+            .expect("state_hash")
+            .to_string();
+
+        let manifest = retrieve
+            .json
+            .get("chunk_manifest")
+            .and_then(Value::as_array)
+            .expect("chunk_manifest array");
+        let selected_chunk_ids = manifest
+            .iter()
+            .take(2)
+            .filter_map(|entry| entry.get("chunk_id").and_then(Value::as_str))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            !selected_chunk_ids.is_empty(),
+            "retrieve should return at least one chunk"
+        );
+        let selected_source_ids = manifest
+            .iter()
+            .take(selected_chunk_ids.len())
+            .filter_map(|entry| entry.get("source_id").and_then(Value::as_str))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+
+        let chunk_summaries = selected_chunk_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, chunk_id)| {
+                json!({
+                    "chunk_id": chunk_id,
+                    "tool_context": format!("tool summary {idx}"),
+                    "reasoning_context": format!("reasoning summary {idx}"),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let apply_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "apply",
+            "policy_id": turn.config.manage_context_policy.quality_rubric_id,
+            "plan_id": plan_id,
+            "state_hash": state_hash,
+            "chunk_summaries": chunk_summaries,
+        }))
+        .expect("parse apply args");
+
+        let result = handle_manage_context(&session, &turn, &apply_args)
+            .await
+            .expect("apply");
+
+        assert_eq!(
+            result.json.get("mode").and_then(Value::as_str),
+            Some("apply")
+        );
+        assert!(
+            result
+                .json
+                .get("stop_reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| {
+                    reason == StopReason::TargetReached.as_str()
+                        || reason == StopReason::FixedPointReached.as_str()
+                }),
+            "expected apply stop_reason in {{target_reached, fixed_point_reached}}"
+        );
+        assert!(
+            result
+                .json
+                .get("new_state_hash")
+                .is_some_and(Value::is_string)
+        );
+        let excluded_chunks = result
+            .json
+            .pointer("/progress_report/excluded_chunks")
+            .and_then(Value::as_u64)
+            .expect("excluded_chunks");
+        let replaced_chunks = result
+            .json
+            .pointer("/progress_report/replaced_chunks")
+            .and_then(Value::as_u64)
+            .expect("replaced_chunks");
+        assert!(
+            excluded_chunks + replaced_chunks >= selected_chunk_ids.len() as u64,
+            "each applied chunk must be excluded or replaced"
+        );
+
+        let applied_events = result
+            .json
+            .get("applied_events")
+            .and_then(Value::as_array)
+            .expect("applied_events array");
+        assert_eq!(applied_events.len(), selected_chunk_ids.len());
+
+        for (idx, event) in applied_events.iter().enumerate() {
+            let chunk_id = &selected_chunk_ids[idx];
+            assert_eq!(
+                event.get("chunk_id").and_then(Value::as_str),
+                Some(chunk_id.as_str())
+            );
+
+            let tool_context = event
+                .get("tool_context")
+                .and_then(Value::as_str)
+                .expect("tool_context");
+            assert!(tool_context.starts_with(TOOL_CONTEXT_OPEN_TAG));
+            assert!(tool_context.contains(&format!("chunk_id={chunk_id}")));
+
+            let reasoning_context = event
+                .get("reasoning_context")
+                .and_then(Value::as_str)
+                .expect("reasoning_context");
+            assert!(reasoning_context.starts_with(REASONING_CONTEXT_OPEN_TAG));
+            assert!(reasoning_context.contains(&format!("chunk_id={chunk_id}")));
+
+            let excluded = event
+                .get("excluded")
+                .and_then(Value::as_bool)
+                .expect("excluded");
+            let replacement_applied = event
+                .get("replacement_applied")
+                .and_then(Value::as_bool)
+                .expect("replacement_applied");
+            assert!(
+                excluded ^ replacement_applied,
+                "each applied chunk must be excluded or replaced exactly once"
+            );
+        }
+
+        let state = session.state.lock().await;
+        let history = state.history_snapshot_lenient();
+
+        let mut tool_context_count = 0usize;
+        let mut reasoning_context_count = 0usize;
+
+        for item in history {
+            let ResponseItem::Message { role, content, .. } = item else {
+                continue;
+            };
+            if role != "user" {
+                continue;
+            }
+            let Some(text) = first_text(&content) else {
+                continue;
+            };
+
+            for chunk_id in &selected_chunk_ids {
+                if text.starts_with(TOOL_CONTEXT_OPEN_TAG)
+                    && text.contains(&format!("chunk_id={chunk_id}"))
+                {
+                    tool_context_count += 1;
+                }
+                if text.starts_with(REASONING_CONTEXT_OPEN_TAG)
+                    && text.contains(&format!("chunk_id={chunk_id}"))
+                {
+                    reasoning_context_count += 1;
+                }
+            }
+        }
+
+        assert_eq!(tool_context_count, selected_chunk_ids.len());
+        assert_eq!(reasoning_context_count, selected_chunk_ids.len());
+        drop(state);
+
+        let retrieve_after_apply: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": turn.config.manage_context_policy.quality_rubric_id,
+        }))
+        .expect("parse retrieve after apply");
+        let after = handle_manage_context(&session, &turn, &retrieve_after_apply)
+            .await
+            .expect("retrieve after apply");
+        let after_manifest = after
+            .json
+            .get("chunk_manifest")
+            .and_then(Value::as_array)
+            .expect("after chunk_manifest array");
+        let remaining_source_ids: HashSet<String> = after_manifest
+            .iter()
+            .filter_map(|entry| entry.get("source_id").and_then(Value::as_str))
+            .map(ToString::to_string)
+            .collect();
+        for applied_source_id in selected_source_ids {
+            assert!(
+                !remaining_source_ids.contains(&applied_source_id),
+                "applied source_id should no longer be in chunk_manifest: {applied_source_id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manage_context_apply_rejects_invalid_chunk_id() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
+
+        let retrieve_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": policy_id,
+        }))
+        .expect("parse retrieve args");
+
+        let retrieve = handle_manage_context(&session, &turn, &retrieve_args)
+            .await
+            .expect("retrieve");
+
+        let plan_id = retrieve
+            .json
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .expect("plan_id")
+            .to_string();
+        let state_hash = retrieve
+            .json
+            .get("state_hash")
+            .and_then(Value::as_str)
+            .expect("state_hash")
+            .to_string();
+
+        let apply_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "apply",
+            "policy_id": turn.config.manage_context_policy.quality_rubric_id,
+            "plan_id": plan_id,
+            "state_hash": state_hash,
+            "chunk_summaries": [{
+                "chunk_id": "chunk_999",
+                "tool_context": "tool summary",
+                "reasoning_context": "reasoning summary"
+            }]
+        }))
+        .expect("parse apply args");
+
+        let err = handle_manage_context(&session, &turn, &apply_args)
+            .await
+            .expect_err("must fail with unknown chunk id");
+
+        let stop_reason = parse_error_stop_reason(err);
+        assert_eq!(stop_reason, StopReason::InvalidSummarySchema.as_str());
+    }
+
+    #[test]
+    fn manage_context_state_hash_ignores_manage_context_call_and_output() {
+        let overlay = ContextOverlay::default();
+
+        let items = vec![user_message("u1"), user_message("u2")];
+        let ev = ContextItemsEvent {
+            items: vec![
+                crate::state::ContextItemSummary {
+                    index: 0,
+                    category: PruneCategory::UserMessage,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r0".to_string()),
+                },
+                crate::state::ContextItemSummary {
+                    index: 1,
+                    category: PruneCategory::UserMessage,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r1".to_string()),
+                },
+            ],
+        };
+        let base = state_hash_for_context(&ev, &overlay, &items);
+
+        let call_id = "call_manage_context";
+        let items_with_manage_context = vec![
+            user_message("u1"),
+            user_message("u2"),
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "manage_context".to_string(),
+                arguments: "{}".to_string(),
+                call_id: call_id.to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: call_id.to_string(),
+                output: codex_protocol::models::FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text("{\"ok\":true}".to_string()),
+                    success: Some(true),
+                },
+            },
+        ];
+        let ev_with_manage_context = ContextItemsEvent {
+            items: vec![
+                crate::state::ContextItemSummary {
+                    index: 0,
+                    category: PruneCategory::UserMessage,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r0".to_string()),
+                },
+                crate::state::ContextItemSummary {
+                    index: 1,
+                    category: PruneCategory::UserMessage,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r1".to_string()),
+                },
+                crate::state::ContextItemSummary {
+                    index: 2,
+                    category: PruneCategory::ToolCall,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r2".to_string()),
+                },
+                crate::state::ContextItemSummary {
+                    index: 3,
+                    category: PruneCategory::ToolOutput,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r3".to_string()),
+                },
+            ],
+        };
+        let extended = state_hash_for_context(
+            &ev_with_manage_context,
+            &overlay,
+            &items_with_manage_context,
+        );
+
+        assert_eq!(base, extended);
+    }
+
+    fn first_text(content: &[codex_protocol::models::ContentItem]) -> Option<&str> {
+        for item in content {
+            match item {
+                codex_protocol::models::ContentItem::InputText { text }
+                | codex_protocol::models::ContentItem::OutputText { text } => return Some(text),
+                codex_protocol::models::ContentItem::InputImage { .. } => {}
+            }
+        }
+        None
+    }
+}

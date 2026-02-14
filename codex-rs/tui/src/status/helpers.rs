@@ -93,11 +93,22 @@ pub(crate) fn compose_account_display(
     match auth.auth_mode() {
         CoreAuthMode::ApiKey => Some(StatusAccountDisplay::ApiKey),
         CoreAuthMode::Chatgpt => {
-            let email = auth.get_account_email();
+            let active_account = auth_manager
+                .list_accounts()
+                .into_iter()
+                .find(|account| account.is_active);
+            let label = active_account
+                .as_ref()
+                .and_then(|account| account.label.clone())
+                .or_else(|| auth.get_account_id());
+            let email = active_account
+                .as_ref()
+                .and_then(|account| account.email.clone())
+                .or_else(|| auth.get_account_email());
             let plan = plan
                 .map(|plan_type| title_case(format!("{plan_type:?}").as_str()))
                 .or_else(|| Some("Unknown".to_string()));
-            Some(StatusAccountDisplay::ChatGpt { email, plan })
+            Some(StatusAccountDisplay::ChatGpt { label, email, plan })
         }
     }
 }

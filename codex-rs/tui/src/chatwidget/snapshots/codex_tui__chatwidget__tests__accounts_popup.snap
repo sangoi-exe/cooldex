@@ -1,0 +1,12 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: popup
+---
+  Accounts
+  Select an account to make it active, or add a new one.
+
+› 1. Work (current)  email: work@example.com • 5h: — • weekly: —
+  2. Personal        email: personal@example.com • 5h: — • weekly: —
+  3. Add account...  sign in to add another ChatGPT account
+
+  Press enter to confirm or esc to go back

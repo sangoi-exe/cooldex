@@ -329,6 +329,14 @@
         "sandbox_mode": {
           "$ref": "#/definitions/SandboxMode"
         },
+        "subagent_instructions_file": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "description": "Optional path to a file containing sub-agent model instructions."
+        },
         "tools_view_image": {
           "type": "boolean"
         },
@@ -427,6 +435,40 @@
           "type": "string"
         }
       ]
+    },
+    "ManageContextPolicyToml": {
+      "additionalProperties": false,
+      "properties": {
+        "fixed_point_k": {
+          "description": "Number of successive retrieve/apply cycles to use for fixed-point checks.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "max_chunks_per_apply": {
+          "description": "Maximum chunk count allowed in a single `manage_context.apply`.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "quality_rubric_id": {
+          "description": "Identifier for the quality rubric used by manage_context orchestration.",
+          "type": "string"
+        },
+        "stalled_signature_threshold": {
+          "description": "Repeated stalled-signature count needed before declaring stagnation.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fixed_point_k",
+        "max_chunks_per_apply",
+        "quality_rubric_id",
+        "stalled_signature_threshold"
+      ],
+      "type": "object"
     },
     "ModeKind": {
       "description": "Initial collaboration mode to use when the TUI starts.",
@@ -1446,6 +1488,14 @@
       ],
       "description": "Directory where Codex writes log files, for example `codex-tui.log`. Defaults to `$CODEX_HOME/log`."
     },
+    "manage_context_policy": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ManageContextPolicyToml"
+        }
+      ],
+      "description": "Explicit policy knobs for `manage_context` orchestration."
+    },
     "mcp_oauth_callback_port": {
       "description": "Optional fixed port for the local HTTP callback server used during MCP OAuth login. When unset, Codex will bind to an ephemeral port chosen by the OS.",
       "format": "uint16",
@@ -1642,6 +1692,14 @@
         }
       ],
       "description": "User-level skill config entries keyed by SKILL.md path."
+    },
+    "subagent_instructions_file": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      ],
+      "description": "Optional path to a file containing model instructions for sub-agent threads spawned via the collab `spawn_agent` tool."
     },
     "suppress_unstable_features_warning": {
       "description": "Suppress warnings about unstable (under development) features.",

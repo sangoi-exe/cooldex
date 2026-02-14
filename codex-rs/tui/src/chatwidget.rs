@@ -231,7 +231,10 @@ use crate::streaming::commit_tick::run_commit_tick;
 use crate::streaming::controller::PlanStreamController;
 use crate::streaming::controller::StreamController;
 
+use chrono::DateTime;
 use chrono::Local;
+use chrono::Utc;
+use codex_app_server_protocol::AuthMode;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::ThreadManager;
@@ -1161,6 +1164,18 @@ impl ChatWidget {
         self.request_redraw();
     }
 
+    pub(crate) fn open_chatgpt_add_account_view(
+        &mut self,
+        auth_url: String,
+        shared_state: Arc<crate::bottom_pane::ChatGptAddAccountSharedState>,
+        shutdown_handle: codex_login::ShutdownHandle,
+    ) {
+        let view =
+            crate::bottom_pane::ChatGptAddAccountView::new(auth_url, shared_state, shutdown_handle);
+        self.bottom_pane.show_view(Box::new(view));
+        self.request_redraw();
+    }
+
     pub(crate) fn open_feedback_consent(&mut self, category: crate::app_event::FeedbackCategory) {
         let params = crate::bottom_pane::feedback_upload_consent_params(
             self.app_event_tx.clone(),
@@ -1574,6 +1589,15 @@ impl ChatWidget {
         }
         self.refresh_status_line();
     }
+
+    pub(crate) fn on_active_account_changed(&mut self) {
+        self.plan_type = None;
+        self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
+        self.prefetch_rate_limits();
+        self.request_redraw();
+        self.refresh_status_line();
+    }
+
     /// Finalize any active exec as failed and stop/clear agent-turn UI state.
     ///
     /// This does not clear MCP startup tracking, because MCP startup can overlap with turn cleanup
@@ -3251,6 +3275,10 @@ impl ChatWidget {
                 self.clear_token_usage();
                 self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
             }
+            SlashCommand::Sanitize => {
+                self.clear_token_usage();
+                self.app_event_tx.send(AppEvent::CodexOp(Op::Sanitize));
+            }
             SlashCommand::Review => {
                 self.open_review_popup();
             }
@@ -3349,11 +3377,19 @@ impl ChatWidget {
                 self.request_quit_without_confirmation();
             }
             SlashCommand::Logout => {
+                if self.auth_manager.get_auth_mode() == Some(AuthMode::Chatgpt)
+                    && self.auth_manager.list_accounts().len() > 1
+                {
+                    self.open_logout_popup();
+                    return;
+                }
                 if let Err(e) = codex_core::auth::logout(
                     &self.config.codex_home,
                     self.config.cli_auth_credentials_store_mode,
                 ) {
                     tracing::error!("failed to logout: {e}");
+                    self.add_error_message(format!("Failed to logout: {e}"));
+                    return;
                 }
                 self.request_quit_without_confirmation();
             }
@@ -3385,6 +3421,9 @@ impl ChatWidget {
             }
             SlashCommand::Status => {
                 self.add_status_output();
+            }
+            SlashCommand::Accounts => {
+                self.app_event_tx.send(AppEvent::StartOpenAccountsPopup);
             }
             SlashCommand::DebugConfig => {
                 self.add_debug_config_output();
@@ -5380,6 +5419,387 @@ impl ChatWidget {
         });
     }
 
+    pub(crate) fn open_accounts_popup(&mut self) {
+        self.open_accounts_popup_at(Local::now());
+    }
+
+    fn rate_limit_window_reset_at_local(
+        window: &codex_core::protocol::RateLimitWindow,
+    ) -> Option<DateTime<Local>> {
+        let seconds = window.resets_at?;
+        Some(DateTime::<Utc>::from_timestamp(seconds, 0)?.with_timezone(&Local))
+    }
+
+    fn rate_limit_is_cache_expired(
+        now: DateTime<Local>,
+        resets_at: Option<DateTime<Local>>,
+    ) -> bool {
+        resets_at.is_some_and(|resets_at| now >= resets_at)
+    }
+
+    fn rate_limit_format_time_remaining(
+        now: DateTime<Local>,
+        resets_at: DateTime<Local>,
+    ) -> Option<String> {
+        let remaining = resets_at.signed_duration_since(now);
+        if remaining <= chrono::Duration::zero() {
+            return None;
+        }
+
+        let total_secs = remaining.num_seconds().max(0);
+        let total_minutes = total_secs.saturating_add(59).saturating_div(60);
+
+        let days = total_minutes / (24 * 60);
+        let hours = (total_minutes % (24 * 60)) / 60;
+        let minutes = total_minutes % 60;
+
+        Some(if days > 0 {
+            if hours > 0 {
+                format!("{days}d{hours}h")
+            } else {
+                format!("{days}d")
+            }
+        } else if hours > 0 {
+            if minutes > 0 {
+                format!("{hours}h{minutes}m")
+            } else {
+                format!("{hours}h")
+            }
+        } else {
+            format!("{minutes}m")
+        })
+    }
+
+    fn rate_limit_window_used_percent_display(
+        now: DateTime<Local>,
+        window: Option<&codex_core::protocol::RateLimitWindow>,
+    ) -> Option<i64> {
+        let window = window?;
+        let resets_at = Self::rate_limit_window_reset_at_local(window);
+        if Self::rate_limit_is_cache_expired(now, resets_at) {
+            return None;
+        }
+        let clamped = window.used_percent.clamp(0.0, 100.0);
+        Some(clamped.round() as i64)
+    }
+
+    fn rate_limit_window_blocked(
+        now: DateTime<Local>,
+        window: Option<&codex_core::protocol::RateLimitWindow>,
+    ) -> bool {
+        let Some(window) = window else {
+            return false;
+        };
+
+        let resets_at = Self::rate_limit_window_reset_at_local(window);
+        if Self::rate_limit_is_cache_expired(now, resets_at) {
+            return false;
+        }
+        window.used_percent >= 100.0
+    }
+
+    fn rate_limit_format_window_status(
+        now: DateTime<Local>,
+        label: &str,
+        window: Option<&codex_core::protocol::RateLimitWindow>,
+    ) -> String {
+        let used = Self::rate_limit_window_used_percent_display(now, window);
+        let blocked = Self::rate_limit_window_blocked(now, window);
+
+        let Some(used) = used else {
+            return format!("{label}: —");
+        };
+
+        if blocked
+            && let Some(window) = window
+            && let Some(resets_at) = Self::rate_limit_window_reset_at_local(window)
+            && let Some(remaining) = Self::rate_limit_format_time_remaining(now, resets_at)
+        {
+            let resets_str = if label == "weekly" {
+                resets_at.format("%a %H:%M").to_string()
+            } else {
+                resets_at.format("%H:%M").to_string()
+            };
+            return format!("{label}: {used}% (resets {resets_str}, in {remaining})");
+        }
+
+        format!("{label}: {used}%")
+    }
+
+    fn rate_limit_primary_label(
+        snapshot: Option<&codex_core::protocol::RateLimitSnapshot>,
+    ) -> String {
+        snapshot
+            .and_then(|snapshot| {
+                snapshot
+                    .primary
+                    .as_ref()
+                    .and_then(|window| window.window_minutes)
+            })
+            .map(get_limits_duration)
+            .unwrap_or_else(|| "5h".to_string())
+    }
+
+    fn rate_limit_secondary_label(
+        snapshot: Option<&codex_core::protocol::RateLimitSnapshot>,
+    ) -> String {
+        snapshot
+            .and_then(|snapshot| {
+                snapshot
+                    .secondary
+                    .as_ref()
+                    .and_then(|window| window.window_minutes)
+            })
+            .map(get_limits_duration)
+            .unwrap_or_else(|| "weekly".to_string())
+    }
+
+    pub(crate) fn open_accounts_popup_at(&mut self, now_local: DateTime<Local>) {
+        if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
+            self.add_error_message(
+                "'/accounts' is only available when using ChatGPT authentication.".to_string(),
+            );
+            return;
+        }
+
+        let accounts = self.auth_manager.list_accounts();
+        if accounts.is_empty() {
+            self.add_error_message("No ChatGPT accounts found.".to_string());
+            return;
+        }
+
+        let now = now_local.with_timezone(&Utc);
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from("Accounts".bold()));
+        header.push(Line::from(
+            "Select an account to make it active, or add a new one.".dim(),
+        ));
+
+        let mut items = accounts
+            .into_iter()
+            .map(|account| {
+                let name = account
+                    .label
+                    .clone()
+                    .or_else(|| account.email.clone())
+                    .unwrap_or_else(|| account.id.clone());
+
+                let snapshot = account.last_rate_limits.as_ref();
+                let primary_label = Self::rate_limit_primary_label(snapshot);
+                let secondary_label = Self::rate_limit_secondary_label(snapshot);
+
+                let five_hour_blocked = Self::rate_limit_window_blocked(
+                    now_local,
+                    snapshot.and_then(|snapshot| snapshot.primary.as_ref()),
+                );
+                let weekly_blocked = Self::rate_limit_window_blocked(
+                    now_local,
+                    snapshot.and_then(|snapshot| snapshot.secondary.as_ref()),
+                );
+                let is_exhausted = account.exhausted_until.is_some_and(|until| until > now);
+
+                let mut description_parts = Vec::new();
+                if account.label.is_some()
+                    && let Some(email) = account.email.as_ref()
+                {
+                    description_parts.push(format!("email: {email}"));
+                }
+
+                description_parts.push(Self::rate_limit_format_window_status(
+                    now_local,
+                    primary_label.as_str(),
+                    snapshot.and_then(|snapshot| snapshot.primary.as_ref()),
+                ));
+                description_parts.push(Self::rate_limit_format_window_status(
+                    now_local,
+                    secondary_label.as_str(),
+                    snapshot.and_then(|snapshot| snapshot.secondary.as_ref()),
+                ));
+
+                if is_exhausted && !five_hour_blocked && !weekly_blocked {
+                    let exhausted_local = account
+                        .exhausted_until
+                        .map(|until| until.with_timezone(&Local));
+                    let exhausted_str = exhausted_local
+                        .map(|until| {
+                            let remaining =
+                                Self::rate_limit_format_time_remaining(now_local, until);
+                            let time = until.format("%H:%M").to_string();
+                            match remaining {
+                                Some(remaining) => format!("blocked until {time} (in {remaining})"),
+                                None => format!("blocked until {time}"),
+                            }
+                        })
+                        .unwrap_or_else(|| "blocked".to_string());
+                    description_parts.push(exhausted_str);
+                }
+                let description =
+                    (!description_parts.is_empty()).then(|| description_parts.join(" • "));
+
+                let account_id = account.id;
+                SelectionItem {
+                    name,
+                    description,
+                    is_current: account.is_active,
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::SetActiveAccount {
+                            account_id: account_id.clone(),
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        items.push(SelectionItem {
+            name: "Add account...".to_string(),
+            description: Some("sign in to add another ChatGPT account".to_string()),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::StartChatGptAddAccount);
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn open_logout_popup(&mut self) {
+        self.open_logout_popup_at(Local::now());
+    }
+
+    pub(crate) fn open_logout_popup_at(&mut self, now_local: DateTime<Local>) {
+        if let Err(err) = self.auth_manager.reload_strict() {
+            self.add_error_message(format!("Failed to reload auth store: {err}"));
+            return;
+        }
+
+        if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
+            self.add_error_message(
+                "'/logout' account selection is only available when using ChatGPT authentication."
+                    .to_string(),
+            );
+            return;
+        }
+
+        let mut accounts = self.auth_manager.list_accounts();
+        if accounts.len() <= 1 {
+            self.add_error_message("No additional accounts found.".to_string());
+            return;
+        }
+
+        accounts.sort_by_key(|account| !account.is_active);
+        let now = now_local.with_timezone(&Utc);
+
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from("Logout".bold()));
+        header.push(Line::from("Codex will exit after logging out.".dim()));
+        header.push(Line::from("Select an option below.".dim()));
+
+        let logout_all_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+            tx.send(AppEvent::LogoutAllAccounts);
+        })];
+
+        let mut items = Vec::with_capacity(accounts.len() + 1);
+        items.push(SelectionItem {
+            name: "Logout all accounts".to_string(),
+            description: Some("Remove all stored credentials.".to_string()),
+            actions: logout_all_actions,
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        for account in accounts {
+            let label = account.label.clone();
+            let email = account.email.clone();
+            let is_exhausted = account.exhausted_until.is_some_and(|until| until > now);
+            let name = label
+                .clone()
+                .or_else(|| email.clone())
+                .unwrap_or_else(|| account.id.clone());
+
+            let snapshot = account.last_rate_limits.as_ref();
+            let primary_label = Self::rate_limit_primary_label(snapshot);
+            let secondary_label = Self::rate_limit_secondary_label(snapshot);
+            let five_hour_blocked = Self::rate_limit_window_blocked(
+                now_local,
+                snapshot.and_then(|snapshot| snapshot.primary.as_ref()),
+            );
+            let weekly_blocked = Self::rate_limit_window_blocked(
+                now_local,
+                snapshot.and_then(|snapshot| snapshot.secondary.as_ref()),
+            );
+
+            let mut description_parts = Vec::new();
+            if account.is_active {
+                description_parts.push("currently active".to_string());
+            }
+            if label.is_some()
+                && let Some(email) = email.as_ref()
+            {
+                description_parts.push(format!("email: {email}"));
+            }
+
+            description_parts.push(Self::rate_limit_format_window_status(
+                now_local,
+                primary_label.as_str(),
+                snapshot.and_then(|snapshot| snapshot.primary.as_ref()),
+            ));
+            description_parts.push(Self::rate_limit_format_window_status(
+                now_local,
+                secondary_label.as_str(),
+                snapshot.and_then(|snapshot| snapshot.secondary.as_ref()),
+            ));
+
+            if is_exhausted && !five_hour_blocked && !weekly_blocked {
+                let exhausted_local = account
+                    .exhausted_until
+                    .map(|until| until.with_timezone(&Local));
+                let exhausted_str = exhausted_local
+                    .map(|until| {
+                        let remaining = Self::rate_limit_format_time_remaining(now_local, until);
+                        let time = until.format("%H:%M").to_string();
+                        match remaining {
+                            Some(remaining) => format!("blocked until {time} (in {remaining})"),
+                            None => format!("blocked until {time}"),
+                        }
+                    })
+                    .unwrap_or_else(|| "blocked".to_string());
+                description_parts.push(exhausted_str);
+            }
+            let description =
+                (!description_parts.is_empty()).then(|| description_parts.join(" • "));
+
+            let account_id = account.id;
+            items.push(SelectionItem {
+                name: format!("Remove: {name}"),
+                description,
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::RemoveAccount {
+                        account_id: account_id.clone(),
+                        exit_after: true,
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            initial_selected_idx: Some(0),
+            ..Default::default()
+        });
+    }
+
     pub(crate) fn open_experimental_popup(&mut self) {
         let features: Vec<ExperimentalFeatureItem> = FEATURES
             .iter()
@@ -7098,7 +7518,7 @@ fn extract_first_bold(s: &str) -> Option<String> {
     None
 }
 
-async fn fetch_rate_limits(base_url: String, auth: CodexAuth) -> Vec<RateLimitSnapshot> {
+pub(crate) async fn fetch_rate_limits(base_url: String, auth: CodexAuth) -> Vec<RateLimitSnapshot> {
     match BackendClient::from_auth(base_url, &auth) {
         Ok(client) => match client.get_rate_limits_many().await {
             Ok(snapshots) => snapshots,

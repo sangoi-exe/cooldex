@@ -15,7 +15,13 @@ use crate::history_cell::UserHistoryCell;
 use crate::test_backend::VT100Backend;
 use crate::tui::FrameRequester;
 use assert_matches::assert_matches;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use codex_core::AuthManager;
 use codex_core::CodexAuth;
+use codex_core::auth::AuthStore;
+use codex_core::auth::StoredAccount;
+use codex_core::auth::save_auth;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
@@ -63,6 +69,8 @@ use codex_core::protocol::UndoStartedEvent;
 use codex_core::protocol::ViewImageToolCallEvent;
 use codex_core::protocol::WarningEvent;
 use codex_core::skills::model::SkillMetadata;
+use codex_core::token_data::TokenData;
+use codex_core::token_data::parse_chatgpt_jwt_claims;
 use codex_otel::OtelManager;
 use codex_otel::RuntimeMetricsSummary;
 use codex_protocol::ThreadId;
@@ -98,15 +106,33 @@ use serial_test::serial;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use tempfile::NamedTempFile;
 use tempfile::tempdir;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
 use toml::Value as TomlValue;
 
+static NEXT_TEST_CODEX_HOME_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_test_codex_home() -> PathBuf {
+    let id = NEXT_TEST_CODEX_HOME_ID.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("codex-tui-test-codex-home-{pid}-{nanos}-{id}"));
+    std::fs::create_dir_all(&path).expect("create test codex_home");
+    path
+}
+
 async fn test_config() -> Config {
     // Use base defaults to avoid depending on host state.
-    let codex_home = std::env::temp_dir();
+    let codex_home = next_test_codex_home();
     ConfigBuilder::default()
         .codex_home(codex_home.clone())
         .build()
@@ -1150,6 +1176,70 @@ fn set_chatgpt_auth(chat: &mut ChatWidget) {
     chat.auth_manager = codex_core::test_support::auth_manager_from_auth(
         CodexAuth::create_dummy_chatgpt_auth_for_testing(),
     );
+    chat.models_manager = Arc::new(ModelsManager::new(
+        chat.config.codex_home.clone(),
+        chat.auth_manager.clone(),
+    ));
+}
+
+fn set_chatgpt_auth_with_secondary_account(chat: &mut ChatWidget) {
+    let id_token_for_email = |email: &str| {
+        let header = serde_json::json!({"alg":"HS256","typ":"JWT"});
+        let payload = serde_json::json!({"email": email});
+        let jwt = format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(header.to_string()),
+            URL_SAFE_NO_PAD.encode(payload.to_string()),
+            URL_SAFE_NO_PAD.encode("sig")
+        );
+        parse_chatgpt_jwt_claims(&jwt).expect("valid jwt")
+    };
+
+    let work_tokens = TokenData {
+        id_token: id_token_for_email("work@example.com"),
+        access_token: "work-access".to_string(),
+        refresh_token: "work-refresh".to_string(),
+        account_id: Some("work-account".to_string()),
+    };
+    let personal_tokens = TokenData {
+        id_token: id_token_for_email("personal@example.com"),
+        access_token: "personal-access".to_string(),
+        refresh_token: "personal-refresh".to_string(),
+        account_id: Some("personal-account".to_string()),
+    };
+
+    let store = AuthStore {
+        active_account_id: Some("work-account".to_string()),
+        accounts: vec![
+            StoredAccount {
+                id: "work-account".to_string(),
+                label: Some("Work".to_string()),
+                tokens: work_tokens,
+                last_refresh: None,
+                usage: None,
+            },
+            StoredAccount {
+                id: "personal-account".to_string(),
+                label: Some("Personal".to_string()),
+                tokens: personal_tokens,
+                last_refresh: None,
+                usage: None,
+            },
+        ],
+        ..AuthStore::default()
+    };
+    save_auth(
+        &chat.config.codex_home,
+        &store,
+        chat.config.cli_auth_credentials_store_mode,
+    )
+    .expect("save auth store");
+
+    chat.auth_manager = Arc::new(AuthManager::new(
+        chat.config.codex_home.clone(),
+        false,
+        chat.config.cli_auth_credentials_store_mode,
+    ));
     chat.models_manager = Arc::new(ModelsManager::new(
         chat.config.codex_home.clone(),
         chat.auth_manager.clone(),
@@ -3365,6 +3455,44 @@ async fn slash_exit_requests_exit() {
 }
 
 #[tokio::test]
+async fn slash_logout_popup_submits_logout_all_accounts_action() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+
+    chat.dispatch_command(SlashCommand::Logout);
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::LogoutAllAccounts));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn slash_logout_single_account_does_not_exit_when_logout_fails() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.config.codex_home = PathBuf::from("/dev/null");
+
+    chat.dispatch_command(SlashCommand::Logout);
+
+    let mut saw_exit = false;
+    let mut saw_error = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AppEvent::Exit(_) => saw_exit = true,
+            AppEvent::InsertHistoryCell(cell) => {
+                let rendered = lines_to_single_string(&cell.display_lines(120));
+                if rendered.contains("Failed to logout:") {
+                    saw_error = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(!saw_exit, "logout failure should not exit the app");
+    assert!(saw_error, "expected logout failure message");
+}
+
+#[tokio::test]
 async fn slash_clean_submits_background_terminal_cleanup() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
 
@@ -3378,6 +3506,15 @@ async fn slash_clean_submits_background_terminal_cleanup() {
         rendered.contains("Stopping all background terminals."),
         "expected cleanup confirmation, got {rendered:?}"
     );
+}
+
+#[tokio::test]
+async fn slash_sanitize_submits_sanitize_op() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.dispatch_command(SlashCommand::Sanitize);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Sanitize)));
 }
 
 #[tokio::test]
@@ -4073,6 +4210,38 @@ async fn personality_selection_popup_snapshot() {
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("personality_selection_popup", popup);
+}
+
+#[tokio::test]
+async fn accounts_popup() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+    assert_eq!(
+        chat.auth_manager.get_auth_mode(),
+        Some(codex_app_server_protocol::AuthMode::Chatgpt)
+    );
+    assert_eq!(chat.auth_manager.list_accounts().len(), 2);
+    chat.open_accounts_popup_at(chrono::Local::now());
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert_snapshot!("accounts_popup", popup);
+}
+
+#[tokio::test]
+async fn logout_popup() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+    assert_eq!(
+        chat.auth_manager.get_auth_mode(),
+        Some(codex_app_server_protocol::AuthMode::Chatgpt)
+    );
+    assert_eq!(chat.auth_manager.list_accounts().len(), 2);
+    chat.open_logout_popup_at(chrono::Local::now());
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert_snapshot!("logout_popup", popup);
 }
 
 #[tokio::test]

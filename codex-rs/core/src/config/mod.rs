@@ -103,6 +103,10 @@ pub use codex_git::GhostSnapshotConfig;
 /// the context window.
 pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
+pub(crate) const DEFAULT_MANAGE_CONTEXT_POLICY_FIXED_POINT_K: usize = 2;
+pub(crate) const DEFAULT_MANAGE_CONTEXT_POLICY_STALLED_SIGNATURE_THRESHOLD: usize = 2;
+pub(crate) const DEFAULT_MANAGE_CONTEXT_POLICY_MAX_CHUNKS_PER_APPLY: usize = 12;
+pub(crate) const DEFAULT_MANAGE_CONTEXT_POLICY_QUALITY_RUBRIC_ID: &str = "sanitize_prompt";
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 
@@ -181,6 +185,10 @@ pub struct Config {
 
     /// Base instructions override.
     pub base_instructions: Option<String>,
+
+    /// Base instructions override for sub-agent threads spawned via the collab
+    /// `spawn_agent` tool.
+    pub subagent_base_instructions: Option<String>,
 
     /// Developer instructions override injected as a separate message.
     pub developer_instructions: Option<String>,
@@ -279,6 +287,9 @@ pub struct Config {
 
     /// Maximum number of agent threads that can be open concurrently.
     pub agent_max_threads: Option<usize>,
+
+    /// Runtime policy knobs for `manage_context` orchestration.
+    pub manage_context_policy: ManageContextPolicy,
 
     /// Directory containing all Codex state (defaults to `~/.codex` but can be
     /// overridden by the `CODEX_HOME` environment variable).
@@ -894,6 +905,10 @@ pub struct ConfigToml {
     /// sanctioned by Codex will likely degrade model performance.
     pub model_instructions_file: Option<AbsolutePathBuf>,
 
+    /// Optional path to a file containing model instructions for sub-agent
+    /// threads spawned via the collab `spawn_agent` tool.
+    pub subagent_instructions_file: Option<AbsolutePathBuf>,
+
     /// Compact prompt used for history compaction.
     pub compact_prompt: Option<String>,
 
@@ -942,6 +957,9 @@ pub struct ConfigToml {
 
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
+
+    /// Explicit policy knobs for `manage_context` orchestration.
+    pub manage_context_policy: Option<ManageContextPolicyToml>,
 
     /// Optional absolute path to the Node runtime used by `js_repl`.
     pub js_repl_node_path: Option<AbsolutePathBuf>,
@@ -1128,6 +1146,55 @@ pub struct AgentsToml {
     /// When unset, no limit is enforced.
     #[schemars(range(min = 1))]
     pub max_threads: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ManageContextPolicyToml {
+    /// Number of successive retrieve/apply cycles to use for fixed-point checks.
+    #[schemars(range(min = 1))]
+    pub fixed_point_k: usize,
+
+    /// Repeated stalled-signature count needed before declaring stagnation.
+    #[schemars(range(min = 1))]
+    pub stalled_signature_threshold: usize,
+
+    /// Maximum chunk count allowed in a single `manage_context.apply`.
+    #[schemars(range(min = 1))]
+    pub max_chunks_per_apply: usize,
+
+    /// Identifier for the quality rubric used by manage_context orchestration.
+    pub quality_rubric_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManageContextPolicy {
+    pub fixed_point_k: usize,
+    pub stalled_signature_threshold: usize,
+    pub max_chunks_per_apply: usize,
+    pub quality_rubric_id: String,
+}
+
+impl Default for ManageContextPolicy {
+    fn default() -> Self {
+        Self {
+            fixed_point_k: DEFAULT_MANAGE_CONTEXT_POLICY_FIXED_POINT_K,
+            stalled_signature_threshold: DEFAULT_MANAGE_CONTEXT_POLICY_STALLED_SIGNATURE_THRESHOLD,
+            max_chunks_per_apply: DEFAULT_MANAGE_CONTEXT_POLICY_MAX_CHUNKS_PER_APPLY,
+            quality_rubric_id: DEFAULT_MANAGE_CONTEXT_POLICY_QUALITY_RUBRIC_ID.to_string(),
+        }
+    }
+}
+
+impl From<ManageContextPolicyToml> for ManageContextPolicy {
+    fn from(value: ManageContextPolicyToml) -> Self {
+        Self {
+            fixed_point_k: value.fixed_point_k,
+            stalled_signature_threshold: value.stalled_signature_threshold,
+            max_chunks_per_apply: value.max_chunks_per_apply,
+            quality_rubric_id: value.quality_rubric_id,
+        }
+    }
 }
 
 impl From<ToolsToml> for Tools {
@@ -1571,6 +1638,36 @@ impl Config {
             ));
         }
 
+        let manage_context_policy = cfg
+            .manage_context_policy
+            .clone()
+            .map(ManageContextPolicy::from)
+            .unwrap_or_default();
+        if manage_context_policy.fixed_point_k == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "manage_context_policy.fixed_point_k must be at least 1",
+            ));
+        }
+        if manage_context_policy.stalled_signature_threshold == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "manage_context_policy.stalled_signature_threshold must be at least 1",
+            ));
+        }
+        if manage_context_policy.max_chunks_per_apply == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "manage_context_policy.max_chunks_per_apply must be at least 1",
+            ));
+        }
+        if manage_context_policy.quality_rubric_id.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "manage_context_policy.quality_rubric_id must not be empty",
+            ));
+        }
+
         let ghost_snapshot = {
             let mut config = GhostSnapshotConfig::default();
             if let Some(ghost_snapshot) = cfg.ghost_snapshot.as_ref()
@@ -1632,6 +1729,15 @@ impl Config {
         let file_base_instructions =
             Self::try_read_non_empty_file(model_instructions_path, "model instructions file")?;
         let base_instructions = base_instructions.or(file_base_instructions);
+
+        let subagent_instructions_path = config_profile
+            .subagent_instructions_file
+            .as_ref()
+            .or(cfg.subagent_instructions_file.as_ref());
+        let subagent_base_instructions = Self::try_read_non_empty_file(
+            subagent_instructions_path,
+            "sub-agent instructions file",
+        )?;
         let developer_instructions = developer_instructions.or(cfg.developer_instructions);
         let personality = personality
             .or(config_profile.personality)
@@ -1735,6 +1841,7 @@ impl Config {
             notify: cfg.notify,
             user_instructions,
             base_instructions,
+            subagent_base_instructions,
             personality,
             developer_instructions,
             compact_prompt,
@@ -1763,6 +1870,7 @@ impl Config {
                 .collect(),
             tool_output_token_limit: cfg.tool_output_token_limit,
             agent_max_threads,
+            manage_context_policy,
             codex_home,
             log_dir,
             config_layer_stack,
@@ -4037,6 +4145,7 @@ model_verbosity = "high"
                 project_doc_fallback_filenames: Vec::new(),
                 tool_output_token_limit: None,
                 agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+                manage_context_policy: ManageContextPolicy::default(),
                 codex_home: fixture.codex_home(),
                 log_dir: fixture.codex_home().join("log"),
                 config_layer_stack: Default::default(),
@@ -4055,6 +4164,7 @@ model_verbosity = "high"
                 personality: Some(Personality::Pragmatic),
                 chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
                 base_instructions: None,
+                subagent_base_instructions: None,
                 developer_instructions: None,
                 compact_prompt: None,
                 forced_chatgpt_workspace_id: None,
@@ -4144,6 +4254,7 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+            manage_context_policy: ManageContextPolicy::default(),
             codex_home: fixture.codex_home(),
             log_dir: fixture.codex_home().join("log"),
             config_layer_stack: Default::default(),
@@ -4162,6 +4273,7 @@ model_verbosity = "high"
             personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            subagent_base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,
@@ -4249,6 +4361,7 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+            manage_context_policy: ManageContextPolicy::default(),
             codex_home: fixture.codex_home(),
             log_dir: fixture.codex_home().join("log"),
             config_layer_stack: Default::default(),
@@ -4267,6 +4380,7 @@ model_verbosity = "high"
             personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            subagent_base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,
@@ -4340,6 +4454,7 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+            manage_context_policy: ManageContextPolicy::default(),
             codex_home: fixture.codex_home(),
             log_dir: fixture.codex_home().join("log"),
             config_layer_stack: Default::default(),
@@ -4358,6 +4473,7 @@ model_verbosity = "high"
             personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
+            subagent_base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
             forced_chatgpt_workspace_id: None,
@@ -4876,6 +4992,114 @@ mcp_oauth_callback_port = 5678
 
         assert_eq!(config.mcp_oauth_callback_port, Some(5678));
         Ok(())
+    }
+
+    #[test]
+    fn config_loads_default_manage_context_policy() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.manage_context_policy, ManageContextPolicy::default());
+        Ok(())
+    }
+
+    #[test]
+    fn config_loads_manage_context_policy_from_toml() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let toml = r#"
+[manage_context_policy]
+fixed_point_k = 3
+stalled_signature_threshold = 4
+max_chunks_per_apply = 9
+quality_rubric_id = "sanitize_strict"
+"#;
+        let cfg: ConfigToml = toml::from_str(toml)
+            .expect("TOML deserialization should succeed for manage_context_policy");
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(
+            config.manage_context_policy,
+            ManageContextPolicy {
+                fixed_point_k: 3,
+                stalled_signature_threshold: 4,
+                max_chunks_per_apply: 9,
+                quality_rubric_id: "sanitize_strict".to_string(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_toml_rejects_partial_manage_context_policy() {
+        let toml = r#"
+[manage_context_policy]
+fixed_point_k = 3
+"#;
+        let error = toml::from_str::<ConfigToml>(toml)
+            .expect_err("partial manage_context_policy must fail loudly");
+        assert!(error.to_string().contains("missing field"));
+    }
+
+    #[test]
+    fn config_rejects_empty_manage_context_quality_rubric_id() {
+        let codex_home = TempDir::new().expect("create temp dir");
+        let cfg = ConfigToml {
+            manage_context_policy: Some(ManageContextPolicyToml {
+                fixed_point_k: 2,
+                stalled_signature_threshold: 2,
+                max_chunks_per_apply: 12,
+                quality_rubric_id: "   ".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let result = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        );
+        let error = result.expect_err("empty quality_rubric_id should fail loudly");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("manage_context_policy.quality_rubric_id must not be empty")
+        );
+    }
+
+    #[test]
+    fn config_rejects_zero_manage_context_policy_values() {
+        let codex_home = TempDir::new().expect("create temp dir");
+        let cfg = ConfigToml {
+            manage_context_policy: Some(ManageContextPolicyToml {
+                fixed_point_k: 0,
+                stalled_signature_threshold: 1,
+                max_chunks_per_apply: 1,
+                quality_rubric_id: "sanitize_strict".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let result = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        );
+        let error = result.expect_err("zero fixed_point_k should fail loudly");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("manage_context_policy.fixed_point_k must be at least 1")
+        );
     }
 
     #[test]
