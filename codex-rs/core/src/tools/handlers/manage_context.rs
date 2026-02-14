@@ -486,9 +486,10 @@ fn build_retrieve_plan(state: &crate::state::SessionState, policy_id: &str) -> R
     let ev = state.build_context_items_event();
     let overlay = state.context_overlay_snapshot();
     let items = state.history_snapshot_lenient();
+    let last_user_index = latest_user_message_index(&items);
 
     let state_hash = state_hash_for_context(&ev, &overlay, &items);
-    let top_offenders = collect_top_offenders(&ev.items, &items, &overlay);
+    let top_offenders = collect_top_offenders(&ev.items, &items, &overlay, last_user_index);
     let chunk_manifest = top_offenders
         .iter()
         .enumerate()
@@ -516,6 +517,7 @@ fn collect_top_offenders(
     summaries: &[crate::state::ContextItemSummary],
     items: &[ResponseItem],
     overlay: &ContextOverlay,
+    last_user_index: Option<usize>,
 ) -> Vec<TopOffender> {
     let manage_context_call_ids = manage_context_call_ids(items);
     let tool_name_by_call_id = tool_name_by_call_id(items);
@@ -523,6 +525,11 @@ fn collect_top_offenders(
     let mut top_offenders = Vec::new();
 
     for summary in summaries {
+        // Post-user append-only items are intentionally excluded from retrieve
+        // planning to keep retrieve/apply stable within the same turn.
+        if last_user_index.is_some_and(|cutoff| summary.index > cutoff) {
+            continue;
+        }
         if !summary.included {
             continue;
         }
@@ -690,6 +697,17 @@ fn call_id_for_item(item: &ResponseItem) -> Option<&str> {
     }
 }
 
+fn latest_user_message_index(items: &[ResponseItem]) -> Option<usize> {
+    items
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, item)| match item {
+            ResponseItem::Message { role, .. } if role == "user" => Some(index),
+            _ => None,
+        })
+}
+
 fn estimate_item_bytes(item: &ResponseItem) -> u64 {
     serde_json::to_vec(item)
         .map(|bytes| bytes.len() as u64)
@@ -713,11 +731,17 @@ fn state_hash_for_context(
     overlay: &ContextOverlay,
     items: &[ResponseItem],
 ) -> String {
+    let last_user_index = latest_user_message_index(items);
     let manage_context_call_ids = manage_context_call_ids(items);
 
     let mut hasher = sha1::Sha1::new();
     hasher.update(b"items\n");
     for item in &ev.items {
+        // Ignore append-only items after the latest user message so retrieve/apply
+        // remains stable within a single sanitize turn.
+        if last_user_index.is_some_and(|cutoff| item.index > cutoff) {
+            continue;
+        }
         if let Some(raw_item) = items.get(item.index)
             && matches!(
                 raw_item,
@@ -998,6 +1022,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manage_context_retrieve_is_stable_when_items_append_after_latest_user_message() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
+
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &tool_call("call_pre_user"),
+                    &tool_output("call_pre_user", "pre-user tool output"),
+                    &user_message("latest user"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let retrieve_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": policy_id,
+        }))
+        .expect("parse retrieve args");
+
+        let first = handle_manage_context(&session, &turn, &retrieve_args)
+            .await
+            .expect("first retrieve");
+        assert!(
+            first
+                .json
+                .get("chunk_manifest")
+                .and_then(Value::as_array)
+                .is_some_and(|chunks| !chunks.is_empty()),
+            "fixture must produce non-empty chunk_manifest"
+        );
+
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &assistant_message("appended after latest user"),
+                    &tool_call("call_post_user"),
+                    &tool_output("call_post_user", "post-user tool output"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let second = handle_manage_context(&session, &turn, &retrieve_args)
+            .await
+            .expect("second retrieve");
+
+        assert_eq!(
+            first.json.get("state_hash"),
+            second.json.get("state_hash"),
+            "state_hash must stay stable for append-only post-user changes"
+        );
+        assert_eq!(
+            first.json.get("plan_id"),
+            second.json.get("plan_id"),
+            "plan_id must stay stable for append-only post-user changes"
+        );
+        assert_eq!(
+            first.json.get("chunk_manifest"),
+            second.json.get("chunk_manifest"),
+            "chunk_manifest must stay stable for append-only post-user changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn manage_context_retrieve_excludes_post_user_offenders_from_chunk_manifest() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
+
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &user_message("latest user"),
+                    &tool_call("call_post_user"),
+                    &tool_output("call_post_user", "post-user tool output"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let retrieve_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": policy_id,
+        }))
+        .expect("parse retrieve args");
+
+        let retrieve = handle_manage_context(&session, &turn, &retrieve_args)
+            .await
+            .expect("retrieve");
+
+        assert_eq!(
+            retrieve
+                .json
+                .get("chunk_manifest")
+                .and_then(Value::as_array)
+                .map(std::vec::Vec::len),
+            Some(0),
+            "post-user offenders are intentionally excluded from current retrieve plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn manage_context_apply_accepts_append_only_post_user_changes() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
+
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &tool_call("call_base"),
+                    &tool_output("call_base", "base tool output"),
+                    &user_message("latest user"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let retrieve_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": policy_id,
+        }))
+        .expect("parse retrieve args");
+
+        let retrieve = handle_manage_context(&session, &turn, &retrieve_args)
+            .await
+            .expect("retrieve");
+
+        let plan_id = retrieve
+            .json
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .expect("plan_id")
+            .to_string();
+        let state_hash = retrieve
+            .json
+            .get("state_hash")
+            .and_then(Value::as_str)
+            .expect("state_hash")
+            .to_string();
+        let chunk_id = retrieve
+            .json
+            .pointer("/chunk_manifest/0/chunk_id")
+            .and_then(Value::as_str)
+            .expect("first chunk id")
+            .to_string();
+
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &assistant_message("appended assistant"),
+                    &tool_call("call_post_user"),
+                    &tool_output("call_post_user", "post-user output"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let apply_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "apply",
+            "policy_id": turn.config.manage_context_policy.quality_rubric_id,
+            "plan_id": plan_id,
+            "state_hash": state_hash,
+            "chunk_summaries": [{
+                "chunk_id": chunk_id,
+                "tool_context": "tool summary",
+                "reasoning_context": "reasoning summary"
+            }]
+        }))
+        .expect("parse apply args");
+
+        let result = handle_manage_context(&session, &turn, &apply_args)
+            .await
+            .expect("apply should accept append-only post-user changes");
+
+        assert_eq!(
+            result.json.get("mode").and_then(Value::as_str),
+            Some("apply")
+        );
+    }
+
+    #[tokio::test]
     async fn manage_context_apply_requires_chunk_summaries() {
         let (session, turn) = crate::codex::make_session_and_context().await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
@@ -1032,6 +1243,7 @@ mod tests {
                     &user_message("u1"),
                     &tool_call("call_tool_1"),
                     &tool_output("call_tool_1", "tool output payload"),
+                    &user_message("u2"),
                 ],
                 turn.truncation_policy,
             );
@@ -1094,6 +1306,7 @@ mod tests {
                     &user_message("u1"),
                     &tool_call("call_tool_1"),
                     &tool_output("call_tool_1", "tool output payload"),
+                    &user_message("u2"),
                 ],
                 turn.truncation_policy,
             );
@@ -1159,6 +1372,7 @@ mod tests {
                     &tool_output("call_tool_1", "tool output payload 1"),
                     &tool_call("call_tool_2"),
                     &tool_output("call_tool_2", "tool output payload 2"),
+                    &user_message("u2"),
                 ],
                 turn.truncation_policy,
             );
@@ -1502,6 +1716,85 @@ mod tests {
             &overlay,
             &items_with_manage_context,
         );
+
+        assert_eq!(base, extended);
+    }
+
+    #[test]
+    fn manage_context_state_hash_ignores_items_appended_after_latest_user_message() {
+        let overlay = ContextOverlay::default();
+
+        let items = vec![
+            assistant_message("older assistant"),
+            user_message("latest user"),
+        ];
+        let ev = ContextItemsEvent {
+            items: vec![
+                crate::state::ContextItemSummary {
+                    index: 0,
+                    category: PruneCategory::AssistantMessage,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r0".to_string()),
+                },
+                crate::state::ContextItemSummary {
+                    index: 1,
+                    category: PruneCategory::UserMessage,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r1".to_string()),
+                },
+            ],
+        };
+        let base = state_hash_for_context(&ev, &overlay, &items);
+
+        let appended_items = vec![
+            assistant_message("older assistant"),
+            user_message("latest user"),
+            assistant_message("appended assistant"),
+            tool_call("call_tool_1"),
+            tool_output("call_tool_1", "appended tool output"),
+        ];
+        let ev_with_append = ContextItemsEvent {
+            items: vec![
+                crate::state::ContextItemSummary {
+                    index: 0,
+                    category: PruneCategory::AssistantMessage,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r0".to_string()),
+                },
+                crate::state::ContextItemSummary {
+                    index: 1,
+                    category: PruneCategory::UserMessage,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r1".to_string()),
+                },
+                crate::state::ContextItemSummary {
+                    index: 2,
+                    category: PruneCategory::AssistantMessage,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r2".to_string()),
+                },
+                crate::state::ContextItemSummary {
+                    index: 3,
+                    category: PruneCategory::ToolCall,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r3".to_string()),
+                },
+                crate::state::ContextItemSummary {
+                    index: 4,
+                    category: PruneCategory::ToolOutput,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r4".to_string()),
+                },
+            ],
+        };
+        let extended = state_hash_for_context(&ev_with_append, &overlay, &appended_items);
 
         assert_eq!(base, extended);
     }
