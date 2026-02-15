@@ -1,5 +1,7 @@
 # Guide Reapply — Recall Tool (Current Session Rollout)
 
+> Canonical current post-auto-compact recall instruction: `recall` (no `max_items` arg in warning; size cap comes from `recall_kbytes_limit`).
+
 ## Scope
 Reapply exactly the `recall` implementation that was added as a **new tool** (without changing `manage_context.retrieve`) in Codex CLI core.
 
@@ -16,11 +18,13 @@ This guide includes:
 ## Behavior Implemented
 - Adds new function tool: `recall`.
 - Source is fixed to **current session rollout JSON** via current session rollout recorder.
-- Boundary is the latest `RolloutItem::Compacted` marker.
+- Upper boundary is the latest `RolloutItem::Compacted` marker.
+- Lower boundary is immediately after latest pre-compaction `EventMsg::UserMessage` (if present).
 - Returns only pre-compaction:
   - reasoning text
   - assistant messages
 - Excludes tool outputs/calls and user messages.
+- Applies payload cap via `recall_kbytes_limit` (KiB) from `config.toml`.
 - Fail-loud stop reasons:
   - `invalid_contract`
   - `unavailable`
@@ -961,32 +965,15 @@ index 000000000..e819a9d5e
 +  - `phase` (assistant message only, when available)
 ```
 
-## Addendum — Post Auto-Compact Warning Enforces Mandatory Recall Step
 
-This was added after the initial `recall` patch so the warning shown after auto-compaction now enforces a mandatory `recall` step before any other action.
+## Current Warning Invariant
+- After auto-compaction, the warning must require `recall` before any other action.
+- The warning must not hardcode `max_items`; payload size is controlled by `recall_kbytes_limit`.
 
-### Exact delta
-
-```diff
-diff --git a/codex-rs/core/src/codex.rs b/codex-rs/core/src/codex.rs
-@@
--const AUTO_COMPACT_RECON_WARNING_BODY: &str = "auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status.";
-+const AUTO_COMPACT_RECON_WARNING_BODY: &str = "auto-compaction completed. MANDATORY before any other action: call recall with max_items=8. Then recon unstaged changes, codex_learning_log, and update_plan status.";
-
-diff --git a/codex-rs/core/tests/suite/compact.rs b/codex-rs/core/tests/suite/compact.rs
-@@
--const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status.";
-+const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. MANDATORY before any other action: call recall with max_items=8. Then recon unstaged changes, codex_learning_log, and update_plan status.";
-
-diff --git a/codex-rs/core/tests/suite/compact_remote.rs b/codex-rs/core/tests/suite/compact_remote.rs
-@@
--const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status.";
-+const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. MANDATORY before any other action: call recall with max_items=8. Then recon unstaged changes, codex_learning_log, and update_plan status.";
-```
-
-### Focused validation used for this addendum
-
+## Focused Validation (Current Contract)
 ```bash
-cargo test -p codex-core --test all compact_remote::remote_compact_replaces_history_for_followups -- --test-threads=1
+cargo test -p codex-core --lib tools::handlers::recall -- --test-threads=1
+cargo test -p codex-core --lib recall_kbytes_limit -- --test-threads=1
 cargo test -p codex-core --test all compact_remote::remote_auto_compact_warning_is_emitted_after_each_compaction -- --test-threads=1
+cargo test -p codex-core --test all compact::local_auto_compact_does_not_emit_remote_warning -- --test-threads=1
 ```

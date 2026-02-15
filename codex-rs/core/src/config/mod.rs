@@ -107,6 +107,7 @@ pub(crate) const DEFAULT_MANAGE_CONTEXT_POLICY_FIXED_POINT_K: usize = 2;
 pub(crate) const DEFAULT_MANAGE_CONTEXT_POLICY_STALLED_SIGNATURE_THRESHOLD: usize = 2;
 pub(crate) const DEFAULT_MANAGE_CONTEXT_POLICY_MAX_CHUNKS_PER_APPLY: usize = 12;
 pub(crate) const DEFAULT_MANAGE_CONTEXT_POLICY_QUALITY_RUBRIC_ID: &str = "sanitize_prompt";
+pub(crate) const DEFAULT_RECALL_KBYTES_LIMIT: usize = 256;
 
 pub const CONFIG_TOML_FILE: &str = "config.toml";
 
@@ -284,6 +285,9 @@ pub struct Config {
 
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
+
+    /// Maximum size budget (KiB) for recall payload items returned to the model.
+    pub recall_kbytes_limit: usize,
 
     /// Maximum number of agent threads that can be open concurrently.
     pub agent_max_threads: Option<usize>,
@@ -957,6 +961,10 @@ pub struct ConfigToml {
 
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
+
+    /// Maximum size budget (KiB) for recall payload items returned to the model.
+    #[schemars(range(min = 1))]
+    pub recall_kbytes_limit: Option<usize>,
 
     /// Explicit policy knobs for `manage_context` orchestration.
     pub manage_context_policy: Option<ManageContextPolicyToml>,
@@ -1667,6 +1675,12 @@ impl Config {
                 "manage_context_policy.quality_rubric_id must not be empty",
             ));
         }
+        if cfg.recall_kbytes_limit == Some(0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "recall_kbytes_limit must be at least 1",
+            ));
+        }
 
         let ghost_snapshot = {
             let mut config = GhostSnapshotConfig::default();
@@ -1869,6 +1883,9 @@ impl Config {
                 })
                 .collect(),
             tool_output_token_limit: cfg.tool_output_token_limit,
+            recall_kbytes_limit: cfg
+                .recall_kbytes_limit
+                .unwrap_or(DEFAULT_RECALL_KBYTES_LIMIT),
             agent_max_threads,
             manage_context_policy,
             codex_home,
@@ -4144,6 +4161,7 @@ model_verbosity = "high"
                 project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
                 project_doc_fallback_filenames: Vec::new(),
                 tool_output_token_limit: None,
+                recall_kbytes_limit: DEFAULT_RECALL_KBYTES_LIMIT,
                 agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
                 manage_context_policy: ManageContextPolicy::default(),
                 codex_home: fixture.codex_home(),
@@ -4253,6 +4271,7 @@ model_verbosity = "high"
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
+            recall_kbytes_limit: DEFAULT_RECALL_KBYTES_LIMIT,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
             manage_context_policy: ManageContextPolicy::default(),
             codex_home: fixture.codex_home(),
@@ -4360,6 +4379,7 @@ model_verbosity = "high"
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
+            recall_kbytes_limit: DEFAULT_RECALL_KBYTES_LIMIT,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
             manage_context_policy: ManageContextPolicy::default(),
             codex_home: fixture.codex_home(),
@@ -4453,6 +4473,7 @@ model_verbosity = "high"
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
+            recall_kbytes_limit: DEFAULT_RECALL_KBYTES_LIMIT,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
             manage_context_policy: ManageContextPolicy::default(),
             codex_home: fixture.codex_home(),
@@ -4992,6 +5013,60 @@ mcp_oauth_callback_port = 5678
 
         assert_eq!(config.mcp_oauth_callback_port, Some(5678));
         Ok(())
+    }
+
+    #[test]
+    fn config_loads_default_recall_kbytes_limit() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.recall_kbytes_limit, DEFAULT_RECALL_KBYTES_LIMIT);
+        Ok(())
+    }
+
+    #[test]
+    fn config_loads_recall_kbytes_limit_from_toml() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let toml = r#"
+model = "gpt-5.1"
+recall_kbytes_limit = 64
+"#;
+        let cfg: ConfigToml =
+            toml::from_str(toml).expect("TOML deserialization should succeed for recall limit");
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.recall_kbytes_limit, 64);
+        Ok(())
+    }
+
+    #[test]
+    fn config_rejects_zero_recall_kbytes_limit() {
+        let codex_home = TempDir::new().expect("create temp dir");
+        let cfg = ConfigToml {
+            recall_kbytes_limit: Some(0),
+            ..Default::default()
+        };
+
+        let result = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        );
+        let error = result.expect_err("zero recall_kbytes_limit should fail loudly");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("recall_kbytes_limit must be at least 1")
+        );
     }
 
     #[test]

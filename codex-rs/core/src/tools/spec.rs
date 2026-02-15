@@ -1163,8 +1163,7 @@ fn create_recall_tool() -> ToolSpec {
             "max_items".to_string(),
             JsonSchema::Number {
                 description: Some(
-                    "Optional maximum number of pre-compaction items to return. Defaults to 24."
-                        .to_string(),
+                    "Optional maximum number of pre-compaction items to return.".to_string(),
                 ),
             },
         ),

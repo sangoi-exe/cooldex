@@ -1646,6 +1646,12 @@
       },
       "type": "object"
     },
+    "recall_kbytes_limit": {
+      "description": "Maximum size budget (KiB) for recall payload items returned to the model.",
+      "format": "uint",
+      "minimum": 1.0,
+      "type": "integer"
+    },
     "review_model": {
       "description": "Review model override used by the `/review` feature.",
       "type": "string"

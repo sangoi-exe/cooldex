@@ -1,4 +1,5 @@
 use crate::codex::Session;
+use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
 use crate::rollout::RolloutRecorder;
 use crate::tools::context::ToolInvocation;
@@ -13,6 +14,7 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use serde::Deserialize;
 use serde::Serialize;
@@ -20,14 +22,9 @@ use serde_json::json;
 
 pub struct RecallHandler;
 
-const DEFAULT_MAX_ITEMS: usize = 24;
 const MAX_MAX_ITEMS: usize = 200;
 const DEFAULT_MAX_CHARS_PER_ITEM: usize = 1200;
 const MAX_MAX_CHARS_PER_ITEM: usize = 16_000;
-
-fn default_max_items() -> usize {
-    DEFAULT_MAX_ITEMS
-}
 
 fn default_max_chars_per_item() -> usize {
     DEFAULT_MAX_CHARS_PER_ITEM
@@ -36,8 +33,8 @@ fn default_max_chars_per_item() -> usize {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecallToolArgs {
-    #[serde(default = "default_max_items")]
-    max_items: usize,
+    #[serde(default)]
+    max_items: Option<usize>,
     #[serde(default = "default_max_chars_per_item")]
     max_chars_per_item: usize,
 }
@@ -80,7 +77,10 @@ impl ToolHandler for RecallHandler {
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
         let ToolInvocation {
-            session, payload, ..
+            session,
+            turn,
+            payload,
+            ..
         } = invocation;
 
         let ToolPayload::Function { arguments } = payload else {
@@ -97,7 +97,7 @@ impl ToolHandler for RecallHandler {
             )
         })?;
 
-        let response = handle_recall(session.as_ref(), &args).await?;
+        let response = handle_recall(session.as_ref(), turn.as_ref(), &args).await?;
         Ok(ToolOutput::Function {
             body: FunctionCallOutputBody::Text(
                 serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string()),
@@ -109,6 +109,7 @@ impl ToolHandler for RecallHandler {
 
 async fn handle_recall(
     session: &Session,
+    turn: &TurnContext,
     args: &RecallToolArgs,
 ) -> Result<serde_json::Value, FunctionCallError> {
     validate_args(args)?;
@@ -135,11 +136,18 @@ async fn handle_recall(
             format!("current session rollout has {parse_errors} parse error(s)"),
         ));
     }
-    build_recall_payload(&rollout_items, args.max_items, args.max_chars_per_item)
+    build_recall_payload(
+        &rollout_items,
+        args.max_items,
+        args.max_chars_per_item,
+        turn.config.recall_kbytes_limit,
+    )
 }
 
 fn validate_args(args: &RecallToolArgs) -> Result<(), FunctionCallError> {
-    if args.max_items == 0 || args.max_items > MAX_MAX_ITEMS {
+    if let Some(max_items) = args.max_items
+        && (max_items == 0 || max_items > MAX_MAX_ITEMS)
+    {
         return Err(contract_error(
             StopReason::InvalidContract,
             format!("recall.max_items must be between 1 and {MAX_MAX_ITEMS}"),
@@ -169,8 +177,9 @@ async fn current_rollout_recorder(session: &Session) -> Result<RolloutRecorder, 
 
 fn build_recall_payload(
     rollout_items: &[RolloutItem],
-    max_items: usize,
+    max_items: Option<usize>,
     max_chars_per_item: usize,
+    recall_kbytes_limit: usize,
 ) -> Result<serde_json::Value, FunctionCallError> {
     let compacted_markers_seen = rollout_items
         .iter()
@@ -188,19 +197,50 @@ fn build_recall_payload(
         ));
     };
 
-    let mut matching_items =
-        collect_pre_compact_items(rollout_items, latest_compacted_index, max_chars_per_item);
+    let last_user_message_event_index =
+        latest_user_message_event_index_before(rollout_items, latest_compacted_index);
+    let start_index = last_user_message_event_index.map_or(0, |index| index.saturating_add(1));
+
+    let mut matching_items = collect_pre_compact_items(
+        rollout_items,
+        start_index,
+        latest_compacted_index,
+        max_chars_per_item,
+    );
     let matching_pre_compact_items = matching_items.len();
-    if matching_items.len() > max_items {
-        let split_point = matching_items.len() - max_items;
-        matching_items = matching_items.split_off(split_point);
+    if let Some(max_items) = max_items
+        && matching_items.len() > max_items
+    {
+        let (mut commentary_items, mut prioritized_items): (Vec<RecallItem>, Vec<RecallItem>) =
+            matching_items.into_iter().partition(|item| {
+                item.kind == "assistant_message" && item.phase.as_deref() == Some("commentary")
+            });
+        if prioritized_items.len() >= max_items {
+            let split_point = prioritized_items.len() - max_items;
+            matching_items = prioritized_items.split_off(split_point);
+        } else {
+            let needed_commentary_items = max_items - prioritized_items.len();
+            if commentary_items.len() > needed_commentary_items {
+                let split_point = commentary_items.len() - needed_commentary_items;
+                commentary_items = commentary_items.split_off(split_point);
+            }
+            prioritized_items.extend(commentary_items);
+            prioritized_items.sort_unstable_by_key(|item| item.rollout_index);
+            matching_items = prioritized_items;
+        }
     }
+
+    let recall_bytes_limit = recall_kbytes_limit.saturating_mul(1024);
+    let (matching_items, returned_bytes) =
+        trim_items_to_bytes_limit(matching_items, recall_bytes_limit);
     let returned_items = matching_items.len();
 
     Ok(json!({
         "mode": "recall_pre_compact",
         "source": "current_session_rollout",
         "boundary": {
+            "start_index": start_index,
+            "last_user_message_event_index": last_user_message_event_index,
             "latest_compacted_index": latest_compacted_index,
             "compacted_markers_seen": compacted_markers_seen,
         },
@@ -213,6 +253,8 @@ fn build_recall_payload(
             "matching_pre_compact_items": matching_pre_compact_items,
             "returned_items": returned_items,
             "max_items": max_items,
+            "returned_bytes": returned_bytes,
+            "bytes_limit": recall_bytes_limit,
         },
         "items": matching_items,
     }))
@@ -220,6 +262,7 @@ fn build_recall_payload(
 
 fn collect_pre_compact_items(
     rollout_items: &[RolloutItem],
+    start_index: usize,
     latest_compacted_index: usize,
     max_chars_per_item: usize,
 ) -> Vec<RecallItem> {
@@ -227,7 +270,8 @@ fn collect_pre_compact_items(
     for (index, rollout_item) in rollout_items
         .iter()
         .enumerate()
-        .take(latest_compacted_index)
+        .skip(start_index)
+        .take(latest_compacted_index.saturating_sub(start_index))
     {
         let RolloutItem::ResponseItem(response_item) = rollout_item else {
             continue;
@@ -272,6 +316,43 @@ fn collect_pre_compact_items(
         }
     }
     output
+}
+
+fn latest_user_message_event_index_before(
+    rollout_items: &[RolloutItem],
+    latest_compacted_index: usize,
+) -> Option<usize> {
+    rollout_items
+        .iter()
+        .enumerate()
+        .take(latest_compacted_index)
+        .rev()
+        .find_map(|(index, item)| {
+            matches!(item, RolloutItem::EventMsg(EventMsg::UserMessage(_))).then_some(index)
+        })
+}
+
+fn trim_items_to_bytes_limit(
+    items: Vec<RecallItem>,
+    bytes_limit: usize,
+) -> (Vec<RecallItem>, usize) {
+    if items.is_empty() || bytes_limit == 0 {
+        return (Vec::new(), 0);
+    }
+    let mut used_bytes = 0usize;
+    let mut selected_reversed: Vec<RecallItem> = Vec::new();
+    for item in items.into_iter().rev() {
+        let item_bytes = serde_json::to_vec(&item)
+            .map(|bytes| bytes.len())
+            .unwrap_or_else(|_| item.text.len());
+        if used_bytes.saturating_add(item_bytes) > bytes_limit {
+            break;
+        }
+        used_bytes = used_bytes.saturating_add(item_bytes);
+        selected_reversed.push(item);
+    }
+    selected_reversed.reverse();
+    (selected_reversed, used_bytes)
 }
 
 fn reasoning_text(
@@ -352,8 +433,11 @@ mod tests {
     use codex_protocol::models::FunctionCallOutputPayload;
     use codex_protocol::models::ReasoningItemReasoningSummary::SummaryText;
     use codex_protocol::protocol::CompactedItem;
+    use codex_protocol::protocol::UserMessageEvent;
     use pretty_assertions::assert_eq;
     use serde_json::Value;
+
+    const TEST_RECALL_KBYTES_LIMIT: usize = 256;
 
     fn assistant_message(text: &str, phase: Option<MessagePhase>) -> RolloutItem {
         RolloutItem::ResponseItem(ResponseItem::Message {
@@ -404,6 +488,15 @@ mod tests {
         })
     }
 
+    fn user_message_event(text: &str) -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: text.to_string(),
+            images: None,
+            local_images: Vec::new(),
+            text_elements: Vec::new(),
+        }))
+    }
+
     fn parse_error_stop_reason(error: FunctionCallError) -> String {
         let FunctionCallError::RespondToModel(raw) = error else {
             panic!("expected RespondToModel error");
@@ -420,7 +513,7 @@ mod tests {
     fn recall_requires_compaction_marker() {
         let rollout_items = vec![assistant_message("before", None), reasoning("analysis")];
 
-        let error = build_recall_payload(&rollout_items, 10, 500)
+        let error = build_recall_payload(&rollout_items, Some(10), 500, TEST_RECALL_KBYTES_LIMIT)
             .expect_err("must fail when no compaction marker is present");
 
         assert_eq!(
@@ -441,7 +534,8 @@ mod tests {
             reasoning("after compact should not be included"),
         ];
 
-        let payload = build_recall_payload(&rollout_items, 10, 500).expect("build recall payload");
+        let payload = build_recall_payload(&rollout_items, Some(10), 500, TEST_RECALL_KBYTES_LIMIT)
+            .expect("build recall payload");
         let items = payload
             .get("items")
             .and_then(Value::as_array)
@@ -472,7 +566,8 @@ mod tests {
             compacted_marker(),
         ];
 
-        let payload = build_recall_payload(&rollout_items, 2, 500).expect("build recall payload");
+        let payload = build_recall_payload(&rollout_items, Some(2), 500, TEST_RECALL_KBYTES_LIMIT)
+            .expect("build recall payload");
         let items = payload
             .get("items")
             .and_then(Value::as_array)
@@ -493,13 +588,113 @@ mod tests {
     fn recall_truncates_text_by_char_limit() {
         let rollout_items = vec![assistant_message("abcdefghijk", None), compacted_marker()];
 
-        let payload = build_recall_payload(&rollout_items, 10, 5).expect("build recall payload");
+        let payload = build_recall_payload(&rollout_items, Some(10), 5, TEST_RECALL_KBYTES_LIMIT)
+            .expect("build recall payload");
         let items = payload
             .get("items")
             .and_then(Value::as_array)
             .expect("items array");
         let text = items[0].get("text").and_then(Value::as_str).expect("text");
         assert_eq!(text, "abcde…");
+    }
+
+    #[test]
+    fn recall_deprioritizes_commentary_when_capped() {
+        let rollout_items = vec![
+            assistant_message("commentary 1", Some(MessagePhase::Commentary)),
+            assistant_message("final answer 1", Some(MessagePhase::FinalAnswer)),
+            reasoning("reasoning 1"),
+            assistant_message("commentary 2", Some(MessagePhase::Commentary)),
+            assistant_message("final answer 2", Some(MessagePhase::FinalAnswer)),
+            compacted_marker(),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, Some(3), 500, TEST_RECALL_KBYTES_LIMIT)
+            .expect("build recall payload");
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items[0].get("rollout_index").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            items[1].get("rollout_index").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            items[2].get("rollout_index").and_then(Value::as_u64),
+            Some(4)
+        );
+        assert!(
+            items
+                .iter()
+                .all(|item| { item.get("phase").and_then(Value::as_str) != Some("commentary") }),
+            "commentary items should be dropped when enough higher-signal items exist"
+        );
+    }
+
+    #[test]
+    fn recall_falls_back_to_commentary_when_needed() {
+        let rollout_items = vec![
+            assistant_message("commentary 1", Some(MessagePhase::Commentary)),
+            assistant_message("commentary 2", Some(MessagePhase::Commentary)),
+            assistant_message("commentary 3", Some(MessagePhase::Commentary)),
+            compacted_marker(),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, Some(2), 500, TEST_RECALL_KBYTES_LIMIT)
+            .expect("build recall payload");
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].get("rollout_index").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            items[1].get("rollout_index").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert!(
+            items
+                .iter()
+                .all(|item| { item.get("phase").and_then(Value::as_str) == Some("commentary") }),
+            "commentary items should still be returned when no higher-signal items exist"
+        );
+    }
+
+    #[test]
+    fn recall_preserves_tail_behavior_when_phase_is_missing() {
+        let rollout_items = vec![
+            assistant_message("assistant 1", None),
+            reasoning("reasoning 1"),
+            assistant_message("assistant 2", None),
+            compacted_marker(),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, Some(2), 500, TEST_RECALL_KBYTES_LIMIT)
+            .expect("build recall payload");
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].get("rollout_index").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            items[1].get("rollout_index").and_then(Value::as_u64),
+            Some(2)
+        );
     }
 
     #[test]
@@ -516,7 +711,8 @@ mod tests {
             compacted_marker(),
         ];
 
-        let payload = build_recall_payload(&rollout_items, 10, 500).expect("build recall payload");
+        let payload = build_recall_payload(&rollout_items, Some(10), 500, TEST_RECALL_KBYTES_LIMIT)
+            .expect("build recall payload");
         let items = payload
             .get("items")
             .and_then(Value::as_array)
@@ -526,22 +722,98 @@ mod tests {
     }
 
     #[test]
+    fn recall_uses_last_user_message_event_as_boundary() {
+        let rollout_items = vec![
+            assistant_message("assistant before user event", None),
+            user_message_event("continue"),
+            reasoning("reasoning after user event"),
+            assistant_message(
+                "assistant after user event",
+                Some(MessagePhase::FinalAnswer),
+            ),
+            compacted_marker(),
+            assistant_message("post compact", None),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, None, 500, TEST_RECALL_KBYTES_LIMIT)
+            .expect("build recall payload");
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].get("rollout_index").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            items[1].get("rollout_index").and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(payload.pointer("/boundary/start_index"), Some(&json!(2)));
+        assert_eq!(
+            payload.pointer("/boundary/last_user_message_event_index"),
+            Some(&json!(1))
+        );
+    }
+
+    #[test]
+    fn recall_applies_kbytes_limit_from_tail() {
+        let alpha = "a".repeat(700);
+        let beta = "b".repeat(700);
+        let gamma = "c".repeat(700);
+        let rollout_items = vec![
+            assistant_message(alpha.as_str(), None),
+            assistant_message(beta.as_str(), None),
+            assistant_message(gamma.as_str(), None),
+            compacted_marker(),
+        ];
+
+        let unconstrained =
+            build_recall_payload(&rollout_items, None, 500, TEST_RECALL_KBYTES_LIMIT)
+                .expect("build unconstrained payload");
+        let unconstrained_bytes = unconstrained
+            .pointer("/counts/returned_bytes")
+            .and_then(Value::as_u64)
+            .expect("returned bytes");
+
+        let constrained =
+            build_recall_payload(&rollout_items, None, 500, 1).expect("build constrained payload");
+        let constrained_items = constrained
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+        let constrained_bytes = constrained
+            .pointer("/counts/returned_bytes")
+            .and_then(Value::as_u64)
+            .expect("returned bytes");
+
+        assert!(constrained_items.len() < 3);
+        assert!(constrained_bytes <= 1024);
+        assert!(constrained_bytes < unconstrained_bytes);
+        assert_eq!(
+            constrained.pointer("/counts/bytes_limit"),
+            Some(&json!(1024))
+        );
+    }
+
+    #[test]
     fn recall_rejects_invalid_argument_bounds() {
         for args in [
             RecallToolArgs {
-                max_items: 0,
+                max_items: Some(0),
                 max_chars_per_item: DEFAULT_MAX_CHARS_PER_ITEM,
             },
             RecallToolArgs {
-                max_items: MAX_MAX_ITEMS + 1,
+                max_items: Some(MAX_MAX_ITEMS + 1),
                 max_chars_per_item: DEFAULT_MAX_CHARS_PER_ITEM,
             },
             RecallToolArgs {
-                max_items: DEFAULT_MAX_ITEMS,
+                max_items: None,
                 max_chars_per_item: 0,
             },
             RecallToolArgs {
-                max_items: DEFAULT_MAX_ITEMS,
+                max_items: None,
                 max_chars_per_item: MAX_MAX_CHARS_PER_ITEM + 1,
             },
         ] {
@@ -555,13 +827,13 @@ mod tests {
 
     #[tokio::test]
     async fn recall_fails_when_session_rollout_is_unavailable() {
-        let (session, _turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::codex::make_session_and_context().await;
         let args = RecallToolArgs {
-            max_items: DEFAULT_MAX_ITEMS,
+            max_items: None,
             max_chars_per_item: DEFAULT_MAX_CHARS_PER_ITEM,
         };
 
-        let error = handle_recall(&session, &args)
+        let error = handle_recall(&session, &turn, &args)
             .await
             .expect_err("must fail without rollout recorder");
 
