@@ -581,8 +581,14 @@ fn collect_top_offenders(
 
 fn materialize_prompt_snapshot_after_apply(state: &mut crate::state::SessionState) {
     let current_history = state.history_snapshot_lenient();
+    let (in_flight_function_call_ids, in_flight_custom_call_ids) =
+        in_flight_manage_context_call_ids(&current_history);
     let mut prompt_snapshot = state.prompt_snapshot_lenient();
-    strip_completed_manage_context_pairs(&mut prompt_snapshot);
+    strip_completed_manage_context_pairs(
+        &mut prompt_snapshot,
+        &in_flight_function_call_ids,
+        &in_flight_custom_call_ids,
+    );
 
     if prompt_snapshot == current_history {
         return;
@@ -591,43 +597,125 @@ fn materialize_prompt_snapshot_after_apply(state: &mut crate::state::SessionStat
     state.replace_history(prompt_snapshot);
 }
 
-fn strip_completed_manage_context_pairs(items: &mut Vec<ResponseItem>) {
-    let mut manage_context_call_ids: HashSet<String> = HashSet::new();
-    let mut manage_context_output_ids: HashSet<String> = HashSet::new();
+fn in_flight_manage_context_call_ids(items: &[ResponseItem]) -> (HashSet<String>, HashSet<String>) {
+    let mut manage_context_function_call_ids: HashSet<String> = HashSet::new();
+    let mut manage_context_custom_call_ids: HashSet<String> = HashSet::new();
+    let mut function_output_ids: HashSet<String> = HashSet::new();
+    let mut custom_output_ids: HashSet<String> = HashSet::new();
 
-    for item in items.iter() {
+    for item in items {
         match item {
-            ResponseItem::FunctionCall { name, call_id, .. }
-            | ResponseItem::CustomToolCall { name, call_id, .. }
-                if name == "manage_context" =>
-            {
-                manage_context_call_ids.insert(call_id.clone());
+            ResponseItem::FunctionCall { name, call_id, .. } if name == "manage_context" => {
+                manage_context_function_call_ids.insert(call_id.clone());
             }
-            ResponseItem::FunctionCallOutput { call_id, .. }
-            | ResponseItem::CustomToolCallOutput { call_id, .. } => {
-                manage_context_output_ids.insert(call_id.clone());
+            ResponseItem::CustomToolCall { name, call_id, .. } if name == "manage_context" => {
+                manage_context_custom_call_ids.insert(call_id.clone());
+            }
+            ResponseItem::FunctionCallOutput { call_id, .. } => {
+                function_output_ids.insert(call_id.clone());
+            }
+            ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                custom_output_ids.insert(call_id.clone());
             }
             _ => {}
         }
     }
 
-    let completed_call_ids: HashSet<String> = manage_context_call_ids
+    let in_flight_function_call_ids: HashSet<String> = manage_context_function_call_ids
         .into_iter()
-        .filter(|call_id| manage_context_output_ids.contains(call_id))
+        .filter(|call_id| !function_output_ids.contains(call_id))
+        .collect();
+    let in_flight_custom_call_ids: HashSet<String> = manage_context_custom_call_ids
+        .into_iter()
+        .filter(|call_id| !custom_output_ids.contains(call_id))
         .collect();
 
-    if completed_call_ids.is_empty() {
+    (in_flight_function_call_ids, in_flight_custom_call_ids)
+}
+
+fn strip_completed_manage_context_pairs(
+    items: &mut Vec<ResponseItem>,
+    in_flight_function_call_ids: &HashSet<String>,
+    in_flight_custom_call_ids: &HashSet<String>,
+) {
+    let mut manage_context_function_call_ids: HashSet<String> = HashSet::new();
+    let mut manage_context_custom_call_ids: HashSet<String> = HashSet::new();
+    let mut function_output_ids: HashSet<String> = HashSet::new();
+    let mut custom_output_ids: HashSet<String> = HashSet::new();
+    let mut non_manage_function_like_call_ids: HashSet<String> = HashSet::new();
+    let mut non_manage_custom_call_ids: HashSet<String> = HashSet::new();
+
+    for item in items.iter() {
+        match item {
+            ResponseItem::FunctionCall { name, call_id, .. } if name == "manage_context" => {
+                manage_context_function_call_ids.insert(call_id.clone());
+            }
+            ResponseItem::CustomToolCall { name, call_id, .. } if name == "manage_context" => {
+                manage_context_custom_call_ids.insert(call_id.clone());
+            }
+            ResponseItem::FunctionCall { call_id, .. } => {
+                non_manage_function_like_call_ids.insert(call_id.clone());
+            }
+            ResponseItem::LocalShellCall {
+                call_id: Some(call_id),
+                ..
+            } => {
+                non_manage_function_like_call_ids.insert(call_id.clone());
+            }
+            ResponseItem::CustomToolCall { call_id, .. } => {
+                non_manage_custom_call_ids.insert(call_id.clone());
+            }
+            ResponseItem::FunctionCallOutput { call_id, .. } => {
+                if !in_flight_function_call_ids.contains(call_id) {
+                    function_output_ids.insert(call_id.clone());
+                }
+            }
+            ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                if !in_flight_custom_call_ids.contains(call_id) {
+                    custom_output_ids.insert(call_id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let completed_function_call_ids: HashSet<String> = manage_context_function_call_ids
+        .into_iter()
+        .filter(|call_id| function_output_ids.contains(call_id))
+        .collect();
+    let completed_custom_call_ids: HashSet<String> = manage_context_custom_call_ids
+        .into_iter()
+        .filter(|call_id| custom_output_ids.contains(call_id))
+        .collect();
+
+    if completed_function_call_ids.is_empty()
+        && completed_custom_call_ids.is_empty()
+        && in_flight_function_call_ids.is_empty()
+        && in_flight_custom_call_ids.is_empty()
+    {
         return;
     }
 
     items.retain(|item| match item {
-        ResponseItem::FunctionCall { name, call_id, .. }
-        | ResponseItem::CustomToolCall { name, call_id, .. } => {
-            !(name == "manage_context" && completed_call_ids.contains(call_id))
+        ResponseItem::FunctionCall { name, call_id, .. } => {
+            !(name == "manage_context" && completed_function_call_ids.contains(call_id))
         }
-        ResponseItem::FunctionCallOutput { call_id, .. }
-        | ResponseItem::CustomToolCallOutput { call_id, .. } => {
-            !completed_call_ids.contains(call_id)
+        ResponseItem::CustomToolCall { name, call_id, .. } => {
+            !(name == "manage_context" && completed_custom_call_ids.contains(call_id))
+        }
+        ResponseItem::FunctionCallOutput { call_id, .. } => {
+            if in_flight_function_call_ids.contains(call_id) {
+                return false;
+            }
+            !completed_function_call_ids.contains(call_id)
+                || non_manage_function_like_call_ids.contains(call_id)
+        }
+        ResponseItem::CustomToolCallOutput { call_id, .. } => {
+            if in_flight_custom_call_ids.contains(call_id) {
+                return false;
+            }
+            !completed_custom_call_ids.contains(call_id)
+                || non_manage_custom_call_ids.contains(call_id)
         }
         _ => true,
     });
@@ -835,6 +923,7 @@ fn contract_error(reason: StopReason, message: impl Into<String>) -> FunctionCal
 mod tests {
     use super::*;
     use codex_protocol::models::ContentItem;
+    use codex_protocol::openai_models::InputModality;
     use serde_json::Value;
 
     fn user_message(text: &str) -> ResponseItem {
@@ -870,6 +959,15 @@ mod tests {
         }
     }
 
+    fn manage_context_call(call_id: &str) -> ResponseItem {
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "manage_context".to_string(),
+            arguments: "{}".to_string(),
+            call_id: call_id.to_string(),
+        }
+    }
+
     fn tool_output(call_id: &str, text: &str) -> ResponseItem {
         ResponseItem::FunctionCallOutput {
             call_id: call_id.to_string(),
@@ -877,6 +975,33 @@ mod tests {
                 body: FunctionCallOutputBody::Text(text.to_string()),
                 success: Some(true),
             },
+        }
+    }
+
+    fn manage_context_output(call_id: &str, text: &str) -> ResponseItem {
+        ResponseItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: codex_protocol::models::FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text(text.to_string()),
+                success: Some(true),
+            },
+        }
+    }
+
+    fn custom_tool_call(name: &str, call_id: &str) -> ResponseItem {
+        ResponseItem::CustomToolCall {
+            id: None,
+            status: None,
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            input: "{}".to_string(),
+        }
+    }
+
+    fn custom_tool_output(call_id: &str, output: &str) -> ResponseItem {
+        ResponseItem::CustomToolCallOutput {
+            call_id: call_id.to_string(),
+            output: output.to_string(),
         }
     }
 
@@ -1125,6 +1250,333 @@ mod tests {
             Some(0),
             "post-user offenders are intentionally excluded from current retrieve plan"
         );
+    }
+
+    #[tokio::test]
+    async fn manage_context_retrieve_never_targets_user_assistant_or_protected_categories() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
+
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &user_message(
+                        "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nkeep\n</INSTRUCTIONS>",
+                    ),
+                    &user_message("<environment_context>\ncwd: /repo\n</environment_context>"),
+                    &assistant_message("assistant chatter"),
+                    &tool_call("call_tool_1"),
+                    &tool_output("call_tool_1", "tool output payload"),
+                    &user_message("latest user"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let retrieve_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": policy_id,
+        }))
+        .expect("parse retrieve args");
+
+        let retrieve = handle_manage_context(&session, &turn, &retrieve_args)
+            .await
+            .expect("retrieve");
+        let categories = retrieve
+            .json
+            .get("chunk_manifest")
+            .and_then(Value::as_array)
+            .expect("chunk_manifest array")
+            .iter()
+            .filter_map(|entry| entry.get("category").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert!(
+            !categories.is_empty(),
+            "fixture must produce at least one targetable chunk"
+        );
+        assert!(
+            categories
+                .iter()
+                .all(|category| { matches!(category, &"tool_output" | &"reasoning") })
+        );
+        assert!(!categories.iter().any(|category| {
+            matches!(
+                category,
+                &"user_message"
+                    | &"assistant_message"
+                    | &"user_instructions"
+                    | &"environment_context"
+            )
+        }));
+    }
+
+    #[test]
+    fn strip_completed_manage_context_pairs_removes_call_and_output_together() {
+        let mut items = vec![
+            user_message("u1"),
+            manage_context_call("done"),
+            manage_context_output("done", "{\"mode\":\"retrieve\"}"),
+            manage_context_call("pending"),
+            tool_call("exec-1"),
+            tool_output("exec-1", "ok"),
+        ];
+
+        strip_completed_manage_context_pairs(&mut items, &HashSet::new(), &HashSet::new());
+
+        assert!(!items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name == "manage_context" && call_id == "done"
+            )
+        }));
+        assert!(!items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "done"
+            )
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name == "manage_context" && call_id == "pending"
+            )
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "exec-1"
+            )
+        }));
+    }
+
+    #[test]
+    fn strip_completed_manage_context_pairs_keeps_outputs_on_call_id_collision() {
+        let mut items = vec![
+            user_message("u1"),
+            manage_context_call("shared"),
+            manage_context_output("shared", "{\"mode\":\"retrieve\"}"),
+            tool_call("shared"),
+        ];
+
+        strip_completed_manage_context_pairs(&mut items, &HashSet::new(), &HashSet::new());
+
+        assert!(!items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name == "manage_context" && call_id == "shared"
+            )
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name == "exec_command" && call_id == "shared"
+            )
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "shared"
+            )
+        }));
+    }
+
+    #[test]
+    fn strip_completed_manage_context_pairs_drops_function_output_when_only_custom_call_collides() {
+        let mut items = vec![
+            user_message("u1"),
+            manage_context_call("shared"),
+            manage_context_output("shared", "{\"mode\":\"retrieve\"}"),
+            custom_tool_call("apply_patch", "shared"),
+            custom_tool_output("shared", "ok"),
+        ];
+
+        strip_completed_manage_context_pairs(&mut items, &HashSet::new(), &HashSet::new());
+
+        assert!(!items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name == "manage_context" && call_id == "shared"
+            )
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::CustomToolCall { name, call_id, .. }
+                    if name == "apply_patch" && call_id == "shared"
+            )
+        }));
+        assert!(!items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "shared"
+            )
+        }));
+        let mut manager = crate::context_manager::ContextManager::new();
+        manager.replace(items);
+        let _ = manager.for_prompt(&[InputModality::Text]);
+    }
+
+    #[test]
+    fn strip_completed_manage_context_pairs_drops_custom_output_when_only_function_call_collides() {
+        let mut items = vec![
+            user_message("u1"),
+            custom_tool_call("manage_context", "shared"),
+            custom_tool_output("shared", "{\"mode\":\"retrieve\"}"),
+            tool_call("shared"),
+            tool_output("shared", "ok"),
+        ];
+
+        strip_completed_manage_context_pairs(&mut items, &HashSet::new(), &HashSet::new());
+
+        assert!(!items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::CustomToolCall { name, call_id, .. }
+                    if name == "manage_context" && call_id == "shared"
+            )
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name == "exec_command" && call_id == "shared"
+            )
+        }));
+        assert!(!items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::CustomToolCallOutput { call_id, .. } if call_id == "shared"
+            )
+        }));
+        let mut manager = crate::context_manager::ContextManager::new();
+        manager.replace(items);
+        let _ = manager.for_prompt(&[InputModality::Text]);
+    }
+
+    #[test]
+    fn strip_completed_manage_context_pairs_keeps_in_flight_call_and_drops_synthetic_output() {
+        let mut items = vec![
+            user_message("u1"),
+            manage_context_call("done"),
+            manage_context_output("done", "{\"mode\":\"retrieve\"}"),
+            manage_context_call("in-flight"),
+            manage_context_output("in-flight", "[codex] tool output omitted"),
+        ];
+
+        strip_completed_manage_context_pairs(
+            &mut items,
+            &HashSet::from(["in-flight".to_string()]),
+            &HashSet::new(),
+        );
+
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name == "manage_context" && call_id == "in-flight"
+            )
+        }));
+        assert!(!items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "in-flight"
+            )
+        }));
+        assert!(!items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name == "manage_context" && call_id == "done"
+            )
+        }));
+        assert!(!items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "done"
+            )
+        }));
+
+        let mut manager = crate::context_manager::ContextManager::new();
+        manager.replace(items);
+        let _ = manager.for_prompt(&[InputModality::Text]);
+    }
+
+    #[test]
+    fn in_flight_manage_context_call_ids_detects_unfinished_pairs() {
+        let items = vec![
+            manage_context_call("done-fn"),
+            manage_context_output("done-fn", "{}"),
+            manage_context_call("pending-fn"),
+            custom_tool_call("manage_context", "done-custom"),
+            custom_tool_output("done-custom", "{}"),
+            custom_tool_call("manage_context", "pending-custom"),
+        ];
+
+        let (in_flight_function_ids, in_flight_custom_ids) =
+            in_flight_manage_context_call_ids(&items);
+
+        assert_eq!(
+            in_flight_function_ids,
+            HashSet::from(["pending-fn".to_string()])
+        );
+        assert_eq!(
+            in_flight_custom_ids,
+            HashSet::from(["pending-custom".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_prompt_snapshot_after_apply_keeps_in_flight_manage_context_call() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &user_message("seed user"),
+                    &manage_context_call("in-flight"),
+                    &tool_call("exec-1"),
+                    &tool_output("exec-1", "tool output"),
+                ],
+                turn.truncation_policy,
+            );
+
+            // Force prompt_snapshot_lenient to run lenient placeholder injection logic.
+            state.set_context_inclusion(&[0], false);
+
+            materialize_prompt_snapshot_after_apply(&mut state);
+
+            let history_after_materialize = state.history_snapshot_lenient();
+            assert!(history_after_materialize.iter().any(|item| {
+                matches!(
+                    item,
+                    ResponseItem::FunctionCall { name, call_id, .. }
+                        if name == "manage_context" && call_id == "in-flight"
+                )
+            }));
+            assert!(!history_after_materialize.iter().any(|item| {
+                matches!(
+                    item,
+                    ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "in-flight"
+                )
+            }));
+
+            state.record_items(
+                [&manage_context_output("in-flight", "{\"mode\":\"apply\"}")],
+                turn.truncation_policy,
+            );
+            let final_history = state.history_snapshot_lenient();
+            let mut manager = crate::context_manager::ContextManager::new();
+            manager.replace(final_history);
+            let _ = manager.for_prompt(&[InputModality::Text]);
+        }
     }
 
     #[tokio::test]

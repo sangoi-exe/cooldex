@@ -29,6 +29,7 @@ const SANITIZE_ERROR_MESSAGE_PREFIX: &str = "/sanitize failed:";
 const SANITIZE_COMPLETED_WITH_CHANGES_MESSAGE: &str =
     "/sanitize completed and applied context updates.";
 const SANITIZE_COMPLETED_NO_CHANGES_MESSAGE: &str = "/sanitize completed with no context changes.";
+const SANITIZE_ALLOWED_TOOL_NAME: &str = "manage_context";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RetrieveSignature {
@@ -218,14 +219,21 @@ impl SanitizeStagnationTracker {
 }
 
 fn summarize_status_message(message: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
     let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.chars().count() <= max_chars {
         return normalized;
+    }
+    if max_chars <= 3 {
+        return "...".chars().take(max_chars).collect();
     }
     let truncated = normalized
         .chars()
         .take(max_chars.saturating_sub(3))
         .collect::<String>();
+    let truncated = truncated.trim_end();
     format!("{truncated}...")
 }
 
@@ -237,6 +245,10 @@ fn build_sanitize_prompt(policy: &crate::config::ManageContextPolicy) -> String 
         policy.stalled_signature_threshold,
         policy.max_chunks_per_apply,
     )
+}
+
+fn sanitize_allowed_tool_names() -> HashSet<String> {
+    HashSet::from([SANITIZE_ALLOWED_TOOL_NAME.to_string()])
 }
 
 async fn materialize_sanitize_history_if_changed(
@@ -306,7 +318,7 @@ impl SessionTask for SanitizeTask {
             Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
         let mut client_session = sess.services.model_client.new_session();
         let explicitly_enabled_connectors = HashSet::new();
-        let allowed_tool_names = HashSet::from(["manage_context".to_string()]);
+        let allowed_tool_names = sanitize_allowed_tool_names();
         let history_before_sanitize = {
             let state = sess.state.lock().await;
             state.history_snapshot_lenient()
@@ -735,6 +747,13 @@ mod tests {
         assert!(prompt.contains("fixed_point_k: 3"));
         assert!(prompt.contains("stalled_signature_threshold: 4"));
         assert!(prompt.contains("max_chunks_per_apply: 9"));
+    }
+
+    #[test]
+    fn sanitize_allowed_tool_names_only_includes_manage_context() {
+        let allowed_tool_names = sanitize_allowed_tool_names();
+        assert_eq!(allowed_tool_names.len(), 1);
+        assert!(allowed_tool_names.contains("manage_context"));
     }
 
     #[test]
@@ -1554,7 +1573,16 @@ mod tests {
             "  state_hash    mismatch   with many spaces and a long tail that should be trimmed",
             40,
         );
-        assert_eq!(summarized, "state_hash mismatch with many spaces an...");
+        assert_eq!(summarized, "state_hash mismatch with many spaces...");
+        assert!(summarized.chars().count() <= 40);
+    }
+
+    #[test]
+    fn summarize_status_message_handles_small_limits() {
+        assert_eq!(summarize_status_message("abcdef", 0), "");
+        assert_eq!(summarize_status_message("abcdef", 1), ".");
+        assert_eq!(summarize_status_message("abcdef", 2), "..");
+        assert_eq!(summarize_status_message("abcdef", 3), "...");
     }
 
     #[test]
