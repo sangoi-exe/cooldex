@@ -46,7 +46,7 @@ fn estimate_compact_payload_tokens(request: &responses::ResponsesRequest) -> i64
         .saturating_add(approx_token_count(&request.instructions_text()))
 }
 
-const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status. If you need pre-compact context, call recall with max_items=8.";
+const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. MANDATORY before any other action: call recall with max_items=8. Then recon unstaged changes, codex_learning_log, and update_plan status.";
 
 fn model_info_with_context_window(slug: &str, context_window: i64) -> ModelInfo {
     let models_response: ModelsResponse =

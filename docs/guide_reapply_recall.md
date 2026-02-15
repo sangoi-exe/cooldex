@@ -961,9 +961,9 @@ index 000000000..e819a9d5e
 +  - `phase` (assistant message only, when available)
 ```
 
-## Addendum — Post Auto-Compact Warning Includes Recall Hint
+## Addendum — Post Auto-Compact Warning Enforces Mandatory Recall Step
 
-This was added after the initial `recall` patch so the warning shown after auto-compaction now guides the operator to use `recall`.
+This was added after the initial `recall` patch so the warning shown after auto-compaction now enforces a mandatory `recall` step before any other action.
 
 ### Exact delta
 
@@ -971,17 +971,17 @@ This was added after the initial `recall` patch so the warning shown after auto-
 diff --git a/codex-rs/core/src/codex.rs b/codex-rs/core/src/codex.rs
 @@
 -const AUTO_COMPACT_RECON_WARNING_BODY: &str = "auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status.";
-+const AUTO_COMPACT_RECON_WARNING_BODY: &str = "auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status. If you need pre-compact context, call recall with max_items=8.";
++const AUTO_COMPACT_RECON_WARNING_BODY: &str = "auto-compaction completed. MANDATORY before any other action: call recall with max_items=8. Then recon unstaged changes, codex_learning_log, and update_plan status.";
 
 diff --git a/codex-rs/core/tests/suite/compact.rs b/codex-rs/core/tests/suite/compact.rs
 @@
 -const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status.";
-+const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status. If you need pre-compact context, call recall with max_items=8.";
++const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. MANDATORY before any other action: call recall with max_items=8. Then recon unstaged changes, codex_learning_log, and update_plan status.";
 
 diff --git a/codex-rs/core/tests/suite/compact_remote.rs b/codex-rs/core/tests/suite/compact_remote.rs
 @@
 -const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status.";
-+const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status. If you need pre-compact context, call recall with max_items=8.";
++const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. MANDATORY before any other action: call recall with max_items=8. Then recon unstaged changes, codex_learning_log, and update_plan status.";
 ```
 
 ### Focused validation used for this addendum
