@@ -960,3 +960,33 @@ index 000000000..e819a9d5e
 +  - `text`
 +  - `phase` (assistant message only, when available)
 ```
+
+## Addendum — Post Auto-Compact Warning Includes Recall Hint
+
+This was added after the initial `recall` patch so the warning shown after auto-compaction now guides the operator to use `recall`.
+
+### Exact delta
+
+```diff
+diff --git a/codex-rs/core/src/codex.rs b/codex-rs/core/src/codex.rs
+@@
+-const AUTO_COMPACT_RECON_WARNING_BODY: &str = "auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status.";
++const AUTO_COMPACT_RECON_WARNING_BODY: &str = "auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status. If you need pre-compact context, call recall with max_items=8.";
+
+diff --git a/codex-rs/core/tests/suite/compact.rs b/codex-rs/core/tests/suite/compact.rs
+@@
+-const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status.";
++const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status. If you need pre-compact context, call recall with max_items=8.";
+
+diff --git a/codex-rs/core/tests/suite/compact_remote.rs b/codex-rs/core/tests/suite/compact_remote.rs
+@@
+-const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status.";
++const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status. If you need pre-compact context, call recall with max_items=8.";
+```
+
+### Focused validation used for this addendum
+
+```bash
+cargo test -p codex-core --test all compact_remote::remote_compact_replaces_history_for_followups -- --test-threads=1
+cargo test -p codex-core --test all compact_remote::remote_auto_compact_warning_is_emitted_after_each_compaction -- --test-threads=1
+```

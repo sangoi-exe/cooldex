@@ -270,7 +270,7 @@ pub struct CodexSpawnOk {
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 64;
-const AUTO_COMPACT_RECON_WARNING_BODY: &str = "auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status.";
+const AUTO_COMPACT_RECON_WARNING_BODY: &str = "auto-compaction completed. Before proceeding, recon unstaged changes, codex_learning_log, and update_plan status. If you need pre-compact context, call recall with max_items=8.";
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
