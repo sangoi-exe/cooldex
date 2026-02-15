@@ -1157,6 +1157,41 @@ fn create_manage_context_tool() -> ToolSpec {
     })
 }
 
+fn create_recall_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "max_items".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Optional maximum number of pre-compaction items to return. Defaults to 24."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "max_chars_per_item".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Optional maximum text length per returned item. Defaults to 1200.".to_string(),
+                ),
+            },
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "recall".to_string(),
+        description:
+            "Recall recent reasoning and assistant messages from the current session rollout before the latest compaction marker (tool outputs excluded)."
+                .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_list_mcp_resources_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
@@ -1472,6 +1507,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::McpResourceHandler;
     use crate::tools::handlers::PlanHandler;
     use crate::tools::handlers::ReadFileHandler;
+    use crate::tools::handlers::RecallHandler;
     use crate::tools::handlers::RequestUserInputHandler;
     use crate::tools::handlers::SearchToolBm25Handler;
     use crate::tools::handlers::ShellCommandHandler;
@@ -1490,6 +1526,7 @@ pub(crate) fn build_specs(
     let dynamic_tool_handler = Arc::new(DynamicToolHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
     let manage_context_handler = Arc::new(ManageContextHandler);
+    let recall_handler = Arc::new(RecallHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
     let shell_command_handler = Arc::new(ShellCommandHandler);
@@ -1630,6 +1667,8 @@ pub(crate) fn build_specs(
     builder.register_handler("view_image", view_image_handler);
     builder.push_spec(create_manage_context_tool());
     builder.register_handler("manage_context", manage_context_handler);
+    builder.push_spec(create_recall_tool());
+    builder.register_handler("recall", recall_handler);
 
     if config.collab_tools {
         let collab_handler = Arc::new(CollabHandler);
@@ -1790,6 +1829,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recall_tool_contract_is_read_only() {
+        let tool = create_recall_tool();
+        let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = tool else {
+            panic!("recall must be a function tool");
+        };
+        let JsonSchema::Object {
+            properties,
+            required,
+            additional_properties,
+        } = parameters
+        else {
+            panic!("recall parameters must be object schema");
+        };
+
+        assert!(properties.contains_key("max_items"));
+        assert!(properties.contains_key("max_chars_per_item"));
+        assert!(!properties.contains_key("rollout_path"));
+        assert!(required.is_none(), "recall must not require arguments");
+        assert_eq!(
+            additional_properties,
+            Some(AdditionalProperties::Boolean(false))
+        );
+    }
+
     fn tool_name(tool: &ToolSpec) -> &str {
         match tool {
             ToolSpec::Function(ResponsesApiTool { name, .. }) => name,
@@ -1933,6 +1997,7 @@ mod tests {
             },
             create_view_image_tool(),
             create_manage_context_tool(),
+            create_recall_tool(),
         ] {
             expected.insert(tool_name(&spec).to_string(), spec);
         }
@@ -2145,6 +2210,7 @@ mod tests {
                 "web_search",
                 "view_image",
                 "manage_context",
+                "recall",
             ],
         );
     }
@@ -2168,6 +2234,7 @@ mod tests {
                 "web_search",
                 "view_image",
                 "manage_context",
+                "recall",
             ],
         );
     }
@@ -2193,6 +2260,7 @@ mod tests {
                 "web_search",
                 "view_image",
                 "manage_context",
+                "recall",
             ],
         );
     }
@@ -2218,6 +2286,7 @@ mod tests {
                 "web_search",
                 "view_image",
                 "manage_context",
+                "recall",
             ],
         );
     }
@@ -2241,6 +2310,7 @@ mod tests {
                 "web_search",
                 "view_image",
                 "manage_context",
+                "recall",
             ],
         );
     }
@@ -2264,6 +2334,7 @@ mod tests {
                 "web_search",
                 "view_image",
                 "manage_context",
+                "recall",
             ],
         );
     }
@@ -2286,6 +2357,7 @@ mod tests {
                 "web_search",
                 "view_image",
                 "manage_context",
+                "recall",
             ],
         );
     }
@@ -2309,6 +2381,7 @@ mod tests {
                 "web_search",
                 "view_image",
                 "manage_context",
+                "recall",
             ],
         );
     }
@@ -2334,6 +2407,7 @@ mod tests {
                 "web_search",
                 "view_image",
                 "manage_context",
+                "recall",
             ],
         );
     }

@@ -82,3 +82,9 @@ Response includes:
 - `invalid_contract`
 
 For model-facing guidance, see `docs/manage_context_model.md`.
+
+## Related: pre-compaction recall
+
+Use `recall` when you need a clean view of recent **pre-compaction** context from the current session rollout, limited to reasoning + assistant messages and excluding tool output.
+
+See `docs/recall.md` for the contract.

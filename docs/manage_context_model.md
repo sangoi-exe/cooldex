@@ -2,6 +2,8 @@
 
 Use `manage_context` to sanitize heavy context with deterministic `retrieve -> apply` cycles.
 
+If the goal is to inspect recent pre-compaction history (reasoning + assistant messages only), use `recall` instead of `manage_context`.
+
 ## Hard rules
 
 - Use only v2 fields.

@@ -91,3 +91,5 @@ CHANGELOG.ignore.md
 __pycache__/
 *.pyc
 
+# Sangoi project docs / dev tooling (lives in separate repo; keep local checkout here)
+/.sangoi/
