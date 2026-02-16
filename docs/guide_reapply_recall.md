@@ -137,10 +137,17 @@ Negative contract checks (must fail loud):
 Both must fail with `invalid_contract` parsing behavior due unknown fields.
 
 ## Git Notes
-- If `master` is intentionally rewritten to this state, remote update usually requires force push:
+- If you need to keep the exact tree state but cannot force-push (policy/protection), use ancestry sync first:
+
+```bash
+git merge -s ours origin/master -m "chore: sync master with origin/master ancestry after reset"
+git push origin master
+```
+
+- If commit identity must match exactly (history rewrite), remote update usually requires force push:
 
 ```bash
 git push --force-with-lease origin master
 ```
 
-- If local policy blocks force push, execute the command outside the restricted environment.
+- If local policy blocks force push, execute that command outside the restricted environment.
