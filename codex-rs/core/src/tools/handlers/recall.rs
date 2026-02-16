@@ -22,22 +22,9 @@ use serde_json::json;
 
 pub struct RecallHandler;
 
-const MAX_MAX_ITEMS: usize = 200;
-const DEFAULT_MAX_CHARS_PER_ITEM: usize = 1200;
-const MAX_MAX_CHARS_PER_ITEM: usize = 16_000;
-
-fn default_max_chars_per_item() -> usize {
-    DEFAULT_MAX_CHARS_PER_ITEM
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RecallToolArgs {
-    #[serde(default)]
-    max_items: Option<usize>,
-    #[serde(default = "default_max_chars_per_item")]
-    max_chars_per_item: usize,
-}
+struct RecallToolArgs {}
 
 #[derive(Debug, Clone, Copy)]
 enum StopReason {
@@ -110,9 +97,8 @@ impl ToolHandler for RecallHandler {
 async fn handle_recall(
     session: &Session,
     turn: &TurnContext,
-    args: &RecallToolArgs,
+    _args: &RecallToolArgs,
 ) -> Result<serde_json::Value, FunctionCallError> {
-    validate_args(args)?;
     let rollout_recorder = current_rollout_recorder(session).await?;
     rollout_recorder.flush().await.map_err(|error| {
         contract_error(
@@ -136,30 +122,7 @@ async fn handle_recall(
             format!("current session rollout has {parse_errors} parse error(s)"),
         ));
     }
-    build_recall_payload(
-        &rollout_items,
-        args.max_items,
-        args.max_chars_per_item,
-        turn.config.recall_kbytes_limit,
-    )
-}
-
-fn validate_args(args: &RecallToolArgs) -> Result<(), FunctionCallError> {
-    if let Some(max_items) = args.max_items
-        && (max_items == 0 || max_items > MAX_MAX_ITEMS)
-    {
-        return Err(contract_error(
-            StopReason::InvalidContract,
-            format!("recall.max_items must be between 1 and {MAX_MAX_ITEMS}"),
-        ));
-    }
-    if args.max_chars_per_item == 0 || args.max_chars_per_item > MAX_MAX_CHARS_PER_ITEM {
-        return Err(contract_error(
-            StopReason::InvalidContract,
-            format!("recall.max_chars_per_item must be between 1 and {MAX_MAX_CHARS_PER_ITEM}"),
-        ));
-    }
-    Ok(())
+    build_recall_payload(&rollout_items, turn.config.recall_kbytes_limit)
 }
 
 async fn current_rollout_recorder(session: &Session) -> Result<RolloutRecorder, FunctionCallError> {
@@ -177,8 +140,6 @@ async fn current_rollout_recorder(session: &Session) -> Result<RolloutRecorder, 
 
 fn build_recall_payload(
     rollout_items: &[RolloutItem],
-    max_items: Option<usize>,
-    max_chars_per_item: usize,
     recall_kbytes_limit: usize,
 ) -> Result<serde_json::Value, FunctionCallError> {
     let compacted_markers_seen = rollout_items
@@ -201,34 +162,9 @@ fn build_recall_payload(
         latest_user_message_event_index_before(rollout_items, latest_compacted_index);
     let start_index = last_user_message_event_index.map_or(0, |index| index.saturating_add(1));
 
-    let mut matching_items = collect_pre_compact_items(
-        rollout_items,
-        start_index,
-        latest_compacted_index,
-        max_chars_per_item,
-    );
+    let matching_items =
+        collect_pre_compact_items(rollout_items, start_index, latest_compacted_index);
     let matching_pre_compact_items = matching_items.len();
-    if let Some(max_items) = max_items
-        && matching_items.len() > max_items
-    {
-        let (mut commentary_items, mut prioritized_items): (Vec<RecallItem>, Vec<RecallItem>) =
-            matching_items.into_iter().partition(|item| {
-                item.kind == "assistant_message" && item.phase.as_deref() == Some("commentary")
-            });
-        if prioritized_items.len() >= max_items {
-            let split_point = prioritized_items.len() - max_items;
-            matching_items = prioritized_items.split_off(split_point);
-        } else {
-            let needed_commentary_items = max_items - prioritized_items.len();
-            if commentary_items.len() > needed_commentary_items {
-                let split_point = commentary_items.len() - needed_commentary_items;
-                commentary_items = commentary_items.split_off(split_point);
-            }
-            prioritized_items.extend(commentary_items);
-            prioritized_items.sort_unstable_by_key(|item| item.rollout_index);
-            matching_items = prioritized_items;
-        }
-    }
 
     let recall_bytes_limit = recall_kbytes_limit.saturating_mul(1024);
     let (matching_items, returned_bytes) =
@@ -252,7 +188,6 @@ fn build_recall_payload(
         "counts": {
             "matching_pre_compact_items": matching_pre_compact_items,
             "returned_items": returned_items,
-            "max_items": max_items,
             "returned_bytes": returned_bytes,
             "bytes_limit": recall_bytes_limit,
         },
@@ -264,7 +199,6 @@ fn collect_pre_compact_items(
     rollout_items: &[RolloutItem],
     start_index: usize,
     latest_compacted_index: usize,
-    max_chars_per_item: usize,
 ) -> Vec<RecallItem> {
     let mut output = Vec::new();
     for (index, rollout_item) in rollout_items
@@ -288,7 +222,7 @@ fn collect_pre_compact_items(
                 output.push(RecallItem {
                     kind: "reasoning".to_string(),
                     rollout_index: index,
-                    text: truncate_to_char_limit(trimmed, max_chars_per_item),
+                    text: trimmed.to_string(),
                     phase: None,
                 });
             }
@@ -306,7 +240,7 @@ fn collect_pre_compact_items(
                 output.push(RecallItem {
                     kind: "assistant_message".to_string(),
                     rollout_index: index,
-                    text: truncate_to_char_limit(trimmed, max_chars_per_item),
+                    text: trimmed.to_string(),
                     phase: phase
                         .as_ref()
                         .map(|message_phase| phase_name(message_phase).to_string()),
@@ -409,14 +343,6 @@ fn phase_name(phase: &MessagePhase) -> &'static str {
     }
 }
 
-fn truncate_to_char_limit(text: &str, max_chars: usize) -> String {
-    let mut char_indices = text.char_indices();
-    let Some((cutoff, _)) = char_indices.nth(max_chars) else {
-        return text.to_string();
-    };
-    format!("{}…", &text[..cutoff])
-}
-
 fn contract_error(reason: StopReason, message: impl Into<String>) -> FunctionCallError {
     FunctionCallError::RespondToModel(
         json!({
@@ -513,7 +439,7 @@ mod tests {
     fn recall_requires_compaction_marker() {
         let rollout_items = vec![assistant_message("before", None), reasoning("analysis")];
 
-        let error = build_recall_payload(&rollout_items, Some(10), 500, TEST_RECALL_KBYTES_LIMIT)
+        let error = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT)
             .expect_err("must fail when no compaction marker is present");
 
         assert_eq!(
@@ -534,7 +460,7 @@ mod tests {
             reasoning("after compact should not be included"),
         ];
 
-        let payload = build_recall_payload(&rollout_items, Some(10), 500, TEST_RECALL_KBYTES_LIMIT)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT)
             .expect("build recall payload");
         let items = payload
             .get("items")
@@ -558,143 +484,30 @@ mod tests {
     }
 
     #[test]
-    fn recall_returns_only_latest_max_items() {
-        let rollout_items = vec![
-            assistant_message("assistant 1", None),
-            reasoning("reasoning 1"),
-            assistant_message("assistant 2", Some(MessagePhase::FinalAnswer)),
-            compacted_marker(),
-        ];
-
-        let payload = build_recall_payload(&rollout_items, Some(2), 500, TEST_RECALL_KBYTES_LIMIT)
-            .expect("build recall payload");
-        let items = payload
-            .get("items")
-            .and_then(Value::as_array)
-            .expect("items array");
-
-        assert_eq!(items.len(), 2);
-        assert_eq!(
-            items[0].get("rollout_index").and_then(Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            items[1].get("rollout_index").and_then(Value::as_u64),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn recall_truncates_text_by_char_limit() {
+    fn recall_keeps_full_message_text_without_char_arg() {
         let rollout_items = vec![assistant_message("abcdefghijk", None), compacted_marker()];
 
-        let payload = build_recall_payload(&rollout_items, Some(10), 5, TEST_RECALL_KBYTES_LIMIT)
-            .expect("build recall payload");
-        let items = payload
-            .get("items")
-            .and_then(Value::as_array)
-            .expect("items array");
-        let text = items[0].get("text").and_then(Value::as_str).expect("text");
-        assert_eq!(text, "abcde…");
-    }
-
-    #[test]
-    fn recall_deprioritizes_commentary_when_capped() {
-        let rollout_items = vec![
-            assistant_message("commentary 1", Some(MessagePhase::Commentary)),
-            assistant_message("final answer 1", Some(MessagePhase::FinalAnswer)),
-            reasoning("reasoning 1"),
-            assistant_message("commentary 2", Some(MessagePhase::Commentary)),
-            assistant_message("final answer 2", Some(MessagePhase::FinalAnswer)),
-            compacted_marker(),
-        ];
-
-        let payload = build_recall_payload(&rollout_items, Some(3), 500, TEST_RECALL_KBYTES_LIMIT)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT)
             .expect("build recall payload");
         let items = payload
             .get("items")
             .and_then(Value::as_array)
             .expect("items array");
 
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 1);
         assert_eq!(
-            items[0].get("rollout_index").and_then(Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            items[1].get("rollout_index").and_then(Value::as_u64),
-            Some(2)
-        );
-        assert_eq!(
-            items[2].get("rollout_index").and_then(Value::as_u64),
-            Some(4)
-        );
-        assert!(
-            items
-                .iter()
-                .all(|item| { item.get("phase").and_then(Value::as_str) != Some("commentary") }),
-            "commentary items should be dropped when enough higher-signal items exist"
+            items[0].get("text").and_then(Value::as_str),
+            Some("abcdefghijk")
         );
     }
 
     #[test]
-    fn recall_falls_back_to_commentary_when_needed() {
-        let rollout_items = vec![
-            assistant_message("commentary 1", Some(MessagePhase::Commentary)),
-            assistant_message("commentary 2", Some(MessagePhase::Commentary)),
-            assistant_message("commentary 3", Some(MessagePhase::Commentary)),
-            compacted_marker(),
-        ];
-
-        let payload = build_recall_payload(&rollout_items, Some(2), 500, TEST_RECALL_KBYTES_LIMIT)
+    fn recall_counts_do_not_expose_removed_max_items_field() {
+        let rollout_items = vec![assistant_message("assistant 1", None), compacted_marker()];
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT)
             .expect("build recall payload");
-        let items = payload
-            .get("items")
-            .and_then(Value::as_array)
-            .expect("items array");
 
-        assert_eq!(items.len(), 2);
-        assert_eq!(
-            items[0].get("rollout_index").and_then(Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            items[1].get("rollout_index").and_then(Value::as_u64),
-            Some(2)
-        );
-        assert!(
-            items
-                .iter()
-                .all(|item| { item.get("phase").and_then(Value::as_str) == Some("commentary") }),
-            "commentary items should still be returned when no higher-signal items exist"
-        );
-    }
-
-    #[test]
-    fn recall_preserves_tail_behavior_when_phase_is_missing() {
-        let rollout_items = vec![
-            assistant_message("assistant 1", None),
-            reasoning("reasoning 1"),
-            assistant_message("assistant 2", None),
-            compacted_marker(),
-        ];
-
-        let payload = build_recall_payload(&rollout_items, Some(2), 500, TEST_RECALL_KBYTES_LIMIT)
-            .expect("build recall payload");
-        let items = payload
-            .get("items")
-            .and_then(Value::as_array)
-            .expect("items array");
-
-        assert_eq!(items.len(), 2);
-        assert_eq!(
-            items[0].get("rollout_index").and_then(Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            items[1].get("rollout_index").and_then(Value::as_u64),
-            Some(2)
-        );
+        assert!(payload.pointer("/counts/max_items").is_none());
     }
 
     #[test]
@@ -711,7 +524,7 @@ mod tests {
             compacted_marker(),
         ];
 
-        let payload = build_recall_payload(&rollout_items, Some(10), 500, TEST_RECALL_KBYTES_LIMIT)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT)
             .expect("build recall payload");
         let items = payload
             .get("items")
@@ -735,7 +548,7 @@ mod tests {
             assistant_message("post compact", None),
         ];
 
-        let payload = build_recall_payload(&rollout_items, None, 500, TEST_RECALL_KBYTES_LIMIT)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT)
             .expect("build recall payload");
         let items = payload
             .get("items")
@@ -769,16 +582,15 @@ mod tests {
             compacted_marker(),
         ];
 
-        let unconstrained =
-            build_recall_payload(&rollout_items, None, 500, TEST_RECALL_KBYTES_LIMIT)
-                .expect("build unconstrained payload");
+        let unconstrained = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT)
+            .expect("build unconstrained payload");
         let unconstrained_bytes = unconstrained
             .pointer("/counts/returned_bytes")
             .and_then(Value::as_u64)
             .expect("returned bytes");
 
         let constrained =
-            build_recall_payload(&rollout_items, None, 500, 1).expect("build constrained payload");
+            build_recall_payload(&rollout_items, 1).expect("build constrained payload");
         let constrained_items = constrained
             .get("items")
             .and_then(Value::as_array)
@@ -798,40 +610,21 @@ mod tests {
     }
 
     #[test]
-    fn recall_rejects_invalid_argument_bounds() {
-        for args in [
-            RecallToolArgs {
-                max_items: Some(0),
-                max_chars_per_item: DEFAULT_MAX_CHARS_PER_ITEM,
-            },
-            RecallToolArgs {
-                max_items: Some(MAX_MAX_ITEMS + 1),
-                max_chars_per_item: DEFAULT_MAX_CHARS_PER_ITEM,
-            },
-            RecallToolArgs {
-                max_items: None,
-                max_chars_per_item: 0,
-            },
-            RecallToolArgs {
-                max_items: None,
-                max_chars_per_item: MAX_MAX_CHARS_PER_ITEM + 1,
-            },
-        ] {
-            let error = validate_args(&args).expect_err("invalid args must fail");
-            assert_eq!(
-                parse_error_stop_reason(error),
-                StopReason::InvalidContract.as_str()
-            );
-        }
+    fn recall_rejects_removed_max_items_argument() {
+        let parse = serde_json::from_str::<RecallToolArgs>(r#"{"max_items":8}"#);
+        assert!(parse.is_err());
+    }
+
+    #[test]
+    fn recall_rejects_removed_max_chars_per_item_argument() {
+        let parse = serde_json::from_str::<RecallToolArgs>(r#"{"max_chars_per_item":400}"#);
+        assert!(parse.is_err());
     }
 
     #[tokio::test]
     async fn recall_fails_when_session_rollout_is_unavailable() {
         let (session, turn) = crate::codex::make_session_and_context().await;
-        let args = RecallToolArgs {
-            max_items: None,
-            max_chars_per_item: DEFAULT_MAX_CHARS_PER_ITEM,
-        };
+        let args = RecallToolArgs {};
 
         let error = handle_recall(&session, &turn, &args)
             .await

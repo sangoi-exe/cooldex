@@ -1,6 +1,6 @@
 # Guide Reapply — Recall Tool (Current Session Rollout)
 
-> Canonical current post-auto-compact recall instruction: `recall` (no `max_items` arg in warning; size cap comes from `recall_kbytes_limit`).
+> Canonical current post-auto-compact recall instruction: `recall` with empty args (`{}`); size cap comes from `recall_kbytes_limit`.
 
 ## Scope
 Reapply exactly the `recall` implementation that was added as a **new tool** (without changing `manage_context.retrieve`) in Codex CLI core.
@@ -83,13 +83,15 @@ rg -n "Pre-Compaction Recall|Related: pre-compaction recall|use `recall`" docs/r
 ## Smoke Test (Runtime)
 After launching Codex CLI with this code, call:
 ```json
-{"max_items": 5}
+{}
 ```
 on tool `recall` and verify:
 - response has `mode = "recall_pre_compact"`
 - response has `source = "current_session_rollout"`
 - `items[]` entries are only `kind = "reasoning" | "assistant_message"`
 - no tool output payloads are returned
+
+> Note: older `max_items` / `max_chars_per_item` references that appear below inside historical patch excerpts are obsolete and must not be used.
 
 ## Full Patch (Exact)
 
@@ -968,7 +970,7 @@ index 000000000..e819a9d5e
 
 ## Current Warning Invariant
 - After auto-compaction, the warning must require `recall` before any other action.
-- The warning must not hardcode `max_items`; payload size is controlled by `recall_kbytes_limit`.
+- The warning must not include tool arguments; payload size is controlled by `recall_kbytes_limit`.
 
 ## Focused Validation (Current Contract)
 ```bash

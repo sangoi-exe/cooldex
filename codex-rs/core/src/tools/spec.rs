@@ -1158,24 +1158,7 @@ fn create_manage_context_tool() -> ToolSpec {
 }
 
 fn create_recall_tool() -> ToolSpec {
-    let properties = BTreeMap::from([
-        (
-            "max_items".to_string(),
-            JsonSchema::Number {
-                description: Some(
-                    "Optional maximum number of pre-compaction items to return.".to_string(),
-                ),
-            },
-        ),
-        (
-            "max_chars_per_item".to_string(),
-            JsonSchema::Number {
-                description: Some(
-                    "Optional maximum text length per returned item. Defaults to 1200.".to_string(),
-                ),
-            },
-        ),
-    ]);
+    let properties = BTreeMap::new();
 
     ToolSpec::Function(ResponsesApiTool {
         name: "recall".to_string(),
@@ -1843,8 +1826,7 @@ mod tests {
             panic!("recall parameters must be object schema");
         };
 
-        assert!(properties.contains_key("max_items"));
-        assert!(properties.contains_key("max_chars_per_item"));
+        assert!(properties.is_empty(), "recall must not accept parameters");
         assert!(!properties.contains_key("rollout_path"));
         assert!(required.is_none(), "recall must not require arguments");
         assert_eq!(
