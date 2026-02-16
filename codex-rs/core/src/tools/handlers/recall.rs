@@ -32,7 +32,6 @@ enum StopReason {
     Unavailable,
     NoCompactionMarker,
     RolloutReadError,
-    RolloutParseError,
 }
 
 impl StopReason {
@@ -42,7 +41,6 @@ impl StopReason {
             Self::Unavailable => "unavailable",
             Self::NoCompactionMarker => "no_compaction_marker",
             Self::RolloutReadError => "rollout_read_error",
-            Self::RolloutParseError => "rollout_parse_error",
         }
     }
 }
@@ -116,13 +114,11 @@ async fn handle_recall(
                     format!("failed to read current session rollout: {error}"),
                 )
             })?;
-    if parse_errors > 0 {
-        return Err(contract_error(
-            StopReason::RolloutParseError,
-            format!("current session rollout has {parse_errors} parse error(s)"),
-        ));
-    }
-    build_recall_payload(&rollout_items, turn.config.recall_kbytes_limit)
+    build_recall_payload(
+        &rollout_items,
+        turn.config.recall_kbytes_limit,
+        parse_errors,
+    )
 }
 
 async fn current_rollout_recorder(session: &Session) -> Result<RolloutRecorder, FunctionCallError> {
@@ -141,6 +137,7 @@ async fn current_rollout_recorder(session: &Session) -> Result<RolloutRecorder, 
 fn build_recall_payload(
     rollout_items: &[RolloutItem],
     recall_kbytes_limit: usize,
+    parse_errors: usize,
 ) -> Result<serde_json::Value, FunctionCallError> {
     let compacted_markers_seen = rollout_items
         .iter()
@@ -152,15 +149,19 @@ fn build_recall_payload(
         .rev()
         .find_map(|(index, item)| matches!(item, RolloutItem::Compacted(_)).then_some(index))
     else {
-        return Err(contract_error(
-            StopReason::NoCompactionMarker,
-            "current session rollout has no compacted marker",
-        ));
+        let message = if parse_errors == 0 {
+            "current session rollout has no compacted marker".to_string()
+        } else {
+            format!(
+                "current session rollout has no compacted marker (rollout parse errors: {parse_errors})"
+            )
+        };
+        return Err(contract_error(StopReason::NoCompactionMarker, message));
     };
 
-    let last_user_message_event_index =
-        latest_user_message_event_index_before(rollout_items, latest_compacted_index);
-    let start_index = last_user_message_event_index.map_or(0, |index| index.saturating_add(1));
+    let last_context_compacted_event_index =
+        previous_context_compacted_event_index_before(rollout_items, latest_compacted_index);
+    let start_index = last_context_compacted_event_index.map_or(0, |index| index.saturating_add(1));
 
     let matching_items =
         collect_pre_compact_items(rollout_items, start_index, latest_compacted_index);
@@ -174,9 +175,13 @@ fn build_recall_payload(
     Ok(json!({
         "mode": "recall_pre_compact",
         "source": "current_session_rollout",
+        "integrity": {
+            "status": if parse_errors == 0 { "ok" } else { "degraded" },
+            "rollout_parse_errors": parse_errors,
+        },
         "boundary": {
             "start_index": start_index,
-            "last_user_message_event_index": last_user_message_event_index,
+            "last_context_compacted_event_index": last_context_compacted_event_index,
             "latest_compacted_index": latest_compacted_index,
             "compacted_markers_seen": compacted_markers_seen,
         },
@@ -252,18 +257,19 @@ fn collect_pre_compact_items(
     output
 }
 
-fn latest_user_message_event_index_before(
+fn previous_context_compacted_event_index_before(
     rollout_items: &[RolloutItem],
     latest_compacted_index: usize,
 ) -> Option<usize> {
-    rollout_items
+    let mut compacted_events = rollout_items
         .iter()
         .enumerate()
         .take(latest_compacted_index)
-        .rev()
-        .find_map(|(index, item)| {
-            matches!(item, RolloutItem::EventMsg(EventMsg::UserMessage(_))).then_some(index)
-        })
+        .filter_map(|(index, item)| {
+            matches!(item, RolloutItem::EventMsg(EventMsg::ContextCompacted(_))).then_some(index)
+        });
+    let _current_compaction_event = compacted_events.next_back();
+    compacted_events.next_back()
 }
 
 fn trim_items_to_bytes_limit(
@@ -356,12 +362,15 @@ fn contract_error(reason: StopReason, message: impl Into<String>) -> FunctionCal
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::models::BaseInstructions;
     use codex_protocol::models::FunctionCallOutputPayload;
     use codex_protocol::models::ReasoningItemReasoningSummary::SummaryText;
     use codex_protocol::protocol::CompactedItem;
+    use codex_protocol::protocol::ContextCompactedEvent;
     use codex_protocol::protocol::UserMessageEvent;
     use pretty_assertions::assert_eq;
     use serde_json::Value;
+    use tokio::io::AsyncWriteExt;
 
     const TEST_RECALL_KBYTES_LIMIT: usize = 256;
 
@@ -423,11 +432,15 @@ mod tests {
         }))
     }
 
-    fn parse_error_stop_reason(error: FunctionCallError) -> String {
+    fn parse_error_payload(error: FunctionCallError) -> Value {
         let FunctionCallError::RespondToModel(raw) = error else {
             panic!("expected RespondToModel error");
         };
-        let payload: Value = serde_json::from_str(&raw).expect("structured error payload");
+        serde_json::from_str(&raw).expect("structured error payload")
+    }
+
+    fn parse_error_stop_reason(error: FunctionCallError) -> String {
+        let payload = parse_error_payload(error);
         payload
             .get("stop_reason")
             .and_then(Value::as_str)
@@ -439,12 +452,35 @@ mod tests {
     fn recall_requires_compaction_marker() {
         let rollout_items = vec![assistant_message("before", None), reasoning("analysis")];
 
-        let error = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT)
+        let error = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
             .expect_err("must fail when no compaction marker is present");
+        let payload = parse_error_payload(error);
 
         assert_eq!(
-            parse_error_stop_reason(error),
-            StopReason::NoCompactionMarker.as_str()
+            payload.get("stop_reason").and_then(Value::as_str),
+            Some(StopReason::NoCompactionMarker.as_str())
+        );
+        assert_eq!(
+            payload.get("message").and_then(Value::as_str),
+            Some("current session rollout has no compacted marker")
+        );
+    }
+
+    #[test]
+    fn recall_no_compaction_marker_error_reports_parse_errors_when_present() {
+        let rollout_items = vec![assistant_message("before", None), reasoning("analysis")];
+
+        let error = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 2)
+            .expect_err("must fail when no compaction marker is present");
+        let payload = parse_error_payload(error);
+
+        assert_eq!(
+            payload.get("stop_reason").and_then(Value::as_str),
+            Some(StopReason::NoCompactionMarker.as_str())
+        );
+        assert_eq!(
+            payload.get("message").and_then(Value::as_str),
+            Some("current session rollout has no compacted marker (rollout parse errors: 2)")
         );
     }
 
@@ -460,7 +496,7 @@ mod tests {
             reasoning("after compact should not be included"),
         ];
 
-        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
             .expect("build recall payload");
         let items = payload
             .get("items")
@@ -487,7 +523,7 @@ mod tests {
     fn recall_keeps_full_message_text_without_char_arg() {
         let rollout_items = vec![assistant_message("abcdefghijk", None), compacted_marker()];
 
-        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
             .expect("build recall payload");
         let items = payload
             .get("items")
@@ -504,7 +540,7 @@ mod tests {
     #[test]
     fn recall_counts_do_not_expose_removed_max_items_field() {
         let rollout_items = vec![assistant_message("assistant 1", None), compacted_marker()];
-        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
             .expect("build recall payload");
 
         assert!(payload.pointer("/counts/max_items").is_none());
@@ -524,7 +560,7 @@ mod tests {
             compacted_marker(),
         ];
 
-        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
             .expect("build recall payload");
         let items = payload
             .get("items")
@@ -535,20 +571,21 @@ mod tests {
     }
 
     #[test]
-    fn recall_uses_last_user_message_event_as_boundary() {
+    fn recall_uses_previous_context_compacted_event_as_boundary() {
         let rollout_items = vec![
-            assistant_message("assistant before user event", None),
-            user_message_event("continue"),
-            reasoning("reasoning after user event"),
+            assistant_message("assistant before previous compact", None),
+            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent)),
+            reasoning("reasoning after previous compact"),
             assistant_message(
-                "assistant after user event",
+                "assistant after previous compact",
                 Some(MessagePhase::FinalAnswer),
             ),
+            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent)),
             compacted_marker(),
             assistant_message("post compact", None),
         ];
 
-        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
             .expect("build recall payload");
         let items = payload
             .get("items")
@@ -565,8 +602,31 @@ mod tests {
         );
         assert_eq!(payload.pointer("/boundary/start_index"), Some(&json!(2)));
         assert_eq!(
-            payload.pointer("/boundary/last_user_message_event_index"),
+            payload.pointer("/boundary/last_context_compacted_event_index"),
             Some(&json!(1))
+        );
+    }
+
+    #[test]
+    fn recall_falls_back_to_start_when_no_previous_context_compacted_event_exists() {
+        let rollout_items = vec![
+            assistant_message("assistant before first compact", None),
+            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent)),
+            reasoning("reasoning before first compact marker"),
+            compacted_marker(),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
+            .expect("build recall payload");
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(payload.pointer("/boundary/start_index"), Some(&json!(0)));
+        assert_eq!(
+            payload.pointer("/boundary/last_context_compacted_event_index"),
+            Some(&Value::Null)
         );
     }
 
@@ -582,7 +642,7 @@ mod tests {
             compacted_marker(),
         ];
 
-        let unconstrained = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT)
+        let unconstrained = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
             .expect("build unconstrained payload");
         let unconstrained_bytes = unconstrained
             .pointer("/counts/returned_bytes")
@@ -590,7 +650,7 @@ mod tests {
             .expect("returned bytes");
 
         let constrained =
-            build_recall_payload(&rollout_items, 1).expect("build constrained payload");
+            build_recall_payload(&rollout_items, 1, 0).expect("build constrained payload");
         let constrained_items = constrained
             .get("items")
             .and_then(Value::as_array)
@@ -606,6 +666,26 @@ mod tests {
         assert_eq!(
             constrained.pointer("/counts/bytes_limit"),
             Some(&json!(1024))
+        );
+    }
+
+    #[test]
+    fn recall_reports_degraded_integrity_when_rollout_has_parse_errors() {
+        let rollout_items = vec![
+            assistant_message("assistant before compact", None),
+            compacted_marker(),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 1)
+            .expect("build recall payload");
+
+        assert_eq!(
+            payload.pointer("/integrity/status"),
+            Some(&json!("degraded"))
+        );
+        assert_eq!(
+            payload.pointer("/integrity/rollout_parse_errors"),
+            Some(&json!(1))
         );
     }
 
@@ -634,5 +714,65 @@ mod tests {
             parse_error_stop_reason(error),
             StopReason::Unavailable.as_str()
         );
+    }
+
+    #[tokio::test]
+    async fn recall_returns_degraded_integrity_when_rollout_contains_invalid_line() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let recorder = crate::rollout::RolloutRecorder::new(
+            turn.config.as_ref(),
+            crate::rollout::RolloutRecorderParams::new(
+                session.conversation_id,
+                None,
+                turn.session_source.clone(),
+                BaseInstructions::default(),
+                Vec::new(),
+            ),
+            None,
+            None,
+        )
+        .await
+        .expect("create rollout recorder");
+        let rollout_path = recorder.rollout_path().to_path_buf();
+        {
+            let mut guard = session.services.rollout.lock().await;
+            *guard = Some(recorder.clone());
+        }
+
+        session
+            .persist_rollout_items(&[
+                user_message_event("continue"),
+                assistant_message("assistant before compact", Some(MessagePhase::Commentary)),
+                compacted_marker(),
+            ])
+            .await;
+        session.ensure_rollout_materialized().await;
+        recorder.flush().await.expect("flush rollout");
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout_path)
+            .await
+            .expect("open rollout");
+        file.write_all(
+            b"timestamp\":\"2026-02-16T00:00:00.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\"}}\n",
+        )
+        .await
+        .expect("append malformed rollout line");
+        file.flush().await.expect("flush malformed line");
+
+        let payload = handle_recall(&session, &turn, &RecallToolArgs {})
+            .await
+            .expect("recall response");
+
+        assert_eq!(
+            payload.pointer("/integrity/status"),
+            Some(&json!("degraded"))
+        );
+        assert_eq!(
+            payload.pointer("/integrity/rollout_parse_errors"),
+            Some(&json!(1))
+        );
+        assert_eq!(payload.pointer("/counts/returned_items"), Some(&json!(1)));
     }
 }

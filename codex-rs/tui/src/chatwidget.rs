@@ -92,6 +92,7 @@ use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::RateLimitSnapshot;
+use codex_core::protocol::RawResponseItemEvent;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
 use codex_core::protocol::SkillMetadata as ProtocolSkillMetadata;
@@ -126,6 +127,7 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::items::AgentMessageItem;
 use codex_protocol::models::MessagePhase;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::models::local_image_label_text;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::request_user_input::RequestUserInputEvent;
@@ -518,6 +520,7 @@ pub(crate) struct ChatWidget {
     stream_controller: Option<StreamController>,
     // Stream lifecycle controller for proposed plan output.
     plan_stream_controller: Option<PlanStreamController>,
+    function_call_names_by_id: HashMap<String, String>,
     running_commands: HashMap<String, RunningCommand>,
     suppressed_exec_calls: HashSet<String>,
     skills_all: Vec<ProtocolSkillMetadata>,
@@ -1197,6 +1200,49 @@ impl ChatWidget {
         self.request_redraw();
     }
 
+    fn on_raw_response_item(&mut self, event: RawResponseItemEvent) {
+        match event.item {
+            ResponseItem::FunctionCall { call_id, name, .. } => {
+                self.function_call_names_by_id.insert(call_id, name);
+            }
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                let tool_name = self.function_call_names_by_id.remove(&call_id);
+                if tool_name.as_deref() != Some("recall") {
+                    return;
+                }
+                let Some(raw_output_text) = output.body.to_text() else {
+                    return;
+                };
+
+                let (formatted_output, fence_language) =
+                    match serde_json::from_str::<serde_json::Value>(&raw_output_text) {
+                        Ok(json_value) => (
+                            serde_json::to_string_pretty(&json_value)
+                                .unwrap_or(raw_output_text.clone()),
+                            "json",
+                        ),
+                        Err(_) => (raw_output_text, ""),
+                    };
+
+                let recall_debug_markdown = if fence_language == "json" {
+                    format!("`recall` output\n\n```json\n{formatted_output}\n```")
+                } else {
+                    format!("`recall` output\n\n```\n{formatted_output}\n```")
+                };
+
+                self.flush_unified_exec_wait_streak();
+                self.flush_active_cell();
+                self.add_to_history(history_cell::ReasoningSummaryCell::new(
+                    "recall".to_string(),
+                    recall_debug_markdown,
+                    false,
+                ));
+                self.request_redraw();
+            }
+            _ => {}
+        }
+    }
+
     fn on_agent_message_delta(&mut self, delta: String) {
         self.handle_streaming_delta(delta);
     }
@@ -1363,6 +1409,7 @@ impl ChatWidget {
         self.pending_status_indicator_restore = false;
         self.agent_turn_running = false;
         self.update_task_running_state();
+        self.function_call_names_by_id.clear();
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
         self.last_unified_wait = None;
@@ -1608,6 +1655,7 @@ impl ChatWidget {
         // Reset running state and clear streaming buffers.
         self.agent_turn_running = false;
         self.update_task_running_state();
+        self.function_call_names_by_id.clear();
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
         self.last_unified_wait = None;
@@ -2646,6 +2694,7 @@ impl ChatWidget {
             adaptive_chunking: AdaptiveChunkingPolicy::default(),
             stream_controller: None,
             plan_stream_controller: None,
+            function_call_names_by_id: HashMap::new(),
             running_commands: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
@@ -2811,6 +2860,7 @@ impl ChatWidget {
             adaptive_chunking: AdaptiveChunkingPolicy::default(),
             stream_controller: None,
             plan_stream_controller: None,
+            function_call_names_by_id: HashMap::new(),
             running_commands: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
@@ -2965,6 +3015,7 @@ impl ChatWidget {
             adaptive_chunking: AdaptiveChunkingPolicy::default(),
             stream_controller: None,
             plan_stream_controller: None,
+            function_call_names_by_id: HashMap::new(),
             running_commands: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
@@ -4098,8 +4149,8 @@ impl ChatWidget {
                     });
                 }
             }
-            EventMsg::RawResponseItem(_)
-            | EventMsg::ItemStarted(_)
+            EventMsg::RawResponseItem(event) => self.on_raw_response_item(event),
+            EventMsg::ItemStarted(_)
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
             | EventMsg::ReasoningRawContentDelta(_)

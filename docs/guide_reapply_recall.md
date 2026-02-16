@@ -7,17 +7,24 @@ Reapply the current `recall` implementation in Codex CLI core with the final con
 - `recall` accepts no parameters (`{}` only)
 - unknown fields fail loud (`invalid_contract`)
 - recall window is bounded by:
-  - lower bound: immediately after latest pre-compaction `event_msg.user_message`
+  - lower bound: immediately after the previous pre-compaction `event_msg.context_compacted`
   - upper bound: latest `RolloutItem::Compacted`
 - payload cap is controlled only by `recall_kbytes_limit` (KiB) in config
+- malformed rollout lines do not hard-fail recall; they are reported via:
+  - `integrity.status = "degraded"`
+  - `integrity.rollout_parse_errors > 0`
 
 ## Canonical Commit Chain
-Use these commits in order when reapplying from scratch:
+Use these commits in order for the baseline recall contract:
 1. `140455920` — add recall tool
 2. `7c967f2f4` — add recall hint to auto-compaction warning
 3. `c1b707be9` — make recall mandatory in warning
-4. `2d05e7923` — user-message boundary + KiB cap
+4. `2d05e7923` — boundary + KiB cap (now anchored to previous `context_compacted`)
 5. `d68d5d8f3` — remove args (`max_items`, `max_chars_per_item`) and fail loud
+
+Then apply the malformed-line integrity behavior (manual checklist in Path B):
+- do not abort on `parse_errors > 0`
+- return `integrity.status` + `integrity.rollout_parse_errors`
 
 ## Files That Must Match Final Contract
 
@@ -25,11 +32,12 @@ Use these commits in order when reapplying from scratch:
 - `codex-rs/core/src/tools/handlers/recall.rs`
   - `RecallToolArgs` must be empty with `#[serde(deny_unknown_fields)]`
   - `handle_recall` must ignore args payload semantics and call:
-    - `build_recall_payload(&rollout_items, turn.config.recall_kbytes_limit)`
+    - `build_recall_payload(&rollout_items, turn.config.recall_kbytes_limit, parse_errors)`
   - no `max_items` path
   - no `max_chars_per_item` path
   - no text truncation helper based on char limit
   - `counts` must include `matching_pre_compact_items`, `returned_items`, `returned_bytes`, `bytes_limit`
+  - response must include `integrity.status` and `integrity.rollout_parse_errors`
   - `counts` must not include `max_items`
 
 - `codex-rs/core/src/tools/spec.rs`
@@ -56,14 +64,18 @@ If target branch does not already have recall:
 git cherry-pick 140455920 7c967f2f4 c1b707be9 2d05e7923 d68d5d8f3
 ```
 
+After the cherry-picks above, apply Path B step 2 delta for malformed-line integrity reporting.
+
 If target branch already has recall with legacy args:
 
 ```bash
 git cherry-pick d68d5d8f3
 ```
 
+After cherry-pick, apply Path B step 2 delta for malformed-line integrity reporting.
+
 ## Reapply Path B: Manual Patch Checklist
-Use this only if cherry-pick is not possible.
+Use this full path if cherry-pick is not possible. If you used Path A, apply only step 2 as the required post-cherry-pick delta.
 
 1. Ensure `recall` handler wiring exists in `codex-rs/core/src/tools/handlers/mod.rs` and `codex-rs/core/src/tools/spec.rs` (`register_handler("recall", ...)`).
 2. In `codex-rs/core/src/tools/handlers/recall.rs`:
@@ -77,6 +89,7 @@ Use this only if cherry-pick is not possible.
    - remove all logic that validates or applies `max_chars_per_item`
    - remove char-based truncation helper
    - keep only KiB-cap trimming via config
+   - do not abort on `parse_errors > 0`; surface parse-error count under `integrity`
 3. In `codex-rs/core/src/tools/spec.rs`:
    - set recall tool `properties` to empty map
    - keep `additional_properties: false`
@@ -120,7 +133,8 @@ Call the tool exactly with empty object:
 
 Then validate:
 - `mode = "recall_pre_compact"`
-- response includes `boundary.start_index` and `boundary.latest_compacted_index`
+- response includes `integrity.status` and `integrity.rollout_parse_errors`
+- response includes `boundary.start_index`, `boundary.last_context_compacted_event_index`, and `boundary.latest_compacted_index`
 - response includes `counts.returned_items`, `counts.returned_bytes`, `counts.bytes_limit`
 - items contain only `reasoning` and/or `assistant_message`
 

@@ -53,6 +53,7 @@ use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::PatchApplyEndEvent;
 use codex_core::protocol::RateLimitWindow;
+use codex_core::protocol::RawResponseItemEvent;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
 use codex_core::protocol::SessionSource;
@@ -82,7 +83,9 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::openai_models::default_input_modalities;
@@ -101,6 +104,7 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
+use ratatui::style::Modifier;
 #[cfg(target_os = "windows")]
 use serial_test::serial;
 use std::collections::BTreeMap;
@@ -1104,6 +1108,7 @@ async fn make_chatwidget_manual(
         adaptive_chunking: crate::streaming::chunking::AdaptiveChunkingPolicy::default(),
         stream_controller: None,
         plan_stream_controller: None,
+        function_call_names_by_id: HashMap::new(),
         running_commands: HashMap::new(),
         suppressed_exec_calls: HashSet::new(),
         skills_all: Vec::new(),
@@ -2293,6 +2298,183 @@ fn get_available_model(chat: &ChatWidget, model: &str) -> ModelPreset {
         .find(|&preset| preset.model == model)
         .cloned()
         .unwrap_or_else(|| panic!("{model} preset not found"))
+}
+
+#[tokio::test]
+async fn raw_recall_function_output_renders_dim_formatted_debug_cell() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "raw-call-recall".to_string(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::FunctionCall {
+                id: None,
+                name: "recall".to_string(),
+                arguments: "{}".to_string(),
+                call_id: "call-recall-1".to_string(),
+            },
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "raw-call-recall-output".to_string(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::FunctionCallOutput {
+                call_id: "call-recall-1".to_string(),
+                output: FunctionCallOutputPayload::from_text(
+                    "{\"mode\":\"recall_pre_compact\",\"counts\":{\"returned_items\":2}}"
+                        .to_string(),
+                ),
+            },
+        }),
+    });
+
+    let inserted = drain_insert_history(&mut rx);
+    assert_eq!(inserted.len(), 1);
+
+    let rendered = inserted
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert!(
+        rendered.contains("recall output"),
+        "expected recall debug label in rendered output: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"mode\": \"recall_pre_compact\""),
+        "expected formatted JSON mode in rendered output: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"returned_items\": 2"),
+        "expected formatted JSON counts in rendered output: {rendered}"
+    );
+
+    let has_dim_style = inserted
+        .iter()
+        .flatten()
+        .flat_map(|line| line.spans.iter())
+        .any(|span| span.style.add_modifier.contains(Modifier::DIM));
+    assert!(
+        has_dim_style,
+        "expected dim (gray-like) styling for recall debug output"
+    );
+}
+
+#[tokio::test]
+async fn raw_non_recall_function_output_is_not_rendered_as_recall_debug_cell() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "raw-call-shell".to_string(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                arguments: "{\"cmd\":\"pwd\"}".to_string(),
+                call_id: "call-shell-1".to_string(),
+            },
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "raw-call-shell-output".to_string(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::FunctionCallOutput {
+                call_id: "call-shell-1".to_string(),
+                output: FunctionCallOutputPayload::from_text("{\"ok\":true}".to_string()),
+            },
+        }),
+    });
+
+    let inserted = drain_insert_history(&mut rx);
+    assert!(
+        inserted.is_empty(),
+        "non-recall raw function output should not render recall debug cell"
+    );
+}
+
+#[tokio::test]
+async fn raw_function_call_name_map_is_cleared_on_error_finalize_turn() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "raw-call-recall-cleanup".to_string(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::FunctionCall {
+                id: None,
+                name: "recall".to_string(),
+                arguments: "{}".to_string(),
+                call_id: "call-recall-cleanup".to_string(),
+            },
+        }),
+    });
+    assert!(
+        chat.function_call_names_by_id
+            .contains_key("call-recall-cleanup")
+    );
+
+    chat.handle_codex_event(Event {
+        id: "error-cleanup".to_string(),
+        msg: EventMsg::Error(ErrorEvent {
+            message: "simulated failure".to_string(),
+            codex_error_info: None,
+        }),
+    });
+
+    assert!(
+        chat.function_call_names_by_id.is_empty(),
+        "function call mapping must be cleared on finalize_turn error path"
+    );
+}
+
+#[tokio::test]
+async fn raw_recall_function_output_with_non_json_text_still_renders_debug_cell() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "raw-call-recall-non-json".to_string(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::FunctionCall {
+                id: None,
+                name: "recall".to_string(),
+                arguments: "{}".to_string(),
+                call_id: "call-recall-non-json".to_string(),
+            },
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "raw-call-recall-non-json-output".to_string(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::FunctionCallOutput {
+                call_id: "call-recall-non-json".to_string(),
+                output: FunctionCallOutputPayload::from_text("not-json-output".to_string()),
+            },
+        }),
+    });
+
+    let inserted = drain_insert_history(&mut rx);
+    assert_eq!(inserted.len(), 1);
+
+    let rendered = inserted
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert!(
+        rendered.contains("recall output"),
+        "expected recall debug label in rendered output: {rendered}"
+    );
+    assert!(
+        rendered.contains("not-json-output"),
+        "expected non-JSON recall output to render as fallback text: {rendered}"
+    );
+
+    let has_dim_style = inserted
+        .iter()
+        .flatten()
+        .flat_map(|line| line.spans.iter())
+        .any(|span| span.style.add_modifier.contains(Modifier::DIM));
+    assert!(
+        has_dim_style,
+        "expected dim (gray-like) styling for non-JSON recall debug output"
+    );
 }
 
 #[tokio::test]

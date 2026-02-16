@@ -22,9 +22,11 @@ Unknown fields are rejected (including removed legacy fields like `max_items` an
 
 - Source is fixed to the current session rollout recorder path (no path argument).
 - Uses the latest `RolloutItem::Compacted` marker as the upper boundary.
-- Uses the latest pre-compaction `EventMsg::UserMessage` as the lower boundary (starts right after that event). If none exists, starts from the beginning of the rollout.
+- Uses the previous `EventMsg::ContextCompacted` (before the latest compact marker) as the lower boundary and starts right after it.
+- If no previous `context_compacted` event exists (first compaction cycle), starts from the beginning of the rollout.
 - Applies payload size cap from `config.toml` key `recall_kbytes_limit` (default `256` KiB).
-- If there is no compaction marker, the tool fails with `stop_reason = "no_compaction_marker"`.
+- If the rollout has malformed lines, `recall` returns the valid parsed subset and reports integrity as degraded (`integrity.status = "degraded"`, `integrity.rollout_parse_errors > 0`).
+- If there is no compaction marker, the tool fails with `stop_reason = "no_compaction_marker"`; when parse errors exist, the error message includes the parse-error count.
 
 ### Example
 
@@ -34,6 +36,9 @@ Unknown fields are rejected (including removed legacy fields like `max_items` an
 
 Response shape (summary):
 - `mode = "recall_pre_compact"`
+- `integrity.status` and `integrity.rollout_parse_errors`
+- `boundary.start_index`
+- `boundary.last_context_compacted_event_index` (nullable)
 - `boundary.latest_compacted_index`
 - `counts`
 - `items[]` with:

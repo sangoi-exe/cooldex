@@ -27,22 +27,15 @@ When using ChatGPT authentication, `auth.json` (or the keyring entry) stores a *
 - `codex logout` deletes the stored credentials (removes the `auth.json` file and the keyring entry, if present).
 - In the TUIs, use `/accounts` to switch the active account and add additional accounts. When multiple accounts are stored, `/logout` lets you choose between logging out all accounts or removing a single account (then exits).
 
-## Auto-switch on usage limit (opt-in)
+## Auto-switch on usage limit
 
-When enabled, if the backend returns `usage_limit_reached` (HTTP 429) for the active **ChatGPT** account, Codex will:
+When the backend returns `usage_limit_reached` (HTTP 429) for the active **ChatGPT** account, Codex will:
 
 1) mark the active account as exhausted until its reset time (when available),
 2) switch to another stored ChatGPT account that is not exhausted (and matches `forced_chatgpt_workspace_id` when set), and
 3) retry the request **in the same turn**.
 
 Codex emits a warning event when this happens.
-
-Enable it with:
-
-```toml
-[auth]
-auto_switch_on_usage_limit = true
-```
 
 Selection heuristic (best-effort, based on the last cached usage snapshot for each account):
 

@@ -4537,6 +4537,15 @@ pub(crate) async fn run_sampling_request(
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, *rate_limits).await;
                 }
+                if maybe_auto_switch_account_on_usage_limit(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    &e,
+                )
+                .await?
+                {
+                    continue;
+                }
                 return Err(CodexErr::UsageLimitReached(e));
             }
             Err(err) => err,
@@ -5085,6 +5094,55 @@ async fn drain_in_flight(
         model = %turn_context.model_info.slug
     )
 )]
+async fn maybe_auto_switch_account_on_usage_limit(
+    sess: &Session,
+    turn_context: &TurnContext,
+    usage_limit: &crate::error::UsageLimitReachedError,
+) -> CodexResult<bool> {
+    if sess.services.auth_manager.auth_mode() != Some(crate::auth::AuthMode::Chatgpt) {
+        return Ok(false);
+    }
+
+    let active_store_account_id = sess
+        .services
+        .auth_manager
+        .list_accounts()
+        .into_iter()
+        .find(|account| account.is_active)
+        .map(|account| account.id);
+
+    sess.services.auth_manager.mark_usage_limit_reached(
+        usage_limit.resets_at,
+        usage_limit.rate_limits.as_deref().cloned(),
+    )?;
+
+    let required_workspace_id = turn_context.config.forced_chatgpt_workspace_id.as_deref();
+    let Some(next_store_account_id) = sess
+        .services
+        .auth_manager
+        .select_account_for_auto_switch(required_workspace_id, active_store_account_id.as_deref())
+    else {
+        return Ok(false);
+    };
+
+    sess.services
+        .auth_manager
+        .set_active_account(&next_store_account_id)?;
+
+    let from_store_account_id = active_store_account_id.unwrap_or_else(|| "<unknown>".to_string());
+    sess.send_event(
+        turn_context,
+        EventMsg::Warning(WarningEvent {
+            message: format!(
+                "Usage limit reached for account '{from_store_account_id}'. Auto-switched to account '{next_store_account_id}' and retrying."
+            ),
+        }),
+    )
+    .await;
+
+    Ok(true)
+}
+
 async fn try_run_sampling_request(
     router: Arc<ToolRouter>,
     sess: Arc<Session>,
@@ -5410,6 +5468,10 @@ pub(crate) use tests::make_session_configuration_for_tests;
 mod tests {
     use super::*;
     use crate::CodexAuth;
+    use crate::auth::AuthCredentialsStoreMode;
+    use crate::auth::AuthStore;
+    use crate::auth::StoredAccount;
+    use crate::auth::save_auth;
     use crate::config::ConfigBuilder;
     use crate::config::test_config;
     use crate::exec::ExecToolCallOutput;
@@ -5435,6 +5497,8 @@ mod tests {
     use crate::state::TaskKind;
     use crate::tasks::SessionTask;
     use crate::tasks::SessionTaskContext;
+    use crate::token_data::TokenData;
+    use crate::token_data::parse_chatgpt_jwt_claims;
     use crate::tools::ToolRouter;
     use crate::tools::context::ToolInvocation;
     use crate::tools::context::ToolOutput;
@@ -5443,6 +5507,8 @@ mod tests {
     use crate::tools::handlers::UnifiedExecHandler;
     use crate::tools::registry::ToolHandler;
     use crate::turn_diff_tracker::TurnDiffTracker;
+    use base64::Engine as _;
+    use chrono::Utc;
     use codex_app_server_protocol::AppInfo;
     use codex_otel::TelemetryAuthMode;
     use codex_protocol::models::BaseInstructions;
@@ -5478,6 +5544,36 @@ mod tests {
             }],
             end_turn: None,
             phase: None,
+        }
+    }
+
+    fn make_account_jwt_for_tests(account_id: &str) -> String {
+        let header_json = json!({ "alg": "none", "typ": "JWT" });
+        let payload_json = json!({
+            "email": "user@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": "pro",
+                "chatgpt_account_id": account_id
+            }
+        });
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let header_bytes = serde_json::to_vec(&header_json).expect("serialize jwt header");
+        let payload_bytes = serde_json::to_vec(&payload_json).expect("serialize jwt payload");
+        let signature_bytes = b"sig".to_vec();
+        let header_encoded = encode(&header_bytes);
+        let payload_encoded = encode(&payload_bytes);
+        let signature_encoded = encode(&signature_bytes);
+        format!("{header_encoded}.{payload_encoded}.{signature_encoded}")
+    }
+
+    fn token_data_for_store_account(account_id: &str) -> TokenData {
+        let raw_jwt = make_account_jwt_for_tests(account_id);
+        let id_token = parse_chatgpt_jwt_claims(&raw_jwt).expect("parse jwt");
+        TokenData {
+            id_token,
+            access_token: format!("access-{account_id}"),
+            refresh_token: format!("refresh-{account_id}"),
+            account_id: Some(account_id.to_string()),
         }
     }
 
@@ -6153,6 +6249,92 @@ mod tests {
 
         let history = sess.clone_history().await;
         assert_eq!(initial_context, history.raw_items());
+    }
+
+    #[tokio::test]
+    async fn maybe_auto_switch_account_on_usage_limit_switches_active_account() {
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        let codex_home = tempfile::tempdir().expect("create temp codex home");
+        let auth_store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: Some("primary".to_string()),
+                    tokens: token_data_for_store_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: Some("secondary".to_string()),
+                    tokens: token_data_for_store_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        save_auth(
+            codex_home.path(),
+            &auth_store,
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("persist test auth store");
+
+        let auth_manager = AuthManager::shared(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        session.services.auth_manager = Arc::clone(&auth_manager);
+        turn_context.auth_manager = Some(Arc::clone(&auth_manager));
+
+        let usage_limit = crate::error::UsageLimitReachedError {
+            plan_type: None,
+            resets_at: Some(Utc::now() + chrono::Duration::minutes(60)),
+            rate_limits: Some(Box::new(RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: Some("codex".to_string()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 100.0,
+                    window_minutes: Some(300),
+                    resets_at: None,
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: 95.0,
+                    window_minutes: Some(10_080),
+                    resets_at: None,
+                }),
+                credits: None,
+                plan_type: None,
+            })),
+            promo_message: None,
+            limit_name: Some("codex".to_string()),
+        };
+
+        let switched =
+            maybe_auto_switch_account_on_usage_limit(&session, &turn_context, &usage_limit)
+                .await
+                .expect("auto switch should not fail");
+        assert!(switched, "should switch to another eligible account");
+
+        let accounts = auth_manager.list_accounts();
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|account| account.is_active)
+                .map(|account| account.id.as_str()),
+            Some("acc-2")
+        );
+        assert!(
+            accounts
+                .iter()
+                .find(|account| account.id == "acc-1")
+                .and_then(|account| account.exhausted_until)
+                .is_some(),
+            "previous account should be marked exhausted"
+        );
     }
 
     #[tokio::test]
