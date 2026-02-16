@@ -65,6 +65,7 @@ Behavior per chunk:
 - validates `chunk_id` against current `chunk_manifest`
 - always emits exactly one `<tool_context>` and one `<reasoning_context>` tied to that chunk
 - applies either replacement (when summary is compact enough) or exclusion for the chunk source
+- persists a `RolloutItem::Compacted` with `replacement_history` so `codex resume` replays the sanitized history (no stale pre-apply rollback)
 
 Response includes:
 - `applied_events`
@@ -80,6 +81,7 @@ Response includes:
 - `state_hash_mismatch`
 - `plan_id_invalid`
 - `invalid_contract`
+- `rollout_persist_error`
 
 For model-facing guidance, see `docs/manage_context_model.md`.
 

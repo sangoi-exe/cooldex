@@ -17,6 +17,8 @@ use crate::tools::registry::ToolKind;
 use async_trait::async_trait;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::RolloutItem;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
@@ -56,6 +58,7 @@ enum StopReason {
     InvalidContract,
     StateHashMismatch,
     PlanIdInvalid,
+    RolloutPersistError,
 }
 
 impl StopReason {
@@ -67,6 +70,7 @@ impl StopReason {
             Self::InvalidContract => "invalid_contract",
             Self::StateHashMismatch => "state_hash_mismatch",
             Self::PlanIdInvalid => "plan_id_invalid",
+            Self::RolloutPersistError => "rollout_persist_error",
         }
     }
 }
@@ -244,7 +248,7 @@ async fn handle_apply(
         ));
     }
 
-    let (applied_events, new_state_hash, progress_report, stop_reason) = {
+    let (applied_events, new_state_hash, progress_report, stop_reason, replacement_history) = {
         let mut state = session.state.lock().await;
 
         let current_plan = build_retrieve_plan(&state, &policy_id);
@@ -337,7 +341,7 @@ async fn handle_apply(
 
         let notes_added = generated_notes.len();
         state.add_context_notes(generated_notes);
-        materialize_prompt_snapshot_after_apply(&mut state);
+        let replacement_history = materialize_prompt_snapshot_after_apply(&mut state);
 
         let final_plan = build_retrieve_plan(&state, &policy_id);
         let new_state_hash = final_plan.state_hash;
@@ -360,8 +364,36 @@ async fn handle_apply(
             "max_chunks_per_apply": max_chunks_per_apply,
         });
 
-        (applied_events, new_state_hash, progress_report, stop_reason)
+        (
+            applied_events,
+            new_state_hash,
+            progress_report,
+            stop_reason,
+            replacement_history,
+        )
     };
+
+    if let Some(replacement_history) = replacement_history {
+        let recorder = {
+            let guard = session.services.rollout.lock().await;
+            guard.clone()
+        };
+        if let Some(recorder) = recorder {
+            let compacted_item = RolloutItem::Compacted(CompactedItem {
+                message: String::new(),
+                replacement_history: Some(replacement_history),
+            });
+            recorder
+                .record_items(&[compacted_item])
+                .await
+                .map_err(|error| {
+                    contract_error(
+                        StopReason::RolloutPersistError,
+                        format!("failed to persist compacted replacement_history: {error}"),
+                    )
+                })?;
+        }
+    }
 
     Ok(ManageContextResult {
         json: json!({
@@ -579,7 +611,9 @@ fn collect_top_offenders(
     top_offenders
 }
 
-fn materialize_prompt_snapshot_after_apply(state: &mut crate::state::SessionState) {
+fn materialize_prompt_snapshot_after_apply(
+    state: &mut crate::state::SessionState,
+) -> Option<Vec<ResponseItem>> {
     let current_history = state.history_snapshot_lenient();
     let (in_flight_function_call_ids, in_flight_custom_call_ids) =
         in_flight_manage_context_call_ids(&current_history);
@@ -591,10 +625,11 @@ fn materialize_prompt_snapshot_after_apply(state: &mut crate::state::SessionStat
     );
 
     if prompt_snapshot == current_history {
-        return;
+        return None;
     }
 
-    state.replace_history(prompt_snapshot);
+    state.replace_history(prompt_snapshot.clone());
+    Some(prompt_snapshot)
 }
 
 fn in_flight_manage_context_call_ids(items: &[ResponseItem]) -> (HashSet<String>, HashSet<String>) {
@@ -1027,6 +1062,7 @@ mod tests {
             StopReason::StateHashMismatch.as_str(),
             StopReason::PlanIdInvalid.as_str(),
             StopReason::InvalidContract.as_str(),
+            StopReason::RolloutPersistError.as_str(),
         ];
         let expected = [
             "target_reached",
@@ -1035,6 +1071,7 @@ mod tests {
             "state_hash_mismatch",
             "plan_id_invalid",
             "invalid_contract",
+            "rollout_persist_error",
         ];
         assert_eq!(actual, expected);
     }
@@ -1551,7 +1588,7 @@ mod tests {
             // Force prompt_snapshot_lenient to run lenient placeholder injection logic.
             state.set_context_inclusion(&[0], false);
 
-            materialize_prompt_snapshot_after_apply(&mut state);
+            let _ = materialize_prompt_snapshot_after_apply(&mut state);
 
             let history_after_materialize = state.history_snapshot_lenient();
             assert!(history_after_materialize.iter().any(|item| {
@@ -2037,6 +2074,118 @@ mod tests {
                 "applied source_id should no longer be in chunk_manifest: {applied_source_id}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn manage_context_apply_persists_compacted_replacement_history_for_resume() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
+
+        let recorder = crate::rollout::RolloutRecorder::new(
+            turn.config.as_ref(),
+            crate::rollout::RolloutRecorderParams::new(
+                session.conversation_id,
+                None,
+                turn.session_source.clone(),
+                codex_protocol::models::BaseInstructions::default(),
+                Vec::new(),
+            ),
+            None,
+            None,
+        )
+        .await
+        .expect("create rollout recorder");
+        let rollout_path = recorder.rollout_path().to_path_buf();
+        {
+            let mut guard = session.services.rollout.lock().await;
+            *guard = Some(recorder);
+        }
+
+        session
+            .persist_rollout_items(&[RolloutItem::EventMsg(
+                codex_protocol::protocol::EventMsg::UserMessage(
+                    codex_protocol::protocol::UserMessageEvent {
+                        message: "seed-user-message".to_string(),
+                        images: None,
+                        local_images: Vec::new(),
+                        text_elements: Vec::new(),
+                    },
+                ),
+            )])
+            .await;
+        session.ensure_rollout_materialized().await;
+
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &user_message("u1"),
+                    &tool_call("call_tool_1"),
+                    &tool_output("call_tool_1", "tool output payload"),
+                    &user_message("u2"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let retrieve_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": policy_id,
+        }))
+        .expect("parse retrieve args");
+        let retrieve = handle_manage_context(&session, &turn, &retrieve_args)
+            .await
+            .expect("retrieve");
+
+        let plan_id = retrieve
+            .json
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .expect("plan_id")
+            .to_string();
+        let state_hash = retrieve
+            .json
+            .get("state_hash")
+            .and_then(Value::as_str)
+            .expect("state_hash")
+            .to_string();
+        let chunk_id = retrieve
+            .json
+            .pointer("/chunk_manifest/0/chunk_id")
+            .and_then(Value::as_str)
+            .expect("first chunk id")
+            .to_string();
+
+        let apply_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "apply",
+            "policy_id": turn.config.manage_context_policy.quality_rubric_id,
+            "plan_id": plan_id,
+            "state_hash": state_hash,
+            "chunk_summaries": [{
+                "chunk_id": chunk_id,
+                "tool_context": "tool summary",
+                "reasoning_context": "reasoning summary"
+            }]
+        }))
+        .expect("parse apply args");
+        handle_manage_context(&session, &turn, &apply_args)
+            .await
+            .expect("apply");
+
+        session.flush_rollout().await;
+        let (rollout_items, _thread_id, parse_errors) =
+            crate::rollout::RolloutRecorder::load_rollout_items(rollout_path.as_path())
+                .await
+                .expect("load rollout items");
+        assert_eq!(parse_errors, 0);
+        let replacement_history = rollout_items.iter().rev().find_map(|item| match item {
+            RolloutItem::Compacted(compacted) => compacted.replacement_history.as_ref(),
+            _ => None,
+        });
+        assert!(
+            replacement_history.is_some_and(|history| !history.is_empty()),
+            "manage_context.apply must persist compacted replacement_history for resume replay"
+        );
     }
 
     #[tokio::test]
