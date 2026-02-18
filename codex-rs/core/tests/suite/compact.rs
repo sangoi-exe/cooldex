@@ -66,7 +66,7 @@ const FUNCTION_CALL_LIMIT_MSG: &str = "function call limit push";
 const POST_AUTO_USER_MSG: &str = "post auto follow-up";
 
 pub(super) const COMPACT_WARNING_MESSAGE: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
-const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. MANDATORY before any other action: call recall. Then recon unstaged changes, codex_learning_log, and update_plan status.";
+const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. MANDATORY before any other action: call recall. Then recon unstaged changes, codex_learning_log, and update_plan status. Then proceed with what was in progress before auto-compact.";
 
 fn auto_summary(summary: &str) -> String {
     summary.to_string()

@@ -270,7 +270,7 @@ pub struct CodexSpawnOk {
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 64;
-const AUTO_COMPACT_RECON_WARNING_BODY: &str = "auto-compaction completed. MANDATORY before any other action: call recall. Then recon unstaged changes, codex_learning_log, and update_plan status.";
+const AUTO_COMPACT_RECON_WARNING_BODY: &str = "auto-compaction completed. MANDATORY before any other action: call recall. Then recon unstaged changes, codex_learning_log, and update_plan status. Then proceed with what was in progress before auto-compact.";
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
@@ -2302,6 +2302,13 @@ impl Session {
     }
 
     pub(crate) async fn record_model_warning(&self, message: impl Into<String>, ctx: &TurnContext) {
+        if matches!(ctx.session_source, SessionSource::SubAgent(_)) {
+            debug!(
+                turn_id = %ctx.sub_id,
+                "skipping model warning injection for sub-agent session"
+            );
+            return;
+        }
         self.services
             .otel_manager
             .counter("codex.model_warning", 1, &[]);
@@ -7134,6 +7141,24 @@ mod tests {
             }
             other => panic!("expected user message, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn record_model_warning_skips_subagent_sessions() {
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        let features = Features::with_defaults();
+        session.features = features;
+        turn_context.session_source =
+            SessionSource::SubAgent(SubAgentSource::Other("collab_spawn".to_string()));
+
+        let before_len = session.clone_history().await.raw_items().len();
+
+        session
+            .record_model_warning("too many unified exec processes", &turn_context)
+            .await;
+
+        let after_len = session.clone_history().await.raw_items().len();
+        assert_eq!(after_len, before_len);
     }
 
     #[tokio::test]
