@@ -5110,13 +5110,25 @@ async fn maybe_auto_switch_account_on_usage_limit(
         return Ok(false);
     }
 
-    let active_store_account_id = sess
-        .services
-        .auth_manager
-        .list_accounts()
-        .into_iter()
-        .find(|account| account.is_active)
-        .map(|account| account.id);
+    let accounts = sess.services.auth_manager.list_accounts();
+    let account_display_name = |account: &crate::auth::AccountSummary| {
+        account
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .or_else(|| {
+                account
+                    .email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|email| !email.is_empty())
+            })
+            .unwrap_or(account.id.as_str())
+            .to_string()
+    };
+    let active_account = accounts.iter().find(|account| account.is_active);
+    let active_store_account_id = active_account.map(|account| account.id.clone());
 
     sess.services.auth_manager.mark_usage_limit_reached(
         usage_limit.resets_at,
@@ -5136,12 +5148,19 @@ async fn maybe_auto_switch_account_on_usage_limit(
         .auth_manager
         .set_active_account(&next_store_account_id)?;
 
-    let from_store_account_id = active_store_account_id.unwrap_or_else(|| "<unknown>".to_string());
+    let from_account_name = active_account
+        .map(account_display_name)
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let next_account_name = accounts
+        .iter()
+        .find(|account| account.id == next_store_account_id)
+        .map(account_display_name)
+        .unwrap_or_else(|| next_store_account_id.clone());
     sess.send_event(
         turn_context,
         EventMsg::Warning(WarningEvent {
             message: format!(
-                "Usage limit reached for account '{from_store_account_id}'. Auto-switched to account '{next_store_account_id}' and retrying."
+                "Usage limit reached for account '{from_account_name}'. Auto-switched to account '{next_account_name}' and retrying."
             ),
         }),
     )
@@ -5554,10 +5573,10 @@ mod tests {
         }
     }
 
-    fn make_account_jwt_for_tests(account_id: &str) -> String {
+    fn make_account_jwt_for_tests(account_id: &str, email: &str) -> String {
         let header_json = json!({ "alg": "none", "typ": "JWT" });
         let payload_json = json!({
-            "email": "user@example.com",
+            "email": email,
             "https://api.openai.com/auth": {
                 "chatgpt_plan_type": "pro",
                 "chatgpt_account_id": account_id
@@ -5574,7 +5593,11 @@ mod tests {
     }
 
     fn token_data_for_store_account(account_id: &str) -> TokenData {
-        let raw_jwt = make_account_jwt_for_tests(account_id);
+        token_data_for_store_account_with_email(account_id, "user@example.com")
+    }
+
+    fn token_data_for_store_account_with_email(account_id: &str, email: &str) -> TokenData {
+        let raw_jwt = make_account_jwt_for_tests(account_id, email);
         let id_token = parse_chatgpt_jwt_claims(&raw_jwt).expect("parse jwt");
         TokenData {
             id_token,
@@ -6261,20 +6284,22 @@ mod tests {
     #[tokio::test]
     async fn maybe_auto_switch_account_on_usage_limit_switches_active_account() {
         let (mut session, mut turn_context) = make_session_and_context().await;
+        let (tx_event, rx_event) = async_channel::unbounded();
+        session.tx_event = tx_event;
         let codex_home = tempfile::tempdir().expect("create temp codex home");
         let auth_store = AuthStore {
             active_account_id: Some("acc-1".to_string()),
             accounts: vec![
                 StoredAccount {
                     id: "acc-1".to_string(),
-                    label: Some("primary".to_string()),
+                    label: Some("  primary  ".to_string()),
                     tokens: token_data_for_store_account("acc-1"),
                     last_refresh: Some(Utc::now()),
                     usage: None,
                 },
                 StoredAccount {
                     id: "acc-2".to_string(),
-                    label: Some("secondary".to_string()),
+                    label: Some("  secondary  ".to_string()),
                     tokens: token_data_for_store_account("acc-2"),
                     last_refresh: Some(Utc::now()),
                     usage: None,
@@ -6326,6 +6351,12 @@ mod tests {
                 .expect("auto switch should not fail");
         assert!(switched, "should switch to another eligible account");
 
+        let warning_message = wait_for_warning_message(&rx_event).await;
+        assert_eq!(
+            warning_message,
+            "Usage limit reached for account 'primary'. Auto-switched to account 'secondary' and retrying."
+        );
+
         let accounts = auth_manager.list_accounts();
         assert_eq!(
             accounts
@@ -6341,6 +6372,166 @@ mod tests {
                 .and_then(|account| account.exhausted_until)
                 .is_some(),
             "previous account should be marked exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_auto_switch_account_on_usage_limit_warning_uses_email_when_label_missing() {
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        let (tx_event, rx_event) = async_channel::unbounded();
+        session.tx_event = tx_event;
+        let codex_home = tempfile::tempdir().expect("create temp codex home");
+        let auth_store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: None,
+                    tokens: token_data_for_store_account_with_email(
+                        "acc-1",
+                        "  primary@example.com  ",
+                    ),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: None,
+                    tokens: token_data_for_store_account_with_email(
+                        "acc-2",
+                        "  secondary@example.com  ",
+                    ),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        save_auth(
+            codex_home.path(),
+            &auth_store,
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("persist test auth store");
+
+        let auth_manager = AuthManager::shared(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        session.services.auth_manager = Arc::clone(&auth_manager);
+        turn_context.auth_manager = Some(Arc::clone(&auth_manager));
+
+        let usage_limit = crate::error::UsageLimitReachedError {
+            plan_type: None,
+            resets_at: Some(Utc::now() + chrono::Duration::minutes(60)),
+            rate_limits: Some(Box::new(RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: Some("codex".to_string()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 100.0,
+                    window_minutes: Some(300),
+                    resets_at: None,
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: 95.0,
+                    window_minutes: Some(10_080),
+                    resets_at: None,
+                }),
+                credits: None,
+                plan_type: None,
+            })),
+            promo_message: None,
+            limit_name: Some("codex".to_string()),
+        };
+
+        let switched =
+            maybe_auto_switch_account_on_usage_limit(&session, &turn_context, &usage_limit)
+                .await
+                .expect("auto switch should not fail");
+        assert!(switched, "should switch to another eligible account");
+
+        let warning_message = wait_for_warning_message(&rx_event).await;
+        assert_eq!(
+            warning_message,
+            "Usage limit reached for account 'primary@example.com'. Auto-switched to account 'secondary@example.com' and retrying."
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_auto_switch_account_on_usage_limit_warning_falls_back_to_id_for_blank_names() {
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        let (tx_event, rx_event) = async_channel::unbounded();
+        session.tx_event = tx_event;
+        let codex_home = tempfile::tempdir().expect("create temp codex home");
+        let auth_store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: Some("   ".to_string()),
+                    tokens: token_data_for_store_account_with_email("acc-1", "   "),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: Some("   ".to_string()),
+                    tokens: token_data_for_store_account_with_email("acc-2", "   "),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        save_auth(
+            codex_home.path(),
+            &auth_store,
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("persist test auth store");
+
+        let auth_manager = AuthManager::shared(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        session.services.auth_manager = Arc::clone(&auth_manager);
+        turn_context.auth_manager = Some(Arc::clone(&auth_manager));
+
+        let usage_limit = crate::error::UsageLimitReachedError {
+            plan_type: None,
+            resets_at: Some(Utc::now() + chrono::Duration::minutes(60)),
+            rate_limits: Some(Box::new(RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: Some("codex".to_string()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 100.0,
+                    window_minutes: Some(300),
+                    resets_at: None,
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: 95.0,
+                    window_minutes: Some(10_080),
+                    resets_at: None,
+                }),
+                credits: None,
+                plan_type: None,
+            })),
+            promo_message: None,
+            limit_name: Some("codex".to_string()),
+        };
+
+        let switched =
+            maybe_auto_switch_account_on_usage_limit(&session, &turn_context, &usage_limit)
+                .await
+                .expect("auto switch should not fail");
+        assert!(switched, "should switch to another eligible account");
+
+        let warning_message = wait_for_warning_message(&rx_event).await;
+        assert_eq!(
+            warning_message,
+            "Usage limit reached for account 'acc-1'. Auto-switched to account 'acc-2' and retrying."
         );
     }
 
@@ -6704,6 +6895,21 @@ mod tests {
                     return payload;
                 }
                 _ => continue,
+            }
+        }
+    }
+
+    async fn wait_for_warning_message(rx: &async_channel::Receiver<Event>) -> String {
+        let deadline = StdDuration::from_secs(2);
+        let start = std::time::Instant::now();
+        loop {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            let evt = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .expect("timeout waiting for warning event")
+                .expect("warning event");
+            if let EventMsg::Warning(warning) = evt.msg {
+                return warning.message;
             }
         }
     }

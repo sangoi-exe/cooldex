@@ -1274,9 +1274,12 @@ impl AuthManager {
                 return Err(std::io::Error::other("active account id not found"));
             };
 
+            let now = Utc::now();
+            let exhausted_until = exhausted_until_from_snapshot(&snapshot, now);
             let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
             usage.last_rate_limits = Some(snapshot);
-            usage.last_seen_at = Some(Utc::now());
+            usage.exhausted_until = exhausted_until;
+            usage.last_seen_at = Some(now);
             Ok(())
         })
     }
@@ -1301,8 +1304,12 @@ impl AuthManager {
                 )));
             };
 
+            let now = Utc::now();
+            let exhausted_until = exhausted_until_from_snapshot(&snapshot, now);
             let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
             usage.last_rate_limits = Some(snapshot);
+            usage.exhausted_until = exhausted_until;
+            usage.last_seen_at = Some(now);
             Ok(())
         })
     }
@@ -1321,11 +1328,15 @@ impl AuthManager {
         }
 
         self.update_store(|store| {
+            let now = Utc::now();
             let mut updated = 0usize;
             for account in &mut store.accounts {
                 if let Some(snapshot) = updates.remove(&account.id) {
+                    let exhausted_until = exhausted_until_from_snapshot(&snapshot, now);
                     let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
                     usage.last_rate_limits = Some(snapshot);
+                    usage.exhausted_until = exhausted_until;
+                    usage.last_seen_at = Some(now);
                     updated = updated.saturating_add(1);
                 }
             }
@@ -2006,6 +2017,51 @@ fn exhausted_until(
         .unwrap_or_else(|| now + chrono::Duration::minutes(15))
 }
 
+fn exhausted_until_from_snapshot(
+    snapshot: &crate::protocol::RateLimitSnapshot,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if rate_limit_window_blocked(snapshot.secondary.as_ref(), now) {
+        return Some(
+            rate_limit_window_reset_at(snapshot.secondary.as_ref())
+                .unwrap_or_else(|| exhausted_until(None, Some(snapshot), now)),
+        );
+    }
+    if rate_limit_window_blocked(snapshot.primary.as_ref(), now) {
+        return Some(
+            rate_limit_window_reset_at(snapshot.primary.as_ref())
+                .unwrap_or_else(|| exhausted_until(None, Some(snapshot), now)),
+        );
+    }
+    None
+}
+
+fn rate_limit_window_blocked(
+    window: Option<&crate::protocol::RateLimitWindow>,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(window) = window else {
+        return false;
+    };
+
+    if let Some(resets_at_seconds) = window.resets_at
+        && let Some(resets_at) = DateTime::<Utc>::from_timestamp(resets_at_seconds, 0)
+        && now >= resets_at
+    {
+        return false;
+    }
+
+    window.used_percent >= 100.0
+}
+
+fn rate_limit_window_reset_at(
+    window: Option<&crate::protocol::RateLimitWindow>,
+) -> Option<DateTime<Utc>> {
+    let window = window?;
+    let resets_at_seconds = window.resets_at?;
+    DateTime::<Utc>::from_timestamp(resets_at_seconds, 0)
+}
+
 fn account_selectable(
     account: &StoredAccount,
     required_workspace_id: Option<&str>,
@@ -2325,6 +2381,205 @@ mod tests {
             .expect("acc-2 should exist");
         assert_eq!(acc_1.last_rate_limits, Some(snapshot_1));
         assert_eq!(acc_2.last_rate_limits, Some(snapshot_2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn update_rate_limits_for_accounts_clears_stale_exhausted_until() -> std::io::Result<()> {
+        use crate::protocol::RateLimitSnapshot;
+        use crate::protocol::RateLimitWindow;
+
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+
+        let store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![StoredAccount {
+                id: "acc-1".to_string(),
+                label: None,
+                tokens: token_data_for_account("acc-1"),
+                last_refresh: Some(now),
+                usage: Some(AccountUsageCache {
+                    last_rate_limits: None,
+                    exhausted_until: Some(now + chrono::Duration::hours(1)),
+                    last_seen_at: Some(now),
+                }),
+            }],
+            ..AuthStore::default()
+        };
+        super::save_auth(dir.path(), &store, AuthCredentialsStoreMode::File)?;
+
+        let manager = AuthManager::shared(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+
+        let available_snapshot = RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 42.0,
+                window_minutes: Some(300),
+                resets_at: Some((now + chrono::Duration::hours(2)).timestamp()),
+            }),
+            secondary: Some(RateLimitWindow {
+                used_percent: 12.0,
+                window_minutes: Some(7 * 24 * 60),
+                resets_at: Some((now + chrono::Duration::days(1)).timestamp()),
+            }),
+            credits: None,
+            plan_type: None,
+        };
+
+        let updated =
+            manager.update_rate_limits_for_accounts([("acc-1".to_string(), available_snapshot)])?;
+        assert_eq!(updated, 1);
+
+        let account = manager
+            .list_accounts()
+            .into_iter()
+            .find(|account| account.id == "acc-1")
+            .expect("acc-1 should exist");
+        assert_eq!(account.exhausted_until, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn update_rate_limits_for_accounts_sets_exhausted_until_from_blocked_window()
+    -> std::io::Result<()> {
+        use crate::protocol::RateLimitSnapshot;
+        use crate::protocol::RateLimitWindow;
+
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+
+        let store = AuthStore {
+            active_account_id: Some("acc-primary".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-primary".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-primary"),
+                    last_refresh: Some(now),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-secondary".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-secondary"),
+                    last_refresh: Some(now),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-both".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-both"),
+                    last_refresh: Some(now),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        super::save_auth(dir.path(), &store, AuthCredentialsStoreMode::File)?;
+
+        let manager = AuthManager::shared(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+
+        let primary_reset = now + chrono::Duration::hours(2);
+        let secondary_reset = now + chrono::Duration::days(2);
+
+        let primary_only_blocked = RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(300),
+                resets_at: Some(primary_reset.timestamp()),
+            }),
+            secondary: Some(RateLimitWindow {
+                used_percent: 10.0,
+                window_minutes: Some(7 * 24 * 60),
+                resets_at: Some(secondary_reset.timestamp()),
+            }),
+            credits: None,
+            plan_type: None,
+        };
+        let secondary_only_blocked = RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 20.0,
+                window_minutes: Some(300),
+                resets_at: Some(primary_reset.timestamp()),
+            }),
+            secondary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(7 * 24 * 60),
+                resets_at: Some(secondary_reset.timestamp()),
+            }),
+            credits: None,
+            plan_type: None,
+        };
+        let both_blocked = RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(300),
+                resets_at: Some(primary_reset.timestamp()),
+            }),
+            secondary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(7 * 24 * 60),
+                resets_at: Some(secondary_reset.timestamp()),
+            }),
+            credits: None,
+            plan_type: None,
+        };
+
+        let updated = manager.update_rate_limits_for_accounts([
+            ("acc-primary".to_string(), primary_only_blocked),
+            ("acc-secondary".to_string(), secondary_only_blocked),
+            ("acc-both".to_string(), both_blocked),
+        ])?;
+        assert_eq!(updated, 3);
+
+        let accounts = manager.list_accounts();
+        let primary_account = accounts
+            .iter()
+            .find(|account| account.id == "acc-primary")
+            .expect("acc-primary should exist");
+        let secondary_account = accounts
+            .iter()
+            .find(|account| account.id == "acc-secondary")
+            .expect("acc-secondary should exist");
+        let both_account = accounts
+            .iter()
+            .find(|account| account.id == "acc-both")
+            .expect("acc-both should exist");
+
+        assert_eq!(
+            primary_account
+                .exhausted_until
+                .map(|until| until.timestamp()),
+            Some(primary_reset.timestamp())
+        );
+        assert_eq!(
+            secondary_account
+                .exhausted_until
+                .map(|until| until.timestamp()),
+            Some(secondary_reset.timestamp())
+        );
+        assert_eq!(
+            both_account.exhausted_until.map(|until| until.timestamp()),
+            Some(secondary_reset.timestamp())
+        );
 
         Ok(())
     }

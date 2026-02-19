@@ -168,6 +168,41 @@ fn snapshot(percent: f64) -> RateLimitSnapshot {
     }
 }
 
+#[test]
+fn preferred_rate_limit_snapshot_prefers_codex_limit_id() {
+    let fallback = RateLimitSnapshot {
+        limit_id: Some("gpt-image-1".to_string()),
+        limit_name: Some("image generation".to_string()),
+        primary: Some(RateLimitWindow {
+            used_percent: 12.0,
+            window_minutes: Some(300),
+            resets_at: Some(1_900_000_000),
+        }),
+        secondary: None,
+        credits: None,
+        plan_type: None,
+    };
+    let codex = RateLimitSnapshot {
+        limit_id: Some("Codex".to_string()),
+        limit_name: Some("codex".to_string()),
+        primary: Some(RateLimitWindow {
+            used_percent: 55.0,
+            window_minutes: Some(300),
+            resets_at: Some(1_900_000_000),
+        }),
+        secondary: None,
+        credits: None,
+        plan_type: None,
+    };
+    let selected =
+        preferred_rate_limit_snapshot(vec![fallback.clone(), codex.clone()]).expect("snapshot");
+    assert_eq!(selected, codex);
+
+    let selected_fallback =
+        preferred_rate_limit_snapshot(vec![fallback.clone()]).expect("fallback snapshot");
+    assert_eq!(selected_fallback, fallback);
+}
+
 #[tokio::test]
 async fn resumed_initial_messages_render_history() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
@@ -4408,6 +4443,218 @@ async fn accounts_popup() {
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("accounts_popup", popup);
+}
+
+#[tokio::test]
+async fn accounts_popup_status_marker_prioritizes_weekly_over_5h() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+
+    let now = chrono::Utc::now();
+    let five_hour_resets_at = (now + chrono::Duration::hours(2)).timestamp();
+    let weekly_resets_at = (now + chrono::Duration::days(2)).timestamp();
+
+    let work_snapshot = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 100.0,
+            window_minutes: Some(300),
+            resets_at: Some(five_hour_resets_at),
+        }),
+        secondary: Some(RateLimitWindow {
+            used_percent: 100.0,
+            window_minutes: Some(7 * 24 * 60),
+            resets_at: Some(weekly_resets_at),
+        }),
+        credits: None,
+        plan_type: None,
+    };
+    let personal_snapshot = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 100.0,
+            window_minutes: Some(300),
+            resets_at: Some(five_hour_resets_at),
+        }),
+        secondary: Some(RateLimitWindow {
+            used_percent: 20.0,
+            window_minutes: Some(7 * 24 * 60),
+            resets_at: Some(weekly_resets_at),
+        }),
+        credits: None,
+        plan_type: None,
+    };
+
+    chat.auth_manager
+        .update_rate_limits_for_accounts([
+            ("work-account".to_string(), work_snapshot),
+            ("personal-account".to_string(), personal_snapshot),
+        ])
+        .expect("update account rate limits");
+
+    chat.open_accounts_popup_at(chrono::Local::now());
+    let popup = render_bottom_popup(&chat, 100);
+    assert!(
+        popup.contains("⚫  Work (current)"),
+        "expected weekly marker for work account:\n{popup}"
+    );
+    assert!(
+        popup.contains("🟡  Personal"),
+        "expected 5h marker for personal account:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn accounts_popup_hides_stale_blocked_until_when_usage_shows_available() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+
+    let exhausted_until = chrono::Utc::now() + chrono::Duration::hours(1);
+    chat.auth_manager
+        .mark_usage_limit_reached(Some(exhausted_until), None)
+        .expect("mark usage limit reached");
+
+    let resets_at = (chrono::Utc::now() + chrono::Duration::hours(2)).timestamp();
+    let available_snapshot = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 42.0,
+            window_minutes: Some(300),
+            resets_at: Some(resets_at),
+        }),
+        secondary: Some(RateLimitWindow {
+            used_percent: 10.0,
+            window_minutes: Some(7 * 24 * 60),
+            resets_at: Some((chrono::Utc::now() + chrono::Duration::days(1)).timestamp()),
+        }),
+        credits: None,
+        plan_type: None,
+    };
+    chat.auth_manager
+        .update_rate_limits_for_accounts([("work-account".to_string(), available_snapshot)])
+        .expect("refresh account rate limits");
+
+    let work_account = chat
+        .auth_manager
+        .list_accounts()
+        .into_iter()
+        .find(|account| account.id == "work-account")
+        .expect("work account should exist");
+    assert_eq!(work_account.exhausted_until, None);
+
+    chat.open_accounts_popup_at(chrono::Local::now());
+    let popup = render_bottom_popup(&chat, 100);
+    assert!(
+        !popup.contains("blocked until"),
+        "expected stale blocked message to be suppressed:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn logout_popup_status_marker_prioritizes_weekly_over_5h() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+
+    let now = chrono::Utc::now();
+    let five_hour_resets_at = (now + chrono::Duration::hours(2)).timestamp();
+    let weekly_resets_at = (now + chrono::Duration::days(2)).timestamp();
+
+    let work_snapshot = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 100.0,
+            window_minutes: Some(300),
+            resets_at: Some(five_hour_resets_at),
+        }),
+        secondary: Some(RateLimitWindow {
+            used_percent: 100.0,
+            window_minutes: Some(7 * 24 * 60),
+            resets_at: Some(weekly_resets_at),
+        }),
+        credits: None,
+        plan_type: None,
+    };
+    let personal_snapshot = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 100.0,
+            window_minutes: Some(300),
+            resets_at: Some(five_hour_resets_at),
+        }),
+        secondary: Some(RateLimitWindow {
+            used_percent: 20.0,
+            window_minutes: Some(7 * 24 * 60),
+            resets_at: Some(weekly_resets_at),
+        }),
+        credits: None,
+        plan_type: None,
+    };
+
+    chat.auth_manager
+        .update_rate_limits_for_accounts([
+            ("work-account".to_string(), work_snapshot),
+            ("personal-account".to_string(), personal_snapshot),
+        ])
+        .expect("update account rate limits");
+
+    chat.open_logout_popup_at(chrono::Local::now());
+    let popup = render_bottom_popup(&chat, 100);
+    assert!(
+        popup.contains("Remove: ⚫  Work"),
+        "expected weekly marker for work account in logout popup:\n{popup}"
+    );
+    assert!(
+        popup.contains("Remove: 🟡  Personal"),
+        "expected 5h marker for personal account in logout popup:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn logout_popup_hides_stale_blocked_until_when_usage_shows_available() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+
+    let exhausted_until = chrono::Utc::now() + chrono::Duration::hours(1);
+    chat.auth_manager
+        .mark_usage_limit_reached(Some(exhausted_until), None)
+        .expect("mark usage limit reached");
+
+    let resets_at = (chrono::Utc::now() + chrono::Duration::hours(2)).timestamp();
+    let available_snapshot = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 30.0,
+            window_minutes: Some(300),
+            resets_at: Some(resets_at),
+        }),
+        secondary: Some(RateLimitWindow {
+            used_percent: 15.0,
+            window_minutes: Some(7 * 24 * 60),
+            resets_at: Some((chrono::Utc::now() + chrono::Duration::days(1)).timestamp()),
+        }),
+        credits: None,
+        plan_type: None,
+    };
+    chat.auth_manager
+        .update_rate_limits_for_accounts([("work-account".to_string(), available_snapshot)])
+        .expect("refresh account rate limits");
+
+    chat.open_logout_popup_at(chrono::Local::now());
+    let popup = render_bottom_popup(&chat, 100);
+    assert!(
+        !popup.contains("blocked until"),
+        "expected stale blocked message to be suppressed in logout popup:\n{popup}"
+    );
 }
 
 #[tokio::test]

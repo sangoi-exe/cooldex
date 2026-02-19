@@ -1706,7 +1706,8 @@ impl App {
 
                     while let Some(result) = join_set.join_next().await {
                         if let Ok((store_account_id, snapshots)) = result
-                            && let Some(snapshot) = snapshots.into_iter().next()
+                            && let Some(snapshot) =
+                                crate::chatwidget::preferred_rate_limit_snapshot(snapshots)
                         {
                             updates.push((store_account_id, snapshot));
                         }

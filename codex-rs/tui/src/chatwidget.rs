@@ -451,6 +451,31 @@ enum RateLimitErrorKind {
     Generic,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountAvailabilityStatus {
+    Available,
+    FiveHourLimitReached,
+    WeeklyLimitReached,
+}
+
+impl AccountAvailabilityStatus {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Available => "🟢",
+            Self::FiveHourLimitReached => "🟡",
+            Self::WeeklyLimitReached => "⚫",
+        }
+    }
+
+    fn summary(self, primary_label: &str, secondary_label: &str) -> String {
+        match self {
+            Self::Available => "status: available".to_string(),
+            Self::FiveHourLimitReached => format!("status: {primary_label} limit reached"),
+            Self::WeeklyLimitReached => format!("status: {secondary_label} limit reached"),
+        }
+    }
+}
+
 fn rate_limit_error_kind(info: &CodexErrorInfo) -> Option<RateLimitErrorKind> {
     match info {
         CodexErrorInfo::ServerOverloaded => Some(RateLimitErrorKind::ServerOverloaded),
@@ -5605,6 +5630,41 @@ impl ChatWidget {
             .unwrap_or_else(|| "weekly".to_string())
     }
 
+    fn rate_limit_account_status(
+        now: DateTime<Local>,
+        snapshot: Option<&codex_core::protocol::RateLimitSnapshot>,
+    ) -> AccountAvailabilityStatus {
+        let five_hour_blocked = Self::rate_limit_window_blocked(
+            now,
+            snapshot.and_then(|snapshot| snapshot.primary.as_ref()),
+        );
+        let weekly_blocked = Self::rate_limit_window_blocked(
+            now,
+            snapshot.and_then(|snapshot| snapshot.secondary.as_ref()),
+        );
+
+        if weekly_blocked {
+            AccountAvailabilityStatus::WeeklyLimitReached
+        } else if five_hour_blocked {
+            AccountAvailabilityStatus::FiveHourLimitReached
+        } else {
+            AccountAvailabilityStatus::Available
+        }
+    }
+
+    fn rate_limit_snapshot_has_fresh_usage(
+        now: DateTime<Local>,
+        snapshot: Option<&codex_core::protocol::RateLimitSnapshot>,
+    ) -> bool {
+        let Some(snapshot) = snapshot else {
+            return false;
+        };
+
+        Self::rate_limit_window_used_percent_display(now, snapshot.primary.as_ref()).is_some()
+            || Self::rate_limit_window_used_percent_display(now, snapshot.secondary.as_ref())
+                .is_some()
+    }
+
     pub(crate) fn open_accounts_popup_at(&mut self, now_local: DateTime<Local>) {
         if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
             self.add_error_message(
@@ -5638,18 +5698,19 @@ impl ChatWidget {
                 let snapshot = account.last_rate_limits.as_ref();
                 let primary_label = Self::rate_limit_primary_label(snapshot);
                 let secondary_label = Self::rate_limit_secondary_label(snapshot);
-
-                let five_hour_blocked = Self::rate_limit_window_blocked(
-                    now_local,
-                    snapshot.and_then(|snapshot| snapshot.primary.as_ref()),
-                );
-                let weekly_blocked = Self::rate_limit_window_blocked(
-                    now_local,
-                    snapshot.and_then(|snapshot| snapshot.secondary.as_ref()),
-                );
+                let status = snapshot.map(|_| Self::rate_limit_account_status(now_local, snapshot));
+                let has_fresh_window_usage =
+                    Self::rate_limit_snapshot_has_fresh_usage(now_local, snapshot);
                 let is_exhausted = account.exhausted_until.is_some_and(|until| until > now);
+                let display_name = status
+                    .map(|status| format!("{} {name}", status.marker()))
+                    .unwrap_or(name);
 
                 let mut description_parts = Vec::new();
+                if let Some(status) = status {
+                    description_parts
+                        .push(status.summary(primary_label.as_str(), secondary_label.as_str()));
+                }
                 if account.label.is_some()
                     && let Some(email) = account.email.as_ref()
                 {
@@ -5667,7 +5728,7 @@ impl ChatWidget {
                     snapshot.and_then(|snapshot| snapshot.secondary.as_ref()),
                 ));
 
-                if is_exhausted && !five_hour_blocked && !weekly_blocked {
+                if is_exhausted && !has_fresh_window_usage {
                     let exhausted_local = account
                         .exhausted_until
                         .map(|until| until.with_timezone(&Local));
@@ -5689,7 +5750,7 @@ impl ChatWidget {
 
                 let account_id = account.id;
                 SelectionItem {
-                    name,
+                    name: display_name,
                     description,
                     is_current: account.is_active,
                     actions: vec![Box::new(move |tx| {
@@ -5778,18 +5839,17 @@ impl ChatWidget {
             let snapshot = account.last_rate_limits.as_ref();
             let primary_label = Self::rate_limit_primary_label(snapshot);
             let secondary_label = Self::rate_limit_secondary_label(snapshot);
-            let five_hour_blocked = Self::rate_limit_window_blocked(
-                now_local,
-                snapshot.and_then(|snapshot| snapshot.primary.as_ref()),
-            );
-            let weekly_blocked = Self::rate_limit_window_blocked(
-                now_local,
-                snapshot.and_then(|snapshot| snapshot.secondary.as_ref()),
-            );
+            let status = snapshot.map(|_| Self::rate_limit_account_status(now_local, snapshot));
+            let has_fresh_window_usage =
+                Self::rate_limit_snapshot_has_fresh_usage(now_local, snapshot);
 
             let mut description_parts = Vec::new();
             if account.is_active {
                 description_parts.push("currently active".to_string());
+            }
+            if let Some(status) = status {
+                description_parts
+                    .push(status.summary(primary_label.as_str(), secondary_label.as_str()));
             }
             if label.is_some()
                 && let Some(email) = email.as_ref()
@@ -5808,7 +5868,7 @@ impl ChatWidget {
                 snapshot.and_then(|snapshot| snapshot.secondary.as_ref()),
             ));
 
-            if is_exhausted && !five_hour_blocked && !weekly_blocked {
+            if is_exhausted && !has_fresh_window_usage {
                 let exhausted_local = account
                     .exhausted_until
                     .map(|until| until.with_timezone(&Local));
@@ -5828,8 +5888,11 @@ impl ChatWidget {
                 (!description_parts.is_empty()).then(|| description_parts.join(" • "));
 
             let account_id = account.id;
+            let display_name = status
+                .map(|status| format!("Remove: {} {name}", status.marker()))
+                .unwrap_or_else(|| format!("Remove: {name}"));
             items.push(SelectionItem {
-                name: format!("Remove: {name}"),
+                name: display_name,
                 description,
                 actions: vec![Box::new(move |tx| {
                     tx.send(AppEvent::RemoveAccount {
@@ -7567,6 +7630,21 @@ fn extract_first_bold(s: &str) -> Option<String> {
         i += 1;
     }
     None
+}
+
+pub(crate) fn preferred_rate_limit_snapshot(
+    snapshots: Vec<RateLimitSnapshot>,
+) -> Option<RateLimitSnapshot> {
+    let preferred = snapshots
+        .iter()
+        .find(|snapshot| {
+            snapshot
+                .limit_id
+                .as_deref()
+                .is_some_and(|limit_id| limit_id.eq_ignore_ascii_case("codex"))
+        })
+        .cloned();
+    preferred.or_else(|| snapshots.into_iter().next())
 }
 
 pub(crate) async fn fetch_rate_limits(base_url: String, auth: CodexAuth) -> Vec<RateLimitSnapshot> {
