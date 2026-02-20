@@ -327,6 +327,7 @@ impl SessionTask for SanitizeTask {
             manage_context_policy.fixed_point_k,
             manage_context_policy.stalled_signature_threshold,
         );
+        let mut server_model_warning_emitted_for_turn = false;
 
         loop {
             if cancellation_token.is_cancelled() {
@@ -353,6 +354,7 @@ impl SessionTask for SanitizeTask {
                 &explicitly_enabled_connectors,
                 None,
                 Some(&allowed_tool_names),
+                &mut server_model_warning_emitted_for_turn,
                 cancellation_token.child_token(),
             )
             .await

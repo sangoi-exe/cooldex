@@ -36,13 +36,8 @@ pub(crate) enum WindowsSandboxEnableMode {
     Legacy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub(crate) enum WindowsSandboxFallbackReason {
-    ElevationFailed,
-}
-
 #[derive(Debug, Clone)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) struct ConnectorsSnapshot {
     pub(crate) connectors: Vec<AppInfo>,
 }
@@ -118,11 +113,13 @@ pub(crate) enum AppEvent {
 
     /// Open the app link view in the bottom pane.
     OpenAppLink {
+        app_id: String,
         title: String,
         description: Option<String>,
         instructions: String,
         url: String,
         is_installed: bool,
+        is_enabled: bool,
     },
 
     /// Open the provided URL in the user's browser.
@@ -240,7 +237,6 @@ pub(crate) enum AppEvent {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     OpenWindowsSandboxFallbackPrompt {
         preset: ApprovalPreset,
-        reason: WindowsSandboxFallbackReason,
     },
 
     /// Begin the elevated Windows sandbox setup flow.
@@ -253,6 +249,19 @@ pub(crate) enum AppEvent {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     BeginWindowsSandboxLegacySetup {
         preset: ApprovalPreset,
+    },
+
+    /// Begin a non-elevated grant of read access for an additional directory.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    BeginWindowsSandboxGrantReadRoot {
+        path: String,
+    },
+
+    /// Result of attempting to grant read access for an additional directory.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    WindowsSandboxGrantReadRootCompleted {
+        path: PathBuf,
+        error: Option<String>,
     },
 
     /// Enable the Windows sandbox feature and switch to Agent mode.
@@ -318,6 +327,12 @@ pub(crate) enum AppEvent {
     /// Enable or disable a skill by path.
     SetSkillEnabled {
         path: PathBuf,
+        enabled: bool,
+    },
+
+    /// Enable or disable an app by connector ID.
+    SetAppEnabled {
+        id: String,
         enabled: bool,
     },
 
@@ -393,5 +408,6 @@ pub(crate) enum FeedbackCategory {
     BadResult,
     GoodResult,
     Bug,
+    SafetyCheck,
     Other,
 }
