@@ -89,11 +89,11 @@ pub fn spawn_response_stream(
         if let Some(etag) = models_etag {
             let _ = tx_event.send(Ok(ResponseEvent::ModelsEtag(etag))).await;
         }
-        if reasoning_included {
-            let _ = tx_event
-                .send(Ok(ResponseEvent::ServerReasoningIncluded(true)))
-                .await;
-        }
+        let _ = tx_event
+            .send(Ok(ResponseEvent::ServerReasoningIncluded(
+                reasoning_included,
+            )))
+            .await;
         process_sse(stream_response.bytes, tx_event, idle_timeout, telemetry).await;
     });
 
@@ -968,6 +968,60 @@ mod tests {
             }
             other => panic!("expected server model event, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn spawn_response_stream_emits_reasoning_included_true_when_header_present() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            X_REASONING_INCLUDED_HEADER,
+            HeaderValue::from_static("true"),
+        );
+        let bytes = stream::iter(Vec::<Result<Bytes, TransportError>>::new());
+        let stream_response = StreamResponse {
+            status: StatusCode::OK,
+            headers,
+            bytes: Box::pin(bytes),
+        };
+
+        let mut stream = spawn_response_stream(stream_response, idle_timeout(), None, None);
+        let mut seen = None;
+        while let Some(event) = stream.rx_event.recv().await {
+            match event.expect("expected ok event") {
+                ResponseEvent::ServerReasoningIncluded(included) => {
+                    seen = Some(included);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(seen, Some(true));
+    }
+
+    #[tokio::test]
+    async fn spawn_response_stream_emits_reasoning_included_false_when_header_missing() {
+        let headers = HeaderMap::new();
+        let bytes = stream::iter(Vec::<Result<Bytes, TransportError>>::new());
+        let stream_response = StreamResponse {
+            status: StatusCode::OK,
+            headers,
+            bytes: Box::pin(bytes),
+        };
+
+        let mut stream = spawn_response_stream(stream_response, idle_timeout(), None, None);
+        let mut seen = None;
+        while let Some(event) = stream.rx_event.recv().await {
+            match event.expect("expected ok event") {
+                ResponseEvent::ServerReasoningIncluded(included) => {
+                    seen = Some(included);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(seen, Some(false));
     }
 
     #[tokio::test]

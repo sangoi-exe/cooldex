@@ -60,9 +60,9 @@ pub enum ResponseEvent {
     /// Emitted when the server includes `OpenAI-Model` on the stream response.
     /// This can differ from the requested model when backend safety routing applies.
     ServerModel(String),
-    /// Emitted when `X-Reasoning-Included: true` is present on the response,
-    /// meaning the server already accounted for past reasoning tokens and the
-    /// client should not re-estimate them.
+    /// Emitted at stream start based on `X-Reasoning-Included`.
+    /// `true` means the server already accounted for past reasoning tokens and
+    /// the client should not re-estimate them.
     ServerReasoningIncluded(bool),
     Completed {
         response_id: String,

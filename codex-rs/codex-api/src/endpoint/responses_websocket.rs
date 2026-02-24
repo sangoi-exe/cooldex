@@ -221,11 +221,11 @@ impl ResponsesWebsocketConnection {
             if let Some(etag) = models_etag {
                 let _ = tx_event.send(Ok(ResponseEvent::ModelsEtag(etag))).await;
             }
-            if server_reasoning_included {
-                let _ = tx_event
-                    .send(Ok(ResponseEvent::ServerReasoningIncluded(true)))
-                    .await;
-            }
+            let _ = tx_event
+                .send(Ok(ResponseEvent::ServerReasoningIncluded(
+                    server_reasoning_included,
+                )))
+                .await;
             let mut guard = stream.lock().await;
             let Some(ws_stream) = guard.as_mut() else {
                 let _ = tx_event
@@ -604,6 +604,48 @@ mod tests {
     fn websocket_config_enables_permessage_deflate() {
         let config = websocket_config();
         assert!(config.extensions.permessage_deflate.is_some());
+    }
+
+    #[tokio::test]
+    async fn stream_request_emits_reasoning_not_included_event_when_header_missing() {
+        let (tx_command, _rx_command) = mpsc::channel::<WsCommand>(1);
+        let (_tx_message, rx_message) = mpsc::unbounded_channel::<Result<Message, WsError>>();
+        let pump_task = tokio::spawn(async {});
+        let ws_stream = WsStream {
+            tx_command,
+            rx_message,
+            pump_task,
+        };
+
+        let connection = ResponsesWebsocketConnection::new(
+            ws_stream,
+            Duration::from_secs(1),
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let request = ResponsesWsRequest::ResponseAppend(crate::common::ResponseAppendWsRequest {
+            input: Vec::new(),
+            client_metadata: None,
+        });
+        let mut stream = connection
+            .stream_request(request)
+            .await
+            .expect("stream request should be created");
+
+        let event = stream
+            .rx_event
+            .recv()
+            .await
+            .expect("expected websocket response event")
+            .expect("expected ok event");
+
+        match event {
+            ResponseEvent::ServerReasoningIncluded(false) => {}
+            other => panic!("expected reasoning-included false event, got {other:?}"),
+        }
     }
 
     #[test]
