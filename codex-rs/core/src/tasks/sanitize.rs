@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -480,19 +481,109 @@ fn manage_context_follow_up_events_from_items(
         .collect()
 }
 
-fn manage_context_call_ids(items: &[ResponseItem]) -> HashSet<String> {
-    items
-        .iter()
-        .filter_map(|item| match item {
-            ResponseItem::FunctionCall { name, call_id, .. }
-            | ResponseItem::CustomToolCall { name, call_id, .. }
-                if name == "manage_context" =>
-            {
-                Some(call_id.clone())
+#[derive(Default)]
+struct ManageContextCallOwnership {
+    manage_context_function_call_ids: HashSet<String>,
+    manage_context_custom_call_ids: HashSet<String>,
+    non_manage_function_like_call_ids: HashSet<String>,
+    non_manage_custom_call_ids: HashSet<String>,
+}
+
+impl ManageContextCallOwnership {
+    fn from_items(items: &[ResponseItem]) -> Self {
+        let mut call_ownership = Self::default();
+        for item in items {
+            match item {
+                ResponseItem::FunctionCall { name, call_id, .. } if name == "manage_context" => {
+                    call_ownership
+                        .manage_context_function_call_ids
+                        .insert(call_id.clone());
+                }
+                ResponseItem::CustomToolCall { name, call_id, .. } if name == "manage_context" => {
+                    call_ownership
+                        .manage_context_custom_call_ids
+                        .insert(call_id.clone());
+                }
+                ResponseItem::FunctionCall { call_id, .. } => {
+                    call_ownership
+                        .non_manage_function_like_call_ids
+                        .insert(call_id.clone());
+                }
+                ResponseItem::LocalShellCall {
+                    call_id: Some(call_id),
+                    ..
+                } => {
+                    call_ownership
+                        .non_manage_function_like_call_ids
+                        .insert(call_id.clone());
+                }
+                ResponseItem::CustomToolCall { call_id, .. } => {
+                    call_ownership
+                        .non_manage_custom_call_ids
+                        .insert(call_id.clone());
+                }
+                _ => {}
             }
-            _ => None,
-        })
-        .collect()
+        }
+        call_ownership
+    }
+
+    fn has_manage_context_calls(&self) -> bool {
+        !self.manage_context_function_call_ids.is_empty()
+            || !self.manage_context_custom_call_ids.is_empty()
+    }
+
+    fn is_manage_context_output(&self, item: &ResponseItem) -> bool {
+        match item {
+            ResponseItem::FunctionCallOutput { call_id, .. } => {
+                self.manage_context_function_call_ids.contains(call_id)
+                    && !self.non_manage_function_like_call_ids.contains(call_id)
+            }
+            ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                self.manage_context_custom_call_ids.contains(call_id)
+                    && !self.non_manage_custom_call_ids.contains(call_id)
+            }
+            _ => false,
+        }
+    }
+
+    fn completed_function_call_ids(&self, items: &[ResponseItem]) -> HashSet<String> {
+        let output_ids: HashSet<String> = items
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::FunctionCallOutput { call_id, .. }
+                    if self.is_manage_context_output(item) =>
+                {
+                    Some(call_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        self.manage_context_function_call_ids
+            .iter()
+            .filter(|call_id| output_ids.contains(*call_id))
+            .cloned()
+            .collect()
+    }
+
+    fn completed_custom_call_ids(&self, items: &[ResponseItem]) -> HashSet<String> {
+        let output_ids: HashSet<String> = items
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::CustomToolCallOutput { call_id, .. }
+                    if self.is_manage_context_output(item) =>
+                {
+                    Some(call_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        self.manage_context_custom_call_ids
+            .iter()
+            .filter(|call_id| output_ids.contains(*call_id))
+            .cloned()
+            .collect()
+    }
 }
 
 fn manage_context_output_call_id(item: &ResponseItem) -> Option<&str> {
@@ -514,31 +605,38 @@ fn manage_context_follow_up_events_since(
     before: &[ResponseItem],
     after: &[ResponseItem],
 ) -> Vec<ManageContextFollowUpEvent> {
-    let before_manage_call_ids = manage_context_call_ids(before);
-    let after_manage_call_ids = manage_context_call_ids(after);
-    if after_manage_call_ids.is_empty() {
+    let before_call_ownership = ManageContextCallOwnership::from_items(before);
+    let after_call_ownership = ManageContextCallOwnership::from_items(after);
+    if !after_call_ownership.has_manage_context_calls() {
         return Vec::new();
     }
 
-    let mut seen_output_signatures: HashSet<(String, String)> = before
+    let mut seen_output_signatures: HashMap<(String, String), usize> = before
         .iter()
         .filter_map(|item| {
-            let (call_id, output_signature, _) = manage_context_output_signature(item)?;
-            if !before_manage_call_ids.contains(call_id.as_str()) {
+            if !before_call_ownership.is_manage_context_output(item) {
                 return None;
             }
+            let (call_id, output_signature, _) = manage_context_output_signature(item)?;
             Some((call_id, output_signature))
         })
-        .collect();
+        .fold(HashMap::new(), |mut seen, key| {
+            *seen.entry(key).or_default() += 1;
+            seen
+        });
 
     after
         .iter()
         .filter_map(|item| {
-            let (call_id, output_signature, output_value) = manage_context_output_signature(item)?;
-            if !after_manage_call_ids.contains(call_id.as_str()) {
+            if !after_call_ownership.is_manage_context_output(item) {
                 return None;
             }
-            if !seen_output_signatures.insert((call_id, output_signature)) {
+            let (call_id, output_signature, output_value) = manage_context_output_signature(item)?;
+            let signature_key = (call_id, output_signature);
+            if let Some(remaining) = seen_output_signatures.get_mut(&signature_key)
+                && *remaining > 0
+            {
+                *remaining -= 1;
                 return None;
             }
             parse_manage_context_follow_up_event(&output_value)
@@ -608,43 +706,29 @@ fn parse_manage_context_follow_up_event(output: &Value) -> Option<ManageContextF
 }
 
 fn collect_manage_context_seed_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
-    let mut manage_context_call_ids: HashSet<String> = HashSet::new();
-    let mut manage_context_output_ids: HashSet<String> = HashSet::new();
-
-    for item in items {
-        match item {
-            ResponseItem::FunctionCall { name, call_id, .. } if name == "manage_context" => {
-                manage_context_call_ids.insert(call_id.clone());
-            }
-            ResponseItem::CustomToolCall { name, call_id, .. } if name == "manage_context" => {
-                manage_context_call_ids.insert(call_id.clone());
-            }
-            ResponseItem::FunctionCallOutput { call_id, .. }
-            | ResponseItem::CustomToolCallOutput { call_id, .. } => {
-                manage_context_output_ids.insert(call_id.clone());
-            }
-            _ => {}
-        }
-    }
-
-    let completed_call_ids: HashSet<String> = manage_context_call_ids
-        .into_iter()
-        .filter(|call_id| manage_context_output_ids.contains(call_id))
-        .collect();
-    if completed_call_ids.is_empty() {
+    let call_ownership = ManageContextCallOwnership::from_items(items);
+    let completed_function_call_ids = call_ownership.completed_function_call_ids(items);
+    let completed_custom_call_ids = call_ownership.completed_custom_call_ids(items);
+    if completed_function_call_ids.is_empty() && completed_custom_call_ids.is_empty() {
         return Vec::new();
     }
 
     items
         .iter()
         .filter(|item| match item {
-            ResponseItem::FunctionCall { name, call_id, .. }
-            | ResponseItem::CustomToolCall { name, call_id, .. } => {
-                name == "manage_context" && completed_call_ids.contains(call_id)
+            ResponseItem::FunctionCall { name, call_id, .. } => {
+                name == "manage_context" && completed_function_call_ids.contains(call_id)
             }
-            ResponseItem::FunctionCallOutput { call_id, .. }
-            | ResponseItem::CustomToolCallOutput { call_id, .. } => {
-                completed_call_ids.contains(call_id)
+            ResponseItem::CustomToolCall { name, call_id, .. } => {
+                name == "manage_context" && completed_custom_call_ids.contains(call_id)
+            }
+            ResponseItem::FunctionCallOutput { call_id, .. } => {
+                call_ownership.is_manage_context_output(item)
+                    && completed_function_call_ids.contains(call_id)
+            }
+            ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                call_ownership.is_manage_context_output(item)
+                    && completed_custom_call_ids.contains(call_id)
             }
             _ => false,
         })
@@ -657,6 +741,9 @@ mod tests {
     use super::*;
     use crate::codex::make_session_configuration_for_tests;
     use codex_protocol::models::ContentItem;
+    use codex_protocol::models::LocalShellAction;
+    use codex_protocol::models::LocalShellExecAction;
+    use codex_protocol::models::LocalShellStatus;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -706,6 +793,21 @@ mod tests {
             name: "other_tool".to_string(),
             arguments: "{}".to_string(),
             call_id: call_id.to_string(),
+        }
+    }
+
+    fn local_shell_call(call_id: &str) -> ResponseItem {
+        ResponseItem::LocalShellCall {
+            id: None,
+            call_id: Some(call_id.to_string()),
+            status: LocalShellStatus::Completed,
+            action: LocalShellAction::Exec(LocalShellExecAction {
+                command: vec!["echo".to_string(), "ok".to_string()],
+                timeout_ms: None,
+                working_directory: None,
+                env: None,
+                user: None,
+            }),
         }
     }
 
@@ -1001,6 +1103,25 @@ mod tests {
     }
 
     #[test]
+    fn collect_manage_context_seed_items_ignores_ambiguous_call_id_collision() {
+        let items = vec![
+            manage_context_call("shared"),
+            non_manage_call("shared"),
+            function_call_output(
+                "shared",
+                &json!({
+                    "mode": "apply",
+                    "stop_reason": "target_reached"
+                })
+                .to_string(),
+            ),
+        ];
+
+        let output = collect_manage_context_seed_items(&items);
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn manage_context_follow_up_events_detect_apply_mode() {
         let items = vec![
             manage_context_call("call-1"),
@@ -1240,6 +1361,65 @@ mod tests {
                 chunk_fingerprints: vec!["source:r-new|7000".to_string()],
             })]
         );
+    }
+
+    #[test]
+    fn manage_context_follow_up_events_since_keeps_repeated_identical_output_for_reused_call_id() {
+        let before = vec![
+            manage_context_call("call-reused"),
+            function_call_output(
+                "call-reused",
+                &json!({
+                    "mode": "apply",
+                    "stop_reason": "target_reached"
+                })
+                .to_string(),
+            ),
+        ];
+
+        let after = vec![
+            manage_context_call("call-reused"),
+            function_call_output(
+                "call-reused",
+                &json!({
+                    "mode": "apply",
+                    "stop_reason": "target_reached"
+                })
+                .to_string(),
+            ),
+            manage_context_call("call-reused"),
+            function_call_output(
+                "call-reused",
+                &json!({
+                    "mode": "apply",
+                    "stop_reason": "target_reached"
+                })
+                .to_string(),
+            ),
+        ];
+
+        let events = manage_context_follow_up_events_since(&before, &after);
+        assert_eq!(events, vec![ManageContextFollowUpEvent::Apply]);
+    }
+
+    #[test]
+    fn manage_context_follow_up_events_since_ignores_local_shell_collision_output() {
+        let before = vec![manage_context_call("call-1")];
+        let after = vec![
+            manage_context_call("shared"),
+            local_shell_call("shared"),
+            function_call_output(
+                "shared",
+                &json!({
+                    "mode": "apply",
+                    "stop_reason": "target_reached"
+                })
+                .to_string(),
+            ),
+        ];
+
+        let events = manage_context_follow_up_events_since(&before, &after);
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -1615,7 +1795,7 @@ mod tests {
     async fn sanitize_replacement_history_if_changed_returns_none_when_no_changes() {
         let session_configuration = make_session_configuration_for_tests().await;
         let mut state = crate::state::SessionState::new(session_configuration);
-        let items = vec![input_text_message("user", "hello")];
+        let items = [input_text_message("user", "hello")];
         state.record_items(
             items.iter(),
             crate::truncate::TruncationPolicy::Tokens(4_096),
@@ -1632,7 +1812,7 @@ mod tests {
     async fn sanitize_replacement_history_if_changed_replaces_history_and_clears_overrides() {
         let session_configuration = make_session_configuration_for_tests().await;
         let mut state = crate::state::SessionState::new(session_configuration);
-        let items = vec![
+        let items = [
             input_text_message("user", "first"),
             input_text_message("assistant", "second"),
         ];
@@ -1670,7 +1850,7 @@ mod tests {
     async fn sanitize_replacement_history_if_changed_persists_delete_only_changes() {
         let session_configuration = make_session_configuration_for_tests().await;
         let mut state = crate::state::SessionState::new(session_configuration);
-        let items = vec![
+        let items = [
             input_text_message("user", "first"),
             input_text_message("assistant", "second"),
         ];
@@ -1694,14 +1874,14 @@ mod tests {
     async fn sanitize_replacement_history_if_changed_keeps_manage_context_pairs() {
         let session_configuration = make_session_configuration_for_tests().await;
         let mut state = crate::state::SessionState::new(session_configuration);
-        let baseline = vec![input_text_message("user", "baseline")];
+        let baseline = [input_text_message("user", "baseline")];
         state.record_items(
             baseline.iter(),
             crate::truncate::TruncationPolicy::Tokens(4_096),
         );
         let baseline_snapshot = state.history_snapshot_lenient();
 
-        let extra_items = vec![
+        let extra_items = [
             manage_context_call("call-1"),
             function_call_output("call-1", "{\"mode\":\"retrieve\",\"plan_id\":\"p1\"}"),
         ];

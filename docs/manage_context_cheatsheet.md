@@ -40,4 +40,4 @@
 
 ## stop_reason
 
-`target_reached | fixed_point_reached | invalid_summary_schema | state_hash_mismatch | plan_id_invalid | invalid_contract`
+`target_reached | fixed_point_reached | invalid_summary_schema | state_hash_mismatch | plan_id_invalid | invalid_contract | rollout_persist_error`

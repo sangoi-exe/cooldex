@@ -25,7 +25,10 @@ Unknown fields are rejected (including removed legacy fields like `max_items` an
 - Uses the previous `EventMsg::ContextCompacted` (before the latest compact marker) as the lower boundary and starts right after it.
 - If no previous `context_compacted` event exists (first compaction cycle), starts from the beginning of the rollout.
 - Applies payload size cap from `config.toml` key `recall_kbytes_limit` (default `256` KiB).
-- If the rollout has malformed lines, `recall` returns the valid parsed subset and reports integrity as degraded (`integrity.status = "degraded"`, `integrity.rollout_parse_errors > 0`).
+- `config.toml` key `recall_debug` controls output shape:
+  - unset/`false` (default): compact payload for the model (`items` as string array).
+  - `true`: full/debug payload (legacy shape).
+- In full/debug mode, if the rollout has malformed lines, `recall` returns the valid parsed subset and reports integrity as degraded (`integrity.status = "degraded"`, `integrity.rollout_parse_errors > 0`).
 - If there is no compaction marker, the tool fails with `stop_reason = "no_compaction_marker"`; when parse errors exist, the error message includes the parse-error count.
 
 ### Example
@@ -35,14 +38,21 @@ Unknown fields are rejected (including removed legacy fields like `max_items` an
 ```
 
 Response shape (summary):
-- `mode = "recall_pre_compact"`
-- `integrity.status` and `integrity.rollout_parse_errors`
-- `boundary.start_index`
-- `boundary.last_context_compacted_event_index` (nullable)
-- `boundary.latest_compacted_index`
-- `counts`
-- `items[]` with:
-  - `kind = "assistant_message" | "reasoning"`
-  - `rollout_index`
-  - `text`
-  - `phase` (assistant message only, when available)
+- Full/debug mode (`recall_debug = true`):
+  - `mode = "recall_pre_compact"`
+  - `integrity.status` and `integrity.rollout_parse_errors`
+  - `boundary.start_index`
+  - `boundary.last_context_compacted_event_index` (nullable)
+  - `boundary.latest_compacted_index`
+  - `counts`
+  - `items[]` with:
+    - `kind = "assistant_message" | "reasoning"`
+    - `rollout_index`
+    - `text`
+    - `phase` (assistant message only, when available)
+- Compact mode (`recall_debug = false`):
+  - `mode = "recall_pre_compact_compact"`
+  - `source = "current_session_rollout"`
+  - `items[]` as numbered strings, for example:
+    - `"1: [r] <reasoning text>"`
+    - `"2: [am] <assistant message>"`

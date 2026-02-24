@@ -118,6 +118,7 @@ async fn handle_recall(
         &rollout_items,
         turn.config.recall_kbytes_limit,
         parse_errors,
+        turn.config.recall_debug.unwrap_or(false),
     )
 }
 
@@ -138,6 +139,7 @@ fn build_recall_payload(
     rollout_items: &[RolloutItem],
     recall_kbytes_limit: usize,
     parse_errors: usize,
+    recall_debug: bool,
 ) -> Result<serde_json::Value, FunctionCallError> {
     let compacted_markers_seen = rollout_items
         .iter()
@@ -170,6 +172,15 @@ fn build_recall_payload(
     let recall_bytes_limit = recall_kbytes_limit.saturating_mul(1024);
     let (matching_items, returned_bytes) =
         trim_items_to_bytes_limit(matching_items, recall_bytes_limit);
+    if !recall_debug {
+        let compact = build_compact_recall_payload(matching_items, recall_bytes_limit);
+        return Ok(json!({
+            "mode": "recall_pre_compact_compact",
+            "source": "current_session_rollout",
+            "items": compact.items,
+        }));
+    }
+
     let returned_items = matching_items.len();
 
     Ok(json!({
@@ -198,6 +209,37 @@ fn build_recall_payload(
         },
         "items": matching_items,
     }))
+}
+
+#[derive(Debug)]
+struct CompactRecallPayload {
+    items: Vec<String>,
+}
+
+fn build_compact_recall_payload(
+    matching_items: Vec<RecallItem>,
+    recall_bytes_limit: usize,
+) -> CompactRecallPayload {
+    let compact_entries: Vec<String> = matching_items
+        .into_iter()
+        .map(|item| format!("{} {}", compact_item_tag(item.kind.as_str()), item.text))
+        .collect();
+    let (trimmed_entries, _) = trim_strings_to_bytes_limit(compact_entries, recall_bytes_limit);
+
+    let mut start_index = 0usize;
+    loop {
+        let numbered = trimmed_entries
+            .iter()
+            .skip(start_index)
+            .enumerate()
+            .map(|(index, entry)| format!("{}: {}", index + 1, entry))
+            .collect::<Vec<String>>();
+        let numbered_bytes = estimate_string_items_bytes(numbered.iter());
+        if numbered_bytes <= recall_bytes_limit || numbered.is_empty() {
+            return CompactRecallPayload { items: numbered };
+        }
+        start_index = start_index.saturating_add(1);
+    }
 }
 
 fn collect_pre_compact_items(
@@ -293,6 +335,43 @@ fn trim_items_to_bytes_limit(
     }
     selected_reversed.reverse();
     (selected_reversed, used_bytes)
+}
+
+fn trim_strings_to_bytes_limit(items: Vec<String>, bytes_limit: usize) -> (Vec<String>, usize) {
+    if items.is_empty() || bytes_limit == 0 {
+        return (Vec::new(), 0);
+    }
+    let mut used_bytes = 0usize;
+    let mut selected_reversed: Vec<String> = Vec::new();
+    for item in items.into_iter().rev() {
+        let item_bytes = serde_json::to_vec(&item)
+            .map(|bytes| bytes.len())
+            .unwrap_or_else(|_| item.len());
+        if used_bytes.saturating_add(item_bytes) > bytes_limit {
+            break;
+        }
+        used_bytes = used_bytes.saturating_add(item_bytes);
+        selected_reversed.push(item);
+    }
+    selected_reversed.reverse();
+    (selected_reversed, used_bytes)
+}
+
+fn estimate_string_items_bytes<'a>(items: impl Iterator<Item = &'a String>) -> usize {
+    items.fold(0usize, |acc, item| {
+        let item_bytes = serde_json::to_vec(item)
+            .map(|bytes| bytes.len())
+            .unwrap_or_else(|_| item.len());
+        acc.saturating_add(item_bytes)
+    })
+}
+
+fn compact_item_tag(kind: &str) -> &'static str {
+    match kind {
+        "reasoning" => "[r]",
+        "assistant_message" => "[am]",
+        _ => "[other]",
+    }
 }
 
 fn reasoning_text(
@@ -452,7 +531,7 @@ mod tests {
     fn recall_requires_compaction_marker() {
         let rollout_items = vec![assistant_message("before", None), reasoning("analysis")];
 
-        let error = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
+        let error = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, true)
             .expect_err("must fail when no compaction marker is present");
         let payload = parse_error_payload(error);
 
@@ -470,7 +549,7 @@ mod tests {
     fn recall_no_compaction_marker_error_reports_parse_errors_when_present() {
         let rollout_items = vec![assistant_message("before", None), reasoning("analysis")];
 
-        let error = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 2)
+        let error = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 2, true)
             .expect_err("must fail when no compaction marker is present");
         let payload = parse_error_payload(error);
 
@@ -496,7 +575,7 @@ mod tests {
             reasoning("after compact should not be included"),
         ];
 
-        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, true)
             .expect("build recall payload");
         let items = payload
             .get("items")
@@ -523,7 +602,7 @@ mod tests {
     fn recall_keeps_full_message_text_without_char_arg() {
         let rollout_items = vec![assistant_message("abcdefghijk", None), compacted_marker()];
 
-        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, true)
             .expect("build recall payload");
         let items = payload
             .get("items")
@@ -540,7 +619,7 @@ mod tests {
     #[test]
     fn recall_counts_do_not_expose_removed_max_items_field() {
         let rollout_items = vec![assistant_message("assistant 1", None), compacted_marker()];
-        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, true)
             .expect("build recall payload");
 
         assert!(payload.pointer("/counts/max_items").is_none());
@@ -560,7 +639,7 @@ mod tests {
             compacted_marker(),
         ];
 
-        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, true)
             .expect("build recall payload");
         let items = payload
             .get("items")
@@ -585,7 +664,7 @@ mod tests {
             assistant_message("post compact", None),
         ];
 
-        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, true)
             .expect("build recall payload");
         let items = payload
             .get("items")
@@ -616,7 +695,7 @@ mod tests {
             compacted_marker(),
         ];
 
-        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, true)
             .expect("build recall payload");
         let items = payload
             .get("items")
@@ -642,7 +721,7 @@ mod tests {
             compacted_marker(),
         ];
 
-        let unconstrained = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0)
+        let unconstrained = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, true)
             .expect("build unconstrained payload");
         let unconstrained_bytes = unconstrained
             .pointer("/counts/returned_bytes")
@@ -650,7 +729,7 @@ mod tests {
             .expect("returned bytes");
 
         let constrained =
-            build_recall_payload(&rollout_items, 1, 0).expect("build constrained payload");
+            build_recall_payload(&rollout_items, 1, 0, true).expect("build constrained payload");
         let constrained_items = constrained
             .get("items")
             .and_then(Value::as_array)
@@ -676,7 +755,7 @@ mod tests {
             compacted_marker(),
         ];
 
-        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 1)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 1, true)
             .expect("build recall payload");
 
         assert_eq!(
@@ -687,6 +766,67 @@ mod tests {
             payload.pointer("/integrity/rollout_parse_errors"),
             Some(&json!(1))
         );
+    }
+
+    #[test]
+    fn recall_compact_mode_returns_string_items_and_hides_debug_metadata() {
+        let rollout_items = vec![
+            assistant_message("assistant one", Some(MessagePhase::Commentary)),
+            reasoning("reasoning one"),
+            compacted_marker(),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 3, false)
+            .expect("build compact recall payload");
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+
+        assert_eq!(
+            payload.get("mode").and_then(Value::as_str),
+            Some("recall_pre_compact_compact")
+        );
+        assert_eq!(
+            payload.get("source").and_then(Value::as_str),
+            Some("current_session_rollout")
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].as_str(), Some("1: [am] assistant one"));
+        assert_eq!(items[1].as_str(), Some("2: [r] reasoning one"));
+        assert!(payload.get("integrity").is_none());
+        assert!(payload.get("boundary").is_none());
+        assert!(payload.get("counts").is_none());
+    }
+
+    #[test]
+    fn recall_compact_mode_applies_kbytes_limit_from_tail() {
+        let alpha = "a".repeat(700);
+        let beta = "b".repeat(700);
+        let gamma = "c".repeat(700);
+        let rollout_items = vec![
+            assistant_message(alpha.as_str(), None),
+            assistant_message(beta.as_str(), None),
+            assistant_message(gamma.as_str(), None),
+            compacted_marker(),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, 1, 0, false)
+            .expect("build compact constrained payload");
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+
+        assert!(items.len() < 3);
+        for (index, item) in items.iter().enumerate() {
+            let expected_prefix = format!("{}: [am] ", index + 1);
+            let text = item.as_str().expect("compact entry string");
+            assert!(
+                text.starts_with(expected_prefix.as_str()),
+                "compact item should be sequentially numbered: {text}"
+            );
+        }
     }
 
     #[test]
@@ -718,7 +858,10 @@ mod tests {
 
     #[tokio::test]
     async fn recall_returns_degraded_integrity_when_rollout_contains_invalid_line() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, mut turn) = crate::codex::make_session_and_context().await;
+        let mut config = (*turn.config).clone();
+        config.recall_debug = Some(true);
+        turn.config = std::sync::Arc::new(config);
         let recorder = crate::rollout::RolloutRecorder::new(
             turn.config.as_ref(),
             crate::rollout::RolloutRecorderParams::new(
@@ -727,6 +870,7 @@ mod tests {
                 turn.session_source.clone(),
                 BaseInstructions::default(),
                 Vec::new(),
+                crate::rollout::policy::EventPersistenceMode::Limited,
             ),
             None,
             None,

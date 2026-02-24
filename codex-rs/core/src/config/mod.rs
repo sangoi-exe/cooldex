@@ -222,6 +222,9 @@ pub struct Config {
     /// Compact prompt override.
     pub compact_prompt: Option<String>,
 
+    /// Optional instructions appended after successful remote auto-compaction.
+    pub pos_compact_instructions: Option<String>,
+
     /// Optional commit attribution text for commit message co-author trailers.
     ///
     /// - `None`: use default attribution (`Codex <noreply@openai.com>`)
@@ -329,6 +332,10 @@ pub struct Config {
 
     /// Maximum size budget (KiB) for recall payload items returned to the model.
     pub recall_kbytes_limit: usize,
+
+    /// Controls recall payload verbosity. When unset/true, use full payload.
+    /// When false, use a compact string-list payload.
+    pub recall_debug: Option<bool>,
 
     /// Maximum number of agent threads that can be open concurrently.
     pub agent_max_threads: Option<usize>,
@@ -1001,6 +1008,9 @@ pub struct ConfigToml {
     /// Compact prompt used for history compaction.
     pub compact_prompt: Option<String>,
 
+    /// Optional instructions appended after successful remote auto-compaction.
+    pub pos_compact_instructions: Option<String>,
+
     /// Optional commit attribution text for commit message co-author trailers.
     ///
     /// Set to an empty string to disable automatic commit attribution.
@@ -1061,6 +1071,10 @@ pub struct ConfigToml {
     /// Maximum size budget (KiB) for recall payload items returned to the model.
     #[schemars(range(min = 1))]
     pub recall_kbytes_limit: Option<usize>,
+
+    /// Controls recall payload verbosity. When unset/true, use full payload.
+    /// When false, use a compact string-list payload.
+    pub recall_debug: Option<bool>,
 
     /// Explicit policy knobs for `manage_context` orchestration.
     pub manage_context_policy: Option<ManageContextPolicyToml>,
@@ -1924,6 +1938,14 @@ impl Config {
                 Some(trimmed.to_string())
             }
         });
+        let pos_compact_instructions = cfg.pos_compact_instructions.as_ref().and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
 
         let commit_attribution = cfg.commit_attribution;
 
@@ -2083,6 +2105,7 @@ impl Config {
             personality,
             developer_instructions,
             compact_prompt,
+            pos_compact_instructions,
             commit_attribution,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.
@@ -2112,6 +2135,7 @@ impl Config {
             recall_kbytes_limit: cfg
                 .recall_kbytes_limit
                 .unwrap_or(DEFAULT_RECALL_KBYTES_LIMIT),
+            recall_debug: cfg.recall_debug,
             agent_max_threads,
             manage_context_policy,
             agent_max_depth,
@@ -4412,6 +4436,45 @@ model = "gpt-5.1-codex"
     }
 
     #[test]
+    fn config_loads_pos_compact_instructions_from_toml() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml {
+            pos_compact_instructions: Some("  keep it short  ".to_string()),
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(
+            config.pos_compact_instructions.as_deref(),
+            Some("keep it short")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_drops_blank_pos_compact_instructions() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml {
+            pos_compact_instructions: Some("   ".to_string()),
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.pos_compact_instructions, None);
+        Ok(())
+    }
+
+    #[test]
     fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result<()> {
         let codex_home = TempDir::new()?;
         let missing_path = codex_home.path().join("agents").join("researcher.toml");
@@ -4662,6 +4725,7 @@ model_verbosity = "high"
                 project_doc_fallback_filenames: Vec::new(),
                 tool_output_token_limit: None,
                 recall_kbytes_limit: DEFAULT_RECALL_KBYTES_LIMIT,
+                recall_debug: None,
                 agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
                 manage_context_policy: ManageContextPolicy::default(),
                 agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
@@ -4691,6 +4755,7 @@ model_verbosity = "high"
                 subagent_base_instructions: None,
                 developer_instructions: None,
                 compact_prompt: None,
+                pos_compact_instructions: None,
                 commit_attribution: None,
                 forced_chatgpt_workspace_id: None,
                 forced_login_method: None,
@@ -4783,6 +4848,7 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             recall_kbytes_limit: DEFAULT_RECALL_KBYTES_LIMIT,
+            recall_debug: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
             manage_context_policy: ManageContextPolicy::default(),
             agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
@@ -4812,6 +4878,7 @@ model_verbosity = "high"
             subagent_base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
+            pos_compact_instructions: None,
             commit_attribution: None,
             forced_chatgpt_workspace_id: None,
             forced_login_method: None,
@@ -4902,6 +4969,7 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             recall_kbytes_limit: DEFAULT_RECALL_KBYTES_LIMIT,
+            recall_debug: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
             manage_context_policy: ManageContextPolicy::default(),
             agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
@@ -4931,6 +4999,7 @@ model_verbosity = "high"
             subagent_base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
+            pos_compact_instructions: None,
             commit_attribution: None,
             forced_chatgpt_workspace_id: None,
             forced_login_method: None,
@@ -5007,6 +5076,7 @@ model_verbosity = "high"
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
             recall_kbytes_limit: DEFAULT_RECALL_KBYTES_LIMIT,
+            recall_debug: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
             manage_context_policy: ManageContextPolicy::default(),
             agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
@@ -5036,6 +5106,7 @@ model_verbosity = "high"
             subagent_base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
+            pos_compact_instructions: None,
             commit_attribution: None,
             forced_chatgpt_workspace_id: None,
             forced_login_method: None,
@@ -5594,6 +5665,36 @@ recall_kbytes_limit = 64
         )?;
 
         assert_eq!(config.recall_kbytes_limit, 64);
+        Ok(())
+    }
+
+    #[test]
+    fn config_defaults_recall_debug_to_none() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.recall_debug, None);
+        Ok(())
+    }
+
+    #[test]
+    fn config_loads_recall_debug_from_toml() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml {
+            recall_debug: Some(true),
+            ..Default::default()
+        };
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.recall_debug, Some(true));
         Ok(())
     }
 

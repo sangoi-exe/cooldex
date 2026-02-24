@@ -1863,6 +1863,10 @@
       ],
       "description": "Optionally specify a personality for the model"
     },
+    "pos_compact_instructions": {
+      "description": "Optional instructions appended after successful remote auto-compaction.",
+      "type": "string"
+    },
     "profile": {
       "description": "Profile to use from the `profiles` map.",
       "type": "string"
@@ -1901,6 +1905,10 @@
         "$ref": "#/definitions/ProjectConfig"
       },
       "type": "object"
+    },
+    "recall_debug": {
+      "description": "Controls recall payload verbosity. When unset/true, use full payload. When false, use a compact string-list payload.",
+      "type": "boolean"
     },
     "recall_kbytes_limit": {
       "description": "Maximum size budget (KiB) for recall payload items returned to the model.",

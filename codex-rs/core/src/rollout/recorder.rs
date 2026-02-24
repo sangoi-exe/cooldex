@@ -811,6 +811,7 @@ async fn rollout_writer(
             }
             RolloutCmd::Shutdown { ack } => {
                 let _ = ack.send(());
+                break;
             }
         }
     }

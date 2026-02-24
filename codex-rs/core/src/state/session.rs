@@ -57,6 +57,15 @@ pub(crate) struct SessionState {
     pub(crate) active_connector_selection: HashSet<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct SessionStateCheckpoint {
+    history: ContextManager,
+    context_inclusion_mask: Option<BTreeSet<u64>>,
+    context_overlay: ContextOverlay,
+    history_rids: Vec<u64>,
+    next_history_rid: u64,
+}
+
 impl SessionState {
     /// Create a new session state mirroring previous `State::default()` semantics.
     pub(crate) fn new(session_configuration: SessionConfiguration) -> Self {
@@ -238,6 +247,26 @@ impl SessionState {
 
     pub(crate) fn context_overlay_snapshot(&self) -> ContextOverlay {
         self.context_overlay.clone()
+    }
+
+    pub(crate) fn manage_context_checkpoint(&self) -> SessionStateCheckpoint {
+        self.assert_history_alignment();
+        SessionStateCheckpoint {
+            history: self.history.clone(),
+            context_inclusion_mask: self.context_inclusion_mask.clone(),
+            context_overlay: self.context_overlay.clone(),
+            history_rids: self.history_rids.clone(),
+            next_history_rid: self.next_history_rid,
+        }
+    }
+
+    pub(crate) fn restore_manage_context_checkpoint(&mut self, checkpoint: SessionStateCheckpoint) {
+        self.history = checkpoint.history;
+        self.context_inclusion_mask = checkpoint.context_inclusion_mask;
+        self.context_overlay = checkpoint.context_overlay;
+        self.history_rids = checkpoint.history_rids;
+        self.next_history_rid = checkpoint.next_history_rid;
+        self.assert_history_alignment();
     }
 
     pub(crate) fn add_context_notes(&mut self, notes: Vec<String>) {
@@ -1105,7 +1134,7 @@ mod tests {
         let second_snapshot = ResponseItem::GhostSnapshot {
             ghost_commit: GhostCommit::new("ghost-2".to_string(), None, Vec::new(), Vec::new()),
         };
-        let items = vec![
+        let items = [
             assistant_message,
             first_snapshot.clone(),
             second_snapshot.clone(),

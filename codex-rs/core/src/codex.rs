@@ -2414,8 +2414,8 @@ impl Session {
         turn_context: &TurnContext,
         items: &[ResponseItem],
     ) {
-        self.record_into_history(items, turn_context).await;
         self.persist_rollout_response_items(items).await;
+        self.record_into_history(items, turn_context).await;
         self.send_raw_response_items(turn_context, items).await;
     }
 
@@ -2682,6 +2682,7 @@ impl Session {
             && let Err(e) = rec.record_items(items).await
         {
             error!("failed to record rollout items: {e:#}");
+            panic!("failed to record rollout items: {e:#}");
         }
     }
 
@@ -4714,12 +4715,34 @@ async fn maybe_run_previous_model_inline_compact(
 async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) -> CodexResult<()> {
     if should_use_remote_compact_task(&turn_context.provider) {
         run_inline_remote_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await?;
-        sess.record_model_warning(AUTO_COMPACT_RECON_WARNING_BODY, turn_context)
-            .await;
+        let warning = resolved_pos_compact_warning(turn_context.config.as_ref());
+        sess.record_model_warning(warning, turn_context).await;
     } else {
         run_inline_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await?;
     }
     Ok(())
+}
+
+fn resolved_pos_compact_warning(config: &Config) -> String {
+    let default_warning = AUTO_COMPACT_RECON_WARNING_BODY.to_string();
+    let Some(raw) = config.pos_compact_instructions.as_deref() else {
+        return default_warning;
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return default_warning;
+    }
+
+    let without_warning_prefix = match trimmed.get(..8) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("warning:") => trimmed[8..].trim_start(),
+        _ => trimmed,
+    };
+    let normalized = without_warning_prefix.trim();
+    if normalized.is_empty() {
+        return default_warning;
+    }
+    normalized.to_string()
 }
 
 fn collect_explicit_app_ids_from_skill_items(
@@ -7030,7 +7053,6 @@ mod tests {
                 plan_type: None,
             })),
             promo_message: None,
-            limit_name: Some("codex".to_string()),
         };
 
         let switched =
@@ -7130,7 +7152,6 @@ mod tests {
                 plan_type: None,
             })),
             promo_message: None,
-            limit_name: Some("codex".to_string()),
         };
 
         let switched =
@@ -7207,7 +7228,6 @@ mod tests {
                 plan_type: None,
             })),
             promo_message: None,
-            limit_name: Some("codex".to_string()),
         };
 
         let switched =
@@ -8154,6 +8174,35 @@ mod tests {
 
         let after_len = session.clone_history().await.raw_items().len();
         assert_eq!(after_len, before_len);
+    }
+
+    #[test]
+    fn resolved_pos_compact_warning_defaults_when_unset() {
+        let config = test_config();
+
+        assert_eq!(
+            resolved_pos_compact_warning(&config),
+            AUTO_COMPACT_RECON_WARNING_BODY
+        );
+    }
+
+    #[test]
+    fn resolved_pos_compact_warning_strips_warning_prefix_once() {
+        let mut config = test_config();
+        config.pos_compact_instructions = Some(" Warning: custom body ".to_string());
+
+        assert_eq!(resolved_pos_compact_warning(&config), "custom body");
+    }
+
+    #[test]
+    fn resolved_pos_compact_warning_falls_back_on_blank_after_prefix() {
+        let mut config = test_config();
+        config.pos_compact_instructions = Some("warning:   ".to_string());
+
+        assert_eq!(
+            resolved_pos_compact_warning(&config),
+            AUTO_COMPACT_RECON_WARNING_BODY
+        );
     }
 
     #[tokio::test]
