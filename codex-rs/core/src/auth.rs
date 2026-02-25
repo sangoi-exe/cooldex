@@ -1387,6 +1387,89 @@ impl AuthManager {
         })
     }
 
+    pub fn switch_account_on_usage_limit(
+        &self,
+        required_workspace_id: Option<&str>,
+        failing_store_account_id: Option<&str>,
+        resets_at: Option<DateTime<Utc>>,
+        snapshot: Option<crate::protocol::RateLimitSnapshot>,
+    ) -> std::io::Result<Option<String>> {
+        if self.get_auth_mode() != Some(ApiAuthMode::Chatgpt) {
+            return Ok(None);
+        }
+
+        self.update_store(|store| {
+            let now = Utc::now();
+            let failing_store_account_id = match failing_store_account_id {
+                Some(store_account_id) => {
+                    if store
+                        .accounts
+                        .iter()
+                        .any(|account| account.id == store_account_id)
+                    {
+                        Some(store_account_id.to_string())
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                _ => store.active_account_id.clone(),
+            };
+
+            let Some(failing_store_account_id) = failing_store_account_id else {
+                return Ok(None);
+            };
+
+            let Some(failing_account) = store
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == failing_store_account_id)
+            else {
+                return Ok(None);
+            };
+
+            let usage = failing_account
+                .usage
+                .get_or_insert_with(AccountUsageCache::default);
+            usage.last_seen_at = Some(now);
+            if let Some(snapshot) = snapshot.clone() {
+                usage.last_rate_limits = Some(snapshot);
+            }
+            usage.exhausted_until = Some(exhausted_until(
+                resets_at,
+                usage.last_rate_limits.as_ref(),
+                now,
+            ));
+
+            let mut candidates = store
+                .accounts
+                .iter()
+                .filter(|account| {
+                    account.id != failing_store_account_id
+                        && account_selectable(account, required_workspace_id, now)
+                })
+                .collect::<Vec<_>>();
+
+            candidates.sort_by(|a, b| compare_auto_switch_candidates(a, b));
+            let Some(next_account_id) = candidates.first().map(|account| account.id.clone()) else {
+                return Ok(None);
+            };
+
+            store.active_account_id = Some(next_account_id.clone());
+            if let Some(next_account) = store
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == next_account_id)
+            {
+                let usage = next_account
+                    .usage
+                    .get_or_insert_with(AccountUsageCache::default);
+                usage.last_seen_at = Some(now);
+            }
+
+            Ok(Some(next_account_id))
+        })
+    }
+
     pub fn select_account_for_auto_switch(
         &self,
         required_workspace_id: Option<&str>,
@@ -1408,6 +1491,45 @@ impl AuthManager {
 
         candidates.sort_by(|a, b| compare_auto_switch_candidates(a, b));
         candidates.first().map(|account| account.id.clone())
+    }
+
+    pub fn accounts_rate_limits_cache_expires_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        if self.get_auth_mode() != Some(ApiAuthMode::Chatgpt) {
+            return None;
+        }
+
+        let guard = self.inner.read().ok()?;
+        let store = &guard.store;
+
+        let next_release_at = store
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                account
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.exhausted_until)
+            })
+            .filter(|until| *until > now)
+            .min();
+        if next_release_at.is_some() {
+            return next_release_at;
+        }
+
+        store
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                account
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.last_rate_limits.as_ref())
+            })
+            .filter_map(|snapshot| snapshot_next_reset_at(snapshot, now))
+            .min()
     }
 
     /// Current cached auth (clone). May be `None` if not logged in or load failed.
@@ -2120,6 +2242,20 @@ fn rate_limit_window_reset_at(
     DateTime::<Utc>::from_timestamp(resets_at_seconds, 0)
 }
 
+fn snapshot_next_reset_at(
+    snapshot: &crate::protocol::RateLimitSnapshot,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    [
+        rate_limit_window_reset_at(snapshot.primary.as_ref()),
+        rate_limit_window_reset_at(snapshot.secondary.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|reset_at| *reset_at > now)
+    .min()
+}
+
 fn account_selectable(
     account: &StoredAccount,
     required_workspace_id: Option<&str>,
@@ -2728,6 +2864,303 @@ mod tests {
             .and_then(|usage| usage.last_rate_limits.clone());
         assert_eq!(acc_1_snapshot, Some(snapshot));
 
+        Ok(())
+    }
+
+    #[test]
+    fn switch_account_on_usage_limit_marks_requested_failing_account() -> std::io::Result<()> {
+        use crate::protocol::RateLimitSnapshot;
+        use crate::protocol::RateLimitWindow;
+
+        let dir = tempdir().unwrap();
+        let store = AuthStore {
+            active_account_id: Some("acc-2".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        super::save_auth(dir.path(), &store, AuthCredentialsStoreMode::File)?;
+
+        let manager = AuthManager::shared(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        let reset = Utc::now() + chrono::Duration::minutes(90);
+        let snapshot = RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(300),
+                resets_at: Some(reset.timestamp()),
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: None,
+        };
+
+        let switched_to = manager.switch_account_on_usage_limit(
+            None,
+            Some("acc-1"),
+            Some(reset),
+            Some(snapshot),
+        )?;
+        assert_eq!(switched_to, Some("acc-2".to_string()));
+
+        let accounts = manager.list_accounts();
+        let acc_1 = accounts
+            .iter()
+            .find(|account| account.id == "acc-1")
+            .expect("acc-1 should exist");
+        let acc_2 = accounts
+            .iter()
+            .find(|account| account.id == "acc-2")
+            .expect("acc-2 should exist");
+        assert!(
+            acc_1.exhausted_until.is_some(),
+            "requested failing account should be marked exhausted"
+        );
+        assert!(acc_2.is_active, "fallback account should stay active");
+        Ok(())
+    }
+
+    #[test]
+    fn switch_account_on_usage_limit_ignores_missing_failing_account() -> std::io::Result<()> {
+        use crate::protocol::RateLimitSnapshot;
+        use crate::protocol::RateLimitWindow;
+
+        let dir = tempdir().unwrap();
+        let store = AuthStore {
+            active_account_id: Some("acc-2".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        super::save_auth(dir.path(), &store, AuthCredentialsStoreMode::File)?;
+
+        let manager = AuthManager::shared(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        let reset = Utc::now() + chrono::Duration::minutes(90);
+        let snapshot = RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(300),
+                resets_at: Some(reset.timestamp()),
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: None,
+        };
+
+        let switched_to = manager.switch_account_on_usage_limit(
+            None,
+            Some("missing-account"),
+            Some(reset),
+            Some(snapshot),
+        )?;
+        assert_eq!(switched_to, None);
+
+        let accounts = manager.list_accounts();
+        let active_account = accounts
+            .iter()
+            .find(|account| account.is_active)
+            .expect("active account should exist");
+        assert_eq!(active_account.id, "acc-2");
+        assert!(
+            active_account.exhausted_until.is_none(),
+            "active account should not be marked exhausted when failing account is unknown"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accounts_rate_limits_cache_expires_at_prefers_next_release() -> std::io::Result<()> {
+        use crate::protocol::RateLimitSnapshot;
+        use crate::protocol::RateLimitWindow;
+
+        let dir = tempdir().unwrap();
+        let store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        super::save_auth(dir.path(), &store, AuthCredentialsStoreMode::File)?;
+
+        let manager = AuthManager::shared(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+
+        let now = Utc::now();
+        let first_release = now + chrono::Duration::minutes(45);
+        let second_release = now + chrono::Duration::minutes(120);
+        let updated = manager.update_rate_limits_for_accounts([
+            (
+                "acc-1".to_string(),
+                RateLimitSnapshot {
+                    limit_id: Some("codex".to_string()),
+                    limit_name: None,
+                    primary: Some(RateLimitWindow {
+                        used_percent: 100.0,
+                        window_minutes: Some(300),
+                        resets_at: Some(first_release.timestamp()),
+                    }),
+                    secondary: None,
+                    credits: None,
+                    plan_type: None,
+                },
+            ),
+            (
+                "acc-2".to_string(),
+                RateLimitSnapshot {
+                    limit_id: Some("codex".to_string()),
+                    limit_name: None,
+                    primary: Some(RateLimitWindow {
+                        used_percent: 100.0,
+                        window_minutes: Some(300),
+                        resets_at: Some(second_release.timestamp()),
+                    }),
+                    secondary: None,
+                    credits: None,
+                    plan_type: None,
+                },
+            ),
+        ])?;
+        assert_eq!(updated, 2);
+
+        let expires_at = manager
+            .accounts_rate_limits_cache_expires_at(now)
+            .expect("cache expiry should be computed");
+        assert_eq!(expires_at.timestamp(), first_release.timestamp());
+        Ok(())
+    }
+
+    #[test]
+    fn accounts_rate_limits_cache_expires_at_uses_next_reset_when_no_blocked_account()
+    -> std::io::Result<()> {
+        use crate::protocol::RateLimitSnapshot;
+        use crate::protocol::RateLimitWindow;
+
+        let dir = tempdir().unwrap();
+        let store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        super::save_auth(dir.path(), &store, AuthCredentialsStoreMode::File)?;
+
+        let manager = AuthManager::shared(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+
+        let now = Utc::now();
+        let first_reset = now + chrono::Duration::minutes(90);
+        let second_reset = now + chrono::Duration::minutes(30);
+        let updated = manager.update_rate_limits_for_accounts([
+            (
+                "acc-1".to_string(),
+                RateLimitSnapshot {
+                    limit_id: Some("codex".to_string()),
+                    limit_name: None,
+                    primary: Some(RateLimitWindow {
+                        used_percent: 35.0,
+                        window_minutes: Some(300),
+                        resets_at: Some(first_reset.timestamp()),
+                    }),
+                    secondary: None,
+                    credits: None,
+                    plan_type: None,
+                },
+            ),
+            (
+                "acc-2".to_string(),
+                RateLimitSnapshot {
+                    limit_id: Some("codex".to_string()),
+                    limit_name: None,
+                    primary: Some(RateLimitWindow {
+                        used_percent: 55.0,
+                        window_minutes: Some(300),
+                        resets_at: Some(second_reset.timestamp()),
+                    }),
+                    secondary: None,
+                    credits: None,
+                    plan_type: None,
+                },
+            ),
+        ])?;
+        assert_eq!(updated, 2);
+
+        let expires_at = manager
+            .accounts_rate_limits_cache_expires_at(now)
+            .expect("cache expiry should be computed");
+        assert_eq!(expires_at.timestamp(), second_reset.timestamp());
         Ok(())
     }
 

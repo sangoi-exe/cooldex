@@ -5557,7 +5557,7 @@ async fn maybe_auto_switch_account_on_usage_limit(
         return Ok(false);
     }
 
-    let accounts = sess.services.auth_manager.list_accounts();
+    let accounts_before = sess.services.auth_manager.list_accounts();
     let account_display_name = |account: &crate::auth::AccountSummary| {
         account
             .label
@@ -5574,31 +5574,48 @@ async fn maybe_auto_switch_account_on_usage_limit(
             .unwrap_or(account.id.as_str())
             .to_string()
     };
-    let active_account = accounts.iter().find(|account| account.is_active);
+    let active_account = accounts_before.iter().find(|account| account.is_active);
     let active_store_account_id = active_account.map(|account| account.id.clone());
-
-    sess.services.auth_manager.mark_usage_limit_reached(
-        usage_limit.resets_at,
-        usage_limit.rate_limits.as_deref().cloned(),
-    )?;
-
-    let required_workspace_id = turn_context.config.forced_chatgpt_workspace_id.as_deref();
-    let Some(next_store_account_id) = sess
+    let failing_store_account_id = sess
         .services
         .auth_manager
-        .select_account_for_auto_switch(required_workspace_id, active_store_account_id.as_deref())
+        .auth_cached()
+        .as_ref()
+        .and_then(crate::auth::CodexAuth::get_account_id)
+        .filter(|store_account_id| {
+            accounts_before
+                .iter()
+                .any(|account| account.id == *store_account_id)
+        })
+        .or(active_store_account_id);
+
+    let required_workspace_id = turn_context.config.forced_chatgpt_workspace_id.as_deref();
+    let Some(next_store_account_id) = sess.services.auth_manager.switch_account_on_usage_limit(
+        required_workspace_id,
+        failing_store_account_id.as_deref(),
+        usage_limit.resets_at,
+        usage_limit.rate_limits.as_deref().cloned(),
+    )?
     else {
         return Ok(false);
     };
 
-    sess.services
-        .auth_manager
-        .set_active_account(&next_store_account_id)?;
-
-    let from_account_name = active_account
+    let accounts_after = sess.services.auth_manager.list_accounts();
+    let from_account_name = failing_store_account_id
+        .as_deref()
+        .and_then(|account_id| {
+            accounts_after
+                .iter()
+                .find(|account| account.id == account_id)
+                .or_else(|| {
+                    accounts_before
+                        .iter()
+                        .find(|account| account.id == account_id)
+                })
+        })
         .map(account_display_name)
         .unwrap_or_else(|| "<unknown>".to_string());
-    let next_account_name = accounts
+    let next_account_name = accounts_after
         .iter()
         .find(|account| account.id == next_store_account_id)
         .map(account_display_name)
@@ -7240,6 +7257,91 @@ mod tests {
         assert_eq!(
             warning_message,
             "Usage limit reached for account 'acc-1'. Auto-switched to account 'acc-2' and retrying."
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_auto_switch_account_on_usage_limit_switches_for_subagent_sessions() {
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        let (tx_event, _rx_event) = async_channel::unbounded();
+        session.tx_event = tx_event;
+        turn_context.session_source =
+            SessionSource::SubAgent(SubAgentSource::Other("unit-test-subagent".to_string()));
+
+        let codex_home = tempfile::tempdir().expect("create temp codex home");
+        let auth_store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: Some("primary".to_string()),
+                    tokens: token_data_for_store_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: Some("secondary".to_string()),
+                    tokens: token_data_for_store_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        save_auth(
+            codex_home.path(),
+            &auth_store,
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("persist test auth store");
+
+        let auth_manager = AuthManager::shared(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        session.services.auth_manager = Arc::clone(&auth_manager);
+        turn_context.auth_manager = Some(Arc::clone(&auth_manager));
+
+        let usage_limit = crate::error::UsageLimitReachedError {
+            plan_type: None,
+            resets_at: Some(Utc::now() + chrono::Duration::minutes(60)),
+            rate_limits: Some(Box::new(RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: Some("codex".to_string()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 100.0,
+                    window_minutes: Some(300),
+                    resets_at: None,
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: 90.0,
+                    window_minutes: Some(10_080),
+                    resets_at: None,
+                }),
+                credits: None,
+                plan_type: None,
+            })),
+            promo_message: None,
+        };
+
+        let switched =
+            maybe_auto_switch_account_on_usage_limit(&session, &turn_context, &usage_limit)
+                .await
+                .expect("auto switch should not fail for sub-agent turns");
+        assert!(
+            switched,
+            "sub-agent turn should auto-switch eligible account"
+        );
+
+        let accounts = auth_manager.list_accounts();
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|account| account.is_active)
+                .map(|account| account.id.as_str()),
+            Some("acc-2")
         );
     }
 

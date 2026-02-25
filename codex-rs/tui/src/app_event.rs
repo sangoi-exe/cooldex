@@ -159,11 +159,16 @@ pub(crate) enum AppEvent {
     /// Update the current personality in the running app and widget.
     UpdatePersonality(Personality),
 
-    /// Fetch per-account rate limits (best-effort) and then open the `/accounts` popup.
+    /// Open `/accounts`, using cached status data when available.
     StartOpenAccountsPopup,
 
-    /// Open the `/accounts` popup.
-    OpenAccountsPopup,
+    /// Periodic poll to refresh `/accounts` cache when it expires.
+    PollAccountsStatusCache,
+
+    /// Result of refreshing per-account rate limits cache.
+    AccountsStatusCacheFetched {
+        updated_accounts: usize,
+    },
 
     /// Switch the active ChatGPT account in the auth store.
     SetActiveAccount {

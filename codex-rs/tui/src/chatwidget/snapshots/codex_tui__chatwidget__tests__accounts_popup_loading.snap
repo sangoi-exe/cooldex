@@ -1,0 +1,10 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: popup
+---
+  Accounts
+  Loading account usage data...
+
+› 1. ⏳  Fetching account status...  Please wait a moment.
+
+  Press enter to confirm or esc to go back

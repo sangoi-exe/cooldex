@@ -1831,6 +1831,7 @@ fn set_chatgpt_auth_with_secondary_account(chat: &mut ChatWidget) {
     chat.models_manager = Arc::new(ModelsManager::new(
         chat.config.codex_home.clone(),
         chat.auth_manager.clone(),
+        None,
     ));
 }
 
@@ -5358,6 +5359,17 @@ async fn accounts_popup() {
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("accounts_popup", popup);
+}
+
+#[tokio::test]
+async fn accounts_popup_loading() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+    chat.open_accounts_loading_popup();
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert_snapshot!("accounts_popup_loading", popup);
 }
 
 #[tokio::test]

@@ -5611,6 +5611,31 @@ impl ChatWidget {
         self.open_accounts_popup_at(Local::now());
     }
 
+    pub(crate) fn open_accounts_loading_popup(&mut self) {
+        if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
+            self.add_error_message(
+                "'/accounts' is only available when using ChatGPT authentication.".to_string(),
+            );
+            return;
+        }
+
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from("Accounts".bold()));
+        header.push(Line::from("Loading account usage data...".dim()));
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items: vec![SelectionItem {
+                name: "⏳ Fetching account status...".to_string(),
+                description: Some("Please wait a moment.".to_string()),
+                dismiss_on_select: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    }
+
     fn rate_limit_window_reset_at_local(
         window: &codex_core::protocol::RateLimitWindow,
     ) -> Option<DateTime<Local>> {
