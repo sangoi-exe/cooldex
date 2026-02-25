@@ -47,7 +47,7 @@ Then apply the malformed-line integrity behavior (manual checklist in Path B):
 
 - `codex-rs/core/src/codex.rs`
   - warning body must require recall without args:
-  - `auto-compaction completed. MANDATORY before any other action: call recall. Then recon unstaged changes, codex_learning_log, and update_plan status. Then proceed with what was in progress before auto-compact.`
+  - `STOP. Codex CLI has just performed an auto-compact. BEFORE any other action: call recall. Then recon unstaged changes and update_plan status. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.`
 
 ### Docs
 - `docs/recall.md`
