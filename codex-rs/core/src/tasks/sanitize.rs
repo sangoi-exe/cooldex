@@ -454,7 +454,8 @@ fn sanitize_replacement_history_if_changed(
     }
 
     if prompt_snapshot != current_history {
-        state.replace_history(prompt_snapshot.clone());
+        let reference_context_item = state.reference_context_item();
+        state.replace_history(prompt_snapshot.clone(), reference_context_item);
     }
 
     Some(prompt_snapshot)
@@ -1860,7 +1861,7 @@ mod tests {
         );
         let baseline = state.history_snapshot_lenient();
 
-        state.replace_history(vec![input_text_message("assistant", "second")]);
+        state.replace_history(vec![input_text_message("assistant", "second")], None);
 
         let expected = state.history_snapshot_lenient();
         let replacement_history = sanitize_replacement_history_if_changed(&mut state, &baseline)

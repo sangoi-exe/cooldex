@@ -3,7 +3,6 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
-use codex_api::AggregateStreamExt;
 use codex_api::AuthProvider;
 use codex_api::Provider;
 use codex_api::ResponseEvent;

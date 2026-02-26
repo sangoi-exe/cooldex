@@ -21,9 +21,22 @@ In the codex-rs folder where the rust code lives:
   locally before CI.
 - Do not create small helper methods that are referenced only once.
 
-Run `just fmt` (in `codex-rs` directory) automatically after you have finished making Rust code changes; do not ask for approval to run it. For build validation, use `cargo build` (prefer `-p <crate>` when possible; use workspace-level `cargo build` only when shared crates require it). Prefer leaving test execution to the user unless explicitly requested.
+Run `just fmt` (in `codex-rs` directory) automatically after you have finished making Rust code changes; do not ask for approval to run it. Do not run `cargo build` as a validation step.
 
-Before finalizing a large change to `codex-rs`, run `just fix -p <project>` (in `codex-rs` directory) to fix any linter issues in the code. Prefer scoping with `-p` to avoid slow workspace‑wide Clippy builds; only run `just fix` without `-p` if you changed shared crates. Do not re-run `cargo build` after running `fix` or `fmt` unless necessary.
+Never run tests whose failure signal is redundant with build/compilation failures (including anything that would only surface the same errors as `cargo build`).
+Run tests only when they provide additional, non-build signal (for example behavioral/runtime/integration/snapshot validation).
+Prefer leaving test execution to the user unless explicitly requested; when requested, keep tests targeted and avoid full-suite runs unless explicitly asked.
+
+Before finalizing a large change to `codex-rs`, run `just fix -p <project>` (in `codex-rs` directory) to fix any linter issues in the code. Prefer scoping with `-p` to avoid slow workspace‑wide Clippy builds; only run `just fix` without `-p` if you changed shared crates. Do not run `cargo build` after `fix`/`fmt`; only run tests when they add non-build signal.
+
+## Sync/Merge personalizado (mandatório)
+
+Durante qualquer sync/merge com `main` e/ou `upstream`, estas regras são obrigatórias:
+
+1. Remover do workspace todo CI/CD que estiver em `.github` (workflows, actions e demais artefatos de pipeline).
+2. Resolver conflitos sempre manualmente. É proibido usar automação `ours/theirs` (incluindo `-X ours`, `-X theirs`, `git checkout --ours`, `git checkout --theirs` e equivalentes).
+3. Em cada conflito, manter as funcionalidades personalizadas que adicionamos e, ao mesmo tempo, conciliar avanços significativos vindos do upstream.
+4. Estas instruções de merge/sync são personalizadas deste workspace e devem ser mantidas SEMPRE no `AGENTS.md` durante sincronizações futuras.
 
 ## TUI style conventions
 
@@ -165,6 +178,6 @@ These guidelines apply to app-server protocol work in `codex-rs`, especially:
 - Regenerate schema fixtures when API shapes change:
   `just write-app-server-schema`
   (and `just write-app-server-schema --experimental` when experimental API fixtures are affected).
-- Validate with `cargo build -p codex-app-server-protocol`.
+- Do not use `cargo build` as a validation gate here; validate only with checks that add non-build signal.
 - Avoid boilerplate tests that only assert experimental field markers for individual
   request fields in `common.rs`; rely on schema generation/tests and behavioral coverage instead.

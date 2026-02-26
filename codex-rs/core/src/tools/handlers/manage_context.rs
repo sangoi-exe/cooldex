@@ -638,7 +638,8 @@ fn materialize_prompt_snapshot_after_apply(
         return None;
     }
 
-    state.replace_history(prompt_snapshot.clone());
+    let reference_context_item = state.reference_context_item();
+    state.replace_history(prompt_snapshot.clone(), reference_context_item);
     Some(prompt_snapshot)
 }
 

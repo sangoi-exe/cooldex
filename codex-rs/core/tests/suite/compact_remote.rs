@@ -7,20 +7,20 @@ use anyhow::Result;
 use codex_core::CodexAuth;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::features::Feature;
-use codex_core::protocol::AskForApproval;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::ItemCompletedEvent;
-use codex_core::protocol::ItemStartedEvent;
-use codex_core::protocol::Op;
-use codex_core::protocol::RolloutItem;
-use codex_core::protocol::RolloutLine;
-use codex_core::protocol::SandboxPolicy;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::ItemStartedEvent;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
@@ -97,6 +97,7 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     )
     .await?;
     let codex = harness.test().codex.clone();
+    let session_id = harness.test().session_configured.session_id.to_string();
 
     let responses_mock = responses::mount_sse_sequence(
         harness.server(),
@@ -113,12 +114,9 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     )
     .await;
 
-    let compacted_history = vec![
-        responses::user_message_item("REMOTE_COMPACTED_SUMMARY"),
-        ResponseItem::Compaction {
-            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
-        },
-    ];
+    let compacted_history = vec![ResponseItem::Compaction {
+        encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
+    }];
     let compact_mock = responses::mount_compact_json_once(
         harness.server(),
         serde_json::json!({ "output": compacted_history.clone() }),
@@ -160,6 +158,10 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
         compact_request.header("authorization").as_deref(),
         Some("Bearer Access Token")
     );
+    assert_eq!(
+        compact_request.header("session_id").as_deref(),
+        Some(session_id.as_str())
+    );
     let compact_body = compact_request.body_json();
     assert_eq!(
         compact_body.get("model").and_then(|v| v.as_str()),
@@ -179,7 +181,7 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     let follow_up_request = response_requests.last().expect("follow-up request missing");
     let follow_up_body = follow_up_request.body_json().to_string();
     assert!(
-        follow_up_body.contains("REMOTE_COMPACTED_SUMMARY"),
+        follow_up_body.contains("\"type\":\"compaction\""),
         "expected follow-up request to use compacted history"
     );
     assert!(
@@ -198,7 +200,7 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     insta::assert_snapshot!(
         "remote_manual_compact_with_history_shapes",
         format_labeled_requests_snapshot(
-            "Remote manual /compact where remote compact output is summary-only: follow-up layout uses returned summary plus new user message.",
+            "Remote manual /compact where remote compact output is compaction-only: follow-up layout uses the returned compaction item plus new user message.",
             &[
                 ("Remote Compaction Request", &compact_request),
                 ("Remote Post-Compaction History Layout", follow_up_request),
@@ -218,6 +220,7 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     )
     .await?;
     let codex = harness.test().codex.clone();
+    let session_id = harness.test().session_configured.session_id.to_string();
 
     mount_sse_once(
         harness.server(),
@@ -260,6 +263,13 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     assert!(message);
     assert_eq!(compact_mock.requests().len(), 1);
+    assert_eq!(
+        compact_mock
+            .single_request()
+            .header("session_id")
+            .as_deref(),
+        Some(session_id.as_str())
+    );
     let follow_up_request = responses_mock.single_request();
     let follow_up_body = follow_up_request.body_json().to_string();
     assert!(follow_up_body.contains("REMOTE_COMPACTED_SUMMARY"));
@@ -1250,7 +1260,6 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
     .await;
 
     let compacted_history = vec![
-        responses::user_message_item("COMPACTED_USER_SUMMARY"),
         ResponseItem::Compaction {
             encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
         },
@@ -1304,17 +1313,6 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
             && compacted.message.is_empty()
             && let Some(replacement_history) = compacted.replacement_history.as_ref()
         {
-            let has_compacted_user_summary = replacement_history.iter().any(|item| {
-                matches!(
-                    item,
-                    ResponseItem::Message { role, content, .. }
-                        if role == "user"
-                            && content.iter().any(|part| matches!(
-                                part,
-                                ContentItem::InputText { text } if text == "COMPACTED_USER_SUMMARY"
-                            ))
-                )
-            });
             let has_compaction_item = replacement_history.iter().any(|item| {
                 matches!(
                     item,
@@ -1346,7 +1344,7 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
                 )
             });
 
-            if has_compacted_user_summary && has_compaction_item && has_compacted_assistant_note {
+            if has_compaction_item && has_compacted_assistant_note {
                 assert!(
                     !has_permissions_developer_message,
                     "manual remote compact rollout replacement history should not inject permissions context"
@@ -1402,7 +1400,6 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
     .await;
 
     let compacted_history = vec![
-        responses::user_message_item("REMOTE_COMPACTED_SUMMARY"),
         ResponseItem::Message {
             id: None,
             role: "developer".to_string(),
@@ -1488,8 +1485,8 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
         "fresh developer instructions should be present after compaction"
     );
     assert!(
-        after_compact_body.contains("REMOTE_COMPACTED_SUMMARY"),
-        "compacted summary should be present after compaction"
+        after_compact_body.contains("ENCRYPTED_COMPACTION_SUMMARY"),
+        "compaction item should be present after compaction"
     );
 
     let after_resume_body = after_resume_request.body_json().to_string();
@@ -1502,8 +1499,8 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
         "fresh developer instructions should be present after resume"
     );
     assert!(
-        after_resume_body.contains("REMOTE_COMPACTED_SUMMARY"),
-        "compacted summary should persist after resume"
+        after_resume_body.contains("ENCRYPTED_COMPACTION_SUMMARY"),
+        "compaction item should persist after resume"
     );
 
     Ok(())
@@ -1535,7 +1532,6 @@ async fn remote_compact_refreshes_stale_developer_instructions_without_resume() 
     .await;
 
     let compacted_history = vec![
-        responses::user_message_item("REMOTE_COMPACTED_SUMMARY"),
         ResponseItem::Message {
             id: None,
             role: "developer".to_string(),
@@ -1594,8 +1590,8 @@ async fn remote_compact_refreshes_stale_developer_instructions_without_resume() 
         "fresh developer instructions should be present after compaction"
     );
     assert!(
-        after_compact_body.contains("REMOTE_COMPACTED_SUMMARY"),
-        "compacted summary should be present after compaction"
+        after_compact_body.contains("ENCRYPTED_COMPACTION_SUMMARY"),
+        "compaction item should be present after compaction"
     );
 
     Ok(())
@@ -1998,7 +1994,7 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
     insta::assert_snapshot!(
         "remote_mid_turn_compaction_shapes",
         format_labeled_requests_snapshot(
-            "Remote mid-turn continuation compaction after tool output: compact request includes tool artifacts and follow-up request includes the summary.",
+            "Remote mid-turn continuation compaction after tool output: compact request includes tool artifacts and the follow-up request includes the returned compaction item.",
             &[
                 ("Remote Compaction Request", &compact_request),
                 ("Remote Post-Compaction History Layout", &requests[1]),
@@ -2041,9 +2037,9 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
     )
     .await;
 
-    let compacted_history = vec![responses::user_message_item(&summary_with_prefix(
-        "REMOTE_SUMMARY_ONLY",
-    ))];
+    let compacted_history = vec![ResponseItem::Compaction {
+        encrypted_content: summary_with_prefix("REMOTE_SUMMARY_ONLY"),
+    }];
     let compact_mock = responses::mount_compact_json_once(
         harness.server(),
         serde_json::json!({ "output": compacted_history }),
@@ -2078,7 +2074,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
     insta::assert_snapshot!(
         "remote_mid_turn_compaction_summary_only_reinjects_context_shapes",
         format_labeled_requests_snapshot(
-            "Remote mid-turn compaction where compact output has only summary user content: continuation layout reinjects canonical context before that summary.",
+            "Remote mid-turn compaction where compact output has only a compaction item: continuation layout reinjects context before that compaction item.",
             &[
                 ("Remote Compaction Request", &compact_request),
                 (
@@ -2185,13 +2181,13 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
     insta::assert_snapshot!(
         "remote_mid_turn_compaction_multi_summary_reinjects_above_last_summary_shapes",
         format_labeled_requests_snapshot(
-            "Remote mid-turn compaction after an earlier summary compaction: the older summary remains in model-visible history and round-trips into the next compact request.",
+            "After a prior manual /compact produced an older remote compaction item, the next turn hits remote auto-compaction before the next sampling request. The compact request carries forward that earlier compaction item, and the next sampling request shows the latest compaction item with context reinjected before USER_TWO.",
             &[
+                ("Remote Compaction Request", &compact_request),
                 (
-                    "Second Turn Request (Before Mid-Turn Compaction)",
+                    "Second Turn Request (After Compaction)",
                     &second_turn_request
                 ),
-                ("Remote Compaction Request", &compact_request),
             ]
         )
     );
