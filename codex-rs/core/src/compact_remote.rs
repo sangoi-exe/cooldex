@@ -91,8 +91,7 @@ async fn run_remote_compact_task_inner_impl(
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
-    let (mut history, ghost_snapshots) =
-        prompt_snapshot_history_for_remote_compact(sess, turn_context.as_ref()).await;
+    let mut history = sess.clone_history().await;
     // Keep compaction prompts in-distribution: if a model-switch update was injected at the
     // tail of history (between turns), exclude it from the compaction request payload.
     let stripped_model_switch_item =
@@ -111,11 +110,15 @@ async fn run_remote_compact_task_inner_impl(
             "trimmed history items before remote compaction"
         );
     }
-
-    let prompt_input = history.raw_items().to_vec();
+    // Required to keep `/undo` available after compaction
+    let ghost_snapshots: Vec<ResponseItem> = history
+        .raw_items()
+        .iter()
+        .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
+        .cloned()
+        .collect();
     let prompt = Prompt {
-        // `prompt_snapshot_for_model` already produced model-ready input.
-        input: prompt_input,
+        input: history.for_prompt(&turn_context.model_info.input_modalities),
         tools: vec![],
         parallel_tool_calls: false,
         base_instructions,
@@ -180,24 +183,6 @@ async fn run_remote_compact_task_inner_impl(
     sess.emit_turn_item_completed(turn_context, compaction_item)
         .await;
     Ok(())
-}
-
-async fn prompt_snapshot_history_for_remote_compact(
-    sess: &Arc<Session>,
-    turn_context: &TurnContext,
-) -> (ContextManager, Vec<ResponseItem>) {
-    let (prompt_items, ghost_snapshots) = {
-        let state = sess.state.lock().await;
-        (
-            state.prompt_snapshot_for_model(&turn_context.model_info.input_modalities),
-            // Required to keep `/undo` available after compaction.
-            state.ghost_snapshots(),
-        )
-    };
-
-    let mut history = ContextManager::new();
-    history.replace(prompt_items);
-    (history, ghost_snapshots)
 }
 
 fn extract_trailing_model_switch_update_for_compaction_request(
