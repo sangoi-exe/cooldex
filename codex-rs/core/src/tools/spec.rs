@@ -633,6 +633,15 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
                 )),
             },
         ),
+        (
+            "profile".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Optional config profile for the spawned agent. If omitted, existing spawn profile behavior is preserved."
+                        .to_string(),
+                ),
+            },
+        ),
     ]);
 
     ToolSpec::Function(ResponsesApiTool {

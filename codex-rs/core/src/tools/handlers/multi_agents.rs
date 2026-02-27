@@ -3,6 +3,8 @@ use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::config::Config;
+use crate::config::ConfigOverrides;
+use crate::config::deserialize_config_toml_with_base;
 use crate::error::CodexErr;
 use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
@@ -103,6 +105,7 @@ mod spawn {
         message: Option<String>,
         items: Option<Vec<UserInput>>,
         agent_type: Option<String>,
+        profile: Option<String>,
     }
 
     #[derive(Debug, Serialize)]
@@ -123,6 +126,11 @@ mod spawn {
             .as_deref()
             .map(str::trim)
             .filter(|role| !role.is_empty());
+        let profile_name = args
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|profile| !profile.is_empty());
         let input_items = parse_collab_input(args.message, args.items)?;
         let prompt = input_preview(&input_items);
         let session_source = turn.session_source.clone();
@@ -149,6 +157,7 @@ mod spawn {
         apply_role_to_config(&mut config, role_name)
             .await
             .map_err(FunctionCallError::RespondToModel)?;
+        apply_spawn_agent_profile_override(&mut config, profile_name)?;
         apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
         apply_spawn_agent_overrides(&mut config, child_depth);
 
@@ -931,6 +940,53 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallE
     Ok(config)
 }
 
+fn apply_spawn_agent_profile_override(
+    config: &mut Config,
+    profile_name: Option<&str>,
+) -> Result<(), FunctionCallError> {
+    let Some(profile_name) = profile_name else {
+        return Ok(());
+    };
+
+    let merged_toml = config.config_layer_stack.effective_config();
+    let merged_config = deserialize_config_toml_with_base(merged_toml, &config.codex_home)
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to load config for profile `{profile_name}`: {err}"
+            ))
+        })?;
+
+    merged_config
+        .get_config_profile(Some(profile_name.to_string()))
+        .map_err(|_| {
+            FunctionCallError::RespondToModel(format!("config profile `{profile_name}` not found"))
+        })?;
+
+    let next_config = Config::load_config_with_layer_stack(
+        merged_config,
+        ConfigOverrides {
+            config_profile: Some(profile_name.to_string()),
+            cwd: Some(config.cwd.clone()),
+            codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
+            main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
+            js_repl_node_path: config.js_repl_node_path.clone(),
+            js_repl_node_module_dirs: Some(config.js_repl_node_module_dirs.clone()),
+            zsh_path: config.zsh_path.clone(),
+            ..Default::default()
+        },
+        config.codex_home.clone(),
+        config.config_layer_stack.clone(),
+    )
+    .map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "failed to apply profile `{profile_name}`: {err}"
+        ))
+    })?;
+
+    *config = next_config;
+    Ok(())
+}
+
 fn apply_spawn_agent_runtime_overrides(
     config: &mut Config,
     turn: &TurnContext,
@@ -983,6 +1039,7 @@ mod tests {
     use codex_protocol::models::BaseInstructions;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
+    use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
     use codex_protocol::protocol::InitialHistory;
     use codex_protocol::protocol::RolloutItem;
     use pretty_assertions::assert_eq;
@@ -1190,6 +1247,80 @@ mod tests {
             .config_snapshot()
             .await;
         assert_eq!(snapshot.approval_policy, AskForApproval::OnRequest);
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_uses_lead_reasoning_effort_when_override_omitted() {
+        #[derive(Debug, Deserialize)]
+        struct SpawnAgentResult {
+            agent_id: String,
+        }
+
+        let (mut session, mut turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+
+        turn.reasoning_effort = Some(ReasoningEffortConfig::Minimal);
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo"
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("spawn_agent should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: SpawnAgentResult =
+            serde_json::from_str(&content).expect("spawn_agent result should be json");
+        let agent_id = agent_id(&result.agent_id).expect("agent_id should be valid");
+
+        let snapshot = manager
+            .get_thread(agent_id)
+            .await
+            .expect("spawned agent thread should exist")
+            .config_snapshot()
+            .await;
+        assert_eq!(
+            snapshot.model_reasoning_effort,
+            Some(ReasoningEffortConfig::Minimal)
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_rejects_unknown_profile() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "profile": "missing-profile"
+            })),
+        );
+        let Err(err) = MultiAgentHandler.handle(invocation).await else {
+            panic!("missing profile should be rejected");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(
+                "config profile `missing-profile` not found".to_string()
+            )
+        );
     }
 
     #[tokio::test]
