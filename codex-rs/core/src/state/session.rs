@@ -129,15 +129,6 @@ impl SessionState {
         self.history.clone()
     }
 
-    pub(crate) fn ghost_snapshots(&self) -> Vec<ResponseItem> {
-        self.history
-            .raw_items()
-            .iter()
-            .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
-            .cloned()
-            .collect()
-    }
-
     pub(crate) fn replace_history(
         &mut self,
         items: Vec<ResponseItem>,
@@ -564,7 +555,8 @@ fn preview_for_item(item: &ResponseItem) -> String {
             tool_output_preview_line(&text).to_string()
         }
         ResponseItem::CustomToolCallOutput { output, .. } => {
-            tool_output_preview_line(output).to_string()
+            let text = output.body.to_text().unwrap_or_default();
+            tool_output_preview_line(&text).to_string()
         }
         ResponseItem::Reasoning { summary, .. } => summary
             .first()
@@ -673,10 +665,13 @@ fn apply_replacement(item: &ResponseItem, replacement: &str) -> Option<ResponseI
                 },
             })
         }
-        ResponseItem::CustomToolCallOutput { call_id, .. } => {
+        ResponseItem::CustomToolCallOutput { call_id, output } => {
             Some(ResponseItem::CustomToolCallOutput {
                 call_id: call_id.clone(),
-                output: trimmed.to_string(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text(trimmed.to_string()),
+                    success: output.success,
+                },
             })
         }
         ResponseItem::Reasoning { .. } => Some(ResponseItem::Message {
@@ -763,7 +758,6 @@ mod tests {
     use super::*;
     use crate::codex::make_session_configuration_for_tests;
     use crate::protocol::RateLimitWindow;
-    use codex_git::GhostCommit;
     use pretty_assertions::assert_eq;
 
     #[tokio::test]
@@ -1065,6 +1059,30 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn apply_replacement_for_custom_tool_output_preserves_success() {
+        let item = ResponseItem::CustomToolCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("old".to_string()),
+                success: Some(false),
+            },
+        };
+
+        let replaced = apply_replacement(&item, "  replacement text  ").expect("replacement");
+
+        assert_eq!(
+            replaced,
+            ResponseItem::CustomToolCallOutput {
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text("replacement text".to_string()),
+                    success: Some(false),
+                },
+            }
+        );
+    }
+
     #[tokio::test]
     async fn prompt_snapshot_lenient_renders_context_notes_as_user_messages() {
         let session_configuration = make_session_configuration_for_tests().await;
@@ -1118,38 +1136,5 @@ mod tests {
                         )
             )
         }));
-    }
-
-    #[tokio::test]
-    async fn ghost_snapshots_returns_only_ghost_snapshot_items() {
-        let session_configuration = make_session_configuration_for_tests().await;
-        let mut state = SessionState::new(session_configuration);
-
-        let assistant_message = ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: "hello".to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        };
-        let first_snapshot = ResponseItem::GhostSnapshot {
-            ghost_commit: GhostCommit::new("ghost-1".to_string(), None, Vec::new(), Vec::new()),
-        };
-        let second_snapshot = ResponseItem::GhostSnapshot {
-            ghost_commit: GhostCommit::new("ghost-2".to_string(), None, Vec::new(), Vec::new()),
-        };
-        let items = [
-            assistant_message,
-            first_snapshot.clone(),
-            second_snapshot.clone(),
-        ];
-        state.record_items(items.iter(), TruncationPolicy::Tokens(10_000));
-
-        assert_eq!(
-            state.ghost_snapshots(),
-            vec![first_snapshot, second_snapshot]
-        );
     }
 }

@@ -464,7 +464,7 @@ fn sanitize_replacement_history_if_changed(
 fn parse_manage_context_output_item(item: &ResponseItem) -> Option<Value> {
     let text = match item {
         ResponseItem::FunctionCallOutput { output, .. } => output.body.to_text()?,
-        ResponseItem::CustomToolCallOutput { output, .. } => output.clone(),
+        ResponseItem::CustomToolCallOutput { output, .. } => output.body.to_text()?,
         _ => return None,
     };
 

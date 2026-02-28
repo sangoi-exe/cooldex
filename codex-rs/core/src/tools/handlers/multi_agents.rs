@@ -1298,7 +1298,7 @@ mod tests {
             .config_snapshot()
             .await;
         assert_eq!(
-            snapshot.model_reasoning_effort,
+            snapshot.reasoning_effort,
             Some(ReasoningEffortConfig::Minimal)
         );
     }

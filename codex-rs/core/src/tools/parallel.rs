@@ -160,7 +160,10 @@ impl ToolCallRuntime {
         match &call.payload {
             ToolPayload::Custom { .. } => ResponseInputItem::CustomToolCallOutput {
                 call_id: call.call_id.clone(),
-                output: message,
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text(message),
+                    success: Some(false),
+                },
             },
             ToolPayload::Mcp { .. } => ResponseInputItem::McpToolCallOutput {
                 call_id: call.call_id.clone(),
@@ -173,6 +176,50 @@ impl ToolCallRuntime {
                     success: Some(false),
                 },
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn disallowed_response_sets_failed_success_for_function_and_custom_outputs() {
+        let function_call = ToolCall {
+            tool_name: "blocked_tool".to_string(),
+            call_id: "function-call".to_string(),
+            payload: ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+        };
+        let custom_call = ToolCall {
+            tool_name: "blocked_tool".to_string(),
+            call_id: "custom-call".to_string(),
+            payload: ToolPayload::Custom {
+                input: "{}".to_string(),
+            },
+        };
+
+        let expected_message = "tool call blocked: blocked_tool is not allowed in this task";
+
+        match ToolCallRuntime::disallowed_response(&function_call) {
+            ResponseInputItem::FunctionCallOutput { call_id, output } => {
+                assert_eq!(call_id, "function-call");
+                assert_eq!(output.text_content(), Some(expected_message));
+                assert_eq!(output.success, Some(false));
+            }
+            other => panic!("expected FunctionCallOutput, got {other:?}"),
+        }
+
+        match ToolCallRuntime::disallowed_response(&custom_call) {
+            ResponseInputItem::CustomToolCallOutput { call_id, output } => {
+                assert_eq!(call_id, "custom-call");
+                assert_eq!(output.text_content(), Some(expected_message));
+                assert_eq!(output.success, Some(false));
+            }
+            other => panic!("expected CustomToolCallOutput, got {other:?}"),
         }
     }
 }

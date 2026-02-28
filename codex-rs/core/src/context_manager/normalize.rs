@@ -125,10 +125,7 @@ pub(crate) fn ensure_call_outputs_present_lenient(items: &mut Vec<ResponseItem>)
                         index,
                         ResponseItem::FunctionCallOutput {
                             call_id: call_id.clone(),
-                            output: FunctionCallOutputPayload {
-                                body: FunctionCallOutputBody::Text(PLACEHOLDER.to_string()),
-                                ..Default::default()
-                            },
+                            output: FunctionCallOutputPayload::from_text(PLACEHOLDER.to_string()),
                         },
                     ));
                 }
@@ -140,7 +137,7 @@ pub(crate) fn ensure_call_outputs_present_lenient(items: &mut Vec<ResponseItem>)
                         index,
                         ResponseItem::CustomToolCallOutput {
                             call_id: call_id.clone(),
-                            output: PLACEHOLDER.to_string(),
+                            output: FunctionCallOutputPayload::from_text(PLACEHOLDER.to_string()),
                         },
                     ));
                 }
@@ -155,10 +152,7 @@ pub(crate) fn ensure_call_outputs_present_lenient(items: &mut Vec<ResponseItem>)
                         index,
                         ResponseItem::FunctionCallOutput {
                             call_id: call_id.clone(),
-                            output: FunctionCallOutputPayload {
-                                body: FunctionCallOutputBody::Text(PLACEHOLDER.to_string()),
-                                ..Default::default()
-                            },
+                            output: FunctionCallOutputPayload::from_text(PLACEHOLDER.to_string()),
                         },
                     ));
                 }

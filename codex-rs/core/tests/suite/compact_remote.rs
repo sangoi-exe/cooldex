@@ -453,7 +453,7 @@ async fn remote_pre_sampling_auto_compact_emits_warning_after_model_switch() -> 
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model: previous_model.to_string(),
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: Some(ReasoningSummary::Auto),
             collaboration_mode: None,
             personality: None,
         })
@@ -472,7 +472,7 @@ async fn remote_pre_sampling_auto_compact_emits_warning_after_model_switch() -> 
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model: next_model.to_string(),
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: Some(ReasoningSummary::Auto),
             collaboration_mode: None,
             personality: None,
         })

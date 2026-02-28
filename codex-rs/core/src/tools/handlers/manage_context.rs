@@ -1086,7 +1086,9 @@ mod tests {
     fn custom_tool_output(call_id: &str, output: &str) -> ResponseItem {
         ResponseItem::CustomToolCallOutput {
             call_id: call_id.to_string(),
-            output: output.to_string(),
+            output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                output.to_string(),
+            ),
         }
     }
 
