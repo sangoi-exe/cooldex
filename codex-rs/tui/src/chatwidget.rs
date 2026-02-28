@@ -468,6 +468,7 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) is_first_run: bool,
     pub(crate) feedback_audience: FeedbackAudience,
     pub(crate) model: Option<String>,
+    pub(crate) startup_tooltip_override: Option<String>,
     // Shared latch so we only warn once about invalid status-line item IDs.
     pub(crate) status_line_invalid_items_warned: Arc<AtomicBool>,
     pub(crate) otel_manager: OtelManager,
@@ -635,6 +636,8 @@ pub(crate) struct ChatWidget {
     frame_requester: FrameRequester,
     // Whether to include the initial welcome banner on session configured
     show_welcome_banner: bool,
+    // One-shot tooltip override for the primary startup session.
+    startup_tooltip_override: Option<String>,
     // When resuming an existing session (selected via resume picker), avoid an
     // immediate redraw on SessionConfigured to prevent a gratuitous UI flicker.
     suppress_session_configured_redraw: bool,
@@ -1176,11 +1179,13 @@ impl ChatWidget {
         );
         self.refresh_model_display();
         self.sync_personality_command_enabled();
+        let startup_tooltip_override = self.startup_tooltip_override.take();
         let session_info_cell = history_cell::new_session_info(
             &self.config,
             &model_for_header,
             event,
             self.show_welcome_banner,
+            startup_tooltip_override,
             self.auth_manager
                 .auth_cached()
                 .and_then(|auth| auth.account_plan_type()),
@@ -2675,6 +2680,8 @@ impl ChatWidget {
 
         let available_decisions = ev.effective_available_decisions();
         let request = ApprovalRequest::Exec {
+            thread_id: self.thread_id.unwrap_or_default(),
+            thread_label: None,
             id: ev.effective_approval_id(),
             command: ev.command,
             reason: ev.reason,
@@ -2691,6 +2698,8 @@ impl ChatWidget {
         self.flush_answer_stream_with_separator();
 
         let request = ApprovalRequest::ApplyPatch {
+            thread_id: self.thread_id.unwrap_or_default(),
+            thread_label: None,
             id: ev.call_id,
             reason: ev.reason,
             changes: ev.changes.clone(),
@@ -2713,10 +2722,18 @@ impl ChatWidget {
         });
 
         let request = ApprovalRequest::McpElicitation {
+            thread_id: self.thread_id.unwrap_or_default(),
+            thread_label: None,
             server_name: ev.server_name,
             request_id: ev.id,
             message: ev.message,
         };
+        self.bottom_pane
+            .push_approval_request(request, &self.config.features);
+        self.request_redraw();
+    }
+
+    pub(crate) fn push_approval_request(&mut self, request: ApprovalRequest) {
         self.bottom_pane
             .push_approval_request(request, &self.config.features);
         self.request_redraw();
@@ -2853,6 +2870,7 @@ impl ChatWidget {
             is_first_run,
             feedback_audience,
             model,
+            startup_tooltip_override,
             status_line_invalid_items_warned,
             otel_manager,
         } = common;
@@ -2951,6 +2969,7 @@ impl ChatWidget {
             queued_user_messages: VecDeque::new(),
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
+            startup_tooltip_override,
             suppress_session_configured_redraw: false,
             pending_notification: None,
             quit_shortcut_expires_at: None,
@@ -3032,6 +3051,7 @@ impl ChatWidget {
             is_first_run,
             feedback_audience,
             model,
+            startup_tooltip_override,
             status_line_invalid_items_warned,
             otel_manager,
         } = common;
@@ -3133,6 +3153,7 @@ impl ChatWidget {
             queued_user_messages: VecDeque::new(),
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
+            startup_tooltip_override,
             suppress_session_configured_redraw: false,
             pending_notification: None,
             quit_shortcut_expires_at: None,
@@ -3199,6 +3220,7 @@ impl ChatWidget {
             is_first_run: _,
             feedback_audience,
             model,
+            startup_tooltip_override: _,
             status_line_invalid_items_warned,
             otel_manager,
         } = common;
@@ -3296,6 +3318,7 @@ impl ChatWidget {
             queued_user_messages: VecDeque::new(),
             queued_message_edit_binding,
             show_welcome_banner: false,
+            startup_tooltip_override: None,
             suppress_session_configured_redraw: true,
             pending_notification: None,
             quit_shortcut_expires_at: None,
@@ -8081,6 +8104,11 @@ impl ChatWidget {
     #[cfg(test)]
     pub(crate) fn pending_thread_approvals(&self) -> &[String] {
         self.bottom_pane.pending_thread_approvals()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_active_view(&self) -> bool {
+        self.bottom_pane.has_active_view()
     }
 
     pub(crate) fn show_esc_backtrack_hint(&mut self) {

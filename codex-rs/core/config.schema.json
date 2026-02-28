@@ -655,6 +655,10 @@
       "additionalProperties": false,
       "description": "Memories settings loaded from config.toml.",
       "properties": {
+        "generate_memories": {
+          "description": "When `false`, newly created threads are stored with `memory_mode = \"disabled\"` in the state DB.",
+          "type": "boolean"
+        },
         "max_raw_memories_for_global": {
           "description": "Maximum number of recent raw memories retained for global consolidation.",
           "format": "uint",
@@ -694,6 +698,14 @@
           "description": "When `false`, skip injecting memory usage instructions into developer prompts.",
           "type": "boolean"
         }
+      },
+      "type": "object"
+    },
+    "ModelAvailabilityNuxConfig": {
+      "additionalProperties": {
+        "format": "uint32",
+        "minimum": 0.0,
+        "type": "integer"
       },
       "type": "object"
     },
@@ -1457,6 +1469,15 @@
           "default": true,
           "description": "Enable animations (welcome screen, shimmer effects, spinners). Defaults to `true`.",
           "type": "boolean"
+        },
+        "model_availability_nux": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelAvailabilityNuxConfig"
+            }
+          ],
+          "default": {},
+          "description": "Startup tooltip availability NUX state persisted by the TUI."
         },
         "notification_method": {
           "allOf": [

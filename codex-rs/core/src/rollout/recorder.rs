@@ -460,6 +460,7 @@ impl RolloutRecorder {
             state_db_ctx.clone(),
             state_builder,
             config.model_provider_id.clone(),
+            config.memories.generate_memories,
         ));
 
         Ok(Self {
@@ -711,6 +712,7 @@ async fn rollout_writer(
     state_db_ctx: Option<StateDbHandle>,
     mut state_builder: Option<ThreadMetadataBuilder>,
     default_provider: String,
+    generate_memories: bool,
 ) -> std::io::Result<()> {
     let mut writer = file.map(|file| JsonlWriter { file });
     let mut buffered_items = Vec::<RolloutItem>::new();
@@ -731,6 +733,7 @@ async fn rollout_writer(
             state_db_ctx.as_deref(),
             &mut state_builder,
             default_provider.as_str(),
+            generate_memories,
         )
         .await?;
     }
@@ -784,6 +787,7 @@ async fn rollout_writer(
                                 state_db_ctx.as_deref(),
                                 &mut state_builder,
                                 default_provider.as_str(),
+                                generate_memories,
                             )
                             .await?;
                         }
@@ -832,6 +836,7 @@ async fn rollout_writer(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_session_meta(
     mut writer: Option<&mut JsonlWriter>,
     session_meta: SessionMeta,
@@ -840,6 +845,7 @@ async fn write_session_meta(
     state_db_ctx: Option<&StateRuntime>,
     state_builder: &mut Option<ThreadMetadataBuilder>,
     default_provider: &str,
+    generate_memories: bool,
 ) -> std::io::Result<()> {
     let git_info = collect_git_info(cwd).await;
     let session_meta_line = SessionMetaLine {
@@ -861,6 +867,7 @@ async fn write_session_meta(
         state_builder.as_ref(),
         std::slice::from_ref(&rollout_item),
         None,
+        (!generate_memories).then_some("disabled"),
     )
     .await;
     Ok(())
@@ -889,6 +896,7 @@ async fn write_and_reconcile_items(
         state_builder.as_ref(),
         items,
         "rollout_writer",
+        None,
     )
     .await;
     Ok(())
