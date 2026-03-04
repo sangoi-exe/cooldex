@@ -44,6 +44,7 @@ impl RegularTask {
                 &turn_context.otel_manager,
                 turn_context.reasoning_effort,
                 turn_context.reasoning_summary,
+                turn_context.config.service_tier,
                 turn_metadata_header.as_deref(),
             )
             .await?;
@@ -79,6 +80,7 @@ impl SessionTask for RegularTask {
         sess.services
             .otel_manager
             .apply_traceparent_parent(&run_turn_span);
+        sess.set_server_reasoning_included(false).await;
         let prewarmed_client_session = self.take_prewarmed_session().await;
         run_turn(
             sess,
