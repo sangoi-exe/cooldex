@@ -6168,6 +6168,8 @@ async fn maybe_auto_switch_account_on_usage_limit(
         return Ok(false);
     }
 
+    refresh_accounts_rate_limits_before_auto_switch(sess, turn_context).await;
+
     let accounts_before = sess.services.auth_manager.list_accounts();
     let account_display_name = |account: &crate::auth::AccountSummary| {
         account
@@ -6242,6 +6244,188 @@ async fn maybe_auto_switch_account_on_usage_limit(
     .await;
 
     Ok(true)
+}
+
+async fn refresh_accounts_rate_limits_before_auto_switch(
+    sess: &Session,
+    turn_context: &TurnContext,
+) {
+    if cfg!(test) {
+        return;
+    }
+
+    let account_ids = sess
+        .services
+        .auth_manager
+        .list_accounts()
+        .into_iter()
+        .map(|account| account.id)
+        .collect::<Vec<_>>();
+    if account_ids.is_empty() {
+        return;
+    }
+
+    let mut updates = Vec::new();
+    for store_account_id in account_ids {
+        let Some(auth) = sess
+            .services
+            .auth_manager
+            .chatgpt_auth_for_store_account_id(&store_account_id)
+        else {
+            continue;
+        };
+        match fetch_account_rate_limits_snapshot(&turn_context.config.chatgpt_base_url, &auth).await
+        {
+            Ok(Some(snapshot)) => updates.push((store_account_id, snapshot)),
+            Ok(None) => {}
+            Err(err) => {
+                debug!(
+                    store_account_id = %store_account_id,
+                    error = %err,
+                    "failed to refresh account usage before auto-switch"
+                );
+            }
+        }
+    }
+
+    if updates.is_empty() {
+        return;
+    }
+
+    match sess
+        .services
+        .auth_manager
+        .update_rate_limits_for_accounts(updates)
+    {
+        Ok(updated_accounts) => {
+            debug!(
+                updated_accounts,
+                "refreshed account usage cache before auto-switch"
+            );
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to persist refreshed account usage before auto-switch"
+            );
+        }
+    }
+}
+
+async fn fetch_account_rate_limits_snapshot(
+    chatgpt_base_url: &str,
+    auth: &CodexAuth,
+) -> Result<Option<RateLimitSnapshot>, String> {
+    let token = auth
+        .get_token()
+        .map_err(|err| format!("failed to read auth token: {err}"))?;
+    let base_url = chatgpt_base_url.trim_end_matches('/');
+    let usage_url = if base_url.contains("/backend-api") {
+        format!("{base_url}/wham/usage")
+    } else {
+        format!("{base_url}/api/codex/usage")
+    };
+
+    let mut request = crate::default_client::build_reqwest_client()
+        .get(usage_url.as_str())
+        .timeout(std::time::Duration::from_secs(5))
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+    if let Some(account_id) = auth.get_account_id() {
+        request = request.header("ChatGPT-Account-Id", account_id);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|err| format!("usage request failed: {err}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("usage request failed with status {status}"));
+    }
+
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|err| format!("failed to decode usage payload: {err}"))?;
+    Ok(parse_rate_limits_snapshot_from_usage_payload(&payload))
+}
+
+fn parse_rate_limits_snapshot_from_usage_payload(payload: &Value) -> Option<RateLimitSnapshot> {
+    let parse_i64 = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_i64)
+            .or_else(|| value.and_then(Value::as_u64).map(|v| v as i64))
+    };
+    let parse_f64 = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_f64)
+            .or_else(|| value.and_then(Value::as_i64).map(|v| v as f64))
+            .or_else(|| value.and_then(Value::as_u64).map(|v| v as f64))
+    };
+    let parse_window = |value: Option<&Value>| {
+        let window = value.and_then(Value::as_object)?;
+        let used_percent = parse_f64(window.get("used_percent"))?;
+        let window_minutes = parse_i64(window.get("limit_window_seconds"))
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| (seconds + 59) / 60);
+        let resets_at = parse_i64(window.get("reset_at"));
+        Some(crate::protocol::RateLimitWindow {
+            used_percent,
+            window_minutes,
+            resets_at,
+        })
+    };
+    let parse_plan_type = |value: Option<&Value>| {
+        let raw = value.and_then(Value::as_str)?;
+        Some(match raw.to_ascii_lowercase().as_str() {
+            "free" => codex_protocol::account::PlanType::Free,
+            "go" => codex_protocol::account::PlanType::Go,
+            "plus" => codex_protocol::account::PlanType::Plus,
+            "pro" => codex_protocol::account::PlanType::Pro,
+            "team" => codex_protocol::account::PlanType::Team,
+            "business" => codex_protocol::account::PlanType::Business,
+            "enterprise" => codex_protocol::account::PlanType::Enterprise,
+            "edu" | "education" => codex_protocol::account::PlanType::Edu,
+            _ => codex_protocol::account::PlanType::Unknown,
+        })
+    };
+    let parse_credits = |value: Option<&Value>| {
+        let credits = value.and_then(Value::as_object)?;
+        let has_credits = credits.get("has_credits").and_then(Value::as_bool);
+        let unlimited = credits.get("unlimited").and_then(Value::as_bool);
+        let balance = credits.get("balance").and_then(|value| match value {
+            Value::String(text) => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        });
+        if has_credits.is_none() && unlimited.is_none() && balance.is_none() {
+            return None;
+        }
+        Some(crate::protocol::CreditsSnapshot {
+            has_credits: has_credits.unwrap_or(false),
+            unlimited: unlimited.unwrap_or(false),
+            balance,
+        })
+    };
+
+    let rate_limit = payload.get("rate_limit");
+    let primary = parse_window(rate_limit.and_then(|limit| limit.get("primary_window")));
+    let secondary = parse_window(rate_limit.and_then(|limit| limit.get("secondary_window")));
+    let credits = parse_credits(payload.get("credits"));
+    let plan_type = parse_plan_type(payload.get("plan_type"));
+
+    if primary.is_none() && secondary.is_none() && credits.is_none() && plan_type.is_none() {
+        return None;
+    }
+
+    Some(RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary,
+        secondary,
+        credits,
+        plan_type,
+    })
 }
 
 async fn try_run_sampling_request(
@@ -8094,6 +8278,84 @@ mod tests {
                 .find(|account| account.is_active)
                 .map(|account| account.id.as_str()),
             Some("acc-2")
+        );
+    }
+
+    #[test]
+    fn parse_rate_limits_snapshot_from_usage_payload_maps_windows_credits_and_plan() {
+        let payload = json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 42,
+                    "limit_window_seconds": 300,
+                    "reset_at": 123
+                },
+                "secondary_window": {
+                    "used_percent": 84.5,
+                    "limit_window_seconds": 3600,
+                    "reset_at": 456
+                }
+            },
+            "credits": {
+                "has_credits": true,
+                "unlimited": false,
+                "balance": "9.99"
+            }
+        });
+
+        let snapshot =
+            parse_rate_limits_snapshot_from_usage_payload(&payload).expect("snapshot should parse");
+        assert_eq!(snapshot.limit_id.as_deref(), Some("codex"));
+        assert_eq!(
+            snapshot.plan_type,
+            Some(codex_protocol::account::PlanType::Pro)
+        );
+        assert_eq!(
+            snapshot.primary.as_ref().map(|window| window.used_percent),
+            Some(42.0)
+        );
+        assert_eq!(
+            snapshot
+                .primary
+                .as_ref()
+                .and_then(|window| window.window_minutes),
+            Some(5)
+        );
+        assert_eq!(
+            snapshot
+                .secondary
+                .as_ref()
+                .map(|window| window.used_percent),
+            Some(84.5)
+        );
+        assert_eq!(
+            snapshot
+                .secondary
+                .as_ref()
+                .and_then(|window| window.window_minutes),
+            Some(60)
+        );
+        assert_eq!(
+            snapshot.credits,
+            Some(crate::protocol::CreditsSnapshot {
+                has_credits: true,
+                unlimited: false,
+                balance: Some("9.99".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_rate_limits_snapshot_from_usage_payload_returns_none_for_empty_payload() {
+        let payload = json!({
+            "plan_type": null,
+            "rate_limit": null,
+            "credits": null
+        });
+        assert_eq!(
+            parse_rate_limits_snapshot_from_usage_payload(&payload),
+            None
         );
     }
 

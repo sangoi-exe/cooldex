@@ -11,6 +11,7 @@ If the goal is to inspect recent pre-compaction history (reasoning + assistant m
 - `retrieve` payload must include only `mode` and `policy_id`.
 - For `apply`, always send `plan_id + state_hash` from the latest `retrieve`.
 - Only use `chunk_id`s returned in the latest `chunk_manifest`.
+- If `retrieve.chunk_manifest` is empty, skip `apply`.
 - `chunk_summaries` must be non-empty and `len <= max_chunks_per_apply` from runtime policy.
 - Each `chunk_summaries[]` entry must include non-empty:
   - `chunk_id`
@@ -18,7 +19,7 @@ If the goal is to inspect recent pre-compaction history (reasoning + assistant m
   - `reasoning_context`
 - Do not repeat `chunk_id` in the same `apply` payload.
 
-Do not send legacy fields (`snapshot_id`, `new_snapshot_id`, `ops`, `max_top_items`, `include_prompt_preview`, `allow_recent`).
+Do not send fields outside the current v2 contract.
 
 ## Loop
 

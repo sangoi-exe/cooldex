@@ -2086,17 +2086,15 @@ mod tests {
             assert!(properties.contains_key(key), "missing v2 field: {key}");
         }
 
-        for legacy_key in [
-            "snapshot_id",
-            "ops",
-            "allow_recent",
-            "include_prompt_preview",
-        ] {
-            assert!(
-                !properties.contains_key(legacy_key),
-                "legacy field should not exist: {legacy_key}"
-            );
-        }
+        let property_keys: std::collections::HashSet<String> = properties.keys().cloned().collect();
+        let expected_keys = std::collections::HashSet::from([
+            "mode".to_string(),
+            "policy_id".to_string(),
+            "plan_id".to_string(),
+            "state_hash".to_string(),
+            "chunk_summaries".to_string(),
+        ]);
+        assert_eq!(property_keys, expected_keys);
 
         assert_eq!(
             additional_properties,

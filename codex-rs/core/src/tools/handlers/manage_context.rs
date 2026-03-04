@@ -1145,19 +1145,15 @@ mod tests {
     }
 
     #[test]
-    fn manage_context_contract_rejects_legacy_fields() {
+    fn manage_context_contract_rejects_unknown_fields() {
         for payload in [
-            r#"{"mode":"retrieve","policy_id":"p","snapshot_id":"legacy"}"#,
-            r#"{"mode":"retrieve","policy_id":"p","new_snapshot_id":"legacy"}"#,
-            r#"{"mode":"retrieve","policy_id":"p","max_top_items":10}"#,
-            r#"{"mode":"retrieve","policy_id":"p","include_prompt_preview":true}"#,
-            r#"{"mode":"retrieve","policy_id":"p","allow_recent":true}"#,
-            r#"{"mode":"apply","policy_id":"p","plan_id":"x","state_hash":"h","ops":[]}"#,
+            r#"{"mode":"retrieve","policy_id":"p","unexpected_field":"x"}"#,
+            r#"{"mode":"apply","policy_id":"p","plan_id":"x","state_hash":"h","unexpected_field":[]}"#,
         ] {
             let parsed: Result<ManageContextToolArgs, _> = serde_json::from_str(payload);
             assert!(
                 parsed.is_err(),
-                "legacy fields must fail strict contract parsing"
+                "unknown fields must fail strict contract parsing"
             );
         }
     }
@@ -1168,7 +1164,7 @@ mod tests {
         let args: ManageContextToolArgs = serde_json::from_value(json!({
             "mode": "retrieve",
             "policy_id": turn.config.manage_context_policy.quality_rubric_id,
-            "plan_id": "legacy-plan",
+            "plan_id": "invalid-plan",
         }))
         .expect("parse args");
 

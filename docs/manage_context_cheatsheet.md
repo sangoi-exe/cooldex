@@ -8,7 +8,7 @@
 {"mode":"retrieve","policy_id":"<runtime policy_id>"}
 ```
 
-2) Apply
+2) Apply (only when `chunk_manifest` is non-empty)
 
 ```json
 {
@@ -28,10 +28,12 @@
 
 3) Retrieve again
 
+If `retrieve.chunk_manifest` is empty, skip `apply`.
+
 ## Required invariants
 
 - one `<tool_context>` + one `<reasoning_context>` per applied chunk
-- no legacy fields (`snapshot_id`, `new_snapshot_id`, `ops`, `max_top_items`, `include_prompt_preview`, `allow_recent`)
+- send only fields from the current v2 contract
 - `retrieve` payload is only `mode` + `policy_id`
 - `chunk_id` must exist in current `chunk_manifest`
 - `chunk_id` cannot repeat in the same `apply`

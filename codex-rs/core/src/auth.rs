@@ -114,6 +114,7 @@ const REFRESH_TOKEN_INVALIDATED_MESSAGE: &str = "Your access token could not be 
 const REFRESH_TOKEN_UNKNOWN_MESSAGE: &str =
     "Your access token could not be refreshed. Please log out and sign in again.";
 const REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE: &str = "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.";
+const NON_PLUS_ACCOUNT_REMOVED_MESSAGE: &str = "Your ChatGPT account is not Plus or Pro and was removed from saved accounts. Please sign in again with a Plus or Pro account.";
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
 
@@ -724,6 +725,13 @@ async fn update_tokens(
         tokens.refresh_token = refresh_token;
     }
     account.last_refresh = Some(Utc::now());
+    let removed_account_ids = enforce_plus_or_pro_saved_accounts(&mut store);
+    if !removed_account_ids.is_empty() {
+        tracing::info!(
+            removed_account_ids = ?removed_account_ids,
+            "removed non-Plus/Pro accounts from auth store"
+        );
+    }
     store.validate()?;
     storage.save(&store)?;
     Ok(store)
@@ -1098,7 +1106,20 @@ impl AuthManager {
         auth_credentials_store_mode: AuthCredentialsStoreMode,
     ) -> Self {
         let storage = create_auth_storage(codex_home.clone(), auth_credentials_store_mode);
-        let store = storage.load().ok().flatten().unwrap_or_default();
+        let mut store = storage.load().ok().flatten().unwrap_or_default();
+        let removed_account_ids = enforce_plus_or_pro_saved_accounts(&mut store);
+        if !removed_account_ids.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_account_ids,
+                "removed non-Plus/Pro accounts during auth manager initialization"
+            );
+            if let Err(error) = save_auth(&codex_home, &store, auth_credentials_store_mode) {
+                tracing::warn!(
+                    error = %error,
+                    "failed to persist plus/pro auth account policy during initialization"
+                );
+            }
+        }
         let auth = load_auth(
             &codex_home,
             enable_codex_api_key_env,
@@ -1573,7 +1594,7 @@ impl AuthManager {
             }
         };
 
-        let store = match self.storage.load() {
+        let mut store = match self.storage.load() {
             Ok(Some(store)) => store,
             Ok(None) => {
                 tracing::info!("Skipping auth reload because auth store is missing.");
@@ -1586,6 +1607,23 @@ impl AuthManager {
                 return ReloadOutcome::Skipped;
             }
         };
+        let removed_account_ids = enforce_plus_or_pro_saved_accounts(&mut store);
+        if !removed_account_ids.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_account_ids,
+                "removed non-Plus/Pro accounts during guarded auth reload"
+            );
+            if let Err(error) =
+                save_auth(&self.codex_home, &store, self.auth_credentials_store_mode)
+            {
+                tracing::warn!(
+                    error = %error,
+                    "failed to persist plus/pro auth account policy during guarded reload"
+                );
+                return ReloadOutcome::Skipped;
+            }
+        }
+
         let new_auth = Self::derive_auth_from_store(
             &store,
             Arc::clone(&self.storage),
@@ -1594,6 +1632,17 @@ impl AuthManager {
         let new_account_id = new_auth.as_ref().and_then(CodexAuth::get_account_id);
 
         if new_account_id.as_deref() != Some(expected_account_id) {
+            if removed_account_ids
+                .iter()
+                .any(|id| id == expected_account_id)
+            {
+                tracing::info!(
+                    expected_account_id,
+                    "Reloading auth after expected account was removed by plus/pro policy"
+                );
+                self.set_cached(store);
+                return ReloadOutcome::ReloadedChanged;
+            }
             let found_account_id = new_account_id.as_deref().unwrap_or("unknown");
             tracing::info!(
                 "Skipping auth reload due to account id mismatch (expected: {expected_account_id}, found: {found_account_id})"
@@ -1738,7 +1787,24 @@ impl AuthManager {
 
     fn load_store_from_storage(&self) -> AuthStore {
         match self.storage.load() {
-            Ok(Some(store)) => store,
+            Ok(Some(mut store)) => {
+                let removed_account_ids = enforce_plus_or_pro_saved_accounts(&mut store);
+                if !removed_account_ids.is_empty() {
+                    tracing::info!(
+                        removed_account_ids = ?removed_account_ids,
+                        "removed non-Plus/Pro accounts while loading auth store"
+                    );
+                    if let Err(error) =
+                        save_auth(&self.codex_home, &store, self.auth_credentials_store_mode)
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to persist plus/pro auth account policy while loading store"
+                        );
+                    }
+                }
+                store
+            }
             Ok(None) => AuthStore::default(),
             Err(err) => {
                 tracing::warn!("Failed to load auth store: {err}");
@@ -1818,8 +1884,22 @@ impl AuthManager {
                 }
             }
         };
+        let removed_before_mutation = enforce_plus_or_pro_saved_accounts(&mut store);
+        if !removed_before_mutation.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_before_mutation,
+                "removed non-Plus/Pro accounts before auth store mutation"
+            );
+        }
 
         let out = mutator(&mut store)?;
+        let removed_after_mutation = enforce_plus_or_pro_saved_accounts(&mut store);
+        if !removed_after_mutation.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_after_mutation,
+                "removed non-Plus/Pro accounts after auth store mutation"
+            );
+        }
         store.validate()?;
         self.storage.save(&store)?;
         self.set_cached(store);
@@ -2066,7 +2146,14 @@ impl AuthManager {
         }
         let auth_dot_json =
             AuthDotJson::from_external_tokens(&refreshed).map_err(RefreshTokenError::Transient)?;
-        let store = AuthStore::from_legacy(auth_dot_json);
+        let mut store = AuthStore::from_legacy(auth_dot_json);
+        let removed_account_ids = enforce_plus_or_pro_saved_accounts(&mut store);
+        if !removed_account_ids.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_account_ids,
+                "removed non-Plus/Pro accounts after external auth refresh"
+            );
+        }
         save_auth(
             &self.codex_home,
             &store,
@@ -2074,6 +2161,15 @@ impl AuthManager {
         )
         .map_err(RefreshTokenError::Transient)?;
         self.reload();
+        if removed_account_ids
+            .iter()
+            .any(|id| id == &refreshed.chatgpt_account_id)
+        {
+            return Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                RefreshTokenFailedReason::Other,
+                NON_PLUS_ACCOUNT_REMOVED_MESSAGE.to_string(),
+            )));
+        }
         Ok(())
     }
 
@@ -2089,7 +2185,7 @@ impl AuthManager {
         let refresh_access_token = refresh_response.access_token.clone();
         let refresh_refresh_token = refresh_response.refresh_token.clone();
 
-        update_tokens(
+        let updated_store = update_tokens(
             &self.codex_home,
             auth.storage(),
             auth.store_account_id.as_str(),
@@ -2099,6 +2195,17 @@ impl AuthManager {
         )
         .await
         .map_err(RefreshTokenError::from)?;
+        if !updated_store
+            .accounts
+            .iter()
+            .any(|account| account.id == auth.store_account_id)
+        {
+            self.reload();
+            return Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                RefreshTokenFailedReason::Other,
+                NON_PLUS_ACCOUNT_REMOVED_MESSAGE.to_string(),
+            )));
+        }
 
         Ok(refresh_response)
     }
@@ -2182,6 +2289,41 @@ fn store_from_auth_for_testing(auth: &CodexAuth) -> AuthStore {
             }
         }
     }
+}
+
+fn is_plus_or_pro_account(account: &StoredAccount) -> bool {
+    matches!(
+        account.tokens.id_token.chatgpt_plan_type.as_ref(),
+        Some(InternalPlanType::Known(
+            InternalKnownPlan::Plus | InternalKnownPlan::Pro
+        ))
+    )
+}
+
+fn enforce_plus_or_pro_saved_accounts(store: &mut AuthStore) -> Vec<String> {
+    let mut removed_account_ids = Vec::new();
+    store.accounts.retain(|account| {
+        let keep_account = is_plus_or_pro_account(account);
+        if !keep_account {
+            removed_account_ids.push(account.id.clone());
+        }
+        keep_account
+    });
+
+    let has_active_account = store
+        .active_account_id
+        .as_ref()
+        .is_some_and(|active_account_id| {
+            store
+                .accounts
+                .iter()
+                .any(|account| &account.id == active_account_id)
+        });
+    if !has_active_account {
+        store.active_account_id = store.accounts.first().map(|account| account.id.clone());
+    }
+
+    removed_account_ids
 }
 
 fn exhausted_until(
@@ -3256,6 +3398,49 @@ mod tests {
         assert_eq!(tokens.refresh_token, "new-refresh-token");
     }
 
+    #[tokio::test]
+    async fn update_tokens_removes_non_plus_accounts() {
+        let codex_home = tempdir().unwrap();
+        write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: Some("plus".to_string()),
+                chatgpt_account_id: None,
+            },
+            codex_home.path(),
+        )
+        .expect("failed to write plus auth file");
+
+        let free_home = tempdir().unwrap();
+        let free_jwt = write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: Some("free".to_string()),
+                chatgpt_account_id: None,
+            },
+            free_home.path(),
+        )
+        .expect("failed to write free auth file");
+
+        let storage = create_auth_storage(
+            codex_home.path().to_path_buf(),
+            AuthCredentialsStoreMode::File,
+        );
+        let updated = super::update_tokens(
+            codex_home.path(),
+            &storage,
+            "test-account",
+            Some(free_jwt),
+            None,
+            None,
+        )
+        .await
+        .expect("update_tokens should succeed");
+
+        assert_eq!(updated.accounts, Vec::new());
+        assert_eq!(updated.active_account_id, None);
+    }
+
     #[test]
     fn login_with_api_key_overwrites_existing_auth_json() {
         let dir = tempdir().unwrap();
@@ -3445,6 +3630,35 @@ mod tests {
         );
         let auth = manager.auth_cached().expect("auth should be cached");
         assert_eq!(auth.internal_auth_mode(), AuthMode::Chatgpt);
+    }
+
+    #[test]
+    #[serial(codex_api_key)]
+    fn auth_manager_new_removes_non_plus_accounts_from_store() {
+        let codex_home = tempdir().unwrap();
+        write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: Some("free".to_string()),
+                chatgpt_account_id: Some("org_workspace".to_string()),
+            },
+            codex_home.path(),
+        )
+        .expect("failed to write auth file");
+
+        let manager = AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        assert_eq!(manager.list_accounts(), Vec::new());
+        assert_eq!(manager.auth_cached(), None);
+
+        let store = super::load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+            .expect("load auth store should succeed")
+            .expect("auth store should exist");
+        assert_eq!(store.accounts, Vec::new());
+        assert_eq!(store.active_account_id, None);
     }
 
     #[tokio::test]

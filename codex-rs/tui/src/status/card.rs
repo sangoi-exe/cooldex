@@ -427,9 +427,9 @@ impl HistoryCell for StatusHistoryCell {
 
         let account_value = self.account.as_ref().map(|account| match account {
             StatusAccountDisplay::ChatGpt { label, email, plan } => {
-                let account_name = label
+                let account_name = email
                     .as_ref()
-                    .or(email.as_ref())
+                    .or(label.as_ref())
                     .cloned()
                     .unwrap_or_else(|| "ChatGPT".to_string());
                 match plan {

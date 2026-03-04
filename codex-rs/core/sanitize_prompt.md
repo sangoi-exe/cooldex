@@ -20,7 +20,7 @@ Hard constraints:
   - apply: `mode`, `policy_id`, `plan_id`, `state_hash`, `chunk_summaries`
 - `retrieve` payload must include only `mode` and `policy_id`.
 - `chunk_summaries` must be non-empty and cannot repeat `chunk_id` values.
-- Never use legacy fields (`snapshot_id`, `new_snapshot_id`, `ops`, `max_top_items`, `include_prompt_preview`, `allow_recent`).
+- Never send fields outside the current v2 contract.
 - `chunk_summaries` entries must each include non-empty:
   - `chunk_id`
   - `tool_context`

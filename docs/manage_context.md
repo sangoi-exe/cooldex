@@ -20,8 +20,6 @@ Request fields:
 - `tool_context` (required)
 - `reasoning_context` (required)
 
-Legacy fields are intentionally invalid: `snapshot_id`, `new_snapshot_id`, `ops`, `max_top_items`, `include_prompt_preview`, `allow_recent`.
-
 ### `retrieve`
 
 Example:
@@ -40,6 +38,7 @@ Returns:
 - `progress_report`
 
 `chunk_manifest` is the source of truth for `chunk_id`s to summarize.
+If `chunk_manifest` is empty, do not call `apply`.
 
 ### `apply`
 

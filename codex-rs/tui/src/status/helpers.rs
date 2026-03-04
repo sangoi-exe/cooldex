@@ -99,8 +99,7 @@ pub(crate) fn compose_account_display(
                 .find(|account| account.is_active);
             let label = active_account
                 .as_ref()
-                .and_then(|account| account.label.clone())
-                .or_else(|| auth.get_account_id());
+                .and_then(|account| account.label.clone());
             let email = active_account
                 .as_ref()
                 .and_then(|account| account.email.clone())
