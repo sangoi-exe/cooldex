@@ -5633,6 +5633,12 @@ pub(crate) async fn run_sampling_request(
     );
     let mut retries = 0;
     loop {
+        let request_store_account_id = sess
+            .services
+            .auth_manager
+            .auth_cached()
+            .as_ref()
+            .and_then(CodexAuth::get_account_id);
         let err = match try_run_sampling_request(
             Arc::clone(&router),
             Arc::clone(&sess),
@@ -5663,6 +5669,7 @@ pub(crate) async fn run_sampling_request(
                     sess.as_ref(),
                     turn_context.as_ref(),
                     &e,
+                    request_store_account_id.as_deref(),
                 )
                 .await?
                 {
@@ -5737,6 +5744,7 @@ fn tool_name(tool: &crate::client_common::tools::ToolSpec) -> &str {
             function_tool.name.as_str()
         }
         crate::client_common::tools::ToolSpec::LocalShell {} => "local_shell",
+        crate::client_common::tools::ToolSpec::ImageGeneration {} => "image_generation",
         crate::client_common::tools::ToolSpec::WebSearch { .. } => "web_search",
         crate::client_common::tools::ToolSpec::Freeform(freeform_tool) => {
             freeform_tool.name.as_str()
@@ -6372,6 +6380,7 @@ async fn maybe_auto_switch_account_on_usage_limit(
     sess: &Session,
     turn_context: &TurnContext,
     usage_limit: &crate::error::UsageLimitReachedError,
+    request_store_account_id: Option<&str>,
 ) -> CodexResult<bool> {
     if sess.services.auth_manager.auth_mode() != Some(crate::auth::AuthMode::Chatgpt) {
         return Ok(false);
@@ -6398,29 +6407,56 @@ async fn maybe_auto_switch_account_on_usage_limit(
     };
     let active_account = accounts_before.iter().find(|account| account.is_active);
     let active_store_account_id = active_account.map(|account| account.id.clone());
-    let failing_store_account_id = sess
-        .services
-        .auth_manager
-        .auth_cached()
-        .as_ref()
-        .and_then(crate::auth::CodexAuth::get_account_id)
+    let failing_store_account_id = request_store_account_id
+        .map(str::to_owned)
         .filter(|store_account_id| {
             accounts_before
                 .iter()
                 .any(|account| account.id == *store_account_id)
         })
-        .or(active_store_account_id);
+        .or(active_store_account_id.clone());
 
     let required_workspace_id = turn_context.config.forced_chatgpt_workspace_id.as_deref();
-    let Some(next_store_account_id) = sess.services.auth_manager.switch_account_on_usage_limit(
+    let switch_result = sess.services.auth_manager.switch_account_on_usage_limit(
         required_workspace_id,
         failing_store_account_id.as_deref(),
         usage_limit.resets_at,
         usage_limit.rate_limits.as_deref().cloned(),
-    )?
-    else {
+    )?;
+    let Some(next_store_account_id) = switch_result else {
+        let current_active_store_account_id = sess
+            .services
+            .auth_manager
+            .list_accounts()
+            .into_iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id);
+        let should_retry_without_switch = request_store_account_id
+            .zip(failing_store_account_id.as_deref())
+            .is_some_and(|(request_store_account_id, failing_store_account_id)| {
+                request_store_account_id == failing_store_account_id
+            })
+            && failing_store_account_id.as_deref() != current_active_store_account_id.as_deref();
+        if should_retry_without_switch {
+            debug!(
+                active_store_account_id = ?active_store_account_id,
+                current_active_store_account_id = ?current_active_store_account_id,
+                failing_store_account_id = ?failing_store_account_id,
+                "auto-switch skipped but active account changed since request; retrying without duplicate warning"
+            );
+            return Ok(true);
+        }
         return Ok(false);
     };
+
+    if active_store_account_id.as_deref() == Some(next_store_account_id.as_str()) {
+        debug!(
+            active_store_account_id = ?active_store_account_id,
+            failing_store_account_id = ?failing_store_account_id,
+            "account already switched before usage-limit handling; retrying without duplicate warning"
+        );
+        return Ok(true);
+    }
 
     let accounts_after = sess.services.auth_manager.list_accounts();
     let from_account_name = failing_store_account_id
@@ -6463,16 +6499,23 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
         return;
     }
 
-    let account_ids = sess
-        .services
-        .auth_manager
-        .list_accounts()
-        .into_iter()
-        .map(|account| account.id)
+    let account_summaries = sess.services.auth_manager.list_accounts();
+    let account_ids = account_summaries
+        .iter()
+        .map(|account| account.id.clone())
         .collect::<Vec<_>>();
     if account_ids.is_empty() {
         return;
     }
+    let exhausted_until_by_account_id = account_summaries
+        .into_iter()
+        .filter_map(|account| {
+            account
+                .exhausted_until
+                .map(|exhausted_until| (account.id, exhausted_until.timestamp()))
+        })
+        .collect::<HashMap<_, _>>();
+    let now_unix_seconds = Utc::now().timestamp();
 
     let mut updates = Vec::new();
     for store_account_id in account_ids {
@@ -6485,7 +6528,23 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
         };
         match fetch_account_rate_limits_snapshot(&turn_context.config.chatgpt_base_url, &auth).await
         {
-            Ok(Some(snapshot)) => updates.push((store_account_id, snapshot)),
+            Ok(Some(snapshot)) => {
+                let should_skip_update = should_skip_auto_switch_refresh_update(
+                    exhausted_until_by_account_id
+                        .get(&store_account_id)
+                        .copied(),
+                    &snapshot,
+                    now_unix_seconds,
+                );
+                if should_skip_update {
+                    debug!(
+                        store_account_id = %store_account_id,
+                        "skipping rate-limit refresh update for exhausted account because snapshot appears temporarily unblocked"
+                    );
+                    continue;
+                }
+                updates.push((store_account_id, snapshot));
+            }
             Ok(None) => {}
             Err(err) => {
                 debug!(
@@ -6519,6 +6578,38 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
             );
         }
     }
+}
+
+fn should_skip_auto_switch_refresh_update(
+    exhausted_until_unix_seconds: Option<i64>,
+    snapshot: &crate::protocol::RateLimitSnapshot,
+    now_unix_seconds: i64,
+) -> bool {
+    exhausted_until_unix_seconds.is_some_and(|exhausted_until| exhausted_until > now_unix_seconds)
+        && !rate_limit_snapshot_reports_usage_blocked(snapshot, now_unix_seconds)
+}
+
+fn rate_limit_snapshot_reports_usage_blocked(
+    snapshot: &crate::protocol::RateLimitSnapshot,
+    now_unix_seconds: i64,
+) -> bool {
+    rate_limit_window_reports_usage_blocked(snapshot.secondary.as_ref(), now_unix_seconds)
+        || rate_limit_window_reports_usage_blocked(snapshot.primary.as_ref(), now_unix_seconds)
+}
+
+fn rate_limit_window_reports_usage_blocked(
+    window: Option<&crate::protocol::RateLimitWindow>,
+    now_unix_seconds: i64,
+) -> bool {
+    let Some(window) = window else {
+        return false;
+    };
+    if let Some(resets_at_unix_seconds) = window.resets_at
+        && now_unix_seconds >= resets_at_unix_seconds
+    {
+        return false;
+    }
+    window.used_percent >= 100.0
 }
 
 async fn fetch_account_rate_limits_snapshot(
@@ -7059,6 +7150,7 @@ mod tests {
     use opentelemetry_sdk::trace::SdkTracerProvider;
     use std::path::Path;
     use std::time::Duration;
+    use tokio::sync::Barrier;
     use tokio::time::sleep;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     use tracing_subscriber::prelude::*;
@@ -8254,7 +8346,7 @@ mod tests {
         };
 
         let switched =
-            maybe_auto_switch_account_on_usage_limit(&session, &turn_context, &usage_limit)
+            maybe_auto_switch_account_on_usage_limit(&session, &turn_context, &usage_limit, None)
                 .await
                 .expect("auto switch should not fail");
         assert!(switched, "should switch to another eligible account");
@@ -8353,7 +8445,7 @@ mod tests {
         };
 
         let switched =
-            maybe_auto_switch_account_on_usage_limit(&session, &turn_context, &usage_limit)
+            maybe_auto_switch_account_on_usage_limit(&session, &turn_context, &usage_limit, None)
                 .await
                 .expect("auto switch should not fail");
         assert!(switched, "should switch to another eligible account");
@@ -8429,7 +8521,7 @@ mod tests {
         };
 
         let switched =
-            maybe_auto_switch_account_on_usage_limit(&session, &turn_context, &usage_limit)
+            maybe_auto_switch_account_on_usage_limit(&session, &turn_context, &usage_limit, None)
                 .await
                 .expect("auto switch should not fail");
         assert!(switched, "should switch to another eligible account");
@@ -8508,7 +8600,7 @@ mod tests {
         };
 
         let switched =
-            maybe_auto_switch_account_on_usage_limit(&session, &turn_context, &usage_limit)
+            maybe_auto_switch_account_on_usage_limit(&session, &turn_context, &usage_limit, None)
                 .await
                 .expect("auto switch should not fail for sub-agent turns");
         assert!(
@@ -8524,6 +8616,395 @@ mod tests {
                 .map(|account| account.id.as_str()),
             Some("acc-2")
         );
+    }
+
+    #[tokio::test]
+    async fn maybe_auto_switch_account_on_usage_limit_retries_without_duplicate_warning_when_already_switched()
+     {
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        let (tx_event, rx_event) = async_channel::unbounded();
+        session.tx_event = tx_event;
+        let codex_home = tempfile::tempdir().expect("create temp codex home");
+        let auth_store = AuthStore {
+            active_account_id: Some("acc-2".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: Some("primary".to_string()),
+                    tokens: token_data_for_store_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: Some("secondary".to_string()),
+                    tokens: token_data_for_store_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        save_auth(
+            codex_home.path(),
+            &auth_store,
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("persist test auth store");
+
+        let auth_manager = AuthManager::shared(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        session.services.auth_manager = Arc::clone(&auth_manager);
+        turn_context.auth_manager = Some(Arc::clone(&auth_manager));
+
+        let usage_limit = crate::error::UsageLimitReachedError {
+            plan_type: None,
+            resets_at: Some(Utc::now() + chrono::Duration::minutes(60)),
+            rate_limits: Some(Box::new(RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: Some("codex".to_string()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 100.0,
+                    window_minutes: Some(300),
+                    resets_at: None,
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: 90.0,
+                    window_minutes: Some(10_080),
+                    resets_at: None,
+                }),
+                credits: None,
+                plan_type: None,
+            })),
+            promo_message: None,
+        };
+
+        let switched = maybe_auto_switch_account_on_usage_limit(
+            &session,
+            &turn_context,
+            &usage_limit,
+            Some("acc-1"),
+        )
+        .await
+        .expect("auto switch retry should not fail");
+        assert!(switched, "should retry when account already switched");
+
+        let accounts = auth_manager.list_accounts();
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|account| account.is_active)
+                .map(|account| account.id.as_str()),
+            Some("acc-2")
+        );
+        assert!(
+            accounts
+                .iter()
+                .find(|account| account.id == "acc-1")
+                .and_then(|account| account.exhausted_until)
+                .is_some(),
+            "failing account should still be marked exhausted"
+        );
+        assert!(
+            matches!(rx_event.try_recv(), Err(async_channel::TryRecvError::Empty)),
+            "should not emit duplicate auto-switch warning when already switched"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_auto_switch_account_on_usage_limit_retries_when_cooldown_suppresses_duplicate_switch()
+     {
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        let (tx_event, rx_event) = async_channel::unbounded();
+        session.tx_event = tx_event;
+        let codex_home = tempfile::tempdir().expect("create temp codex home");
+        let auth_store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: Some("primary".to_string()),
+                    tokens: token_data_for_store_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: Some("secondary".to_string()),
+                    tokens: token_data_for_store_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        save_auth(
+            codex_home.path(),
+            &auth_store,
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("persist test auth store");
+
+        let auth_manager = AuthManager::shared(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        session.services.auth_manager = Arc::clone(&auth_manager);
+        turn_context.auth_manager = Some(Arc::clone(&auth_manager));
+
+        let usage_limit = crate::error::UsageLimitReachedError {
+            plan_type: None,
+            resets_at: Some(Utc::now() + chrono::Duration::minutes(60)),
+            rate_limits: Some(Box::new(RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: Some("codex".to_string()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 100.0,
+                    window_minutes: Some(300),
+                    resets_at: None,
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: 90.0,
+                    window_minutes: Some(10_080),
+                    resets_at: None,
+                }),
+                credits: None,
+                plan_type: None,
+            })),
+            promo_message: None,
+        };
+
+        let first_switched = maybe_auto_switch_account_on_usage_limit(
+            &session,
+            &turn_context,
+            &usage_limit,
+            Some("acc-1"),
+        )
+        .await
+        .expect("first auto-switch retry should not fail");
+        assert!(first_switched, "first attempt should switch and retry");
+        let first_warning_message = wait_for_warning_message(&rx_event).await;
+        assert!(
+            first_warning_message.contains("Auto-switched"),
+            "first attempt should emit switch warning"
+        );
+
+        let second_switched = maybe_auto_switch_account_on_usage_limit(
+            &session,
+            &turn_context,
+            &usage_limit,
+            Some("acc-1"),
+        )
+        .await
+        .expect("second auto-switch retry should not fail");
+        assert!(
+            second_switched,
+            "second attempt should retry when cooldown suppresses duplicate switch"
+        );
+
+        let accounts = auth_manager.list_accounts();
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|account| account.is_active)
+                .map(|account| account.id.as_str()),
+            Some("acc-2")
+        );
+        assert!(
+            matches!(rx_event.try_recv(), Err(async_channel::TryRecvError::Empty)),
+            "second retry should not emit duplicate warning"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn maybe_auto_switch_account_on_usage_limit_retries_when_other_lane_switched_between_snapshot_and_switch()
+     {
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        let (tx_event, rx_event) = async_channel::unbounded();
+        session.tx_event = tx_event;
+        let codex_home = tempfile::tempdir().expect("create temp codex home");
+        let auth_store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: Some("primary".to_string()),
+                    tokens: token_data_for_store_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: Some("secondary".to_string()),
+                    tokens: token_data_for_store_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        save_auth(
+            codex_home.path(),
+            &auth_store,
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("persist test auth store");
+
+        let auth_manager = AuthManager::shared(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        session.services.auth_manager = Arc::clone(&auth_manager);
+        turn_context.auth_manager = Some(Arc::clone(&auth_manager));
+
+        let usage_limit = Arc::new(crate::error::UsageLimitReachedError {
+            plan_type: None,
+            resets_at: Some(Utc::now() + chrono::Duration::minutes(60)),
+            rate_limits: Some(Box::new(RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: Some("codex".to_string()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 100.0,
+                    window_minutes: Some(300),
+                    resets_at: None,
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: 90.0,
+                    window_minutes: Some(10_080),
+                    resets_at: None,
+                }),
+                credits: None,
+                plan_type: None,
+            })),
+            promo_message: None,
+        });
+
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        let start_barrier = Arc::new(Barrier::new(3));
+        let cooldown_lock = auth_manager.lock_usage_limit_auto_switch_cooldown_for_test();
+
+        let lane_one = {
+            let session = Arc::clone(&session);
+            let turn_context = Arc::clone(&turn_context);
+            let start_barrier = Arc::clone(&start_barrier);
+            let usage_limit = Arc::clone(&usage_limit);
+            tokio::spawn(async move {
+                start_barrier.wait().await;
+                maybe_auto_switch_account_on_usage_limit(
+                    &session,
+                    &turn_context,
+                    usage_limit.as_ref(),
+                    Some("acc-1"),
+                )
+                .await
+            })
+        };
+        let lane_two = {
+            let session = Arc::clone(&session);
+            let turn_context = Arc::clone(&turn_context);
+            let start_barrier = Arc::clone(&start_barrier);
+            let usage_limit = Arc::clone(&usage_limit);
+            tokio::spawn(async move {
+                start_barrier.wait().await;
+                maybe_auto_switch_account_on_usage_limit(
+                    &session,
+                    &turn_context,
+                    usage_limit.as_ref(),
+                    Some("acc-1"),
+                )
+                .await
+            })
+        };
+
+        start_barrier.wait().await;
+        sleep(Duration::from_millis(50)).await;
+        drop(cooldown_lock);
+
+        let lane_one_switched = lane_one
+            .await
+            .expect("join lane one")
+            .expect("lane one should not fail");
+        let lane_two_switched = lane_two
+            .await
+            .expect("join lane two")
+            .expect("lane two should not fail");
+        assert!(
+            lane_one_switched && lane_two_switched,
+            "both lanes should retry successfully when one switches and the other is cooldown-suppressed"
+        );
+
+        let accounts = auth_manager.list_accounts();
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|account| account.is_active)
+                .map(|account| account.id.as_str()),
+            Some("acc-2")
+        );
+
+        let mut warning_count = 0;
+        while let Ok(event) = rx_event.try_recv() {
+            if matches!(event.msg, EventMsg::Warning(_)) {
+                warning_count += 1;
+            }
+        }
+        assert_eq!(
+            warning_count, 1,
+            "exactly one lane should emit the auto-switch warning"
+        );
+    }
+
+    #[test]
+    fn should_skip_auto_switch_refresh_update_when_account_is_still_exhausted_and_snapshot_looks_unblocked()
+     {
+        let now_unix_seconds = 1_700_000_000;
+        let snapshot = RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: Some("codex".to_string()),
+            primary: Some(RateLimitWindow {
+                used_percent: 32.0,
+                window_minutes: Some(5),
+                resets_at: Some(now_unix_seconds + 300),
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: None,
+        };
+
+        assert!(should_skip_auto_switch_refresh_update(
+            Some(now_unix_seconds + 120),
+            &snapshot,
+            now_unix_seconds,
+        ));
+    }
+
+    #[test]
+    fn should_not_skip_auto_switch_refresh_update_when_snapshot_still_reports_blocked() {
+        let now_unix_seconds = 1_700_000_000;
+        let snapshot = RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: Some("codex".to_string()),
+            primary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(5),
+                resets_at: Some(now_unix_seconds + 300),
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: None,
+        };
+
+        assert!(!should_skip_auto_switch_refresh_update(
+            Some(now_unix_seconds + 120),
+            &snapshot,
+            now_unix_seconds,
+        ));
     }
 
     #[test]

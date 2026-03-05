@@ -8,10 +8,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use tokio::task::JoinHandle;
 
-use codex_protocol::models::ContentItem;
-use codex_protocol::models::FunctionCallOutputBody;
-use codex_protocol::models::FunctionCallOutputPayload;
-use codex_protocol::openai_models::InputModality;
 use crate::codex::PreviousTurnSettings;
 use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
@@ -34,6 +30,10 @@ use crate::state::ContextOverlay;
 use crate::state::PruneCategory;
 use crate::tasks::RegularTask;
 use crate::truncate::TruncationPolicy;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::TurnContextItem;
 
 #[derive(Default)]
@@ -540,7 +540,8 @@ fn prune_category_for_item(item: &ResponseItem) -> PruneCategory {
         ResponseItem::FunctionCall { .. }
         | ResponseItem::CustomToolCall { .. }
         | ResponseItem::LocalShellCall { .. }
-        | ResponseItem::WebSearchCall { .. } => PruneCategory::ToolCall,
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. } => PruneCategory::ToolCall,
         ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. } => {
             PruneCategory::ToolOutput
         }
@@ -562,6 +563,7 @@ fn preview_for_item(item: &ResponseItem) -> String {
         ResponseItem::CustomToolCall { name, .. } => format!("tool call: {name}"),
         ResponseItem::LocalShellCall { .. } => "tool call: local_shell".to_string(),
         ResponseItem::WebSearchCall { .. } => "tool call: web_search".to_string(),
+        ResponseItem::ImageGenerationCall { .. } => "tool call: image_generation".to_string(),
         ResponseItem::FunctionCallOutput { output, .. } => {
             let text = output.body.to_text().unwrap_or_default();
             tool_output_preview_line(&text).to_string()

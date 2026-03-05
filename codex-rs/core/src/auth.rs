@@ -107,6 +107,7 @@ impl PartialEq for CodexAuth {
 
 // TODO(pakrym): use token exp field to check for expiration instead
 const TOKEN_REFRESH_INTERVAL: i64 = 8;
+const USAGE_LIMIT_AUTO_SWITCH_COOLDOWN_SECONDS: i64 = 2;
 
 const REFRESH_TOKEN_EXPIRED_MESSAGE: &str = "Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.";
 const REFRESH_TOKEN_REUSED_MESSAGE: &str = "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.";
@@ -1092,6 +1093,7 @@ pub struct AuthManager {
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     forced_chatgpt_workspace_id: RwLock<Option<String>>,
+    usage_limit_auto_switch_cooldown_until: Mutex<Option<DateTime<Utc>>>,
     _test_home_guard: Option<tempfile::TempDir>,
 }
 
@@ -1138,6 +1140,7 @@ impl AuthManager {
             enable_codex_api_key_env,
             auth_credentials_store_mode,
             forced_chatgpt_workspace_id: RwLock::new(None),
+            usage_limit_auto_switch_cooldown_until: Mutex::new(None),
             _test_home_guard: None,
         }
     }
@@ -1161,6 +1164,7 @@ impl AuthManager {
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             forced_chatgpt_workspace_id: RwLock::new(None),
+            usage_limit_auto_switch_cooldown_until: Mutex::new(None),
             _test_home_guard: Some(temp_dir),
         })
     }
@@ -1184,8 +1188,18 @@ impl AuthManager {
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             forced_chatgpt_workspace_id: RwLock::new(None),
+            usage_limit_auto_switch_cooldown_until: Mutex::new(None),
             _test_home_guard: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_usage_limit_auto_switch_cooldown_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<DateTime<Utc>>> {
+        self.usage_limit_auto_switch_cooldown_until
+            .lock()
+            .expect("auto-switch cooldown lock should not be poisoned in tests")
     }
 
     /// Current cached auth (clone) without attempting a refresh.
@@ -1424,8 +1438,21 @@ impl AuthManager {
             return Ok(None);
         }
 
-        self.update_store(|store| {
-            let now = Utc::now();
+        let cooldown_check_now = Utc::now();
+        let mut cooldown_until = self
+            .usage_limit_auto_switch_cooldown_until
+            .lock()
+            .map_err(|_| std::io::Error::other("auto-switch cooldown lock poisoned"))?;
+        if cooldown_until.is_some_and(|until| until > cooldown_check_now) {
+            tracing::debug!(
+                cooldown_until = ?*cooldown_until,
+                "skipping usage-limit auto-switch during cooldown"
+            );
+            return Ok(None);
+        }
+
+        let switched_to = self.update_store(|store| {
+            let mutation_now = Utc::now();
             let failing_store_account_id = match failing_store_account_id {
                 Some(store_account_id) => {
                     if store
@@ -1456,14 +1483,14 @@ impl AuthManager {
             let usage = failing_account
                 .usage
                 .get_or_insert_with(AccountUsageCache::default);
-            usage.last_seen_at = Some(now);
+            usage.last_seen_at = Some(mutation_now);
             if let Some(snapshot) = snapshot.clone() {
                 usage.last_rate_limits = Some(snapshot);
             }
             usage.exhausted_until = Some(exhausted_until(
                 resets_at,
                 usage.last_rate_limits.as_ref(),
-                now,
+                mutation_now,
             ));
 
             let mut candidates = store
@@ -1471,7 +1498,7 @@ impl AuthManager {
                 .iter()
                 .filter(|account| {
                     account.id != failing_store_account_id
-                        && account_selectable(account, required_workspace_id, now)
+                        && account_selectable(account, required_workspace_id, mutation_now)
                 })
                 .collect::<Vec<_>>();
 
@@ -1489,11 +1516,19 @@ impl AuthManager {
                 let usage = next_account
                     .usage
                     .get_or_insert_with(AccountUsageCache::default);
-                usage.last_seen_at = Some(now);
+                usage.last_seen_at = Some(mutation_now);
             }
 
             Ok(Some(next_account_id))
-        })
+        })?;
+        if switched_to.is_some() {
+            let cooldown_started_at = Utc::now();
+            *cooldown_until = Some(
+                cooldown_started_at
+                    + chrono::Duration::seconds(USAGE_LIMIT_AUTO_SWITCH_COOLDOWN_SECONDS),
+            );
+        }
+        Ok(switched_to)
     }
 
     pub fn select_account_for_auto_switch(
@@ -3150,6 +3185,83 @@ mod tests {
         assert!(
             active_account.exhausted_until.is_none(),
             "active account should not be marked exhausted when failing account is unknown"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn switch_account_on_usage_limit_respects_short_cooldown() -> std::io::Result<()> {
+        use crate::protocol::RateLimitSnapshot;
+        use crate::protocol::RateLimitWindow;
+
+        let dir = tempdir().unwrap();
+        let store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        super::save_auth(dir.path(), &store, AuthCredentialsStoreMode::File)?;
+
+        let manager = AuthManager::shared(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        let reset = Utc::now() + chrono::Duration::minutes(90);
+        let snapshot = RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(300),
+                resets_at: Some(reset.timestamp()),
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: None,
+        };
+
+        let first_switch = manager.switch_account_on_usage_limit(
+            None,
+            Some("acc-1"),
+            Some(reset),
+            Some(snapshot.clone()),
+        )?;
+        assert_eq!(first_switch, Some("acc-2".to_string()));
+
+        let second_switch = manager.switch_account_on_usage_limit(
+            None,
+            Some("acc-2"),
+            Some(reset),
+            Some(snapshot),
+        )?;
+        assert_eq!(
+            second_switch, None,
+            "second switch in short window should be suppressed by cooldown"
+        );
+
+        let accounts = manager.list_accounts();
+        assert_eq!(
+            accounts
+                .iter()
+                .find(|account| account.is_active)
+                .map(|account| account.id.as_str()),
+            Some("acc-2")
         );
         Ok(())
     }

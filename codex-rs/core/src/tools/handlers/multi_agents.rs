@@ -931,7 +931,14 @@ pub(crate) fn build_agent_spawn_config(
         config.developer_instructions = None;
         config.user_instructions = None;
         config.project_doc_max_bytes = 0;
-        config.features.disable(Feature::ChildAgentsMd);
+        config
+            .features
+            .disable(Feature::ChildAgentsMd)
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "failed to disable ChildAgentsMd for sub-agent spawn config: {error}"
+                ))
+            })?;
     }
     Ok(config)
 }
