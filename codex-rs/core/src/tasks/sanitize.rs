@@ -288,6 +288,10 @@ impl SessionTask for SanitizeTask {
         TaskKind::Sanitize
     }
 
+    fn span_name(&self) -> &'static str {
+        "session_task.sanitize"
+    }
+
     async fn run(
         self: Arc<Self>,
         session: Arc<SessionTaskContext>,

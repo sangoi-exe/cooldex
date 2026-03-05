@@ -112,6 +112,8 @@ use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExitedReviewModeEvent;
+use codex_protocol::protocol::ImageGenerationBeginEvent;
+use codex_protocol::protocol::ImageGenerationEndEvent;
 use codex_protocol::protocol::ListCustomPromptsResponseEvent;
 use codex_protocol::protocol::ListSkillsResponseEvent;
 use codex_protocol::protocol::McpListToolsResponseEvent;
@@ -1254,6 +1256,7 @@ impl ChatWidget {
         self.sync_fast_command_enabled();
         self.sync_personality_command_enabled();
         let startup_tooltip_override = self.startup_tooltip_override.take();
+        let show_fast_status = self.should_show_fast_status(event.service_tier);
         let session_info_cell = history_cell::new_session_info(
             &self.config,
             &model_for_header,
@@ -1263,6 +1266,7 @@ impl ChatWidget {
             self.auth_manager
                 .auth_cached()
                 .and_then(|auth| auth.account_plan_type()),
+            show_fast_status,
         );
         self.apply_session_info_cell(session_info_cell);
 
@@ -1400,9 +1404,7 @@ impl ChatWidget {
             self.app_event_tx.clone(),
             category,
             self.current_rollout_path.clone(),
-            snapshot
-                .feedback_diagnostics_attachment_text(true)
-                .is_some(),
+            snapshot.feedback_diagnostics(),
         );
         self.bottom_pane.show_selection_view(params);
         self.request_redraw();
@@ -1743,6 +1745,9 @@ impl ChatWidget {
             footer_hint: Some(standard_popup_hint_line()),
             items,
             ..Default::default()
+        });
+        self.notify(Notification::PlanModePrompt {
+            title: PLAN_IMPLEMENTATION_TITLE.to_string(),
         });
     }
 
@@ -2377,6 +2382,20 @@ impl ChatWidget {
         self.request_redraw();
     }
 
+    fn on_image_generation_begin(&mut self, _event: ImageGenerationBeginEvent) {
+        self.flush_answer_stream_with_separator();
+    }
+
+    fn on_image_generation_end(&mut self, event: ImageGenerationEndEvent) {
+        self.flush_answer_stream_with_separator();
+        self.add_to_history(history_cell::new_image_generation_call(
+            event.call_id,
+            event.status,
+            event.revised_prompt,
+        ));
+        self.request_redraw();
+    }
+
     fn on_patch_apply_end(&mut self, event: codex_protocol::protocol::PatchApplyEndEvent) {
         let ev2 = event.clone();
         self.defer_or_handle(
@@ -2955,7 +2974,7 @@ impl ChatWidget {
             thread_label: None,
             server_name: ev.server_name,
             request_id: ev.id,
-            message: ev.message,
+            message: ev.request.message().to_string(),
         };
         self.bottom_pane
             .push_approval_request(request, &self.config.features);
@@ -2970,6 +2989,10 @@ impl ChatWidget {
 
     pub(crate) fn handle_request_user_input_now(&mut self, ev: RequestUserInputEvent) {
         self.flush_answer_stream_with_separator();
+        self.notify(Notification::UserInputRequested {
+            question_count: ev.questions.len(),
+            summary: Notification::user_input_request_summary(&ev.questions),
+        });
         self.bottom_pane.push_user_input_request(ev);
         self.request_redraw();
     }
@@ -3433,6 +3456,9 @@ impl ChatWidget {
         widget
             .bottom_pane
             .set_queued_message_edit_binding(widget.queued_message_edit_binding);
+        widget
+            .bottom_pane
+            .set_connectors_enabled(widget.config.features.enabled(Feature::Apps));
 
         widget
     }
@@ -3614,6 +3640,9 @@ impl ChatWidget {
                 ),
         );
         widget.update_collaboration_mode_indicator();
+        widget
+            .bottom_pane
+            .set_connectors_enabled(widget.config.features.enabled(Feature::Apps));
 
         widget
     }
@@ -4847,6 +4876,8 @@ impl ChatWidget {
             EventMsg::PatchApplyEnd(ev) => self.on_patch_apply_end(ev),
             EventMsg::ExecCommandEnd(ev) => self.on_exec_command_end(ev),
             EventMsg::ViewImageToolCall(ev) => self.on_view_image_tool_call(ev),
+            EventMsg::ImageGenerationBegin(ev) => self.on_image_generation_begin(ev),
+            EventMsg::ImageGenerationEnd(ev) => self.on_image_generation_end(ev),
             EventMsg::McpToolCallBegin(ev) => self.on_mcp_tool_call_begin(ev),
             EventMsg::McpToolCallEnd(ev) => self.on_mcp_tool_call_end(ev),
             EventMsg::WebSearchBegin(ev) => self.on_web_search_begin(ev),
@@ -5090,6 +5121,11 @@ impl ChatWidget {
 
     fn notify(&mut self, notification: Notification) {
         if !notification.allowed_for(&self.config.tui_notifications) {
+            return;
+        }
+        if let Some(existing) = self.pending_notification.as_ref()
+            && existing.priority() > notification.priority()
+        {
             return;
         }
         self.pending_notification = Some(notification);
@@ -6287,6 +6323,9 @@ impl ChatWidget {
                 },
             ],
             ..Default::default()
+        });
+        self.notify(Notification::PlanModePrompt {
+            title: PLAN_MODE_REASONING_SCOPE_TITLE.to_string(),
         });
     }
 
@@ -7733,6 +7772,15 @@ impl ChatWidget {
         self.config.service_tier
     }
 
+    pub(crate) fn should_show_fast_status(&self, service_tier: Option<ServiceTier>) -> bool {
+        matches!(service_tier, Some(ServiceTier::Fast))
+            && self
+                .auth_manager
+                .auth_cached()
+                .as_ref()
+                .is_some_and(CodexAuth::is_chatgpt_auth)
+    }
+
     fn fast_mode_enabled(&self) -> bool {
         self.config.features.enabled(Feature::FastMode)
     }
@@ -8067,6 +8115,7 @@ impl ChatWidget {
             DEFAULT_MODEL_DISPLAY_NAME.to_string(),
             placeholder_style,
             None,
+            false,
             config.cwd.clone(),
             CODEX_CLI_VERSION,
         ))
@@ -8934,11 +8983,28 @@ impl Renderable for ChatWidget {
     }
 }
 
+#[derive(Debug)]
 enum Notification {
-    AgentTurnComplete { response: String },
-    ExecApprovalRequested { command: String },
-    EditApprovalRequested { cwd: PathBuf, changes: Vec<PathBuf> },
-    ElicitationRequested { server_name: String },
+    AgentTurnComplete {
+        response: String,
+    },
+    ExecApprovalRequested {
+        command: String,
+    },
+    EditApprovalRequested {
+        cwd: PathBuf,
+        changes: Vec<PathBuf>,
+    },
+    ElicitationRequested {
+        server_name: String,
+    },
+    PlanModePrompt {
+        title: String,
+    },
+    UserInputRequested {
+        question_count: usize,
+        summary: Option<String>,
+    },
 }
 
 impl Notification {
@@ -8965,6 +9031,17 @@ impl Notification {
             Notification::ElicitationRequested { server_name } => {
                 format!("Approval requested by {server_name}")
             }
+            Notification::PlanModePrompt { title } => {
+                format!("Plan mode prompt: {title}")
+            }
+            Notification::UserInputRequested {
+                question_count,
+                summary,
+            } => match (*question_count, summary.as_deref()) {
+                (1, Some(summary)) => format!("Question requested: {summary}"),
+                (1, None) => "Question requested".to_string(),
+                (count, _) => format!("Questions requested: {count}"),
+            },
         }
     }
 
@@ -8974,6 +9051,19 @@ impl Notification {
             Notification::ExecApprovalRequested { .. }
             | Notification::EditApprovalRequested { .. }
             | Notification::ElicitationRequested { .. } => "approval-requested",
+            Notification::PlanModePrompt { .. } => "plan-mode-prompt",
+            Notification::UserInputRequested { .. } => "user-input-requested",
+        }
+    }
+
+    fn priority(&self) -> u8 {
+        match self {
+            Notification::AgentTurnComplete { .. } => 0,
+            Notification::ExecApprovalRequested { .. }
+            | Notification::EditApprovalRequested { .. }
+            | Notification::ElicitationRequested { .. }
+            | Notification::PlanModePrompt { .. }
+            | Notification::UserInputRequested { .. } => 1,
         }
     }
 
@@ -8997,6 +9087,22 @@ impl Notification {
             None
         } else {
             Some(truncate_text(trimmed, AGENT_NOTIFICATION_PREVIEW_GRAPHEMES))
+        }
+    }
+
+    fn user_input_request_summary(
+        questions: &[codex_protocol::request_user_input::RequestUserInputQuestion],
+    ) -> Option<String> {
+        let first_question = questions.first()?;
+        let summary = if first_question.header.trim().is_empty() {
+            first_question.question.trim()
+        } else {
+            first_question.header.trim()
+        };
+        if summary.is_empty() {
+            None
+        } else {
+            Some(truncate_text(summary, 30))
         }
     }
 }
