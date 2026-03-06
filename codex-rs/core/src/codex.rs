@@ -6377,7 +6377,7 @@ async fn drain_in_flight(
         model = %turn_context.model_info.slug
     )
 )]
-async fn maybe_auto_switch_account_on_usage_limit(
+pub(crate) async fn maybe_auto_switch_account_on_usage_limit(
     sess: &Session,
     turn_context: &TurnContext,
     usage_limit: &crate::error::UsageLimitReachedError,
