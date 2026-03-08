@@ -27,8 +27,15 @@ pub(crate) fn with_config_overrides(mut model: ModelInfo, config: &Config) -> Mo
     {
         model.supports_reasoning_summaries = true;
     }
-    if let Some(context_window) = config.model_context_window {
-        model.context_window = Some(context_window);
+    if let Some(config_context_window) = config.model_context_window {
+        let resolved_context_window = if let Some(remote_context_window) = model.context_window
+            && !model.used_fallback_model_metadata
+        {
+            config_context_window.min(remote_context_window)
+        } else {
+            config_context_window
+        };
+        model.context_window = Some(resolved_context_window);
     }
     if let Some(auto_compact_token_limit) = config.model_auto_compact_token_limit {
         model.auto_compact_token_limit = Some(auto_compact_token_limit);
@@ -149,5 +156,42 @@ mod tests {
         let updated = with_config_overrides(model.clone(), &config);
 
         assert_eq!(updated, model);
+    }
+
+    #[test]
+    fn context_window_override_is_clamped_to_remote_metadata() {
+        let mut model = model_info_from_slug("gpt-5.3-codex");
+        model.used_fallback_model_metadata = false;
+        model.context_window = Some(272_000);
+        let mut config = test_config();
+        config.model_context_window = Some(1_000_000);
+
+        let updated = with_config_overrides(model.clone(), &config);
+
+        assert_eq!(updated.context_window, Some(272_000));
+    }
+
+    #[test]
+    fn context_window_override_can_reduce_remote_metadata() {
+        let mut model = model_info_from_slug("gpt-5.3-codex");
+        model.used_fallback_model_metadata = false;
+        model.context_window = Some(272_000);
+        let mut config = test_config();
+        config.model_context_window = Some(200_000);
+
+        let updated = with_config_overrides(model.clone(), &config);
+
+        assert_eq!(updated.context_window, Some(200_000));
+    }
+
+    #[test]
+    fn context_window_override_is_used_for_fallback_metadata() {
+        let model = model_info_from_slug("unknown-model");
+        let mut config = test_config();
+        config.model_context_window = Some(1_000_000);
+
+        let updated = with_config_overrides(model, &config);
+
+        assert_eq!(updated.context_window, Some(1_000_000));
     }
 }

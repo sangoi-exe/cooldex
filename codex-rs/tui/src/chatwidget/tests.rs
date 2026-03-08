@@ -1856,6 +1856,7 @@ async fn make_chatwidget_manual(
         plan_stream_controller: None,
         function_call_names_by_id: HashMap::new(),
         last_copyable_output: None,
+        last_debug_raw_response_item: None,
         running_commands: HashMap::new(),
         suppressed_exec_calls: HashSet::new(),
         skills_all: Vec::new(),
@@ -2015,6 +2016,7 @@ fn set_chatgpt_auth_with_secondary_account(chat: &mut ChatWidget) {
         chat.config.codex_home.clone(),
         chat.auth_manager.clone(),
         None,
+        CollaborationModesConfig::default(),
     ));
 }
 
@@ -6007,6 +6009,139 @@ async fn slash_copy_does_not_return_stale_output_after_thread_rollback() {
             "`/copy` is unavailable before the first Codex output or right after a rollback."
         ),
         "expected rollback-cleared copy state message, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_debug_state_tracks_latest_raw_response_item() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let item = ResponseItem::FunctionCall {
+        id: None,
+        name: "shell".to_string(),
+        arguments: "{\"cmd\":\"pwd\"}".to_string(),
+        call_id: "call-debug-state".to_string(),
+    };
+    let expected = serde_json::to_string_pretty(&item).expect("serialize expected debug payload");
+
+    chat.handle_codex_event(Event {
+        id: "raw-debug-state".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent { item }),
+    });
+
+    assert_eq!(chat.last_debug_raw_response_item, Some(Ok(expected)));
+}
+
+#[tokio::test]
+async fn slash_debug_reports_when_no_raw_output_exists() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.dispatch_command(SlashCommand::Debug);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one info message");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains(
+            "`/debug` is unavailable before the first raw response output or right after a rollback."
+        ),
+        "expected no-output message, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_debug_state_clears_on_thread_rollback() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "raw-debug-rollback".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                arguments: "{\"cmd\":\"pwd\"}".to_string(),
+                call_id: "call-debug-rollback".to_string(),
+            },
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "rollback-debug-1".into(),
+        msg: EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
+    });
+
+    assert_eq!(chat.last_debug_raw_response_item, None);
+}
+
+#[tokio::test]
+async fn slash_debug_is_unavailable_after_thread_rollback() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "raw-debug-stale".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                arguments: "{\"cmd\":\"pwd\"}".to_string(),
+                call_id: "call-debug-stale".to_string(),
+            },
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "rollback-debug-stale".into(),
+        msg: EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
+    });
+    let _ = drain_insert_history(&mut rx);
+
+    chat.dispatch_command(SlashCommand::Debug);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one info message");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains(
+            "`/debug` is unavailable before the first raw response output or right after a rollback."
+        ),
+        "expected rollback-cleared debug state message, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_debug_renders_cached_payload_with_json_fence() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "raw-debug-success".into(),
+        msg: EventMsg::RawResponseItem(RawResponseItemEvent {
+            item: ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".to_string(),
+                arguments: "{\"cmd\":\"pwd\"}".to_string(),
+                call_id: "call-debug-success".to_string(),
+            },
+        }),
+    });
+    let _ = drain_insert_history(&mut rx);
+
+    chat.dispatch_command(SlashCommand::Debug);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one info message");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("Latest raw API response item:"),
+        "expected debug heading, got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("```json"),
+        "expected opening json fence, got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("\"call_id\": \"call-debug-success\""),
+        "expected serialized payload content, got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("```"),
+        "expected fenced payload terminator, got {rendered:?}"
     );
 }
 

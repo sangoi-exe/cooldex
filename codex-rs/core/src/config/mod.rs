@@ -201,7 +201,10 @@ pub struct Config {
     /// Model used specifically for review sessions.
     pub review_model: Option<String>,
 
-    /// Size of the context window for the model, in tokens.
+    /// Requested context window override, in tokens.
+    ///
+    /// When remote model metadata provides a context window, this value is
+    /// clamped so it cannot exceed the remote model's context window.
     pub model_context_window: Option<i64>,
 
     /// Token usage threshold triggering auto-compaction of conversation history.
@@ -1042,7 +1045,10 @@ pub struct ConfigToml {
     /// Provider to use from the model_providers map.
     pub model_provider: Option<String>,
 
-    /// Size of the context window for the model, in tokens.
+    /// Requested context window override, in tokens.
+    ///
+    /// When remote model metadata provides a context window, this value is
+    /// clamped so it cannot exceed the remote model's context window.
     pub model_context_window: Option<i64>,
 
     /// Token usage threshold triggering auto-compaction of conversation history.

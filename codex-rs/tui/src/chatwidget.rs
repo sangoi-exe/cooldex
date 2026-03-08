@@ -606,6 +606,12 @@ pub(crate) struct ChatWidget {
     function_call_names_by_id: HashMap<String, String>,
     // Latest completed user-visible Codex output that `/copy` should place on the clipboard.
     last_copyable_output: Option<String>,
+    // Latest raw API response item captured for `/debug`.
+    //
+    // `Ok(pretty_json)` stores the formatted payload. `Err(_)` indicates we observed a raw item
+    // but failed to serialize it, and `/debug` should fail loud instead of silently reporting
+    // unavailable or stale data.
+    last_debug_raw_response_item: Option<Result<String, String>>,
     running_commands: HashMap<String, RunningCommand>,
     suppressed_exec_calls: HashSet<String>,
     skills_all: Vec<ProtocolSkillMetadata>,
@@ -1425,6 +1431,9 @@ impl ChatWidget {
     }
 
     fn on_raw_response_item(&mut self, event: RawResponseItemEvent) {
+        self.last_debug_raw_response_item =
+            Some(serde_json::to_string_pretty(&event.item).map_err(|err| err.to_string()));
+
         match event.item {
             ResponseItem::FunctionCall { call_id, name, .. } => {
                 self.function_call_names_by_id.insert(call_id, name);
@@ -3197,6 +3206,7 @@ impl ChatWidget {
             plan_stream_controller: None,
             function_call_names_by_id: HashMap::new(),
             last_copyable_output: None,
+            last_debug_raw_response_item: None,
             running_commands: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
@@ -3380,6 +3390,7 @@ impl ChatWidget {
             plan_stream_controller: None,
             function_call_names_by_id: HashMap::new(),
             last_copyable_output: None,
+            last_debug_raw_response_item: None,
             running_commands: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
@@ -3555,6 +3566,7 @@ impl ChatWidget {
             plan_stream_controller: None,
             function_call_names_by_id: HashMap::new(),
             last_copyable_output: None,
+            last_debug_raw_response_item: None,
             running_commands: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
@@ -4116,6 +4128,32 @@ impl ChatWidget {
                     }
                     Err(err) => {
                         self.add_error_message(format!("Failed to copy to clipboard: {err}"))
+                    }
+                }
+            }
+            SlashCommand::Debug => {
+                let Some(latest_raw_response) = self.last_debug_raw_response_item.as_ref() else {
+                    self.add_info_message(
+                        "`/debug` is unavailable before the first raw response output or right after a rollback."
+                            .to_string(),
+                        None,
+                    );
+                    return;
+                };
+
+                match latest_raw_response {
+                    Ok(raw_response) => {
+                        self.add_info_message(
+                            format!(
+                                "Latest raw API response item:\n\n```json\n{raw_response}\n```"
+                            ),
+                            None,
+                        );
+                    }
+                    Err(err) => {
+                        self.add_error_message(format!(
+                            "Failed to serialize latest raw response item for `/debug`: {err}"
+                        ));
                     }
                 }
             }
@@ -4935,10 +4973,11 @@ impl ChatWidget {
             EventMsg::CollabResumeBegin(ev) => self.on_collab_event(multi_agents::resume_begin(ev)),
             EventMsg::CollabResumeEnd(ev) => self.on_collab_event(multi_agents::resume_end(ev)),
             EventMsg::ThreadRolledBack(rollback) => {
-                // Conservatively clear `/copy` state on rollback. The app layer trims visible
-                // transcript cells, but we do not maintain rollback-aware raw-markdown history yet,
-                // so keeping the previous cache can return content that was just removed.
+                // Conservatively clear `/copy` and `/debug` state on rollback. The app layer trims
+                // visible transcript cells, but we do not maintain rollback-aware raw-markdown
+                // history yet, so keeping previous caches can return content that was just removed.
                 self.last_copyable_output = None;
+                self.last_debug_raw_response_item = None;
                 if from_replay {
                     self.app_event_tx.send(AppEvent::ApplyThreadRollback {
                         num_turns: rollback.num_turns,

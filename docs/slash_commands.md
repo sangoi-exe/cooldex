@@ -21,6 +21,7 @@ Control Codex’s behavior during an interactive session with slash commands.
 | `/compact`      | summarize conversation to prevent hitting the context limit                |
 | `/sanitize`     | sanitize context using manage_context                                      |
 | `/diff`         | show git diff (including untracked files)                                  |
+| `/debug`        | show the latest raw API response item captured by the TUI                  |
 | `/mention`      | mention a file                                                             |
 | `/status`       | show current session configuration and token usage                         |
 | `/accounts`     | manage ChatGPT accounts (switch active / add account)                      |

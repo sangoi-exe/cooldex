@@ -36,6 +36,7 @@ pub enum SlashCommand {
     // Undo,
     Diff,
     Copy,
+    Debug,
     Mention,
     Status,
     DebugConfig,
@@ -82,6 +83,7 @@ impl SlashCommand {
             SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
             SlashCommand::Diff => "show git diff (including untracked files)",
             SlashCommand::Copy => "copy the latest Codex output to your clipboard",
+            SlashCommand::Debug => "show the latest raw API response item",
             SlashCommand::Mention => "mention a file",
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
@@ -163,6 +165,7 @@ impl SlashCommand {
             | SlashCommand::MemoryUpdate => false,
             SlashCommand::Diff
             | SlashCommand::Copy
+            | SlashCommand::Debug
             | SlashCommand::Rename
             | SlashCommand::Mention
             | SlashCommand::Skills
@@ -210,6 +213,7 @@ mod tests {
     #[test]
     fn task_availability_preserves_existing_commands() {
         assert_eq!(SlashCommand::DebugConfig.available_during_task(), true);
+        assert_eq!(SlashCommand::Debug.available_during_task(), true);
         assert_eq!(SlashCommand::Clean.available_during_task(), true);
         assert_eq!(SlashCommand::Sanitize.available_during_task(), false);
         assert_eq!(SlashCommand::Accounts.available_during_task(), false);
