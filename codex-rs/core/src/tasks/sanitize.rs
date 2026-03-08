@@ -256,10 +256,14 @@ async fn materialize_sanitize_history_if_changed(
     sess: &crate::codex::Session,
     ctx: &TurnContext,
     history_before_sanitize: &[ResponseItem],
-) -> bool {
-    let replacement_history = {
+) -> Result<bool, CodexErr> {
+    let (replacement_history, checkpoint) = {
         let mut state = sess.state.lock().await;
-        sanitize_replacement_history_if_changed(&mut state, history_before_sanitize)
+        let checkpoint = state.manage_context_checkpoint();
+        (
+            sanitize_replacement_history_if_changed(&mut state, history_before_sanitize),
+            checkpoint,
+        )
     };
     let changed_history = replacement_history.is_some();
     if let Some(replacement_history) = replacement_history {
@@ -267,10 +271,34 @@ async fn materialize_sanitize_history_if_changed(
             message: String::new(),
             replacement_history: Some(replacement_history),
         });
-        sess.persist_rollout_items(&[compacted_item]).await;
+        let recorder = {
+            let guard = sess.services.rollout.lock().await;
+            guard.clone()
+        };
+        if let Some(recorder) = recorder
+            && let Err(error) = recorder.record_items(&[compacted_item]).await
+        {
+            let mut state = sess.state.lock().await;
+            state.restore_manage_context_checkpoint(checkpoint);
+            return Err(CodexErr::Fatal(format!(
+                "failed to persist compacted replacement_history: {error}"
+            )));
+        }
     }
     sess.recompute_token_usage(ctx).await;
-    changed_history
+    Ok(changed_history)
+}
+
+async fn report_sanitize_materialization_error(
+    sess: &crate::codex::Session,
+    ctx: &TurnContext,
+    error: CodexErr,
+) -> Option<String> {
+    sess.send_event(ctx, EventMsg::Error(error.to_error_event(None)))
+        .await;
+    Some(format!(
+        "{SANITIZE_ERROR_MESSAGE_PREFIX} {error}. Fix the error and retry /sanitize."
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -382,12 +410,23 @@ impl SessionTask for SanitizeTask {
             };
 
             if !output.needs_follow_up {
-                let changed_history = materialize_sanitize_history_if_changed(
+                let changed_history = match materialize_sanitize_history_if_changed(
                     sess.as_ref(),
                     ctx.as_ref(),
                     &history_before_sanitize,
                 )
-                .await;
+                .await
+                {
+                    Ok(changed_history) => changed_history,
+                    Err(error) => {
+                        return report_sanitize_materialization_error(
+                            sess.as_ref(),
+                            ctx.as_ref(),
+                            error,
+                        )
+                        .await;
+                    }
+                };
                 return Some(sanitize_completion_message(
                     output.last_agent_message,
                     changed_history,
@@ -403,24 +442,46 @@ impl SessionTask for SanitizeTask {
             match stagnation_tracker.record_follow_up_events(&follow_up_events) {
                 SanitizeLoopDecision::Continue => {}
                 SanitizeLoopDecision::ReachedFixedPoint => {
-                    let changed_history = materialize_sanitize_history_if_changed(
+                    let changed_history = match materialize_sanitize_history_if_changed(
                         sess.as_ref(),
                         ctx.as_ref(),
                         &history_before_sanitize,
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(changed_history) => changed_history,
+                        Err(error) => {
+                            return report_sanitize_materialization_error(
+                                sess.as_ref(),
+                                ctx.as_ref(),
+                                error,
+                            )
+                            .await;
+                        }
+                    };
                     return Some(sanitize_completion_message(
                         output.last_agent_message,
                         changed_history,
                     ));
                 }
                 SanitizeLoopDecision::Stalled => {
-                    let changed_history = materialize_sanitize_history_if_changed(
+                    let changed_history = match materialize_sanitize_history_if_changed(
                         sess.as_ref(),
                         ctx.as_ref(),
                         &history_before_sanitize,
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(changed_history) => changed_history,
+                        Err(error) => {
+                            return report_sanitize_materialization_error(
+                                sess.as_ref(),
+                                ctx.as_ref(),
+                                error,
+                            )
+                            .await;
+                        }
+                    };
                     stagnation_tracker.set_changed_history(changed_history);
                     return Some(stagnation_tracker.stalled_loop_message());
                 }
@@ -1902,5 +1963,84 @@ mod tests {
 
         assert_eq!(replacement_history, expected);
         assert_eq!(state.history_snapshot_lenient(), expected);
+    }
+
+    #[tokio::test]
+    async fn sanitize_rollout_persist_failure_rolls_back_state() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+
+        let recorder = crate::rollout::RolloutRecorder::new(
+            turn.config.as_ref(),
+            crate::rollout::RolloutRecorderParams::new(
+                session.conversation_id,
+                None,
+                turn.session_source.clone(),
+                codex_protocol::models::BaseInstructions::default(),
+                Vec::new(),
+                crate::rollout::policy::EventPersistenceMode::Limited,
+            ),
+            None,
+            None,
+        )
+        .await
+        .expect("create rollout recorder");
+        recorder
+            .shutdown()
+            .await
+            .expect("shutdown rollout recorder");
+        {
+            let mut guard = session.services.rollout.lock().await;
+            *guard = Some(recorder);
+        }
+
+        let history_before_sanitize = {
+            let mut state = session.state.lock().await;
+            let items = [
+                input_text_message("user", "first"),
+                input_text_message("assistant", "second"),
+            ];
+            state.record_items(items.iter(), turn.truncation_policy);
+            let baseline = state.history_snapshot_lenient();
+            state.set_context_inclusion(&[1], false);
+            let first_rid = state.history_rids_snapshot_lenient()[0];
+            state.upsert_context_replacements(vec![(first_rid, "first replaced".to_string())]);
+            state.add_context_notes(vec!["Decision: keep strict pruning.".to_string()]);
+            baseline
+        };
+
+        let (before_history, before_overlay, before_context_items, before_rids) = {
+            let state = session.state.lock().await;
+            (
+                state.history_snapshot_lenient(),
+                state.context_overlay_snapshot(),
+                state.build_context_items_event(),
+                state.history_rids_snapshot_lenient(),
+            )
+        };
+
+        let error =
+            materialize_sanitize_history_if_changed(&session, &turn, &history_before_sanitize)
+                .await
+                .expect_err("materialization should fail when rollout persistence cannot enqueue");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to persist compacted replacement_history"),
+            "unexpected error: {error}"
+        );
+
+        let (after_history, after_overlay, after_context_items, after_rids) = {
+            let state = session.state.lock().await;
+            (
+                state.history_snapshot_lenient(),
+                state.context_overlay_snapshot(),
+                state.build_context_items_event(),
+                state.history_rids_snapshot_lenient(),
+            )
+        };
+        assert_eq!(after_history, before_history);
+        assert_eq!(after_overlay, before_overlay);
+        assert_eq!(after_context_items, before_context_items);
+        assert_eq!(after_rids, before_rids);
     }
 }
