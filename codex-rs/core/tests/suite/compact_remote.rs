@@ -59,7 +59,7 @@ fn estimate_compact_payload_tokens(request: &responses::ResponsesRequest) -> i64
         .saturating_add(approx_token_count(&request.instructions_text()))
 }
 
-const AUTO_COMPACT_RECON_WARNING: &str = "Warning: auto-compaction completed. MANDATORY before any other action: call recall. Then recon unstaged changes, codex_learning_log, and update_plan status. Then proceed with what was in progress before auto-compact.";
+const AUTO_COMPACT_RECON_WARNING: &str = "STOP. Codex CLI has just performed an auto-compact. BEFORE any other action: call recall. Then recon unstaged changes and update_plan status. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
 fn model_info_with_context_window(slug: &str, context_window: i64) -> ModelInfo {
     let models_response: ModelsResponse =
         serde_json::from_str(include_str!("../../models.json")).expect("valid models.json");
@@ -559,6 +559,7 @@ async fn remote_pre_sampling_auto_compact_emits_warning_after_model_switch() -> 
             model: previous_model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -578,6 +579,7 @@ async fn remote_pre_sampling_auto_compact_emits_warning_after_model_switch() -> 
             model: next_model.to_string(),
             effort: None,
             summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })

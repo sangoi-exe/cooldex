@@ -1103,21 +1103,22 @@ The JSON-RPC auth/account surface exposes request/response methods plus server-i
 
 ### Authentication modes
 
-Codex supports these authentication modes. The current mode is surfaced in `account/updated` (`authMode`), which also includes the current ChatGPT `planType` when available, and can be inferred from `account/read`.
+Codex supports these authentication modes. The current mode is surfaced in `account/updated` (`authMode`: `apikey`, `chatgpt`, `chatgptAuthTokens`, or `null`), which also includes the current ChatGPT `planType` when available.
 
 - **API key (`apiKey`)**: Caller supplies an OpenAI API key via `account/login/start` with `type: "apiKey"`. The API key is saved and used for API requests.
 - **ChatGPT managed (`chatgpt`)** (recommended): Codex owns the ChatGPT OAuth flow and refresh tokens. Start via `account/login/start` with `type: "chatgpt"`; Codex persists tokens to disk and refreshes them automatically.
+- **ChatGPT external tokens (`chatgptAuthTokens`)**: Caller provides ChatGPT tokens via `account/login/start` with `type: "chatgptAuthTokens"`. Tokens are kept in memory and the external host app is responsible for refresh.
 
 ### API Overview
 
-- `account/read` — fetch current account info; optionally refresh tokens.
-- `account/login/start` — begin login (`apiKey`, `chatgpt`).
+- `account/read` — fetch current account info; optionally request a best-effort token refresh.
+- `account/login/start` — begin login (`apiKey`, `chatgpt`, `chatgptAuthTokens`).
 - `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
 - `account/login/cancel` — cancel a pending ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated`.
-- `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, or `null`) and includes the current ChatGPT `planType` when available.
-- `account/rateLimits/read` — fetch ChatGPT rate limits; updates arrive via `account/rateLimits/updated` (notify).
-- `account/rateLimits/updated` (notify) — emitted whenever a user's ChatGPT rate limits change.
+- `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, `chatgptAuthTokens`, or `null`) and includes the current ChatGPT `planType` when available.
+- `account/rateLimits/read` — fetch ChatGPT rate limits (`rateLimits` plus `rateLimitsByLimitId`); updates arrive via `account/rateLimits/updated` (notify).
+- `account/rateLimits/updated` (notify) — emitted whenever a user's ChatGPT rate limits change; payload includes `rateLimits` only (no `rateLimitsByLimitId`).
 - `mcpServer/oauthLogin/completed` (notify) — emitted after a `mcpServer/oauth/login` flow finishes for a server; payload includes `{ name, success, error? }`.
 
 ### 1) Check auth state
@@ -1139,7 +1140,9 @@ Response examples:
 
 Field notes:
 
-- `refreshToken` (bool): set `true` to force a token refresh.
+- `refreshToken` (bool): when `true`, Codex requests a proactive token refresh before returning account state.
+  This is best-effort: refresh failures are logged and the call still returns the current account view.
+  In `chatgptAuthTokens` mode, this flag is ignored.
 - `requiresOpenaiAuth` reflects the active provider; when `false`, Codex can run without OpenAI credentials.
 
 ### 2) Log in with an API key
@@ -1195,12 +1198,14 @@ Field notes:
 
 ```json
 { "method": "account/rateLimits/read", "id": 6 }
-{ "id": 6, "result": { "rateLimits": { "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null } } }
-{ "method": "account/rateLimits/updated", "params": { "rateLimits": { … } } }
+{ "id": 6, "result": { "rateLimits": { "limitId": "codex", "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "credits": null, "planType": "plus" }, "rateLimitsByLimitId": { "codex": { "limitId": "codex", "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "credits": null, "planType": "plus" } } } }
+{ "method": "account/rateLimits/updated", "params": { "rateLimits": { "limitId": "codex", "primary": { "usedPercent": 26, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "credits": null, "planType": "plus" } } }
 ```
 
 Field notes:
 
+- `account/rateLimits/read` returns both `rateLimits` and `rateLimitsByLimitId`.
+- `account/rateLimits/updated` includes only `rateLimits`; call `account/rateLimits/read` to refresh `rateLimitsByLimitId`.
 - `usedPercent` is current usage within the OpenAI quota window.
 - `windowDurationMins` is the quota window length.
 - `resetsAt` is a Unix timestamp (seconds) for the next reset.

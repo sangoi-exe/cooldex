@@ -207,6 +207,7 @@ pub(crate) enum AppEvent {
     /// Result of refreshing per-account rate limits cache.
     AccountsStatusCacheFetched {
         updated_accounts: usize,
+        cache_fully_refreshed: bool,
     },
 
     /// Switch the active ChatGPT account in the auth store.
