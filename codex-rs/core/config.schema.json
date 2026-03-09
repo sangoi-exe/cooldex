@@ -2269,7 +2269,7 @@
       "type": "object"
     },
     "recall_debug": {
-      "description": "Controls recall payload verbosity. When unset/true, use full payload. When false, use a compact string-list payload.",
+      "description": "Controls recall payload verbosity. When unset/false, use a compact string-list payload. When true, use the full/debug payload.",
       "type": "boolean"
     },
     "recall_kbytes_limit": {

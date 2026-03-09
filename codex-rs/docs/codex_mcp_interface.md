@@ -20,7 +20,7 @@ At a glance:
   - `model/list`, `app/list`, `collaborationMode/list`
 - Remaining v1 compatibility RPCs
   - `getConversationSummary`
-  - `getAuthStatus`
+  - `getAuthStatus` (compatibility-only; use `account/read` for current auth/account state)
   - `gitDiffToRemote`
   - `fuzzyFileSearch`, `fuzzyFileSearch/sessionStart`, `fuzzyFileSearch/sessionUpdate`, `fuzzyFileSearch/sessionStop`
 - Notifications
@@ -137,6 +137,9 @@ The server still accepts a narrow v1 compatibility surface for existing app clie
 - `getAuthStatus`
 - `gitDiffToRemote`
 - `fuzzyFileSearch`, `fuzzyFileSearch/sessionStart`, `fuzzyFileSearch/sessionUpdate`, `fuzzyFileSearch/sessionStop`
+
+`getAuthStatus` is compatibility-only. It never returns auth tokens; use
+`account/read` for authoritative auth/account state.
 
 ## Compatibility and stability
 

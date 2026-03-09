@@ -174,6 +174,31 @@ impl McpProcess {
         &mut self,
         client_info: ClientInfo,
     ) -> anyhow::Result<JSONRPCMessage> {
+        self.initialize_with_capabilities(client_info, None).await
+    }
+
+    /// Performs the initialization handshake with the MCP server using experimental capabilities.
+    pub async fn initialize_experimental(&mut self) -> anyhow::Result<()> {
+        let initialized = self
+            .initialize_experimental_with_client_info(ClientInfo {
+                name: DEFAULT_CLIENT_NAME.to_string(),
+                title: None,
+                version: "0.1.0".to_string(),
+            })
+            .await?;
+        let JSONRPCMessage::Response(_) = initialized else {
+            unreachable!(
+                "expected JSONRPCMessage::Response for initialize_experimental, got {initialized:?}"
+            );
+        };
+        Ok(())
+    }
+
+    /// Sends initialize with experimental capabilities and returns the response/error message.
+    pub async fn initialize_experimental_with_client_info(
+        &mut self,
+        client_info: ClientInfo,
+    ) -> anyhow::Result<JSONRPCMessage> {
         self.initialize_with_capabilities(
             client_info,
             Some(InitializeCapabilities {

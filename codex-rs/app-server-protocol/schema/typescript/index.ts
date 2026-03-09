@@ -24,6 +24,8 @@ export type { ClientInfo } from "./ClientInfo";
 export type { ClientNotification } from "./ClientNotification";
 export type { ClientRequest } from "./ClientRequest";
 export type { CodexErrorInfo } from "./CodexErrorInfo";
+export type { CollabAgentActivity } from "./CollabAgentActivity";
+export type { CollabAgentActivityKind } from "./CollabAgentActivityKind";
 export type { CollabAgentInteractionBeginEvent } from "./CollabAgentInteractionBeginEvent";
 export type { CollabAgentInteractionEndEvent } from "./CollabAgentInteractionEndEvent";
 export type { CollabAgentRef } from "./CollabAgentRef";

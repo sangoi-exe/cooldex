@@ -16,6 +16,7 @@ use toml::Value as TomlValue;
 /// LoaderOverrides overrides managed configuration inputs (primarily for tests).
 #[derive(Debug, Default, Clone)]
 pub struct LoaderOverrides {
+    pub user_config_path: Option<PathBuf>,
     pub managed_config_path: Option<PathBuf>,
     //TODO(gt): Add a macos_ prefix to this field and remove the target_os check.
     #[cfg(target_os = "macos")]
@@ -152,6 +153,16 @@ impl ConfigLayerStack {
     pub fn get_user_layer(&self) -> Option<&ConfigLayerEntry> {
         self.user_layer_index
             .and_then(|index| self.layers.get(index))
+    }
+
+    pub fn get_user_config_file(&self) -> Option<&AbsolutePathBuf> {
+        match self.get_user_layer() {
+            Some(ConfigLayerEntry {
+                name: ConfigLayerSource::User { file },
+                ..
+            }) => Some(file),
+            _ => None,
+        }
     }
 
     pub fn requirements(&self) -> &ConfigRequirements {

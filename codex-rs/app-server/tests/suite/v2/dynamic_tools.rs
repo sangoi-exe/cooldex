@@ -46,7 +46,7 @@ async fn thread_start_injects_dynamic_tools_into_model_requests() -> Result<()> 
     create_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     // Use a minimal JSON schema so we can assert the tool payload round-trips.
     let input_schema = json!({
@@ -141,7 +141,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
     create_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let dynamic_tool = DynamicToolSpec {
         name: tool_name.to_string(),
@@ -313,7 +313,7 @@ async fn dynamic_tool_call_round_trip_sends_content_items_to_model() -> Result<(
     create_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let dynamic_tool = DynamicToolSpec {
         name: tool_name.to_string(),

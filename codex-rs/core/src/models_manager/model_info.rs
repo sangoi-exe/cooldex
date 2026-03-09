@@ -166,7 +166,7 @@ mod tests {
         let mut config = test_config();
         config.model_context_window = Some(1_000_000);
 
-        let updated = with_config_overrides(model.clone(), &config);
+        let updated = with_config_overrides(model, &config);
 
         assert_eq!(updated.context_window, Some(272_000));
     }
@@ -179,7 +179,7 @@ mod tests {
         let mut config = test_config();
         config.model_context_window = Some(200_000);
 
-        let updated = with_config_overrides(model.clone(), &config);
+        let updated = with_config_overrides(model, &config);
 
         assert_eq!(updated.context_window, Some(200_000));
     }

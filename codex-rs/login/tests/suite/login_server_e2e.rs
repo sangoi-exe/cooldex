@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::Result;
 use base64::Engine;
 use codex_core::auth::AuthCredentialsStoreMode;
+use codex_core::auth::NON_PLUS_ACCOUNT_REMOVED_MESSAGE;
 use codex_login::ServerOptions;
 use codex_login::run_login_server;
 use core_test_support::skip_if_no_network;
@@ -15,12 +16,16 @@ use tempfile::tempdir;
 
 // See spawn.rs for details
 
-fn start_mock_issuer(chatgpt_account_id: &str) -> (SocketAddr, thread::JoinHandle<()>) {
+fn start_mock_issuer(
+    chatgpt_account_id: &str,
+    chatgpt_plan_type: &str,
+) -> (SocketAddr, thread::JoinHandle<()>) {
     // Bind to a random available port
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tiny_http::Server::from_listener(listener, None).unwrap();
     let chatgpt_account_id = chatgpt_account_id.to_string();
+    let chatgpt_plan_type = chatgpt_plan_type.to_string();
 
     let handle = thread::spawn(move || {
         while let Ok(mut req) = server.recv() {
@@ -29,7 +34,7 @@ fn start_mock_issuer(chatgpt_account_id: &str) -> (SocketAddr, thread::JoinHandl
                 // Read body
                 let mut body = String::new();
                 let _ = req.as_reader().read_to_string(&mut body);
-                // Build minimal JWT with plan=pro
+                // Build minimal JWT with the requested plan.
                 #[derive(serde::Serialize)]
                 struct Header {
                     alg: &'static str,
@@ -42,7 +47,7 @@ fn start_mock_issuer(chatgpt_account_id: &str) -> (SocketAddr, thread::JoinHandl
                 let payload = serde_json::json!({
                     "email": "user@example.com",
                     "https://api.openai.com/auth": {
-                        "chatgpt_plan_type": "pro",
+                        "chatgpt_plan_type": chatgpt_plan_type,
                         "chatgpt_account_id": chatgpt_account_id,
                     }
                 });
@@ -83,7 +88,7 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let chatgpt_account_id = "12345678-0000-0000-0000-000000000000";
-    let (issuer_addr, issuer_handle) = start_mock_issuer(chatgpt_account_id);
+    let (issuer_addr, issuer_handle) = start_mock_issuer(chatgpt_account_id, "pro");
     let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
 
     let tmp = tempdir()?;
@@ -157,10 +162,67 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
 }
 
 #[tokio::test]
+async fn end_to_end_login_flow_rejects_non_plus_or_pro_account() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let chatgpt_account_id = "12345678-0000-0000-0000-000000000000";
+    let (issuer_addr, issuer_handle) = start_mock_issuer(chatgpt_account_id, "free");
+    let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
+
+    let tmp = tempdir()?;
+    let codex_home = tmp.path().to_path_buf();
+    let state = "test_state_free".to_string();
+
+    let opts = ServerOptions {
+        codex_home: codex_home.clone(),
+        cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+        client_id: codex_login::CLIENT_ID.to_string(),
+        issuer,
+        port: 0,
+        open_browser: false,
+        force_state: Some(state),
+        forced_chatgpt_workspace_id: Some(chatgpt_account_id.to_string()),
+    };
+    let server = run_login_server(opts)?;
+    let login_port = server.actual_port;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()?;
+    let url = format!("http://127.0.0.1:{login_port}/auth/callback?code=abc&state=test_state_free");
+    let resp = client.get(&url).send().await?;
+    assert!(resp.status().is_success());
+    let body = resp.text().await?;
+    assert!(
+        body.contains("Your ChatGPT account is not Plus or Pro"),
+        "error body should explain the unsupported plan"
+    );
+    assert!(
+        body.contains("unsupported_plan"),
+        "error body should preserve the structured error code"
+    );
+
+    let err = server
+        .block_until_done()
+        .await
+        .expect_err("free-plan login should fail loudly");
+    assert_eq!(err.to_string(), NON_PLUS_ACCOUNT_REMOVED_MESSAGE);
+
+    let auth_path = codex_home.join("auth.json");
+    assert!(
+        !auth_path.exists(),
+        "unsupported-plan login must not persist auth.json"
+    );
+
+    drop(issuer_handle);
+    Ok(())
+}
+
+#[tokio::test]
 async fn creates_missing_codex_home_dir() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let (issuer_addr, _issuer_handle) = start_mock_issuer("org-123");
+    let (issuer_addr, _issuer_handle) = start_mock_issuer("org-123", "pro");
     let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
 
     let tmp = tempdir()?;
@@ -202,7 +264,7 @@ async fn creates_missing_codex_home_dir() -> Result<()> {
 async fn forced_chatgpt_workspace_id_mismatch_blocks_login() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let (issuer_addr, _issuer_handle) = start_mock_issuer("org-actual");
+    let (issuer_addr, _issuer_handle) = start_mock_issuer("org-actual", "pro");
     let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
 
     let tmp = tempdir()?;
@@ -259,7 +321,7 @@ async fn forced_chatgpt_workspace_id_mismatch_blocks_login() -> Result<()> {
 async fn oauth_access_denied_missing_entitlement_blocks_login_with_clear_error() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let (issuer_addr, _issuer_handle) = start_mock_issuer("org-123");
+    let (issuer_addr, _issuer_handle) = start_mock_issuer("org-123", "pro");
     let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
 
     let tmp = tempdir()?;
@@ -326,7 +388,7 @@ async fn oauth_access_denied_missing_entitlement_blocks_login_with_clear_error()
 async fn oauth_access_denied_unknown_reason_uses_generic_error_page() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let (issuer_addr, _issuer_handle) = start_mock_issuer("org-123");
+    let (issuer_addr, _issuer_handle) = start_mock_issuer("org-123", "pro");
     let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
 
     let tmp = tempdir()?;
@@ -405,7 +467,7 @@ async fn oauth_access_denied_unknown_reason_uses_generic_error_page() -> Result<
 async fn cancels_previous_login_server_when_port_is_in_use() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let (issuer_addr, _issuer_handle) = start_mock_issuer("org-123");
+    let (issuer_addr, _issuer_handle) = start_mock_issuer("org-123", "pro");
     let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
 
     let first_tmp = tempdir()?;

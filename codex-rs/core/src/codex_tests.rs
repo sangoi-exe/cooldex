@@ -1,5 +1,6 @@
 use super::*;
 use crate::CodexAuth;
+use crate::config::CONFIG_TOML_FILE;
 use crate::config::ConfigBuilder;
 use crate::config::test_config;
 use crate::config_loader::ConfigLayerStack;
@@ -1423,6 +1424,9 @@ async fn set_rate_limits_retains_previous_credits() {
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
+        config_path: config
+            .active_user_config_path()
+            .expect("active user config path"),
         codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
@@ -1519,6 +1523,9 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
+        config_path: config
+            .active_user_config_path()
+            .expect("active user config path"),
         codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
@@ -1873,6 +1880,9 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
+        config_path: config
+            .active_user_config_path()
+            .expect("active user config path"),
         codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
@@ -1932,6 +1942,9 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
+        config_path: config
+            .active_user_config_path()
+            .expect("active user config path"),
         codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
@@ -1951,6 +1964,8 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         config.codex_home.clone(),
         Arc::clone(&plugins_manager),
     ));
+    let (agent_last_activity_tx, _agent_last_activity_rx) =
+        watch::channel::<Option<codex_protocol::protocol::CollabAgentActivity>>(None);
     let result = Session::new(
         session_configuration,
         Arc::clone(&config),
@@ -1959,6 +1974,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         ExecPolicyManager::default(),
         tx_event,
         agent_status_tx,
+        agent_last_activity_tx,
         InitialHistory::New,
         SessionSource::Exec,
         skills_manager,
@@ -1994,6 +2010,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let agent_control = AgentControl::default();
     let exec_policy = ExecPolicyManager::default();
     let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
+    let (agent_last_activity_tx, _agent_last_activity_rx) =
+        watch::channel::<Option<codex_protocol::protocol::CollabAgentActivity>>(None);
     let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
     let model_info = ModelsManager::construct_model_info_offline_for_tests(model.as_str(), &config);
     let reasoning_effort = config.model_reasoning_effort;
@@ -2024,6 +2042,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
+        config_path: config
+            .active_user_config_path()
+            .expect("active user config path"),
         codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
@@ -2128,6 +2149,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation_id,
         tx_event,
         agent_status: agent_status_tx,
+        agent_last_activity: agent_last_activity_tx,
         state: Mutex::new(state),
         features: config.features.clone(),
         pending_mcp_server_refresh_config: Mutex::new(None),
@@ -2147,10 +2169,13 @@ async fn submit_with_id_captures_current_span_trace_context() {
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     let (_tx_event, rx_event) = async_channel::unbounded();
     let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+    let (_agent_last_activity_tx, agent_last_activity) =
+        watch::channel::<Option<codex_protocol::protocol::CollabAgentActivity>>(None);
     let codex = Codex {
         tx_sub,
         rx_event,
         agent_status,
+        agent_last_activity,
         session: Arc::new(session),
     };
 
@@ -2401,6 +2426,8 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
     let agent_control = AgentControl::default();
     let exec_policy = ExecPolicyManager::default();
     let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
+    let (agent_last_activity_tx, _agent_last_activity_rx) =
+        watch::channel::<Option<codex_protocol::protocol::CollabAgentActivity>>(None);
     let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
     let model_info = ModelsManager::construct_model_info_offline_for_tests(model.as_str(), &config);
     let reasoning_effort = config.model_reasoning_effort;
@@ -2431,6 +2458,9 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
+        config_path: config
+            .active_user_config_path()
+            .expect("active user config path"),
         codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
@@ -2535,6 +2565,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         conversation_id,
         tx_event,
         agent_status: agent_status_tx,
+        agent_last_activity: agent_last_activity_tx,
         state: Mutex::new(state),
         features: config.features.clone(),
         pending_mcp_server_refresh_config: Mutex::new(None),

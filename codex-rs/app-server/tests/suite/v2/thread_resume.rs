@@ -275,6 +275,7 @@ stream_max_retries = 0
         forked_from_id: None,
         timestamp: "2025-01-05T12:00:00Z".to_string(),
         cwd: repo_path.clone(),
+        config_path: None,
         originator: "codex".to_string(),
         cli_version: "0.0.0".to_string(),
         source: RolloutSessionSource::Cli,
@@ -538,7 +539,7 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
     create_config_toml(codex_home.path(), &server.uri())?;
 
     let mut primary = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, primary.initialize_experimental()).await??;
 
     let start_id = primary
         .send_thread_start_request(ThreadStartParams {
@@ -654,7 +655,7 @@ async fn thread_resume_rejects_mismatched_path_when_thread_is_running() -> Resul
     create_config_toml(codex_home.path(), &server.uri())?;
 
     let mut primary = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, primary.initialize_experimental()).await??;
 
     let start_id = primary
         .send_thread_start_request(ThreadStartParams {
@@ -1160,7 +1161,7 @@ async fn thread_resume_with_overrides_defers_updated_at_until_turn_start() -> Re
         mut mcp,
         thread_id,
         rollout_file_path,
-    } = start_materialized_thread_and_restart(codex_home.path(), "materialize").await?;
+    } = start_materialized_thread_and_restart(codex_home.path(), "materialize", false).await?;
     let expected_updated_at_rfc3339 = "2025-01-07T00:00:00Z";
     set_rollout_mtime(rollout_file_path.as_path(), expected_updated_at_rfc3339)?;
     let before_modified = std::fs::metadata(&rollout_file_path)?.modified()?;
@@ -1263,7 +1264,7 @@ async fn thread_resume_prefers_path_over_thread_id() -> Result<()> {
     create_config_toml(codex_home.path(), &server.uri())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let start_id = mcp
         .send_thread_start_request(ThreadStartParams {
@@ -1331,7 +1332,7 @@ async fn thread_resume_supports_history_and_overrides() -> Result<()> {
 
     let RestartedThreadFixture {
         mut mcp, thread_id, ..
-    } = start_materialized_thread_and_restart(codex_home.path(), "seed history").await?;
+    } = start_materialized_thread_and_restart(codex_home.path(), "seed history", true).await?;
 
     let history_text = "Hello from history";
     let history = vec![ResponseItem::Message {
@@ -1381,9 +1382,14 @@ struct RestartedThreadFixture {
 async fn start_materialized_thread_and_restart(
     codex_home: &Path,
     seed_text: &str,
+    experimental_api: bool,
 ) -> Result<RestartedThreadFixture> {
     let mut first_mcp = McpProcess::new(codex_home).await?;
-    timeout(DEFAULT_READ_TIMEOUT, first_mcp.initialize()).await??;
+    if experimental_api {
+        timeout(DEFAULT_READ_TIMEOUT, first_mcp.initialize_experimental()).await??;
+    } else {
+        timeout(DEFAULT_READ_TIMEOUT, first_mcp.initialize()).await??;
+    }
 
     let start_id = first_mcp
         .send_thread_start_request(ThreadStartParams {
@@ -1427,7 +1433,11 @@ async fn start_materialized_thread_and_restart(
     drop(first_mcp);
 
     let mut second_mcp = McpProcess::new(codex_home).await?;
-    timeout(DEFAULT_READ_TIMEOUT, second_mcp.initialize()).await??;
+    if experimental_api {
+        timeout(DEFAULT_READ_TIMEOUT, second_mcp.initialize_experimental()).await??;
+    } else {
+        timeout(DEFAULT_READ_TIMEOUT, second_mcp.initialize()).await??;
+    }
 
     Ok(RestartedThreadFixture {
         mcp: second_mcp,

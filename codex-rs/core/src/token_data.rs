@@ -43,6 +43,13 @@ impl IdTokenInfo {
         })
     }
 
+    pub fn is_plus_or_pro_saved_account(&self) -> bool {
+        matches!(
+            self.chatgpt_plan_type,
+            Some(PlanType::Known(KnownPlan::Plus | KnownPlan::Pro))
+        )
+    }
+
     pub fn is_workspace_account(&self) -> bool {
         matches!(
             self.chatgpt_plan_type,

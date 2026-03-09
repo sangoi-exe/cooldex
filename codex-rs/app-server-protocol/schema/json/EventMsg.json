@@ -296,6 +296,44 @@
         }
       ]
     },
+    "CollabAgentActivity": {
+      "properties": {
+        "kind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CollabAgentActivityKind"
+            }
+          ],
+          "description": "Category of the most recent observed progress signal for the agent."
+        },
+        "occurred_at": {
+          "description": "Unix timestamp in seconds when the activity was observed.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "summary": {
+          "description": "Short, user-facing summary of the observed activity.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "occurred_at",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "CollabAgentActivityKind": {
+      "enum": [
+        "message",
+        "reasoning",
+        "command",
+        "edit",
+        "task",
+        "status"
+      ],
+      "type": "string"
+    },
     "CollabAgentRef": {
       "properties": {
         "agent_nickname": {
@@ -341,6 +379,17 @@
             "string",
             "null"
           ]
+        },
+        "last_activity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CollabAgentActivity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Most recent observed activity for the agent, when available."
         },
         "status": {
           "allOf": [

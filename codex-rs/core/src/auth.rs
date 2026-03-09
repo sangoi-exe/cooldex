@@ -115,7 +115,7 @@ const REFRESH_TOKEN_INVALIDATED_MESSAGE: &str = "Your access token could not be 
 const REFRESH_TOKEN_UNKNOWN_MESSAGE: &str =
     "Your access token could not be refreshed. Please log out and sign in again.";
 const REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE: &str = "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.";
-const NON_PLUS_ACCOUNT_REMOVED_MESSAGE: &str = "Your ChatGPT account is not Plus or Pro and was removed from saved accounts. Please sign in again with a Plus or Pro account.";
+pub const NON_PLUS_ACCOUNT_REMOVED_MESSAGE: &str = "Your ChatGPT account is not Plus or Pro and was removed from saved accounts. Please sign in again with a Plus or Pro account.";
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
 
@@ -1189,15 +1189,6 @@ impl AuthManager {
             usage_limit_auto_switch_cooldown_until: Mutex::new(None),
             _test_home_guard: None,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn lock_usage_limit_auto_switch_cooldown_for_test(
-        &self,
-    ) -> std::sync::MutexGuard<'_, Option<DateTime<Utc>>> {
-        self.usage_limit_auto_switch_cooldown_until
-            .lock()
-            .expect("auto-switch cooldown lock should not be poisoned in tests")
     }
 
     /// Current cached auth (clone) without attempting a refresh.
@@ -2325,12 +2316,7 @@ fn store_from_auth_for_testing(auth: &CodexAuth) -> AuthStore {
 }
 
 fn is_plus_or_pro_account(account: &StoredAccount) -> bool {
-    matches!(
-        account.tokens.id_token.chatgpt_plan_type.as_ref(),
-        Some(InternalPlanType::Known(
-            InternalKnownPlan::Plus | InternalKnownPlan::Pro
-        ))
-    )
+    account.tokens.id_token.is_plus_or_pro_saved_account()
 }
 
 fn enforce_plus_or_pro_saved_accounts(store: &mut AuthStore) -> Vec<String> {

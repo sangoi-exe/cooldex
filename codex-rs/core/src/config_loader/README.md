@@ -10,7 +10,7 @@ This module is the canonical place to **load and describe Codex configuration la
 
 Exported from `codex_core::config_loader`:
 
-- `load_config_layers_state(codex_home, cwd_opt, cli_overrides, overrides, cloud_requirements) -> ConfigLayerStack`
+- `load_config_layers_state(codex_home, cwd_opt, cli_overrides, loader_overrides, cloud_requirements) -> ConfigLayerStack`
 - `ConfigLayerStack`
   - `effective_config() -> toml::Value`
   - `origins() -> HashMap<String, ConfigLayerMetadata>`
@@ -27,7 +27,7 @@ Precedence is **top overrides bottom**:
 1. **MDM** managed preferences (macOS only)
 2. **System** managed config (e.g. `managed_config.toml`)
 3. **Session flags** (CLI overrides, applied as dotted-path TOML writes)
-4. **User** config (`config.toml`)
+4. **User** config (`config.toml`), or an explicit path via `LoaderOverrides.user_config_path`
 
 Layers with a `disabled_reason` are still surfaced for UI, but are ignored when
 computing the effective config and origins metadata. This is what
@@ -38,7 +38,7 @@ computing the effective config and origins metadata. This is what
 Most callers want the effective config plus metadata:
 
 ```rust
-use codex_core::config_loader::{load_config_layers_state, LoaderOverrides};
+use codex_core::config_loader::{load_config_layers_state, CloudRequirementsLoader, LoaderOverrides};
 use codex_utils_absolute_path::AbsolutePathBuf;
 use toml::Value as TomlValue;
 
@@ -49,7 +49,7 @@ let layers = load_config_layers_state(
     Some(cwd),
     &cli_overrides,
     LoaderOverrides::default(),
-    None,
+    CloudRequirementsLoader::default(),
 ).await?;
 
 let effective = layers.effective_config();

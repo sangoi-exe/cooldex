@@ -886,12 +886,11 @@ mod tests {
         let mut stream = spawn_response_stream(stream_response, idle_timeout(), None, None);
         let mut seen = None;
         while let Some(event) = stream.rx_event.recv().await {
-            match event.expect("expected ok event") {
-                ResponseEvent::ServerReasoningIncluded(included) => {
-                    seen = Some(included);
-                    break;
-                }
-                _ => {}
+            if let ResponseEvent::ServerReasoningIncluded(included) =
+                event.expect("expected ok event")
+            {
+                seen = Some(included);
+                break;
             }
         }
 
@@ -911,12 +910,11 @@ mod tests {
         let mut stream = spawn_response_stream(stream_response, idle_timeout(), None, None);
         let mut seen = None;
         while let Some(event) = stream.rx_event.recv().await {
-            match event.expect("expected ok event") {
-                ResponseEvent::ServerReasoningIncluded(included) => {
-                    seen = Some(included);
-                    break;
-                }
-                _ => {}
+            if let ResponseEvent::ServerReasoningIncluded(included) =
+                event.expect("expected ok event")
+            {
+                seen = Some(included);
+                break;
             }
         }
 

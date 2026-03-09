@@ -168,8 +168,8 @@ Example with notification opt-out:
 - `config/read` — fetch the effective config on disk after resolving config layering.
 - `externalAgentConfig/detect` — detect migratable external-agent artifacts with `includeHome` and optional `cwds`; each detected item includes `cwd` (`null` for home).
 - `externalAgentConfig/import` — apply selected external-agent migration items by passing explicit `migrationItems` with `cwd` (`null` for home).
-- `config/value/write` — write a single config key/value to the user's config.toml on disk.
-- `config/batchWrite` — apply multiple config edits atomically to the user's config.toml on disk.
+- `config/value/write` — write a single config key/value to the active user config.toml path on disk.
+- `config/batchWrite` — apply multiple config edits atomically to the active user config.toml path on disk.
 - `configRequirements/read` — fetch loaded requirements constraints from `requirements.toml` and/or MDM (or `null` if none are configured), including allow-lists (`allowedApprovalPolicies`, `allowedSandboxModes`, `allowedWebSearchModes`), pinned feature values (`featureRequirements`), `enforceResidency`, and `network` constraints.
 
 ### Example: Start or resume a thread
@@ -182,6 +182,7 @@ Start a fresh thread when you need a new Codex conversation.
     // current config settings.
     "model": "gpt-5.1-codex",
     "cwd": "/Users/me/project",
+    "configPath": "/Users/me/.codex/config.toml",
     "approvalPolicy": "never",
     "sandbox": "workspaceWrite",
     "personality": "friendly",
@@ -207,7 +208,8 @@ Start a fresh thread when you need a new Codex conversation.
         "preview": "",
         "modelProvider": "openai",
         "createdAt": 1730910000
-    }
+    },
+    "configPath": "/Users/me/.codex/config.toml"
 } }
 { "method": "thread/started", "params": { "thread": { … } } }
 ```
@@ -223,6 +225,12 @@ To continue a stored session, call `thread/resume` with the `thread.id` you prev
 } }
 { "id": 11, "result": { "thread": { "id": "thr_123", … } } }
 ```
+
+`configPath` precedence is explicit:
+
+- `thread/start`: when omitted, Codex uses the default user config path (`$CODEX_HOME/config.toml`).
+- `thread/resume` / `thread/fork`: when provided, `configPath` overrides inherited session metadata; when omitted, Codex inherits the persisted session `configPath`.
+- When an explicit `configPath` is invalid, unreadable, or missing, the request fails at config-load time (no fallback to the default path).
 
 To branch from a stored session, call `thread/fork` with the `thread.id`. This creates a new thread id and emits a `thread/started` notification for it:
 
@@ -770,7 +778,7 @@ Today both notifications carry an empty `items` array even when item events were
 - `commandExecution` — `{id, command, cwd, status, commandActions, aggregatedOutput?, exitCode?, durationMs?}` for sandboxed commands; `status` is `inProgress`, `completed`, `failed`, or `declined`.
 - `fileChange` — `{id, changes, status}` describing proposed edits; `changes` list `{path, kind, diff}` and `status` is `inProgress`, `completed`, `failed`, or `declined`.
 - `mcpToolCall` — `{id, server, tool, status, arguments, result?, error?}` describing MCP calls; `status` is `inProgress`, `completed`, or `failed`.
-- `collabToolCall` — `{id, tool, status, senderThreadId, receiverThreadId?, newThreadId?, prompt?, agentStatus?}` describing collab tool calls (`spawn_agent`, `send_input`, `resume_agent`, `wait`, `close_agent`); `status` is `inProgress`, `completed`, or `failed`.
+- `collabToolCall` — `{id, tool, status, senderThreadId, receiverThreadIds, prompt?, agentsStates}` describing collab tool calls (`spawn_agent`, `send_input`, `resume_agent`, `wait`, `close_agent`); `receiverThreadIds` is the list of target thread IDs (including newly spawned agents), `agentsStates` maps each target thread ID to `{status, message?, lastActivity?}`, and `status` is `inProgress`, `completed`, or `failed`.
 - `webSearch` — `{id, query, action?}` for a web search request issued by the agent; `action` mirrors the Responses API web_search action payload (`search`, `open_page`, `find_in_page`) and may be omitted until completion.
 - `imageView` — `{id, path}` emitted when the agent invokes the image viewer tool.
 - `enteredReviewMode` — `{id, review}` sent when the reviewer starts; `review` is a short user-facing label such as `"current changes"` or the requested target description.
@@ -1111,7 +1119,7 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 
 ### API Overview
 
-- `account/read` — fetch current account info; optionally request a best-effort token refresh.
+- `account/read` — fetch current account info; optionally request a proactive token refresh.
 - `account/login/start` — begin login (`apiKey`, `chatgpt`, `chatgptAuthTokens`).
 - `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
 - `account/login/cancel` — cancel a pending ChatGPT login by `loginId`.
@@ -1141,7 +1149,7 @@ Response examples:
 Field notes:
 
 - `refreshToken` (bool): when `true`, Codex requests a proactive token refresh before returning account state.
-  This is best-effort: refresh failures are logged and the call still returns the current account view.
+  In managed auth mode, refresh failure fails the RPC instead of returning stale cached account data.
   In `chatgptAuthTokens` mode, this flag is ignored.
 - `requiresOpenaiAuth` reflects the active provider; when `false`, Codex can run without OpenAI credentials.
 

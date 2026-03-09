@@ -1557,6 +1557,17 @@
             "null"
           ]
         },
+        "last_activity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/v2/CollabAgentActivity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Most recent observed activity for the agent, when available."
+        },
         "status": {
           "allOf": [
             {
@@ -9198,8 +9209,49 @@
           }
         ]
       },
+      "CollabAgentActivity": {
+        "properties": {
+          "kind": {
+            "$ref": "#/definitions/v2/CollabAgentActivityKind"
+          },
+          "occurredAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "occurredAt",
+          "summary"
+        ],
+        "type": "object"
+      },
+      "CollabAgentActivityKind": {
+        "enum": [
+          "message",
+          "reasoning",
+          "command",
+          "edit",
+          "task",
+          "status"
+        ],
+        "type": "string"
+      },
       "CollabAgentState": {
         "properties": {
+          "lastActivity": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/CollabAgentActivity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "message": {
             "type": [
               "string",
@@ -10060,7 +10112,7 @@
             "type": "object"
           },
           {
-            "description": "User config layer from $CODEX_HOME/config.toml. This layer is special in that it is expected to be: - writable by the user - generally outside the workspace directory",
+            "description": "Active user config layer. When no override is in use, this defaults to $CODEX_HOME/config.toml. This layer is special in that it is expected to be: - writable by the user - generally outside the workspace directory",
             "properties": {
               "file": {
                 "allOf": [
@@ -10068,7 +10120,7 @@
                     "$ref": "#/definitions/v2/AbsolutePathBuf"
                   }
                 ],
-                "description": "This is the path to the user's config.toml file, though it is not guaranteed to exist."
+                "description": "This is the resolved path to the active user config file, though it is not guaranteed to exist."
               },
               "type": {
                 "enum": [
@@ -11022,7 +11074,7 @@
         "properties": {
           "refreshToken": {
             "default": false,
-            "description": "When `true`, requests a proactive token refresh before returning.\n\nIn managed auth mode this triggers the normal refresh-token flow. In external auth mode this flag is ignored. Clients should refresh tokens themselves and call `account/login/start` with `chatgptAuthTokens`.",
+            "description": "When `true`, requests a proactive token refresh before returning.\n\nIn managed auth mode this triggers the normal refresh-token flow and the RPC fails if the requested refresh fails. In external auth mode this flag is ignored. Clients should refresh tokens themselves and call `account/login/start` with `chatgptAuthTokens`.",
             "type": "boolean"
           }
         },
@@ -14524,6 +14576,13 @@
               "null"
             ]
           },
+          "configPath": {
+            "description": "Optional user config file path override for the forked thread. When omitted, Codex reuses the source thread's active user config path.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "cwd": {
             "type": [
               "string",
@@ -14592,6 +14651,9 @@
           "approvalPolicy": {
             "$ref": "#/definitions/v2/AskForApproval"
           },
+          "configPath": {
+            "type": "string"
+          },
           "cwd": {
             "type": "string"
           },
@@ -14630,6 +14692,7 @@
         },
         "required": [
           "approvalPolicy",
+          "configPath",
           "cwd",
           "model",
           "modelProvider",
@@ -15621,6 +15684,13 @@
               "null"
             ]
           },
+          "configPath": {
+            "description": "Optional user config file path override for the resumed thread. When omitted, Codex reuses the thread's persisted active user config path.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "cwd": {
             "type": [
               "string",
@@ -15699,6 +15769,9 @@
           "approvalPolicy": {
             "$ref": "#/definitions/v2/AskForApproval"
           },
+          "configPath": {
+            "type": "string"
+          },
           "cwd": {
             "type": "string"
           },
@@ -15737,6 +15810,7 @@
         },
         "required": [
           "approvalPolicy",
+          "configPath",
           "cwd",
           "model",
           "modelProvider",
@@ -15854,6 +15928,13 @@
               "null"
             ]
           },
+          "configPath": {
+            "description": "Optional user config file path for this thread. When omitted, Codex uses the default active user config path.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "cwd": {
             "type": [
               "string",
@@ -15937,6 +16018,9 @@
           "approvalPolicy": {
             "$ref": "#/definitions/v2/AskForApproval"
           },
+          "configPath": {
+            "type": "string"
+          },
           "cwd": {
             "type": "string"
           },
@@ -15975,6 +16059,7 @@
         },
         "required": [
           "approvalPolicy",
+          "configPath",
           "cwd",
           "model",
           "modelProvider",

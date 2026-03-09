@@ -46,8 +46,7 @@ pub struct CodexToolCallParam {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<CodexToolCallSandboxMode>,
 
-    /// Individual config settings that will override what is in
-    /// CODEX_HOME/config.toml.
+    /// Individual config settings that override the active user config file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<HashMap<String, serde_json::Value>>,
 

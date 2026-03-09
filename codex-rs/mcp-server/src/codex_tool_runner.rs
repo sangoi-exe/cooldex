@@ -250,7 +250,7 @@ async fn run_codex_tool_session_inner(
                         continue;
                     }
                     EventMsg::Error(err_event) => {
-                        // Always respond in tools/call's expected shape, and include conversationId so the client can resume.
+                        // Always respond in tools/call's expected shape, and include threadId so the client can resume.
                         let result = create_call_tool_result_with_thread_id(
                             thread_id,
                             err_event.message,

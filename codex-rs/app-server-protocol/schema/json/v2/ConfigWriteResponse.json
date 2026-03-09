@@ -74,7 +74,7 @@
           "type": "object"
         },
         {
-          "description": "User config layer from $CODEX_HOME/config.toml. This layer is special in that it is expected to be: - writable by the user - generally outside the workspace directory",
+          "description": "Active user config layer. When no override is in use, this defaults to $CODEX_HOME/config.toml. This layer is special in that it is expected to be: - writable by the user - generally outside the workspace directory",
           "properties": {
             "file": {
               "allOf": [
@@ -82,7 +82,7 @@
                   "$ref": "#/definitions/AbsolutePathBuf"
                 }
               ],
-              "description": "This is the path to the user's config.toml file, though it is not guaranteed to exist."
+              "description": "This is the resolved path to the active user config file, though it is not guaranteed to exist."
             },
             "type": {
               "enum": [

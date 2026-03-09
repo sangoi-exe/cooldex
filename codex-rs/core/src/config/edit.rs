@@ -687,6 +687,7 @@ fn normalize_skill_config_path(path: &Path) -> String {
 /// Persist edits using a blocking strategy.
 pub fn apply_blocking(
     codex_home: &Path,
+    user_config_path: Option<&Path>,
     profile: Option<&str>,
     edits: &[ConfigEdit],
 ) -> anyhow::Result<()> {
@@ -694,7 +695,9 @@ pub fn apply_blocking(
         return Ok(());
     }
 
-    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let config_path = user_config_path
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| codex_home.join(CONFIG_TOML_FILE));
     let write_paths = resolve_symlink_write_paths(&config_path)?;
     let serialized = match write_paths.read_path {
         Some(path) => match std::fs::read_to_string(&path) {
@@ -741,20 +744,30 @@ pub fn apply_blocking(
 /// Persist edits asynchronously by offloading the blocking writer.
 pub async fn apply(
     codex_home: &Path,
+    user_config_path: Option<&Path>,
     profile: Option<&str>,
     edits: Vec<ConfigEdit>,
 ) -> anyhow::Result<()> {
     let codex_home = codex_home.to_path_buf();
+    let user_config_path = user_config_path.map(ToOwned::to_owned);
     let profile = profile.map(ToOwned::to_owned);
-    task::spawn_blocking(move || apply_blocking(&codex_home, profile.as_deref(), &edits))
-        .await
-        .context("config persistence task panicked")?
+    task::spawn_blocking(move || {
+        apply_blocking(
+            &codex_home,
+            user_config_path.as_deref(),
+            profile.as_deref(),
+            &edits,
+        )
+    })
+    .await
+    .context("config persistence task panicked")?
 }
 
 /// Fluent builder to batch config edits and apply them atomically.
 #[derive(Default)]
 pub struct ConfigEditsBuilder {
     codex_home: PathBuf,
+    user_config_path: Option<PathBuf>,
     profile: Option<String>,
     edits: Vec<ConfigEdit>,
 }
@@ -763,9 +776,15 @@ impl ConfigEditsBuilder {
     pub fn new(codex_home: &Path) -> Self {
         Self {
             codex_home: codex_home.to_path_buf(),
+            user_config_path: None,
             profile: None,
             edits: Vec::new(),
         }
+    }
+
+    pub fn user_config_path(mut self, user_config_path: impl Into<PathBuf>) -> Self {
+        self.user_config_path = Some(user_config_path.into());
+        self
     }
 
     pub fn with_profile(mut self, profile: Option<&str>) -> Self {
@@ -938,13 +957,23 @@ impl ConfigEditsBuilder {
 
     /// Apply edits on a blocking thread.
     pub fn apply_blocking(self) -> anyhow::Result<()> {
-        apply_blocking(&self.codex_home, self.profile.as_deref(), &self.edits)
+        apply_blocking(
+            &self.codex_home,
+            self.user_config_path.as_deref(),
+            self.profile.as_deref(),
+            &self.edits,
+        )
     }
 
     /// Apply edits asynchronously via a blocking offload.
     pub async fn apply(self) -> anyhow::Result<()> {
         task::spawn_blocking(move || {
-            apply_blocking(&self.codex_home, self.profile.as_deref(), &self.edits)
+            apply_blocking(
+                &self.codex_home,
+                self.user_config_path.as_deref(),
+                self.profile.as_deref(),
+                &self.edits,
+            )
         })
         .await
         .context("config persistence task panicked")?
@@ -969,6 +998,7 @@ mod tests {
 
         apply_blocking(
             codex_home,
+            None,
             None,
             &[ConfigEdit::SetModel {
                 model: Some("gpt-5.1-codex".to_string()),
@@ -1088,6 +1118,7 @@ profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
         apply_blocking(
             codex_home,
             None,
+            None,
             &[ConfigEdit::SetModel {
                 model: Some("o4-mini".to_string()),
                 effort: None,
@@ -1133,6 +1164,7 @@ profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
         apply_blocking(
             codex_home,
             None,
+            None,
             &[ConfigEdit::SetModel {
                 model: Some("gpt-5.1-codex".to_string()),
                 effort: Some(ReasoningEffort::High),
@@ -1165,6 +1197,7 @@ model_reasoning_effort = "high"
 
         apply_blocking(
             codex_home,
+            None,
             None,
             &[ConfigEdit::SetModel {
                 model: Some("gpt-5.1-codex".to_string()),
@@ -1204,6 +1237,7 @@ network_access = false
 
         apply_blocking(
             codex_home,
+            None,
             None,
             &[
                 ConfigEdit::SetPath {
@@ -1261,6 +1295,7 @@ profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
         apply_blocking(
             codex_home,
             None,
+            None,
             &[ConfigEdit::SetModel {
                 model: None,
                 effort: Some(ReasoningEffort::High),
@@ -1296,6 +1331,7 @@ model_reasoning_effort = "low"
         apply_blocking(
             codex_home,
             None,
+            None,
             &[ConfigEdit::SetModel {
                 model: Some("o5-preview".to_string()),
                 effort: Some(ReasoningEffort::Minimal),
@@ -1328,6 +1364,7 @@ model = "gpt-5.1-codex"
 
         apply_blocking(
             codex_home,
+            None,
             Some("team a"),
             &[ConfigEdit::SetModel {
                 model: Some("o4-mini".to_string()),
@@ -1362,6 +1399,7 @@ existing = "value"
         apply_blocking(
             codex_home,
             None,
+            None,
             &[ConfigEdit::SetNoticeHideFullAccessWarning(true)],
         )
         .expect("persist");
@@ -1393,6 +1431,7 @@ existing = "value"
         apply_blocking(
             codex_home,
             None,
+            None,
             &[ConfigEdit::SetNoticeHideRateLimitModelNudge(true)],
         )
         .expect("persist");
@@ -1419,6 +1458,7 @@ existing = "value"
         .expect("seed");
         apply_blocking(
             codex_home,
+            None,
             None,
             &[ConfigEdit::SetNoticeHideModelMigrationPrompt(
                 "hide_gpt5_1_migration_prompt".to_string(),
@@ -1450,6 +1490,7 @@ existing = "value"
         apply_blocking(
             codex_home,
             None,
+            None,
             &[ConfigEdit::SetNoticeHideModelMigrationPrompt(
                 "hide_gpt-5.1-codex-max_migration_prompt".to_string(),
                 true,
@@ -1479,6 +1520,7 @@ existing = "value"
         .expect("seed");
         apply_blocking(
             codex_home,
+            None,
             None,
             &[ConfigEdit::RecordModelMigrationSeen {
                 from: "gpt-5".to_string(),
@@ -1561,6 +1603,7 @@ gpt-5 = "gpt-5.1"
         apply_blocking(
             codex_home,
             None,
+            None,
             &[ConfigEdit::ReplaceMcpServers(servers.clone())],
         )
         .expect("persist");
@@ -1627,8 +1670,13 @@ foo = { command = "cmd" }
             },
         );
 
-        apply_blocking(codex_home, None, &[ConfigEdit::ReplaceMcpServers(servers)])
-            .expect("persist");
+        apply_blocking(
+            codex_home,
+            None,
+            None,
+            &[ConfigEdit::ReplaceMcpServers(servers)],
+        )
+        .expect("persist");
 
         let contents =
             std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
@@ -1674,8 +1722,13 @@ foo = { command = "cmd" } # keep me
             },
         );
 
-        apply_blocking(codex_home, None, &[ConfigEdit::ReplaceMcpServers(servers)])
-            .expect("persist");
+        apply_blocking(
+            codex_home,
+            None,
+            None,
+            &[ConfigEdit::ReplaceMcpServers(servers)],
+        )
+        .expect("persist");
 
         let contents =
             std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
@@ -1720,8 +1773,13 @@ foo = { command = "cmd", args = ["--flag"] } # keep me
             },
         );
 
-        apply_blocking(codex_home, None, &[ConfigEdit::ReplaceMcpServers(servers)])
-            .expect("persist");
+        apply_blocking(
+            codex_home,
+            None,
+            None,
+            &[ConfigEdit::ReplaceMcpServers(servers)],
+        )
+        .expect("persist");
 
         let contents =
             std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
@@ -1767,8 +1825,13 @@ foo = { command = "cmd" }
             },
         );
 
-        apply_blocking(codex_home, None, &[ConfigEdit::ReplaceMcpServers(servers)])
-            .expect("persist");
+        apply_blocking(
+            codex_home,
+            None,
+            None,
+            &[ConfigEdit::ReplaceMcpServers(servers)],
+        )
+        .expect("persist");
 
         let contents =
             std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
@@ -1786,6 +1849,7 @@ foo = { command = "cmd" , enabled = false }
 
         apply_blocking(
             codex_home,
+            None,
             None,
             &[ConfigEdit::ClearPath {
                 segments: vec!["missing".to_string()],
@@ -1807,6 +1871,7 @@ foo = { command = "cmd" , enabled = false }
         let item = value(false);
         apply_blocking(
             codex_home,
+            None,
             None,
             &[ConfigEdit::SetPath {
                 segments: vec!["tui".to_string(), "notifications".to_string()],
@@ -1955,6 +2020,7 @@ model_reasoning_effort = "high"
 
         apply_blocking(
             codex_home,
+            None,
             None,
             &[ConfigEdit::ReplaceMcpServers(BTreeMap::new())],
         )

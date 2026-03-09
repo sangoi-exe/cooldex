@@ -179,7 +179,7 @@ async fn responses_stream_parses_items_and_completed_end_to_end() -> Result<()> 
 }
 
 #[tokio::test]
-async fn responses_stream_aggregates_output_text_deltas() -> Result<()> {
+async fn responses_stream_emits_aggregated_output_text_deltas() -> Result<()> {
     let delta1 = serde_json::json!({
         "type": "response.output_text.delta",
         "delta": "Hello, "
@@ -208,7 +208,7 @@ async fn responses_stream_aggregates_output_text_deltas() -> Result<()> {
         )
         .await?;
 
-    let mut stream = stream.aggregate();
+    let mut stream = stream;
     let mut events = Vec::new();
     while let Some(ev) = stream.next().await {
         events.push(ev?);

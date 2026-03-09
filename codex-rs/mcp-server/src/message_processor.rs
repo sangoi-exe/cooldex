@@ -449,11 +449,11 @@ impl MessageProcessor {
             },
             None => {
                 tracing::error!(
-                    "Missing arguments for codex-reply tool-call; the `thread_id` and `prompt` fields are required."
+                    "Missing arguments for codex-reply tool-call; the `threadId` (or deprecated `conversationId`) and `prompt` fields are required."
                 );
                 let result = CallToolResult {
                     content: vec![rmcp::model::Content::text(
-                        "Missing arguments for codex-reply tool-call; the `thread_id` and `prompt` fields are required.",
+                        "Missing arguments for codex-reply tool-call; the `threadId` (or deprecated `conversationId`) and `prompt` fields are required.",
                     )],
                     structured_content: None,
                     is_error: Some(true),
@@ -467,10 +467,10 @@ impl MessageProcessor {
         let thread_id = match codex_tool_call_reply_param.get_thread_id() {
             Ok(id) => id,
             Err(e) => {
-                tracing::error!("Failed to parse thread_id: {e}");
+                tracing::error!("Failed to parse `threadId` (or deprecated `conversationId`): {e}");
                 let result = CallToolResult {
                     content: vec![rmcp::model::Content::text(format!(
-                        "Failed to parse thread_id: {e}"
+                        "Failed to parse `threadId` (or deprecated `conversationId`): {e}"
                     ))],
                     structured_content: None,
                     is_error: Some(true),
@@ -488,10 +488,10 @@ impl MessageProcessor {
         let codex = match self.thread_manager.get_thread(thread_id).await {
             Ok(c) => c,
             Err(_) => {
-                tracing::warn!("Session not found for thread_id: {thread_id}");
+                tracing::warn!("Session not found for threadId: {thread_id}");
                 let result = crate::codex_tool_runner::create_call_tool_result_with_thread_id(
                     thread_id,
-                    format!("Session not found for thread_id: {thread_id}"),
+                    format!("Session not found for threadId: {thread_id}"),
                     Some(true),
                 );
                 outgoing.send_response(request_id, result).await;
@@ -560,13 +560,13 @@ impl MessageProcessor {
                 }
             }
         };
-        tracing::info!("thread_id: {thread_id}");
+        tracing::info!("threadId: {thread_id}");
 
         // Obtain the Codex thread from the server.
         let codex_arc = match self.thread_manager.get_thread(thread_id).await {
             Ok(c) => c,
             Err(_) => {
-                tracing::warn!("Session not found for thread_id: {thread_id}");
+                tracing::warn!("Session not found for threadId: {thread_id}");
                 return;
             }
         };

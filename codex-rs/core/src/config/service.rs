@@ -249,9 +249,16 @@ impl ConfigService {
         expected_version: Option<String>,
         edits: Vec<(String, JsonValue, MergeStrategy)>,
     ) -> Result<ConfigWriteResponse, ConfigServiceError> {
-        let allowed_path =
-            AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, &self.codex_home)
-                .map_err(|err| ConfigServiceError::io("failed to resolve user config path", err))?;
+        let layers = self
+            .load_thread_agnostic_config()
+            .await
+            .map_err(|err| ConfigServiceError::io("failed to load configuration", err))?;
+        let allowed_path = layers.get_user_config_file().cloned().ok_or_else(|| {
+            ConfigServiceError::write(
+                ConfigWriteErrorCode::UserLayerNotFound,
+                "active user config layer is missing",
+            )
+        })?;
         let provided_path = match file_path {
             Some(path) => AbsolutePathBuf::from_absolute_path(PathBuf::from(path))
                 .map_err(|err| ConfigServiceError::io("failed to resolve user config path", err))?,
@@ -261,14 +268,10 @@ impl ConfigService {
         if !paths_match(&allowed_path, &provided_path) {
             return Err(ConfigServiceError::write(
                 ConfigWriteErrorCode::ConfigLayerReadonly,
-                "Only writes to the user config are allowed",
+                "Only writes to the active user config are allowed",
             ));
         }
 
-        let layers = self
-            .load_thread_agnostic_config()
-            .await
-            .map_err(|err| ConfigServiceError::io("failed to load configuration", err))?;
         let user_layer = match layers.get_user_layer() {
             Some(layer) => Cow::Borrowed(layer),
             None => Cow::Owned(create_empty_user_layer(&allowed_path).await?),
@@ -334,15 +337,18 @@ impl ConfigService {
                 format!("Invalid configuration: {err}"),
             )
         })?;
+        let user_config_base_dir = provided_path
+            .parent()
+            .map(|path| path.to_path_buf())
+            .unwrap_or_else(|| self.codex_home.clone());
         let user_config_toml =
-            deserialize_config_toml_with_base(user_config.clone(), &self.codex_home).map_err(
-                |err| {
+            deserialize_config_toml_with_base(user_config.clone(), user_config_base_dir.as_path())
+                .map_err(|err| {
                     ConfigServiceError::write(
                         ConfigWriteErrorCode::ConfigValidationError,
                         format!("Invalid configuration: {err}"),
                     )
-                },
-            )?;
+                })?;
         validate_explicit_feature_settings_in_config_toml(
             &user_config_toml,
             layers.requirements().feature_requirements.as_ref(),
@@ -375,6 +381,7 @@ impl ConfigService {
 
         if !config_edits.is_empty() {
             ConfigEditsBuilder::new(&self.codex_home)
+                .user_config_path(provided_path.as_path())
                 .with_edits(config_edits)
                 .apply()
                 .await
@@ -912,6 +919,7 @@ personality = true
             tmp.path().to_path_buf(),
             vec![],
             LoaderOverrides {
+                user_config_path: None,
                 managed_config_path: Some(managed_path.clone()),
                 #[cfg(target_os = "macos")]
                 managed_preferences_base64: None,
@@ -987,6 +995,7 @@ personality = true
             tmp.path().to_path_buf(),
             vec![],
             LoaderOverrides {
+                user_config_path: None,
                 managed_config_path: Some(managed_path.clone()),
                 #[cfg(target_os = "macos")]
                 managed_preferences_base64: None,
@@ -1092,6 +1101,7 @@ personality = true
             tmp.path().to_path_buf(),
             vec![],
             LoaderOverrides {
+                user_config_path: None,
                 managed_config_path: Some(managed_path.clone()),
                 #[cfg(target_os = "macos")]
                 managed_preferences_base64: None,
@@ -1130,6 +1140,7 @@ personality = true
             tmp.path().to_path_buf(),
             vec![],
             LoaderOverrides {
+                user_config_path: None,
                 managed_config_path: None,
                 #[cfg(target_os = "macos")]
                 managed_preferences_base64: None,
@@ -1181,6 +1192,7 @@ personality = true
             tmp.path().to_path_buf(),
             vec![],
             LoaderOverrides {
+                user_config_path: None,
                 managed_config_path: None,
                 #[cfg(target_os = "macos")]
                 managed_preferences_base64: None,
@@ -1243,6 +1255,7 @@ personality = true
             tmp.path().to_path_buf(),
             cli_overrides,
             LoaderOverrides {
+                user_config_path: None,
                 managed_config_path: Some(managed_path.clone()),
                 #[cfg(target_os = "macos")]
                 managed_preferences_base64: None,
@@ -1301,6 +1314,7 @@ personality = true
             tmp.path().to_path_buf(),
             vec![],
             LoaderOverrides {
+                user_config_path: None,
                 managed_config_path: Some(managed_path.clone()),
                 #[cfg(target_os = "macos")]
                 managed_preferences_base64: None,

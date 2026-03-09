@@ -1,3 +1,4 @@
+use crate::agent::AgentRuntimeState;
 use crate::agent::AgentStatus;
 use crate::agent::guards::Guards;
 use crate::agent::role::DEFAULT_ROLE_NAME;
@@ -341,6 +342,25 @@ impl AgentControl {
             return AgentStatus::NotFound;
         };
         thread.agent_status().await
+    }
+
+    pub(crate) async fn get_runtime_state(&self, agent_id: ThreadId) -> AgentRuntimeState {
+        let Ok(state) = self.upgrade() else {
+            return AgentRuntimeState {
+                status: AgentStatus::NotFound,
+                last_activity: None,
+            };
+        };
+        let Ok(thread) = state.get_thread(agent_id).await else {
+            return AgentRuntimeState {
+                status: AgentStatus::NotFound,
+                last_activity: None,
+            };
+        };
+        AgentRuntimeState {
+            status: thread.agent_status().await,
+            last_activity: thread.agent_last_activity().await,
+        }
     }
 
     pub(crate) async fn get_agent_nickname_and_role(

@@ -165,11 +165,11 @@ fn accounts_cache_fallback_expires_at(
 
 fn spawn_next_accounts_rate_limit_fetch(
     join_set: &mut tokio::task::JoinSet<(String, Option<RateLimitSnapshot>)>,
-    pending: &mut std::vec::IntoIter<String>,
+    pending: &mut impl Iterator<Item = String>,
     auth_manager: &AuthManager,
     base_url: &str,
 ) -> bool {
-    while let Some(store_account_id) = pending.next() {
+    for store_account_id in pending.by_ref() {
         let Some(auth) = auth_manager.chatgpt_auth_for_store_account_id(&store_account_id) else {
             continue;
         };
@@ -210,12 +210,10 @@ async fn fetch_accounts_rate_limit_updates(
     let mut join_set = tokio::task::JoinSet::new();
     let mut attempted_fetches = 0usize;
     let mut successful_fetches = 0usize;
-    let account_ids = auth_manager
+    let mut pending = auth_manager
         .list_accounts()
         .into_iter()
-        .map(|account| account.id)
-        .collect::<Vec<_>>();
-    let mut pending = account_ids.into_iter();
+        .map(|account| account.id);
 
     for _ in 0..MAX_IN_FLIGHT {
         if !spawn_next_accounts_rate_limit_fetch(

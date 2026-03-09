@@ -651,23 +651,42 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::CollabWaitingEndEvent,
     ) {
-        let status = if payload
+        let has_failed_status = payload
             .statuses
             .values()
             .any(|status| matches!(status, AgentStatus::Errored(_) | AgentStatus::NotFound))
-        {
+            || payload.agent_statuses.iter().any(|status| {
+                matches!(
+                    &status.status,
+                    AgentStatus::Errored(_) | AgentStatus::NotFound
+                )
+            });
+        let status = if has_failed_status {
             CollabAgentToolCallStatus::Failed
         } else {
             CollabAgentToolCallStatus::Completed
         };
-        let mut receiver_thread_ids: Vec<String> =
-            payload.statuses.keys().map(ToString::to_string).collect();
+        let mut receiver_thread_ids: Vec<String> = payload
+            .statuses
+            .keys()
+            .map(ToString::to_string)
+            .chain(
+                payload
+                    .agent_statuses
+                    .iter()
+                    .map(|status| status.thread_id.to_string()),
+            )
+            .collect();
         receiver_thread_ids.sort();
-        let agents_states = payload
+        receiver_thread_ids.dedup();
+        let mut agents_states = payload
             .statuses
             .iter()
             .map(|(id, status)| (id.to_string(), CollabAgentState::from(status.clone())))
-            .collect();
+            .collect::<HashMap<_, _>>();
+        for status in &payload.agent_statuses {
+            agents_states.insert(status.thread_id.to_string(), CollabAgentState::from(status));
+        }
         self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::Wait,
@@ -2329,6 +2348,7 @@ mod tests {
                     CollabAgentState {
                         status: crate::protocol::v2::CollabAgentStatus::Completed,
                         message: None,
+                        last_activity: None,
                     },
                 )]
                 .into_iter()

@@ -1,5 +1,16 @@
 # Codex Local Scratchpad
 
-Freeform notes for this workspace only.
-Record durable local preferences and recurring mistakes that should change future decisions.
-Avoid routine operational logs.
+Workspace-specific notes that should change future behavior.
+Keep this high-signal. Avoid operational logs.
+
+- While both `.sangoi/codex_scratchpad_local.md` and `./codex_scratchpad_local.md` exist, update them together; the workspace currently uses both entrypoints and durable memory must not split across them.
+- In this workspace, `~/.codex/config.toml` duplicates some sub-agent rules across the playbook and role-specific sections; when one rule changes, update every mirrored instruction in the same edit to avoid stale references.
+- Durable workspace-specific implementation clusters still carried outside `upstream/main`:
+  - `manage_context`: strict retrieve/apply v2 flow, prompt-sanitization integration, replacement-history materialization/rollback, and the accompanying docs stack. Primary anchors: `codex-rs/core/src/tools/handlers/manage_context.rs`, `codex-rs/core/src/tasks/sanitize.rs`, `codex-rs/core/sanitize_prompt.md`, `docs/manage_context.md`, `docs/manage_context_cheatsheet.md`, `docs/manage_context_model.md`.
+  - `recall`: args-less recall tool, rollout/compaction coupling, auto-compact warning flow, and recall docs. Primary anchors: `codex-rs/core/src/tools/handlers/recall.rs`, `codex-rs/core/src/codex.rs`, `docs/recall.md`, `docs/guide_reapply_recall.md`, `retrieve`, `codex-rs/core/tests/suite/compact.rs`, `codex-rs/core/tests/suite/compact_remote.rs`.
+  - `/accounts`: multi-account ChatGPT management is a cross-file divergence cluster, not a single TUI command. Treat auth storage, TUI popup/cache flow, slash-command gating, and app-server/auth docs as one subsystem. Primary anchors: `codex-rs/core/src/auth.rs`, `codex-rs/tui/src/app.rs`, `codex-rs/tui/src/app_event.rs`, `codex-rs/tui/src/chatwidget.rs`, `codex-rs/tui/src/slash_command.rs`, `codex-rs/app-server/README.md`, `docs/authentication.md`.
+  - sub-agent/runtime orchestration: custom spawn/profile plumbing, background-agent handling, and parallel tool execution live outside upstream. Merge-sensitive detail: child agents must stay isolated from the lead prompt stack; preserve `subagent_instructions_file` as the child-only base-instructions source and keep child spawn/resume config from inheriting lead `developer_instructions`, AGENTS/project-doc-derived `user_instructions`, and `Feature::ChildAgentsMd`. Primary anchors: `codex-rs/core/src/tools/handlers/multi_agents.rs`, `codex-rs/core/src/config/mod.rs`, `codex-rs/core/src/project_doc.rs`, `codex-rs/core/src/tools/parallel.rs`, `codex-rs/core/src/state/session.rs`, `codex-rs/core/src/rid.rs`, `AGENTS.md`.
+  - TUI debugging/custom operator surfaces: `/debug` and nearby raw-response inspection/context-window handling are local customizations. Primary anchors: `codex-rs/tui/src/chatwidget.rs`, `codex-rs/tui/src/slash_command.rs`, `codex-rs/core/src/codex.rs`.
+  - workspace sync policy is also custom: keep `.github/**` removed from this workspace and resolve upstream sync conflicts manually while preserving local behavior. Primary anchors: `AGENTS.md`, diff against `upstream/main` for `.github/**`.
+- Drift traps to remember during future syncs:
+  - `recall_debug` defaults to compact mode when unset; if runtime, `docs/recall.md`, `docs/guide_reapply_recall.md`, `codex-rs/core/src/config/mod.rs`, and `codex-rs/core/config.schema.json` drift apart, fix them in one patch.

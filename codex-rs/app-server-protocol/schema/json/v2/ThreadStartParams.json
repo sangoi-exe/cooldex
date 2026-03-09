@@ -108,6 +108,13 @@
         "null"
       ]
     },
+    "configPath": {
+      "description": "Optional user config file path for this thread. When omitted, Codex uses the default active user config path.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "cwd": {
       "type": [
         "string",

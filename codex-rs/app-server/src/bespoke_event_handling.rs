@@ -917,23 +917,48 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::CollabWaitingEnd(end_event) => {
-            let status = if end_event.statuses.values().any(|status| {
+            let has_failed_status = end_event.statuses.values().any(|status| {
                 matches!(
                     status,
                     codex_protocol::protocol::AgentStatus::Errored(_)
                         | codex_protocol::protocol::AgentStatus::NotFound
                 )
-            }) {
+            }) || end_event.agent_statuses.iter().any(|status| {
+                matches!(
+                    &status.status,
+                    codex_protocol::protocol::AgentStatus::Errored(_)
+                        | codex_protocol::protocol::AgentStatus::NotFound
+                )
+            });
+            let status = if has_failed_status {
                 V2CollabToolCallStatus::Failed
             } else {
                 V2CollabToolCallStatus::Completed
             };
-            let receiver_thread_ids = end_event.statuses.keys().map(ToString::to_string).collect();
-            let agents_states = end_event
+            let mut receiver_thread_ids: Vec<String> = end_event
+                .statuses
+                .keys()
+                .map(ToString::to_string)
+                .chain(
+                    end_event
+                        .agent_statuses
+                        .iter()
+                        .map(|status| status.thread_id.to_string()),
+                )
+                .collect();
+            receiver_thread_ids.sort();
+            receiver_thread_ids.dedup();
+            let mut agents_states = end_event
                 .statuses
                 .iter()
                 .map(|(id, status)| (id.to_string(), V2CollabAgentStatus::from(status.clone())))
-                .collect();
+                .collect::<HashMap<_, _>>();
+            for status in &end_event.agent_statuses {
+                agents_states.insert(
+                    status.thread_id.to_string(),
+                    V2CollabAgentStatus::from(status),
+                );
+            }
             let item = ThreadItem::CollabAgentToolCall {
                 id: end_event.call_id,
                 tool: CollabAgentTool::Wait,

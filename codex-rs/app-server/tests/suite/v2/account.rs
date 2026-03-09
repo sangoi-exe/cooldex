@@ -29,6 +29,7 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_core::auth::AuthCredentialsStoreMode;
+use codex_core::auth::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_login::login_with_api_key;
 use codex_protocol::account::PlanType as AccountPlanType;
 use core_test_support::responses;
@@ -39,8 +40,11 @@ use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
+use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -175,7 +179,7 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let set_id = mcp
         .send_chatgpt_auth_tokens_login_request(
@@ -249,7 +253,7 @@ async fn account_read_refresh_token_is_noop_in_external_mode() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let set_id = mcp
         .send_chatgpt_auth_tokens_login_request(
@@ -303,6 +307,76 @@ async fn account_read_refresh_token_is_noop_in_external_mode() -> Result<()> {
         "external mode should not emit account/chatgptAuthTokens/refresh for refreshToken=true"
     );
 
+    Ok(())
+}
+
+#[serial(auth_refresh)]
+#[tokio::test]
+async fn account_read_refresh_token_failure_returns_error_in_managed_mode() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": "temporary-failure"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            requires_openai_auth: Some(true),
+            ..Default::default()
+        },
+    )?;
+    write_models_cache(codex_home.path())?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("access-chatgpt")
+            .account_id("org-embedded")
+            .chatgpt_account_id("org-embedded")
+            .email("user@example.com")
+            .plan_type("pro")
+            .refresh_token("refresh-token"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let refresh_url = format!("{}/oauth/token", mock_server.uri());
+    let mut mcp = McpProcess::new_with_env(
+        codex_home.path(),
+        &[
+            ("OPENAI_API_KEY", None),
+            (
+                REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+                Some(refresh_url.as_str()),
+            ),
+        ],
+    )
+    .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_get_account_request(GetAccountParams {
+            refresh_token: true,
+        })
+        .await?;
+    let err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    assert!(
+        err.error
+            .message
+            .starts_with("failed to refresh token while getting account:"),
+        "unexpected error message: {}",
+        err.error.message
+    );
+
+    mock_server.verify().await;
     Ok(())
 }
 
@@ -374,7 +448,7 @@ async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let set_id = mcp
         .send_chatgpt_auth_tokens_login_request(
@@ -480,7 +554,7 @@ async fn external_auth_refresh_error_fails_turn() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let set_id = mcp
         .send_chatgpt_auth_tokens_login_request(
@@ -602,7 +676,7 @@ async fn external_auth_refresh_mismatched_workspace_fails_turn() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let set_id = mcp
         .send_chatgpt_auth_tokens_login_request(
@@ -717,7 +791,7 @@ async fn external_auth_refresh_invalid_access_token_fails_turn() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let set_id = mcp
         .send_chatgpt_auth_tokens_login_request(
@@ -983,7 +1057,7 @@ async fn set_auth_token_cancels_active_chatgpt_login() -> Result<()> {
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     // Initiate the ChatGPT login flow
     let request_id = mcp.send_login_account_chatgpt_request().await?;

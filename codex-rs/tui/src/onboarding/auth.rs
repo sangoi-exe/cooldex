@@ -196,7 +196,7 @@ impl KeyboardHandler for AuthModeWidget {
 pub(crate) struct AuthModeWidget {
     pub request_frame: FrameRequester,
     pub highlighted_mode: SignInOption,
-    pub error: Option<String>,
+    pub error: Arc<RwLock<Option<String>>>,
     pub sign_in_state: Arc<RwLock<SignInState>>,
     pub codex_home: PathBuf,
     pub cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
@@ -225,6 +225,18 @@ impl AuthModeWidget {
             options.push(SignInOption::ApiKey);
         }
         options
+    }
+
+    fn error_message(&self) -> Option<String> {
+        self.error.read().unwrap().clone()
+    }
+
+    fn set_error(&self, message: impl Into<String>) {
+        *self.error.write().unwrap() = Some(message.into());
+    }
+
+    fn clear_error(&self) {
+        *self.error.write().unwrap() = None;
     }
 
     fn selectable_sign_in_options(&self) -> Vec<SignInOption> {
@@ -285,7 +297,7 @@ impl AuthModeWidget {
 
     fn disallow_api_login(&mut self) {
         self.highlighted_mode = SignInOption::ChatGpt;
-        self.error = Some(API_KEY_DISABLED_MESSAGE.to_string());
+        self.set_error(API_KEY_DISABLED_MESSAGE);
         *self.sign_in_state.write().unwrap() = SignInState::PickMode;
         self.request_frame.schedule_frame();
     }
@@ -335,7 +347,7 @@ impl AuthModeWidget {
         let chatgpt_description = if !self.is_chatgpt_login_allowed() {
             "ChatGPT login is disabled"
         } else {
-            "Usage included with Plus, Pro, Business, and Enterprise plans"
+            "Usage included with Plus and Pro plans"
         };
         let device_code_description = "Sign in from another device with a one-time code";
 
@@ -382,9 +394,9 @@ impl AuthModeWidget {
             //     But leaving this for a future cleanup.
             "  Press Enter to continue".dim().into(),
         );
-        if let Some(err) = &self.error {
+        if let Some(err) = self.error_message() {
             lines.push("".into());
-            lines.push(err.as_str().red().into());
+            lines.push(err.red().into());
         }
 
         Paragraph::new(lines)
@@ -543,9 +555,9 @@ impl AuthModeWidget {
             "  Press Enter to save".dim().into(),
             "  Press Esc to go back".dim().into(),
         ];
-        if let Some(error) = &self.error {
+        if let Some(error) = self.error_message() {
             footer_lines.push("".into());
-            footer_lines.push(error.as_str().red().into());
+            footer_lines.push(error.red().into());
         }
         Paragraph::new(footer_lines)
             .wrap(Wrap { trim: false })
@@ -562,13 +574,13 @@ impl AuthModeWidget {
                 match key_event.code {
                     KeyCode::Esc => {
                         *guard = SignInState::PickMode;
-                        self.error = None;
+                        self.clear_error();
                         should_request_frame = true;
                     }
                     KeyCode::Enter => {
                         let trimmed = state.value.trim().to_string();
                         if trimmed.is_empty() {
-                            self.error = Some("API key cannot be empty".to_string());
+                            self.set_error("API key cannot be empty");
                             should_request_frame = true;
                         } else {
                             should_save = Some(trimmed);
@@ -581,7 +593,7 @@ impl AuthModeWidget {
                         } else {
                             state.value.pop();
                         }
-                        self.error = None;
+                        self.clear_error();
                         should_request_frame = true;
                     }
                     KeyCode::Char(c)
@@ -595,7 +607,7 @@ impl AuthModeWidget {
                             state.prepopulated_from_env = false;
                         }
                         state.value.push(c);
-                        self.error = None;
+                        self.clear_error();
                         should_request_frame = true;
                     }
                     _ => {}
@@ -628,7 +640,7 @@ impl AuthModeWidget {
             } else {
                 state.value.push_str(trimmed);
             }
-            self.error = None;
+            self.clear_error();
         } else {
             return false;
         }
@@ -643,7 +655,7 @@ impl AuthModeWidget {
             self.disallow_api_login();
             return;
         }
-        self.error = None;
+        self.clear_error();
         let prefill_from_env = read_openai_api_key_from_env();
         let mut guard = self.sign_in_state.write().unwrap();
         match &mut *guard {
@@ -679,13 +691,13 @@ impl AuthModeWidget {
             self.cli_auth_credentials_store_mode,
         ) {
             Ok(()) => {
-                self.error = None;
+                self.clear_error();
                 self.login_status = LoginStatus::AuthMode(AuthMode::ApiKey);
                 self.auth_manager.reload();
                 *self.sign_in_state.write().unwrap() = SignInState::ApiKeyConfigured;
             }
             Err(err) => {
-                self.error = Some(format!("Failed to save API key: {err}"));
+                self.set_error(format!("Failed to save API key: {err}"));
                 let mut guard = self.sign_in_state.write().unwrap();
                 if let SignInState::ApiKeyEntry(existing) = &mut *guard {
                     if existing.value.is_empty() {
@@ -722,7 +734,7 @@ impl AuthModeWidget {
             return;
         }
 
-        self.error = None;
+        self.clear_error();
         let opts = ServerOptions::new(
             self.codex_home.clone(),
             CLIENT_ID.to_string(),
@@ -735,6 +747,7 @@ impl AuthModeWidget {
                 let sign_in_state = self.sign_in_state.clone();
                 let request_frame = self.request_frame.clone();
                 let auth_manager = self.auth_manager.clone();
+                let error = self.error.clone();
                 tokio::spawn(async move {
                     let auth_url = child.auth_url.clone();
                     {
@@ -750,13 +763,14 @@ impl AuthModeWidget {
                         Ok(()) => {
                             // Force the auth manager to reload the new auth information.
                             auth_manager.reload();
+                            *error.write().unwrap() = None;
 
                             *sign_in_state.write().unwrap() = SignInState::ChatGptSuccessMessage;
                             request_frame.schedule_frame();
                         }
-                        _ => {
+                        Err(err) => {
                             *sign_in_state.write().unwrap() = SignInState::PickMode;
-                            // self.error = Some(e.to_string());
+                            *error.write().unwrap() = Some(err.to_string());
                             request_frame.schedule_frame();
                         }
                     }
@@ -764,7 +778,7 @@ impl AuthModeWidget {
             }
             Err(e) => {
                 *self.sign_in_state.write().unwrap() = SignInState::PickMode;
-                self.error = Some(e.to_string());
+                self.set_error(e.to_string());
                 self.request_frame.schedule_frame();
             }
         }
@@ -775,7 +789,7 @@ impl AuthModeWidget {
             return;
         }
 
-        self.error = None;
+        self.clear_error();
         let opts = ServerOptions::new(
             self.codex_home.clone(),
             CLIENT_ID.to_string(),
@@ -843,7 +857,7 @@ mod tests {
         let widget = AuthModeWidget {
             request_frame: FrameRequester::test_dummy(),
             highlighted_mode: SignInOption::ChatGpt,
-            error: None,
+            error: Arc::new(RwLock::new(None)),
             sign_in_state: Arc::new(RwLock::new(SignInState::PickMode)),
             codex_home: codex_home_path.clone(),
             cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
@@ -866,7 +880,10 @@ mod tests {
 
         widget.start_api_key_entry();
 
-        assert_eq!(widget.error.as_deref(), Some(API_KEY_DISABLED_MESSAGE));
+        assert_eq!(
+            widget.error_message().as_deref(),
+            Some(API_KEY_DISABLED_MESSAGE)
+        );
         assert!(matches!(
             &*widget.sign_in_state.read().unwrap(),
             SignInState::PickMode
@@ -879,7 +896,10 @@ mod tests {
 
         widget.save_api_key("sk-test".to_string());
 
-        assert_eq!(widget.error.as_deref(), Some(API_KEY_DISABLED_MESSAGE));
+        assert_eq!(
+            widget.error_message().as_deref(),
+            Some(API_KEY_DISABLED_MESSAGE)
+        );
         assert!(matches!(
             &*widget.sign_in_state.read().unwrap(),
             SignInState::PickMode

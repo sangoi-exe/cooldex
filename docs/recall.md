@@ -1,58 +1,57 @@
 ## Pre-Compaction Recall (`recall`)
 
-`recall` is a read-only tool for recovering recent context from the **current session rollout JSON** before the latest compaction marker.
+`recall` is a read-only tool that retrieves model-relevant context from the current session rollout before the latest compaction marker.
 
-It intentionally returns only:
-- assistant messages
-- reasoning text (summary first; falls back to reasoning content when summary is absent)
+### Request Contract
 
-It intentionally excludes:
-- tool calls
-- tool outputs
-- user messages
+- Request payload must be `{}`.
+- Unknown fields are rejected with `invalid_contract`.
 
-### Contract
+### Boundary Semantics
 
-Request fields:
-- none (`{}` only)
+- Upper boundary: latest `RolloutItem::Compacted`.
+- Lower boundary: most recent boundary marker before that upper boundary where a marker is either:
+  - `EventMsg::ContextCompacted(_)`, or
+  - `RolloutItem::Compacted` with `replacement_history: Some(...)`.
+- If that lower boundary is `replacement_history_compacted`, `recall` starts from the sanitized `replacement_history` persisted on that boundary and then appends newer assistant/reasoning rollout items after the marker until the latest compaction marker.
+- Otherwise, returned scan starts at `lower_boundary_index + 1`.
+- If no lower boundary marker exists, scan starts at rollout index `0`.
+- If no upper boundary marker exists, the tool fails with `stop_reason = "no_compaction_marker"`.
 
-Unknown fields are rejected (including removed legacy fields like `max_items` and `max_chars_per_item`).
+### Filtering and Size Budget
 
-### Behavior
+- Includes only assistant messages and reasoning text.
+- Excludes user messages, tool calls, and tool outputs.
+- Reasoning uses summary text first and falls back to reasoning content when needed.
+- Uses the latest `RolloutItem::Compacted` as the upper boundary.
+- For standard compactions, the matching `EventMsg::ContextCompacted(_)` is a legacy event emitted after the `ContextCompaction` item completes, so the current compaction's own legacy event is not part of the pre-`Compacted` scan.
+- Uses the most recent earlier boundary marker before that upper boundary as the lower boundary, where a boundary marker is either:
+  - `EventMsg::ContextCompacted(_)` from a previous compaction, or
+  - `RolloutItem::Compacted` with `replacement_history: Some(...)`.
+- When that lower boundary is `replacement_history_compacted`, the persisted sanitized history at that boundary becomes the authoritative recall base for the returned reasoning/assistant window.
+- Applies `recall_kbytes_limit` (default `256` KiB) as a byte cap from the tail of matching items.
 
-- Source is fixed to the current session rollout recorder path (no path argument).
-- Uses the latest `RolloutItem::Compacted` marker as the upper boundary.
-- Uses the previous `EventMsg::ContextCompacted` (before the latest compact marker) as the lower boundary and starts right after it.
-- If no previous `context_compacted` event exists (first compaction cycle), starts from the beginning of the rollout.
-- Applies payload size cap from `config.toml` key `recall_kbytes_limit` (default `256` KiB).
-- `config.toml` key `recall_debug` controls output shape:
-  - unset/`false` (default): compact payload for the model (`items` as string array).
-  - `true`: full/debug payload (legacy shape).
-- In full/debug mode, if the rollout has malformed lines, `recall` returns the valid parsed subset and reports integrity as degraded (`integrity.status = "degraded"`, `integrity.rollout_parse_errors > 0`).
-- If there is no compaction marker, the tool fails with `stop_reason = "no_compaction_marker"`; when parse errors exist, the error message includes the parse-error count.
+### Output Modes
 
-### Example
-
-```json
-{}
-```
-
-Response shape (summary):
-- Full/debug mode (`recall_debug = true`):
-  - `mode = "recall_pre_compact"`
-  - `integrity.status` and `integrity.rollout_parse_errors`
-  - `boundary.start_index`
-  - `boundary.last_context_compacted_event_index` (nullable)
-  - `boundary.latest_compacted_index`
-  - `counts`
-  - `items[]` with:
-    - `kind = "assistant_message" | "reasoning"`
-    - `rollout_index`
-    - `text`
-    - `phase` (assistant message only, when available)
-- Compact mode (`recall_debug = false`):
+- Compact mode (default: `recall_debug` unset or `false`):
   - `mode = "recall_pre_compact_compact"`
   - `source = "current_session_rollout"`
-  - `items[]` as numbered strings, for example:
-    - `"1: [r] <reasoning text>"`
-    - `"2: [am] <assistant message>"`
+  - `items[]` as numbered strings
+
+- Debug mode (`recall_debug = true`):
+  - `mode = "recall_pre_compact"`
+  - `source = "current_session_rollout"`
+  - `integrity.status`
+  - `integrity.rollout_parse_errors`
+  - `boundary.start_index`
+  - `boundary.last_boundary_index` (nullable)
+  - `boundary.last_boundary_kind` (`"context_compacted_event" | "replacement_history_compacted" | null`)
+  - `boundary.latest_compacted_index`
+  - `boundary.compacted_markers_seen`
+  - `counts.matching_pre_compact_items`
+  - `counts.returned_items`
+  - `counts.returned_bytes`
+  - `counts.bytes_limit`
+  - `items[]` objects with `kind`, `source` (`"rollout"` | `"replacement_history"`), `rollout_index` (nullable for items hydrated from sanitized `replacement_history`), `text`, and optional `phase`
+
+When rollout parsing encounters malformed lines, debug mode returns valid parsed items and reports degraded integrity instead of hard-failing.

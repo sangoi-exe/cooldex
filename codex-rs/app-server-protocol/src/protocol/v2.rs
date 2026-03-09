@@ -46,6 +46,9 @@ use codex_protocol::plan_tool::StepStatus as CorePlanStepStatus;
 use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
 use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
+use codex_protocol::protocol::CollabAgentActivity as CoreCollabAgentActivity;
+use codex_protocol::protocol::CollabAgentActivityKind as CoreCollabAgentActivityKind;
+use codex_protocol::protocol::CollabAgentStatusEntry as CoreCollabAgentStatusEntry;
 use codex_protocol::protocol::CreditsSnapshot as CoreCreditsSnapshot;
 use codex_protocol::protocol::ExecCommandStatus as CoreExecCommandStatus;
 use codex_protocol::protocol::ModelRerouteReason as CoreModelRerouteReason;
@@ -298,15 +301,16 @@ pub enum ConfigLayerSource {
         file: AbsolutePathBuf,
     },
 
-    /// User config layer from $CODEX_HOME/config.toml. This layer is special
+    /// Active user config layer. When no override is in use, this defaults to
+    /// $CODEX_HOME/config.toml. This layer is special
     /// in that it is expected to be:
     /// - writable by the user
     /// - generally outside the workspace directory
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     User {
-        /// This is the path to the user's config.toml file, though it is not
-        /// guaranteed to exist.
+        /// This is the resolved path to the active user config file, though it
+        /// is not guaranteed to exist.
         file: AbsolutePathBuf,
     },
 
@@ -1389,9 +1393,10 @@ pub struct GetAccountRateLimitsResponse {
 pub struct GetAccountParams {
     /// When `true`, requests a proactive token refresh before returning.
     ///
-    /// In managed auth mode this triggers the normal refresh-token flow. In
-    /// external auth mode this flag is ignored. Clients should refresh tokens
-    /// themselves and call `account/login/start` with `chatgptAuthTokens`.
+    /// In managed auth mode this triggers the normal refresh-token flow and the
+    /// RPC fails if the requested refresh fails. In external auth mode this
+    /// flag is ignored. Clients should refresh tokens themselves and call
+    /// `account/login/start` with `chatgptAuthTokens`.
     #[serde(default)]
     pub refresh_token: bool,
 }
@@ -2005,6 +2010,10 @@ pub struct ThreadStartParams {
     pub service_tier: Option<Option<ServiceTier>>,
     #[ts(optional = nullable)]
     pub cwd: Option<String>,
+    /// Optional user config file path for this thread. When omitted, Codex
+    /// uses the default active user config path.
+    #[ts(optional = nullable)]
+    pub config_path: Option<String>,
     #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
     #[ts(optional = nullable)]
@@ -2067,6 +2076,7 @@ pub struct ThreadStartResponse {
     pub model_provider: String,
     pub service_tier: Option<ServiceTier>,
     pub cwd: PathBuf,
+    pub config_path: PathBuf,
     pub approval_policy: AskForApproval,
     pub sandbox: SandboxPolicy,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -2117,6 +2127,10 @@ pub struct ThreadResumeParams {
     pub service_tier: Option<Option<ServiceTier>>,
     #[ts(optional = nullable)]
     pub cwd: Option<String>,
+    /// Optional user config file path override for the resumed thread. When
+    /// omitted, Codex reuses the thread's persisted active user config path.
+    #[ts(optional = nullable)]
+    pub config_path: Option<String>,
     #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
     #[ts(optional = nullable)]
@@ -2145,6 +2159,7 @@ pub struct ThreadResumeResponse {
     pub model_provider: String,
     pub service_tier: Option<ServiceTier>,
     pub cwd: PathBuf,
+    pub config_path: PathBuf,
     pub approval_policy: AskForApproval,
     pub sandbox: SandboxPolicy,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -2186,6 +2201,10 @@ pub struct ThreadForkParams {
     pub service_tier: Option<Option<ServiceTier>>,
     #[ts(optional = nullable)]
     pub cwd: Option<String>,
+    /// Optional user config file path override for the forked thread. When
+    /// omitted, Codex reuses the source thread's active user config path.
+    #[ts(optional = nullable)]
+    pub config_path: Option<String>,
     #[ts(optional = nullable)]
     pub approval_policy: Option<AskForApproval>,
     #[ts(optional = nullable)]
@@ -2212,6 +2231,7 @@ pub struct ThreadForkResponse {
     pub model_provider: String,
     pub service_tier: Option<ServiceTier>,
     pub cwd: PathBuf,
+    pub config_path: PathBuf,
     pub approval_policy: AskForApproval,
     pub sandbox: SandboxPolicy,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -3844,9 +3864,54 @@ pub enum CollabAgentStatus {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+pub enum CollabAgentActivityKind {
+    Message,
+    Reasoning,
+    Command,
+    Edit,
+    Task,
+    Status,
+}
+
+impl From<CoreCollabAgentActivityKind> for CollabAgentActivityKind {
+    fn from(value: CoreCollabAgentActivityKind) -> Self {
+        match value {
+            CoreCollabAgentActivityKind::Message => Self::Message,
+            CoreCollabAgentActivityKind::Reasoning => Self::Reasoning,
+            CoreCollabAgentActivityKind::Command => Self::Command,
+            CoreCollabAgentActivityKind::Edit => Self::Edit,
+            CoreCollabAgentActivityKind::Task => Self::Task,
+            CoreCollabAgentActivityKind::Status => Self::Status,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct CollabAgentActivity {
+    pub kind: CollabAgentActivityKind,
+    pub summary: String,
+    pub occurred_at: i64,
+}
+
+impl From<CoreCollabAgentActivity> for CollabAgentActivity {
+    fn from(value: CoreCollabAgentActivity) -> Self {
+        Self {
+            kind: value.kind.into(),
+            summary: value.summary,
+            occurred_at: value.occurred_at,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub struct CollabAgentState {
     pub status: CollabAgentStatus,
     pub message: Option<String>,
+    pub last_activity: Option<CollabAgentActivity>,
 }
 
 impl From<CoreAgentStatus> for CollabAgentState {
@@ -3855,28 +3920,48 @@ impl From<CoreAgentStatus> for CollabAgentState {
             CoreAgentStatus::PendingInit => Self {
                 status: CollabAgentStatus::PendingInit,
                 message: None,
+                last_activity: None,
             },
             CoreAgentStatus::Running => Self {
                 status: CollabAgentStatus::Running,
                 message: None,
+                last_activity: None,
             },
             CoreAgentStatus::Completed(message) => Self {
                 status: CollabAgentStatus::Completed,
                 message,
+                last_activity: None,
             },
             CoreAgentStatus::Errored(message) => Self {
                 status: CollabAgentStatus::Errored,
                 message: Some(message),
+                last_activity: None,
             },
             CoreAgentStatus::Shutdown => Self {
                 status: CollabAgentStatus::Shutdown,
                 message: None,
+                last_activity: None,
             },
             CoreAgentStatus::NotFound => Self {
                 status: CollabAgentStatus::NotFound,
                 message: None,
+                last_activity: None,
             },
         }
+    }
+}
+
+impl From<&CoreCollabAgentStatusEntry> for CollabAgentState {
+    fn from(value: &CoreCollabAgentStatusEntry) -> Self {
+        let mut state = Self::from(value.status.clone());
+        state.last_activity = value.last_activity.clone().map(CollabAgentActivity::from);
+        state
+    }
+}
+
+impl From<CoreCollabAgentStatusEntry> for CollabAgentState {
+    fn from(value: CoreCollabAgentStatusEntry) -> Self {
+        Self::from(&value)
     }
 }
 

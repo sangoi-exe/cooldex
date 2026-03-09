@@ -209,7 +209,18 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         return;
     }
 
+    let user_config_path = match config.active_user_config_path() {
+        Ok(path) => path,
+        Err(err) => {
+            warn!(
+                "failed to resolve active user config path while persisting MCP dependencies: {err}"
+            );
+            return;
+        }
+    };
+
     if let Err(err) = ConfigEditsBuilder::new(&codex_home)
+        .user_config_path(user_config_path)
         .replace_mcp_servers(&servers)
         .apply()
         .await

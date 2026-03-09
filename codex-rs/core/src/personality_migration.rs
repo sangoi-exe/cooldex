@@ -169,6 +169,7 @@ mod tests {
                 forked_from_id: None,
                 timestamp: TEST_TIMESTAMP.to_string(),
                 cwd: std::path::PathBuf::from("."),
+                config_path: None,
                 originator: "test_originator".to_string(),
                 cli_version: "test_version".to_string(),
                 source: SessionSource::Cli,

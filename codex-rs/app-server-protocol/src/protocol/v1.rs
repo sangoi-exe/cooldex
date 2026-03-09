@@ -300,7 +300,14 @@ pub struct LogoutChatGptResponse {}
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct GetAuthStatusParams {
+    /// Deprecated compatibility flag.
+    ///
+    /// Accepted on the wire for legacy clients, but ignored. `getAuthStatus`
+    /// never returns auth tokens; use `account/read` for authoritative
+    /// auth/account state.
     pub include_token: Option<bool>,
+    /// When `true`, requests the legacy best-effort refresh path before
+    /// returning compatibility status.
     pub refresh_token: Option<bool>,
 }
 
@@ -324,7 +331,10 @@ pub struct ExecOneOffCommandResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct GetAuthStatusResponse {
+    /// Compatibility-only auth mode summary. Use `account/read` for the
+    /// authoritative auth/account surface.
     pub auth_method: Option<AuthMode>,
+    /// Deprecated compatibility field. Always `None`.
     pub auth_token: Option<String>,
     pub requires_openai_auth: Option<bool>,
 }

@@ -110,7 +110,7 @@ async fn get_auth_status_no_auth() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_auth_status_with_api_key() -> Result<()> {
+async fn get_auth_status_with_api_key_omits_token() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path())?;
 
@@ -133,7 +133,10 @@ async fn get_auth_status_with_api_key() -> Result<()> {
     .await??;
     let status: GetAuthStatusResponse = to_response(resp)?;
     assert_eq!(status.auth_method, Some(AuthMode::ApiKey));
-    assert_eq!(status.auth_token, Some("sk-test-key".to_string()));
+    assert_eq!(
+        status.auth_token, None,
+        "getAuthStatus must not return tokens; use account/read instead"
+    );
     Ok(())
 }
 

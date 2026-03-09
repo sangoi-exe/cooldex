@@ -11,6 +11,7 @@ use crate::CodexAuth;
 use crate::SandboxState;
 use crate::agent::AgentControl;
 use crate::agent::AgentStatus;
+use crate::agent::agent_last_activity_from_event;
 use crate::agent::agent_status_from_event;
 use crate::analytics_client::AnalyticsEventsClient;
 use crate::analytics_client::AppInvocation;
@@ -163,7 +164,6 @@ use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 #[cfg(test)]
 use crate::exec::StreamOutput;
-use codex_config::CONFIG_TOML_FILE;
 
 mod rollout_reconstruction;
 #[cfg(test)]
@@ -312,6 +312,7 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::CollabAgentActivity;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -325,6 +326,8 @@ pub struct Codex {
     pub(crate) rx_event: Receiver<Event>,
     // Last known status of the agent.
     pub(crate) agent_status: watch::Receiver<AgentStatus>,
+    // Last known activity of the agent.
+    pub(crate) agent_last_activity: watch::Receiver<Option<CollabAgentActivity>>,
     pub(crate) session: Arc<Session>,
 }
 
@@ -502,6 +505,7 @@ impl Codex {
             network_sandbox_policy: config.permissions.network_sandbox_policy,
             windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
             cwd: config.cwd.clone(),
+            config_path: config.active_user_config_path()?,
             codex_home: config.codex_home.clone(),
             thread_name: None,
             original_config_do_not_use: Arc::clone(&config),
@@ -516,6 +520,8 @@ impl Codex {
         // Generate a unique ID for the lifetime of this Codex session.
         let session_source_clone = session_configuration.session_source.clone();
         let (agent_status_tx, agent_status_rx) = watch::channel(AgentStatus::PendingInit);
+        let (agent_last_activity_tx, agent_last_activity_rx) =
+            watch::channel::<Option<CollabAgentActivity>>(None);
 
         let session_init_span = info_span!("session_init");
         let session = Session::new(
@@ -526,6 +532,7 @@ impl Codex {
             exec_policy,
             tx_event.clone(),
             agent_status_tx.clone(),
+            agent_last_activity_tx.clone(),
             conversation_history,
             session_source_clone,
             skills_manager,
@@ -551,6 +558,7 @@ impl Codex {
             tx_sub,
             rx_event,
             agent_status: agent_status_rx,
+            agent_last_activity: agent_last_activity_rx,
             session,
         };
 
@@ -620,6 +628,10 @@ impl Codex {
         self.agent_status.borrow().clone()
     }
 
+    pub(crate) async fn agent_last_activity(&self) -> Option<CollabAgentActivity> {
+        self.agent_last_activity.borrow().clone()
+    }
+
     pub(crate) async fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
         let state = self.session.state.lock().await;
         state.session_configuration.thread_config_snapshot()
@@ -641,6 +653,7 @@ pub(crate) struct Session {
     pub(crate) conversation_id: ThreadId,
     tx_event: Sender<Event>,
     agent_status: watch::Sender<AgentStatus>,
+    agent_last_activity: watch::Sender<Option<CollabAgentActivity>>,
     pub(crate) state: Mutex<SessionState>,
     /// The set of enabled features should be invariant for the lifetime of the
     /// session.
@@ -907,6 +920,8 @@ pub(crate) struct SessionConfiguration {
     /// `ConfigureSession` operation so that the business-logic layer can
     /// operate deterministically.
     cwd: PathBuf,
+    /// Active user config.toml file for this session.
+    config_path: PathBuf,
     /// Directory containing all Codex state for this session.
     codex_home: PathBuf,
     /// Optional user-facing name for the thread, updated during the session.
@@ -937,6 +952,7 @@ impl SessionConfiguration {
             approval_policy: self.approval_policy.value(),
             sandbox_policy: self.sandbox_policy.get().clone(),
             cwd: self.cwd.clone(),
+            config_path: self.config_path.clone(),
             ephemeral: self.original_config_do_not_use.ephemeral,
             reasoning_effort: self.collaboration_mode.reasoning_effort(),
             personality: self.personality,
@@ -1209,6 +1225,7 @@ impl Session {
         exec_policy: ExecPolicyManager,
         tx_event: Sender<Event>,
         agent_status: watch::Sender<AgentStatus>,
+        agent_last_activity: watch::Sender<Option<CollabAgentActivity>>,
         initial_history: InitialHistory,
         session_source: SessionSource,
         skills_manager: Arc<SkillsManager>,
@@ -1592,6 +1609,7 @@ impl Session {
             conversation_id,
             tx_event: tx_event.clone(),
             agent_status,
+            agent_last_activity,
             state: Mutex::new(state),
             features: config.features.clone(),
             pending_mcp_server_refresh_config: Mutex::new(None),
@@ -2357,10 +2375,7 @@ impl Session {
     pub(crate) async fn reload_user_config_layer(&self) {
         let config_toml_path = {
             let state = self.state.lock().await;
-            state
-                .session_configuration
-                .codex_home
-                .join(CONFIG_TOML_FILE)
+            state.session_configuration.config_path.clone()
         };
 
         let user_config = match std::fs::read_to_string(&config_toml_path) {
@@ -2481,6 +2496,9 @@ impl Session {
         if let Some(status) = agent_status_from_event(&event.msg) {
             self.agent_status.send_replace(status);
         }
+        if let Some(activity) = agent_last_activity_from_event(&event.msg) {
+            self.agent_last_activity.send_replace(Some(activity));
+        }
         // Persist the event into rollout (recorder filters as needed)
         let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
         self.persist_rollout_items(&rollout_items).await;
@@ -2498,6 +2516,9 @@ impl Session {
         // Record the last known agent status.
         if let Some(status) = agent_status_from_event(&event.msg) {
             self.agent_status.send_replace(status);
+        }
+        if let Some(activity) = agent_last_activity_from_event(&event.msg) {
+            self.agent_last_activity.send_replace(Some(activity));
         }
         self.persist_rollout_items(&[RolloutItem::EventMsg(event.msg.clone())])
             .await;
@@ -5884,18 +5905,18 @@ pub(crate) async fn run_sampling_request(
             .auth_cached()
             .as_ref()
             .and_then(CodexAuth::get_account_id);
-        let err = match try_run_sampling_request(
-            Arc::clone(&router),
-            Arc::clone(&sess),
-            Arc::clone(&turn_context),
+        let err = match try_run_sampling_request(SamplingRequestArgs {
+            router: Arc::clone(&router),
+            sess: Arc::clone(&sess),
+            turn_context: Arc::clone(&turn_context),
             client_session,
             turn_metadata_header,
-            Arc::clone(&turn_diff_tracker),
+            turn_diff_tracker: Arc::clone(&turn_diff_tracker),
             server_model_warning_emitted_for_turn,
-            &prompt,
+            prompt: &prompt,
             allowed_tool_names,
-            cancellation_token.child_token(),
-        )
+            cancellation_token: cancellation_token.child_token(),
+        })
         .await
         {
             Ok(output) => {
@@ -6981,18 +7002,34 @@ fn parse_rate_limits_snapshot_from_usage_payload(payload: &Value) -> Option<Rate
     })
 }
 
-async fn try_run_sampling_request(
+struct SamplingRequestArgs<'a> {
     router: Arc<ToolRouter>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
-    client_session: &mut ModelClientSession,
-    turn_metadata_header: Option<&str>,
+    client_session: &'a mut ModelClientSession,
+    turn_metadata_header: Option<&'a str>,
     turn_diff_tracker: SharedTurnDiffTracker,
-    server_model_warning_emitted_for_turn: &mut bool,
-    prompt: &Prompt,
-    allowed_tool_names: Option<&HashSet<String>>,
+    server_model_warning_emitted_for_turn: &'a mut bool,
+    prompt: &'a Prompt,
+    allowed_tool_names: Option<&'a HashSet<String>>,
     cancellation_token: CancellationToken,
+}
+
+async fn try_run_sampling_request(
+    args: SamplingRequestArgs<'_>,
 ) -> CodexResult<SamplingRequestResult> {
+    let SamplingRequestArgs {
+        router,
+        sess,
+        turn_context,
+        client_session,
+        turn_metadata_header,
+        turn_diff_tracker,
+        server_model_warning_emitted_for_turn,
+        prompt,
+        allowed_tool_names,
+        cancellation_token,
+    } = args;
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy.value(),

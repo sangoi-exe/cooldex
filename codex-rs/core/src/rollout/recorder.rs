@@ -401,6 +401,7 @@ impl RolloutRecorder {
                         forked_from_id,
                         timestamp,
                         cwd: config.cwd.clone(),
+                        config_path: Some(config.active_user_config_path()?),
                         originator: originator().value,
                         cli_version: env!("CARGO_PKG_VERSION").to_string(),
                         agent_nickname: source.get_nickname(),

@@ -113,7 +113,7 @@ async fn run_remote_compact_task_inner_impl(
             .auth_manager
             .auth_cached()
             .as_ref()
-            .and_then(|auth| auth.get_account_id());
+            .and_then(super::auth::CodexAuth::get_account_id);
         match sess
             .services
             .model_client
@@ -329,6 +329,35 @@ fn log_remote_compact_failure(
         compact_error = %err,
         "remote compaction failed"
     );
+}
+
+fn trim_function_call_history_to_fit_context_window(
+    history: &mut ContextManager,
+    turn_context: &TurnContext,
+    base_instructions: &BaseInstructions,
+) -> usize {
+    let mut deleted_items = 0usize;
+    let Some(context_window) = turn_context.model_context_window() else {
+        return deleted_items;
+    };
+
+    while history
+        .estimate_token_count_with_base_instructions(base_instructions)
+        .is_some_and(|estimated_tokens| estimated_tokens > context_window)
+    {
+        let Some(last_item) = history.raw_items().last() else {
+            break;
+        };
+        if !is_codex_generated_item(last_item) {
+            break;
+        }
+        if !history.remove_last_item() {
+            break;
+        }
+        deleted_items += 1;
+    }
+
+    deleted_items
 }
 
 #[cfg(test)]
@@ -648,33 +677,4 @@ mod tests {
 
         server.verify().await;
     }
-}
-
-fn trim_function_call_history_to_fit_context_window(
-    history: &mut ContextManager,
-    turn_context: &TurnContext,
-    base_instructions: &BaseInstructions,
-) -> usize {
-    let mut deleted_items = 0usize;
-    let Some(context_window) = turn_context.model_context_window() else {
-        return deleted_items;
-    };
-
-    while history
-        .estimate_token_count_with_base_instructions(base_instructions)
-        .is_some_and(|estimated_tokens| estimated_tokens > context_window)
-    {
-        let Some(last_item) = history.raw_items().last() else {
-            break;
-        };
-        if !is_codex_generated_item(last_item) {
-            break;
-        }
-        if !history.remove_last_item() {
-            break;
-        }
-        deleted_items += 1;
-    }
-
-    deleted_items
 }

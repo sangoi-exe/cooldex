@@ -93,3 +93,4 @@ __pycache__/
 
 # Sangoi project docs / dev tooling (lives in separate repo; keep local checkout here)
 /.sangoi/
+*.png

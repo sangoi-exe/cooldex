@@ -26,6 +26,7 @@ use super::mark_url_hyperlink;
 pub(super) fn start_headless_chatgpt_login(widget: &mut AuthModeWidget, mut opts: ServerOptions) {
     opts.open_browser = false;
     let sign_in_state = widget.sign_in_state.clone();
+    let error = widget.error.clone();
     let request_frame = widget.request_frame.clone();
     let auth_manager = widget.auth_manager.clone();
     let cancel = begin_device_code_attempt(&sign_in_state, &request_frame);
@@ -59,31 +60,39 @@ pub(super) fn start_headless_chatgpt_login(widget: &mut AuthModeWidget, mut opts
                             match r {
                                 Ok(()) => {
                                     auth_manager.reload();
+                                    *error.write().unwrap() = None;
                                     *sign_in_state.write().unwrap() =
                                         SignInState::ChatGptSuccessMessage;
                                     request_frame.schedule_frame();
                                 }
-                                _ => {
-                                    *sign_in_state.write().unwrap() = SignInState::PickMode;
-                                    request_frame.schedule_frame();
+                                Err(err) => {
+                                    set_device_code_error_for_active_attempt(
+                                        &sign_in_state,
+                                        &request_frame,
+                                        &error,
+                                        &cancel,
+                                        err.to_string(),
+                                    );
                                 }
                             }
                         }
-                        Err(_) => {
-                            set_device_code_state_for_active_attempt(
+                        Err(err) => {
+                            set_device_code_error_for_active_attempt(
                                 &sign_in_state,
                                 &request_frame,
+                                &error,
                                 &cancel,
-                                SignInState::PickMode,
+                                err.to_string(),
                             );
                         }
                     }
                 } else {
-                    set_device_code_state_for_active_attempt(
+                    set_device_code_error_for_active_attempt(
                         &sign_in_state,
                         &request_frame,
+                        &error,
                         &cancel,
-                        SignInState::PickMode,
+                        err.to_string(),
                     );
                 }
 
@@ -115,12 +124,13 @@ pub(super) fn start_headless_chatgpt_login(widget: &mut AuthModeWidget, mut opts
                             &cancel,
                         );
                     }
-                    Err(_) => {
-                        set_device_code_state_for_active_attempt(
+                    Err(err) => {
+                        set_device_code_error_for_active_attempt(
                             &sign_in_state,
                             &request_frame,
+                            &error,
                             &cancel,
-                            SignInState::PickMode,
+                            err.to_string(),
                         );
                     }
                 }
@@ -238,6 +248,25 @@ fn set_device_code_state_for_active_attempt(
     true
 }
 
+fn set_device_code_error_for_active_attempt(
+    sign_in_state: &Arc<RwLock<SignInState>>,
+    request_frame: &FrameRequester,
+    error: &Arc<RwLock<Option<String>>>,
+    cancel: &Arc<Notify>,
+    message: String,
+) -> bool {
+    let mut guard = sign_in_state.write().unwrap();
+    if !device_code_attempt_matches(&guard, cancel) {
+        return false;
+    }
+
+    *guard = SignInState::PickMode;
+    drop(guard);
+    *error.write().unwrap() = Some(message);
+    request_frame.schedule_frame();
+    true
+}
+
 fn set_device_code_success_message_for_active_attempt(
     sign_in_state: &Arc<RwLock<SignInState>>,
     request_frame: &FrameRequester,
@@ -341,6 +370,48 @@ mod tests {
             &*sign_in_state.read().unwrap(),
             SignInState::ChatGptDeviceCode(_)
         ));
+    }
+
+    #[test]
+    fn set_device_code_error_for_active_attempt_updates_only_when_active() {
+        let request_frame = FrameRequester::test_dummy();
+        let error = Arc::new(RwLock::new(None));
+        let cancel = Arc::new(Notify::new());
+        let sign_in_state = device_code_sign_in_state(cancel.clone());
+
+        assert_eq!(
+            set_device_code_error_for_active_attempt(
+                &sign_in_state,
+                &request_frame,
+                &error,
+                &cancel,
+                "device code failed".to_string(),
+            ),
+            true
+        );
+        assert!(matches!(
+            &*sign_in_state.read().unwrap(),
+            SignInState::PickMode
+        ));
+        assert_eq!(error.read().unwrap().as_deref(), Some("device code failed"));
+
+        let sign_in_state = device_code_sign_in_state(Arc::new(Notify::new()));
+        *error.write().unwrap() = None;
+        assert_eq!(
+            set_device_code_error_for_active_attempt(
+                &sign_in_state,
+                &request_frame,
+                &error,
+                &cancel,
+                "device code failed".to_string(),
+            ),
+            false
+        );
+        assert!(matches!(
+            &*sign_in_state.read().unwrap(),
+            SignInState::ChatGptDeviceCode(_)
+        ));
+        assert_eq!(error.read().unwrap().as_deref(), None);
     }
 
     #[test]

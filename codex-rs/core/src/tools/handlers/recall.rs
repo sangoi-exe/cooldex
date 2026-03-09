@@ -45,10 +45,32 @@ impl StopReason {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RecallBoundaryKind {
+    ContextCompactedEvent,
+    ReplacementHistoryCompacted,
+}
+
+impl RecallBoundaryKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextCompactedEvent => "context_compacted_event",
+            Self::ReplacementHistoryCompacted => "replacement_history_compacted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecallBoundary {
+    index: usize,
+    kind: RecallBoundaryKind,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct RecallItem {
     kind: String,
-    rollout_index: usize,
+    source: String,
+    rollout_index: Option<usize>,
     text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     phase: Option<String>,
@@ -161,12 +183,24 @@ fn build_recall_payload(
         return Err(contract_error(StopReason::NoCompactionMarker, message));
     };
 
-    let last_context_compacted_event_index =
-        previous_context_compacted_event_index_before(rollout_items, latest_compacted_index);
-    let start_index = last_context_compacted_event_index.map_or(0, |index| index.saturating_add(1));
+    let last_boundary = previous_recall_boundary_before(rollout_items, latest_compacted_index);
+    let start_index = last_boundary.map_or(0, |boundary| boundary.index.saturating_add(1));
 
-    let matching_items =
-        collect_pre_compact_items(rollout_items, start_index, latest_compacted_index);
+    let mut matching_items = last_boundary
+        .filter(|boundary| {
+            matches!(
+                boundary.kind,
+                RecallBoundaryKind::ReplacementHistoryCompacted
+            )
+        })
+        .and_then(|boundary| replacement_history_for_boundary(rollout_items, boundary.index))
+        .map(collect_replacement_history_items)
+        .unwrap_or_default();
+    matching_items.extend(collect_pre_compact_items(
+        rollout_items,
+        start_index,
+        latest_compacted_index,
+    ));
     let matching_pre_compact_items = matching_items.len();
 
     let recall_bytes_limit = recall_kbytes_limit.saturating_mul(1024);
@@ -192,7 +226,8 @@ fn build_recall_payload(
         },
         "boundary": {
             "start_index": start_index,
-            "last_context_compacted_event_index": last_context_compacted_event_index,
+            "last_boundary_index": last_boundary.map(|boundary| boundary.index),
+            "last_boundary_kind": last_boundary.map(|boundary| boundary.kind.as_str()),
             "latest_compacted_index": latest_compacted_index,
             "compacted_markers_seen": compacted_markers_seen,
         },
@@ -257,61 +292,101 @@ fn collect_pre_compact_items(
         let RolloutItem::ResponseItem(response_item) = rollout_item else {
             continue;
         };
-        match response_item {
-            ResponseItem::Reasoning {
-                summary, content, ..
-            } => {
-                let text = reasoning_text(summary, content);
-                let trimmed = text.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                output.push(RecallItem {
-                    kind: "reasoning".to_string(),
-                    rollout_index: index,
-                    text: trimmed.to_string(),
-                    phase: None,
-                });
-            }
-            ResponseItem::Message {
-                role,
-                content,
-                phase,
-                ..
-            } if role == "assistant" => {
-                let text = assistant_message_text(content);
-                let trimmed = text.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                output.push(RecallItem {
-                    kind: "assistant_message".to_string(),
-                    rollout_index: index,
-                    text: trimmed.to_string(),
-                    phase: phase
-                        .as_ref()
-                        .map(|message_phase| phase_name(message_phase).to_string()),
-                });
-            }
-            _ => {}
+        if let Some(item) = recall_item_from_response_item(response_item, "rollout", Some(index)) {
+            output.push(item);
         }
     }
     output
 }
 
-fn previous_context_compacted_event_index_before(
+fn collect_replacement_history_items(replacement_history: &[ResponseItem]) -> Vec<RecallItem> {
+    replacement_history
+        .iter()
+        .filter_map(|response_item| {
+            recall_item_from_response_item(response_item, "replacement_history", None)
+        })
+        .collect()
+}
+
+fn replacement_history_for_boundary(
+    rollout_items: &[RolloutItem],
+    boundary_index: usize,
+) -> Option<&[ResponseItem]> {
+    match rollout_items.get(boundary_index) {
+        Some(RolloutItem::Compacted(compacted)) => compacted.replacement_history.as_deref(),
+        _ => None,
+    }
+}
+
+fn previous_recall_boundary_before(
     rollout_items: &[RolloutItem],
     latest_compacted_index: usize,
-) -> Option<usize> {
-    let mut compacted_events = rollout_items
+) -> Option<RecallBoundary> {
+    rollout_items
         .iter()
         .enumerate()
         .take(latest_compacted_index)
-        .filter_map(|(index, item)| {
-            matches!(item, RolloutItem::EventMsg(EventMsg::ContextCompacted(_))).then_some(index)
-        });
-    let _current_compaction_event = compacted_events.next_back();
-    compacted_events.next_back()
+        .filter_map(|(index, item)| match item {
+            RolloutItem::EventMsg(EventMsg::ContextCompacted(_)) => Some(RecallBoundary {
+                index,
+                kind: RecallBoundaryKind::ContextCompactedEvent,
+            }),
+            RolloutItem::Compacted(compacted) if compacted.replacement_history.is_some() => {
+                Some(RecallBoundary {
+                    index,
+                    kind: RecallBoundaryKind::ReplacementHistoryCompacted,
+                })
+            }
+            _ => None,
+        })
+        .next_back()
+}
+
+fn recall_item_from_response_item(
+    response_item: &ResponseItem,
+    source: &str,
+    rollout_index: Option<usize>,
+) -> Option<RecallItem> {
+    match response_item {
+        ResponseItem::Reasoning {
+            summary, content, ..
+        } => {
+            let text = reasoning_text(summary, content);
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            Some(RecallItem {
+                kind: "reasoning".to_string(),
+                source: source.to_string(),
+                rollout_index,
+                text: trimmed.to_string(),
+                phase: None,
+            })
+        }
+        ResponseItem::Message {
+            role,
+            content,
+            phase,
+            ..
+        } if role == "assistant" => {
+            let text = assistant_message_text(content);
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            Some(RecallItem {
+                kind: "assistant_message".to_string(),
+                source: source.to_string(),
+                rollout_index,
+                text: trimmed.to_string(),
+                phase: phase
+                    .as_ref()
+                    .map(|message_phase| phase_name(message_phase).to_string()),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn trim_items_to_bytes_limit(
@@ -502,6 +577,19 @@ mod tests {
         })
     }
 
+    fn replacement_history_compacted_marker() -> RolloutItem {
+        replacement_history_compacted_marker_with_history(Vec::new())
+    }
+
+    fn replacement_history_compacted_marker_with_history(
+        replacement_history: Vec<ResponseItem>,
+    ) -> RolloutItem {
+        RolloutItem::Compacted(CompactedItem {
+            message: "replacement history compacted".to_string(),
+            replacement_history: Some(replacement_history),
+        })
+    }
+
     fn user_message_event(text: &str) -> RolloutItem {
         RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
             message: text.to_string(),
@@ -652,15 +740,15 @@ mod tests {
     #[test]
     fn recall_uses_previous_context_compacted_event_as_boundary() {
         let rollout_items = vec![
-            assistant_message("assistant before previous compact", None),
+            compacted_marker(),
             RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent)),
             reasoning("reasoning after previous compact"),
             assistant_message(
                 "assistant after previous compact",
                 Some(MessagePhase::FinalAnswer),
             ),
-            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent)),
             compacted_marker(),
+            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent)),
             assistant_message("post compact", None),
         ];
 
@@ -681,18 +769,22 @@ mod tests {
         );
         assert_eq!(payload.pointer("/boundary/start_index"), Some(&json!(2)));
         assert_eq!(
-            payload.pointer("/boundary/last_context_compacted_event_index"),
+            payload.pointer("/boundary/last_boundary_index"),
             Some(&json!(1))
+        );
+        assert_eq!(
+            payload.pointer("/boundary/last_boundary_kind"),
+            Some(&json!("context_compacted_event"))
         );
     }
 
     #[test]
-    fn recall_falls_back_to_start_when_no_previous_context_compacted_event_exists() {
+    fn recall_falls_back_to_start_when_no_previous_boundary_exists() {
         let rollout_items = vec![
             assistant_message("assistant before first compact", None),
-            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent)),
             reasoning("reasoning before first compact marker"),
             compacted_marker(),
+            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent)),
         ];
 
         let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, true)
@@ -704,8 +796,161 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(payload.pointer("/boundary/start_index"), Some(&json!(0)));
         assert_eq!(
-            payload.pointer("/boundary/last_context_compacted_event_index"),
+            payload.pointer("/boundary/last_boundary_index"),
             Some(&Value::Null)
+        );
+        assert_eq!(
+            payload.pointer("/boundary/last_boundary_kind"),
+            Some(&Value::Null)
+        );
+    }
+
+    #[test]
+    fn recall_uses_previous_replacement_history_compaction_as_boundary() {
+        let replacement_history = vec![
+            ResponseItem::Reasoning {
+                id: "replacement-reasoning".to_string(),
+                summary: vec![SummaryText {
+                    text: "sanitized reasoning base".to_string(),
+                }],
+                content: None,
+                encrypted_content: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "sanitized assistant base".to_string(),
+                }],
+                end_turn: None,
+                phase: Some(MessagePhase::Commentary),
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "user should still be ignored".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+        ];
+        let rollout_items = vec![
+            replacement_history_compacted_marker_with_history(replacement_history),
+            reasoning("reasoning after replacement-history compact"),
+            assistant_message("assistant after replacement-history compact", None),
+            compacted_marker(),
+            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent)),
+            assistant_message("post compact", None),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, true)
+            .expect("build recall payload");
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].get("source"), Some(&json!("replacement_history")));
+        assert_eq!(items[1].get("source"), Some(&json!("replacement_history")));
+        assert_eq!(items[2].get("source"), Some(&json!("rollout")));
+        assert_eq!(items[3].get("source"), Some(&json!("rollout")));
+        assert_eq!(items[0].get("rollout_index").and_then(Value::as_u64), None);
+        assert_eq!(items[1].get("rollout_index").and_then(Value::as_u64), None);
+        assert_eq!(
+            items[2].get("rollout_index").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            items[3].get("rollout_index").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            items[0].get("text"),
+            Some(&json!("sanitized reasoning base"))
+        );
+        assert_eq!(
+            items[1].get("text"),
+            Some(&json!("sanitized assistant base"))
+        );
+        assert_eq!(items[1].get("phase"), Some(&json!("commentary")));
+        assert_eq!(payload.pointer("/boundary/start_index"), Some(&json!(1)));
+        assert_eq!(
+            payload.pointer("/boundary/last_boundary_index"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            payload.pointer("/boundary/last_boundary_kind"),
+            Some(&json!("replacement_history_compacted"))
+        );
+    }
+
+    #[test]
+    fn recall_uses_most_recent_boundary_marker_across_supported_types() {
+        let rollout_items = vec![
+            replacement_history_compacted_marker(),
+            reasoning("reasoning after replacement-history boundary"),
+            compacted_marker(),
+            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent)),
+            assistant_message("assistant after latest context boundary", None),
+            compacted_marker(),
+            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent)),
+            assistant_message("post compact", None),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, true)
+            .expect("build recall payload");
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].get("rollout_index").and_then(Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(payload.pointer("/boundary/start_index"), Some(&json!(4)));
+        assert_eq!(
+            payload.pointer("/boundary/last_boundary_index"),
+            Some(&json!(3))
+        );
+        assert_eq!(
+            payload.pointer("/boundary/last_boundary_kind"),
+            Some(&json!("context_compacted_event"))
+        );
+    }
+
+    #[test]
+    fn recall_ignores_non_replacement_history_compacted_markers_as_lower_boundaries() {
+        let rollout_items = vec![
+            compacted_marker(),
+            reasoning("reasoning after ignored compacted marker"),
+            replacement_history_compacted_marker(),
+            assistant_message("assistant after replacement-history boundary", None),
+            compacted_marker(),
+            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent)),
+            assistant_message("post compact", None),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, true)
+            .expect("build recall payload");
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].get("rollout_index").and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(payload.pointer("/boundary/start_index"), Some(&json!(3)));
+        assert_eq!(
+            payload.pointer("/boundary/last_boundary_index"),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            payload.pointer("/boundary/last_boundary_kind"),
+            Some(&json!("replacement_history_compacted"))
         );
     }
 

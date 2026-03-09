@@ -180,8 +180,49 @@
         }
       ]
     },
+    "CollabAgentActivity": {
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/CollabAgentActivityKind"
+        },
+        "occurredAt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "occurredAt",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "CollabAgentActivityKind": {
+      "enum": [
+        "message",
+        "reasoning",
+        "command",
+        "edit",
+        "task",
+        "status"
+      ],
+      "type": "string"
+    },
     "CollabAgentState": {
       "properties": {
+        "lastActivity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CollabAgentActivity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "message": {
           "type": [
             "string",
@@ -1929,6 +1970,9 @@
     "approvalPolicy": {
       "$ref": "#/definitions/AskForApproval"
     },
+    "configPath": {
+      "type": "string"
+    },
     "cwd": {
       "type": "string"
     },
@@ -1967,6 +2011,7 @@
   },
   "required": [
     "approvalPolicy",
+    "configPath",
     "cwd",
     "model",
     "modelProvider",

@@ -521,7 +521,7 @@ async fn turn_start_accepts_collaboration_mode_override_v2() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let thread_req = mcp
         .send_thread_start_request(ThreadStartParams {
@@ -604,7 +604,7 @@ async fn turn_start_uses_thread_feature_overrides_for_collaboration_mode_instruc
     )?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let thread_req = mcp
         .send_thread_start_request(ThreadStartParams {

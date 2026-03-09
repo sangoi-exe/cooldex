@@ -652,8 +652,22 @@ mod tests {
             None,
         );
 
-        let request = ResponsesWsRequest::ResponseAppend(crate::common::ResponseAppendWsRequest {
+        let request = ResponsesWsRequest::ResponseCreate(crate::common::ResponseCreateWsRequest {
+            model: "gpt-test".to_string(),
+            instructions: "Say hi".to_string(),
+            previous_response_id: None,
             input: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: false,
+            reasoning: None,
+            store: false,
+            stream: true,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            generate: None,
             client_metadata: None,
         });
         let mut stream = connection

@@ -72,6 +72,14 @@ See `codex-rs/tui/styles.md`.
 
 ## Tests
 
+Whenever test execution is explicitly authorized in this workspace, run `cargo clean`
+immediately before the test command and immediately after it finishes.
+
+### Workspace safety override
+
+- Do not delegate test execution to sub-agents in this workspace.
+- Do not run tests that trigger compilation in this workspace. Leave compile-triggering validation to the user unless they explicitly re-authorize it in the current session.
+
 ### Snapshot tests
 
 This repo uses snapshot tests (via `insta`), especially in `codex-rs/tui`, to validate rendered output.
@@ -83,6 +91,7 @@ is easy to review and future diffs stay visual.
 
 When UI or text output changes intentionally, update the snapshots as follows:
 
+- Apply the `cargo clean` guardrail above before and after any `cargo test` run in this workflow.
 - Run tests to generate any updated snapshots:
   - `cargo test -p codex-tui`
 - Check what’s pending:

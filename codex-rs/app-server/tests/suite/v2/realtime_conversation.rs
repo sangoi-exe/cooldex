@@ -82,7 +82,7 @@ async fn realtime_conversation_streams_v2_notifications() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
-    mcp.initialize().await?;
+    mcp.initialize_experimental().await?;
     login_with_api_key(&mut mcp, "sk-test-key").await?;
 
     let thread_start_request_id = mcp
@@ -248,7 +248,7 @@ async fn realtime_conversation_stop_emits_closed_notification() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
-    mcp.initialize().await?;
+    mcp.initialize_experimental().await?;
     login_with_api_key(&mut mcp, "sk-test-key").await?;
 
     let thread_start_request_id = mcp
@@ -320,7 +320,7 @@ async fn realtime_conversation_requires_feature_flag() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
-    mcp.initialize().await?;
+    mcp.initialize_experimental().await?;
 
     let thread_start_request_id = mcp
         .send_thread_start_request(ThreadStartParams::default())

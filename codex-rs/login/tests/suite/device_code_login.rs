@@ -4,7 +4,8 @@ use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex_core::auth::AuthCredentialsStoreMode;
-use codex_core::auth::load_auth_dot_json;
+use codex_core::auth::NON_PLUS_ACCOUNT_REMOVED_MESSAGE;
+use codex_core::auth::load_auth_store;
 use codex_login::ServerOptions;
 use codex_login::run_device_code_login;
 use serde_json::json;
@@ -126,7 +127,8 @@ async fn device_code_login_integration_succeeds() -> anyhow::Result<()> {
 
     let jwt = make_jwt(json!({
         "https://api.openai.com/auth": {
-            "chatgpt_account_id": "acct_321"
+            "chatgpt_account_id": "acct_321",
+            "chatgpt_plan_type": "pro"
         }
     }));
 
@@ -139,11 +141,10 @@ async fn device_code_login_integration_succeeds() -> anyhow::Result<()> {
         .await
         .expect("device code login integration should succeed");
 
-    let auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
-        .context("auth.json should load after login succeeds")?
-        .context("auth.json written")?;
-    // assert_eq!(auth.openai_api_key.as_deref(), Some("api-key-321"));
-    let tokens = auth.tokens.expect("tokens persisted");
+    let auth = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+        .context("auth store should load after login succeeds")?
+        .context("auth store written")?;
+    let tokens = &auth.accounts.first().expect("account persisted").tokens;
     assert_eq!(tokens.access_token, "access-token-123");
     assert_eq!(tokens.refresh_token, "refresh-token-123");
     assert_eq!(tokens.id_token.raw_jwt, jwt);
@@ -180,11 +181,48 @@ async fn device_code_login_rejects_workspace_mismatch() -> anyhow::Result<()> {
         .expect_err("device code login should fail when workspace mismatches");
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
 
-    let auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
-        .context("auth.json should load after login fails")?;
+    let auth = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+        .context("auth store should load after login fails")?;
     assert!(
         auth.is_none(),
-        "auth.json should not be created when workspace validation fails"
+        "auth store should not be created when workspace validation fails"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn device_code_login_rejects_non_plus_or_pro_account() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let codex_home = tempdir().unwrap();
+    let mock_server = MockServer::start().await;
+
+    mock_usercode_success(&mock_server).await;
+    mock_poll_token_two_step(&mock_server, Arc::new(AtomicUsize::new(0)), 404).await;
+
+    let jwt = make_jwt(json!({
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acct_321",
+            "chatgpt_plan_type": "free"
+        }
+    }));
+
+    mock_oauth_token_single(&mock_server, jwt).await;
+
+    let issuer = mock_server.uri();
+    let opts = server_opts(&codex_home, issuer, AuthCredentialsStoreMode::File);
+
+    let err = run_device_code_login(opts)
+        .await
+        .expect_err("device code login should fail for unsupported plan");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(err.to_string(), NON_PLUS_ACCOUNT_REMOVED_MESSAGE);
+
+    let auth = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+        .context("auth store should load after login fails")?;
+    assert!(
+        auth.is_none(),
+        "auth store should not be created when plan validation fails"
     );
     Ok(())
 }
@@ -211,11 +249,11 @@ async fn device_code_login_integration_handles_usercode_http_failure() -> anyhow
         "unexpected error: {err:?}"
     );
 
-    let auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
-        .context("auth.json should load after login fails")?;
+    let auth = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+        .context("auth store should load after login fails")?;
     assert!(
         auth.is_none(),
-        "auth.json should not be created when login fails"
+        "auth store should not be created when login fails"
     );
     Ok(())
 }
@@ -233,7 +271,12 @@ async fn device_code_login_integration_persists_without_api_key_on_exchange_fail
 
     mock_poll_token_two_step(&mock_server, Arc::new(AtomicUsize::new(0)), 404).await;
 
-    let jwt = make_jwt(json!({}));
+    let jwt = make_jwt(json!({
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acct_321",
+            "chatgpt_plan_type": "pro"
+        }
+    }));
 
     mock_oauth_token_single(&mock_server, jwt.clone()).await;
 
@@ -252,11 +295,11 @@ async fn device_code_login_integration_persists_without_api_key_on_exchange_fail
         .await
         .expect("device login should succeed without API key exchange");
 
-    let auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
-        .context("auth.json should load after login succeeds")?
-        .context("auth.json written")?;
+    let auth = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+        .context("auth store should load after login succeeds")?
+        .context("auth store written")?;
     assert!(auth.openai_api_key.is_none());
-    let tokens = auth.tokens.expect("tokens persisted");
+    let tokens = &auth.accounts.first().expect("account persisted").tokens;
     assert_eq!(tokens.access_token, "access-token-123");
     assert_eq!(tokens.refresh_token, "refresh-token-123");
     assert_eq!(tokens.id_token.raw_jwt, jwt);
@@ -308,11 +351,11 @@ async fn device_code_login_integration_handles_error_payload() -> anyhow::Result
         "Expected an authorization_declined / 400 / 404 error, got {err:?}"
     );
 
-    let auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
-        .context("auth.json should load after login fails")?;
+    let auth = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+        .context("auth store should load after login fails")?;
     assert!(
         auth.is_none(),
-        "auth.json should not be created when device auth fails"
+        "auth store should not be created when device auth fails"
     );
     Ok(())
 }

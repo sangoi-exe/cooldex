@@ -94,7 +94,7 @@ pub(crate) async fn first_layer_config_error_from_entries(
 /// - admin:    managed preferences (*)
 /// - system    `/etc/codex/config.toml` (Unix) or
 ///   `%ProgramData%\OpenAI\Codex\config.toml` (Windows)
-/// - user      `${CODEX_HOME}/config.toml`
+/// - user      explicit `configPath` when provided, otherwise `${CODEX_HOME}/config.toml`
 /// - cwd       `${PWD}/config.toml` (loaded but disabled when the directory is untrusted)
 /// - tree      parent directories up to root looking for `./.codex/config.toml` (loaded but disabled when untrusted)
 /// - repo      `$(git rev-parse --show-toplevel)/.codex/config.toml` (loaded but disabled when untrusted)
@@ -137,6 +137,7 @@ pub async fn load_config_layers_state(
 
     // Make a best-effort to support the legacy `managed_config.toml` as a
     // requirements specification.
+    let user_config_path = overrides.user_config_path.clone();
     let loaded_config_layers = layer_io::load_config_layers_internal(codex_home, overrides).await?;
     load_requirements_from_legacy_scheme(
         &mut config_requirements_toml,
@@ -175,19 +176,39 @@ pub async fn load_config_layers_state(
         .await?;
     layers.push(system_layer);
 
-    // Add a layer for $CODEX_HOME/config.toml if it exists. Note if the file
-    // exists, but is malformed, then this error should be propagated to the
-    // user.
-    let user_file = AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, codex_home)?;
-    let user_layer = load_config_toml_for_required_layer(&user_file, |config_toml| {
-        ConfigLayerEntry::new(
-            ConfigLayerSource::User {
-                file: user_file.clone(),
-            },
-            config_toml,
-        )
-    })
-    .await?;
+    // Add a layer for the active user config path. This is either the explicit
+    // path from LoaderOverrides or $CODEX_HOME/config.toml. If the file exists
+    // but is malformed, propagate the error to the user.
+    let explicit_user_config_path_provided = user_config_path.is_some();
+    let user_file = match user_config_path {
+        Some(path) => AbsolutePathBuf::from_absolute_path(path)?,
+        None => AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, codex_home)?,
+    };
+    let user_config_base_dir = user_file
+        .parent()
+        .map(|path| path.to_path_buf())
+        .unwrap_or_else(|| codex_home.to_path_buf());
+    let user_layer = if explicit_user_config_path_provided {
+        load_config_toml_for_explicit_user_layer(&user_file, |config_toml| {
+            ConfigLayerEntry::new(
+                ConfigLayerSource::User {
+                    file: user_file.clone(),
+                },
+                config_toml,
+            )
+        })
+        .await?
+    } else {
+        load_config_toml_for_required_layer(&user_file, |config_toml| {
+            ConfigLayerEntry::new(
+                ConfigLayerSource::User {
+                    file: user_file.clone(),
+                },
+                config_toml,
+            )
+        })
+        .await?
+    };
     layers.push(user_layer);
 
     if let Some(cwd) = cwd {
@@ -216,7 +237,7 @@ pub async fn load_config_layers_state(
             &merged_so_far,
             &cwd,
             &project_root_markers,
-            codex_home,
+            user_config_base_dir.as_path(),
             &user_file,
         )
         .await
@@ -338,6 +359,34 @@ async fn load_config_toml_for_required_layer(
     }?;
 
     Ok(create_entry(toml_value))
+}
+
+async fn load_config_toml_for_explicit_user_layer(
+    config_toml: impl AsRef<Path>,
+    create_entry: impl FnOnce(TomlValue) -> ConfigLayerEntry,
+) -> io::Result<ConfigLayerEntry> {
+    let toml_file = config_toml.as_ref();
+    let metadata = tokio::fs::metadata(toml_file).await.map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "explicit user config path {} is not readable: {err}",
+                toml_file.display()
+            ),
+        )
+    })?;
+
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "explicit user config path {} is not a file",
+                toml_file.display()
+            ),
+        ));
+    }
+
+    load_config_toml_for_required_layer(toml_file, create_entry).await
 }
 
 /// If available, apply requirements from the platform system

@@ -3,6 +3,7 @@ use crate::render::line_utils::prefix_lines;
 use crate::text_formatting::truncate_text;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::CollabAgentActivity;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
 use codex_protocol::protocol::CollabAgentRef;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
@@ -19,6 +20,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 const COLLAB_PROMPT_PREVIEW_GRAPHEMES: usize = 160;
+const COLLAB_AGENT_ACTIVITY_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_ERROR_PREVIEW_GRAPHEMES: usize = 160;
 const COLLAB_AGENT_RESPONSE_PREVIEW_GRAPHEMES: usize = 240;
 
@@ -357,6 +359,7 @@ fn wait_complete_lines(
                 agent_nickname: None,
                 agent_role: None,
                 status: status.clone(),
+                last_activity: None,
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.thread_id.to_string().cmp(&right.thread_id.to_string()));
@@ -375,6 +378,7 @@ fn wait_complete_lines(
                 agent_nickname: None,
                 agent_role: None,
                 status: status.clone(),
+                last_activity: None,
             })
             .collect::<Vec<_>>();
         extras.sort_by(|left, right| left.thread_id.to_string().cmp(&right.thread_id.to_string()));
@@ -390,6 +394,7 @@ fn wait_complete_lines(
                 agent_nickname,
                 agent_role,
                 status,
+                last_activity,
             } = entry;
             let mut spans = agent_label_spans(AgentLabel {
                 thread_id: Some(thread_id),
@@ -397,20 +402,40 @@ fn wait_complete_lines(
                 role: agent_role.as_deref(),
             });
             spans.push(Span::from(": ").dim());
-            spans.extend(status_summary_spans(&status));
+            spans.extend(status_summary_spans(&status, last_activity.as_ref()));
             spans.into()
         })
         .collect()
 }
 
 fn status_summary_line(status: &AgentStatus) -> Line<'static> {
-    status_summary_spans(status).into()
+    status_summary_spans(status, None).into()
 }
 
-fn status_summary_spans(status: &AgentStatus) -> Vec<Span<'static>> {
+fn status_summary_spans(
+    status: &AgentStatus,
+    last_activity: Option<&CollabAgentActivity>,
+) -> Vec<Span<'static>> {
     match status {
         AgentStatus::PendingInit => vec![Span::from("Pending init").cyan()],
-        AgentStatus::Running => vec![Span::from("Running").cyan().bold()],
+        AgentStatus::Running => {
+            let mut spans = vec![Span::from("Running").cyan().bold()];
+            if let Some(last_activity) = last_activity {
+                let activity_preview = truncate_text(
+                    &last_activity
+                        .summary
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    COLLAB_AGENT_ACTIVITY_PREVIEW_GRAPHEMES,
+                );
+                if !activity_preview.is_empty() {
+                    spans.push(Span::from(" - ").dim());
+                    spans.push(Span::from(activity_preview));
+                }
+            }
+            spans
+        }
         AgentStatus::Completed(message) => {
             let mut spans = vec![Span::from("Completed").green()];
             if let Some(message) = message.as_ref() {
@@ -446,6 +471,7 @@ fn status_summary_spans(status: &AgentStatus) -> Vec<Span<'static>> {
 mod tests {
     use super::*;
     use crate::history_cell::HistoryCell;
+    use codex_protocol::protocol::CollabAgentActivityKind;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
     use ratatui::style::Color;
@@ -459,6 +485,8 @@ mod tests {
             .expect("valid robie thread id");
         let bob_id = ThreadId::from_string("00000000-0000-0000-0000-000000000003")
             .expect("valid bob thread id");
+        let alice_id = ThreadId::from_string("00000000-0000-0000-0000-000000000004")
+            .expect("valid alice thread id");
 
         let spawn = spawn_end(CollabAgentSpawnEndEvent {
             call_id: "call-spawn".to_string(),
@@ -497,6 +525,7 @@ mod tests {
             AgentStatus::Completed(Some("39916800".to_string())),
         );
         statuses.insert(bob_id, AgentStatus::Errored("tool timeout".to_string()));
+        statuses.insert(alice_id, AgentStatus::Running);
         let finished = waiting_end(CollabWaitingEndEvent {
             sender_thread_id,
             call_id: "call-wait".to_string(),
@@ -506,12 +535,25 @@ mod tests {
                     agent_nickname: Some("Robie".to_string()),
                     agent_role: Some("explorer".to_string()),
                     status: AgentStatus::Completed(Some("39916800".to_string())),
+                    last_activity: None,
                 },
                 CollabAgentStatusEntry {
                     thread_id: bob_id,
                     agent_nickname: Some("Bob".to_string()),
                     agent_role: Some("worker".to_string()),
                     status: AgentStatus::Errored("tool timeout".to_string()),
+                    last_activity: None,
+                },
+                CollabAgentStatusEntry {
+                    thread_id: alice_id,
+                    agent_nickname: Some("Alice".to_string()),
+                    agent_role: Some("reviewer".to_string()),
+                    status: AgentStatus::Running,
+                    last_activity: Some(CollabAgentActivity {
+                        kind: CollabAgentActivityKind::Reasoning,
+                        summary: "Collecting references for the final report".to_string(),
+                        occurred_at: 1_731_720_000,
+                    }),
                 },
             ],
             statuses,

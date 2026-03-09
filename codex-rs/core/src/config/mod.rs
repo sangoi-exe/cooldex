@@ -385,8 +385,8 @@ pub struct Config {
     /// Maximum size budget (KiB) for recall payload items returned to the model.
     pub recall_kbytes_limit: usize,
 
-    /// Controls recall payload verbosity. When unset/true, use full payload.
-    /// When false, use a compact string-list payload.
+    /// Controls recall payload verbosity. When unset/false, use a compact string-list payload.
+    /// When true, use the full/debug payload.
     pub recall_debug: Option<bool>,
 
     /// Maximum number of agent threads that can be open concurrently.
@@ -594,6 +594,13 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn user_config_path(mut self, user_config_path: Option<PathBuf>) -> Self {
+        self.loader_overrides
+            .get_or_insert_with(LoaderOverrides::default)
+            .user_config_path = user_config_path;
+        self
+    }
+
     pub fn cloud_requirements(mut self, cloud_requirements: CloudRequirementsLoader) -> Self {
         self.cloud_requirements = cloud_requirements;
         self
@@ -721,20 +728,21 @@ pub async fn load_config_as_toml_with_cli_overrides(
     codex_home: &Path,
     cwd: &AbsolutePathBuf,
     cli_overrides: Vec<(String, TomlValue)>,
+    loader_overrides: LoaderOverrides,
 ) -> std::io::Result<ConfigToml> {
     let config_layer_stack = load_config_layers_state(
         codex_home,
         Some(cwd.clone()),
         &cli_overrides,
-        LoaderOverrides::default(),
+        loader_overrides,
         CloudRequirementsLoader::default(),
     )
     .await?;
 
     let merged_toml = config_layer_stack.effective_config();
-    let cfg = deserialize_config_toml_with_base(merged_toml, codex_home).map_err(|e| {
-        tracing::error!("Failed to deserialize overridden config: {e}");
-        e
+    let cfg: ConfigToml = merged_toml.try_into().map_err(|err| {
+        tracing::error!("Failed to deserialize overridden config: {err}");
+        std::io::Error::new(std::io::ErrorKind::InvalidData, err)
     })?;
 
     Ok(cfg)
@@ -1191,8 +1199,8 @@ pub struct ConfigToml {
     #[schemars(range(min = 1))]
     pub recall_kbytes_limit: Option<usize>,
 
-    /// Controls recall payload verbosity. When unset/true, use full payload.
-    /// When false, use a compact string-list payload.
+    /// Controls recall payload verbosity. When unset/false, use a compact string-list payload.
+    /// When true, use the full/debug payload.
     pub recall_debug: Option<bool>,
 
     /// Explicit policy knobs for `manage_context` orchestration.
@@ -2358,6 +2366,9 @@ impl Config {
             .subagent_instructions_file
             .as_ref()
             .or(cfg.subagent_instructions_file.as_ref());
+        // Workspace customization seam: child-agent base instructions come from
+        // `subagent_instructions_file` so subagents can stay isolated from the
+        // lead prompt stack during spawn/resume flows.
         let subagent_base_instructions = Self::try_read_non_empty_file(
             subagent_instructions_path,
             "sub-agent instructions file",
@@ -2827,6 +2838,18 @@ impl Config {
             .requirements_toml()
             .network
             .is_some()
+    }
+
+    pub fn active_user_config_path(&self) -> std::io::Result<PathBuf> {
+        self.config_layer_stack
+            .get_user_config_file()
+            .map(codex_utils_absolute_path::AbsolutePathBuf::to_path_buf)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "active user config layer is missing from configuration",
+                )
+            })
     }
 }
 

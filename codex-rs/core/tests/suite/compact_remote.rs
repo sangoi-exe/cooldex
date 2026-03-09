@@ -493,7 +493,10 @@ async fn remote_pre_sampling_auto_compact_emits_warning_after_model_switch() -> 
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_model(previous_model)
             .with_config(|config| {
-                config.features.enable(Feature::RemoteModels);
+                config
+                    .features
+                    .enable(Feature::RemoteModels)
+                    .expect("remote models feature should be enabled for this test");
                 config.model_auto_compact_token_limit = Some(100_000);
             }),
     )

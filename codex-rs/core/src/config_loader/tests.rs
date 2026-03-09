@@ -109,6 +109,26 @@ async fn returns_config_error_for_invalid_user_config_toml() {
 }
 
 #[tokio::test]
+async fn explicit_user_config_path_must_exist() {
+    let tmp = tempdir().expect("tempdir");
+    let missing_path = tmp.path().join("missing-config.toml");
+
+    let err = ConfigBuilder::default()
+        .codex_home(tmp.path().to_path_buf())
+        .user_config_path(Some(missing_path.clone()))
+        .fallback_cwd(Some(tmp.path().to_path_buf()))
+        .build()
+        .await
+        .expect_err("expected missing explicit config path to fail");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert!(
+        err.to_string().contains("explicit user config path"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn returns_config_error_for_invalid_managed_config_toml() {
     let tmp = tempdir().expect("tempdir");
     let managed_path = tmp.path().join("managed_config.toml");
@@ -116,6 +136,7 @@ async fn returns_config_error_for_invalid_managed_config_toml() {
     std::fs::write(&managed_path, contents).expect("write managed config");
 
     let overrides = LoaderOverrides {
+        user_config_path: None,
         managed_config_path: Some(managed_path.clone()),
         ..Default::default()
     };
@@ -203,6 +224,7 @@ extra = true
     .expect("write managed config");
 
     let overrides = LoaderOverrides {
+        user_config_path: None,
         managed_config_path: Some(managed_path),
         #[cfg(target_os = "macos")]
         managed_preferences_base64: None,
@@ -240,6 +262,7 @@ async fn returns_empty_when_all_layers_missing() {
     let managed_path = tmp.path().join("managed_config.toml");
 
     let overrides = LoaderOverrides {
+        user_config_path: None,
         managed_config_path: Some(managed_path),
         #[cfg(target_os = "macos")]
         // Force managed preferences to resolve as empty so this test does not
@@ -338,6 +361,7 @@ flag = false
 "#;
 
     let overrides = LoaderOverrides {
+        user_config_path: None,
         managed_config_path: Some(managed_path),
         managed_preferences_base64: Some(
             base64::prelude::BASE64_STANDARD.encode(raw_managed_preferences.as_bytes()),
@@ -392,6 +416,7 @@ async fn managed_preferences_requirements_are_applied() -> anyhow::Result<()> {
         Some(AbsolutePathBuf::try_from(tmp.path())?),
         &[] as &[(String, TomlValue)],
         LoaderOverrides {
+            user_config_path: None,
             managed_config_path: Some(tmp.path().join("managed_config.toml")),
             managed_preferences_base64: Some(String::new()),
             macos_managed_config_requirements_base64: Some(
@@ -455,6 +480,7 @@ async fn managed_preferences_requirements_take_precedence() -> anyhow::Result<()
         Some(AbsolutePathBuf::try_from(tmp.path())?),
         &[] as &[(String, TomlValue)],
         LoaderOverrides {
+            user_config_path: None,
             managed_config_path: Some(managed_path),
             managed_preferences_base64: Some(String::new()),
             macos_managed_config_requirements_base64: Some(

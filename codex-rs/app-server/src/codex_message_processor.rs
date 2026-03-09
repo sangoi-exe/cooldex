@@ -1306,20 +1306,23 @@ impl CodexMessageProcessor {
         }
     }
 
-    async fn refresh_token_if_requested(&self, do_refresh: bool) {
+    async fn refresh_token_best_effort_if_requested(&self, do_refresh: bool) {
         if self.auth_manager.is_external_auth_active() {
             return;
         }
         if do_refresh && let Err(err) = self.auth_manager.refresh_token().await {
-            tracing::warn!("failed to refresh token while getting account: {err}");
+            tracing::warn!("failed to refresh token during best-effort auth refresh: {err}");
         }
     }
 
     async fn get_auth_status(&self, request_id: ConnectionRequestId, params: GetAuthStatusParams) {
-        let include_token = params.include_token.unwrap_or(false);
+        // Compatibility-only RPC. `include_token` is intentionally ignored and
+        // tokens are never returned from this surface. Use `account/read` for
+        // authoritative auth/account state.
         let do_refresh = params.refresh_token.unwrap_or(false);
 
-        self.refresh_token_if_requested(do_refresh).await;
+        self.refresh_token_best_effort_if_requested(do_refresh)
+            .await;
 
         // Determine whether auth is required based on the active model provider.
         // If a custom provider is configured with `requires_openai_auth == false`,
@@ -1336,20 +1339,17 @@ impl CodexMessageProcessor {
             match self.auth_manager.auth().await {
                 Some(auth) => {
                     let auth_mode = auth.api_auth_mode();
-                    let (reported_auth_method, token_opt) = match auth.get_token() {
-                        Ok(token) if !token.is_empty() => {
-                            let tok = if include_token { Some(token) } else { None };
-                            (Some(auth_mode), tok)
-                        }
-                        Ok(_) => (None, None),
+                    let reported_auth_method = match auth.get_token() {
+                        Ok(token) if !token.is_empty() => Some(auth_mode),
+                        Ok(_) => None,
                         Err(err) => {
                             tracing::warn!("failed to get token for auth status: {err}");
-                            (None, None)
+                            None
                         }
                     };
                     GetAuthStatusResponse {
                         auth_method: reported_auth_method,
-                        auth_token: token_opt,
+                        auth_token: None,
                         requires_openai_auth: Some(true),
                     }
                 }
@@ -1367,7 +1367,18 @@ impl CodexMessageProcessor {
     async fn get_account(&self, request_id: ConnectionRequestId, params: GetAccountParams) {
         let do_refresh = params.refresh_token;
 
-        self.refresh_token_if_requested(do_refresh).await;
+        if do_refresh
+            && !self.auth_manager.is_external_auth_active()
+            && let Err(err) = self.auth_manager.refresh_token_from_authority().await
+        {
+            let error = JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("failed to refresh token while getting account: {err}"),
+                data: None,
+            };
+            self.outgoing.send_error(request_id, error).await;
+            return;
+        }
 
         // Whether auth is required for the active model provider.
         let requires_openai_auth = self.config.model_provider.requires_openai_auth;
@@ -1793,6 +1804,7 @@ impl CodexMessageProcessor {
             model_provider,
             service_tier,
             cwd,
+            config_path,
             approval_policy,
             sandbox,
             config,
@@ -1837,6 +1849,7 @@ impl CodexMessageProcessor {
                 request_id,
                 config,
                 typesafe_overrides,
+                config_path.map(PathBuf::from),
                 dynamic_tools,
                 persist_extended_history,
                 service_name,
@@ -1854,6 +1867,7 @@ impl CodexMessageProcessor {
         request_id: ConnectionRequestId,
         config_overrides: Option<HashMap<String, serde_json::Value>>,
         typesafe_overrides: ConfigOverrides,
+        config_path: Option<PathBuf>,
         dynamic_tools: Option<Vec<ApiDynamicToolSpec>>,
         persist_extended_history: bool,
         service_name: Option<String>,
@@ -1863,6 +1877,7 @@ impl CodexMessageProcessor {
             &cli_overrides,
             config_overrides,
             typesafe_overrides,
+            config_path,
             &cloud_requirements,
         )
         .await
@@ -1966,6 +1981,7 @@ impl CodexMessageProcessor {
                     model_provider: config_snapshot.model_provider_id,
                     service_tier: config_snapshot.service_tier,
                     cwd: config_snapshot.cwd,
+                    config_path: config_snapshot.config_path,
                     approval_policy: config_snapshot.approval_policy.into(),
                     sandbox: config_snapshot.sandbox_policy.into(),
                     reasoning_effort: config_snapshot.reasoning_effort,
@@ -3123,6 +3139,7 @@ impl CodexMessageProcessor {
             model_provider,
             service_tier,
             cwd,
+            config_path,
             approval_policy,
             sandbox,
             config: request_overrides,
@@ -3151,6 +3168,8 @@ impl CodexMessageProcessor {
         };
 
         let history_cwd = thread_history.session_cwd();
+        let history_config_path = thread_history.session_config_path();
+        let requested_config_path = config_path.map(PathBuf::from);
         let typesafe_overrides = self.build_thread_config_overrides(
             model,
             model_provider,
@@ -3170,6 +3189,7 @@ impl CodexMessageProcessor {
             request_overrides,
             typesafe_overrides,
             history_cwd,
+            requested_config_path.or(history_config_path),
             &cloud_requirements,
         )
         .await
@@ -3204,6 +3224,7 @@ impl CodexMessageProcessor {
                 thread,
                 session_configured,
             }) => {
+                let config_snapshot = thread.config_snapshot().await;
                 let SessionConfiguredEvent { rollout_path, .. } = session_configured;
                 let Some(rollout_path) = rollout_path else {
                     self.send_internal_error(
@@ -3254,13 +3275,14 @@ impl CodexMessageProcessor {
 
                 let response = ThreadResumeResponse {
                     thread,
-                    model: session_configured.model,
-                    model_provider: session_configured.model_provider_id,
-                    service_tier: session_configured.service_tier,
-                    cwd: session_configured.cwd,
-                    approval_policy: session_configured.approval_policy.into(),
-                    sandbox: session_configured.sandbox_policy.into(),
-                    reasoning_effort: session_configured.reasoning_effort,
+                    model: config_snapshot.model,
+                    model_provider: config_snapshot.model_provider_id,
+                    service_tier: config_snapshot.service_tier,
+                    cwd: config_snapshot.cwd,
+                    config_path: config_snapshot.config_path,
+                    approval_policy: config_snapshot.approval_policy.into(),
+                    sandbox: config_snapshot.sandbox_policy.into(),
+                    reasoning_effort: config_snapshot.reasoning_effort,
                 };
 
                 self.outgoing.send_response(request_id, response).await;
@@ -3597,6 +3619,7 @@ impl CodexMessageProcessor {
             model_provider,
             service_tier,
             cwd,
+            config_path,
             approval_policy,
             sandbox,
             config: cli_overrides,
@@ -3647,9 +3670,10 @@ impl CodexMessageProcessor {
             }
         };
 
-        let history_cwd =
-            read_history_cwd_from_state_db(&self.config, source_thread_id, rollout_path.as_path())
+        let history_session_location =
+            read_history_session_location(&self.config, source_thread_id, rollout_path.as_path())
                 .await;
+        let requested_config_path = config_path.map(PathBuf::from);
 
         // Persist Windows sandbox mode.
         let mut cli_overrides = cli_overrides.unwrap_or_default();
@@ -3690,7 +3714,8 @@ impl CodexMessageProcessor {
             &self.cli_overrides,
             request_overrides,
             typesafe_overrides,
-            history_cwd,
+            history_session_location.cwd,
+            requested_config_path.or(history_session_location.config_path),
             &cloud_requirements,
         )
         .await
@@ -3710,6 +3735,7 @@ impl CodexMessageProcessor {
         let fallback_model_provider = config.model_provider_id.clone();
 
         let NewThread {
+            thread,
             thread_id,
             session_configured,
             ..
@@ -3743,6 +3769,7 @@ impl CodexMessageProcessor {
             }
         };
 
+        let config_snapshot = thread.config_snapshot().await;
         let SessionConfiguredEvent { rollout_path, .. } = session_configured;
         let Some(rollout_path) = rollout_path else {
             self.send_internal_error(
@@ -3816,13 +3843,14 @@ impl CodexMessageProcessor {
 
         let response = ThreadForkResponse {
             thread: thread.clone(),
-            model: session_configured.model,
-            model_provider: session_configured.model_provider_id,
-            service_tier: session_configured.service_tier,
-            cwd: session_configured.cwd,
-            approval_policy: session_configured.approval_policy.into(),
-            sandbox: session_configured.sandbox_policy.into(),
-            reasoning_effort: session_configured.reasoning_effort,
+            model: config_snapshot.model,
+            model_provider: config_snapshot.model_provider_id,
+            service_tier: config_snapshot.service_tier,
+            cwd: config_snapshot.cwd,
+            config_path: config_snapshot.config_path,
+            approval_policy: config_snapshot.approval_policy.into(),
+            sandbox: config_snapshot.sandbox_policy.into(),
+            reasoning_effort: config_snapshot.reasoning_effort,
         };
 
         self.outgoing.send_response(request_id, response).await;
@@ -5356,8 +5384,20 @@ impl CodexMessageProcessor {
         params: SkillsConfigWriteParams,
     ) {
         let SkillsConfigWriteParams { path, enabled } = params;
+        let user_config_path = match self.config.active_user_config_path() {
+            Ok(path) => path,
+            Err(err) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to resolve active user config path: {err}"),
+                )
+                .await;
+                return;
+            }
+        };
         let edits = vec![ConfigEdit::SetSkillConfig { path, enabled }];
         let result = ConfigEditsBuilder::new(&self.config.codex_home)
+            .user_config_path(user_config_path)
             .with_edits(edits)
             .apply()
             .await;
@@ -6669,6 +6709,7 @@ impl CodexMessageProcessor {
                     ..Default::default()
                 },
                 Some(command_cwd.clone()),
+                None,
                 &cloud_requirements,
             )
             .await;
@@ -6824,6 +6865,7 @@ async fn handle_pending_thread_resume_request(
         approval_policy,
         sandbox_policy,
         cwd,
+        config_path,
         reasoning_effort,
         ..
     } = pending.config_snapshot;
@@ -6833,6 +6875,7 @@ async fn handle_pending_thread_resume_request(
         model_provider: model_provider_id,
         service_tier,
         cwd,
+        config_path,
         approval_policy: approval_policy.into(),
         sandbox: sandbox_policy.into(),
         reasoning_effort,
@@ -6948,6 +6991,16 @@ fn collect_resume_override_mismatches(
             ));
         }
     }
+    if let Some(requested_config_path) = request.config_path.as_deref() {
+        let requested_config_path = std::path::PathBuf::from(requested_config_path);
+        if requested_config_path != config_snapshot.config_path {
+            mismatch_details.push(format!(
+                "configPath requested={} active={}",
+                requested_config_path.display(),
+                config_snapshot.config_path.display()
+            ));
+        }
+    }
     if let Some(requested_approval) = request.approval_policy.as_ref() {
         let active_approval: AskForApproval = config_snapshot.approval_policy.into();
         if requested_approval != &active_approval {
@@ -6992,6 +7045,10 @@ fn collect_resume_override_mismatches(
     if request.config.is_some() {
         mismatch_details
             .push("config overrides were provided and ignored while running".to_string());
+    }
+    if request.config_path.is_some() {
+        mismatch_details
+            .push("configPath override was provided and ignored while running".to_string());
     }
     if request.base_instructions.is_some() {
         mismatch_details
@@ -7148,6 +7205,7 @@ async fn derive_config_from_params(
     cli_overrides: &[(String, TomlValue)],
     request_overrides: Option<HashMap<String, serde_json::Value>>,
     typesafe_overrides: ConfigOverrides,
+    config_path: Option<PathBuf>,
     cloud_requirements: &CloudRequirementsLoader,
 ) -> std::io::Result<Config> {
     let merged_cli_overrides = cli_overrides
@@ -7164,6 +7222,7 @@ async fn derive_config_from_params(
     codex_core::config::ConfigBuilder::default()
         .cli_overrides(merged_cli_overrides)
         .harness_overrides(typesafe_overrides)
+        .user_config_path(config_path)
         .cloud_requirements(cloud_requirements.clone())
         .build()
         .await
@@ -7174,6 +7233,7 @@ async fn derive_config_for_cwd(
     request_overrides: Option<HashMap<String, serde_json::Value>>,
     typesafe_overrides: ConfigOverrides,
     cwd: Option<PathBuf>,
+    config_path: Option<PathBuf>,
     cloud_requirements: &CloudRequirementsLoader,
 ) -> std::io::Result<Config> {
     let merged_cli_overrides = cli_overrides
@@ -7191,30 +7251,47 @@ async fn derive_config_for_cwd(
         .cli_overrides(merged_cli_overrides)
         .harness_overrides(typesafe_overrides)
         .fallback_cwd(cwd)
+        .user_config_path(config_path)
         .cloud_requirements(cloud_requirements.clone())
         .build()
         .await
 }
 
-async fn read_history_cwd_from_state_db(
+#[derive(Default)]
+struct HistorySessionLocation {
+    cwd: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+}
+
+async fn read_history_session_location(
     config: &Config,
     thread_id: Option<ThreadId>,
     rollout_path: &Path,
-) -> Option<PathBuf> {
-    if let Some(state_db_ctx) = get_state_db(config).await
-        && let Some(thread_id) = thread_id
-        && let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await
-    {
-        return Some(metadata.cwd);
-    }
-
-    match read_session_meta_line(rollout_path).await {
-        Ok(meta_line) => Some(meta_line.meta.cwd),
+) -> HistorySessionLocation {
+    let session_meta = match read_session_meta_line(rollout_path).await {
+        Ok(meta_line) => Some(meta_line.meta),
         Err(err) => {
             let rollout_path = rollout_path.display();
             warn!("failed to read session metadata from rollout {rollout_path}: {err}");
             None
         }
+    };
+
+    if let Some(state_db_ctx) = get_state_db(config).await
+        && let Some(thread_id) = thread_id
+        && let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await
+    {
+        return HistorySessionLocation {
+            cwd: Some(metadata.cwd),
+            config_path: session_meta
+                .as_ref()
+                .and_then(|meta| meta.config_path.clone()),
+        };
+    }
+
+    HistorySessionLocation {
+        cwd: session_meta.as_ref().map(|meta| meta.cwd.clone()),
+        config_path: session_meta.and_then(|meta| meta.config_path),
     }
 }
 
@@ -7743,6 +7820,7 @@ mod tests {
             model_provider: None,
             service_tier: Some(Some(codex_protocol::config_types::ServiceTier::Fast)),
             cwd: None,
+            config_path: None,
             approval_policy: None,
             sandbox: None,
             config: None,
@@ -7758,6 +7836,7 @@ mod tests {
             approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
             sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
             cwd: PathBuf::from("/tmp"),
+            config_path: PathBuf::from("/tmp/config.toml"),
             ephemeral: false,
             reasoning_effort: None,
             personality: None,

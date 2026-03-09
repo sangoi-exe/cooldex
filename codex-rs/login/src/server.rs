@@ -27,7 +27,9 @@ use crate::pkce::PkceCodes;
 use crate::pkce::generate_pkce;
 use base64::Engine;
 use chrono::Utc;
+use codex_core::AuthManager;
 use codex_core::auth::AuthCredentialsStoreMode;
+use codex_core::auth::NON_PLUS_ACCOUNT_REMOVED_MESSAGE;
 use codex_core::auth::StoredAccount;
 use codex_core::auth::update_auth_store;
 use codex_core::default_client::originator;
@@ -348,6 +350,14 @@ async fn process_request(
                     .await
                     {
                         eprintln!("Persist error: {err}");
+                        if err.kind() == io::ErrorKind::PermissionDenied {
+                            return login_error_response(
+                                &err.to_string(),
+                                io::ErrorKind::PermissionDenied,
+                                Some("unsupported_plan"),
+                                None,
+                            );
+                        }
                         return login_error_response(
                             "Sign-in completed but credentials could not be saved locally.",
                             io::ErrorKind::Other,
@@ -770,7 +780,14 @@ pub(crate) async fn persist_tokens_async(
             .account_id
             .clone()
             .unwrap_or_else(|| format!("account-{}", Utc::now().timestamp_millis()));
+        let account_id_for_store = account_id.clone();
         let now = Utc::now();
+        if !tokens.id_token.is_plus_or_pro_saved_account() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                NON_PLUS_ACCOUNT_REMOVED_MESSAGE,
+            ));
+        }
 
         update_auth_store(&codex_home, auth_credentials_store_mode, move |store| {
             store.openai_api_key = api_key.clone();
@@ -778,7 +795,7 @@ pub(crate) async fn persist_tokens_async(
             match store
                 .accounts
                 .iter_mut()
-                .find(|account| account.id == account_id)
+                .find(|account| account.id == account_id_for_store)
             {
                 Some(account) => {
                     account.tokens = tokens.clone();
@@ -786,7 +803,7 @@ pub(crate) async fn persist_tokens_async(
                 }
                 None => {
                     store.accounts.push(StoredAccount {
-                        id: account_id.clone(),
+                        id: account_id_for_store.clone(),
                         label: None,
                         tokens: tokens.clone(),
                         last_refresh: Some(now),
@@ -795,9 +812,24 @@ pub(crate) async fn persist_tokens_async(
                 }
             }
 
-            store.active_account_id = Some(account_id.clone());
+            store.active_account_id = Some(account_id_for_store);
             Ok(())
-        })
+        })?;
+
+        let auth_manager = AuthManager::new(codex_home.clone(), false, auth_credentials_store_mode);
+        let Some(auth) = auth_manager.auth_cached() else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                NON_PLUS_ACCOUNT_REMOVED_MESSAGE,
+            ));
+        };
+        if auth.get_account_id().as_deref() != Some(account_id.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                NON_PLUS_ACCOUNT_REMOVED_MESSAGE,
+            ));
+        }
+        Ok(())
     })
     .await
     .map_err(|e| io::Error::other(format!("persist task failed: {e}")))?
@@ -1115,17 +1147,22 @@ mod tests {
     use super::sanitize_url_for_logging;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use codex_core::auth::NON_PLUS_ACCOUNT_REMOVED_MESSAGE;
     use codex_core::auth::load_auth_store;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
-    fn id_token(email: &str, account_id: &str) -> String {
+    fn id_token(email: &str, account_id: &str, plan_type: Option<&str>) -> String {
         let header = serde_json::json!({"alg":"HS256","typ":"JWT"});
+        let mut auth_payload = serde_json::json!({
+            "chatgpt_account_id": account_id,
+        });
+        if let Some(plan_type) = plan_type {
+            auth_payload["chatgpt_plan_type"] = serde_json::Value::String(plan_type.to_string());
+        }
         let payload = serde_json::json!({
             "email": email,
-            "https://api.openai.com/auth": {
-                "chatgpt_account_id": account_id,
-            }
+            "https://api.openai.com/auth": auth_payload
         });
         format!(
             "{}.{}.{}",
@@ -1144,7 +1181,7 @@ mod tests {
         persist_tokens_async(
             codex_home,
             None,
-            id_token("work@example.com", "acc-work"),
+            id_token("work@example.com", "acc-work", Some("pro")),
             "access-work".to_string(),
             "refresh-work".to_string(),
             mode,
@@ -1155,7 +1192,7 @@ mod tests {
         persist_tokens_async(
             codex_home,
             None,
-            id_token("personal@example.com", "acc-personal"),
+            id_token("personal@example.com", "acc-personal", Some("pro")),
             "access-personal".to_string(),
             "refresh-personal".to_string(),
             mode,
@@ -1192,7 +1229,7 @@ mod tests {
         persist_tokens_async(
             codex_home,
             Some("sk-test".to_string()),
-            id_token("work@example.com", "acc-work"),
+            id_token("work@example.com", "acc-work", Some("pro")),
             "access-work".to_string(),
             "refresh-work".to_string(),
             mode,
@@ -1203,7 +1240,7 @@ mod tests {
         persist_tokens_async(
             codex_home,
             None,
-            id_token("personal@example.com", "acc-personal"),
+            id_token("personal@example.com", "acc-personal", Some("pro")),
             "access-personal".to_string(),
             "refresh-personal".to_string(),
             mode,
@@ -1218,6 +1255,48 @@ mod tests {
         assert_eq!(store.openai_api_key, None);
         assert_eq!(store.accounts.len(), 2);
         assert_eq!(store.active_account_id.as_deref(), Some("acc-personal"));
+    }
+
+    #[tokio::test]
+    async fn persist_tokens_async_rejects_non_plus_or_pro_plan() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path();
+        let mode = AuthCredentialsStoreMode::File;
+
+        let error = persist_tokens_async(
+            codex_home,
+            None,
+            id_token("free@example.com", "acc-free", Some("free")),
+            "access-free".to_string(),
+            "refresh-free".to_string(),
+            mode,
+        )
+        .await
+        .expect_err("free plan should be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), NON_PLUS_ACCOUNT_REMOVED_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn persist_tokens_async_rejects_missing_plan_claim() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path();
+        let mode = AuthCredentialsStoreMode::File;
+
+        let error = persist_tokens_async(
+            codex_home,
+            None,
+            id_token("missing-plan@example.com", "acc-missing-plan", None),
+            "access-missing-plan".to_string(),
+            "refresh-missing-plan".to_string(),
+            mode,
+        )
+        .await
+        .expect_err("missing plan should be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), NON_PLUS_ACCOUNT_REMOVED_MESSAGE);
     }
 
     #[test]

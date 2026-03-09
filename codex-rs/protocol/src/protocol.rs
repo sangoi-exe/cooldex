@@ -1981,6 +1981,16 @@ impl InitialHistory {
         }
     }
 
+    pub fn session_config_path(&self) -> Option<PathBuf> {
+        match self {
+            InitialHistory::New => None,
+            InitialHistory::Resumed(resumed) => {
+                session_config_path_from_items(resumed.history.as_slice())
+            }
+            InitialHistory::Forked(items) => session_config_path_from_items(items.as_slice()),
+        }
+    }
+
     pub fn get_rollout_items(&self) -> Vec<RolloutItem> {
         match self {
             InitialHistory::New => Vec::new(),
@@ -2051,6 +2061,13 @@ impl InitialHistory {
 fn session_cwd_from_items(items: &[RolloutItem]) -> Option<PathBuf> {
     items.iter().find_map(|item| match item {
         RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.cwd.clone()),
+        _ => None,
+    })
+}
+
+fn session_config_path_from_items(items: &[RolloutItem]) -> Option<PathBuf> {
+    items.iter().find_map(|item| match item {
+        RolloutItem::SessionMeta(meta_line) => meta_line.meta.config_path.clone(),
         _ => None,
     })
 }
@@ -2156,6 +2173,8 @@ pub struct SessionMeta {
     pub forked_from_id: Option<ThreadId>,
     pub timestamp: String,
     pub cwd: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<PathBuf>,
     pub originator: String,
     pub cli_version: String,
     #[serde(default)]
@@ -2184,6 +2203,7 @@ impl Default for SessionMeta {
             forked_from_id: None,
             timestamp: String::new(),
             cwd: PathBuf::new(),
+            config_path: None,
             originator: String::new(),
             cli_version: String::new(),
             source: SessionSource::default(),
@@ -3012,6 +3032,28 @@ pub struct CollabAgentRef {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum CollabAgentActivityKind {
+    Message,
+    Reasoning,
+    Command,
+    Edit,
+    Task,
+    Status,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct CollabAgentActivity {
+    /// Category of the most recent observed progress signal for the agent.
+    pub kind: CollabAgentActivityKind,
+    /// Short, user-facing summary of the observed activity.
+    pub summary: String,
+    /// Unix timestamp in seconds when the activity was observed.
+    pub occurred_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct CollabAgentStatusEntry {
     /// Thread ID of the receiver/new agent.
     pub thread_id: ThreadId,
@@ -3023,6 +3065,9 @@ pub struct CollabAgentStatusEntry {
     pub agent_role: Option<String>,
     /// Last known status of the agent.
     pub status: AgentStatus,
+    /// Most recent observed activity for the agent, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<CollabAgentActivity>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]

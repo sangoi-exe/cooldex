@@ -29,7 +29,7 @@ async fn list_collaboration_modes_returns_presets() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mut mcp = McpProcess::new(codex_home.path()).await?;
 
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let request_id = mcp
         .send_list_collaboration_modes_request(CollaborationModeListParams::default())
