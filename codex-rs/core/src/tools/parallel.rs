@@ -62,6 +62,8 @@ impl ToolCallRuntime {
             return Ok(Self::disallowed_response(&call));
         }
 
+        // Merge-safety anchor: this router decision is the single gate between
+        // shared read-lane execution and serialized write-lane execution.
         let supports_parallel = self.router.tool_supports_parallel(&call.tool_name);
 
         let router = Arc::clone(&self.router);

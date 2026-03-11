@@ -20,6 +20,7 @@ If the goal is to inspect recent pre-compaction history (reasoning + assistant m
 - Do not repeat `chunk_id` in the same `apply` payload.
 
 Do not send fields outside the current v2 contract.
+Merge-safety note: handler-side enforcement in `codex-rs/core/src/tools/handlers/manage_context.rs` must stay aligned with this playbook.
 
 ## Loop
 

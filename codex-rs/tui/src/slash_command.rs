@@ -137,6 +137,8 @@ impl SlashCommand {
     }
 
     /// Whether this command can be run while a task is in progress.
+    /// Merge anchor: `/accounts` and `/logout` stay blocked during active turns
+    /// because account mutations are coordinated through app-level auth flows.
     pub fn available_during_task(self) -> bool {
         match self {
             SlashCommand::New

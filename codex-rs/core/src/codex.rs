@@ -3187,6 +3187,8 @@ impl Session {
     }
 
     async fn send_raw_response_items(&self, turn_context: &TurnContext, items: &[ResponseItem]) {
+        // Merge anchor: TUI `/debug` caches the latest `RawResponseItem` event, so this stream
+        // must keep emitting every response item in order.
         for item in items {
             self.send_event(
                 turn_context,

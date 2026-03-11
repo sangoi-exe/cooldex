@@ -14,6 +14,7 @@ Request fields:
 - `chunk_summaries`: required in `apply` (non-empty and bounded by runtime `max_chunks_per_apply`)
 
 `retrieve` accepts only `mode` + `policy_id`; sending `plan_id`, `state_hash`, or `chunk_summaries` in `retrieve` is invalid.
+Merge-safety note: this fail-loud shape is enforced in `codex-rs/core/src/tools/handlers/manage_context.rs`; keep this doc aligned with handler validation.
 
 `chunk_summaries[]` item:
 - `chunk_id` (required, unique in payload, and must exist in current `chunk_manifest`)

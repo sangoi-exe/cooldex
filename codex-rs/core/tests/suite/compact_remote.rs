@@ -60,6 +60,8 @@ fn estimate_compact_payload_tokens(request: &responses::ResponsesRequest) -> i64
 }
 
 const AUTO_COMPACT_RECON_WARNING: &str = "STOP. Codex CLI has just performed an auto-compact. BEFORE any other action: call recall. Then recon unstaged changes and update_plan status. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
+// Merge-safety anchor: this fixture string must match compact.rs and runtime
+// auto-compact warning injection so recall-first assertions stay coherent.
 fn model_info_with_context_window(slug: &str, context_window: i64) -> ModelInfo {
     let models_response: ModelsResponse =
         serde_json::from_str(include_str!("../../models.json")).expect("valid models.json");

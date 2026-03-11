@@ -130,6 +130,7 @@ pub use codex_git::GhostSnapshotConfig;
 /// the context window.
 pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
+pub(crate) const DEFAULT_AGENT_ALLOW_RUNNING_SUBAGENT_PREEMPTION: bool = true;
 pub(crate) const DEFAULT_MANAGE_CONTEXT_POLICY_FIXED_POINT_K: usize = 2;
 pub(crate) const DEFAULT_MANAGE_CONTEXT_POLICY_STALLED_SIGNATURE_THRESHOLD: usize = 2;
 pub(crate) const DEFAULT_MANAGE_CONTEXT_POLICY_MAX_CHUNKS_PER_APPLY: usize = 12;
@@ -387,10 +388,13 @@ pub struct Config {
 
     /// Controls recall payload verbosity. When unset/false, use a compact string-list payload.
     /// When true, use the full/debug payload.
+    /// Keep docs/recall.md and docs/guide_reapply_recall.md aligned with this default.
     pub recall_debug: Option<bool>,
 
     /// Maximum number of agent threads that can be open concurrently.
     pub agent_max_threads: Option<usize>,
+    /// When `false`, collab tools cannot interrupt or close active sub-agents.
+    pub agent_allow_running_subagent_preemption: bool,
     /// Maximum runtime in seconds for agent job workers before they are failed.
     pub agent_job_max_runtime_seconds: Option<u64>,
 
@@ -1201,6 +1205,7 @@ pub struct ConfigToml {
 
     /// Controls recall payload verbosity. When unset/false, use a compact string-list payload.
     /// When true, use the full/debug payload.
+    /// Keep docs/recall.md and docs/guide_reapply_recall.md aligned with this default.
     pub recall_debug: Option<bool>,
 
     /// Explicit policy knobs for `manage_context` orchestration.
@@ -1453,6 +1458,9 @@ pub struct AgentsToml {
     /// When unset, no limit is enforced.
     #[schemars(range(min = 1))]
     pub max_threads: Option<usize>,
+    /// Whether collab tools may interrupt or close active sub-agents.
+    /// Defaults to `true`.
+    pub allow_running_subagent_preemption: Option<bool>,
     /// Maximum nesting depth allowed for spawned agent threads.
     /// Root sessions start at depth 0.
     #[schemars(range(min = 1))]
@@ -2182,6 +2190,11 @@ impl Config {
                 "agents.max_threads must be at least 1",
             ));
         }
+        let agent_allow_running_subagent_preemption = cfg
+            .agents
+            .as_ref()
+            .and_then(|agents| agents.allow_running_subagent_preemption)
+            .unwrap_or(DEFAULT_AGENT_ALLOW_RUNNING_SUBAGENT_PREEMPTION);
         let agent_max_depth = cfg
             .agents
             .as_ref()
@@ -2368,7 +2381,7 @@ impl Config {
             .or(cfg.subagent_instructions_file.as_ref());
         // Workspace customization seam: child-agent base instructions come from
         // `subagent_instructions_file` so subagents can stay isolated from the
-        // lead prompt stack during spawn/resume flows.
+        // lead prompt stack during spawn/resume flows in multi_agents.rs.
         let subagent_base_instructions = Self::try_read_non_empty_file(
             subagent_instructions_path,
             "sub-agent instructions file",
@@ -2559,6 +2572,7 @@ impl Config {
                 .unwrap_or(DEFAULT_RECALL_KBYTES_LIMIT),
             recall_debug: cfg.recall_debug,
             agent_max_threads,
+            agent_allow_running_subagent_preemption,
             manage_context_policy,
             agent_max_depth,
             agent_roles,

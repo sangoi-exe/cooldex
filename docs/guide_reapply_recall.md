@@ -23,6 +23,7 @@ This document describes the current `recall` contract and the required maintenan
 - In debug mode, replacement-history-derived items must report `source = "replacement_history"` and may use `rollout_index = null`; raw rollout-derived items use `source = "rollout"` with a concrete rollout index.
 - Rollout parse errors do not hard-fail recall; debug mode reports degraded integrity with `integrity.rollout_parse_errors`.
 - If no compaction marker exists, recall fails loud with `stop_reason = "no_compaction_marker"`.
+- Merge-safety note: keep this recall-first recovery contract aligned with auto-compact warning coverage in `codex-rs/core/tests/suite/compact.rs` and `codex-rs/core/tests/suite/compact_remote.rs`.
 
 ## Required Touchpoints for Contract Changes
 
@@ -31,6 +32,7 @@ When changing recall behavior, update these in the same change:
 - `codex-rs/core/src/tools/handlers/recall.rs`
 - `docs/recall.md`
 - `codex-rs/core/src/config/mod.rs` comments for recall-related settings
+- `codex-rs/core/tests/suite/compact.rs` and `codex-rs/core/tests/suite/compact_remote.rs` when recall-first warning flow assertions change
 - `codex-rs/core/config.schema.json` descriptions if config docs changed
 
 ## Minimum Validation

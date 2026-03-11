@@ -169,6 +169,8 @@ async fn handle_retrieve(
     turn: &TurnContext,
     args: &ManageContextToolArgs,
 ) -> Result<ManageContextResult, FunctionCallError> {
+    // Merge-safety anchor: `/sanitize` and docs/manage_context*.md depend on
+    // retrieve rejecting apply-only fields instead of silently ignoring them.
     if args.plan_id.is_some() || args.state_hash.is_some() || args.chunk_summaries.is_some() {
         return Err(contract_error(
             StopReason::InvalidContract,
@@ -353,6 +355,8 @@ async fn handle_apply(
 
         let notes_added = generated_notes.len();
         state.add_context_notes(generated_notes);
+        // Merge-safety anchor: this snapshot is the source persisted into rollout
+        // replacement_history and later consumed by resume/recall boundaries.
         let replacement_history = materialize_prompt_snapshot_after_apply(&mut state);
 
         let final_plan = build_retrieve_plan(&state, &policy_id);

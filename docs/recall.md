@@ -17,6 +17,7 @@
 - Otherwise, returned scan starts at `lower_boundary_index + 1`.
 - If no lower boundary marker exists, scan starts at rollout index `0`.
 - If no upper boundary marker exists, the tool fails with `stop_reason = "no_compaction_marker"`.
+- Merge-safety note: this boundary behavior must stay aligned with `codex-rs/core/src/tools/handlers/recall.rs` and compaction paths that persist `replacement_history`.
 
 ### Filtering and Size Budget
 

@@ -1068,6 +1068,8 @@ impl App {
             self.open_accounts_popup_when_cache_ready = true;
         }
 
+        // Merge anchor: `/accounts` UX depends on this refresh gate to avoid stale account
+        // usage data before `chat_widget.open_accounts_popup()`.
         if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
             self.pending_forced_accounts_status_refresh = false;
             self.accounts_status_cache_last_updated_at = None;

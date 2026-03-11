@@ -68,6 +68,8 @@ const POST_AUTO_USER_MSG: &str = "post auto follow-up";
 const PRETURN_CONTEXT_DIFF_CWD: &str = "/tmp/PRETURN_CONTEXT_DIFF_CWD";
 
 pub(super) const COMPACT_WARNING_MESSAGE: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
+// Merge-safety anchor: keep this warning string aligned with runtime auto-compact
+// injection and compact_remote.rs assertions for the recall-first flow.
 const AUTO_COMPACT_RECON_WARNING: &str = "STOP. Codex CLI has just performed an auto-compact. BEFORE any other action: call recall. Then recon unstaged changes and update_plan status. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
 
 fn auto_summary(summary: &str) -> String {

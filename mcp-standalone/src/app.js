@@ -79,6 +79,9 @@ export function createApp({ config, logger, bridgeRuntime }) {
       service: "codex-netsuite-bridge",
       bridgeBasePath: config.bridgeBasePath,
       authConfigured: Boolean(config.bridgeBearerToken),
+      defaultSessionCwd: config.defaultSessionCwd,
+      defaultSessionConfigPath: config.defaultSessionConfigPath,
+      bridgeStateDbPath: config.bridgeStateDbPath,
       runtime: bridgeRuntime.getHealth(),
     });
   });
@@ -86,6 +89,8 @@ export function createApp({ config, logger, bridgeRuntime }) {
   const router = express.Router();
   router.use(requireBridgeAuth(config));
 
+  // Merge anchor: these route bindings define the published bridge contract in
+  // `mcp-standalone/README.md`; keep paths and runtime method wiring aligned.
   router.get("/sessions", asyncRoute(async (req, res) => {
     const response = await bridgeRuntime.listSessions(req.query ?? {});
     res.json({

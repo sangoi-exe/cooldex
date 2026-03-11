@@ -11,6 +11,7 @@
     "check": "node --check src/index.js"
   },
   "dependencies": {
+    "better-sqlite3": "^11.10.0",
     "dotenv": "^16.4.7",
     "express": "^5.1.0",
     "pino": "^9.6.0"

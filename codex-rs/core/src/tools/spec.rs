@@ -947,7 +947,7 @@ fn create_send_input_tool() -> ToolSpec {
             "interrupt".to_string(),
             JsonSchema::Boolean {
                 description: Some(
-                    "When true, stop the agent's current task and handle this immediately. When false (default), queue this message."
+                    "When true, stop the agent's current task and handle this immediately when `agents.allow_running_subagent_preemption` permits preemption of active sub-agents. When false (default), queue this message."
                         .to_string(),
                 ),
             },
@@ -956,7 +956,7 @@ fn create_send_input_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "send_input".to_string(),
-        description: "Send a message to an existing agent. Use interrupt=true to redirect work immediately. You should reuse the agent by send_input if you believe your assigned task is highly dependent on the context of a previous task."
+        description: "Send a message to an existing agent. Use interrupt=true to redirect work immediately when `agents.allow_running_subagent_preemption` allows preemption of active sub-agents. You should reuse the agent by send_input if you believe your assigned task is highly dependent on the context of a previous task."
             .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
@@ -1120,7 +1120,7 @@ fn create_close_agent_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "close_agent".to_string(),
-        description: "Close an agent when it is no longer needed and return its last known status."
+        description: "Close an agent when it is no longer needed and return its last known status. When `agents.allow_running_subagent_preemption` is false, close_agent rejects active sub-agents."
             .to_string(),
         strict: false,
         parameters: JsonSchema::Object {

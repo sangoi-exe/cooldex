@@ -33,6 +33,7 @@ If `retrieve.chunk_manifest` is empty, skip `apply`.
 ## Required invariants
 
 - one `<tool_context>` + one `<reasoning_context>` per applied chunk
+- Merge-safety note: this retrieve/apply loop is implemented in `codex-rs/core/src/tasks/sanitize.rs` against `codex-rs/core/src/tools/handlers/manage_context.rs`; update both with this sheet.
 - `recall` output is eligible for summarization when it is substantive
 - send only fields from the current v2 contract
 - `retrieve` payload is only `mode` + `policy_id`

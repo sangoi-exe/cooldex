@@ -1129,6 +1129,9 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 - `account/rateLimits/updated` (notify) — emitted whenever a user's ChatGPT rate limits change; payload includes `rateLimits` only (no `rateLimitsByLimitId`).
 - `mcpServer/oauthLogin/completed` (notify) — emitted after a `mcpServer/oauth/login` flow finishes for a server; payload includes `{ name, success, error? }`.
 
+Workspace contract: these account APIs expose current-account state only; the
+multi-account list/switch/remove workflow remains the TUI `/accounts` surface.
+
 ### 1) Check auth state
 
 Request:

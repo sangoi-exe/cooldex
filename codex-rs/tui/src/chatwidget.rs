@@ -4172,6 +4172,8 @@ impl ChatWidget {
                 }
             }
             SlashCommand::Debug => {
+                // Merge anchor: `/debug` reads the cache fed by `EventMsg::RawResponseItem` and
+                // reset on rollback, so availability must follow that exact lifecycle.
                 let Some(latest_raw_response) = self.last_debug_raw_response_item.as_ref() else {
                     self.add_info_message(
                         "`/debug` is unavailable before the first raw response output or right after a rollback."
@@ -6980,6 +6982,8 @@ impl ChatWidget {
             return;
         }
 
+        // Merge anchor: `/accounts` descriptions depend on `AccountSummary` cache semantics from
+        // `AuthManager::list_accounts()` (active flag, exhausted_until, last_rate_limits).
         let accounts = self.auth_manager.list_accounts();
         if accounts.is_empty() {
             self.add_error_message("No ChatGPT accounts found.".to_string());

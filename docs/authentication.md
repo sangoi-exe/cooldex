@@ -27,6 +27,7 @@ When using ChatGPT authentication, `auth.json` (or the keyring entry) stores a *
 - Only **Plus** and **Pro** ChatGPT accounts remain in the saved multi-account store; unsupported plans fail the login instead of being stored and purged later.
 - `codex logout` deletes the stored credentials (removes the `auth.json` file and the keyring entry, if present).
 - In the TUIs, use `/accounts` to switch the active account and add additional accounts. When multiple accounts are stored, `/logout` lets you choose between logging out all accounts or removing a single account (then exits).
+- Keep this aligned with `AuthManager::list_accounts()` and TUI account popups: `/accounts` renders only the summary fields exposed there.
 - This multi-account management surface is currently a TUI feature. App-server account APIs expose the current account and current-account rate limits, not the full list/switch/remove workflow used by `/accounts`.
 
 ## Auto-switch on usage limit

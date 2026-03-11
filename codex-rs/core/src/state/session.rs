@@ -247,6 +247,8 @@ impl SessionState {
     }
 
     pub(crate) fn manage_context_checkpoint(&self) -> SessionStateCheckpoint {
+        // Merge-safety anchor: checkpoint must carry history, rid mapping, and
+        // overlay together so manage_context rollback restores plan/source_id alignment.
         self.assert_history_alignment();
         SessionStateCheckpoint {
             history: self.history.clone(),

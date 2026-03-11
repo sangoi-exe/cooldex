@@ -239,6 +239,8 @@ fn summarize_status_message(message: &str, max_chars: usize) -> String {
 }
 
 fn build_sanitize_prompt(policy: &crate::config::ManageContextPolicy) -> String {
+    // Merge-safety anchor: this runtime policy block must stay aligned with
+    // manage_context v2 validation and core/sanitize_prompt.md contract text.
     format!(
         "{SANITIZE_PROMPT}\n\nRuntime manage_context policy (authoritative):\n- policy_id: {}\n- fixed_point_k: {}\n- stalled_signature_threshold: {}\n- max_chunks_per_apply: {}",
         policy.quality_rubric_id,
@@ -267,6 +269,8 @@ async fn materialize_sanitize_history_if_changed(
     };
     let changed_history = replacement_history.is_some();
     if let Some(replacement_history) = replacement_history {
+        // Merge-safety anchor: persisting replacement_history here defines the
+        // sanitized boundary consumed by recall and resume replay.
         let compacted_item = RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(replacement_history),

@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import { EventEmitter, once } from "node:events";
 import readline from "node:readline";
 
+import { truncateLogText } from "../logger.js";
+
 function createTimeoutError(method, timeoutMs) {
   const error = new Error(`${method} timed out after ${timeoutMs}ms.`);
   error.code = "APP_SERVER_TIMEOUT";
@@ -161,6 +163,8 @@ export class AppServerTransport extends EventEmitter {
   }
 
   async #startInternal() {
+    // Merge anchor: process boot cwd must stay aligned with bridge default-session
+    // cwd semantics used by runtime thread/start and thread/resume checks.
     const child = spawn(this.config.codexCommand, this.config.codexArgs, {
       cwd: this.config.defaultSessionCwd,
       env: process.env,
@@ -203,7 +207,7 @@ export class AppServerTransport extends EventEmitter {
     this.stderrReader.on("line", (line) => {
       this.logger.warn({
         event: "bridge.app_server.stderr",
-        line,
+        line: truncateLogText(line, 320),
       }, "codex app-server stderr");
     });
 

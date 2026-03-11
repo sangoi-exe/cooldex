@@ -199,6 +199,8 @@ pub(crate) enum AppEvent {
     UpdatePersonality(Personality),
 
     /// Open `/accounts`, using cached status data when available.
+    /// Merge anchor: this event starts the app-level refresh flow that must stay
+    /// aligned with `AuthManager::list_accounts()` fields rendered by account popups.
     StartOpenAccountsPopup,
 
     /// Periodic poll to refresh `/accounts` cache when it expires.

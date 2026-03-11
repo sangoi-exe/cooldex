@@ -1,3 +1,5 @@
+// Merge-safety anchor: context source IDs are serialized as `r{rid}` and parsed
+// case-insensitively; manage_context replacement lookups depend on this round-trip.
 pub(crate) fn rid_to_string(rid: u64) -> String {
     format!("r{rid}")
 }

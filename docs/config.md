@@ -49,4 +49,16 @@ Plan preset. The string value `none` means "no reasoning" (an explicit Plan
 override), not "inherit the global default". There is currently no separate
 config value for "follow the global default in Plan mode".
 
+## Agents preemption control
+
+Use `[agents].allow_running_subagent_preemption` to control whether collab
+tools may preempt active sub-agents.
+
+- Default: `true`
+- When set to `false`, `send_input` with `interrupt = true` is rejected for
+  non-final agent statuses.
+- When set to `false`, `close_agent` is rejected for non-final agent statuses.
+- Plain `send_input` without `interrupt` is unchanged, and terminal/final agents
+  can still be closed.
+
 Ctrl+C/Ctrl+D quitting uses a ~1 second double-press hint (`ctrl + c again to quit`).

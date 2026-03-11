@@ -101,6 +101,19 @@ persistence = "none"
         history_no_persistence_cfg.history
     );
 
+    let agents = r#"
+[agents]
+allow_running_subagent_preemption = false
+"#;
+    let agents_cfg =
+        toml::from_str::<ConfigToml>(agents).expect("TOML deserialization should succeed");
+    assert_eq!(
+        agents_cfg
+            .agents
+            .and_then(|parsed_agents| parsed_agents.allow_running_subagent_preemption),
+        Some(false)
+    );
+
     let memories = r#"
 [memories]
 no_memories_if_mcp_or_web_search = true
@@ -2617,6 +2630,7 @@ fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result<()> {
     let cfg = ConfigToml {
         agents: Some(AgentsToml {
             max_threads: None,
+            allow_running_subagent_preemption: None,
             max_depth: None,
             job_max_runtime_seconds: None,
             roles: BTreeMap::from([(
@@ -2642,6 +2656,46 @@ fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result<()> {
     assert!(message.contains("agents.researcher.config_file"));
     assert!(message.contains("must point to an existing file"));
 
+    Ok(())
+}
+
+#[test]
+fn load_config_defaults_allow_running_subagent_preemption_to_true() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml::default(),
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    assert_eq!(
+        config.agent_allow_running_subagent_preemption,
+        DEFAULT_AGENT_ALLOW_RUNNING_SUBAGENT_PREEMPTION
+    );
+    Ok(())
+}
+
+#[test]
+fn load_config_materializes_allow_running_subagent_preemption_from_agents() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg = ConfigToml {
+        agents: Some(AgentsToml {
+            max_threads: None,
+            allow_running_subagent_preemption: Some(false),
+            max_depth: None,
+            job_max_runtime_seconds: None,
+            roles: BTreeMap::new(),
+        }),
+        ..Default::default()
+    };
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    assert!(!config.agent_allow_running_subagent_preemption);
     Ok(())
 }
 
@@ -2696,6 +2750,7 @@ fn load_config_normalizes_agent_role_nickname_candidates() -> std::io::Result<()
     let cfg = ConfigToml {
         agents: Some(AgentsToml {
             max_threads: None,
+            allow_running_subagent_preemption: None,
             max_depth: None,
             job_max_runtime_seconds: None,
             roles: BTreeMap::from([(
@@ -2737,6 +2792,7 @@ fn load_config_rejects_empty_agent_role_nickname_candidates() -> std::io::Result
     let cfg = ConfigToml {
         agents: Some(AgentsToml {
             max_threads: None,
+            allow_running_subagent_preemption: None,
             max_depth: None,
             job_max_runtime_seconds: None,
             roles: BTreeMap::from([(
@@ -2772,6 +2828,7 @@ fn load_config_rejects_duplicate_agent_role_nickname_candidates() -> std::io::Re
     let cfg = ConfigToml {
         agents: Some(AgentsToml {
             max_threads: None,
+            allow_running_subagent_preemption: None,
             max_depth: None,
             job_max_runtime_seconds: None,
             roles: BTreeMap::from([(
@@ -2807,6 +2864,7 @@ fn load_config_rejects_unsafe_agent_role_nickname_candidates() -> std::io::Resul
     let cfg = ConfigToml {
         agents: Some(AgentsToml {
             max_threads: None,
+            allow_running_subagent_preemption: None,
             max_depth: None,
             job_max_runtime_seconds: None,
             roles: BTreeMap::from([(
@@ -3050,6 +3108,8 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             recall_kbytes_limit: DEFAULT_RECALL_KBYTES_LIMIT,
             recall_debug: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+            agent_allow_running_subagent_preemption:
+                DEFAULT_AGENT_ALLOW_RUNNING_SUBAGENT_PREEMPTION,
             manage_context_policy: ManageContextPolicy::default(),
             agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
             agent_roles: BTreeMap::new(),
@@ -3190,6 +3250,7 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         recall_kbytes_limit: DEFAULT_RECALL_KBYTES_LIMIT,
         recall_debug: None,
         agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+        agent_allow_running_subagent_preemption: DEFAULT_AGENT_ALLOW_RUNNING_SUBAGENT_PREEMPTION,
         manage_context_policy: ManageContextPolicy::default(),
         agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
         agent_roles: BTreeMap::new(),
@@ -3328,6 +3389,7 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         recall_kbytes_limit: DEFAULT_RECALL_KBYTES_LIMIT,
         recall_debug: None,
         agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+        agent_allow_running_subagent_preemption: DEFAULT_AGENT_ALLOW_RUNNING_SUBAGENT_PREEMPTION,
         manage_context_policy: ManageContextPolicy::default(),
         agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
         agent_roles: BTreeMap::new(),
@@ -3452,6 +3514,7 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         recall_kbytes_limit: DEFAULT_RECALL_KBYTES_LIMIT,
         recall_debug: None,
         agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
+        agent_allow_running_subagent_preemption: DEFAULT_AGENT_ALLOW_RUNNING_SUBAGENT_PREEMPTION,
         manage_context_policy: ManageContextPolicy::default(),
         agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
         agent_roles: BTreeMap::new(),

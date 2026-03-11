@@ -4,6 +4,9 @@ use crate::agent::guards::Guards;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::resolve_role_config;
 use crate::agent::status::is_final;
+use crate::contextual_user_message::AGENTS_MD_FRAGMENT;
+use crate::contextual_user_message::ENVIRONMENT_CONTEXT_FRAGMENT;
+use crate::contextual_user_message::SKILL_FRAGMENT;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::find_thread_path_by_id_str;
@@ -14,6 +17,7 @@ use crate::shell_snapshot::ShellSnapshot;
 use crate::state_db;
 use crate::thread_manager::ThreadManagerState;
 use codex_protocol::ThreadId;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
@@ -22,6 +26,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::user_input::UserInput;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -58,6 +63,96 @@ fn agent_nickname_candidates(
         .into_iter()
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn build_forked_subagent_export(
+    parent_rollout_items: Vec<RolloutItem>,
+    parent_spawn_call_id: &str,
+) -> Vec<RolloutItem> {
+    let mut exported_items = parent_rollout_items
+        .into_iter()
+        .filter_map(export_forked_subagent_rollout_item)
+        .collect::<Vec<_>>();
+
+    let mut output =
+        FunctionCallOutputPayload::from_text(FORKED_SPAWN_AGENT_OUTPUT_MESSAGE.to_string());
+    output.success = Some(true);
+    exported_items.push(RolloutItem::ResponseItem(
+        ResponseItem::FunctionCallOutput {
+            call_id: parent_spawn_call_id.to_string(),
+            output,
+        },
+    ));
+
+    exported_items
+}
+
+fn export_forked_subagent_rollout_item(item: RolloutItem) -> Option<RolloutItem> {
+    match item {
+        RolloutItem::ResponseItem(item) => {
+            export_forked_subagent_response_item(item).map(RolloutItem::ResponseItem)
+        }
+        RolloutItem::Compacted(mut compacted) => {
+            compacted.replacement_history = compacted
+                .replacement_history
+                .map(export_forked_subagent_response_items);
+            Some(RolloutItem::Compacted(compacted))
+        }
+        RolloutItem::TurnContext(turn_context) => Some(RolloutItem::TurnContext(
+            export_forked_subagent_turn_context(turn_context),
+        )),
+        RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => Some(item),
+    }
+}
+
+fn export_forked_subagent_response_items(items: Vec<ResponseItem>) -> Vec<ResponseItem> {
+    items
+        .into_iter()
+        .filter_map(export_forked_subagent_response_item)
+        .collect()
+}
+
+fn is_forked_subagent_prompt_fragment(content_item: &ContentItem) -> bool {
+    let ContentItem::InputText { text } = content_item else {
+        return false;
+    };
+
+    AGENTS_MD_FRAGMENT.matches_text(text)
+        || ENVIRONMENT_CONTEXT_FRAGMENT.matches_text(text)
+        || SKILL_FRAGMENT.matches_text(text)
+}
+
+fn export_forked_subagent_response_item(item: ResponseItem) -> Option<ResponseItem> {
+    match item {
+        ResponseItem::Message { role, .. } if role == "developer" => None,
+        ResponseItem::Message {
+            id,
+            role,
+            mut content,
+            end_turn,
+            phase,
+        } if role == "user" => {
+            content.retain(|content_item| !is_forked_subagent_prompt_fragment(content_item));
+            if content.is_empty() {
+                None
+            } else {
+                Some(ResponseItem::Message {
+                    id,
+                    role,
+                    content,
+                    end_turn,
+                    phase,
+                })
+            }
+        }
+        _ => Some(item),
+    }
+}
+
+fn export_forked_subagent_turn_context(mut turn_context: TurnContextItem) -> TurnContextItem {
+    turn_context.user_instructions = None;
+    turn_context.developer_instructions = None;
+    turn_context
 }
 
 /// Control-plane handle for multi-agent operations.
@@ -166,20 +261,12 @@ impl AgentControl {
                                 "parent thread rollout unavailable for fork: {parent_thread_id}"
                             ))
                         })?;
-                    let mut forked_rollout_items =
+                    let forked_rollout_items = build_forked_subagent_export(
                         RolloutRecorder::get_rollout_history(&rollout_path)
                             .await?
-                            .get_rollout_items();
-                    let mut output = FunctionCallOutputPayload::from_text(
-                        FORKED_SPAWN_AGENT_OUTPUT_MESSAGE.to_string(),
+                            .get_rollout_items(),
+                        call_id,
                     );
-                    output.success = Some(true);
-                    forked_rollout_items.push(RolloutItem::ResponseItem(
-                        ResponseItem::FunctionCallOutput {
-                            call_id: call_id.clone(),
-                            output,
-                        },
-                    ));
                     let initial_history = InitialHistory::Forked(forked_rollout_items);
                     state
                         .fork_thread_with_source(
@@ -517,21 +604,32 @@ mod tests {
     use crate::config::Config;
     use crate::config::ConfigBuilder;
     use crate::config_loader::LoaderOverrides;
+    use crate::contextual_user_message::SUBAGENT_NOTIFICATION_CLOSE_TAG;
     use crate::contextual_user_message::SUBAGENT_NOTIFICATION_OPEN_TAG;
+    use crate::contextual_user_message::USER_SHELL_COMMAND_CLOSE_TAG;
+    use crate::contextual_user_message::USER_SHELL_COMMAND_OPEN_TAG;
     use crate::features::Feature;
     use assert_matches::assert_matches;
+    use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
+    use codex_protocol::config_types::Settings;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
+    use codex_protocol::openai_models::ReasoningSummaryConfig;
+    use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
     use codex_protocol::protocol::TurnCompleteEvent;
+    use codex_protocol::protocol::TurnContextItem;
     use codex_protocol::protocol::TurnStartedEvent;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
     use tempfile::TempDir;
     use tokio::time::Duration;
     use tokio::time::sleep;
@@ -566,6 +664,72 @@ mod tests {
             text: text.to_string(),
             text_elements: Vec::new(),
         }]
+    }
+
+    fn user_message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
+    fn developer_message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
+    fn assistant_message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
+    fn test_turn_context_item() -> TurnContextItem {
+        TurnContextItem {
+            turn_id: Some("turn-1".to_string()),
+            trace_id: Some("trace-1".to_string()),
+            cwd: std::path::PathBuf::from("/tmp/project"),
+            current_date: Some("2026-03-10".to_string()),
+            timezone: Some("America/Sao_Paulo".to_string()),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            network: None,
+            model: "gpt-5-codex".to_string(),
+            personality: None,
+            collaboration_mode: Some(CollaborationMode {
+                mode: ModeKind::Default,
+                settings: Settings {
+                    model: "gpt-5-codex".to_string(),
+                    reasoning_effort: None,
+                    developer_instructions: Some("mode instructions".to_string()),
+                },
+            }),
+            realtime_active: Some(false),
+            effort: None,
+            summary: ReasoningSummaryConfig::Auto,
+            user_instructions: Some("user instructions".to_string()),
+            developer_instructions: Some("developer instructions".to_string()),
+            final_output_json_schema: Some(json!({"type":"object"})),
+            truncation_policy: None,
+        }
     }
 
     struct AgentControlHarness {
@@ -619,18 +783,41 @@ mod tests {
         })
     }
 
+    fn response_item_contains_text(item: &ResponseItem, needle: &str) -> bool {
+        match item {
+            ResponseItem::Message { content, .. } => {
+                content.iter().any(|content_item| match content_item {
+                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                        text.contains(needle)
+                    }
+                    ContentItem::InputImage { .. } => false,
+                })
+            }
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => output
+                .text_content()
+                .is_some_and(|text| text.contains(needle)),
+            _ => false,
+        }
+    }
+
     /// Returns true when any message item contains `needle` in a text span.
     fn history_contains_text(history_items: &[ResponseItem], needle: &str) -> bool {
-        history_items.iter().any(|item| {
-            let ResponseItem::Message { content, .. } = item else {
-                return false;
-            };
-            content.iter().any(|content_item| match content_item {
-                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                    text.contains(needle)
-                }
-                ContentItem::InputImage { .. } => false,
-            })
+        history_items
+            .iter()
+            .any(|item| response_item_contains_text(item, needle))
+    }
+
+    fn history_contains_text_from_rollout(history_items: &[RolloutItem], needle: &str) -> bool {
+        history_items.iter().any(|item| match item {
+            RolloutItem::ResponseItem(item) => response_item_contains_text(item, needle),
+            RolloutItem::Compacted(compacted) => compacted
+                .replacement_history
+                .as_ref()
+                .is_some_and(|items| history_contains_text(items, needle)),
+            RolloutItem::TurnContext(_)
+            | RolloutItem::EventMsg(_)
+            | RolloutItem::SessionMeta(_) => false,
         })
     }
 
@@ -959,6 +1146,261 @@ mod tests {
             .into_iter()
             .find(|entry| *entry == expected);
         assert_eq!(captured, Some(expected));
+
+        let _ = harness
+            .control
+            .shutdown_agent(child_thread_id)
+            .await
+            .expect("child shutdown should submit");
+        let _ = parent_thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("parent shutdown should submit");
+    }
+
+    #[test]
+    fn build_forked_subagent_export_excludes_parent_prompt_stack_items() {
+        let exported = build_forked_subagent_export(
+            vec![
+                RolloutItem::ResponseItem(developer_message("parent developer instructions")),
+                RolloutItem::ResponseItem(user_message(
+                    "<environment_context>ctx</environment_context>",
+                )),
+                RolloutItem::ResponseItem(ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![
+                        ContentItem::InputText {
+                            text: "<environment_context>ctx</environment_context>".to_string(),
+                        },
+                        ContentItem::InputText {
+                            text: "keep mixed user context".to_string(),
+                        },
+                    ],
+                    end_turn: None,
+                    phase: None,
+                }),
+                RolloutItem::ResponseItem(user_message(format!(
+                    "{USER_SHELL_COMMAND_OPEN_TAG}echo 42{USER_SHELL_COMMAND_CLOSE_TAG}"
+                ).as_str())),
+                RolloutItem::ResponseItem(user_message(format!(
+                    "{SUBAGENT_NOTIFICATION_OPEN_TAG}{{\"agent_id\":\"a\",\"status\":\"completed\"}}{SUBAGENT_NOTIFICATION_CLOSE_TAG}"
+                ).as_str())),
+                RolloutItem::ResponseItem(user_message("keep user context")),
+                RolloutItem::ResponseItem(assistant_message("keep assistant context")),
+                RolloutItem::TurnContext(test_turn_context_item()),
+                RolloutItem::Compacted(CompactedItem {
+                    message: "compacted".to_string(),
+                    replacement_history: Some(vec![
+                        developer_message("nested developer instructions"),
+                        ResponseItem::Message {
+                            id: None,
+                            role: "user".to_string(),
+                            content: vec![
+                                ContentItem::InputText {
+                                    text: "<skill>\n<name>demo</name>\n<path>x</path>\nbody\n</skill>"
+                                        .to_string(),
+                                },
+                                ContentItem::InputText {
+                                    text: "nested keep mixed user context".to_string(),
+                                },
+                            ],
+                            end_turn: None,
+                            phase: None,
+                        },
+                        user_message(format!(
+                            "{USER_SHELL_COMMAND_OPEN_TAG}git status{USER_SHELL_COMMAND_CLOSE_TAG}"
+                        ).as_str()),
+                        assistant_message("nested assistant context"),
+                    ]),
+                }),
+            ],
+            "spawn-call-1",
+        );
+
+        assert!(!history_contains_text_from_rollout(
+            &exported,
+            "parent developer instructions"
+        ));
+        assert!(!history_contains_text_from_rollout(
+            &exported,
+            "<environment_context>ctx</environment_context>"
+        ));
+        assert!(history_contains_text_from_rollout(
+            &exported,
+            "keep user context"
+        ));
+        assert!(history_contains_text_from_rollout(
+            &exported,
+            "keep mixed user context"
+        ));
+        assert!(history_contains_text_from_rollout(
+            &exported,
+            USER_SHELL_COMMAND_OPEN_TAG
+        ));
+        assert!(history_contains_text_from_rollout(
+            &exported,
+            SUBAGENT_NOTIFICATION_OPEN_TAG
+        ));
+        assert!(history_contains_text_from_rollout(
+            &exported,
+            "keep assistant context"
+        ));
+        assert!(history_contains_text_from_rollout(
+            &exported,
+            FORKED_SPAWN_AGENT_OUTPUT_MESSAGE
+        ));
+
+        let exported_turn_context = exported.iter().find_map(|item| match item {
+            RolloutItem::TurnContext(turn_context) => Some(turn_context),
+            _ => None,
+        });
+        let exported_turn_context =
+            exported_turn_context.expect("fork export should preserve turn context");
+        assert_eq!(
+            exported_turn_context.collaboration_mode,
+            test_turn_context_item().collaboration_mode
+        );
+        assert_eq!(exported_turn_context.user_instructions, None);
+        assert_eq!(exported_turn_context.developer_instructions, None);
+        assert_eq!(
+            exported_turn_context.final_output_json_schema,
+            test_turn_context_item().final_output_json_schema
+        );
+
+        let replacement_history = exported.iter().find_map(|item| match item {
+            RolloutItem::Compacted(compacted) => compacted.replacement_history.as_ref(),
+            _ => None,
+        });
+        let replacement_history =
+            replacement_history.expect("fork export should preserve replacement history");
+        assert!(!history_contains_text(
+            replacement_history,
+            "nested developer instructions"
+        ));
+        assert!(!history_contains_text(
+            replacement_history,
+            "<skill>\n<name>demo</name>\n<path>x</path>\nbody\n</skill>"
+        ));
+        assert!(history_contains_text(
+            replacement_history,
+            "nested keep mixed user context"
+        ));
+        assert!(history_contains_text(
+            replacement_history,
+            "nested assistant context"
+        ));
+        assert!(history_contains_text(
+            replacement_history,
+            USER_SHELL_COMMAND_OPEN_TAG
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_fork_excludes_parent_prompt_stack_items() {
+        let harness = AgentControlHarness::new().await;
+        let (parent_thread_id, parent_thread) = harness.start_thread().await;
+        let turn_context = parent_thread.codex.session.new_default_turn().await;
+        let parent_shell_wrapper =
+            format!("{USER_SHELL_COMMAND_OPEN_TAG}echo 42{USER_SHELL_COMMAND_CLOSE_TAG}");
+        let parent_subagent_notification = format!(
+            "{SUBAGENT_NOTIFICATION_OPEN_TAG}{{\"agent_id\":\"a\",\"status\":\"completed\"}}{SUBAGENT_NOTIFICATION_CLOSE_TAG}"
+        );
+        parent_thread
+            .codex
+            .session
+            .record_conversation_items(
+                turn_context.as_ref(),
+                &[
+                    developer_message("parent developer instructions"),
+                    user_message("<environment_context>ctx</environment_context>"),
+                    ResponseItem::Message {
+                        id: None,
+                        role: "user".to_string(),
+                        content: vec![
+                            ContentItem::InputText {
+                                text: "<environment_context>ctx</environment_context>".to_string(),
+                            },
+                            ContentItem::InputText {
+                                text: "parent mixed user context".to_string(),
+                            },
+                        ],
+                        end_turn: None,
+                        phase: None,
+                    },
+                    user_message(&parent_shell_wrapper),
+                    user_message(&parent_subagent_notification),
+                    assistant_message("parent assistant context"),
+                ],
+            )
+            .await;
+        let parent_spawn_call_id = "spawn-call-filtered".to_string();
+        let parent_spawn_call = ResponseItem::FunctionCall {
+            id: None,
+            name: "spawn_agent".to_string(),
+            arguments: "{}".to_string(),
+            call_id: parent_spawn_call_id.clone(),
+        };
+        parent_thread
+            .codex
+            .session
+            .record_conversation_items(turn_context.as_ref(), &[parent_spawn_call])
+            .await;
+        parent_thread
+            .codex
+            .session
+            .ensure_rollout_materialized()
+            .await;
+        parent_thread.codex.session.flush_rollout().await;
+
+        let child_thread_id = harness
+            .control
+            .spawn_agent_with_options(
+                harness.config.clone(),
+                text_input("child task"),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth: 1,
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+                SpawnAgentOptions {
+                    fork_parent_spawn_call_id: Some(parent_spawn_call_id),
+                },
+            )
+            .await
+            .expect("forked spawn should succeed");
+
+        let child_thread = harness
+            .manager
+            .get_thread(child_thread_id)
+            .await
+            .expect("child thread should be registered");
+        let history = child_thread.codex.session.clone_history().await;
+        assert!(!history_contains_text(
+            history.raw_items(),
+            "parent developer instructions"
+        ));
+        assert!(!history_contains_text(
+            history.raw_items(),
+            "<environment_context>ctx</environment_context>"
+        ));
+        assert!(history_contains_text(
+            history.raw_items(),
+            "parent mixed user context"
+        ));
+        assert!(history_contains_text(
+            history.raw_items(),
+            "parent assistant context"
+        ));
+        assert!(history_contains_text(
+            history.raw_items(),
+            &parent_shell_wrapper
+        ));
+        assert!(history_contains_text(
+            history.raw_items(),
+            &parent_subagent_notification
+        ));
 
         let _ = harness
             .control

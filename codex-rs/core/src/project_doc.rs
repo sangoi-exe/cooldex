@@ -126,6 +126,8 @@ pub(crate) async fn get_user_instructions(
         output.push_str(&skills_section);
     }
 
+    // Merge-safety anchor: lead threads may append ChildAgentsMd guidance here,
+    // while child threads explicitly disable this feature in multi_agents.rs.
     if config.features.enabled(Feature::ChildAgentsMd) {
         if !output.is_empty() {
             output.push_str("\n\n");

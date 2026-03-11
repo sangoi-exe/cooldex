@@ -28,8 +28,13 @@ export function createAppServerClient({ config, logger }) {
     respondError(id, error) {
       transport.respondError(id, error);
     },
+    // Merge anchor: runtime session flow depends on these exact app-server RPC
+    // methods (`thread/start` -> `thread/resume` -> `turn/start`).
     threadStart(params) {
       return transport.request("thread/start", params);
+    },
+    threadResume(params) {
+      return transport.request("thread/resume", params);
     },
     turnStart(params) {
       return transport.request("turn/start", params);

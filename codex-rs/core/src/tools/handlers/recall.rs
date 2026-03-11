@@ -173,6 +173,8 @@ fn build_recall_payload(
         .rev()
         .find_map(|(index, item)| matches!(item, RolloutItem::Compacted(_)).then_some(index))
     else {
+        // Merge-safety anchor: "no_compaction_marker" drives the fail-loud
+        // recall-first recovery path after auto-compaction warnings.
         let message = if parse_errors == 0 {
             "current session rollout has no compacted marker".to_string()
         } else {
@@ -186,6 +188,8 @@ fn build_recall_payload(
     let last_boundary = previous_recall_boundary_before(rollout_items, latest_compacted_index);
     let start_index = last_boundary.map_or(0, |boundary| boundary.index.saturating_add(1));
 
+    // Merge-safety anchor: replacement-history boundaries must hydrate stored
+    // sanitized history before appending newer rollout items.
     let mut matching_items = last_boundary
         .filter(|boundary| {
             matches!(

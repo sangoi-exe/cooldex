@@ -36,6 +36,10 @@
         "$ref": "#/definitions/AgentRoleToml"
       },
       "properties": {
+        "allow_running_subagent_preemption": {
+          "description": "Whether collab tools may interrupt or close active sub-agents. Defaults to `true`.",
+          "type": "boolean"
+        },
         "job_max_runtime_seconds": {
           "description": "Default maximum runtime in seconds for agent job workers.",
           "format": "uint64",

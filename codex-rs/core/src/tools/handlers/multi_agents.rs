@@ -277,6 +277,17 @@ mod send_input {
             .await
             .unwrap_or((None, None));
         if args.interrupt {
+            let status = session
+                .services
+                .agent_control
+                .get_status(receiver_thread_id)
+                .await;
+            ensure_running_subagent_preemption_allowed(
+                turn.config.as_ref(),
+                "interrupt",
+                receiver_thread_id,
+                &status,
+            )?;
             session
                 .services
                 .agent_control
@@ -742,16 +753,21 @@ pub mod close_agent {
                 return Err(collab_agent_error(agent_id, err));
             }
         };
-        let result = if !matches!(status, AgentStatus::Shutdown) {
-            session
+        let result = match ensure_running_subagent_preemption_allowed(
+            turn.config.as_ref(),
+            "close",
+            agent_id,
+            &status,
+        ) {
+            Ok(()) if !matches!(status, AgentStatus::Shutdown) => session
                 .services
                 .agent_control
                 .shutdown_agent(agent_id)
                 .await
                 .map_err(|err| collab_agent_error(agent_id, err))
-                .map(|_| ())
-        } else {
-            Ok(())
+                .map(|_| ()),
+            Ok(()) => Ok(()),
+            Err(err) => Err(err),
         };
         session
             .send_event(
@@ -783,6 +799,21 @@ pub mod close_agent {
 fn agent_id(id: &str) -> Result<ThreadId, FunctionCallError> {
     ThreadId::from_string(id)
         .map_err(|e| FunctionCallError::RespondToModel(format!("invalid agent id {id}: {e:?}")))
+}
+
+fn ensure_running_subagent_preemption_allowed(
+    config: &Config,
+    action: &str,
+    target_agent_id: ThreadId,
+    status: &AgentStatus,
+) -> Result<(), FunctionCallError> {
+    if config.agent_allow_running_subagent_preemption || crate::agent::status::is_final(status) {
+        return Ok(());
+    }
+
+    Err(FunctionCallError::RespondToModel(format!(
+        "agents.allow_running_subagent_preemption=false blocks {action} for active agent {target_agent_id} with status {status:?}"
+    )))
 }
 
 async fn collect_current_agent_states(
@@ -952,6 +983,8 @@ pub(crate) fn build_agent_spawn_config(
 ) -> Result<Config, FunctionCallError> {
     let mut config = build_agent_shared_config(turn)?;
     let subagent_instructions = config.subagent_base_instructions.clone();
+    // Merge-safety anchor: child base instructions are sourced only here; lead
+    // developer/user/project-doc channels are stripped in build_agent_shared_config.
     config.base_instructions =
         Some(subagent_instructions.unwrap_or_else(|| base_instructions.text.clone()));
     Ok(config)
@@ -963,7 +996,8 @@ fn build_agent_resume_config(
 ) -> Result<Config, FunctionCallError> {
     let mut config = build_agent_shared_config(turn)?;
     apply_spawn_agent_overrides(&mut config, child_depth);
-    // For resume, keep base instructions sourced from rollout/session metadata.
+    // Merge-safety anchor: resume keeps base instructions sourced from
+    // rollout/session metadata instead of reusing parent prompt channels.
     config.base_instructions = None;
     Ok(config)
 }
@@ -1124,6 +1158,16 @@ mod tests {
         ToolPayload::Function {
             arguments: args.to_string(),
         }
+    }
+
+    fn with_running_subagent_preemption(
+        mut turn: TurnContext,
+        allow_running_subagent_preemption: bool,
+    ) -> TurnContext {
+        let mut config = (*turn.config).clone();
+        config.agent_allow_running_subagent_preemption = allow_running_subagent_preemption;
+        turn.config = Arc::new(config);
+        turn
     }
 
     fn thread_manager() -> ThreadManager {
@@ -1706,6 +1750,148 @@ mod tests {
             .submit(Op::Shutdown {})
             .await
             .expect("shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn send_input_interrupt_rejects_active_agent_when_preemption_disabled() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let thread = manager.start_thread(config).await.expect("start thread");
+        let agent_id = thread.thread_id;
+        let turn = with_running_subagent_preemption(turn, false);
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "send_input",
+            function_payload(json!({
+                "id": agent_id.to_string(),
+                "message": "hi",
+                "interrupt": true
+            })),
+        );
+
+        let Err(err) = MultiAgentHandler.handle(invocation).await else {
+            panic!("interrupt should be rejected when preemption is disabled");
+        };
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("expected respond-to-model error");
+        };
+        assert!(message.contains("agents.allow_running_subagent_preemption"));
+        assert!(message.contains("interrupt"));
+        assert!(message.contains(&agent_id.to_string()));
+        assert!(message.contains("status"));
+
+        let submitted_any = manager.captured_ops().iter().any(|(id, _)| *id == agent_id);
+        assert!(!submitted_any);
+
+        let _ = thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn send_input_without_interrupt_is_unchanged_when_preemption_disabled() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let thread = manager.start_thread(config).await.expect("start thread");
+        let agent_id = thread.thread_id;
+        let turn = with_running_subagent_preemption(turn, false);
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "send_input",
+            function_payload(json!({
+                "id": agent_id.to_string(),
+                "message": "hi"
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("send_input should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: serde_json::Value =
+            serde_json::from_str(&content).expect("send_input result should be json");
+        let submission_id = result
+            .get("submission_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(!submission_id.is_empty());
+        assert_eq!(success, Some(true));
+
+        let ops = manager.captured_ops();
+        let ops_for_agent: Vec<&Op> = ops
+            .iter()
+            .filter_map(|(id, op)| (*id == agent_id).then_some(op))
+            .collect();
+        assert_eq!(ops_for_agent.len(), 1);
+        assert!(matches!(ops_for_agent[0], Op::UserInput { .. }));
+
+        let _ = thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn preemption_guard_rejects_pending_init_and_running_statuses_when_disabled() {
+        let (_session, turn) = make_session_and_context().await;
+        let turn = with_running_subagent_preemption(turn, false);
+        let agent_id = ThreadId::new();
+
+        for (action, status) in [
+            ("interrupt", AgentStatus::PendingInit),
+            ("close", AgentStatus::Running),
+        ] {
+            let err = ensure_running_subagent_preemption_allowed(
+                turn.config.as_ref(),
+                action,
+                agent_id,
+                &status,
+            )
+            .expect_err("active status should be rejected");
+            let FunctionCallError::RespondToModel(message) = err else {
+                panic!("expected respond-to-model error");
+            };
+            assert!(message.contains("agents.allow_running_subagent_preemption"));
+            assert!(message.contains(action));
+            assert!(message.contains(&agent_id.to_string()));
+            assert!(message.contains(&format!("{status:?}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn preemption_guard_allows_completed_and_errored_statuses_when_disabled() {
+        let (_session, turn) = make_session_and_context().await;
+        let turn = with_running_subagent_preemption(turn, false);
+        let agent_id = ThreadId::new();
+
+        for status in [
+            AgentStatus::Completed(Some("done".to_string())),
+            AgentStatus::Errored("boom".to_string()),
+        ] {
+            ensure_running_subagent_preemption_allowed(
+                turn.config.as_ref(),
+                "close",
+                agent_id,
+                &status,
+            )
+            .expect("final status should be allowed");
+        }
     }
 
     #[tokio::test]
@@ -2353,6 +2539,94 @@ mod tests {
 
         let status_after = manager.agent_control().get_status(agent_id).await;
         assert_eq!(status_after, AgentStatus::NotFound);
+    }
+
+    #[tokio::test]
+    async fn close_agent_rejects_active_agent_when_preemption_disabled() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let thread = manager.start_thread(config).await.expect("start thread");
+        let agent_id = thread.thread_id;
+        let turn = with_running_subagent_preemption(turn, false);
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "close_agent",
+            function_payload(json!({"id": agent_id.to_string()})),
+        );
+
+        let Err(err) = MultiAgentHandler.handle(invocation).await else {
+            panic!("close_agent should be rejected for active agent");
+        };
+        let FunctionCallError::RespondToModel(message) = err else {
+            panic!("expected respond-to-model error");
+        };
+        assert!(message.contains("agents.allow_running_subagent_preemption"));
+        assert!(message.contains("close"));
+        assert!(message.contains(&agent_id.to_string()));
+        assert!(message.contains("status"));
+
+        let submitted_shutdown = manager
+            .captured_ops()
+            .iter()
+            .any(|(id, op)| *id == agent_id && matches!(op, Op::Shutdown));
+        assert!(!submitted_shutdown);
+
+        let _ = thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn close_agent_allows_terminal_agent_when_preemption_disabled() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let thread = manager.start_thread(config).await.expect("start thread");
+        let agent_id = thread.thread_id;
+        let mut status_rx = manager
+            .agent_control()
+            .subscribe_status(agent_id)
+            .await
+            .expect("subscribe should succeed");
+
+        let _ = thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("shutdown should submit");
+        let _ = timeout(Duration::from_secs(1), status_rx.changed())
+            .await
+            .expect("shutdown status should arrive");
+
+        let turn = with_running_subagent_preemption(turn, false);
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "close_agent",
+            function_payload(json!({"id": agent_id.to_string()})),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("close_agent should allow terminal agent");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: close_agent::CloseAgentResult =
+            serde_json::from_str(&content).expect("close_agent result should be json");
+        assert_eq!(result.status, AgentStatus::Shutdown);
+        assert_eq!(success, Some(true));
     }
 
     #[tokio::test]

@@ -3,10 +3,14 @@ import { realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 
 import { createAppServerClient } from "../app-server/client.js";
+import { truncateLogText } from "../logger.js";
 import { createBridgeStore } from "./store.js";
 
 const MAX_SESSION_LIST_LIMIT = 200;
 const MAX_SESSION_POLL_LIMIT = 500;
+const MAX_PERSISTED_TOOL_TEXT_CHARS = 512;
+const MAX_TOOL_TRANSCRIPT_LINE_CHARS = 240;
+const MAX_TOOL_TRANSCRIPT_ITEM_CHARS = 4096;
 
 function nowMilliseconds() {
   return Date.now();
@@ -18,6 +22,103 @@ function normalizeTranscriptText(value) {
   }
   const normalized = value.replace(/\r\n/g, "\n");
   return normalized.length > 0 ? normalized : null;
+}
+
+function extractResponseConfigPath(response) {
+  if (typeof response?.configPath === "string") {
+    return response.configPath;
+  }
+  if (typeof response?.thread?.configPath === "string") {
+    return response.thread.configPath;
+  }
+  return null;
+}
+
+function extractResponseCwd(response) {
+  if (typeof response?.cwd === "string") {
+    return response.cwd;
+  }
+  if (typeof response?.thread?.cwd === "string") {
+    return response.thread.cwd;
+  }
+  return null;
+}
+
+function cloneBridgeParams(params) {
+  if (params === null || params === undefined) {
+    return {};
+  }
+  return structuredClone(params);
+}
+
+function truncatePersistedToolItem(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) {
+    return;
+  }
+
+  switch (item.type) {
+    case "commandExecution":
+      item.aggregatedOutput = truncateLogText(item.aggregatedOutput, MAX_PERSISTED_TOOL_TEXT_CHARS);
+      if (typeof item.result === "string") {
+        item.result = truncateLogText(item.result, MAX_PERSISTED_TOOL_TEXT_CHARS);
+      }
+      if (typeof item.error === "string") {
+        item.error = truncateLogText(item.error, MAX_PERSISTED_TOOL_TEXT_CHARS);
+      }
+      break;
+    case "fileChange":
+      if (Array.isArray(item.changes)) {
+        for (const change of item.changes) {
+          if (!change || typeof change !== "object" || Array.isArray(change)) {
+            continue;
+          }
+          change.diff = truncateLogText(change.diff, MAX_PERSISTED_TOOL_TEXT_CHARS);
+        }
+      }
+      if (typeof item.error === "string") {
+        item.error = truncateLogText(item.error, MAX_PERSISTED_TOOL_TEXT_CHARS);
+      }
+      break;
+    case "mcpToolCall":
+      if (typeof item.result === "string") {
+        item.result = truncateLogText(item.result, MAX_PERSISTED_TOOL_TEXT_CHARS);
+      }
+      if (typeof item.error === "string") {
+        item.error = truncateLogText(item.error, MAX_PERSISTED_TOOL_TEXT_CHARS);
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+function createPersistedPayload(message) {
+  // Merge anchor: truncation here must stay aligned with README transcript/persistence
+  // guarantees and with store-side payload readers.
+  const payload = {
+    method: message.method,
+    params: cloneBridgeParams(message.params),
+  };
+  if (!payload.params || typeof payload.params !== "object" || Array.isArray(payload.params)) {
+    return payload;
+  }
+
+  switch (message.method) {
+    case "item/commandExecution/outputDelta":
+    case "item/fileChange/outputDelta":
+      payload.params.delta = truncateLogText(payload.params.delta, MAX_PERSISTED_TOOL_TEXT_CHARS);
+      break;
+    case "item/mcpToolCall/progress":
+      payload.params.message = truncateLogText(payload.params.message, MAX_PERSISTED_TOOL_TEXT_CHARS);
+      break;
+    case "item/completed":
+      truncatePersistedToolItem(payload.params.item);
+      break;
+    default:
+      break;
+  }
+
+  return payload;
 }
 
 function shortId(value) {
@@ -218,6 +319,8 @@ function createSnapshotResponse(store, session) {
 }
 
 function resolveSessionCwd(requestBody, defaultSessionCwd) {
+  // Merge anchor: `session_create.cwd` semantics are part of the bridge contract
+  // and must stay aligned with README + config default resolution.
   const rawCwd = requestBody?.cwd;
   if (rawCwd === undefined || rawCwd === null) {
     return defaultSessionCwd;
@@ -255,6 +358,130 @@ function resolveSessionCwd(requestBody, defaultSessionCwd) {
   }
 
   return realpathSync(trimmed);
+}
+
+function resolveSessionConfigPath(requestBody, defaultSessionConfigPath) {
+  // Merge anchor: `session_create.configPath` precedence (request -> env default -> null)
+  // is contract behavior shared with docs and resume/start validation.
+  const rawConfigPath = requestBody?.configPath;
+  if (rawConfigPath === undefined || rawConfigPath === null) {
+    return defaultSessionConfigPath;
+  }
+  if (typeof rawConfigPath !== "string") {
+    throw createBridgeRuntimeError(
+      400,
+      "BAD_REQUEST",
+      "session_create configPath must be a string or null.",
+      {
+        configPath: rawConfigPath,
+      },
+    );
+  }
+
+  const trimmed = rawConfigPath.trim();
+  if (trimmed.length === 0) {
+    throw createBridgeRuntimeError(
+      400,
+      "BAD_REQUEST",
+      "session_create configPath must not be empty when provided.",
+      {
+        configPath: rawConfigPath,
+      },
+    );
+  }
+  if (!isAbsolute(trimmed)) {
+    throw createBridgeRuntimeError(
+      400,
+      "BAD_REQUEST",
+      "session_create configPath must be an absolute file path.",
+      {
+        configPath: rawConfigPath,
+      },
+    );
+  }
+
+  let stats;
+  try {
+    stats = statSync(trimmed);
+  } catch {
+    throw createBridgeRuntimeError(
+      400,
+      "BAD_REQUEST",
+      "session_create configPath must point to an existing file.",
+      {
+        configPath: rawConfigPath,
+      },
+    );
+  }
+  if (!stats.isFile()) {
+    throw createBridgeRuntimeError(
+      400,
+      "BAD_REQUEST",
+      "session_create configPath must point to a file.",
+      {
+        configPath: rawConfigPath,
+      },
+    );
+  }
+
+  return realpathSync(trimmed);
+}
+
+function normalizeOptionalSessionOperator(requestBody) {
+  // Merge anchor: operator normalization feeds persisted `session.operator` and
+  // API `SessionSummary.operator`; keep nullability and key derivation stable.
+  const rawOperator = requestBody?.operator;
+  if (rawOperator === undefined || rawOperator === null) {
+    return null;
+  }
+  if (typeof rawOperator !== "object" || Array.isArray(rawOperator)) {
+    throw createBridgeRuntimeError(
+      400,
+      "BAD_REQUEST",
+      "session_create operator must be an object or null.",
+      {
+        operator: rawOperator,
+      },
+    );
+  }
+
+  function readOptionalField(fieldName) {
+    if (!(fieldName in rawOperator)) {
+      return null;
+    }
+    const value = rawOperator[fieldName];
+    if (value === null) {
+      return null;
+    }
+    if (typeof value !== "string") {
+      throw createBridgeRuntimeError(
+        400,
+        "BAD_REQUEST",
+        `session_create operator.${fieldName} must be a string or null.`,
+        {
+          operator: rawOperator,
+        },
+      );
+    }
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  const operator = {
+    userId: readOptionalField("userId"),
+    userEmail: readOptionalField("userEmail"),
+    displayName: readOptionalField("displayName"),
+    key: null,
+  };
+  if (operator.userId && operator.displayName) {
+    const firstName = operator.displayName.split(/\s+/, 1)[0] ?? "";
+    operator.key = firstName.length > 0 ? `${firstName}:${operator.userId}` : null;
+  }
+
+  if (!operator.userId && !operator.userEmail && !operator.displayName) {
+    return null;
+  }
+  return operator;
 }
 
 function extractTranscriptItemType(message) {
@@ -356,10 +583,12 @@ function createUnsupportedServerRequestResponse(serverRequest) {
 }
 
 export function createBridgeRuntime({ config, logger, onFatal }) {
-  const store = createBridgeStore();
+  const store = createBridgeStore({ bridgeStateDbPath: config.bridgeStateDbPath });
   const appServerClient = createAppServerClient({ config, logger });
   const bufferedThreadMessages = new Map();
   const transcriptBuffers = new Map();
+  const toolTranscriptBudgets = new Map();
+  const liveThreadIds = new Set();
   const health = {
     appServerState: "starting",
     lastError: null,
@@ -393,6 +622,56 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
     return `${channel}:${threadId ?? "-"}:${turnId ?? "-"}:${itemId ?? "-"}`;
   }
 
+  function clearToolTranscriptBudget(key) {
+    toolTranscriptBudgets.delete(key);
+  }
+
+  function writeBufferedTranscriptLine(channel, scope, key, line) {
+    if (line.length === 0) {
+      return;
+    }
+    if (channel !== "TOOL") {
+      writeTranscriptLine(channel, scope, line);
+      return;
+    }
+
+    let budget = toolTranscriptBudgets.get(key);
+    if (!budget) {
+      budget = {
+        emittedChars: 0,
+        suppressionWritten: false,
+      };
+      toolTranscriptBudgets.set(key, budget);
+    }
+
+    if (budget.emittedChars >= MAX_TOOL_TRANSCRIPT_ITEM_CHARS) {
+      if (!budget.suppressionWritten) {
+        writeTranscriptLine(channel, scope, `[additional tool output suppressed after ${MAX_TOOL_TRANSCRIPT_ITEM_CHARS} chars]`);
+        budget.suppressionWritten = true;
+      }
+      return;
+    }
+
+    const truncatedLine = truncateLogText(line, MAX_TOOL_TRANSCRIPT_LINE_CHARS);
+    const remainingChars = MAX_TOOL_TRANSCRIPT_ITEM_CHARS - budget.emittedChars;
+    const emittedLine = truncatedLine.length > remainingChars
+      ? truncateLogText(truncatedLine, remainingChars)
+      : truncatedLine;
+
+    if (emittedLine.length > 0) {
+      writeTranscriptLine(channel, scope, emittedLine);
+      budget.emittedChars += emittedLine.length;
+    }
+
+    if (truncatedLine.length > remainingChars || budget.emittedChars >= MAX_TOOL_TRANSCRIPT_ITEM_CHARS) {
+      budget.emittedChars = MAX_TOOL_TRANSCRIPT_ITEM_CHARS;
+      if (!budget.suppressionWritten) {
+        writeTranscriptLine(channel, scope, `[additional tool output suppressed after ${MAX_TOOL_TRANSCRIPT_ITEM_CHARS} chars]`);
+        budget.suppressionWritten = true;
+      }
+    }
+  }
+
   function appendTranscriptDelta(channel, threadId, turnId, itemId, text) {
     if (!config.bridgeDebugTranscript) {
       return;
@@ -411,7 +690,7 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
       const newlineIndex = buffer.indexOf("\n");
       const line = buffer.slice(0, newlineIndex);
       if (line.length > 0) {
-        writeTranscriptLine(channel, scope, line);
+        writeBufferedTranscriptLine(channel, scope, key, line);
       }
       buffer = buffer.slice(newlineIndex + 1);
     }
@@ -428,10 +707,16 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
     const key = createTranscriptBufferKey(channel, threadId, turnId, itemId);
     const pending = transcriptBuffers.get(key);
     if (!pending) {
+      if (channel === "TOOL") {
+        clearToolTranscriptBudget(key);
+      }
       return false;
     }
     transcriptBuffers.delete(key);
-    writeTranscriptLine(channel, createTranscriptScope({ threadId, turnId, itemId }), pending);
+    writeBufferedTranscriptLine(channel, createTranscriptScope({ threadId, turnId, itemId }), key, pending);
+    if (channel === "TOOL") {
+      clearToolTranscriptBudget(key);
+    }
     return true;
   }
 
@@ -514,16 +799,18 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
 
     const turnId = extractTurnId(message);
     const itemId = extractItemId(message);
-    const payload = {
-      method: message.method,
-      params: message.params ?? {},
-    };
+    const payload = createPersistedPayload(message);
 
     switch (message.method) {
       case "thread/started":
       case "thread/status/changed":
       case "thread/closed": {
         const status = normalizeSessionStatus(message.params?.thread?.status ?? message.params?.status ?? null);
+        if (message.method === "thread/closed") {
+          liveThreadIds.delete(threadId);
+        } else {
+          liveThreadIds.add(threadId);
+        }
         setSessionStatusByThread(threadId, status);
         writeTranscriptLine(
           "SESSION",
@@ -814,7 +1101,75 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
     processServerRequest(serverRequest);
   }
 
+  async function ensureSessionThreadLoaded(session) {
+    if (liveThreadIds.has(session.threadId)) {
+      return;
+    }
+
+    let threadResumeResponse;
+    try {
+      const params = {
+        threadId: session.threadId,
+        cwd: session.cwd,
+      };
+      if (session.configPath !== null) {
+        params.configPath = session.configPath;
+      }
+      threadResumeResponse = await appServerClient.threadResume(params);
+    } catch (error) {
+      throw mapAppServerError("thread/resume", error);
+    }
+
+    const resumedThreadId = threadResumeResponse?.thread?.id;
+    if (resumedThreadId !== session.threadId) {
+      throw createBridgeRuntimeError(
+        502,
+        "APP_SERVER_INVALID_RESPONSE",
+        "thread/resume response thread id does not match the stored session thread id.",
+        {
+          expectedThreadId: session.threadId,
+          actualThreadId: resumedThreadId ?? null,
+        },
+      );
+    }
+
+    const resumedCwd = extractResponseCwd(threadResumeResponse);
+    if (resumedCwd !== session.cwd) {
+      throw createBridgeRuntimeError(
+        502,
+        "APP_SERVER_INVALID_RESPONSE",
+        "thread/resume response cwd does not match the stored session cwd.",
+        {
+          expectedCwd: session.cwd,
+          actualCwd: resumedCwd,
+        },
+      );
+    }
+
+    const resumedConfigPath = extractResponseConfigPath(threadResumeResponse);
+    if (session.configPath !== null && resumedConfigPath !== session.configPath) {
+      throw createBridgeRuntimeError(
+        502,
+        "APP_SERVER_INVALID_RESPONSE",
+        "thread/resume response configPath does not match the stored session configPath.",
+        {
+          expectedConfigPath: session.configPath,
+          actualConfigPath: resumedConfigPath,
+        },
+      );
+    }
+
+    store.updateSession(session, {
+      status: normalizeSessionStatus(threadResumeResponse?.thread?.status ?? null),
+    });
+    liveThreadIds.add(session.threadId);
+  }
+
   function handleFatal(error) {
+    bufferedThreadMessages.clear();
+    transcriptBuffers.clear();
+    toolTranscriptBudgets.clear();
+    liveThreadIds.clear();
     health.appServerState = "failed";
     health.lastError = {
       code: error.code ?? "APP_SERVER_FATAL",
@@ -829,6 +1184,10 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
 
   return {
     async start() {
+      bufferedThreadMessages.clear();
+      transcriptBuffers.clear();
+      toolTranscriptBudgets.clear();
+      liveThreadIds.clear();
       appServerClient.onNotification(handleNotification);
       appServerClient.onServerRequest(handleServerRequest);
       appServerClient.onFatal(handleFatal);
@@ -837,6 +1196,10 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
       health.lastError = null;
     },
     async stop() {
+      bufferedThreadMessages.clear();
+      transcriptBuffers.clear();
+      toolTranscriptBudgets.clear();
+      liveThreadIds.clear();
       await appServerClient.stop();
       health.appServerState = "stopped";
     },
@@ -875,7 +1238,7 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
 
       const eventPage = store.readSessionEvents(session, { afterCursor, limit });
       if (!eventPage.cursorFound) {
-        throw createQueryValidationError("session_poll cursor was not found in the current in-memory journal.", {
+        throw createQueryValidationError("session_poll cursor was not found in the current bridge journal.", {
           sessionId,
           cursor: afterCursor,
         });
@@ -889,13 +1252,21 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
       };
     },
     async createSession(requestBody) {
+      // Merge anchor: session_create resolves cwd/configPath/operator exactly once;
+      // persisted values here are the source of truth for later send/resume calls.
       const cwd = resolveSessionCwd(requestBody, config.defaultSessionCwd);
+      const resolvedConfigPath = resolveSessionConfigPath(requestBody, config.defaultSessionConfigPath);
+      const operator = normalizeOptionalSessionOperator(requestBody);
       let threadStartResponse;
       try {
-        threadStartResponse = await appServerClient.threadStart({
+        const params = {
           cwd,
           ephemeral: false,
-        });
+        };
+        if (resolvedConfigPath !== null) {
+          params.configPath = resolvedConfigPath;
+        }
+        threadStartResponse = await appServerClient.threadStart(params);
       } catch (error) {
         throw mapAppServerError("thread/start", error);
       }
@@ -908,14 +1279,27 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
           threadStartResponse ?? null,
         );
       }
-      if (threadStartResponse?.thread?.cwd !== cwd) {
+      const responseCwd = extractResponseCwd(threadStartResponse);
+      if (responseCwd !== cwd) {
         throw createBridgeRuntimeError(
           502,
           "APP_SERVER_INVALID_RESPONSE",
           "thread/start response cwd does not match the resolved session cwd.",
           {
             expectedCwd: cwd,
-            actualCwd: threadStartResponse?.thread?.cwd ?? null,
+            actualCwd: responseCwd,
+          },
+        );
+      }
+      const responseConfigPath = extractResponseConfigPath(threadStartResponse);
+      if (resolvedConfigPath !== null && responseConfigPath !== resolvedConfigPath) {
+        throw createBridgeRuntimeError(
+          502,
+          "APP_SERVER_INVALID_RESPONSE",
+          "thread/start response configPath does not match the resolved session configPath.",
+          {
+            expectedConfigPath: resolvedConfigPath,
+            actualConfigPath: responseConfigPath,
           },
         );
       }
@@ -923,10 +1307,17 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
       const title = typeof requestBody?.title === "string" && requestBody.title.trim().length > 0
         ? requestBody.title.trim()
         : null;
-      const session = store.createSession({ title, threadId, cwd });
+      const session = store.createSession({
+        title,
+        operator,
+        threadId,
+        cwd,
+        configPath: resolvedConfigPath === null ? null : responseConfigPath,
+      });
       store.updateSession(session, {
         status: normalizeSessionStatus(threadStartResponse?.thread?.status ?? null),
       });
+      liveThreadIds.add(threadId);
       flushBufferedThreadMessages(threadId);
 
       return createSnapshotResponse(store, session);
@@ -937,13 +1328,12 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
         throw createBridgeRuntimeError(404, "SESSION_NOT_FOUND", `Unknown sessionId ${sessionId}.`);
       }
 
+      // Merge anchor: `message_send` intentionally reuses persisted session cwd/configPath
+      // and fails loud when they are missing or malformed.
       const text = typeof requestBody?.text === "string" ? requestBody.text.trim() : "";
       if (text.length === 0) {
         throw createBridgeRuntimeError(400, "BAD_REQUEST", "message_send requires a non-empty text field.");
       }
-
-      writeTranscriptText("USER", createTranscriptScope({ threadId: session.threadId }), text);
-
       if (typeof session.cwd !== "string" || session.cwd.length === 0) {
         throw createBridgeRuntimeError(
           500,
@@ -951,10 +1341,28 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
           `Session ${sessionId} is missing a resolved cwd.`,
         );
       }
+      if (!Object.hasOwn(session, "configPath")) {
+        throw createBridgeRuntimeError(
+          500,
+          "SESSION_INVALID",
+          `Session ${sessionId} is missing a resolved configPath.`,
+        );
+      }
+      if (session.configPath !== null && (typeof session.configPath !== "string" || session.configPath.length === 0)) {
+        throw createBridgeRuntimeError(
+          500,
+          "SESSION_INVALID",
+          `Session ${sessionId} has an invalid resolved configPath value.`,
+          {
+            configPath: session.configPath,
+          },
+        );
+      }
 
+      await ensureSessionThreadLoaded(session);
       let turnStartResponse;
       try {
-        turnStartResponse = await appServerClient.turnStart({
+        const params = {
           cwd: session.cwd,
           threadId: session.threadId,
           input: [
@@ -964,11 +1372,13 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
               textElements: [],
             },
           ],
-        });
+        };
+        turnStartResponse = await appServerClient.turnStart(params);
       } catch (error) {
         throw mapAppServerError("turn/start", error);
       }
 
+      writeTranscriptText("USER", createTranscriptScope({ threadId: session.threadId }), text);
       store.updateSession(session, {
         lastMessagePreview: text,
         status: "running",

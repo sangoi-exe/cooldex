@@ -2235,6 +2235,8 @@ impl AuthManager {
     }
 }
 
+/// Merge anchor: `/accounts` and `/logout` render this exact summary from
+/// `AuthManager::list_accounts`; keep field semantics aligned with TUI account flows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountSummary {
     pub id: String,

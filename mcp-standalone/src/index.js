@@ -48,12 +48,17 @@ async function main() {
 
   const app = createApp({ config, logger, bridgeRuntime });
   server = app.listen(config.port, () => {
+    // Merge anchor: startup log fields must stay aligned with `/healthz` and
+    // config defaults so operator diagnostics stay consistent.
     logger.info(
       {
         event: "bridge.runtime.ready",
         port: config.port,
         bridgeBasePath: config.bridgeBasePath,
         codexCommand: config.codexCommand,
+        defaultSessionCwd: config.defaultSessionCwd,
+        defaultSessionConfigPath: config.defaultSessionConfigPath,
+        bridgeStateDbPath: config.bridgeStateDbPath,
       },
       "standalone bridge runtime slice ready",
     );
