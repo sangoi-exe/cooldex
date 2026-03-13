@@ -169,7 +169,7 @@ async fn handle_retrieve(
     turn: &TurnContext,
     args: &ManageContextToolArgs,
 ) -> Result<ManageContextResult, FunctionCallError> {
-    // Merge-safety anchor: `/sanitize` and docs/manage_context*.md depend on
+    // Merge-safety anchor: `/sanitize` and `~/.codex/manage_context*.md` depend on
     // retrieve rejecting apply-only fields instead of silently ignoring them.
     if args.plan_id.is_some() || args.state_hash.is_some() || args.chunk_summaries.is_some() {
         return Err(contract_error(

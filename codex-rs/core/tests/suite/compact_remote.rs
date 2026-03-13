@@ -97,6 +97,57 @@ fn format_labeled_requests_snapshot(
     )
 }
 
+fn count_message_text_occurrences(request: &responses::ResponsesRequest, needle: &str) -> usize {
+    request
+        .message_input_text_groups("developer")
+        .into_iter()
+        .chain(request.message_input_text_groups("user"))
+        .flatten()
+        .filter(|text| text.contains(needle))
+        .count()
+}
+
+fn assert_prompt_top_has_canonical_context(request: &responses::ResponsesRequest) {
+    let input = request.input();
+    let developer_item = input.first().expect("expected developer prompt item");
+    assert_eq!(
+        developer_item.get("type").and_then(|value| value.as_str()),
+        Some("message")
+    );
+    assert_eq!(
+        developer_item.get("role").and_then(|value| value.as_str()),
+        Some("developer")
+    );
+    let developer_text = developer_item["content"][0]["text"]
+        .as_str()
+        .expect("developer prompt text");
+    assert!(
+        developer_text.contains("<permissions instructions>"),
+        "expected canonical developer instructions at prompt top"
+    );
+
+    let contextual_user_item = input.get(1).expect("expected contextual user prompt item");
+    assert_eq!(
+        contextual_user_item
+            .get("type")
+            .and_then(|value| value.as_str()),
+        Some("message")
+    );
+    assert_eq!(
+        contextual_user_item
+            .get("role")
+            .and_then(|value| value.as_str()),
+        Some("user")
+    );
+    let contextual_user_text = contextual_user_item["content"][0]["text"]
+        .as_str()
+        .expect("contextual user prompt text");
+    assert!(
+        contextual_user_text.contains("<environment_context>"),
+        "expected canonical contextual user block immediately after developer instructions"
+    );
+}
+
 fn compacted_summary_only_output(summary: &str) -> Vec<ResponseItem> {
     vec![ResponseItem::Compaction {
         encrypted_content: summary_with_prefix(summary),
@@ -303,11 +354,12 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
         !follow_up_body.contains("hello remote compact"),
         "expected follow-up request to drop compacted-away user turns when remote output omits them"
     );
+    assert_prompt_top_has_canonical_context(follow_up_request);
 
     insta::assert_snapshot!(
         "remote_manual_compact_with_history_shapes",
         format_labeled_requests_snapshot(
-            "Remote manual /compact where remote compact output is compaction-only: follow-up layout uses the returned compaction item plus new user message.",
+            "Remote manual /compact where remote compact output is compaction-only: follow-up layout restores canonical prompt-top context before the returned compaction item and new user message.",
             &[
                 ("Remote Compaction Request", &compact_request),
                 ("Remote Post-Compaction History Layout", follow_up_request),
@@ -1458,9 +1510,29 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
 
             if has_compaction_item && has_compacted_assistant_note {
                 assert!(
-                    !has_permissions_developer_message,
-                    "manual remote compact rollout replacement history should not inject permissions context"
+                    has_permissions_developer_message,
+                    "manual remote compact rollout replacement history should persist canonical developer context"
                 );
+                let first_item = replacement_history
+                    .first()
+                    .expect("replacement history should keep canonical developer context first");
+                assert!(matches!(
+                    first_item,
+                    ResponseItem::Message { role, .. } if role == "developer"
+                ));
+                let second_item = replacement_history
+                    .get(1)
+                    .expect("replacement history should keep canonical contextual user second");
+                assert!(matches!(
+                    second_item,
+                    ResponseItem::Message { role, content, .. }
+                        if role == "user"
+                            && content.iter().any(|part| matches!(
+                                part,
+                                ContentItem::InputText { text }
+                                    if text.contains("<environment_context>")
+                            ))
+                ));
                 saw_compacted_history = true;
                 break;
             }
@@ -1775,11 +1847,17 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_sta
     let compact_request = compact_mock.single_request();
     let post_compact_request = &requests[1];
     assert_request_contains_realtime_start(post_compact_request);
+    assert_eq!(
+        post_compact_request.instructions_text(),
+        requests[0].instructions_text(),
+        "remote post-compaction follow-up should preserve the base-instructions lane"
+    );
+    assert_prompt_top_has_canonical_context(post_compact_request);
 
     insta::assert_snapshot!(
         "remote_pre_turn_compaction_restates_realtime_start_shapes",
         format_labeled_requests_snapshot(
-            "Remote pre-turn auto-compaction while realtime remains active: compaction clears the reference baseline, so the follow-up request restates realtime-start instructions.",
+            "Remote pre-turn auto-compaction while realtime remains active: compacted replacement history already carries canonical prompt-top context, so the follow-up request keeps realtime-start instructions without a later baseline repair.",
             &[
                 ("Remote Compaction Request", &compact_request),
                 (
@@ -1863,6 +1941,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end
     let compact_request = compact_mock.single_request();
     let post_compact_request = &requests[1];
     assert_request_contains_realtime_end(post_compact_request);
+    assert_prompt_top_has_canonical_context(post_compact_request);
 
     insta::assert_snapshot!(
         "remote_pre_turn_compaction_restates_realtime_end_shapes",
@@ -1949,11 +2028,12 @@ async fn snapshot_request_shape_remote_manual_compact_restates_realtime_start() 
     let compact_request = compact_mock.single_request();
     let post_compact_request = &requests[1];
     assert_request_contains_realtime_start(post_compact_request);
+    assert_prompt_top_has_canonical_context(post_compact_request);
 
     insta::assert_snapshot!(
         "remote_manual_compact_restates_realtime_start_shapes",
         format_labeled_requests_snapshot(
-            "Remote manual /compact while realtime remains active: the next regular turn restates realtime-start instructions after compaction clears the baseline.",
+            "Remote manual /compact while realtime remains active: compacted replacement history already carries canonical prompt-top context, so the next regular turn keeps realtime-start instructions without clearing the baseline first.",
             &[
                 ("Remote Compaction Request", &compact_request),
                 (
@@ -2157,11 +2237,12 @@ async fn snapshot_request_shape_remote_compact_resume_restates_realtime_end() ->
     let compact_request = compact_mock.single_request();
     let after_resume_request = &requests[1];
     assert_request_contains_realtime_end(after_resume_request);
+    assert_prompt_top_has_canonical_context(after_resume_request);
 
     insta::assert_snapshot!(
         "remote_compact_resume_restates_realtime_end_shapes",
         format_labeled_requests_snapshot(
-            "After remote manual /compact and resume, the first resumed turn rebuilds history from the compaction item and restates realtime-end instructions from reconstructed previous-turn settings.",
+            "After remote manual /compact and resume, the first resumed turn preserves canonical prompt-top context from replacement history and keeps realtime-end instructions from reconstructed previous-turn settings.",
             &[
                 ("Remote Compaction Request", &compact_request),
                 ("Remote Post-Resume History Layout", after_resume_request),
@@ -2174,8 +2255,7 @@ async fn snapshot_request_shape_remote_compact_resume_restates_realtime_end() ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// TODO(ccunningham): Update once remote pre-turn compaction includes incoming user input.
-async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_user_message()
+async fn snapshot_request_shape_remote_pre_turn_compaction_excludes_incoming_user_message()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2253,9 +2333,9 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
 
     let compact_request = compact_mock.single_request();
     insta::assert_snapshot!(
-        "remote_pre_turn_compaction_including_incoming_shapes",
+        "remote_pre_turn_compaction_excluding_incoming_shapes",
         format_labeled_requests_snapshot(
-            "Remote pre-turn auto-compaction with a context override emits the context diff in the compact request while excluding the incoming user message.",
+            "Remote pre-turn auto-compaction with a context override emits the context diff in the compact request while excluding the incoming user message, and the follow-up request restores canonical prompt-top context before the compacted history.",
             &[
                 ("Remote Compaction Request", &compact_request),
                 ("Remote Post-Compaction History Layout", &requests[2]),
@@ -2271,6 +2351,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
         1,
         "post-compaction request should contain incoming user exactly once from runtime append"
     );
+    assert_prompt_top_has_canonical_context(&requests[2]);
 
     Ok(())
 }
@@ -2393,11 +2474,22 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
         follow_up_body.contains("<model_switch>"),
         "post-compaction follow-up should include the model-switch update item"
     );
+    assert_eq!(
+        count_message_text_occurrences(&post_compact_turn_request, "<model_switch>"),
+        1,
+        "post-compaction follow-up should contain the model-switch instruction exactly once"
+    );
+    assert_eq!(
+        post_compact_turn_request.instructions_text(),
+        initial_turn_request.instructions_text(),
+        "remote post-compaction follow-up should preserve the base-instructions lane during model switch"
+    );
+    assert_prompt_top_has_canonical_context(&post_compact_turn_request);
 
     insta::assert_snapshot!(
         "remote_pre_turn_compaction_strips_incoming_model_switch_shapes",
         format_labeled_requests_snapshot(
-            "Remote pre-turn compaction during model switch currently excludes incoming user input, strips incoming <model_switch> from the compact request payload, and restores it in the post-compaction follow-up request.",
+            "Remote pre-turn compaction during model switch excludes the incoming user input, strips the incoming <model_switch> tail item from the compact request payload, and restores canonical prompt-top context with a single model-switch instruction in the follow-up request.",
             &[
                 ("Initial Request (Previous Model)", &initial_turn_request),
                 ("Remote Compaction Request", &compact_request),
@@ -2819,6 +2911,7 @@ async fn snapshot_request_shape_remote_manual_compact_without_previous_user_mess
     );
     let compact_request = compact_mock.single_request();
     let follow_up_request = responses_mock.single_request();
+    assert_prompt_top_has_canonical_context(&follow_up_request);
     insta::assert_snapshot!(
         "remote_manual_compact_without_prev_user_shapes",
         format_labeled_requests_snapshot(

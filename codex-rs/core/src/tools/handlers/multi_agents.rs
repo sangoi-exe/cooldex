@@ -24,7 +24,7 @@ use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use async_trait::async_trait;
 use codex_protocol::ThreadId;
-use codex_protocol::models::BaseInstructions;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::protocol::CollabAgentInteractionBeginEvent;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
@@ -164,13 +164,18 @@ mod spawn {
                 .into(),
             )
             .await;
-        let mut config =
-            build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+        let mut config = build_agent_spawn_config(turn.as_ref())?;
         apply_role_to_config(&mut config, role_name)
             .await
             .map_err(FunctionCallError::RespondToModel)?;
         apply_spawn_agent_profile_override(&mut config, profile_name)?;
         apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+        finalize_spawn_agent_prompt_config(
+            &mut config,
+            turn.as_ref(),
+            session.services.models_manager.as_ref(),
+        )
+        .await;
         apply_spawn_agent_overrides(&mut config, child_depth);
 
         let result = session
@@ -977,16 +982,16 @@ fn input_preview(items: &[UserInput]) -> String {
 /// approval policy, sandbox, and cwd. Role-specific overrides are layered after this step;
 /// skipping this helper and cloning stale config state directly can send the child agent out with
 /// the wrong provider or runtime policy.
-pub(crate) fn build_agent_spawn_config(
-    base_instructions: &BaseInstructions,
-    turn: &TurnContext,
-) -> Result<Config, FunctionCallError> {
+pub(crate) fn build_agent_spawn_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
     let mut config = build_agent_shared_config(turn)?;
     let subagent_instructions = config.subagent_base_instructions.clone();
-    // Merge-safety anchor: child base instructions are sourced only here; lead
-    // developer/user/project-doc channels are stripped in build_agent_shared_config.
-    config.base_instructions =
-        Some(subagent_instructions.unwrap_or_else(|| base_instructions.text.clone()));
+    // Merge-safety anchor: seed child base instructions for the no-reload path here. If role or
+    // profile reloads rebuild the config later, `finalize_spawn_agent_prompt_config` recomputes
+    // this same source from the child config that actually ships.
+    config.base_instructions = Some(
+        subagent_instructions
+            .unwrap_or_else(|| turn.model_info.get_model_instructions(turn.personality)),
+    );
     Ok(config)
 }
 
@@ -1009,17 +1014,45 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallE
     config.model_provider = turn.provider.clone();
     config.model_reasoning_effort = turn.reasoning_effort;
     config.model_reasoning_summary = Some(turn.reasoning_summary);
-    // Workspace customization: child agents must not inherit the lead prompt stack.
-    // `subagent_instructions_file` provides the child-only base instructions instead,
-    // while AGENTS/project-doc and lead developer instructions stay isolated.
-    config.developer_instructions = None;
-    config.user_instructions = None;
-    config.project_doc_max_bytes = 0;
-    let _ = config.features.disable(Feature::ChildAgentsMd);
+    strip_child_prompt_inheritance(&mut config);
     config.compact_prompt = turn.compact_prompt.clone();
     apply_spawn_agent_runtime_overrides(&mut config, turn)?;
 
     Ok(config)
+}
+
+fn strip_child_prompt_inheritance(config: &mut Config) {
+    // Workspace customization: child agents must not inherit the lead prompt stack.
+    // `subagent_instructions_file` provides the child-only base instructions instead, while
+    // AGENTS/project-doc and lead developer instructions stay isolated. Re-run this after any
+    // role/profile reload that reconstructs `Config` from persisted layers.
+    config.developer_instructions = None;
+    config.user_instructions = None;
+    config.project_doc_max_bytes = 0;
+    let _ = config.features.disable(Feature::ChildAgentsMd);
+}
+
+async fn finalize_spawn_agent_prompt_config(
+    config: &mut Config,
+    turn: &TurnContext,
+    models_manager: &crate::models_manager::manager::ModelsManager,
+) {
+    // Merge-safety anchor: role/profile reloads rebuild `Config` from persisted layers, which can
+    // repopulate developer instructions, AGENTS/project-doc context, and feature flags. Normalize
+    // the child prompt after the final reload so sub-agents stay isolated from the lead prompt
+    // stack and derive base instructions from the child's final model/personality selection.
+    strip_child_prompt_inheritance(config);
+    let model = config
+        .model
+        .clone()
+        .unwrap_or_else(|| turn.model_info.slug.clone());
+    let model_info = models_manager.get_model_info(model.as_str(), config).await;
+    config.base_instructions = Some(
+        config
+            .subagent_base_instructions
+            .clone()
+            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+    );
 }
 
 fn apply_spawn_agent_profile_override(
@@ -1094,6 +1127,66 @@ fn apply_spawn_agent_runtime_overrides(
         .map_err(|err| {
             FunctionCallError::RespondToModel(format!("sandbox_policy is invalid: {err}"))
         })?;
+    config.permissions.file_system_sandbox_policy =
+        crate::config::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
+    config.permissions.network_sandbox_policy =
+        crate::config::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
+    // Child session startup re-derives the effective Windows sandbox level from config. Keep the
+    // config-side mode aligned with the live turn override so spawned and resumed children do not
+    // silently fall back to stale Windows sandbox policy.
+    match turn.windows_sandbox_level {
+        WindowsSandboxLevel::Elevated => {
+            config.permissions.windows_sandbox_mode =
+                Some(crate::config::types::WindowsSandboxModeToml::Elevated);
+            config
+                .features
+                .enable(Feature::WindowsSandboxElevated)
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "windows sandbox features are invalid: {err}"
+                    ))
+                })?;
+        }
+        WindowsSandboxLevel::RestrictedToken => {
+            config.permissions.windows_sandbox_mode =
+                Some(crate::config::types::WindowsSandboxModeToml::Unelevated);
+            config
+                .features
+                .enable(Feature::WindowsSandbox)
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "windows sandbox features are invalid: {err}"
+                    ))
+                })?;
+            config
+                .features
+                .disable(Feature::WindowsSandboxElevated)
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "windows sandbox features are invalid: {err}"
+                    ))
+                })?;
+        }
+        WindowsSandboxLevel::Disabled => {
+            config.permissions.windows_sandbox_mode = None;
+            config
+                .features
+                .disable(Feature::WindowsSandbox)
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "windows sandbox features are invalid: {err}"
+                    ))
+                })?;
+            config
+                .features
+                .disable(Feature::WindowsSandboxElevated)
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "windows sandbox features are invalid: {err}"
+                    ))
+                })?;
+        }
+    }
     Ok(())
 }
 
@@ -1111,8 +1204,13 @@ mod tests {
     use crate::ThreadManager;
     use crate::built_in_model_providers;
     use crate::codex::make_session_and_context;
+    use crate::config::AgentRoleConfig;
+    use crate::config::ConfigToml;
     use crate::config::DEFAULT_AGENT_MAX_DEPTH;
+    use crate::config::profile::ConfigProfile;
     use crate::config::types::ShellEnvironmentPolicy;
+    use crate::config::types::WindowsSandboxModeToml;
+    use crate::config_loader::ConfigLayerStack;
     use crate::features::Feature;
     use crate::function_tool::FunctionCallError;
     use crate::protocol::AskForApproval;
@@ -1122,12 +1220,13 @@ mod tests {
     use crate::protocol::SubAgentSource;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_protocol::ThreadId;
-    use codex_protocol::models::BaseInstructions;
+    use codex_protocol::config_types::WindowsSandboxLevel;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
     use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
     use codex_protocol::protocol::InitialHistory;
     use codex_protocol::protocol::RolloutItem;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use serde::Deserialize;
     use serde_json::json;
@@ -1177,6 +1276,23 @@ mod tests {
         )
     }
 
+    fn load_test_config(
+        cfg: ConfigToml,
+        codex_home: &tempfile::TempDir,
+        workspace: &tempfile::TempDir,
+    ) -> Config {
+        Config::load_config_with_layer_stack(
+            cfg,
+            ConfigOverrides {
+                cwd: Some(workspace.path().to_path_buf()),
+                ..Default::default()
+            },
+            codex_home.path().to_path_buf(),
+            ConfigLayerStack::default(),
+        )
+        .expect("test config")
+    }
+
     #[tokio::test]
     async fn spawn_config_prefers_subagent_base_instructions_when_present() {
         let (_session, mut turn) = make_session_and_context().await;
@@ -1188,13 +1304,7 @@ mod tests {
         turn.config = Arc::new(config);
         turn.developer_instructions = Some("dev".to_string());
 
-        let spawn_config = build_agent_spawn_config(
-            &BaseInstructions {
-                text: "parent instructions".to_string(),
-            },
-            &turn,
-        )
-        .expect("spawn config");
+        let spawn_config = build_agent_spawn_config(&turn).expect("spawn config");
 
         assert_eq!(
             spawn_config.base_instructions,
@@ -2647,9 +2757,6 @@ mod tests {
         }
 
         let (_session, mut turn) = make_session_and_context().await;
-        let base_instructions = BaseInstructions {
-            text: "base".to_string(),
-        };
         turn.developer_instructions = Some("dev".to_string());
         turn.compact_prompt = Some("compact".to_string());
         turn.shell_environment_policy = ShellEnvironmentPolicy {
@@ -2669,10 +2776,11 @@ mod tests {
         turn.approval_policy
             .set(AskForApproval::OnRequest)
             .expect("approval policy set");
+        turn.windows_sandbox_level = WindowsSandboxLevel::Elevated;
 
-        let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
+        let config = build_agent_spawn_config(&turn).expect("spawn config");
         let mut expected = (*turn.config).clone();
-        expected.base_instructions = Some(base_instructions.text);
+        expected.base_instructions = Some(turn.model_info.get_model_instructions(turn.personality));
         expected.model = Some(turn.model_info.slug.clone());
         expected.model_provider = turn.provider.clone();
         expected.model_reasoning_effort = turn.reasoning_effort;
@@ -2695,6 +2803,11 @@ mod tests {
             .sandbox_policy
             .set(turn.sandbox_policy.get().clone())
             .expect("sandbox policy set");
+        expected.permissions.file_system_sandbox_policy =
+            crate::config::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
+        expected.permissions.network_sandbox_policy =
+            crate::config::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
+        expected.permissions.windows_sandbox_mode = Some(WindowsSandboxModeToml::Elevated);
         assert_eq!(config, expected);
     }
 
@@ -2705,13 +2818,136 @@ mod tests {
         base_config.user_instructions = Some("base-user".to_string());
         turn.user_instructions = Some("resolved-user".to_string());
         turn.config = Arc::new(base_config.clone());
-        let base_instructions = BaseInstructions {
-            text: "base".to_string(),
-        };
 
-        let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
+        let config = build_agent_spawn_config(&turn).expect("spawn config");
 
         assert_eq!(config.user_instructions, None);
+    }
+
+    #[tokio::test]
+    async fn spawn_config_uses_child_model_default_instructions_without_subagent_override() {
+        let (_session, turn) = make_session_and_context().await;
+
+        let spawn_config = build_agent_spawn_config(&turn).expect("spawn config");
+
+        assert_eq!(
+            spawn_config.base_instructions,
+            Some(turn.model_info.get_model_instructions(turn.personality))
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_spawn_config_reapplies_isolation_after_role_reload() {
+        let (session, mut turn) = make_session_and_context().await;
+        let codex_home = tempfile::tempdir().expect("codex home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        tokio::fs::write(
+            workspace.path().join("AGENTS.md"),
+            "# AGENTS.md instructions for test\n\nrole reload should not leak this",
+        )
+        .await
+        .expect("write AGENTS");
+        let role_path = workspace.path().join("custom-role.toml");
+        tokio::fs::write(&role_path, "model = \"o3\"")
+            .await
+            .expect("write role");
+
+        let cfg = ConfigToml {
+            developer_instructions: Some("lead dev".to_string()),
+            project_doc_max_bytes: Some(4096),
+            ..Default::default()
+        };
+        let mut loaded_config = load_test_config(cfg, &codex_home, &workspace);
+        loaded_config.agent_roles.insert(
+            "custom".to_string(),
+            AgentRoleConfig {
+                description: None,
+                config_file: Some(role_path),
+                nickname_candidates: None,
+            },
+        );
+        turn.cwd = workspace.path().to_path_buf();
+        turn.config = Arc::new(loaded_config);
+
+        let mut spawn_config = build_agent_spawn_config(&turn).expect("spawn config");
+        apply_role_to_config(&mut spawn_config, Some("custom"))
+            .await
+            .expect("apply role");
+        apply_spawn_agent_runtime_overrides(&mut spawn_config, &turn).expect("runtime overrides");
+        finalize_spawn_agent_prompt_config(
+            &mut spawn_config,
+            &turn,
+            session.services.models_manager.as_ref(),
+        )
+        .await;
+
+        let expected_model_info = session
+            .services
+            .models_manager
+            .get_model_info(spawn_config.model.as_deref().expect("model"), &spawn_config)
+            .await;
+        assert_eq!(spawn_config.developer_instructions, None);
+        assert_eq!(spawn_config.user_instructions, None);
+        assert_eq!(spawn_config.project_doc_max_bytes, 0);
+        assert_eq!(
+            spawn_config.base_instructions,
+            Some(expected_model_info.get_model_instructions(spawn_config.personality))
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_spawn_config_uses_subagent_file_after_profile_reload() {
+        let (session, mut turn) = make_session_and_context().await;
+        let codex_home = tempfile::tempdir().expect("codex home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        tokio::fs::write(
+            workspace.path().join("AGENTS.md"),
+            "# AGENTS.md instructions for test\n\nprofile reload should not leak this",
+        )
+        .await
+        .expect("write AGENTS");
+        let subagent_path = workspace.path().join("subagent.md");
+        tokio::fs::write(&subagent_path, "child-only profile instructions")
+            .await
+            .expect("write subagent instructions");
+
+        let cfg = ConfigToml {
+            developer_instructions: Some("lead dev".to_string()),
+            project_doc_max_bytes: Some(4096),
+            profiles: HashMap::from([(
+                "child".to_string(),
+                ConfigProfile {
+                    model: Some("o3".to_string()),
+                    subagent_instructions_file: Some(
+                        AbsolutePathBuf::try_from(subagent_path).expect("absolute subagent path"),
+                    ),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let loaded_config = load_test_config(cfg, &codex_home, &workspace);
+        turn.cwd = workspace.path().to_path_buf();
+        turn.config = Arc::new(loaded_config);
+
+        let mut spawn_config = build_agent_spawn_config(&turn).expect("spawn config");
+        apply_spawn_agent_profile_override(&mut spawn_config, Some("child"))
+            .expect("apply profile");
+        apply_spawn_agent_runtime_overrides(&mut spawn_config, &turn).expect("runtime overrides");
+        finalize_spawn_agent_prompt_config(
+            &mut spawn_config,
+            &turn,
+            session.services.models_manager.as_ref(),
+        )
+        .await;
+
+        assert_eq!(spawn_config.developer_instructions, None);
+        assert_eq!(spawn_config.user_instructions, None);
+        assert_eq!(spawn_config.project_doc_max_bytes, 0);
+        assert_eq!(
+            spawn_config.base_instructions,
+            Some("child-only profile instructions".to_string())
+        );
     }
 
     #[tokio::test]
@@ -2723,6 +2959,7 @@ mod tests {
         turn.approval_policy
             .set(AskForApproval::OnRequest)
             .expect("approval policy set");
+        turn.windows_sandbox_level = WindowsSandboxLevel::RestrictedToken;
 
         let config = build_agent_resume_config(&turn, 0).expect("resume config");
 
@@ -2750,6 +2987,47 @@ mod tests {
             .sandbox_policy
             .set(turn.sandbox_policy.get().clone())
             .expect("sandbox policy set");
+        expected.permissions.file_system_sandbox_policy =
+            crate::config::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
+        expected.permissions.network_sandbox_policy =
+            crate::config::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
+        expected.permissions.windows_sandbox_mode = Some(WindowsSandboxModeToml::Unelevated);
         assert_eq!(config, expected);
+    }
+
+    #[tokio::test]
+    async fn build_agent_spawn_config_keeps_disabled_windows_override() {
+        let (_session, mut turn) = make_session_and_context().await;
+        let mut base_config = (*turn.config).clone();
+        base_config
+            .features
+            .enable(Feature::WindowsSandbox)
+            .expect("enable windows sandbox feature");
+        turn.config = Arc::new(base_config);
+        turn.windows_sandbox_level = WindowsSandboxLevel::Disabled;
+
+        let config = build_agent_spawn_config(&turn).expect("spawn config");
+
+        assert_eq!(config.permissions.windows_sandbox_mode, None);
+        assert!(!config.features.enabled(Feature::WindowsSandbox));
+        assert!(!config.features.enabled(Feature::WindowsSandboxElevated));
+    }
+
+    #[tokio::test]
+    async fn build_agent_resume_config_keeps_disabled_windows_override() {
+        let (_session, mut turn) = make_session_and_context().await;
+        let mut base_config = (*turn.config).clone();
+        base_config
+            .features
+            .enable(Feature::WindowsSandboxElevated)
+            .expect("enable elevated windows sandbox feature");
+        turn.config = Arc::new(base_config);
+        turn.windows_sandbox_level = WindowsSandboxLevel::Disabled;
+
+        let config = build_agent_resume_config(&turn, 0).expect("resume config");
+
+        assert_eq!(config.permissions.windows_sandbox_mode, None);
+        assert!(!config.features.enabled(Feature::WindowsSandbox));
+        assert!(!config.features.enabled(Feature::WindowsSandboxElevated));
     }
 }

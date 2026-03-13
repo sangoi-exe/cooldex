@@ -19,7 +19,7 @@ Control Codex’s behavior during an interactive session with slash commands.
 | `/resume`       | resume an old chat                                                         |
 | `/init`         | create an AGENTS.md file with instructions for Codex                       |
 | `/compact`      | summarize conversation to prevent hitting the context limit                |
-| `/sanitize`     | sanitize context using manage_context                                      |
+| `/sanitize`     | sanitize session context                                                   |
 | `/diff`         | show git diff (including untracked files)                                  |
 | `/debug`        | show the latest raw API response item captured by the TUI                  |
 | `/mention`      | mention a file                                                             |

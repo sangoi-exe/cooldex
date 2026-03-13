@@ -521,7 +521,7 @@ fn required_state_db(
 }
 
 async fn build_runner_options(
-    session: &Arc<Session>,
+    _session: &Arc<Session>,
     turn: &Arc<TurnContext>,
     requested_concurrency: Option<usize>,
 ) -> Result<JobRunnerOptions, FunctionCallError> {
@@ -535,8 +535,7 @@ async fn build_runner_options(
     }
     let max_concurrency =
         normalize_concurrency(requested_concurrency, turn.config.agent_max_threads);
-    let base_instructions = session.get_base_instructions().await;
-    let spawn_config = build_agent_spawn_config(&base_instructions, turn.as_ref())?;
+    let spawn_config = build_agent_spawn_config(turn.as_ref())?;
     Ok(JobRunnerOptions {
         max_concurrency,
         spawn_config,

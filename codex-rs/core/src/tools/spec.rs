@@ -1579,9 +1579,8 @@ fn create_manage_context_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "manage_context".to_string(),
-        description:
-            "Manage long-session context using manage_context v2 retrieve/apply chunk contract."
-                .to_string(),
+        description: "Manage long-session context using the current retrieve/apply chunk contract."
+            .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -2248,7 +2247,7 @@ mod tests {
     }
 
     #[test]
-    fn manage_context_tool_contract_is_v2_only() {
+    fn manage_context_tool_contract_matches_current_fields() {
         let tool = create_manage_context_tool();
         let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = tool else {
             panic!("manage_context must be a function tool");
@@ -2279,7 +2278,10 @@ mod tests {
             "state_hash",
             "chunk_summaries",
         ] {
-            assert!(properties.contains_key(key), "missing v2 field: {key}");
+            assert!(
+                properties.contains_key(key),
+                "missing contract field: {key}"
+            );
         }
 
         let property_keys: std::collections::HashSet<String> = properties.keys().cloned().collect();

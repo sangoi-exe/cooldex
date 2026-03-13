@@ -2,7 +2,7 @@
 source: core/tests/suite/compact_remote.rs
 expression: "format_labeled_requests_snapshot(\"After remote manual /compact and resume, the first resumed turn rebuilds history from the compaction item and restates realtime-end instructions from reconstructed previous-turn settings.\",\n&[(\"Remote Compaction Request\", &compact_request),\n(\"Remote Post-Resume History Layout\", after_resume_request),])"
 ---
-Scenario: After remote manual /compact and resume, the first resumed turn rebuilds history from the compaction item and restates realtime-end instructions from reconstructed previous-turn settings.
+Scenario: After remote manual /compact and resume, the first resumed turn preserves canonical prompt-top context from replacement history and keeps realtime-end instructions from reconstructed previous-turn settings.
 
 ## Remote Compaction Request
 00:message/developer:<PERMISSIONS_INSTRUCTIONS>
@@ -14,11 +14,11 @@ Scenario: After remote manual /compact and resume, the first resumed turn rebuil
 04:message/assistant:REMOTE_FIRST_REPLY
 
 ## Remote Post-Resume History Layout
-00:compaction:encrypted=true
-01:message/developer[2]:
+00:message/developer[2]:
     [01] <PERMISSIONS_INSTRUCTIONS>
     [02] <realtime_conversation>\nRealtime conversation ended.\n\nSubsequ...
-02:message/user[2]:
+01:message/user[2]:
     [01] <AGENTS_MD>
     [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
+02:compaction:encrypted=true
 03:message/user:USER_TWO

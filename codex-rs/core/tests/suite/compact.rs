@@ -95,6 +95,62 @@ fn json_fragment(text: &str) -> String {
         .to_string()
 }
 
+fn count_message_text_occurrences(
+    request: &core_test_support::responses::ResponsesRequest,
+    needle: &str,
+) -> usize {
+    request
+        .message_input_text_groups("developer")
+        .into_iter()
+        .chain(request.message_input_text_groups("user"))
+        .flatten()
+        .filter(|text| text.contains(needle))
+        .count()
+}
+
+fn assert_prompt_top_has_canonical_context(
+    request: &core_test_support::responses::ResponsesRequest,
+) {
+    let input = request.input();
+    let developer_item = input.first().expect("expected developer prompt item");
+    assert_eq!(
+        developer_item.get("type").and_then(|value| value.as_str()),
+        Some("message")
+    );
+    assert_eq!(
+        developer_item.get("role").and_then(|value| value.as_str()),
+        Some("developer")
+    );
+    let developer_text = developer_item["content"][0]["text"]
+        .as_str()
+        .expect("developer prompt text");
+    assert!(
+        developer_text.contains("<permissions instructions>"),
+        "expected canonical developer instructions at prompt top"
+    );
+
+    let contextual_user_item = input.get(1).expect("expected contextual user prompt item");
+    assert_eq!(
+        contextual_user_item
+            .get("type")
+            .and_then(|value| value.as_str()),
+        Some("message")
+    );
+    assert_eq!(
+        contextual_user_item
+            .get("role")
+            .and_then(|value| value.as_str()),
+        Some("user")
+    );
+    let contextual_user_text = contextual_user_item["content"][0]["text"]
+        .as_str()
+        .expect("contextual user prompt text");
+    assert!(
+        contextual_user_text.contains("<environment_context>"),
+        "expected canonical contextual user block immediately after developer instructions"
+    );
+}
+
 fn non_openai_model_provider(server: &MockServer) -> ModelProviderInfo {
     let mut provider = built_in_model_providers()["openai"].clone();
     provider.name = "OpenAI (test)".into();
@@ -305,6 +361,7 @@ async fn summarize_context_three_requests_and_instructions() {
 
     // Third request must contain the refreshed instructions, compacted user history, and new user message.
     let input3 = body3.get("input").and_then(|v| v.as_array()).unwrap();
+    assert_prompt_top_has_canonical_context(&requests[2]);
 
     assert!(
         input3.len() >= 3,
@@ -1397,6 +1454,7 @@ async fn auto_compact_runs_after_token_limit_hit() {
             .any(|text| text.contains(prefixed_auto_summary)),
         "auto compact follow-up request should include the summary message"
     );
+    assert_prompt_top_has_canonical_context(&requests[follow_up_index]);
 }
 
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
@@ -1887,11 +1945,12 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
         previous_model,
         next_model,
     );
+    assert_prompt_top_has_canonical_context(&requests[2]);
 
     insta::assert_snapshot!(
         "pre_sampling_model_switch_compaction_shapes",
         format_labeled_requests_snapshot(
-            "Pre-sampling compaction on model switch to a smaller context window: current behavior compacts using prior-turn history only (incoming user message excluded), and the follow-up request carries compacted history plus the new user message.",
+            "Pre-sampling compaction on model switch to a smaller context window compacts using prior-turn history only (incoming user message excluded), and the follow-up request restores canonical prompt-top context ahead of the compacted history and new user message.",
             &[
                 ("Initial Request (Previous Model)", &requests[0]),
                 ("Pre-sampling Compaction Request", &requests[1]),
@@ -2499,6 +2558,7 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         contains_user_text(&requests[2], second_user_message),
         "second turn request missing second user message"
     );
+    assert_prompt_top_has_canonical_context(&requests[2]);
     assert!(
         contains_user_text(&requests[2], first_user_message),
         "second turn request should include the compacted user history"
@@ -2512,7 +2572,7 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
     insta::assert_snapshot!(
         "manual_compact_with_history_shapes",
         format_labeled_requests_snapshot(
-            "Manual /compact with prior user history compacts existing history and the follow-up turn includes the compact summary plus new user message.",
+            "Manual /compact with prior user history compacts existing history and the follow-up turn keeps canonical prompt-top context ahead of the compact summary and new user message.",
             &[
                 ("Local Compaction Request", &requests[1]),
                 ("Local Post-Compaction History Layout", &requests[2]),
@@ -3051,8 +3111,7 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// TODO(ccunningham): Update once pre-turn compaction includes incoming user input.
-async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_message() {
+async fn snapshot_request_shape_pre_turn_compaction_excludes_incoming_user_message() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -3138,9 +3197,9 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
     assert_eq!(requests.len(), 4, "expected user, user, compact, follow-up");
 
     insta::assert_snapshot!(
-        "pre_turn_compaction_including_incoming_shapes",
+        "pre_turn_compaction_excluding_incoming_shapes",
         format_labeled_requests_snapshot(
-            "Pre-turn auto-compaction with a context override emits the context diff in the compact request while the incoming user message is still excluded.",
+            "Pre-turn auto-compaction with a context override emits the context diff in the compact request while the incoming user message is still excluded, and the follow-up request restores canonical prompt-top context before the compacted history.",
             &[
                 ("Local Compaction Request", &requests[2]),
                 ("Local Post-Compaction History Layout", &requests[3]),
@@ -3166,6 +3225,12 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
             .any(|url| url == image_url.as_str()),
         "expected post-compaction follow-up request to keep incoming user image content"
     );
+    assert_eq!(
+        requests[3].instructions_text(),
+        requests[0].instructions_text(),
+        "post-compaction follow-up should preserve the base-instructions lane"
+    );
+    assert_prompt_top_has_canonical_context(&requests[3]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3283,11 +3348,17 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
         follow_up_body.contains("<model_switch>"),
         "post-compaction follow-up should include model-switch update item"
     );
+    assert_eq!(
+        count_message_text_occurrences(&requests[2], "<model_switch>"),
+        1,
+        "post-compaction follow-up should contain the model-switch instruction exactly once"
+    );
+    assert_prompt_top_has_canonical_context(&requests[2]);
 
     insta::assert_snapshot!(
         "pre_turn_compaction_strips_incoming_model_switch_shapes",
         format_labeled_requests_snapshot(
-            "Pre-turn compaction during model switch (without pre-sampling model-switch compaction): current behavior strips incoming <model_switch> from the compact request and restores it in the post-compaction follow-up request.",
+            "Pre-turn compaction during model switch (without pre-sampling model-switch compaction): the compact request still strips the incoming <model_switch> tail item, and the post-compaction follow-up rebuilds canonical prompt-top context with a single model-switch instruction.",
             &[
                 ("Initial Request (Previous Model)", &requests[0]),
                 ("Local Compaction Request", &requests[1]),
@@ -3432,6 +3503,7 @@ async fn snapshot_request_shape_manual_compact_without_previous_user_messages() 
         2,
         "expected manual /compact request and follow-up turn request"
     );
+    assert_prompt_top_has_canonical_context(&requests[1]);
 
     insta::assert_snapshot!(
         "manual_compact_without_prev_user_shapes",
