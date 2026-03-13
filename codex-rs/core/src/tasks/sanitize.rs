@@ -20,6 +20,7 @@ use crate::protocol::RolloutItem;
 use crate::protocol::TurnStartedEvent;
 use crate::state::TaskKind;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::handlers::ManageContextHandler;
 use crate::turn_diff_tracker::TurnDiffTracker;
 
 use super::SessionTask;
@@ -48,6 +49,31 @@ enum ManageContextFollowUpEvent {
     Apply,
     Retrieve(RetrieveSignature),
     Error(ManageContextErrorSignature),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManageContextSeedMode {
+    Retrieve,
+    Apply,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ManageContextSeedPairId {
+    call_item_index: usize,
+    output_item_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SanitizeMaterializationOutcome {
+    history_cleanup_required: bool,
+    semantic_context_changed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SanitizeHistoryMaterialization {
+    replacement_history: Vec<ResponseItem>,
+    history_cleanup_required: bool,
+    semantic_context_changed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,22 +284,33 @@ async fn materialize_sanitize_history_if_changed(
     sess: &crate::codex::Session,
     ctx: &TurnContext,
     history_before_sanitize: &[ResponseItem],
-) -> Result<bool, CodexErr> {
-    let (replacement_history, checkpoint) = {
+    sanitize_generated_non_tool_items: &[ResponseItem],
+) -> Result<SanitizeMaterializationOutcome, CodexErr> {
+    let (materialization, checkpoint) = {
         let mut state = sess.state.lock().await;
         let checkpoint = state.manage_context_checkpoint();
         (
-            sanitize_replacement_history_if_changed(&mut state, history_before_sanitize),
+            sanitize_replacement_history_if_changed(
+                &mut state,
+                history_before_sanitize,
+                sanitize_generated_non_tool_items,
+            ),
             checkpoint,
         )
     };
-    let changed_history = replacement_history.is_some();
-    if let Some(replacement_history) = replacement_history {
+    let outcome = materialization.as_ref().map_or(
+        SanitizeMaterializationOutcome::default(),
+        |materialization| SanitizeMaterializationOutcome {
+            history_cleanup_required: materialization.history_cleanup_required,
+            semantic_context_changed: materialization.semantic_context_changed,
+        },
+    );
+    if let Some(materialization) = materialization {
         // Merge-safety anchor: persisting replacement_history here defines the
         // sanitized boundary consumed by recall and resume replay.
         let compacted_item = RolloutItem::Compacted(CompactedItem {
             message: String::new(),
-            replacement_history: Some(replacement_history),
+            replacement_history: Some(materialization.replacement_history),
         });
         let recorder = {
             let guard = sess.services.rollout.lock().await;
@@ -290,7 +327,7 @@ async fn materialize_sanitize_history_if_changed(
         }
     }
     sess.recompute_token_usage(ctx).await;
-    Ok(changed_history)
+    Ok(outcome)
 }
 
 async fn report_sanitize_materialization_error(
@@ -364,6 +401,7 @@ impl SessionTask for SanitizeTask {
             manage_context_policy.fixed_point_k,
             manage_context_policy.stalled_signature_threshold,
         );
+        let mut sanitize_generated_non_tool_items: Vec<ResponseItem> = Vec::new();
         let mut server_model_warning_emitted_for_turn = false;
 
         loop {
@@ -412,16 +450,20 @@ impl SessionTask for SanitizeTask {
                     ));
                 }
             };
+            let needs_follow_up = output.needs_follow_up;
+            let last_agent_message = output.last_agent_message;
+            sanitize_generated_non_tool_items.extend(output.non_tool_response_items);
 
-            if !output.needs_follow_up {
-                let changed_history = match materialize_sanitize_history_if_changed(
+            if !needs_follow_up {
+                let materialization = match materialize_sanitize_history_if_changed(
                     sess.as_ref(),
                     ctx.as_ref(),
                     &history_before_sanitize,
+                    &sanitize_generated_non_tool_items,
                 )
                 .await
                 {
-                    Ok(changed_history) => changed_history,
+                    Ok(materialization) => materialization,
                     Err(error) => {
                         return report_sanitize_materialization_error(
                             sess.as_ref(),
@@ -432,8 +474,8 @@ impl SessionTask for SanitizeTask {
                     }
                 };
                 return Some(sanitize_completion_message(
-                    output.last_agent_message,
-                    changed_history,
+                    last_agent_message,
+                    materialization.semantic_context_changed,
                 ));
             }
 
@@ -446,14 +488,15 @@ impl SessionTask for SanitizeTask {
             match stagnation_tracker.record_follow_up_events(&follow_up_events) {
                 SanitizeLoopDecision::Continue => {}
                 SanitizeLoopDecision::ReachedFixedPoint => {
-                    let changed_history = match materialize_sanitize_history_if_changed(
+                    let materialization = match materialize_sanitize_history_if_changed(
                         sess.as_ref(),
                         ctx.as_ref(),
                         &history_before_sanitize,
+                        &sanitize_generated_non_tool_items,
                     )
                     .await
                     {
-                        Ok(changed_history) => changed_history,
+                        Ok(materialization) => materialization,
                         Err(error) => {
                             return report_sanitize_materialization_error(
                                 sess.as_ref(),
@@ -464,19 +507,20 @@ impl SessionTask for SanitizeTask {
                         }
                     };
                     return Some(sanitize_completion_message(
-                        output.last_agent_message,
-                        changed_history,
+                        last_agent_message,
+                        materialization.semantic_context_changed,
                     ));
                 }
                 SanitizeLoopDecision::Stalled => {
-                    let changed_history = match materialize_sanitize_history_if_changed(
+                    let materialization = match materialize_sanitize_history_if_changed(
                         sess.as_ref(),
                         ctx.as_ref(),
                         &history_before_sanitize,
+                        &sanitize_generated_non_tool_items,
                     )
                     .await
                     {
-                        Ok(changed_history) => changed_history,
+                        Ok(materialization) => materialization,
                         Err(error) => {
                             return report_sanitize_materialization_error(
                                 sess.as_ref(),
@@ -486,7 +530,8 @@ impl SessionTask for SanitizeTask {
                             .await;
                         }
                     };
-                    stagnation_tracker.set_changed_history(changed_history);
+                    stagnation_tracker
+                        .set_changed_history(materialization.semantic_context_changed);
                     return Some(stagnation_tracker.stalled_loop_message());
                 }
             }
@@ -496,38 +541,67 @@ impl SessionTask for SanitizeTask {
 
 fn sanitize_completion_message(
     last_agent_message: Option<String>,
-    changed_history: bool,
+    semantic_context_changed: bool,
 ) -> String {
+    if !semantic_context_changed {
+        return SANITIZE_COMPLETED_NO_CHANGES_MESSAGE.to_string();
+    }
+
     if let Some(message) = last_agent_message
         && !message.trim().is_empty()
     {
         return message;
     }
 
-    if changed_history {
-        SANITIZE_COMPLETED_WITH_CHANGES_MESSAGE.to_string()
-    } else {
-        SANITIZE_COMPLETED_NO_CHANGES_MESSAGE.to_string()
+    SANITIZE_COMPLETED_WITH_CHANGES_MESSAGE.to_string()
+}
+
+fn strip_sanitize_generated_non_tool_items(
+    prompt_snapshot: &mut Vec<ResponseItem>,
+    sanitize_generated_non_tool_items: &[ResponseItem],
+) {
+    for item in sanitize_generated_non_tool_items.iter().rev() {
+        if let Some(index) = prompt_snapshot
+            .iter()
+            .rposition(|candidate| candidate == item)
+        {
+            prompt_snapshot.remove(index);
+        }
     }
 }
 
 fn sanitize_replacement_history_if_changed(
     state: &mut crate::state::SessionState,
     history_before_sanitize: &[ResponseItem],
-) -> Option<Vec<ResponseItem>> {
+    sanitize_generated_non_tool_items: &[ResponseItem],
+) -> Option<SanitizeHistoryMaterialization> {
     let current_history = state.history_snapshot_lenient();
-    let prompt_snapshot = state.prompt_snapshot_lenient();
+    let mut stripped_prompt_snapshot = state.prompt_snapshot_lenient();
+    ManageContextHandler::strip_completed_manage_context_pairs_from_prompt_snapshot(
+        &current_history,
+        &mut stripped_prompt_snapshot,
+    );
+    strip_sanitize_generated_non_tool_items(
+        &mut stripped_prompt_snapshot,
+        sanitize_generated_non_tool_items,
+    );
+    let history_cleanup_required = stripped_prompt_snapshot != current_history;
+    let semantic_context_changed = stripped_prompt_snapshot != history_before_sanitize;
 
-    if current_history == history_before_sanitize && prompt_snapshot == history_before_sanitize {
+    if !history_cleanup_required && !semantic_context_changed {
         return None;
     }
 
-    if prompt_snapshot != current_history {
+    if history_cleanup_required {
         let reference_context_item = state.reference_context_item();
-        state.replace_history(prompt_snapshot.clone(), reference_context_item);
+        state.replace_history(stripped_prompt_snapshot.clone(), reference_context_item);
     }
 
-    Some(prompt_snapshot)
+    Some(SanitizeHistoryMaterialization {
+        replacement_history: stripped_prompt_snapshot,
+        history_cleanup_required,
+        semantic_context_changed,
+    })
 }
 
 fn parse_manage_context_output_item(item: &ResponseItem) -> Option<Value> {
@@ -615,44 +689,6 @@ impl ManageContextCallOwnership {
             }
             _ => false,
         }
-    }
-
-    fn completed_function_call_ids(&self, items: &[ResponseItem]) -> HashSet<String> {
-        let output_ids: HashSet<String> = items
-            .iter()
-            .filter_map(|item| match item {
-                ResponseItem::FunctionCallOutput { call_id, .. }
-                    if self.is_manage_context_output(item) =>
-                {
-                    Some(call_id.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        self.manage_context_function_call_ids
-            .iter()
-            .filter(|call_id| output_ids.contains(*call_id))
-            .cloned()
-            .collect()
-    }
-
-    fn completed_custom_call_ids(&self, items: &[ResponseItem]) -> HashSet<String> {
-        let output_ids: HashSet<String> = items
-            .iter()
-            .filter_map(|item| match item {
-                ResponseItem::CustomToolCallOutput { call_id, .. }
-                    if self.is_manage_context_output(item) =>
-                {
-                    Some(call_id.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        self.manage_context_custom_call_ids
-            .iter()
-            .filter(|call_id| output_ids.contains(*call_id))
-            .cloned()
-            .collect()
     }
 }
 
@@ -775,34 +811,115 @@ fn parse_manage_context_follow_up_event(output: &Value) -> Option<ManageContextF
     ))
 }
 
-fn collect_manage_context_seed_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
+fn manage_context_seed_mode(output: &Value) -> Option<ManageContextSeedMode> {
+    match parse_manage_context_follow_up_event(output)? {
+        ManageContextFollowUpEvent::Retrieve(_) => Some(ManageContextSeedMode::Retrieve),
+        ManageContextFollowUpEvent::Apply => Some(ManageContextSeedMode::Apply),
+        ManageContextFollowUpEvent::Error(_) => None,
+    }
+}
+
+fn select_manage_context_seed_pairs(items: &[ResponseItem]) -> Vec<ManageContextSeedPairId> {
     let call_ownership = ManageContextCallOwnership::from_items(items);
-    let completed_function_call_ids = call_ownership.completed_function_call_ids(items);
-    let completed_custom_call_ids = call_ownership.completed_custom_call_ids(items);
-    if completed_function_call_ids.is_empty() && completed_custom_call_ids.is_empty() {
-        return Vec::new();
+    let mut pending_function_calls: HashMap<String, VecDeque<usize>> = HashMap::new();
+    let mut pending_custom_calls: HashMap<String, VecDeque<usize>> = HashMap::new();
+    let mut latest_retrieve_pair: Option<ManageContextSeedPairId> = None;
+    let mut latest_apply_pair: Option<ManageContextSeedPairId> = None;
+
+    for (item_index, item) in items.iter().enumerate() {
+        match item {
+            ResponseItem::FunctionCall { name, call_id, .. }
+                if name == SANITIZE_ALLOWED_TOOL_NAME =>
+            {
+                pending_function_calls
+                    .entry(call_id.clone())
+                    .or_default()
+                    .push_back(item_index);
+            }
+            ResponseItem::CustomToolCall { name, call_id, .. }
+                if name == SANITIZE_ALLOWED_TOOL_NAME =>
+            {
+                pending_custom_calls
+                    .entry(call_id.clone())
+                    .or_default()
+                    .push_back(item_index);
+            }
+            ResponseItem::FunctionCallOutput { call_id, .. }
+                if call_ownership.is_manage_context_output(item) =>
+            {
+                let Some(call_item_index) = pending_function_calls
+                    .get_mut(call_id.as_str())
+                    .and_then(VecDeque::pop_front)
+                else {
+                    continue;
+                };
+                let Some(output_value) = parse_manage_context_output_item(item) else {
+                    continue;
+                };
+                let Some(mode) = manage_context_seed_mode(&output_value) else {
+                    continue;
+                };
+                let pair_id = ManageContextSeedPairId {
+                    call_item_index,
+                    output_item_index: item_index,
+                };
+                match mode {
+                    ManageContextSeedMode::Retrieve => latest_retrieve_pair = Some(pair_id),
+                    ManageContextSeedMode::Apply => latest_apply_pair = Some(pair_id),
+                }
+            }
+            ResponseItem::CustomToolCallOutput { call_id, .. }
+                if call_ownership.is_manage_context_output(item) =>
+            {
+                let Some(call_item_index) = pending_custom_calls
+                    .get_mut(call_id.as_str())
+                    .and_then(VecDeque::pop_front)
+                else {
+                    continue;
+                };
+                let Some(output_value) = parse_manage_context_output_item(item) else {
+                    continue;
+                };
+                let Some(mode) = manage_context_seed_mode(&output_value) else {
+                    continue;
+                };
+                let pair_id = ManageContextSeedPairId {
+                    call_item_index,
+                    output_item_index: item_index,
+                };
+                match mode {
+                    ManageContextSeedMode::Retrieve => latest_retrieve_pair = Some(pair_id),
+                    ManageContextSeedMode::Apply => latest_apply_pair = Some(pair_id),
+                }
+            }
+            _ => {}
+        }
     }
 
+    let mut selected_pairs = Vec::new();
+    if let Some(pair_id) = latest_retrieve_pair {
+        selected_pairs.push(pair_id);
+    }
+    if let Some(pair_id) = latest_apply_pair {
+        selected_pairs.push(pair_id);
+    }
+    selected_pairs
+}
+
+fn collect_manage_context_seed_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
+    let selected_pairs = select_manage_context_seed_pairs(items);
+    if selected_pairs.is_empty() {
+        return Vec::new();
+    }
+    let selected_indices: HashSet<usize> = selected_pairs
+        .into_iter()
+        .flat_map(|pair_id| [pair_id.call_item_index, pair_id.output_item_index])
+        .collect();
     items
         .iter()
-        .filter(|item| match item {
-            ResponseItem::FunctionCall { name, call_id, .. } => {
-                name == "manage_context" && completed_function_call_ids.contains(call_id)
-            }
-            ResponseItem::CustomToolCall { name, call_id, .. } => {
-                name == "manage_context" && completed_custom_call_ids.contains(call_id)
-            }
-            ResponseItem::FunctionCallOutput { call_id, .. } => {
-                call_ownership.is_manage_context_output(item)
-                    && completed_function_call_ids.contains(call_id)
-            }
-            ResponseItem::CustomToolCallOutput { call_id, .. } => {
-                call_ownership.is_manage_context_output(item)
-                    && completed_custom_call_ids.contains(call_id)
-            }
-            _ => false,
-        })
-        .cloned()
+        .enumerate()
+        .filter(|(item_index, _)| selected_indices.contains(item_index))
+        .map(|(_, item)| item.clone())
         .collect()
 }
 
@@ -881,30 +998,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn collect_manage_context_seed_items_includes_all_complete_pairs_in_order() {
-        let items = vec![
-            manage_context_call("call-1"),
-            function_call_output("call-1", "out-1"),
-            manage_context_call("call-2"),
-            function_call_output("call-2", "out-2"),
-            manage_context_call("call-3"),
-            function_call_output("call-3", "out-3"),
-        ];
+    fn custom_manage_context_call(call_id: &str, input: &str) -> ResponseItem {
+        ResponseItem::CustomToolCall {
+            id: None,
+            status: Some("completed".to_string()),
+            call_id: call_id.to_string(),
+            name: "manage_context".to_string(),
+            input: input.to_string(),
+        }
+    }
 
-        let output = collect_manage_context_seed_items(&items);
-
-        assert_eq!(
-            output,
-            vec![
-                manage_context_call("call-1"),
-                function_call_output("call-1", "out-1"),
-                manage_context_call("call-2"),
-                function_call_output("call-2", "out-2"),
-                manage_context_call("call-3"),
-                function_call_output("call-3", "out-3")
-            ]
-        );
+    fn custom_manage_context_output(call_id: &str, content: &str) -> ResponseItem {
+        ResponseItem::CustomToolCallOutput {
+            call_id: call_id.to_string(),
+            output: codex_protocol::models::FunctionCallOutputPayload {
+                body: codex_protocol::models::FunctionCallOutputBody::Text(content.to_string()),
+                success: Some(true),
+            },
+        }
     }
 
     #[test]
@@ -948,7 +1059,14 @@ mod tests {
                 })
                 .to_string(),
             ),
-            function_call_output("call-1", "out-1"),
+            function_call_output(
+                "call-1",
+                &json!({
+                    "mode": "apply",
+                    "stop_reason": "target_reached"
+                })
+                .to_string(),
+            ),
         ];
 
         let output = collect_manage_context_seed_items(&items);
@@ -1128,10 +1246,114 @@ mod tests {
     }
 
     #[test]
-    fn collect_manage_context_seed_items_prefers_older_complete_pairs_when_recent_are_incomplete() {
+    fn collect_manage_context_seed_items_keeps_latest_retrieve_and_apply_pairs_in_original_order() {
+        let items = vec![
+            manage_context_call("retrieve-1"),
+            function_call_output(
+                "retrieve-1",
+                &json!({
+                    "mode": "retrieve",
+                    "chunk_manifest": [{
+                        "chunk_id": "chunk_001",
+                        "source_id": "r1",
+                        "approx_bytes": 1000
+                    }]
+                })
+                .to_string(),
+            ),
+            manage_context_call("apply-1"),
+            function_call_output(
+                "apply-1",
+                &json!({
+                    "mode": "apply",
+                    "stop_reason": "target_reached"
+                })
+                .to_string(),
+            ),
+            manage_context_call("retrieve-2"),
+            function_call_output(
+                "retrieve-2",
+                &json!({
+                    "mode": "retrieve",
+                    "chunk_manifest": [{
+                        "chunk_id": "chunk_002",
+                        "source_id": "r2",
+                        "approx_bytes": 2000
+                    }]
+                })
+                .to_string(),
+            ),
+            manage_context_call("apply-2"),
+            function_call_output(
+                "apply-2",
+                &json!({
+                    "mode": "apply",
+                    "stop_reason": "target_reached"
+                })
+                .to_string(),
+            ),
+            manage_context_call("retrieve-3"),
+            function_call_output(
+                "retrieve-3",
+                &json!({
+                    "mode": "retrieve",
+                    "chunk_manifest": [{
+                        "chunk_id": "chunk_003",
+                        "source_id": "r3",
+                        "approx_bytes": 3000
+                    }]
+                })
+                .to_string(),
+            ),
+        ];
+
+        let output = collect_manage_context_seed_items(&items);
+
+        assert_eq!(
+            output,
+            vec![
+                manage_context_call("apply-2"),
+                function_call_output(
+                    "apply-2",
+                    &json!({
+                        "mode": "apply",
+                        "stop_reason": "target_reached"
+                    })
+                    .to_string(),
+                ),
+                manage_context_call("retrieve-3"),
+                function_call_output(
+                    "retrieve-3",
+                    &json!({
+                        "mode": "retrieve",
+                        "chunk_manifest": [{
+                            "chunk_id": "chunk_003",
+                            "source_id": "r3",
+                            "approx_bytes": 3000
+                        }]
+                    })
+                    .to_string(),
+                ),
+            ]
+        );
+        assert_eq!(output.len(), 4);
+    }
+
+    #[test]
+    fn collect_manage_context_seed_items_keeps_latest_eligible_pair_when_newer_same_mode_is_incomplete()
+     {
+        let retrieve_output = json!({
+            "mode": "retrieve",
+            "chunk_manifest": [{
+                "chunk_id": "chunk_001",
+                "source_id": "r1",
+                "approx_bytes": 1000
+            }]
+        })
+        .to_string();
         let items = vec![
             manage_context_call("call-1"),
-            function_call_output("call-1", "out-1"),
+            function_call_output("call-1", &retrieve_output),
             manage_context_call("call-2"),
         ];
 
@@ -1141,35 +1363,119 @@ mod tests {
             output,
             vec![
                 manage_context_call("call-1"),
-                function_call_output("call-1", "out-1"),
+                function_call_output("call-1", &retrieve_output),
             ]
         );
     }
 
     #[test]
-    fn collect_manage_context_seed_items_includes_all_complete_calls_without_limit() {
-        let mut items = Vec::new();
-        for idx in 1..=12 {
-            let call_id = format!("call-{idx}");
-            let output = format!("out-{idx}");
-            items.push(manage_context_call(&call_id));
-            items.push(function_call_output(&call_id, &output));
-        }
+    fn collect_manage_context_seed_items_ignores_malformed_and_error_outputs() {
+        let retrieve_output = json!({
+            "mode": "retrieve",
+            "chunk_manifest": [{
+                "chunk_id": "chunk_001",
+                "source_id": "r1",
+                "approx_bytes": 1000
+            }]
+        })
+        .to_string();
+        let items = vec![
+            manage_context_call("retrieve-ok"),
+            function_call_output("retrieve-ok", &retrieve_output),
+            manage_context_call("bad-json"),
+            function_call_output("bad-json", "{not-json"),
+            manage_context_call("error"),
+            function_call_output(
+                "error",
+                &json!({
+                    "stop_reason": "state_hash_mismatch",
+                    "message": "state_hash mismatch"
+                })
+                .to_string(),
+            ),
+            manage_context_call("unknown"),
+            function_call_output(
+                "unknown",
+                &json!({
+                    "mode": "unexpected"
+                })
+                .to_string(),
+            ),
+        ];
 
         let output = collect_manage_context_seed_items(&items);
 
-        let expected = (1..=12)
-            .flat_map(|idx| {
-                let call_id = format!("call-{idx}");
-                let output = format!("out-{idx}");
-                [
-                    manage_context_call(&call_id),
-                    function_call_output(&call_id, &output),
-                ]
-            })
-            .collect::<Vec<ResponseItem>>();
+        assert_eq!(
+            output,
+            vec![
+                manage_context_call("retrieve-ok"),
+                function_call_output("retrieve-ok", &retrieve_output),
+            ]
+        );
+    }
 
-        assert_eq!(output, expected);
+    #[test]
+    fn collect_manage_context_seed_items_selects_latest_pair_instance_for_reused_call_id() {
+        let apply_output = json!({
+            "mode": "apply",
+            "stop_reason": "target_reached"
+        })
+        .to_string();
+        let older_call = manage_context_call_with_arguments(
+            "shared",
+            &json!({
+                "mode": "apply",
+                "plan_id": "plan-old"
+            })
+            .to_string(),
+        );
+        let newer_call = manage_context_call_with_arguments(
+            "shared",
+            &json!({
+                "mode": "apply",
+                "plan_id": "plan-new"
+            })
+            .to_string(),
+        );
+        let items = vec![
+            older_call,
+            function_call_output("shared", &apply_output),
+            newer_call.clone(),
+            function_call_output("shared", &apply_output),
+        ];
+
+        let output = collect_manage_context_seed_items(&items);
+
+        assert_eq!(
+            output,
+            vec![newer_call, function_call_output("shared", &apply_output),]
+        );
+    }
+
+    #[test]
+    fn collect_manage_context_seed_items_supports_custom_tool_variant() {
+        let retrieve_input = json!({
+            "mode": "retrieve",
+            "policy_id": "sanitize_strict"
+        })
+        .to_string();
+        let retrieve_output = json!({
+            "mode": "retrieve",
+            "chunk_manifest": [{
+                "chunk_id": "chunk_001",
+                "source_id": "r-custom",
+                "approx_bytes": 1000
+            }]
+        })
+        .to_string();
+        let items = vec![
+            custom_manage_context_call("custom-1", &retrieve_input),
+            custom_manage_context_output("custom-1", &retrieve_output),
+        ];
+
+        let output = collect_manage_context_seed_items(&items);
+
+        assert_eq!(output, items);
     }
 
     #[test]
@@ -1839,7 +2145,7 @@ mod tests {
 
     #[test]
     fn sanitize_completion_message_prefers_model_output() {
-        let message = sanitize_completion_message(Some("done".to_string()), false);
+        let message = sanitize_completion_message(Some("done".to_string()), true);
         assert_eq!(message, "done");
     }
 
@@ -1852,6 +2158,15 @@ mod tests {
     #[test]
     fn sanitize_completion_message_reports_no_changes_when_model_is_silent() {
         let message = sanitize_completion_message(None, false);
+        assert_eq!(message, SANITIZE_COMPLETED_NO_CHANGES_MESSAGE);
+    }
+
+    #[test]
+    fn sanitize_completion_message_ignores_model_output_when_semantically_unchanged() {
+        let message = sanitize_completion_message(
+            Some("completed and applied context updates".to_string()),
+            false,
+        );
         assert_eq!(message, SANITIZE_COMPLETED_NO_CHANGES_MESSAGE);
     }
 
@@ -1872,7 +2187,7 @@ mod tests {
         );
 
         let baseline = state.history_snapshot_lenient();
-        let materialized = sanitize_replacement_history_if_changed(&mut state, &baseline);
+        let materialized = sanitize_replacement_history_if_changed(&mut state, &baseline, &[]);
 
         assert_eq!(materialized, None);
         assert_eq!(state.history_snapshot_lenient(), baseline);
@@ -1898,10 +2213,12 @@ mod tests {
         state.add_context_notes(vec!["Decision: keep strict pruning.".to_string()]);
 
         let expected = state.prompt_snapshot_lenient();
-        let materialized = sanitize_replacement_history_if_changed(&mut state, &baseline)
+        let materialized = sanitize_replacement_history_if_changed(&mut state, &baseline, &[])
             .expect("must materialize");
 
-        assert_eq!(materialized, expected);
+        assert!(materialized.history_cleanup_required);
+        assert!(materialized.semantic_context_changed);
+        assert_eq!(materialized.replacement_history, expected);
         assert_eq!(state.history_snapshot_lenient(), expected);
 
         let overlay = state.context_overlay_snapshot();
@@ -1933,15 +2250,18 @@ mod tests {
         state.replace_history(vec![input_text_message("assistant", "second")], None);
 
         let expected = state.history_snapshot_lenient();
-        let replacement_history = sanitize_replacement_history_if_changed(&mut state, &baseline)
+        let materialized = sanitize_replacement_history_if_changed(&mut state, &baseline, &[])
             .expect("delete-only change should persist");
 
-        assert_eq!(replacement_history, expected);
+        assert!(!materialized.history_cleanup_required);
+        assert!(materialized.semantic_context_changed);
+        assert_eq!(materialized.replacement_history, expected);
         assert_eq!(state.history_snapshot_lenient(), expected);
     }
 
     #[tokio::test]
-    async fn sanitize_replacement_history_if_changed_keeps_manage_context_pairs() {
+    async fn sanitize_replacement_history_if_changed_drops_completed_manage_context_pairs_for_cleanup_only_runs()
+     {
         let session_configuration = make_session_configuration_for_tests().await;
         let mut state = crate::state::SessionState::new(session_configuration);
         let baseline = [input_text_message("user", "baseline")];
@@ -1953,20 +2273,98 @@ mod tests {
 
         let extra_items = [
             manage_context_call("call-1"),
-            function_call_output("call-1", "{\"mode\":\"retrieve\",\"plan_id\":\"p1\"}"),
+            function_call_output(
+                "call-1",
+                &json!({
+                    "mode": "retrieve",
+                    "plan_id": "p1"
+                })
+                .to_string(),
+            ),
+            input_text_message(
+                "assistant",
+                "/sanitize completed and applied context updates.",
+            ),
         ];
         state.record_items(
             extra_items.iter(),
             crate::truncate::TruncationPolicy::Tokens(4_096),
         );
-        let expected = state.history_snapshot_lenient();
 
-        let replacement_history =
-            sanitize_replacement_history_if_changed(&mut state, &baseline_snapshot)
-                .expect("must materialize with manage_context pairs preserved");
+        let sanitize_generated_non_tool_items = [input_text_message(
+            "assistant",
+            "/sanitize completed and applied context updates.",
+        )];
+        let materialized = sanitize_replacement_history_if_changed(
+            &mut state,
+            &baseline_snapshot,
+            &sanitize_generated_non_tool_items,
+        )
+        .expect("cleanup-only sanitize chatter must materialize");
 
-        assert_eq!(replacement_history, expected);
-        assert_eq!(state.history_snapshot_lenient(), expected);
+        assert!(materialized.history_cleanup_required);
+        assert!(!materialized.semantic_context_changed);
+        assert_eq!(materialized.replacement_history, baseline_snapshot);
+        assert_eq!(state.history_snapshot_lenient(), baseline_snapshot);
+    }
+
+    #[tokio::test]
+    async fn sanitize_replacement_history_if_changed_preserves_in_flight_manage_context_calls() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = crate::state::SessionState::new(session_configuration);
+        let baseline = [
+            input_text_message("user", "baseline"),
+            non_manage_call("tool-1"),
+            function_call_output("tool-1", "ok"),
+        ];
+        state.record_items(
+            baseline.iter(),
+            crate::truncate::TruncationPolicy::Tokens(4_096),
+        );
+        let baseline_snapshot = state.history_snapshot_lenient();
+
+        let extra_items = [
+            manage_context_call("done"),
+            function_call_output("done", "{\"mode\":\"retrieve\"}"),
+            manage_context_call("in-flight"),
+        ];
+        state.record_items(
+            extra_items.iter(),
+            crate::truncate::TruncationPolicy::Tokens(4_096),
+        );
+        state.set_context_inclusion(&[0], false);
+
+        let materialized =
+            sanitize_replacement_history_if_changed(&mut state, &baseline_snapshot, &[])
+                .expect("must materialize with in-flight manage_context call preserved");
+
+        assert!(materialized.history_cleanup_required);
+        assert!(materialized.semantic_context_changed);
+        assert!(materialized.replacement_history.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name == "manage_context" && call_id == "in-flight"
+            )
+        }));
+        assert!(!materialized.replacement_history.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name == "manage_context" && call_id == "done"
+            )
+        }));
+        assert!(!materialized.replacement_history.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput { call_id, .. }
+                    if call_id == "done" || call_id == "in-flight"
+            )
+        }));
+        assert_eq!(
+            state.history_snapshot_lenient(),
+            materialized.replacement_history
+        );
     }
 
     #[tokio::test]
@@ -2023,7 +2421,7 @@ mod tests {
         };
 
         let error =
-            materialize_sanitize_history_if_changed(&session, &turn, &history_before_sanitize)
+            materialize_sanitize_history_if_changed(&session, &turn, &history_before_sanitize, &[])
                 .await
                 .expect_err("materialization should fail when rollout persistence cannot enqueue");
         assert!(

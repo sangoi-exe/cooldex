@@ -2341,7 +2341,7 @@ impl Session {
         .await?;
         let startup_prompt = build_prompt(
             Vec::new(),
-            startup_router.as_ref(),
+            startup_router.specs(),
             startup_turn_context.as_ref(),
             BaseInstructions {
                 text: base_instructions,
@@ -5433,6 +5433,7 @@ pub(crate) async fn run_turn(
                 let SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
+                    ..
                 } = sampling_request_output;
                 let total_usage_tokens = sess.get_total_token_usage().await;
                 let token_limit_reached = total_usage_tokens >= auto_compact_limit;
@@ -5840,18 +5841,34 @@ fn codex_apps_connector_id(tool: &crate::mcp_connection_manager::ToolInfo) -> Op
 
 fn build_prompt(
     input: Vec<ResponseItem>,
-    router: &ToolRouter,
+    tools: Vec<crate::client_common::tools::ToolSpec>,
     turn_context: &TurnContext,
     base_instructions: BaseInstructions,
 ) -> Prompt {
     Prompt {
         input,
-        tools: router.specs(),
+        tools,
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
         personality: turn_context.personality,
         output_schema: turn_context.final_output_json_schema.clone(),
     }
+}
+
+fn prompt_tools_for_request(
+    router: &ToolRouter,
+    allowed_tool_names: Option<&HashSet<String>>,
+) -> Vec<crate::client_common::tools::ToolSpec> {
+    let specs = router.specs();
+    if let Some(allowed_tool_names) = allowed_tool_names
+        && !allowed_tool_names.is_empty()
+    {
+        return specs
+            .into_iter()
+            .filter(|tool| allowed_tool_names.contains(tool_name(tool)))
+            .collect();
+    }
+    specs
 }
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
@@ -5884,13 +5901,11 @@ pub(crate) async fn run_sampling_request(
         &cancellation_token,
     )
     .await?;
+    let prompt_tools = prompt_tools_for_request(router.as_ref(), allowed_tool_names);
 
     if let Some(allowed_tool_names) = allowed_tool_names
         && !allowed_tool_names.is_empty()
-        && !router
-            .specs()
-            .iter()
-            .any(|tool| allowed_tool_names.contains(tool_name(tool)))
+        && prompt_tools.is_empty()
     {
         return Err(CodexErr::InvalidRequest(
             "no allowed tools are available for this request".to_string(),
@@ -5900,7 +5915,7 @@ pub(crate) async fn run_sampling_request(
 
     let prompt = build_prompt(
         input,
-        router.as_ref(),
+        prompt_tools,
         turn_context.as_ref(),
         base_instructions,
     );
@@ -6113,6 +6128,7 @@ async fn built_tools(
 pub(crate) struct SamplingRequestResult {
     pub(crate) needs_follow_up: bool,
     pub(crate) last_agent_message: Option<String>,
+    pub(crate) non_tool_response_items: Vec<ResponseItem>,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -7070,6 +7086,7 @@ async fn try_run_sampling_request(
         FuturesOrdered::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
+    let mut non_tool_response_items: Vec<ResponseItem> = Vec::new();
     let mut active_item: Option<TurnItem> = None;
     let mut should_emit_turn_diff = false;
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
@@ -7147,12 +7164,17 @@ async fn try_run_sampling_request(
                     tool_runtime: tool_runtime.clone(),
                     cancellation_token: cancellation_token.child_token(),
                 };
+                let completed_item = item.clone();
 
                 let output_result = handle_output_item_done(&mut ctx, item, previously_active_item)
                     .instrument(handle_responses)
                     .await?;
+                let is_non_tool_item = output_result.tool_future.is_none();
                 if let Some(tool_future) = output_result.tool_future {
                     in_flight.push_back(tool_future);
+                }
+                if is_non_tool_item {
+                    non_tool_response_items.push(completed_item);
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
                     last_agent_message = Some(agent_message);
@@ -7253,6 +7275,7 @@ async fn try_run_sampling_request(
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
+                    non_tool_response_items,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {

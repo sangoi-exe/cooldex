@@ -111,6 +111,7 @@ mod review;
 mod rmcp_client;
 mod rollout_list_find;
 mod safety_check_downgrade;
+mod sanitize;
 mod search_tool;
 mod seatbelt;
 mod shell_command;

@@ -10,6 +10,7 @@ use anyhow::Result;
 use codex_core::features::Feature;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
 use core_test_support::assert_regex_match;
 use core_test_support::responses::ev_assistant_message;
@@ -340,6 +341,30 @@ async fn unified_exec_spec_toggle_end_to_end() -> Result<()> {
         tools_enabled.iter().any(|name| name == "write_stdin"),
         "tools list should include write_stdin when enabled: {tools_enabled:?}"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sanitize_request_only_advertises_manage_context() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let test = test_codex().build(&server).await?;
+
+    test.codex.submit(Op::Sanitize).await?;
+
+    let body = mock.single_request().body_json();
+    assert_eq!(tool_names(&body), vec!["manage_context".to_string()]);
 
     Ok(())
 }

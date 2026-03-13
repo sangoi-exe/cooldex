@@ -28,6 +28,21 @@ use std::collections::HashSet;
 
 pub struct ManageContextHandler;
 
+impl ManageContextHandler {
+    pub(crate) fn strip_completed_manage_context_pairs_from_prompt_snapshot(
+        current_history: &[ResponseItem],
+        prompt_snapshot: &mut Vec<ResponseItem>,
+    ) {
+        let (in_flight_function_call_ids, in_flight_custom_call_ids) =
+            in_flight_manage_context_call_ids(current_history);
+        strip_completed_manage_context_pairs(
+            prompt_snapshot,
+            &in_flight_function_call_ids,
+            &in_flight_custom_call_ids,
+        );
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManageContextToolArgs {
@@ -629,13 +644,10 @@ fn materialize_prompt_snapshot_after_apply(
     state: &mut crate::state::SessionState,
 ) -> Option<Vec<ResponseItem>> {
     let current_history = state.history_snapshot_lenient();
-    let (in_flight_function_call_ids, in_flight_custom_call_ids) =
-        in_flight_manage_context_call_ids(&current_history);
     let mut prompt_snapshot = state.prompt_snapshot_lenient();
-    strip_completed_manage_context_pairs(
+    ManageContextHandler::strip_completed_manage_context_pairs_from_prompt_snapshot(
+        &current_history,
         &mut prompt_snapshot,
-        &in_flight_function_call_ids,
-        &in_flight_custom_call_ids,
     );
 
     if prompt_snapshot == current_history {
@@ -993,12 +1005,31 @@ fn contract_error(reason: StopReason, message: impl Into<String>) -> FunctionCal
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ModelClient;
+    use crate::features::Feature;
+    use crate::protocol::Event;
+    use crate::protocol::EventMsg;
+    use crate::tasks::RegularTask;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::LocalShellAction;
     use codex_protocol::models::LocalShellExecAction;
     use codex_protocol::models::LocalShellStatus;
     use codex_protocol::openai_models::InputModality;
+    use codex_protocol::user_input::UserInput;
     use serde_json::Value;
+    use std::fmt::Write as _;
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::Respond;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
     fn user_message(text: &str) -> ResponseItem {
         ResponseItem::Message {
@@ -1107,6 +1138,136 @@ mod tests {
             .and_then(Value::as_str)
             .expect("stop_reason")
             .to_string()
+    }
+
+    fn response_created(id: &str) -> Value {
+        json!({
+            "type": "response.created",
+            "response": {
+                "id": id,
+            }
+        })
+    }
+
+    fn assistant_message_event(id: &str, text: &str) -> Value {
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "id": id,
+                "content": [{"type": "output_text", "text": text}]
+            }
+        })
+    }
+
+    fn response_completed(id: &str) -> Value {
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": id,
+                "usage": {
+                    "input_tokens": 0,
+                    "input_tokens_details": null,
+                    "output_tokens": 0,
+                    "output_tokens_details": null,
+                    "total_tokens": 0
+                }
+            }
+        })
+    }
+
+    fn sse(events: &[Value]) -> String {
+        let mut output = String::new();
+        for event in events {
+            let event_type = event
+                .get("type")
+                .and_then(Value::as_str)
+                .expect("response event type");
+            writeln!(&mut output, "event: {event_type}").expect("write SSE event type");
+            write!(&mut output, "data: {event}\n\n").expect("write SSE event body");
+        }
+        output
+    }
+
+    fn decode_request_body(request: &wiremock::Request) -> Vec<u8> {
+        let encoding = request
+            .headers
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok());
+        if encoding.is_some_and(|value| {
+            value
+                .split(',')
+                .any(|entry| entry.trim().eq_ignore_ascii_case("zstd"))
+        }) {
+            zstd::stream::decode_all(Cursor::new(request.body.as_slice()))
+                .expect("decode zstd request body")
+        } else {
+            request.body.clone()
+        }
+    }
+
+    fn request_contains_manage_context_pair(body: &Value, call_id: &str) -> bool {
+        body.get("input")
+            .and_then(Value::as_array)
+            .is_some_and(|input| {
+                input
+                    .iter()
+                    .any(|item| match item.get("type").and_then(Value::as_str) {
+                        Some("function_call") => {
+                            item.get("name").and_then(Value::as_str) == Some("manage_context")
+                        }
+                        Some("function_call_output") => {
+                            item.get("call_id").and_then(Value::as_str) == Some(call_id)
+                        }
+                        Some("custom_tool_call") => {
+                            item.get("name").and_then(Value::as_str) == Some("manage_context")
+                        }
+                        Some("custom_tool_call_output") => {
+                            item.get("call_id").and_then(Value::as_str) == Some(call_id)
+                        }
+                        _ => false,
+                    })
+            })
+    }
+
+    async fn wait_for_turn_complete(rx: &async_channel::Receiver<Event>) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = rx.recv().await.expect("event channel open");
+                if matches!(event.msg, EventMsg::TurnComplete(_)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timeout waiting for turn completion");
+    }
+
+    struct CaptureResponsesRequestResponder {
+        calls: AtomicUsize,
+        requests: Arc<Mutex<Vec<Value>>>,
+        response_body: String,
+    }
+
+    impl Respond for CaptureResponsesRequestResponder {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let call_num = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call_num > 0 {
+                panic!("unexpected extra model request {call_num}");
+            }
+
+            let parsed: Value = serde_json::from_slice(&decode_request_body(request))
+                .expect("valid model request body");
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(parsed);
+
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(self.response_body.clone())
+        }
     }
 
     #[test]
@@ -2158,6 +2319,164 @@ mod tests {
                 "applied source_id should no longer be in chunk_manifest: {applied_source_id}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manage_context_apply_follow_up_request_keeps_context_notes_without_completed_manage_context_chatter()
+     {
+        let server = MockServer::start().await;
+        let captured_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let response_body = sse(&[
+            response_created("resp-1"),
+            assistant_message_event("msg-1", "done"),
+            response_completed("resp-1"),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(CaptureResponsesRequestResponder {
+                calls: AtomicUsize::new(0),
+                requests: Arc::clone(&captured_requests),
+                response_body,
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (mut session, turn, rx) = crate::codex::make_session_and_context_with_rx().await;
+        let mut provider = crate::built_in_model_providers()["openai"].clone();
+        provider.base_url = Some(format!("{}/v1", server.uri()));
+
+        let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
+        let auth_manager = Arc::clone(&session_mut.services.auth_manager);
+        session_mut.services.model_client = ModelClient::new(
+            Some(auth_manager),
+            session_mut.conversation_id,
+            provider,
+            turn.session_source.clone(),
+            turn.config.model_verbosity,
+            crate::ws_version_from_features(turn.config.as_ref()),
+            turn.config
+                .features
+                .enabled(Feature::EnableRequestCompression),
+            turn.config.features.enabled(Feature::RuntimeMetrics),
+            None,
+        );
+
+        let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &user_message("u1"),
+                    &tool_call("call_tool_1"),
+                    &tool_output("call_tool_1", "tool output payload"),
+                    &user_message("u2"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let retrieve_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": policy_id,
+        }))
+        .expect("parse retrieve args");
+        let retrieve = handle_manage_context(session.as_ref(), turn.as_ref(), &retrieve_args)
+            .await
+            .expect("retrieve");
+
+        let plan_id = retrieve
+            .json
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .expect("plan_id")
+            .to_string();
+        let state_hash = retrieve
+            .json
+            .get("state_hash")
+            .and_then(Value::as_str)
+            .expect("state_hash")
+            .to_string();
+        let chunk_id = retrieve
+            .json
+            .pointer("/chunk_manifest/0/chunk_id")
+            .and_then(Value::as_str)
+            .expect("first chunk id")
+            .to_string();
+
+        let apply_call_id = "apply-call";
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &manage_context_call(apply_call_id),
+                    &manage_context_output(
+                        apply_call_id,
+                        &json!({
+                            "mode": "apply",
+                            "stop_reason": "target_reached"
+                        })
+                        .to_string(),
+                    ),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let tool_summary = "tool summary after apply";
+        let reasoning_summary = "reasoning summary after apply";
+        let apply_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "apply",
+            "policy_id": turn.config.manage_context_policy.quality_rubric_id,
+            "plan_id": plan_id,
+            "state_hash": state_hash,
+            "chunk_summaries": [{
+                "chunk_id": chunk_id,
+                "tool_context": tool_summary,
+                "reasoning_context": reasoning_summary
+            }]
+        }))
+        .expect("parse apply args");
+        handle_manage_context(session.as_ref(), turn.as_ref(), &apply_args)
+            .await
+            .expect("apply");
+
+        session
+            .spawn_task(
+                Arc::clone(&turn),
+                vec![UserInput::Text {
+                    text: "follow up after apply".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                RegularTask::default(),
+            )
+            .await;
+        wait_for_turn_complete(&rx).await;
+
+        let requests = captured_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(requests.len(), 1);
+
+        let body = &requests[0];
+        let body_text = body.to_string();
+        assert!(
+            body_text.contains(tool_summary),
+            "follow-up request should include applied tool summary: {body:#?}"
+        );
+        assert!(
+            body_text.contains(reasoning_summary),
+            "follow-up request should include applied reasoning summary: {body:#?}"
+        );
+        assert!(
+            body_text.contains("follow up after apply"),
+            "follow-up request should include the new user input: {body:#?}"
+        );
+        assert!(
+            !request_contains_manage_context_pair(body, apply_call_id),
+            "follow-up request should not contain completed manage_context chatter: {body:#?}"
+        );
     }
 
     #[tokio::test]

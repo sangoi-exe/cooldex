@@ -1128,9 +1128,9 @@ fn apply_spawn_agent_runtime_overrides(
             FunctionCallError::RespondToModel(format!("sandbox_policy is invalid: {err}"))
         })?;
     config.permissions.file_system_sandbox_policy =
-        crate::config::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
+        crate::protocol::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
     config.permissions.network_sandbox_policy =
-        crate::config::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
+        crate::protocol::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
     // Child session startup re-derives the effective Windows sandbox level from config. Keep the
     // config-side mode aligned with the live turn override so spawned and resumed children do not
     // silently fall back to stale Windows sandbox policy.
@@ -2804,9 +2804,9 @@ mod tests {
             .set(turn.sandbox_policy.get().clone())
             .expect("sandbox policy set");
         expected.permissions.file_system_sandbox_policy =
-            crate::config::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
+            crate::protocol::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
         expected.permissions.network_sandbox_policy =
-            crate::config::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
+            crate::protocol::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
         expected.permissions.windows_sandbox_mode = Some(WindowsSandboxModeToml::Elevated);
         assert_eq!(config, expected);
     }
@@ -2988,9 +2988,9 @@ mod tests {
             .set(turn.sandbox_policy.get().clone())
             .expect("sandbox policy set");
         expected.permissions.file_system_sandbox_policy =
-            crate::config::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
+            crate::protocol::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
         expected.permissions.network_sandbox_policy =
-            crate::config::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
+            crate::protocol::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
         expected.permissions.windows_sandbox_mode = Some(WindowsSandboxModeToml::Unelevated);
         assert_eq!(config, expected);
     }
