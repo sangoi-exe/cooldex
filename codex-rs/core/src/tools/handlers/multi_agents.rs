@@ -1202,6 +1202,7 @@ mod tests {
     use crate::AuthManager;
     use crate::CodexAuth;
     use crate::ThreadManager;
+    use crate::agent::role::apply_role_to_config;
     use crate::built_in_model_providers;
     use crate::codex::make_session_and_context;
     use crate::config::AgentRoleConfig;

@@ -2,6 +2,12 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ENVIRONMENT_CONTEXT_CLOSE_TAG;
 use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
+use codex_protocol::protocol::PINNED_NOTES_CLOSE_TAG;
+use codex_protocol::protocol::PINNED_NOTES_OPEN_TAG;
+use codex_protocol::protocol::REASONING_CONTEXT_CLOSE_TAG;
+use codex_protocol::protocol::REASONING_CONTEXT_OPEN_TAG;
+use codex_protocol::protocol::TOOL_CONTEXT_CLOSE_TAG;
+use codex_protocol::protocol::TOOL_CONTEXT_OPEN_TAG;
 
 pub(crate) const AGENTS_MD_START_MARKER: &str = "# AGENTS.md instructions for ";
 pub(crate) const AGENTS_MD_END_MARKER: &str = "</INSTRUCTIONS>";
@@ -84,6 +90,12 @@ pub(crate) const SUBAGENT_NOTIFICATION_FRAGMENT: ContextualUserFragmentDefinitio
         SUBAGENT_NOTIFICATION_OPEN_TAG,
         SUBAGENT_NOTIFICATION_CLOSE_TAG,
     );
+pub(crate) const TOOL_CONTEXT_FRAGMENT: ContextualUserFragmentDefinition =
+    ContextualUserFragmentDefinition::new(TOOL_CONTEXT_OPEN_TAG, TOOL_CONTEXT_CLOSE_TAG);
+pub(crate) const REASONING_CONTEXT_FRAGMENT: ContextualUserFragmentDefinition =
+    ContextualUserFragmentDefinition::new(REASONING_CONTEXT_OPEN_TAG, REASONING_CONTEXT_CLOSE_TAG);
+pub(crate) const PINNED_NOTES_FRAGMENT: ContextualUserFragmentDefinition =
+    ContextualUserFragmentDefinition::new(PINNED_NOTES_OPEN_TAG, PINNED_NOTES_CLOSE_TAG);
 
 const CONTEXTUAL_USER_FRAGMENTS: &[ContextualUserFragmentDefinition] = &[
     AGENTS_MD_FRAGMENT,
@@ -92,6 +104,9 @@ const CONTEXTUAL_USER_FRAGMENTS: &[ContextualUserFragmentDefinition] = &[
     USER_SHELL_COMMAND_FRAGMENT,
     TURN_ABORTED_FRAGMENT,
     SUBAGENT_NOTIFICATION_FRAGMENT,
+    TOOL_CONTEXT_FRAGMENT,
+    REASONING_CONTEXT_FRAGMENT,
+    PINNED_NOTES_FRAGMENT,
 ];
 
 pub(crate) fn is_contextual_user_fragment(content_item: &ContentItem) -> bool {
@@ -101,6 +116,15 @@ pub(crate) fn is_contextual_user_fragment(content_item: &ContentItem) -> bool {
     CONTEXTUAL_USER_FRAGMENTS
         .iter()
         .any(|definition| definition.matches_text(text))
+}
+
+pub(crate) fn is_prompt_gc_contextual_fragment(content_item: &ContentItem) -> bool {
+    let ContentItem::InputText { text } = content_item else {
+        return false;
+    };
+    TOOL_CONTEXT_FRAGMENT.matches_text(text)
+        || REASONING_CONTEXT_FRAGMENT.matches_text(text)
+        || PINNED_NOTES_FRAGMENT.matches_text(text)
 }
 
 #[cfg(test)]
@@ -134,6 +158,19 @@ mod tests {
     fn ignores_regular_user_text() {
         assert!(!is_contextual_user_fragment(&ContentItem::InputText {
             text: "hello".to_string(),
+        }));
+    }
+
+    #[test]
+    fn detects_prompt_gc_note_fragments() {
+        assert!(is_prompt_gc_contextual_fragment(&ContentItem::InputText {
+            text: "<tool_context>\ntool summary\n</tool_context>".to_string(),
+        }));
+        assert!(is_prompt_gc_contextual_fragment(&ContentItem::InputText {
+            text: "<reasoning_context>\nreasoning summary\n</reasoning_context>".to_string(),
+        }));
+        assert!(is_prompt_gc_contextual_fragment(&ContentItem::InputText {
+            text: "<pinned_notes>\nPinned notes:\n- keep this\n</pinned_notes>".to_string(),
         }));
     }
 }

@@ -9,6 +9,7 @@ use crate::function_tool::FunctionCallError;
 use crate::memories::usage::emit_metric_for_tool_read;
 use crate::protocol::SandboxPolicy;
 use crate::sandbox_tags::sandbox_tag;
+use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -79,6 +80,7 @@ impl ToolRegistry {
     pub async fn dispatch(
         &self,
         invocation: ToolInvocation,
+        source: ToolCallSource,
     ) -> Result<ResponseInputItem, FunctionCallError> {
         let tool_name = invocation.tool_name.clone();
         let call_id_owned = invocation.call_id.clone();
@@ -122,7 +124,9 @@ impl ToolRegistry {
             let mut active = invocation.session.active_turn.lock().await;
             if let Some(active_turn) = active.as_mut() {
                 let mut turn_state = active_turn.turn_state.lock().await;
-                turn_state.tool_calls = turn_state.tool_calls.saturating_add(1);
+                if source != ToolCallSource::Sidecar {
+                    turn_state.tool_calls = turn_state.tool_calls.saturating_add(1);
+                }
             }
         }
 
@@ -206,6 +210,7 @@ impl ToolRegistry {
         emit_metric_for_tool_read(&invocation, success).await;
         let hook_abort_error = dispatch_after_tool_use_hook(AfterToolUseHookDispatch {
             invocation: &invocation,
+            source,
             output_preview,
             success,
             executed: true,
@@ -368,6 +373,7 @@ fn hook_tool_kind(tool_input: &HookToolInput) -> HookToolKind {
 
 struct AfterToolUseHookDispatch<'a> {
     invocation: &'a ToolInvocation,
+    source: ToolCallSource,
     output_preview: String,
     success: bool,
     executed: bool,
@@ -378,7 +384,15 @@ struct AfterToolUseHookDispatch<'a> {
 async fn dispatch_after_tool_use_hook(
     dispatch: AfterToolUseHookDispatch<'_>,
 ) -> Option<FunctionCallError> {
-    let AfterToolUseHookDispatch { invocation, .. } = dispatch;
+    let AfterToolUseHookDispatch {
+        invocation, source, ..
+    } = dispatch;
+    // Merge-safety anchor: hidden PromptGcSidecar tool calls must not flow
+    // through user after_tool_use hooks, or internal prompt compaction can
+    // leak behavior and abort on hook failures outside the visible turn path.
+    if source == ToolCallSource::Sidecar {
+        return None;
+    }
     let session = invocation.session.as_ref();
     let turn = invocation.turn.as_ref();
     let tool_input = HookToolInput::from(&invocation.payload);

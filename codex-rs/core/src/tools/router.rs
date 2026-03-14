@@ -9,6 +9,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ConfiguredToolSpec;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::registry::ToolRegistryBuilder;
 use crate::tools::spec::ToolsConfig;
 use crate::tools::spec::build_specs;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -46,6 +47,11 @@ impl ToolRouter {
         let builder = build_specs(config, mcp_tools, app_tools, dynamic_tools);
         let (specs, registry) = builder.build();
 
+        Self { registry, specs }
+    }
+
+    pub fn from_builder(builder: ToolRegistryBuilder) -> Self {
+        let (specs, registry) = builder.build();
         Self { registry, specs }
     }
 
@@ -177,7 +183,7 @@ impl ToolRouter {
             payload,
         };
 
-        match self.registry.dispatch(invocation).await {
+        match self.registry.dispatch(invocation, source).await {
             Ok(response) => Ok(response),
             Err(FunctionCallError::Fatal(message)) => Err(FunctionCallError::Fatal(message)),
             Err(err) => Ok(Self::failure_response(

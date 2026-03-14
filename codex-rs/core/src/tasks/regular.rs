@@ -68,6 +68,10 @@ impl SessionTask for RegularTask {
         TaskKind::Regular
     }
 
+    fn supports_prompt_gc(&self) -> bool {
+        true
+    }
+
     fn span_name(&self) -> &'static str {
         "session_task.turn"
     }

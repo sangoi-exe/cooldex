@@ -2272,8 +2272,12 @@
       },
       "type": "object"
     },
+    "prompt_gc_prompt": {
+      "description": "PromptGcSidecar prompt used for hidden prompt-gc turns.",
+      "type": "string"
+    },
     "recall_debug": {
-      "description": "Controls recall payload verbosity. When unset/false, use a compact string-list payload. When true, use the full/debug payload.",
+      "description": "Controls recall payload verbosity. When unset/false, use a compact string-list payload. When true, use the full/debug payload. Keep docs/recall.md and docs/guide_reapply_recall.md aligned with this default.",
       "type": "boolean"
     },
     "recall_kbytes_limit": {

@@ -18,6 +18,8 @@ use tokio::sync::mpsc;
 pub const REVIEW_PROMPT: &str = include_str!("../review_prompt.md");
 /// Sanitize sub-agent system prompt. Edit `core/sanitize_prompt.md` to customize.
 pub const SANITIZE_PROMPT: &str = include_str!("../sanitize_prompt.md");
+/// Default PromptGcSidecar system prompt used when `config.toml` does not override it.
+pub const PROMPT_GC_PROMPT: &str = include_str!("../prompt_gc_prompt.md");
 
 // Centralized templates for review-related user messages
 pub const REVIEW_EXIT_SUCCESS_TMPL: &str = include_str!("../templates/review/exit_success.xml");

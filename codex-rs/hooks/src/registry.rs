@@ -38,6 +38,13 @@ impl Hooks {
         }
     }
 
+    pub fn from_hooks(after_agent: Vec<Hook>, after_tool_use: Vec<Hook>) -> Self {
+        Self {
+            after_agent,
+            after_tool_use,
+        }
+    }
+
     fn hooks_for_event(&self, hook_event: &HookEvent) -> &[Hook] {
         match hook_event {
             HookEvent::AfterAgent { .. } => &self.after_agent,

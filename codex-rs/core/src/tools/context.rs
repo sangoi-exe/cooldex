@@ -19,6 +19,7 @@ pub type SharedTurnDiffTracker = Arc<Mutex<TurnDiffTracker>>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolCallSource {
     Direct,
+    Sidecar,
     JsRepl,
 }
 

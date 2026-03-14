@@ -82,18 +82,6 @@ async fn save_image_generation_result_to_cwd(
     Ok(path)
 }
 
-/// Persist a completed model response item and record any cited memory usage.
-pub(crate) async fn record_completed_response_item(
-    sess: &Session,
-    turn_context: &TurnContext,
-    item: &ResponseItem,
-) {
-    sess.record_conversation_items(turn_context, std::slice::from_ref(item))
-        .await;
-    maybe_mark_thread_memory_mode_polluted_from_web_search(sess, turn_context, item).await;
-    record_stage1_output_usage_for_completed_item(turn_context, item).await;
-}
-
 async fn maybe_mark_thread_memory_mode_polluted_from_web_search(
     sess: &Session,
     turn_context: &TurnContext,
@@ -140,11 +128,37 @@ async fn record_stage1_output_usage_for_completed_item(
 pub(crate) type InFlightFuture<'f> =
     Pin<Box<dyn Future<Output = Result<ResponseInputItem>> + Send + 'f>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SamplingExecutionMode {
+    Visible,
+    Hidden,
+}
+
+/// Persist a completed model response item and record any cited memory usage.
+pub(crate) async fn record_completed_response_item(
+    sess: &Session,
+    turn_context: &TurnContext,
+    item: &ResponseItem,
+    execution_mode: SamplingExecutionMode,
+) -> Option<ResponseItem> {
+    match execution_mode {
+        SamplingExecutionMode::Visible => {
+            sess.record_conversation_items(turn_context, std::slice::from_ref(item))
+                .await;
+            maybe_mark_thread_memory_mode_polluted_from_web_search(sess, turn_context, item).await;
+            record_stage1_output_usage_for_completed_item(turn_context, item).await;
+            None
+        }
+        SamplingExecutionMode::Hidden => Some(item.clone()),
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct OutputItemResult {
     pub last_agent_message: Option<String>,
     pub needs_follow_up: bool,
     pub tool_future: Option<InFlightFuture<'static>>,
+    pub recorded_response_items: Vec<ResponseItem>,
 }
 
 pub(crate) struct HandleOutputCtx {
@@ -152,6 +166,7 @@ pub(crate) struct HandleOutputCtx {
     pub turn_context: Arc<TurnContext>,
     pub tool_runtime: ToolCallRuntime,
     pub cancellation_token: CancellationToken,
+    pub execution_mode: SamplingExecutionMode,
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -174,8 +189,16 @@ pub(crate) async fn handle_output_item_done(
                 payload_preview
             );
 
-            record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
-                .await;
+            if let Some(recorded_item) = record_completed_response_item(
+                ctx.sess.as_ref(),
+                ctx.turn_context.as_ref(),
+                &item,
+                ctx.execution_mode,
+            )
+            .await
+            {
+                output.recorded_response_items.push(recorded_item);
+            }
 
             let cancellation_token = ctx.cancellation_token.child_token();
             let tool_future: InFlightFuture<'static> = Box::pin(
@@ -192,7 +215,9 @@ pub(crate) async fn handle_output_item_done(
             if let Some(turn_item) =
                 handle_non_tool_response_item(&item, plan_mode, Some(&ctx.turn_context.cwd)).await
             {
-                if previously_active_item.is_none() {
+                if ctx.execution_mode == SamplingExecutionMode::Visible
+                    && previously_active_item.is_none()
+                {
                     let mut started_item = turn_item.clone();
                     if let TurnItem::ImageGeneration(item) = &mut started_item {
                         item.status = "in_progress".to_string();
@@ -205,13 +230,23 @@ pub(crate) async fn handle_output_item_done(
                         .await;
                 }
 
-                ctx.sess
-                    .emit_turn_item_completed(&ctx.turn_context, turn_item)
-                    .await;
+                if ctx.execution_mode == SamplingExecutionMode::Visible {
+                    ctx.sess
+                        .emit_turn_item_completed(&ctx.turn_context, turn_item)
+                        .await;
+                }
             }
 
-            record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
-                .await;
+            if let Some(recorded_item) = record_completed_response_item(
+                ctx.sess.as_ref(),
+                ctx.turn_context.as_ref(),
+                &item,
+                ctx.execution_mode,
+            )
+            .await
+            {
+                output.recorded_response_items.push(recorded_item);
+            }
             let last_agent_message = last_assistant_message_from_item(&item, plan_mode);
 
             output.last_agent_message = last_agent_message;
@@ -231,15 +266,30 @@ pub(crate) async fn handle_output_item_done(
                     ..Default::default()
                 },
             };
-            record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
-                .await;
+            if let Some(recorded_item) = record_completed_response_item(
+                ctx.sess.as_ref(),
+                ctx.turn_context.as_ref(),
+                &item,
+                ctx.execution_mode,
+            )
+            .await
+            {
+                output.recorded_response_items.push(recorded_item);
+            }
             if let Some(response_item) = response_input_to_response_item(&response) {
-                ctx.sess
-                    .record_conversation_items(
-                        &ctx.turn_context,
-                        std::slice::from_ref(&response_item),
-                    )
-                    .await;
+                match ctx.execution_mode {
+                    SamplingExecutionMode::Visible => {
+                        ctx.sess
+                            .record_conversation_items(
+                                &ctx.turn_context,
+                                std::slice::from_ref(&response_item),
+                            )
+                            .await;
+                    }
+                    SamplingExecutionMode::Hidden => {
+                        output.recorded_response_items.push(response_item);
+                    }
+                }
             }
 
             output.needs_follow_up = true;
@@ -253,15 +303,30 @@ pub(crate) async fn handle_output_item_done(
                     ..Default::default()
                 },
             };
-            record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
-                .await;
+            if let Some(recorded_item) = record_completed_response_item(
+                ctx.sess.as_ref(),
+                ctx.turn_context.as_ref(),
+                &item,
+                ctx.execution_mode,
+            )
+            .await
+            {
+                output.recorded_response_items.push(recorded_item);
+            }
             if let Some(response_item) = response_input_to_response_item(&response) {
-                ctx.sess
-                    .record_conversation_items(
-                        &ctx.turn_context,
-                        std::slice::from_ref(&response_item),
-                    )
-                    .await;
+                match ctx.execution_mode {
+                    SamplingExecutionMode::Visible => {
+                        ctx.sess
+                            .record_conversation_items(
+                                &ctx.turn_context,
+                                std::slice::from_ref(&response_item),
+                            )
+                            .await;
+                    }
+                    SamplingExecutionMode::Hidden => {
+                        output.recorded_response_items.push(response_item);
+                    }
+                }
             }
 
             output.needs_follow_up = true;

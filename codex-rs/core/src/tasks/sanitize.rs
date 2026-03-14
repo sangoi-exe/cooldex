@@ -69,7 +69,7 @@ struct SanitizeMaterializationOutcome {
     semantic_context_changed: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct SanitizeHistoryMaterialization {
     replacement_history: Vec<ResponseItem>,
     history_cleanup_required: bool,

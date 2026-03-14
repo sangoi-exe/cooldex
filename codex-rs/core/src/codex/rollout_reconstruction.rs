@@ -39,6 +39,10 @@ fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&s
         .is_none_or(|turn_id| item_turn_id.is_none_or(|item_turn_id| item_turn_id == turn_id))
 }
 
+fn is_prompt_gc_compaction_marker(compacted: &CompactedItem) -> bool {
+    compacted.message == crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER
+}
+
 fn finalize_active_segment<'a>(
     active_segment: ActiveReplaySegment<'a>,
     base_replacement_history: &mut Option<&'a [ResponseItem]>,
@@ -121,7 +125,18 @@ impl Session {
                     }
                     if active_segment.base_replacement_history.is_none()
                         && let Some(replacement_history) = &compacted.replacement_history
+                        && (!is_prompt_gc_compaction_marker(compacted)
+                            || matches!(
+                                active_segment.reference_context_item,
+                                TurnReferenceContextItem::Latest(_)
+                            ))
                     {
+                        // Merge-safety anchor: prompt_gc writes a Compacted item
+                        // before its matching TurnContext. Reverse replay must
+                        // only accept that replacement_history after the segment
+                        // has observed the matching TurnContext; otherwise a
+                        // crash-truncated prompt_gc pair would rewrite history
+                        // without the resume metadata that anchors it.
                         active_segment.base_replacement_history = Some(replacement_history);
                         rollout_suffix = &rollout_items[index + 1..];
                     }
@@ -245,6 +260,9 @@ impl Session {
                 }
                 RolloutItem::Compacted(compacted) => {
                     if let Some(replacement_history) = &compacted.replacement_history {
+                        if is_prompt_gc_compaction_marker(compacted) {
+                            continue;
+                        }
                         // This should actually never happen, because the reverse loop above (to build rollout_suffix)
                         // should stop before any compaction that has Some replacement_history
                         history.replace(replacement_history.clone());

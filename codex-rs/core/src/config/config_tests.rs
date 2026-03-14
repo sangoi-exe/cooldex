@@ -2624,6 +2624,28 @@ fn loads_compact_prompt_from_file() -> std::io::Result<()> {
 }
 
 #[test]
+fn loads_prompt_gc_prompt_from_config_toml() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg = ConfigToml {
+        prompt_gc_prompt: Some("  Use the prompt gc override  ".to_string()),
+        ..Default::default()
+    };
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    assert_eq!(
+        config.prompt_gc_prompt.as_deref(),
+        Some("Use the prompt gc override")
+    );
+
+    Ok(())
+}
+
+#[test]
 fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let missing_path = codex_home.path().join("agents").join("researcher.toml");
@@ -3147,6 +3169,7 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             subagent_base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
+            prompt_gc_prompt: None,
             pos_compact_instructions: None,
             commit_attribution: None,
             forced_chatgpt_workspace_id: None,
@@ -3288,6 +3311,7 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         subagent_base_instructions: None,
         developer_instructions: None,
         compact_prompt: None,
+        prompt_gc_prompt: None,
         pos_compact_instructions: None,
         commit_attribution: None,
         forced_chatgpt_workspace_id: None,
@@ -3427,6 +3451,7 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         subagent_base_instructions: None,
         developer_instructions: None,
         compact_prompt: None,
+        prompt_gc_prompt: None,
         pos_compact_instructions: None,
         commit_attribution: None,
         forced_chatgpt_workspace_id: None,
@@ -3552,6 +3577,7 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         subagent_base_instructions: None,
         developer_instructions: None,
         compact_prompt: None,
+        prompt_gc_prompt: None,
         pos_compact_instructions: None,
         commit_attribution: None,
         forced_chatgpt_workspace_id: None,

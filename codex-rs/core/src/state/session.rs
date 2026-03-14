@@ -11,6 +11,7 @@ use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
 use crate::contextual_user_message::AGENTS_MD_FRAGMENT;
 use crate::contextual_user_message::SKILL_FRAGMENT;
+use crate::contextual_user_message::is_prompt_gc_contextual_fragment;
 use crate::error::Result as CodexResult;
 use crate::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 use crate::protocol::PINNED_NOTES_CLOSE_TAG;
@@ -96,6 +97,35 @@ impl SessionState {
 
         let before_len = self.history.raw_items().len();
         self.history.record_items(items, policy);
+        let _ = self.finalize_recorded_items(before_len);
+    }
+
+    pub(crate) fn record_items_and_snapshot_appended<I>(
+        &mut self,
+        items: I,
+        policy: TruncationPolicy,
+    ) -> (usize, Vec<ResponseItem>)
+    where
+        I: IntoIterator,
+        I::Item: std::ops::Deref<Target = ResponseItem>,
+    {
+        self.assert_history_alignment();
+
+        let before_len = self.history.raw_items().len();
+        self.history.record_items(items, policy);
+        let after_len = self.finalize_recorded_items(before_len);
+        let appended_count = after_len.saturating_sub(before_len);
+        if appended_count == 0 {
+            return (before_len, Vec::new());
+        }
+
+        (
+            before_len,
+            self.history.raw_items()[before_len..after_len].to_vec(),
+        )
+    }
+
+    fn finalize_recorded_items(&mut self, before_len: usize) -> usize {
         let after_len = self.history.raw_items().len();
 
         assert!(
@@ -105,7 +135,7 @@ impl SessionState {
 
         let appended_count = after_len.saturating_sub(before_len);
         if appended_count == 0 {
-            return;
+            return after_len;
         }
 
         let new_rids = self.allocate_rids(appended_count);
@@ -115,6 +145,7 @@ impl SessionState {
             }
         }
         self.history_rids.extend(new_rids);
+        after_len
     }
 
     pub(crate) fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
@@ -520,6 +551,8 @@ fn prune_category_for_item(item: &ResponseItem) -> PruneCategory {
                 PruneCategory::UserInstructions
             } else if is_environment_context_message(content) {
                 PruneCategory::EnvironmentContext
+            } else if content.iter().any(is_prompt_gc_contextual_fragment) {
+                PruneCategory::UserInstructions
             } else {
                 PruneCategory::UserMessage
             }
@@ -764,6 +797,7 @@ mod tests {
     use super::*;
     use crate::codex::make_session_configuration_for_tests;
     use crate::protocol::RateLimitWindow;
+    use crate::protocol::TOOL_CONTEXT_CLOSE_TAG;
     use pretty_assertions::assert_eq;
 
     #[tokio::test]
@@ -1142,5 +1176,23 @@ mod tests {
                         )
             )
         }));
+    }
+
+    #[test]
+    fn prune_category_treats_prompt_gc_notes_as_user_instructions() {
+        let item = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: format!("{TOOL_CONTEXT_OPEN_TAG}\ntool summary\n{TOOL_CONTEXT_CLOSE_TAG}"),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+
+        assert_eq!(
+            prune_category_for_item(&item),
+            PruneCategory::UserInstructions
+        );
     }
 }

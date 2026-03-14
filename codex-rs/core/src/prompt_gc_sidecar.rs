@@ -1,0 +1,711 @@
+use std::collections::HashMap;
+use std::collections::HashSet;
+
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::LocalShellAction;
+use codex_protocol::models::MessagePhase;
+use codex_protocol::models::ResponseItem;
+
+pub(crate) const PROMPT_GC_TOOL_NAME: &str = "prompt_gc";
+pub(crate) const PROMPT_GC_COMPACTION_MARKER: &str = "[internal] prompt_gc";
+pub(crate) const MAX_UNITS_PER_RETRIEVE: usize = 16;
+pub(crate) const MAX_RAW_BYTES_PER_RETRIEVE: usize = 24_000;
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PromptGcObservedItem {
+    Recorded {
+        history_index: usize,
+        item: ResponseItem,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PromptGcCheckpoint {
+    pub(crate) checkpoint_id: String,
+    pub(crate) checkpoint_seq: u64,
+    pub(crate) eligible_unit_count: usize,
+    pub(crate) phase: MessagePhase,
+    pub(crate) assistant_item_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PromptGcUnitKind {
+    Reasoning,
+    ToolPair,
+    ToolResult,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PromptGcUnitResolver {
+    Reasoning {
+        fingerprint: String,
+    },
+    ToolPair {
+        call_id: String,
+        call_fingerprint: String,
+        output_fingerprint: String,
+        call_name: String,
+    },
+    ToolResult {
+        fingerprint: String,
+        call_name: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PromptGcCapturedUnit {
+    pub(crate) unit_key: u64,
+    pub(crate) chunk_id: String,
+    pub(crate) kind: PromptGcUnitKind,
+    pub(crate) payload_text: String,
+    pub(crate) approx_bytes: usize,
+    pub(crate) resolver: PromptGcUnitResolver,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PromptGcPendingCall {
+    fingerprint: String,
+    payload_text: String,
+    call_name: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PromptGcStatus {
+    pub(crate) last_error: Option<String>,
+    pub(crate) last_applied_checkpoint_seq: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PromptGcApplyOutcome {
+    pub(crate) checkpoint_id: String,
+    pub(crate) checkpoint_seq: u64,
+    pub(crate) applied_unit_keys: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PromptGcSidecar {
+    turn_id: Option<String>,
+    next_unit_key: u64,
+    next_checkpoint_seq: u64,
+    next_chunk_seq: u64,
+    units: Vec<PromptGcCapturedUnit>,
+    compacted_unit_keys: HashSet<u64>,
+    pending_function_calls: HashMap<String, Vec<PromptGcPendingCall>>,
+    pending_custom_calls: HashMap<String, Vec<PromptGcPendingCall>>,
+    pending_checkpoint: Option<PromptGcCheckpoint>,
+    active_checkpoint: Option<PromptGcCheckpoint>,
+    pending_apply_outcome: Option<PromptGcApplyOutcome>,
+    running: bool,
+    pub(crate) status: PromptGcStatus,
+}
+
+impl PromptGcSidecar {
+    pub(crate) fn bind_turn(&mut self, turn_id: impl Into<String>) {
+        self.turn_id = Some(turn_id.into());
+    }
+
+    pub(crate) fn observe_recorded_item(&mut self, _history_index: usize, item: &ResponseItem) {
+        match item {
+            ResponseItem::Reasoning { .. } => {
+                self.push_reasoning_unit(item);
+            }
+            ResponseItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                ..
+            } => {
+                if name == PROMPT_GC_TOOL_NAME {
+                    return;
+                }
+                let payload_text =
+                    format!("tool_call\nname: {name}\ncall_id: {call_id}\narguments:\n{arguments}");
+                let pending = PromptGcPendingCall {
+                    fingerprint: response_item_fingerprint(item),
+                    payload_text,
+                    call_name: name.clone(),
+                };
+                self.pending_function_calls
+                    .entry(call_id.clone())
+                    .or_default()
+                    .push(pending);
+            }
+            ResponseItem::CustomToolCall {
+                call_id,
+                name,
+                input,
+                ..
+            } => {
+                if name == PROMPT_GC_TOOL_NAME {
+                    return;
+                }
+                let payload_text =
+                    format!("tool_call\nname: {name}\ncall_id: {call_id}\ninput:\n{input}");
+                let pending = PromptGcPendingCall {
+                    fingerprint: response_item_fingerprint(item),
+                    payload_text,
+                    call_name: name.clone(),
+                };
+                self.pending_custom_calls
+                    .entry(call_id.clone())
+                    .or_default()
+                    .push(pending);
+            }
+            ResponseItem::LocalShellCall {
+                id,
+                call_id,
+                action,
+                ..
+            } => {
+                let Some(call_id) = call_id.as_ref().or(id.as_ref()) else {
+                    return;
+                };
+                // Merge-safety anchor: local shell records as a call item plus
+                // a later FunctionCallOutput. PromptGcSidecar must treat it as
+                // function-like ownership or shell transcript bloat becomes
+                // permanently ineligible for prompt GC.
+                let payload_text = format!(
+                    "tool_call\nname: local_shell\ncall_id: {call_id}\naction:\n{}",
+                    local_shell_action_text(action)
+                );
+                let pending = PromptGcPendingCall {
+                    fingerprint: response_item_fingerprint(item),
+                    payload_text,
+                    call_name: "local_shell".to_string(),
+                };
+                self.pending_function_calls
+                    .entry(call_id.clone())
+                    .or_default()
+                    .push(pending);
+            }
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                if let Some(pending) = pop_pending_call(&mut self.pending_function_calls, call_id) {
+                    self.push_tool_pair_unit(call_id, output, item, pending);
+                }
+            }
+            ResponseItem::CustomToolCallOutput { call_id, output } => {
+                if let Some(pending) = pop_pending_call(&mut self.pending_custom_calls, call_id) {
+                    self.push_tool_pair_unit(call_id, output, item, pending);
+                }
+            }
+            ResponseItem::WebSearchCall { .. } => {
+                // Merge-safety anchor: some tool classes materialize their
+                // result inline as a single response item rather than a
+                // call/output pair. PromptGcSidecar must capture them directly.
+                self.push_tool_result_unit("web_search", item);
+            }
+            ResponseItem::ImageGenerationCall { .. } => {
+                self.push_tool_result_unit("image_generation", item);
+            }
+            ResponseItem::Message {
+                id, role, phase, ..
+            } => {
+                if role == "assistant"
+                    && let Some(phase) = phase.clone()
+                {
+                    self.observe_phase_checkpoint(phase, id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn observe_recorded_batch(&mut self, observed_items: &[PromptGcObservedItem]) {
+        for observed in observed_items {
+            match observed {
+                PromptGcObservedItem::Recorded {
+                    history_index,
+                    item,
+                } => self.observe_recorded_item(*history_index, item),
+            }
+        }
+    }
+
+    pub(crate) fn take_pending_checkpoint(&mut self) -> Option<PromptGcCheckpoint> {
+        if self.running {
+            return None;
+        }
+        let checkpoint = self.pending_checkpoint.take()?;
+        self.running = true;
+        self.active_checkpoint = Some(checkpoint.clone());
+        Some(checkpoint)
+    }
+
+    pub(crate) fn checkpoint(&self, checkpoint_id: &str) -> Option<PromptGcCheckpoint> {
+        self.active_checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)
+            .cloned()
+    }
+
+    pub(crate) fn selectable_units(
+        &self,
+        checkpoint_id: &str,
+        max_units: usize,
+        max_raw_bytes: usize,
+    ) -> Option<Vec<PromptGcCapturedUnit>> {
+        let checkpoint = self.checkpoint(checkpoint_id)?;
+        let mut selected = Vec::new();
+        let mut selected_bytes = 0usize;
+        for unit in self.units.iter().take(checkpoint.eligible_unit_count) {
+            if self.compacted_unit_keys.contains(&unit.unit_key) {
+                continue;
+            }
+            let projected_bytes = selected_bytes.saturating_add(unit.approx_bytes);
+            if !selected.is_empty() && projected_bytes > max_raw_bytes {
+                break;
+            }
+            selected.push(unit.clone());
+            selected_bytes = projected_bytes;
+            if selected.len() >= max_units || selected_bytes >= max_raw_bytes {
+                break;
+            }
+        }
+        Some(selected)
+    }
+
+    pub(crate) fn complete_cycle(&mut self, outcome: PromptGcApplyOutcome) {
+        for unit_key in outcome.applied_unit_keys {
+            self.compacted_unit_keys.insert(unit_key);
+        }
+        self.status.last_applied_checkpoint_seq = Some(outcome.checkpoint_seq);
+        self.status.last_error = None;
+        self.running = false;
+        if self
+            .pending_apply_outcome
+            .as_ref()
+            .is_some_and(|pending| pending.checkpoint_id == outcome.checkpoint_id)
+        {
+            self.pending_apply_outcome = None;
+        }
+        if self
+            .active_checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.checkpoint_id == outcome.checkpoint_id)
+        {
+            self.active_checkpoint = None;
+        }
+    }
+
+    pub(crate) fn clear_pending_calls_for_rewrite(&mut self) {
+        self.pending_function_calls.clear();
+        self.pending_custom_calls.clear();
+    }
+
+    pub(crate) fn fail_cycle(&mut self, checkpoint_id: &str, error: impl Into<String>) {
+        self.status.last_error = Some(error.into());
+        self.running = false;
+        if self
+            .pending_apply_outcome
+            .as_ref()
+            .is_some_and(|pending| pending.checkpoint_id == checkpoint_id)
+        {
+            self.pending_apply_outcome = None;
+        }
+        if self
+            .active_checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)
+        {
+            self.active_checkpoint = None;
+        }
+    }
+
+    pub(crate) fn note_apply_outcome(&mut self, checkpoint_id: &str, applied_unit_keys: Vec<u64>) {
+        let Some(checkpoint) = self.checkpoint(checkpoint_id) else {
+            return;
+        };
+        self.pending_apply_outcome = Some(PromptGcApplyOutcome {
+            checkpoint_id: checkpoint_id.to_string(),
+            checkpoint_seq: checkpoint.checkpoint_seq,
+            applied_unit_keys,
+        });
+    }
+
+    pub(crate) fn take_noted_apply_outcome(
+        &mut self,
+        checkpoint_id: &str,
+    ) -> Option<PromptGcApplyOutcome> {
+        let outcome = self.pending_apply_outcome.take()?;
+        if outcome.checkpoint_id == checkpoint_id {
+            return Some(outcome);
+        }
+        self.pending_apply_outcome = Some(outcome);
+        None
+    }
+
+    fn observe_phase_checkpoint(&mut self, phase: MessagePhase, assistant_item_id: Option<String>) {
+        let checkpoint_seq = self.next_checkpoint_seq;
+        self.next_checkpoint_seq += 1;
+        let turn_id = self.turn_id.as_deref().unwrap_or("active-turn");
+        self.pending_checkpoint = Some(PromptGcCheckpoint {
+            checkpoint_id: format!("{turn_id}:prompt_gc:{checkpoint_seq}"),
+            checkpoint_seq,
+            eligible_unit_count: self.units.len(),
+            phase,
+            assistant_item_id,
+        });
+    }
+
+    fn push_reasoning_unit(&mut self, item: &ResponseItem) {
+        let payload_text = response_item_payload_text(item);
+        let unit_key = self.next_unit_key;
+        self.next_unit_key += 1;
+        let chunk_id = format!("prompt_gc_chunk_{}", self.next_chunk_seq);
+        self.next_chunk_seq += 1;
+        self.units.push(PromptGcCapturedUnit {
+            unit_key,
+            chunk_id,
+            kind: PromptGcUnitKind::Reasoning,
+            approx_bytes: payload_text.len(),
+            payload_text,
+            resolver: PromptGcUnitResolver::Reasoning {
+                fingerprint: response_item_fingerprint(item),
+            },
+        });
+    }
+
+    fn push_tool_pair_unit(
+        &mut self,
+        call_id: &str,
+        output: &FunctionCallOutputPayload,
+        output_item: &ResponseItem,
+        pending: PromptGcPendingCall,
+    ) {
+        if pending.call_name == PROMPT_GC_TOOL_NAME {
+            return;
+        }
+        let output_text = function_call_output_text(output);
+        let payload_text = format!(
+            "{}\n\ntool_output\ncall_id: {call_id}\noutput:\n{output_text}",
+            pending.payload_text
+        );
+        let unit_key = self.next_unit_key;
+        self.next_unit_key += 1;
+        let chunk_id = format!("prompt_gc_chunk_{}", self.next_chunk_seq);
+        self.next_chunk_seq += 1;
+        self.units.push(PromptGcCapturedUnit {
+            unit_key,
+            chunk_id,
+            kind: PromptGcUnitKind::ToolPair,
+            approx_bytes: payload_text.len(),
+            payload_text,
+            resolver: PromptGcUnitResolver::ToolPair {
+                call_id: call_id.to_string(),
+                call_fingerprint: pending.fingerprint,
+                output_fingerprint: response_item_fingerprint(output_item),
+                call_name: pending.call_name,
+            },
+        });
+    }
+
+    fn push_tool_result_unit(&mut self, call_name: &str, item: &ResponseItem) {
+        let payload_text = format!(
+            "tool_output\nname: {call_name}\npayload:\n{}",
+            response_item_payload_text(item)
+        );
+        let unit_key = self.next_unit_key;
+        self.next_unit_key += 1;
+        let chunk_id = format!("prompt_gc_chunk_{}", self.next_chunk_seq);
+        self.next_chunk_seq += 1;
+        self.units.push(PromptGcCapturedUnit {
+            unit_key,
+            chunk_id,
+            kind: PromptGcUnitKind::ToolResult,
+            approx_bytes: payload_text.len(),
+            payload_text,
+            resolver: PromptGcUnitResolver::ToolResult {
+                fingerprint: response_item_fingerprint(item),
+                call_name: call_name.to_string(),
+            },
+        });
+    }
+}
+
+fn response_item_payload_text(item: &ResponseItem) -> String {
+    serde_json::to_string_pretty(item)
+        .unwrap_or_else(|error| format!("failed_to_serialize: {error}"))
+}
+
+fn response_item_fingerprint(item: &ResponseItem) -> String {
+    serde_json::to_string(item).unwrap_or_else(|error| format!("failed_to_serialize:{error}"))
+}
+
+fn function_call_output_text(output: &FunctionCallOutputPayload) -> String {
+    output
+        .text_content()
+        .map(ToOwned::to_owned)
+        .or_else(|| serde_json::to_string_pretty(output).ok())
+        .unwrap_or_default()
+}
+
+fn local_shell_action_text(action: &LocalShellAction) -> String {
+    serde_json::to_string_pretty(action)
+        .unwrap_or_else(|error| format!("failed_to_serialize: {error}"))
+}
+
+fn pop_pending_call(
+    pending_calls: &mut HashMap<String, Vec<PromptGcPendingCall>>,
+    call_id: &str,
+) -> Option<PromptGcPendingCall> {
+    let calls = pending_calls.get_mut(call_id)?;
+    let pending = (!calls.is_empty()).then(|| calls.remove(0));
+    if calls.is_empty() {
+        pending_calls.remove(call_id);
+    }
+    pending
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::LocalShellExecAction;
+    use codex_protocol::models::LocalShellStatus;
+    use codex_protocol::models::WebSearchAction;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn captures_tool_pairs_and_reasoning_before_phase_checkpoint() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let reasoning = ResponseItem::Reasoning {
+            id: String::new(),
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: None,
+        };
+        sidecar.observe_recorded_item(0, &reasoning);
+
+        let call = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: "{\"cmd\":\"pwd\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(1, &call);
+
+        let output = ResponseItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("/tmp".to_string()),
+                success: Some(true),
+            },
+        };
+        sidecar.observe_recorded_item(2, &output);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(3, &phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let units = sidecar
+            .selectable_units(
+                checkpoint.checkpoint_id.as_str(),
+                MAX_UNITS_PER_RETRIEVE,
+                MAX_RAW_BYTES_PER_RETRIEVE,
+            )
+            .expect("units");
+
+        assert_eq!(checkpoint.eligible_unit_count, 2);
+        assert_eq!(units.len(), 2);
+        assert!(matches!(units[0].kind, PromptGcUnitKind::Reasoning));
+        assert!(matches!(units[1].kind, PromptGcUnitKind::ToolPair));
+        assert!(units[1].payload_text.contains("tool_output"));
+    }
+
+    #[test]
+    fn captures_local_shell_and_single_item_tool_results() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let shell_call = ResponseItem::LocalShellCall {
+            id: None,
+            call_id: Some("shell-1".to_string()),
+            status: LocalShellStatus::Completed,
+            action: LocalShellAction::Exec(LocalShellExecAction {
+                command: vec!["pwd".to_string()],
+                working_directory: None,
+                timeout_ms: None,
+                env: None,
+                user: None,
+            }),
+        };
+        sidecar.observe_recorded_item(0, &shell_call);
+
+        let shell_output = ResponseItem::FunctionCallOutput {
+            call_id: "shell-1".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("/tmp".to_string()),
+                success: Some(true),
+            },
+        };
+        sidecar.observe_recorded_item(1, &shell_output);
+
+        let web_search = ResponseItem::WebSearchCall {
+            id: Some("ws_1".to_string()),
+            status: Some("completed".to_string()),
+            action: Some(WebSearchAction::Search {
+                query: Some("weather".to_string()),
+                queries: None,
+            }),
+        };
+        sidecar.observe_recorded_item(2, &web_search);
+
+        let image_generation = ResponseItem::ImageGenerationCall {
+            id: "ig_1".to_string(),
+            status: "completed".to_string(),
+            revised_prompt: Some("cat".to_string()),
+            result: "image-ref".to_string(),
+        };
+        sidecar.observe_recorded_item(3, &image_generation);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(4, &phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let units = sidecar
+            .selectable_units(
+                checkpoint.checkpoint_id.as_str(),
+                MAX_UNITS_PER_RETRIEVE,
+                MAX_RAW_BYTES_PER_RETRIEVE,
+            )
+            .expect("units");
+
+        assert_eq!(checkpoint.eligible_unit_count, 3);
+        assert_eq!(units.len(), 3);
+        assert!(matches!(units[0].kind, PromptGcUnitKind::ToolPair));
+        assert!(matches!(units[1].kind, PromptGcUnitKind::ToolResult));
+        assert!(matches!(units[2].kind, PromptGcUnitKind::ToolResult));
+        assert!(units[0].payload_text.contains("local_shell"));
+        assert!(units[1].payload_text.contains("web_search"));
+        assert!(units[2].payload_text.contains("image_generation"));
+    }
+
+    #[test]
+    fn captures_local_shell_legacy_id_fallback() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let shell_call = ResponseItem::LocalShellCall {
+            id: Some("legacy-shell".to_string()),
+            call_id: None,
+            status: LocalShellStatus::Completed,
+            action: LocalShellAction::Exec(LocalShellExecAction {
+                command: vec!["pwd".to_string()],
+                working_directory: None,
+                timeout_ms: None,
+                env: None,
+                user: None,
+            }),
+        };
+        sidecar.observe_recorded_item(0, &shell_call);
+
+        let shell_output = ResponseItem::FunctionCallOutput {
+            call_id: "legacy-shell".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("/tmp".to_string()),
+                success: Some(true),
+            },
+        };
+        sidecar.observe_recorded_item(1, &shell_output);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(2, &phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let units = sidecar
+            .selectable_units(
+                checkpoint.checkpoint_id.as_str(),
+                MAX_UNITS_PER_RETRIEVE,
+                MAX_RAW_BYTES_PER_RETRIEVE,
+            )
+            .expect("units");
+
+        assert_eq!(checkpoint.eligible_unit_count, 1);
+        assert_eq!(units.len(), 1);
+        assert!(matches!(units[0].kind, PromptGcUnitKind::ToolPair));
+        assert!(units[0].payload_text.contains("legacy-shell"));
+    }
+
+    #[test]
+    fn clearing_pending_calls_prevents_rewrite_stale_pairing_on_reused_call_id() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let old_call = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: "{\"cmd\":\"old\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(0, &old_call);
+        sidecar.clear_pending_calls_for_rewrite();
+
+        let new_call = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: "{\"cmd\":\"new\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(1, &new_call);
+
+        let output = ResponseItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("/tmp".to_string()),
+                success: Some(true),
+            },
+        };
+        sidecar.observe_recorded_item(2, &output);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(3, &phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let units = sidecar
+            .selectable_units(
+                checkpoint.checkpoint_id.as_str(),
+                MAX_UNITS_PER_RETRIEVE,
+                MAX_RAW_BYTES_PER_RETRIEVE,
+            )
+            .expect("units");
+
+        assert_eq!(units.len(), 1);
+        assert!(units[0].payload_text.contains("{\"cmd\":\"new\"}"));
+        assert!(!units[0].payload_text.contains("{\"cmd\":\"old\"}"));
+    }
+}

@@ -8,6 +8,7 @@ use crate::features::Features;
 use crate::mcp_connection_manager::ToolInfo;
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::tools::handlers::PLAN_TOOL;
+use crate::tools::handlers::PromptGcHandler;
 use crate::tools::handlers::SEARCH_TOOL_BM25_DEFAULT_LIMIT;
 use crate::tools::handlers::SEARCH_TOOL_BM25_TOOL_NAME;
 use crate::tools::handlers::agent_jobs::BatchJobHandler;
@@ -18,6 +19,7 @@ use crate::tools::handlers::multi_agents::MAX_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents::MIN_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::request_user_input_tool_description;
 use crate::tools::registry::ToolRegistryBuilder;
+use crate::tools::router::ToolRouter;
 use codex_protocol::config_types::WebSearchConfig;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -1588,6 +1590,98 @@ fn create_manage_context_tool() -> ToolSpec {
             additional_properties: Some(false.into()),
         },
     })
+}
+
+pub(crate) fn create_prompt_gc_tool() -> ToolSpec {
+    let mut chunk_summary_properties = BTreeMap::new();
+    chunk_summary_properties.insert(
+        "chunk_id".to_string(),
+        JsonSchema::String {
+            description: Some("Identifier for a chunk from chunk_manifest.".to_string()),
+        },
+    );
+    chunk_summary_properties.insert(
+        "tool_context".to_string(),
+        JsonSchema::String {
+            description: Some("Condensed tool-facing context for this chunk.".to_string()),
+        },
+    );
+    chunk_summary_properties.insert(
+        "reasoning_context".to_string(),
+        JsonSchema::String {
+            description: Some("Condensed reasoning context for this chunk.".to_string()),
+        },
+    );
+    let chunk_summary_schema = JsonSchema::Object {
+        properties: chunk_summary_properties,
+        required: Some(vec![
+            "chunk_id".to_string(),
+            "tool_context".to_string(),
+            "reasoning_context".to_string(),
+        ]),
+        additional_properties: Some(false.into()),
+    };
+
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "mode".to_string(),
+        JsonSchema::String {
+            description: Some("Mode: retrieve | apply.".to_string()),
+        },
+    );
+    properties.insert(
+        "policy_id".to_string(),
+        JsonSchema::String {
+            description: Some("Required policy identifier for retrieve/apply.".to_string()),
+        },
+    );
+    properties.insert(
+        "checkpoint_id".to_string(),
+        JsonSchema::String {
+            description: Some("Required active-turn checkpoint identifier.".to_string()),
+        },
+    );
+    properties.insert(
+        "plan_id".to_string(),
+        JsonSchema::String {
+            description: Some("Required for apply; obtained from retrieve.".to_string()),
+        },
+    );
+    properties.insert(
+        "state_hash".to_string(),
+        JsonSchema::String {
+            description: Some("Required for apply; anti-drift hash from retrieve.".to_string()),
+        },
+    );
+    properties.insert(
+        "chunk_summaries".to_string(),
+        JsonSchema::Array {
+            description: Some(
+                "Required for apply; one condensed summary per selected chunk.".to_string(),
+            ),
+            items: Box::new(chunk_summary_schema),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "prompt_gc".to_string(),
+        description: "Internal PromptGcSidecar tool for active-turn prompt compaction.".to_string(),
+        strict: true,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["mode".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+pub(crate) fn build_prompt_gc_sidecar_router() -> ToolRouter {
+    use std::sync::Arc;
+
+    let mut builder = ToolRegistryBuilder::new();
+    builder.push_spec(create_prompt_gc_tool());
+    builder.register_handler("prompt_gc", Arc::new(PromptGcHandler));
+    ToolRouter::from_builder(builder)
 }
 
 fn create_recall_tool() -> ToolSpec {

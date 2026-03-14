@@ -47,7 +47,12 @@ use crate::tools::handlers::UnifiedExecHandler;
 use crate::tools::registry::ToolHandler;
 use crate::tools::router::ToolCallSource;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use chrono::TimeZone;
+use chrono::Utc;
 use codex_app_server_protocol::AppInfo;
+use codex_hooks::Hook;
+use codex_hooks::HookResult;
+use codex_hooks::Hooks;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
@@ -62,7 +67,10 @@ use opentelemetry::trace::TraceContextExt;
 use opentelemetry::trace::TraceId;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -73,11 +81,18 @@ use pretty_assertions::assert_eq;
 use rmcp::model::JsonObject;
 use rmcp::model::Tool;
 use serde::Deserialize;
+use serde_json::Value;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration as StdDuration;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::Respond;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 #[path = "codex_tests_guardian.rs"]
 mod guardian_tests;
@@ -220,6 +235,565 @@ fn assistant_message_stream_parsers_seed_plan_parser_across_added_and_delta_boun
     assert!(tail.plan_segments.is_empty());
 }
 
+#[test]
+fn prompt_gc_capability_is_explicitly_opt_in() {
+    assert!(RegularTask::default().supports_prompt_gc());
+    assert!(!crate::tasks::UserShellCommandTask::new("echo hi".to_string()).supports_prompt_gc());
+    assert!(!crate::tasks::UndoTask::new().supports_prompt_gc());
+    assert!(
+        !NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        }
+        .supports_prompt_gc()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_gc_sidecar_empty_retrieve_completes_without_visible_accounting() {
+    let server = MockServer::start().await;
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
+    let retrieve_args = json!({
+        "mode": "retrieve",
+        "policy_id": turn_context.config.manage_context_policy.quality_rubric_id,
+        "checkpoint_id": checkpoint_id,
+    })
+    .to_string();
+    let hidden_rate_limits = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 12.0,
+            window_minutes: Some(5),
+            resets_at: Some(1_700_000_000),
+        }),
+        secondary: None,
+        credits: None,
+        plan_type: None,
+    };
+    let response_body = sse(&[
+        response_created("resp-1"),
+        function_call_event("call-1", "prompt_gc", &retrieve_args),
+        response_completed_with_usage("resp-1", 17),
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(StaticSseResponder {
+            calls: AtomicUsize::new(0),
+            response_body,
+            headers: vec![
+                (
+                    "x-codex-primary-used-percent".to_string(),
+                    "12.0".to_string(),
+                ),
+                (
+                    "x-codex-primary-window-minutes".to_string(),
+                    "5".to_string(),
+                ),
+                (
+                    "x-codex-primary-reset-at".to_string(),
+                    "1700000000".to_string(),
+                ),
+            ],
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let phase_message = ResponseItem::Message {
+        id: Some("phase-1".to_string()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "checkpoint".to_string(),
+        }],
+        end_turn: None,
+        phase: Some(codex_protocol::models::MessagePhase::Commentary),
+    };
+    let observed_items = session
+        .record_into_history(std::slice::from_ref(&phase_message), &turn_context)
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
+    assert_eq!(status.last_error, None);
+
+    let tool_calls = {
+        let active = session.active_turn.lock().await;
+        let active_turn = active.as_ref().expect("active turn");
+        active_turn.turn_state.lock().await.tool_calls
+    };
+    assert_eq!(
+        tool_calls, 0,
+        "hidden prompt_gc should not increment visible tool accounting"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "hidden prompt_gc should not emit visible events such as TokenCount"
+    );
+    let latest_rate_limits = session.state.lock().await.latest_rate_limits.clone();
+    assert_eq!(latest_rate_limits, Some(hidden_rate_limits));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_gc_sidecar_skips_after_tool_use_hooks() {
+    let server = MockServer::start().await;
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls_for_hook = Arc::clone(&hook_calls);
+    let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
+    session_mut.services.hooks = Hooks::from_hooks(
+        Vec::new(),
+        vec![Hook {
+            name: "abort-sidecar".to_string(),
+            func: Arc::new(move |_| {
+                let hook_calls = Arc::clone(&hook_calls_for_hook);
+                Box::pin(async move {
+                    hook_calls.fetch_add(1, Ordering::SeqCst);
+                    HookResult::FailedAbort(
+                        std::io::Error::other("sidecar hook should not run").into(),
+                    )
+                })
+            }),
+        }],
+    );
+
+    let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
+    let retrieve_args = json!({
+        "mode": "retrieve",
+        "policy_id": turn_context.config.manage_context_policy.quality_rubric_id,
+        "checkpoint_id": checkpoint_id,
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(StaticSseResponder {
+            calls: AtomicUsize::new(0),
+            response_body: sse(&[
+                response_created("resp-1"),
+                function_call_event("call-1", "prompt_gc", &retrieve_args),
+                response_completed_with_usage("resp-1", 17),
+            ]),
+            headers: Vec::new(),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let phase_message = ResponseItem::Message {
+        id: Some("phase-1".to_string()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "checkpoint".to_string(),
+        }],
+        end_turn: None,
+        phase: Some(codex_protocol::models::MessagePhase::Commentary),
+    };
+    let observed_items = session
+        .record_into_history(std::slice::from_ref(&phase_message), &turn_context)
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
+    assert_eq!(status.last_error, None);
+    assert_eq!(
+        hook_calls.load(Ordering::SeqCst),
+        0,
+        "hidden prompt_gc must not dispatch after_tool_use hooks"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "hidden prompt_gc should stay silent in visible events when hooks are configured"
+    );
+}
+
+#[tokio::test]
+async fn prompt_gc_persist_replacement_history_flush_failure_keeps_live_history_unchanged() {
+    let (session, turn_context) = make_session_and_context().await;
+    let history_before = {
+        let mut state = session.state.lock().await;
+        state.record_items(
+            [user_message("before"), assistant_message("still here")].iter(),
+            turn_context.truncation_policy,
+        );
+        state.history_snapshot_lenient()
+    };
+
+    let error = session
+        .persist_prompt_gc_replacement_history_with_sink(
+            &turn_context,
+            vec![assistant_message("replacement history")],
+            Some(&FlushFailingPromptGcRolloutSink),
+        )
+        .await
+        .expect_err("flush failure should fail prompt_gc persistence");
+    assert!(
+        error.contains("failed to persist prompt_gc replacement_history atomically"),
+        "unexpected error: {error}"
+    );
+
+    let history_after = {
+        let state = session.state.lock().await;
+        state.history_snapshot_lenient()
+    };
+    assert_eq!(history_after, history_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_gc_hidden_usage_limit_updates_rate_limits_without_visible_events() {
+    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let rate_limits = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 87.5,
+            window_minutes: Some(15),
+            resets_at: Some(1_700_000_123),
+        }),
+        secondary: None,
+        credits: None,
+        plan_type: None,
+    };
+    let usage_limit = crate::error::UsageLimitReachedError {
+        plan_type: None,
+        resets_at: Some(Utc.with_ymd_and_hms(2024, 1, 1, 0, 15, 0).unwrap()),
+        rate_limits: Some(Box::new(rate_limits.clone())),
+        promo_message: None,
+    };
+
+    let should_retry = handle_usage_limit_for_execution_mode(
+        &session,
+        &turn_context,
+        &usage_limit,
+        None,
+        SamplingExecutionMode::Hidden,
+    )
+    .await
+    .expect("hidden usage-limit handling should succeed");
+
+    assert!(
+        !should_retry,
+        "hidden prompt_gc should not auto-switch accounts or silently retry"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "hidden usage-limit refresh should not emit visible events"
+    );
+    let latest_rate_limits = session.state.lock().await.latest_rate_limits.clone();
+    assert_eq!(latest_rate_limits, Some(rate_limits));
+}
+
+#[tokio::test]
+async fn prompt_gc_sidecar_contract_error_is_terminal_after_first_request() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(StaticSseResponder {
+            calls: AtomicUsize::new(0),
+            response_body: sse(&[
+                response_created("resp-1"),
+                function_call_event(
+                    "call-1",
+                    crate::prompt_gc_sidecar::PROMPT_GC_TOOL_NAME,
+                    &json!({
+                        "mode": "retrieve",
+                        "checkpoint_id": format!("{}:prompt_gc:0", turn_context.sub_id),
+                    })
+                    .to_string(),
+                ),
+                response_completed_with_usage("resp-1", 17),
+            ]),
+            headers: Vec::new(),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let phase_message = ResponseItem::Message {
+        id: Some("phase-1".to_string()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "checkpoint".to_string(),
+        }],
+        end_turn: None,
+        phase: Some(codex_protocol::models::MessagePhase::Commentary),
+    };
+    sidecar
+        .lock()
+        .await
+        .observe_recorded_item(0, &phase_message);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, None);
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some("invalid_contract: missing or empty 'policy_id'")
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "hidden prompt_gc contract errors must stay silent in visible events"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_gc_hidden_context_window_does_not_emit_token_count() {
+    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let token_info_before = {
+        let state = session.state.lock().await;
+        state.token_info()
+    };
+
+    maybe_set_total_tokens_full_for_execution_mode(
+        &session,
+        &turn_context,
+        SamplingExecutionMode::Hidden,
+    )
+    .await;
+
+    assert!(
+        rx.try_recv().is_err(),
+        "hidden context-window handling should not emit visible token counts"
+    );
+    let token_info_after = {
+        let state = session.state.lock().await;
+        state.token_info()
+    };
+    assert_eq!(token_info_after, token_info_before);
+}
+
+#[tokio::test]
+async fn prompt_gc_sidecar_recovers_noted_apply_outcome_after_stream_failure() {
+    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let reasoning = ResponseItem::Reasoning {
+        id: String::new(),
+        summary: Vec::new(),
+        content: None,
+        encrypted_content: None,
+    };
+    let phase_message = ResponseItem::Message {
+        id: Some("phase-1".to_string()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "checkpoint".to_string(),
+        }],
+        end_turn: None,
+        phase: Some(codex_protocol::models::MessagePhase::Commentary),
+    };
+    let observed_items = session
+        .record_into_history(&[reasoning, phase_message], &turn_context)
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+
+    let checkpoint = sidecar
+        .lock()
+        .await
+        .take_pending_checkpoint()
+        .expect("checkpoint");
+    sidecar
+        .lock()
+        .await
+        .note_apply_outcome(&checkpoint.checkpoint_id, vec![7]);
+
+    let outcome =
+        take_noted_prompt_gc_apply_outcome(session.as_ref(), turn_context.as_ref(), &checkpoint)
+            .await
+            .expect("noted outcome");
+    sidecar.lock().await.complete_cycle(outcome);
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_error, None);
+    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
+    assert!(
+        rx.try_recv().is_err(),
+        "noted hidden prompt_gc recovery should not emit visible events"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_gc_hidden_transport_fallback_warning_is_suppressed() {
+    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+
+    maybe_emit_transport_fallback_warning_for_execution_mode(
+        &session,
+        &turn_context,
+        SamplingExecutionMode::Hidden,
+        &CodexErr::Stream("websocket disconnected".to_string(), None),
+    )
+    .await;
+
+    assert!(
+        rx.try_recv().is_err(),
+        "hidden transport fallback should not emit visible warnings"
+    );
+}
+
+#[tokio::test]
+async fn prompt_gc_hidden_fallback_does_not_disable_visible_websocket_transport() {
+    let (mut session, mut turn_context, _rx) = make_session_and_context_with_rx().await;
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.provider.supports_websockets = true;
+    turn_context_mut.model_info.prefer_websockets = true;
+
+    let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(426))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(StaticSseResponder {
+            calls: AtomicUsize::new(0),
+            response_body: sse(&[
+                response_created("resp-1"),
+                response_completed_with_usage("resp-1", 1),
+            ]),
+            headers: Vec::new(),
+        })
+        .mount(&server)
+        .await;
+    let auth_manager = Arc::clone(&session_mut.services.auth_manager);
+    session_mut.services.model_client = ModelClient::new(
+        Some(auth_manager),
+        session_mut.conversation_id,
+        {
+            let mut provider = turn_context.provider.clone();
+            provider.base_url = Some(format!("{}/v1", server.uri()));
+            provider
+        },
+        turn_context.session_source.clone(),
+        turn_context.config.model_verbosity,
+        false,
+        turn_context
+            .config
+            .features
+            .enabled(Feature::EnableRequestCompression),
+        turn_context
+            .config
+            .features
+            .enabled(Feature::RuntimeMetrics),
+        None,
+    );
+
+    let parent_client_session = session.services.model_client.new_session();
+    let mut client_session = parent_client_session.new_hidden_child_session();
+    assert!(
+        session
+            .services
+            .model_client
+            .responses_websocket_enabled(&turn_context.model_info),
+        "test setup should start with websockets enabled"
+    );
+
+    let _stream = client_session
+        .stream(
+            &Prompt {
+                input: vec![user_message("gc checkpoint")],
+                tools: Vec::new(),
+                parallel_tool_calls: false,
+                base_instructions: BaseInstructions {
+                    text: "hidden prompt gc".to_string(),
+                },
+                personality: None,
+                output_schema: None,
+            },
+            &turn_context.model_info,
+            &turn_context.session_telemetry,
+            turn_context.reasoning_effort,
+            turn_context.reasoning_summary,
+            turn_context.config.service_tier,
+            None,
+        )
+        .await
+        .expect("hidden prompt_gc should fall back to HTTP without mutating visible transport");
+    assert!(
+        session
+            .services
+            .model_client
+            .responses_websocket_enabled(&turn_context.model_info),
+        "hidden prompt_gc fallback handling must leave visible websocket transport enabled"
+    );
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    let websocket_attempts = requests
+        .iter()
+        .filter(|request| {
+            request.method.as_str() == "GET" && request.url.path().ends_with("/responses")
+        })
+        .count();
+    let http_attempts = requests
+        .iter()
+        .filter(|request| {
+            request.method.as_str() == "POST" && request.url.path().ends_with("/responses")
+        })
+        .count();
+    assert_eq!(websocket_attempts, 1);
+    assert_eq!(http_attempts, 1);
+
+    assert!(
+        session
+            .services
+            .model_client
+            .new_session()
+            .try_switch_fallback_transport(
+                &turn_context.session_telemetry,
+                &turn_context.model_info
+            ),
+        "visible execution should still be able to activate fallback"
+    );
+    assert!(
+        !session
+            .services
+            .model_client
+            .responses_websocket_enabled(&turn_context.model_info),
+        "visible fallback activation should disable websocket transport"
+    );
+}
+
 fn make_mcp_tool(
     server_name: &str,
     tool_name: &str,
@@ -260,6 +834,140 @@ fn function_call_output_rollout_item(call_id: &str, output: &str) -> RolloutItem
         call_id: call_id.to_string(),
         output: FunctionCallOutputPayload::from_text(output.to_string()),
     })
+}
+
+fn response_created(id: &str) -> Value {
+    json!({
+        "type": "response.created",
+        "response": {
+            "id": id,
+        }
+    })
+}
+
+fn response_completed_with_usage(id: &str, total_tokens: u32) -> Value {
+    json!({
+        "type": "response.completed",
+        "response": {
+            "id": id,
+            "usage": {
+                "input_tokens": total_tokens,
+                "input_tokens_details": null,
+                "output_tokens": 0,
+                "output_tokens_details": null,
+                "total_tokens": total_tokens
+            }
+        }
+    })
+}
+
+fn function_call_event(call_id: &str, name: &str, arguments: &str) -> Value {
+    json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments
+        }
+    })
+}
+
+fn sse(events: &[Value]) -> String {
+    let mut output = String::new();
+    for event in events {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .expect("response event type");
+        writeln!(&mut output, "event: {event_type}").expect("write SSE event type");
+        write!(&mut output, "data: {event}\n\n").expect("write SSE event body");
+    }
+    output
+}
+
+struct StaticSseResponder {
+    calls: AtomicUsize,
+    response_body: String,
+    headers: Vec<(String, String)>,
+}
+
+impl Respond for StaticSseResponder {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        let call_num = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call_num > 0 {
+            panic!("unexpected extra model request {call_num}");
+        }
+        let mut response = ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(self.response_body.clone());
+        for (name, value) in &self.headers {
+            response = response.insert_header(name.clone(), value.clone());
+        }
+        response
+    }
+}
+
+struct FlushFailingPromptGcRolloutSink;
+
+#[async_trait::async_trait]
+impl PromptGcRolloutSink for FlushFailingPromptGcRolloutSink {
+    async fn persist_items_atomically(&self, _items: &[RolloutItem]) -> std::io::Result<()> {
+        Err(std::io::Error::other("flush failed"))
+    }
+}
+
+async fn install_prompt_gc_active_turn(
+    session: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+) -> Arc<tokio::sync::Mutex<crate::prompt_gc_sidecar::PromptGcSidecar>> {
+    let mut active_turn = crate::state::ActiveTurn::default();
+    let sidecar = active_turn.ensure_prompt_gc_sidecar();
+    sidecar.lock().await.bind_turn(turn_context.sub_id.clone());
+    active_turn.add_task(crate::state::RunningTask {
+        done: Arc::new(tokio::sync::Notify::new()),
+        kind: TaskKind::Regular,
+        task: Arc::new(NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        }),
+        cancellation_token: CancellationToken::new(),
+        handle: Arc::new(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            async {},
+        ))),
+        turn_context: Arc::clone(turn_context),
+        _timer: None,
+    });
+    *session.active_turn.lock().await = Some(active_turn);
+    sidecar
+}
+
+fn configure_session_model_client_for_server(
+    session: &mut Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    server: &MockServer,
+) {
+    let mut provider = crate::built_in_model_providers()["openai"].clone();
+    provider.base_url = Some(format!("{}/v1", server.uri()));
+    let session_mut = Arc::get_mut(session).expect("session arc should be unique");
+    let auth_manager = Arc::clone(&session_mut.services.auth_manager);
+    session_mut.services.model_client = ModelClient::new(
+        Some(auth_manager),
+        session_mut.conversation_id,
+        provider,
+        turn_context.session_source.clone(),
+        turn_context.config.model_verbosity,
+        crate::ws_version_from_features(turn_context.config.as_ref()),
+        turn_context
+            .config
+            .features
+            .enabled(Feature::EnableRequestCompression),
+        turn_context
+            .config
+            .features
+            .enabled(Feature::RuntimeMetrics),
+        None,
+    );
 }
 
 #[test]
@@ -948,6 +1656,23 @@ async fn recompute_token_usage_updates_model_context_window() {
 }
 
 #[tokio::test]
+async fn prompt_gc_prompt_defaults_to_builtin_prompt() {
+    let (_session, turn_context) = make_session_and_context().await;
+    assert_eq!(
+        turn_context.prompt_gc_prompt(),
+        crate::client_common::PROMPT_GC_PROMPT
+    );
+}
+
+#[tokio::test]
+async fn prompt_gc_prompt_prefers_turn_context_override() {
+    let (_session, mut turn_context) = make_session_and_context().await;
+    turn_context.prompt_gc_prompt = Some("override prompt".to_string());
+
+    assert_eq!(turn_context.prompt_gc_prompt(), "override prompt");
+}
+
+#[tokio::test]
 async fn record_initial_history_reconstructs_forked_transcript() {
     let (session, turn_context) = make_session_and_context().await;
     let (rollout_items, mut expected) = sample_rollout(&session, &turn_context).await;
@@ -1418,6 +2143,7 @@ async fn set_rate_limits_retains_previous_credits() {
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
         compact_prompt: config.compact_prompt.clone(),
+        prompt_gc_prompt: config.prompt_gc_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         sandbox_policy: config.permissions.sandbox_policy.clone(),
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
@@ -1517,6 +2243,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
         compact_prompt: config.compact_prompt.clone(),
+        prompt_gc_prompt: config.prompt_gc_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         sandbox_policy: config.permissions.sandbox_policy.clone(),
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
@@ -1874,6 +2601,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
         compact_prompt: config.compact_prompt.clone(),
+        prompt_gc_prompt: config.prompt_gc_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         sandbox_policy: config.permissions.sandbox_policy.clone(),
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
@@ -1936,6 +2664,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
         compact_prompt: config.compact_prompt.clone(),
+        prompt_gc_prompt: config.prompt_gc_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         sandbox_policy: config.permissions.sandbox_policy.clone(),
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
@@ -2036,6 +2765,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
         compact_prompt: config.compact_prompt.clone(),
+        prompt_gc_prompt: config.prompt_gc_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         sandbox_policy: config.permissions.sandbox_policy.clone(),
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
@@ -2452,6 +3182,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
         compact_prompt: config.compact_prompt.clone(),
+        prompt_gc_prompt: config.prompt_gc_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         sandbox_policy: config.permissions.sandbox_policy.clone(),
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),

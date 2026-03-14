@@ -269,6 +269,10 @@ pub struct Config {
     /// Compact prompt override.
     pub compact_prompt: Option<String>,
 
+    /// PromptGcSidecar prompt override. Defaults to the built-in
+    /// `prompt_gc_prompt.md` when unset.
+    pub prompt_gc_prompt: Option<String>,
+
     /// Optional instructions appended after successful remote auto-compaction.
     pub pos_compact_instructions: Option<String>,
 
@@ -1138,6 +1142,10 @@ pub struct ConfigToml {
 
     /// Compact prompt used for history compaction.
     pub compact_prompt: Option<String>,
+
+    /// PromptGcSidecar prompt override used for hidden prompt-gc turns.
+    /// Defaults to the built-in `prompt_gc_prompt.md` when unset.
+    pub prompt_gc_prompt: Option<String>,
 
     /// Optional instructions appended after successful remote auto-compaction.
     pub pos_compact_instructions: Option<String>,
@@ -2353,6 +2361,14 @@ impl Config {
                 Some(trimmed.to_string())
             }
         });
+        let prompt_gc_prompt = cfg.prompt_gc_prompt.as_ref().and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
         let pos_compact_instructions = cfg.pos_compact_instructions.as_ref().and_then(|value| {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -2540,6 +2556,7 @@ impl Config {
             personality,
             developer_instructions,
             compact_prompt,
+            prompt_gc_prompt,
             pos_compact_instructions,
             commit_attribution,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"

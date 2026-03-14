@@ -16,6 +16,7 @@ use rmcp::model::RequestId;
 use tokio::sync::oneshot;
 
 use crate::codex::TurnContext;
+use crate::prompt_gc_sidecar::PromptGcSidecar;
 use crate::protocol::ReviewDecision;
 use crate::protocol::TokenUsage;
 use crate::tasks::SessionTask;
@@ -24,6 +25,7 @@ use crate::tasks::SessionTask;
 pub(crate) struct ActiveTurn {
     pub(crate) tasks: IndexMap<String, RunningTask>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
+    pub(crate) prompt_gc_sidecar: Option<Arc<Mutex<PromptGcSidecar>>>,
 }
 
 impl Default for ActiveTurn {
@@ -31,6 +33,7 @@ impl Default for ActiveTurn {
         Self {
             tasks: IndexMap::new(),
             turn_state: Arc::new(Mutex::new(TurnState::default())),
+            prompt_gc_sidecar: None,
         }
     }
 }
@@ -67,6 +70,17 @@ impl ActiveTurn {
 
     pub(crate) fn drain_tasks(&mut self) -> Vec<RunningTask> {
         self.tasks.drain(..).map(|(_, task)| task).collect()
+    }
+
+    pub(crate) fn ensure_prompt_gc_sidecar(&mut self) -> Arc<Mutex<PromptGcSidecar>> {
+        Arc::clone(
+            self.prompt_gc_sidecar
+                .get_or_insert_with(|| Arc::new(Mutex::new(PromptGcSidecar::default()))),
+        )
+    }
+
+    pub(crate) fn prompt_gc_sidecar(&self) -> Option<Arc<Mutex<PromptGcSidecar>>> {
+        self.prompt_gc_sidecar.as_ref().map(Arc::clone)
     }
 }
 

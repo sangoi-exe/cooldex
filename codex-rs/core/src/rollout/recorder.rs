@@ -93,6 +93,10 @@ pub enum RolloutRecorderParams {
 
 enum RolloutCmd {
     AddItems(Vec<RolloutItem>),
+    AddItemsAtomically {
+        items: Vec<RolloutItem>,
+        ack: oneshot::Sender<std::io::Result<()>>,
+    },
     Persist {
         ack: oneshot::Sender<()>,
     },
@@ -504,6 +508,36 @@ impl RolloutRecorder {
             .map_err(|e| IoError::other(format!("failed to queue rollout items: {e}")))
     }
 
+    pub(crate) async fn persist_items_atomically(
+        &self,
+        items: &[RolloutItem],
+    ) -> std::io::Result<()> {
+        // Merge-safety anchor: prompt_gc rewrites depend on this ack meaning both
+        // rollout items are durably written together before live history commits.
+        let mut filtered = Vec::new();
+        for item in items {
+            if is_persisted_response_item(item, self.event_persistence_mode) {
+                filtered.push(sanitize_rollout_item_for_persistence(
+                    item.clone(),
+                    self.event_persistence_mode,
+                ));
+            }
+        }
+        if filtered.is_empty() {
+            return Ok(());
+        }
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(RolloutCmd::AddItemsAtomically {
+                items: filtered,
+                ack: tx,
+            })
+            .await
+            .map_err(|e| IoError::other(format!("failed to queue atomic rollout items: {e}")))?;
+        rx.await
+            .map_err(|e| IoError::other(format!("failed waiting for atomic rollout items: {e}")))?
+    }
+
     /// Materialize the rollout file and persist all buffered items.
     ///
     /// This is idempotent; after first materialization, repeated calls are no-ops.
@@ -765,48 +799,54 @@ async fn rollout_writer(
                 )
                 .await?;
             }
+            RolloutCmd::AddItemsAtomically { items, ack } => {
+                let result = async {
+                    ensure_rollout_writer_ready(
+                        &mut writer,
+                        &mut deferred_log_file_info,
+                        &mut meta,
+                        &cwd,
+                        &rollout_path,
+                        state_db_ctx.as_deref(),
+                        &mut state_builder,
+                        default_provider.as_str(),
+                        generate_memories,
+                        &mut buffered_items,
+                    )
+                    .await?;
+                    write_and_reconcile_items_atomically(
+                        writer.as_mut(),
+                        items.as_slice(),
+                        &rollout_path,
+                        state_db_ctx.as_deref(),
+                        state_builder.as_ref(),
+                        default_provider.as_str(),
+                    )
+                    .await
+                }
+                .await;
+
+                let ack_result = result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| IoError::other(error.to_string()));
+                let _ = ack.send(ack_result);
+                result?;
+            }
             RolloutCmd::Persist { ack } => {
                 if writer.is_none() {
-                    let result = async {
-                        let Some(log_file_info) = deferred_log_file_info.take() else {
-                            return Err(IoError::other(
-                                "deferred rollout recorder missing log file metadata",
-                            ));
-                        };
-                        let file = open_log_file(log_file_info.path.as_path())?;
-                        writer = Some(JsonlWriter {
-                            file: tokio::fs::File::from_std(file),
-                        });
-
-                        if let Some(session_meta) = meta.take() {
-                            write_session_meta(
-                                writer.as_mut(),
-                                session_meta,
-                                &cwd,
-                                &rollout_path,
-                                state_db_ctx.as_deref(),
-                                &mut state_builder,
-                                default_provider.as_str(),
-                                generate_memories,
-                            )
-                            .await?;
-                        }
-
-                        if !buffered_items.is_empty() {
-                            write_and_reconcile_items(
-                                writer.as_mut(),
-                                buffered_items.as_slice(),
-                                &rollout_path,
-                                state_db_ctx.as_deref(),
-                                state_builder.as_ref(),
-                                default_provider.as_str(),
-                            )
-                            .await?;
-                            buffered_items.clear();
-                        }
-
-                        Ok(())
-                    }
+                    let result = ensure_rollout_writer_ready(
+                        &mut writer,
+                        &mut deferred_log_file_info,
+                        &mut meta,
+                        &cwd,
+                        &rollout_path,
+                        state_db_ctx.as_deref(),
+                        &mut state_builder,
+                        default_provider.as_str(),
+                        generate_memories,
+                        &mut buffered_items,
+                    )
                     .await;
 
                     if let Err(err) = result {
@@ -872,6 +912,63 @@ async fn write_session_meta(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn ensure_rollout_writer_ready(
+    writer: &mut Option<JsonlWriter>,
+    deferred_log_file_info: &mut Option<LogFileInfo>,
+    meta: &mut Option<SessionMeta>,
+    cwd: &Path,
+    rollout_path: &Path,
+    state_db_ctx: Option<&StateRuntime>,
+    state_builder: &mut Option<ThreadMetadataBuilder>,
+    default_provider: &str,
+    generate_memories: bool,
+    buffered_items: &mut Vec<RolloutItem>,
+) -> std::io::Result<()> {
+    if writer.is_some() {
+        return Ok(());
+    }
+
+    let Some(log_file_info) = deferred_log_file_info.take() else {
+        return Err(IoError::other(
+            "deferred rollout recorder missing log file metadata",
+        ));
+    };
+    let file = open_log_file(log_file_info.path.as_path())?;
+    *writer = Some(JsonlWriter {
+        file: tokio::fs::File::from_std(file),
+    });
+
+    if let Some(session_meta) = meta.take() {
+        write_session_meta(
+            writer.as_mut(),
+            session_meta,
+            cwd,
+            rollout_path,
+            state_db_ctx,
+            state_builder,
+            default_provider,
+            generate_memories,
+        )
+        .await?;
+    }
+
+    if !buffered_items.is_empty() {
+        write_and_reconcile_items(
+            writer.as_mut(),
+            buffered_items.as_slice(),
+            rollout_path,
+            state_db_ctx,
+            state_builder.as_ref(),
+            default_provider,
+        )
+        .await?;
+        buffered_items.clear();
+    }
+
+    Ok(())
+}
+
 async fn write_and_reconcile_items(
     mut writer: Option<&mut JsonlWriter>,
     items: &[RolloutItem],
@@ -884,6 +981,29 @@ async fn write_and_reconcile_items(
         for item in items {
             writer.write_rollout_item(item).await?;
         }
+    }
+    sync_thread_state_after_write(
+        state_db_ctx,
+        rollout_path,
+        state_builder,
+        items,
+        default_provider,
+        None,
+    )
+    .await;
+    Ok(())
+}
+
+async fn write_and_reconcile_items_atomically(
+    mut writer: Option<&mut JsonlWriter>,
+    items: &[RolloutItem],
+    rollout_path: &Path,
+    state_db_ctx: Option<&StateRuntime>,
+    state_builder: Option<&ThreadMetadataBuilder>,
+    default_provider: &str,
+) -> std::io::Result<()> {
+    if let Some(writer) = writer.as_mut() {
+        writer.write_rollout_items_atomically(items).await?;
     }
     sync_thread_state_after_write(
         state_db_ctx,
@@ -977,6 +1097,34 @@ impl JsonlWriter {
         json.push('\n');
         self.file.write_all(json.as_bytes()).await?;
         self.file.flush().await?;
+        Ok(())
+    }
+
+    async fn write_rollout_items_atomically(
+        &mut self,
+        rollout_items: &[RolloutItem],
+    ) -> std::io::Result<()> {
+        // Merge-safety anchor: keep prompt_gc multi-item persistence on a single
+        // write+flush path so the recorder does not ack halfway through a pair.
+        let timestamp_format: &[FormatItem] = format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        );
+        let mut payload = String::new();
+        for rollout_item in rollout_items {
+            let timestamp = OffsetDateTime::now_utc()
+                .format(timestamp_format)
+                .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
+            let line = RolloutLineRef {
+                timestamp,
+                item: rollout_item,
+            };
+            let mut json = serde_json::to_string(&line)?;
+            json.push('\n');
+            payload.push_str(&json);
+        }
+        self.file.write_all(payload.as_bytes()).await?;
+        self.file.flush().await?;
+        self.file.sync_data().await?;
         Ok(())
     }
 }
@@ -1110,8 +1258,11 @@ mod tests {
     use crate::features::Feature;
     use chrono::TimeZone;
     use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::protocol::AgentMessageEvent;
     use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::TurnContextItem;
@@ -1615,6 +1766,85 @@ mod tests {
             )
             .await
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prompt_gc_persist_items_atomically_writes_both_rollout_items() -> std::io::Result<()> {
+        let home = TempDir::new().expect("temp dir");
+        let config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        let recorder = RolloutRecorder::new(
+            &config,
+            RolloutRecorderParams::new(
+                ThreadId::new(),
+                None,
+                SessionSource::Exec,
+                BaseInstructions::default(),
+                Vec::new(),
+                EventPersistenceMode::Limited,
+            ),
+            None,
+            None,
+        )
+        .await?;
+
+        recorder
+            .persist_items_atomically(&[
+                RolloutItem::Compacted(CompactedItem {
+                    message: String::new(),
+                    replacement_history: Some(vec![ResponseItem::Message {
+                        id: Some("msg-1".to_string()),
+                        role: "assistant".to_string(),
+                        content: vec![ContentItem::OutputText {
+                            text: "prompt gc summary".to_string(),
+                        }],
+                        end_turn: None,
+                        phase: None,
+                    }]),
+                }),
+                RolloutItem::TurnContext(TurnContextItem {
+                    turn_id: Some("turn-1".to_string()),
+                    trace_id: None,
+                    cwd: home.path().to_path_buf(),
+                    current_date: None,
+                    timezone: None,
+                    approval_policy: AskForApproval::Never,
+                    sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                    network: None,
+                    model: "test-model".to_string(),
+                    personality: None,
+                    collaboration_mode: None,
+                    realtime_active: None,
+                    effort: None,
+                    summary: ReasoningSummaryConfig::Auto,
+                    user_instructions: None,
+                    developer_instructions: None,
+                    final_output_json_schema: None,
+                    truncation_policy: None,
+                }),
+            ])
+            .await?;
+        recorder.flush().await?;
+
+        let rollout_path = recorder.rollout_path().to_path_buf();
+        assert!(
+            rollout_path.exists(),
+            "atomic prompt_gc persist should materialize rollout"
+        );
+        let text = std::fs::read_to_string(rollout_path)?;
+        assert!(
+            text.contains("\"type\":\"compacted\""),
+            "expected compacted item in rollout"
+        );
+        assert!(
+            text.contains("\"type\":\"turn_context\""),
+            "expected turn context item in rollout"
+        );
+
+        recorder.shutdown().await?;
         Ok(())
     }
 }

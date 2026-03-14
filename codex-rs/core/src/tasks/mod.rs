@@ -39,6 +39,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
 
 use crate::features::Feature;
@@ -111,6 +112,16 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
         input: Vec<UserInput>,
         cancellation_token: CancellationToken,
     ) -> Option<String>;
+
+    /// Returns whether this task is allowed to own a PromptGcSidecar.
+    ///
+    /// Merge-safety anchor: phase-1 prompt GC is an explicit capability, not a
+    /// `TaskKind::Regular` side effect. Keep standalone regular lifecycle tasks
+    /// (for example undo/shell auxiliaries) opted out unless their prompt/base
+    /// invariants are reviewed together with hidden-runner semantics.
+    fn supports_prompt_gc(&self) -> bool {
+        false
+    }
 
     /// Gives the task a chance to perform cleanup after an abort.
     ///
@@ -335,11 +346,23 @@ impl Session {
         task: RunningTask,
         token_usage_at_turn_start: TokenUsage,
     ) {
+        let should_enable_prompt_gc = task.task.supports_prompt_gc()
+            && !matches!(task.turn_context.session_source, SessionSource::SubAgent(_));
         let mut active = self.active_turn.lock().await;
         let mut turn = ActiveTurn::default();
         let mut turn_state = turn.turn_state.lock().await;
         turn_state.token_usage_at_turn_start = token_usage_at_turn_start;
         drop(turn_state);
+        if should_enable_prompt_gc {
+            // Merge-safety anchor: prompt GC is regular-turn-only in phase 1; do not enable on
+            // non-regular or child turns without revisiting hidden-runner and persistence
+            // invariants.
+            let sidecar = turn.ensure_prompt_gc_sidecar();
+            sidecar
+                .lock()
+                .await
+                .bind_turn(task.turn_context.sub_id.clone());
+        }
         turn.add_task(task);
         *active = Some(turn);
     }

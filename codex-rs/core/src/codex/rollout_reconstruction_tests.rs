@@ -1289,3 +1289,97 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
     );
     assert!(session.reference_context_item().await.is_none());
 }
+
+#[tokio::test]
+async fn record_initial_history_resumed_ignores_truncated_prompt_gc_compaction_without_turn_context()
+ {
+    let (session, _turn_context) = make_session_and_context().await;
+    let rollout_items = vec![
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: "truncated-prompt-gc-turn".to_string(),
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                message: "incomplete".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+            },
+        )),
+        RolloutItem::Compacted(CompactedItem {
+            message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
+            replacement_history: Some(vec![assistant_message("should not replace")]),
+        }),
+    ];
+
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            history: rollout_items,
+            rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+        }))
+        .await;
+
+    let history = session.clone_history().await;
+    assert!(
+        !history
+            .raw_items()
+            .iter()
+            .any(|item| item == &assistant_message("should not replace"))
+    );
+    assert!(session.reference_context_item().await.is_none());
+}
+
+#[tokio::test]
+async fn record_initial_history_resumed_uses_prompt_gc_compaction_with_matching_turn_context() {
+    let (session, turn_context) = make_session_and_context().await;
+    let current_context_item = turn_context.to_turn_context_item();
+    let current_turn_id = current_context_item
+        .turn_id
+        .clone()
+        .expect("turn context should have turn_id");
+    let replacement_history = vec![assistant_message("prompt-gc summary")];
+    let rollout_items = vec![
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: current_turn_id,
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                message: "incomplete".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+            },
+        )),
+        RolloutItem::Compacted(CompactedItem {
+            message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
+            replacement_history: Some(replacement_history.clone()),
+        }),
+        RolloutItem::TurnContext(current_context_item.clone()),
+    ];
+
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            history: rollout_items,
+            rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+        }))
+        .await;
+
+    let history = session.clone_history().await;
+    assert_eq!(history.raw_items(), replacement_history.as_slice());
+    assert_eq!(
+        serde_json::to_value(session.reference_context_item().await)
+            .expect("serialize seeded reference context item"),
+        serde_json::to_value(Some(current_context_item))
+            .expect("serialize expected reference context item")
+    );
+}

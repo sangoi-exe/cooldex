@@ -15,6 +15,7 @@ use crate::codex::TurnContext;
 use crate::error::CodexErr;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolPayload;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolRouter;
@@ -30,6 +31,7 @@ pub(crate) struct ToolCallRuntime {
     tracker: SharedTurnDiffTracker,
     parallel_execution: Arc<RwLock<()>>,
     allowed_tool_names: Option<HashSet<String>>,
+    source: ToolCallSource,
 }
 
 impl ToolCallRuntime {
@@ -39,6 +41,7 @@ impl ToolCallRuntime {
         turn_context: Arc<TurnContext>,
         tracker: SharedTurnDiffTracker,
         allowed_tool_names: Option<HashSet<String>>,
+        source: ToolCallSource,
     ) -> Self {
         Self {
             router,
@@ -47,6 +50,7 @@ impl ToolCallRuntime {
             tracker,
             parallel_execution: Arc::new(RwLock::new(())),
             allowed_tool_names,
+            source,
         }
     }
 
@@ -72,6 +76,7 @@ impl ToolCallRuntime {
         let tracker = Arc::clone(&self.tracker);
         let lock = Arc::clone(&self.parallel_execution);
         let started = Instant::now();
+        let source = self.source;
 
         let dispatch_span = trace_span!(
             "dispatch_tool_call",
@@ -102,7 +107,7 @@ impl ToolCallRuntime {
                                 turn,
                                 tracker,
                                 call.clone(),
-                                crate::tools::router::ToolCallSource::Direct,
+                                source,
                             )
                             .instrument(dispatch_span.clone())
                             .await

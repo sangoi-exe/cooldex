@@ -176,6 +176,8 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    cache_websocket_session_on_drop: bool,
+    allow_session_transport_fallback_mutation: bool,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -249,6 +251,8 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
+            cache_websocket_session_on_drop: true,
+            allow_session_transport_fallback_mutation: true,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -471,13 +475,30 @@ impl ModelClient {
 
 impl Drop for ModelClientSession {
     fn drop(&mut self) {
-        let websocket_session = std::mem::take(&mut self.websocket_session);
-        self.client
-            .store_cached_websocket_session(websocket_session);
+        if self.cache_websocket_session_on_drop {
+            let websocket_session = std::mem::take(&mut self.websocket_session);
+            self.client
+                .store_cached_websocket_session(websocket_session);
+        }
     }
 }
 
 impl ModelClientSession {
+    pub(crate) fn new_hidden_child_session(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            websocket_session: WebsocketSession::default(),
+            cache_websocket_session_on_drop: false,
+            allow_session_transport_fallback_mutation: false,
+            // Merge-safety anchor: hidden prompt_gc requests must replay the
+            // current turn's sticky-routing token while keeping websocket and
+            // incremental-request bookkeeping isolated from the visible turn.
+            // Hidden sidecars also must not mutate the session-global
+            // websocket fallback policy for visible turns.
+            turn_state: Arc::clone(&self.turn_state),
+        }
+    }
+
     fn activate_http_fallback(&self, websocket_enabled: bool) -> bool {
         websocket_enabled
             && !self
@@ -1032,6 +1053,9 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         model_info: &ModelInfo,
     ) -> bool {
+        if !self.allow_session_transport_fallback_mutation {
+            return false;
+        }
         let websocket_enabled = self.client.responses_websocket_enabled(model_info);
         let activated = self.activate_http_fallback(websocket_enabled);
         if activated {
@@ -1261,19 +1285,26 @@ impl WebsocketTelemetry for ApiTelemetry {
 #[cfg(test)]
 mod tests {
     use super::ModelClient;
+    use super::X_CODEX_TURN_STATE_HEADER;
+    use super::build_responses_headers;
+    use crate::client_common::Prompt;
     use codex_otel::SessionTelemetry;
     use codex_protocol::ThreadId;
+    use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+    use codex_protocol::models::BaseInstructions;
     use codex_protocol::openai_models::ModelInfo;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path_regex;
 
     fn test_model_client(session_source: SessionSource) -> ModelClient {
-        let provider = crate::model_provider_info::create_oss_provider_with_base_url(
-            "https://example.com/v1",
-            crate::model_provider_info::WireApi::Responses,
-        );
+        let provider = test_provider("https://example.com/v1");
         ModelClient::new(
             None,
             ThreadId::new(),
@@ -1285,6 +1316,15 @@ mod tests {
             false,
             None,
         )
+    }
+
+    fn test_provider(base_url: &str) -> crate::ModelProviderInfo {
+        let mut provider = crate::model_provider_info::create_oss_provider_with_base_url(
+            base_url,
+            crate::model_provider_info::WireApi::Responses,
+        );
+        provider.supports_websockets = true;
+        provider
     }
 
     fn test_model_info() -> ModelInfo {
@@ -1355,5 +1395,119 @@ mod tests {
             .await
             .expect("empty summarize request should succeed");
         assert_eq!(output.len(), 0);
+    }
+
+    #[test]
+    fn prompt_gc_hidden_child_session_reuses_turn_state_without_request_cache() {
+        let client = test_model_client(SessionSource::Cli);
+        let parent = client.new_session();
+        parent
+            .turn_state
+            .set("sticky-turn-state".to_string())
+            .expect("set turn state");
+
+        let child = parent.new_hidden_child_session();
+        let headers = build_responses_headers(None, Some(&child.turn_state), None);
+
+        assert_eq!(
+            child.turn_state.get().map(String::as_str),
+            Some("sticky-turn-state")
+        );
+        assert_eq!(
+            headers
+                .get(X_CODEX_TURN_STATE_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("sticky-turn-state")
+        );
+        assert!(child.websocket_session.connection.is_none());
+        assert!(child.websocket_session.last_request.is_none());
+        assert!(child.websocket_session.last_response_rx.is_none());
+        assert!(!child.cache_websocket_session_on_drop);
+        assert!(!child.allow_session_transport_fallback_mutation);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_gc_hidden_child_session_stream_fallback_keeps_visible_websockets_enabled() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(".*/responses$"))
+            .respond_with(ResponseTemplate::new(426))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(".*/responses$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "event: response.created\n",
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+                        "event: response.completed\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+                    )),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ModelClient::new(
+            None,
+            ThreadId::new(),
+            test_provider(&format!("{}/v1", server.uri())),
+            SessionSource::Cli,
+            None,
+            true,
+            false,
+            false,
+            None,
+        );
+        let parent = client.new_session();
+        let mut child = parent.new_hidden_child_session();
+        let mut model_info = test_model_info();
+        model_info.prefer_websockets = true;
+        let session_telemetry = test_session_telemetry();
+        let prompt = Prompt {
+            input: Vec::new(),
+            tools: Vec::new(),
+            parallel_tool_calls: false,
+            base_instructions: BaseInstructions {
+                text: "hidden prompt gc".to_string(),
+            },
+            personality: None,
+            output_schema: None,
+        };
+
+        let _stream = child
+            .stream(
+                &prompt,
+                &model_info,
+                &session_telemetry,
+                None,
+                ReasoningSummaryConfig::None,
+                None,
+                None,
+            )
+            .await
+            .expect("hidden fallback should continue over HTTP");
+
+        assert!(
+            client.responses_websocket_enabled(&model_info),
+            "hidden prompt_gc fallback must not disable visible websocket transport"
+        );
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let websocket_attempts = requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "GET" && request.url.path().ends_with("/responses")
+            })
+            .count();
+        let http_attempts = requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path().ends_with("/responses")
+            })
+            .count();
+        assert_eq!(websocket_attempts, 1);
+        assert_eq!(http_attempts, 1);
     }
 }

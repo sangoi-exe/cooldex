@@ -35,6 +35,9 @@ use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::ModelsManager;
 use crate::parse_command::parse_command;
 use crate::parse_turn_item;
+use crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER;
+use crate::prompt_gc_sidecar::PromptGcApplyOutcome;
+use crate::prompt_gc_sidecar::PromptGcObservedItem;
 use crate::realtime_conversation::RealtimeConversationManager;
 use crate::realtime_conversation::handle_audio as handle_realtime_conversation_audio;
 use crate::realtime_conversation::handle_close as handle_realtime_conversation_close;
@@ -42,6 +45,7 @@ use crate::realtime_conversation::handle_start as handle_realtime_conversation_s
 use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
 use crate::rollout::session_index;
 use crate::stream_events_utils::HandleOutputCtx;
+use crate::stream_events_utils::SamplingExecutionMode;
 use crate::stream_events_utils::handle_non_tool_response_item;
 use crate::stream_events_utils::handle_output_item_done;
 use crate::stream_events_utils::last_assistant_message_from_item;
@@ -54,6 +58,7 @@ use crate::util::error_or_panic;
 use crate::ws_version_from_features;
 use async_channel::Receiver;
 use async_channel::Sender;
+use async_trait::async_trait;
 use chrono::Local;
 use chrono::Utc;
 use codex_app_server_protocol::McpServerElicitationRequest;
@@ -499,6 +504,7 @@ impl Codex {
             personality: config.personality,
             base_instructions,
             compact_prompt: config.compact_prompt.clone(),
+            prompt_gc_prompt: config.prompt_gc_prompt.clone(),
             approval_policy: config.permissions.approval_policy.clone(),
             sandbox_policy: config.permissions.sandbox_policy.clone(),
             file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
@@ -703,6 +709,7 @@ pub(crate) struct TurnContext {
     pub(crate) app_server_client_name: Option<String>,
     pub(crate) developer_instructions: Option<String>,
     pub(crate) compact_prompt: Option<String>,
+    pub(crate) prompt_gc_prompt: Option<String>,
     pub(crate) user_instructions: Option<String>,
     pub(crate) collaboration_mode: CollaborationMode,
     pub(crate) personality: Option<Personality>,
@@ -796,6 +803,7 @@ impl TurnContext {
             app_server_client_name: self.app_server_client_name.clone(),
             developer_instructions: self.developer_instructions.clone(),
             compact_prompt: self.compact_prompt.clone(),
+            prompt_gc_prompt: self.prompt_gc_prompt.clone(),
             user_instructions: self.user_instructions.clone(),
             collaboration_mode,
             personality: self.personality,
@@ -831,6 +839,12 @@ impl TurnContext {
         self.compact_prompt
             .as_deref()
             .unwrap_or(compact::SUMMARIZATION_PROMPT)
+    }
+
+    pub(crate) fn prompt_gc_prompt(&self) -> &str {
+        self.prompt_gc_prompt
+            .as_deref()
+            .unwrap_or(crate::client_common::PROMPT_GC_PROMPT)
     }
 
     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {
@@ -903,6 +917,9 @@ pub(crate) struct SessionConfiguration {
 
     /// Compact prompt override.
     compact_prompt: Option<String>,
+
+    /// PromptGcSidecar prompt override.
+    prompt_gc_prompt: Option<String>,
 
     /// When to escalate for approval for execution
     approval_policy: Constrained<AskForApproval>,
@@ -1009,6 +1026,18 @@ pub(crate) struct SessionSettingsUpdate {
     pub(crate) final_output_json_schema: Option<Option<Value>>,
     pub(crate) personality: Option<Personality>,
     pub(crate) app_server_client_name: Option<String>,
+}
+
+#[async_trait]
+trait PromptGcRolloutSink: Send + Sync {
+    async fn persist_items_atomically(&self, items: &[RolloutItem]) -> std::io::Result<()>;
+}
+
+#[async_trait]
+impl PromptGcRolloutSink for crate::rollout::RolloutRecorder {
+    async fn persist_items_atomically(&self, items: &[RolloutItem]) -> std::io::Result<()> {
+        crate::rollout::RolloutRecorder::persist_items_atomically(self, items).await
+    }
 }
 
 impl Session {
@@ -1191,6 +1220,7 @@ impl Session {
             app_server_client_name: session_configuration.app_server_client_name.clone(),
             developer_instructions: session_configuration.developer_instructions.clone(),
             compact_prompt: session_configuration.compact_prompt.clone(),
+            prompt_gc_prompt: session_configuration.prompt_gc_prompt.clone(),
             user_instructions: session_configuration.user_instructions.clone(),
             collaboration_mode: session_configuration.collaboration_mode.clone(),
             personality: session_configuration.personality,
@@ -2587,6 +2617,19 @@ impl Session {
             .map(|task| Arc::clone(&task.turn_context))
     }
 
+    pub(crate) async fn prompt_gc_sidecar_for_sub_id(
+        &self,
+        sub_id: &str,
+    ) -> Option<Arc<tokio::sync::Mutex<crate::prompt_gc_sidecar::PromptGcSidecar>>> {
+        let active = self.active_turn.lock().await;
+        active.as_ref().and_then(|turn| {
+            turn.tasks
+                .contains_key(sub_id)
+                .then(|| turn.prompt_gc_sidecar())
+                .flatten()
+        })
+    }
+
     async fn active_turn_context_and_cancellation_token(
         &self,
     ) -> Option<(Arc<TurnContext>, CancellationToken)> {
@@ -3059,7 +3102,18 @@ impl Session {
         items: &[ResponseItem],
     ) {
         self.persist_rollout_response_items(items).await;
-        self.record_into_history(items, turn_context).await;
+        let sidecar = self
+            .prompt_gc_sidecar_for_sub_id(&turn_context.sub_id)
+            .await;
+        let observed_items = self
+            .record_into_history_with_observation(items, turn_context, sidecar.is_some())
+            .await;
+        if let Some(sidecar) = sidecar {
+            // Merge-safety anchor: prompt GC eligibility is sourced from recorded history writes
+            // so executed tool outputs are visible; streamed OutputItemDone alone is insufficient.
+            let mut sidecar = sidecar.lock().await;
+            sidecar.observe_recorded_batch(&observed_items);
+        }
         self.send_raw_response_items(turn_context, items).await;
     }
 
@@ -3068,9 +3122,40 @@ impl Session {
         &self,
         items: &[ResponseItem],
         turn_context: &TurnContext,
-    ) {
+    ) -> Vec<PromptGcObservedItem> {
+        let collect_observed_items = self
+            .prompt_gc_sidecar_for_sub_id(&turn_context.sub_id)
+            .await
+            .is_some();
+        self.record_into_history_with_observation(items, turn_context, collect_observed_items)
+            .await
+    }
+
+    async fn record_into_history_with_observation(
+        &self,
+        items: &[ResponseItem],
+        turn_context: &TurnContext,
+        collect_observed_items: bool,
+    ) -> Vec<PromptGcObservedItem> {
         let mut state = self.state.lock().await;
-        state.record_items(items.iter(), turn_context.truncation_policy);
+        if !collect_observed_items {
+            state.record_items(items.iter(), turn_context.truncation_policy);
+            return Vec::new();
+        }
+        // Merge-safety anchor: PromptGcSidecar must fingerprint the canonical
+        // stored history tail, not the pre-processed input items. History write
+        // processing can truncate tool outputs, and prompt_gc.retrieve later
+        // resolves against the stored history snapshot.
+        let (start_index, appended_items) =
+            state.record_items_and_snapshot_appended(items.iter(), turn_context.truncation_policy);
+        appended_items
+            .into_iter()
+            .enumerate()
+            .map(|(offset, item)| PromptGcObservedItem::Recorded {
+                history_index: start_index + offset,
+                item,
+            })
+            .collect()
     }
 
     pub(crate) async fn record_model_warning(&self, message: impl Into<String>, ctx: &TurnContext) {
@@ -3162,6 +3247,64 @@ impl Session {
             self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item)])
                 .await;
         }
+    }
+
+    pub(crate) async fn persist_prompt_gc_replacement_history(
+        &self,
+        turn_context: &TurnContext,
+        replacement_history: Vec<ResponseItem>,
+    ) -> Result<(), String> {
+        let recorder = {
+            let guard = self.services.rollout.lock().await;
+            guard.clone()
+        };
+        self.persist_prompt_gc_replacement_history_with_sink(
+            turn_context,
+            replacement_history,
+            recorder
+                .as_ref()
+                .map(|recorder| recorder as &dyn PromptGcRolloutSink),
+        )
+        .await
+    }
+
+    async fn persist_prompt_gc_replacement_history_with_sink(
+        &self,
+        turn_context: &TurnContext,
+        replacement_history: Vec<ResponseItem>,
+        recorder: Option<&dyn PromptGcRolloutSink>,
+    ) -> Result<(), String> {
+        let reference_context_item = Some(turn_context.to_turn_context_item());
+        let mut rollout_items = vec![RolloutItem::Compacted(CompactedItem {
+            // Merge-safety anchor: prompt_gc compaction markers must stay
+            // distinguishable from normal compaction so resume can reject lone
+            // partial prompt_gc writes without weakening other compaction paths.
+            message: PROMPT_GC_COMPACTION_MARKER.to_string(),
+            replacement_history: Some(replacement_history.clone()),
+        })];
+        if let Some(turn_context_item) = reference_context_item.clone() {
+            rollout_items.push(RolloutItem::TurnContext(turn_context_item));
+        }
+        persist_prompt_gc_rollout_items(recorder, &rollout_items).await?;
+
+        {
+            let mut state = self.state.lock().await;
+            // Merge-safety anchor: PromptGcSidecar rewrites must update the same
+            // canonical history/persisted replacement boundary that recall and
+            // resume consume, or hidden compaction will drift from visible state.
+            state.replace_history(replacement_history, reference_context_item);
+        }
+        if let Some(sidecar) = self
+            .prompt_gc_sidecar_for_sub_id(&turn_context.sub_id)
+            .await
+        {
+            // Merge-safety anchor: prompt_gc rewrites replace the live canonical
+            // history prefix. Pending unmatched calls from the pre-rewrite tail
+            // must be dropped so reused call_ids cannot pair against stale state.
+            sidecar.lock().await.clear_pending_calls_for_rewrite();
+        }
+        self.recompute_token_usage_silently(turn_context).await;
+        Ok(())
     }
 
     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
@@ -3401,6 +3544,20 @@ impl Session {
     }
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
+        self.recompute_token_usage_with_visibility(turn_context, true)
+            .await;
+    }
+
+    pub(crate) async fn recompute_token_usage_silently(&self, turn_context: &TurnContext) {
+        self.recompute_token_usage_with_visibility(turn_context, false)
+            .await;
+    }
+
+    async fn recompute_token_usage_with_visibility(
+        &self,
+        turn_context: &TurnContext,
+        emit_token_count_event: bool,
+    ) {
         let history = self.clone_history().await;
         let base_instructions = self.get_base_instructions().await;
         let Some(estimated_total_tokens) =
@@ -3430,7 +3587,9 @@ impl Session {
 
             state.set_token_info(Some(info));
         }
-        self.send_token_count_event(turn_context).await;
+        if emit_token_count_event {
+            self.send_token_count_event(turn_context).await;
+        }
     }
 
     pub(crate) async fn update_rate_limits(
@@ -3438,11 +3597,23 @@ impl Session {
         turn_context: &TurnContext,
         new_rate_limits: RateLimitSnapshot,
     ) {
+        self.update_rate_limits_with_visibility(turn_context, new_rate_limits, true)
+            .await;
+    }
+
+    async fn update_rate_limits_with_visibility(
+        &self,
+        turn_context: &TurnContext,
+        new_rate_limits: RateLimitSnapshot,
+        emit_token_count_event: bool,
+    ) {
         {
             let mut state = self.state.lock().await;
             state.set_rate_limits(new_rate_limits);
         }
-        self.send_token_count_event(turn_context).await;
+        if emit_token_count_event {
+            self.send_token_count_event(turn_context).await;
+        }
     }
 
     pub(crate) async fn mcp_dependency_prompted(&self) -> HashSet<String> {
@@ -3852,6 +4023,21 @@ impl Session {
             .await
             .cancel();
     }
+}
+
+async fn persist_prompt_gc_rollout_items(
+    recorder: Option<&dyn PromptGcRolloutSink>,
+    rollout_items: &[RolloutItem],
+) -> Result<(), String> {
+    let Some(recorder) = recorder else {
+        return Ok(());
+    };
+    if let Err(error) = recorder.persist_items_atomically(rollout_items).await {
+        return Err(format!(
+            "failed to persist prompt_gc replacement_history atomically: {error}"
+        ));
+    }
+    Ok(())
 }
 
 async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiver<Submission>) {
@@ -5053,6 +5239,7 @@ async fn spawn_review_thread(
         developer_instructions: None,
         user_instructions: None,
         compact_prompt: parent_turn_context.compact_prompt.clone(),
+        prompt_gc_prompt: parent_turn_context.prompt_gc_prompt.clone(),
         collaboration_mode: parent_turn_context.collaboration_mode.clone(),
         personality: parent_turn_context.personality,
         approval_policy: parent_turn_context.approval_policy.clone(),
@@ -5435,6 +5622,18 @@ pub(crate) async fn run_turn(
                     last_agent_message: sampling_request_last_agent_message,
                     ..
                 } = sampling_request_output;
+                // Merge-safety anchor: PromptGcSidecar runs after the main request has fully
+                // drained tool futures, but before token-pressure and auto-compact checks. That
+                // keeps phase-checkpoint compaction on the same canonical history the next
+                // prompt snapshot will read.
+                run_prompt_gc_sidecar_if_needed(
+                    &sess,
+                    &turn_context,
+                    Arc::clone(&turn_diff_tracker),
+                    &client_session,
+                    cancellation_token.child_token(),
+                )
+                .await;
                 let total_usage_tokens = sess.get_total_token_usage().await;
                 let token_limit_reached = total_usage_tokens >= auto_compact_limit;
 
@@ -5855,6 +6054,335 @@ fn build_prompt(
     }
 }
 
+async fn run_prompt_gc_sidecar_if_needed(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    turn_diff_tracker: SharedTurnDiffTracker,
+    parent_client_session: &ModelClientSession,
+    cancellation_token: CancellationToken,
+) {
+    let Some(sidecar) = sess
+        .prompt_gc_sidecar_for_sub_id(&turn_context.sub_id)
+        .await
+    else {
+        return;
+    };
+    let Some(checkpoint) = sidecar.lock().await.take_pending_checkpoint() else {
+        return;
+    };
+
+    let router = Arc::new(crate::tools::spec::build_prompt_gc_sidecar_router());
+    let allowed_tool_names =
+        HashSet::from([crate::prompt_gc_sidecar::PROMPT_GC_TOOL_NAME.to_string()]);
+    let prompt_tools = prompt_tools_for_request(router.as_ref(), Some(&allowed_tool_names));
+    let base_instructions = codex_protocol::models::BaseInstructions {
+        text: turn_context.prompt_gc_prompt().to_string(),
+    };
+    let mut client_session = parent_client_session.new_hidden_child_session();
+    let mut server_model_warning_emitted = false;
+
+    let first_prompt = Prompt {
+        input: prompt_gc_sidecar_input(turn_context.as_ref(), &checkpoint),
+        tools: prompt_tools.clone(),
+        parallel_tool_calls: false,
+        base_instructions: base_instructions.clone(),
+        personality: None,
+        output_schema: None,
+    };
+    let first_result = run_sampling_request_with_router_and_prompt(
+        Arc::clone(sess),
+        Arc::clone(turn_context),
+        Arc::clone(&turn_diff_tracker),
+        &mut client_session,
+        None,
+        Arc::clone(&router),
+        first_prompt,
+        Some(&allowed_tool_names),
+        &mut server_model_warning_emitted,
+        cancellation_token.child_token(),
+        SamplingExecutionMode::Hidden,
+    )
+    .await;
+
+    let first_result = match first_result {
+        Ok(result) => result,
+        Err(error) => {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                checkpoint_id = %checkpoint.checkpoint_id,
+                error = %error,
+                "prompt_gc sidecar request failed"
+            );
+            sidecar
+                .lock()
+                .await
+                .fail_cycle(&checkpoint.checkpoint_id, error.to_string());
+            return;
+        }
+    };
+
+    if let Some(outcome) =
+        parse_prompt_gc_apply_outcome(&first_result.recorded_response_items, &checkpoint)
+    {
+        sidecar.lock().await.complete_cycle(outcome);
+        return;
+    }
+    if let Some(outcome) =
+        take_noted_prompt_gc_apply_outcome(sess.as_ref(), turn_context.as_ref(), &checkpoint).await
+    {
+        sidecar.lock().await.complete_cycle(outcome);
+        return;
+    }
+    if let Some(error) = parse_prompt_gc_error(&first_result.recorded_response_items) {
+        sidecar
+            .lock()
+            .await
+            .fail_cycle(&checkpoint.checkpoint_id, error);
+        return;
+    }
+
+    if prompt_gc_retrieve_was_empty(&first_result.recorded_response_items) {
+        let outcome = PromptGcApplyOutcome {
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            checkpoint_seq: checkpoint.checkpoint_seq,
+            applied_unit_keys: Vec::new(),
+        };
+        sidecar.lock().await.complete_cycle(outcome);
+        return;
+    }
+
+    if !first_result.needs_follow_up {
+        sidecar.lock().await.fail_cycle(
+            &checkpoint.checkpoint_id,
+            "prompt_gc sidecar stopped after retrieve without an apply follow-up",
+        );
+        return;
+    }
+
+    let second_prompt = Prompt {
+        input: first_result.recorded_response_items,
+        tools: prompt_tools,
+        parallel_tool_calls: false,
+        base_instructions,
+        personality: None,
+        output_schema: None,
+    };
+    let second_result = run_sampling_request_with_router_and_prompt(
+        Arc::clone(sess),
+        Arc::clone(turn_context),
+        turn_diff_tracker,
+        &mut client_session,
+        None,
+        router,
+        second_prompt,
+        Some(&allowed_tool_names),
+        &mut server_model_warning_emitted,
+        cancellation_token.child_token(),
+        SamplingExecutionMode::Hidden,
+    )
+    .await;
+
+    match second_result {
+        Ok(result) => {
+            if let Some(outcome) =
+                parse_prompt_gc_apply_outcome(&result.recorded_response_items, &checkpoint)
+            {
+                sidecar.lock().await.complete_cycle(outcome);
+            } else if let Some(outcome) = take_noted_prompt_gc_apply_outcome(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &checkpoint,
+            )
+            .await
+            {
+                sidecar.lock().await.complete_cycle(outcome);
+            } else if let Some(error) = parse_prompt_gc_error(&result.recorded_response_items) {
+                sidecar
+                    .lock()
+                    .await
+                    .fail_cycle(&checkpoint.checkpoint_id, error);
+            } else {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    checkpoint_id = %checkpoint.checkpoint_id,
+                    "prompt_gc sidecar completed without an apply outcome"
+                );
+                sidecar.lock().await.fail_cycle(
+                    &checkpoint.checkpoint_id,
+                    "prompt_gc sidecar completed without apply",
+                );
+            }
+        }
+        Err(error) => {
+            if let Some(outcome) = take_noted_prompt_gc_apply_outcome(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &checkpoint,
+            )
+            .await
+            {
+                sidecar.lock().await.complete_cycle(outcome);
+                return;
+            }
+            warn!(
+                turn_id = %turn_context.sub_id,
+                checkpoint_id = %checkpoint.checkpoint_id,
+                error = %error,
+                "prompt_gc sidecar apply request failed"
+            );
+            sidecar
+                .lock()
+                .await
+                .fail_cycle(&checkpoint.checkpoint_id, error.to_string());
+        }
+    }
+}
+
+async fn take_noted_prompt_gc_apply_outcome(
+    session: &Session,
+    turn_context: &TurnContext,
+    checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
+) -> Option<PromptGcApplyOutcome> {
+    let sidecar = session
+        .prompt_gc_sidecar_for_sub_id(&turn_context.sub_id)
+        .await?;
+    sidecar
+        .lock()
+        .await
+        .take_noted_apply_outcome(&checkpoint.checkpoint_id)
+}
+
+fn prompt_gc_sidecar_input(
+    turn_context: &TurnContext,
+    checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
+) -> Vec<ResponseItem> {
+    vec![ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: format!(
+                "mode=prompt_gc\npolicy_id={}\ncheckpoint_id={}",
+                turn_context.config.manage_context_policy.quality_rubric_id,
+                checkpoint.checkpoint_id
+            ),
+        }],
+        end_turn: None,
+        phase: None,
+    }]
+}
+
+fn parse_prompt_gc_apply_outcome(
+    items: &[ResponseItem],
+    checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
+) -> Option<PromptGcApplyOutcome> {
+    for item in items.iter().rev() {
+        let output_text = match item {
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => match output.text_content() {
+                Some(text) => text,
+                None => continue,
+            },
+            _ => continue,
+        };
+        // Merge-safety anchor: hidden prompt_gc recovery may scan mixed tool outputs after a
+        // stream failure. Skip unrelated or malformed payloads instead of aborting the scan
+        // before a valid terminal prompt_gc apply output is reached.
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(output_text) else {
+            continue;
+        };
+        if value.get("mode").and_then(serde_json::Value::as_str) != Some("apply") {
+            continue;
+        }
+        let applied_unit_keys = value
+            .get("applied_unit_keys")
+            .and_then(serde_json::Value::as_array)
+            .map(|keys| {
+                keys.iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .collect::<Vec<u64>>()
+            })
+            .unwrap_or_default();
+        return Some(PromptGcApplyOutcome {
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            checkpoint_seq: checkpoint.checkpoint_seq,
+            applied_unit_keys,
+        });
+    }
+    None
+}
+
+fn parse_prompt_gc_error(items: &[ResponseItem]) -> Option<String> {
+    for item in items.iter().rev() {
+        let output_text = match item {
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => match output.text_content() {
+                Some(text) => text,
+                None => continue,
+            },
+            _ => continue,
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(output_text) else {
+            continue;
+        };
+        if value.get("mode").and_then(serde_json::Value::as_str) != Some("error") {
+            continue;
+        }
+        let message = value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("prompt_gc failed");
+        if let Some(stop_reason) = value.get("stop_reason").and_then(serde_json::Value::as_str) {
+            return Some(format!("{stop_reason}: {message}"));
+        }
+        return Some(message.to_string());
+    }
+    None
+}
+
+fn prompt_gc_retrieve_was_empty(items: &[ResponseItem]) -> bool {
+    for item in items.iter().rev() {
+        let output_text = match item {
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => match output.text_content() {
+                Some(text) => text,
+                None => continue,
+            },
+            _ => continue,
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(output_text) else {
+            continue;
+        };
+        if value.get("mode").and_then(serde_json::Value::as_str) != Some("retrieve") {
+            continue;
+        }
+        return value
+            .get("chunk_manifest")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty);
+    }
+    false
+}
+
+fn prompt_gc_terminal_output_present(items: &[ResponseItem]) -> bool {
+    items.iter().rev().any(|item| {
+        let output_text = match item {
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => match output.text_content() {
+                Some(text) => text,
+                None => return false,
+            },
+            _ => return false,
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(output_text) else {
+            return false;
+        };
+        value
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|mode| matches!(mode, "retrieve" | "apply" | "error"))
+    })
+}
+
 fn prompt_tools_for_request(
     router: &ToolRouter,
     allowed_tool_names: Option<&HashSet<String>>,
@@ -5919,6 +6447,36 @@ pub(crate) async fn run_sampling_request(
         turn_context.as_ref(),
         base_instructions,
     );
+    run_sampling_request_with_router_and_prompt(
+        Arc::clone(&sess),
+        Arc::clone(&turn_context),
+        turn_diff_tracker,
+        client_session,
+        turn_metadata_header,
+        router,
+        prompt,
+        allowed_tool_names,
+        server_model_warning_emitted_for_turn,
+        cancellation_token,
+        SamplingExecutionMode::Visible,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_sampling_request_with_router_and_prompt(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    turn_diff_tracker: SharedTurnDiffTracker,
+    client_session: &mut ModelClientSession,
+    turn_metadata_header: Option<&str>,
+    router: Arc<ToolRouter>,
+    prompt: Prompt,
+    allowed_tool_names: Option<&HashSet<String>>,
+    server_model_warning_emitted_for_turn: &mut bool,
+    cancellation_token: CancellationToken,
+    execution_mode: SamplingExecutionMode,
+) -> CodexResult<SamplingRequestResult> {
     let mut retries = 0;
     loop {
         let request_store_account_id = sess
@@ -5938,6 +6496,7 @@ pub(crate) async fn run_sampling_request(
             prompt: &prompt,
             allowed_tool_names,
             cancellation_token: cancellation_token.child_token(),
+            execution_mode,
         })
         .await
         {
@@ -5945,19 +6504,21 @@ pub(crate) async fn run_sampling_request(
                 return Ok(output);
             }
             Err(CodexErr::ContextWindowExceeded) => {
-                sess.set_total_tokens_full(&turn_context).await;
+                maybe_set_total_tokens_full_for_execution_mode(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    execution_mode,
+                )
+                .await;
                 return Err(CodexErr::ContextWindowExceeded);
             }
             Err(CodexErr::UsageLimitReached(e)) => {
-                let rate_limits = e.rate_limits.clone();
-                if let Some(rate_limits) = rate_limits {
-                    sess.update_rate_limits(&turn_context, *rate_limits).await;
-                }
-                if maybe_auto_switch_account_on_usage_limit(
+                if handle_usage_limit_for_execution_mode(
                     sess.as_ref(),
                     turn_context.as_ref(),
                     &e,
                     request_store_account_id.as_deref(),
+                    execution_mode,
                 )
                 .await?
                 {
@@ -5980,11 +6541,11 @@ pub(crate) async fn run_sampling_request(
                 &turn_context.model_info,
             )
         {
-            sess.send_event(
-                &turn_context,
-                EventMsg::Warning(WarningEvent {
-                    message: format!("Falling back from WebSockets to HTTPS transport. {err:#}"),
-                }),
+            maybe_emit_transport_fallback_warning_for_execution_mode(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                execution_mode,
+                &err,
             )
             .await;
             retries = 0;
@@ -6010,7 +6571,7 @@ pub(crate) async fn run_sampling_request(
                     .services
                     .model_client
                     .responses_websocket_enabled(&turn_context.model_info);
-            if report_error {
+            if report_error && execution_mode == SamplingExecutionMode::Visible {
                 // Surface retry information to any UI/front‑end so the
                 // user understands what is happening instead of staring
                 // at a seemingly frozen screen.
@@ -6129,6 +6690,7 @@ pub(crate) struct SamplingRequestResult {
     pub(crate) needs_follow_up: bool,
     pub(crate) last_agent_message: Option<String>,
     pub(crate) non_tool_response_items: Vec<ResponseItem>,
+    pub(crate) recorded_response_items: Vec<ResponseItem>,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -6596,16 +7158,22 @@ async fn emit_turn_item_in_plan_mode(
     turn_item: TurnItem,
     previously_active_item: Option<&TurnItem>,
     state: &mut PlanModeStreamState,
+    execution_mode: SamplingExecutionMode,
 ) {
     match turn_item {
         TurnItem::AgentMessage(agent_message) => {
-            emit_agent_message_in_plan_mode(sess, turn_context, agent_message, state).await;
+            if execution_mode == SamplingExecutionMode::Visible {
+                emit_agent_message_in_plan_mode(sess, turn_context, agent_message, state).await;
+            }
         }
         _ => {
-            if previously_active_item.is_none() {
+            if execution_mode == SamplingExecutionMode::Visible && previously_active_item.is_none()
+            {
                 sess.emit_turn_item_started(turn_context, &turn_item).await;
             }
-            sess.emit_turn_item_completed(turn_context, turn_item).await;
+            if execution_mode == SamplingExecutionMode::Visible {
+                sess.emit_turn_item_completed(turn_context, turn_item).await;
+            }
         }
     }
 }
@@ -6618,11 +7186,15 @@ async fn handle_assistant_item_done_in_plan_mode(
     state: &mut PlanModeStreamState,
     previously_active_item: Option<&TurnItem>,
     last_agent_message: &mut Option<String>,
+    recorded_response_items: &mut Vec<ResponseItem>,
+    execution_mode: SamplingExecutionMode,
 ) -> bool {
     if let ResponseItem::Message { role, .. } = item
         && role == "assistant"
     {
-        maybe_complete_plan_item_from_message(sess, turn_context, state, item).await;
+        if execution_mode == SamplingExecutionMode::Visible {
+            maybe_complete_plan_item_from_message(sess, turn_context, state, item).await;
+        }
 
         if let Some(turn_item) =
             handle_non_tool_response_item(item, true, Some(&turn_context.cwd)).await
@@ -6633,11 +7205,16 @@ async fn handle_assistant_item_done_in_plan_mode(
                 turn_item,
                 previously_active_item,
                 state,
+                execution_mode,
             )
             .await;
         }
 
-        record_completed_response_item(sess, turn_context, item).await;
+        if let Some(recorded_item) =
+            record_completed_response_item(sess, turn_context, item, execution_mode).await
+        {
+            recorded_response_items.push(recorded_item);
+        }
         if let Some(agent_message) = last_assistant_message_from_item(item, true) {
             *last_agent_message = Some(agent_message);
         }
@@ -6650,12 +7227,25 @@ async fn drain_in_flight(
     in_flight: &mut FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    execution_mode: SamplingExecutionMode,
+    recorded_response_items: &mut Vec<ResponseItem>,
 ) -> CodexResult<()> {
     while let Some(res) = in_flight.next().await {
         match res {
             Ok(response_input) => {
-                sess.record_conversation_items(&turn_context, &[response_input.into()])
-                    .await;
+                let response_item: ResponseItem = response_input.into();
+                match execution_mode {
+                    SamplingExecutionMode::Visible => {
+                        sess.record_conversation_items(
+                            &turn_context,
+                            std::slice::from_ref(&response_item),
+                        )
+                        .await;
+                    }
+                    SamplingExecutionMode::Hidden => {
+                        recorded_response_items.push(response_item);
+                    }
+                }
             }
             Err(err) => {
                 error_or_panic(format!("in-flight tool future failed during drain: {err}"));
@@ -6786,6 +7376,66 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit(
     .await;
 
     Ok(true)
+}
+
+pub(crate) async fn maybe_set_total_tokens_full_for_execution_mode(
+    sess: &Session,
+    turn_context: &TurnContext,
+    execution_mode: SamplingExecutionMode,
+) {
+    // Merge-safety anchor: hidden prompt_gc retries must not emit visible token
+    // accounting, or the background sidecar leaks into the lead turn UI.
+    if execution_mode == SamplingExecutionMode::Visible {
+        sess.set_total_tokens_full(turn_context).await;
+    }
+}
+
+pub(crate) async fn handle_usage_limit_for_execution_mode(
+    sess: &Session,
+    turn_context: &TurnContext,
+    usage_limit: &crate::error::UsageLimitReachedError,
+    request_store_account_id: Option<&str>,
+    execution_mode: SamplingExecutionMode,
+) -> CodexResult<bool> {
+    if let Some(rate_limits) = usage_limit.rate_limits.clone() {
+        sess.update_rate_limits_with_visibility(
+            turn_context,
+            *rate_limits,
+            execution_mode == SamplingExecutionMode::Visible,
+        )
+        .await;
+    }
+    // Merge-safety anchor: hidden prompt_gc usage-limit handling must refresh
+    // internal limits without auto-switching accounts or warning the user.
+    if execution_mode == SamplingExecutionMode::Visible {
+        return maybe_auto_switch_account_on_usage_limit(
+            sess,
+            turn_context,
+            usage_limit,
+            request_store_account_id,
+        )
+        .await;
+    }
+    Ok(false)
+}
+
+pub(crate) async fn maybe_emit_transport_fallback_warning_for_execution_mode(
+    sess: &Session,
+    turn_context: &TurnContext,
+    execution_mode: SamplingExecutionMode,
+    err: &CodexErr,
+) {
+    // Merge-safety anchor: transport fallback is part of the shared retry path,
+    // but hidden prompt_gc runs must stay silent in the visible event stream.
+    if execution_mode == SamplingExecutionMode::Visible {
+        sess.send_event(
+            turn_context,
+            EventMsg::Warning(WarningEvent {
+                message: format!("Falling back from WebSockets to HTTPS transport. {err:#}"),
+            }),
+        )
+        .await;
+    }
 }
 
 async fn refresh_accounts_rate_limits_before_auto_switch(
@@ -7036,6 +7686,7 @@ struct SamplingRequestArgs<'a> {
     prompt: &'a Prompt,
     allowed_tool_names: Option<&'a HashSet<String>>,
     cancellation_token: CancellationToken,
+    execution_mode: SamplingExecutionMode,
 }
 
 async fn try_run_sampling_request(
@@ -7052,6 +7703,7 @@ async fn try_run_sampling_request(
         prompt,
         allowed_tool_names,
         cancellation_token,
+        execution_mode,
     } = args;
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
@@ -7081,12 +7733,17 @@ async fn try_run_sampling_request(
         Arc::clone(&turn_context),
         Arc::clone(&turn_diff_tracker),
         allowed_tool_names.cloned(),
+        match execution_mode {
+            SamplingExecutionMode::Visible => crate::tools::context::ToolCallSource::Direct,
+            SamplingExecutionMode::Hidden => crate::tools::context::ToolCallSource::Sidecar,
+        },
     );
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut non_tool_response_items: Vec<ResponseItem> = Vec::new();
+    let mut recorded_response_items: Vec<ResponseItem> = Vec::new();
     let mut active_item: Option<TurnItem> = None;
     let mut should_emit_turn_diff = false;
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
@@ -7131,7 +7788,8 @@ async fn try_run_sampling_request(
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(item) => {
                 let previously_active_item = active_item.take();
-                if let Some(previous) = previously_active_item.as_ref()
+                if execution_mode == SamplingExecutionMode::Visible
+                    && let Some(previous) = previously_active_item.as_ref()
                     && matches!(previous, TurnItem::AgentMessage(_))
                 {
                     let item_id = previous.id();
@@ -7152,6 +7810,8 @@ async fn try_run_sampling_request(
                         state,
                         previously_active_item.as_ref(),
                         &mut last_agent_message,
+                        &mut recorded_response_items,
+                        execution_mode,
                     )
                     .await
                 {
@@ -7163,6 +7823,7 @@ async fn try_run_sampling_request(
                     turn_context: turn_context.clone(),
                     tool_runtime: tool_runtime.clone(),
                     cancellation_token: cancellation_token.child_token(),
+                    execution_mode,
                 };
                 let completed_item = item.clone();
 
@@ -7176,6 +7837,7 @@ async fn try_run_sampling_request(
                 if is_non_tool_item {
                     non_tool_response_items.push(completed_item);
                 }
+                recorded_response_items.extend(output_result.recorded_response_items);
                 if let Some(agent_message) = output_result.last_agent_message {
                     last_agent_message = Some(agent_message);
                 }
@@ -7214,14 +7876,16 @@ async fn try_run_sampling_request(
                         state
                             .pending_agent_message_items
                             .insert(item_id, turn_item.clone());
-                    } else {
+                    } else if execution_mode == SamplingExecutionMode::Visible {
                         sess.emit_turn_item_started(&turn_context, &turn_item).await;
                     }
-                    if let (Some(state), Some(item_id), Some(parsed)) = (
-                        plan_mode_state.as_mut(),
-                        seeded_item_id.as_deref(),
-                        seeded_parsed,
-                    ) {
+                    if execution_mode == SamplingExecutionMode::Visible
+                        && let (Some(state), Some(item_id), Some(parsed)) = (
+                            plan_mode_state.as_mut(),
+                            seeded_item_id.as_deref(),
+                            seeded_parsed,
+                        )
+                    {
                         emit_streamed_assistant_text_delta(
                             &sess,
                             &turn_context,
@@ -7235,7 +7899,8 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::ServerModel(server_model) => {
-                if !*server_model_warning_emitted_for_turn
+                if execution_mode == SamplingExecutionMode::Visible
+                    && !*server_model_warning_emitted_for_turn
                     && sess
                         .maybe_warn_on_server_model_mismatch(&turn_context, server_model)
                         .await
@@ -7244,12 +7909,19 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::ServerReasoningIncluded(included) => {
-                sess.set_server_reasoning_included(included).await;
+                if execution_mode == SamplingExecutionMode::Visible {
+                    sess.set_server_reasoning_included(included).await;
+                }
             }
             ResponseEvent::RateLimits(snapshot) => {
                 // Update internal state with latest rate limits, but defer sending until
                 // token usage is available to avoid duplicate TokenCount events.
-                sess.update_rate_limits(&turn_context, snapshot).await;
+                sess.update_rate_limits_with_visibility(
+                    &turn_context,
+                    snapshot,
+                    execution_mode == SamplingExecutionMode::Visible,
+                )
+                .await;
             }
             ResponseEvent::ModelsEtag(etag) => {
                 // Update internal state with latest models etag
@@ -7259,29 +7931,36 @@ async fn try_run_sampling_request(
                 response_id: _,
                 token_usage,
             } => {
-                flush_assistant_text_segments_all(
-                    &sess,
-                    &turn_context,
-                    plan_mode_state.as_mut(),
-                    &mut assistant_message_stream_parsers,
-                )
-                .await;
-                sess.update_token_usage_info(&turn_context, token_usage.as_ref())
+                if execution_mode == SamplingExecutionMode::Visible {
+                    flush_assistant_text_segments_all(
+                        &sess,
+                        &turn_context,
+                        plan_mode_state.as_mut(),
+                        &mut assistant_message_stream_parsers,
+                    )
                     .await;
-                should_emit_turn_diff = true;
+                }
+                if execution_mode == SamplingExecutionMode::Visible {
+                    sess.update_token_usage_info(&turn_context, token_usage.as_ref())
+                        .await;
+                    should_emit_turn_diff = true;
+                }
 
                 needs_follow_up |= sess.has_pending_input().await;
 
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
-                    last_agent_message,
-                    non_tool_response_items,
+                    last_agent_message: std::mem::take(&mut last_agent_message),
+                    non_tool_response_items: std::mem::take(&mut non_tool_response_items),
+                    recorded_response_items: Vec::new(),
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
                 // In review child threads, suppress assistant text deltas; the
                 // UI will show a selection popup from the final ReviewOutput.
-                if let Some(active) = active_item.as_ref() {
+                if execution_mode == SamplingExecutionMode::Visible
+                    && let Some(active) = active_item.as_ref()
+                {
                     let item_id = active.id();
                     if matches!(active, TurnItem::AgentMessage(_)) {
                         let parsed = assistant_message_stream_parsers.parse_delta(&item_id, &delta);
@@ -7303,7 +7982,7 @@ async fn try_run_sampling_request(
                         sess.send_event(&turn_context, EventMsg::AgentMessageContentDelta(event))
                             .await;
                     }
-                } else {
+                } else if execution_mode == SamplingExecutionMode::Visible {
                     error_or_panic("OutputTextDelta without active item".to_string());
                 }
             }
@@ -7311,7 +7990,9 @@ async fn try_run_sampling_request(
                 delta,
                 summary_index,
             } => {
-                if let Some(active) = active_item.as_ref() {
+                if execution_mode == SamplingExecutionMode::Visible
+                    && let Some(active) = active_item.as_ref()
+                {
                     let event = ReasoningContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
                         turn_id: turn_context.sub_id.clone(),
@@ -7321,19 +8002,21 @@ async fn try_run_sampling_request(
                     };
                     sess.send_event(&turn_context, EventMsg::ReasoningContentDelta(event))
                         .await;
-                } else {
+                } else if execution_mode == SamplingExecutionMode::Visible {
                     error_or_panic("ReasoningSummaryDelta without active item".to_string());
                 }
             }
             ResponseEvent::ReasoningSummaryPartAdded { summary_index } => {
-                if let Some(active) = active_item.as_ref() {
+                if execution_mode == SamplingExecutionMode::Visible
+                    && let Some(active) = active_item.as_ref()
+                {
                     let event =
                         EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
                             item_id: active.id(),
                             summary_index,
                         });
                     sess.send_event(&turn_context, event).await;
-                } else {
+                } else if execution_mode == SamplingExecutionMode::Visible {
                     error_or_panic("ReasoningSummaryPartAdded without active item".to_string());
                 }
             }
@@ -7341,7 +8024,9 @@ async fn try_run_sampling_request(
                 delta,
                 content_index,
             } => {
-                if let Some(active) = active_item.as_ref() {
+                if execution_mode == SamplingExecutionMode::Visible
+                    && let Some(active) = active_item.as_ref()
+                {
                     let event = ReasoningRawContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
                         turn_id: turn_context.sub_id.clone(),
@@ -7351,22 +8036,31 @@ async fn try_run_sampling_request(
                     };
                     sess.send_event(&turn_context, EventMsg::ReasoningRawContentDelta(event))
                         .await;
-                } else {
+                } else if execution_mode == SamplingExecutionMode::Visible {
                     error_or_panic("ReasoningRawContentDelta without active item".to_string());
                 }
             }
         }
     };
 
-    flush_assistant_text_segments_all(
-        &sess,
-        &turn_context,
-        plan_mode_state.as_mut(),
-        &mut assistant_message_stream_parsers,
-    )
-    .await;
+    if execution_mode == SamplingExecutionMode::Visible {
+        flush_assistant_text_segments_all(
+            &sess,
+            &turn_context,
+            plan_mode_state.as_mut(),
+            &mut assistant_message_stream_parsers,
+        )
+        .await;
+    }
 
-    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    drain_in_flight(
+        &mut in_flight,
+        sess.clone(),
+        turn_context.clone(),
+        execution_mode,
+        &mut recorded_response_items,
+    )
+    .await?;
 
     if should_emit_turn_diff {
         let unified_diff = {
@@ -7379,7 +8073,25 @@ async fn try_run_sampling_request(
         }
     }
 
-    outcome
+    match outcome {
+        Ok(mut result) => {
+            result.recorded_response_items = recorded_response_items;
+            Ok(result)
+        }
+        Err(err) => {
+            if execution_mode == SamplingExecutionMode::Hidden
+                && prompt_gc_terminal_output_present(&recorded_response_items)
+            {
+                return Ok(SamplingRequestResult {
+                    needs_follow_up,
+                    last_agent_message,
+                    non_tool_response_items,
+                    recorded_response_items,
+                });
+            }
+            Err(err)
+        }
+    }
 }
 
 pub(super) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<String> {

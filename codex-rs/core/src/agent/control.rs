@@ -6,7 +6,10 @@ use crate::agent::role::resolve_role_config;
 use crate::agent::status::is_final;
 use crate::contextual_user_message::AGENTS_MD_FRAGMENT;
 use crate::contextual_user_message::ENVIRONMENT_CONTEXT_FRAGMENT;
+use crate::contextual_user_message::PINNED_NOTES_FRAGMENT;
+use crate::contextual_user_message::REASONING_CONTEXT_FRAGMENT;
 use crate::contextual_user_message::SKILL_FRAGMENT;
+use crate::contextual_user_message::TOOL_CONTEXT_FRAGMENT;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::find_thread_path_by_id_str;
@@ -120,6 +123,9 @@ fn is_forked_subagent_prompt_fragment(content_item: &ContentItem) -> bool {
     AGENTS_MD_FRAGMENT.matches_text(text)
         || ENVIRONMENT_CONTEXT_FRAGMENT.matches_text(text)
         || SKILL_FRAGMENT.matches_text(text)
+        || TOOL_CONTEXT_FRAGMENT.matches_text(text)
+        || REASONING_CONTEXT_FRAGMENT.matches_text(text)
+        || PINNED_NOTES_FRAGMENT.matches_text(text)
 }
 
 fn export_forked_subagent_response_item(item: ResponseItem) -> Option<ResponseItem> {
@@ -612,10 +618,10 @@ mod tests {
     use assert_matches::assert_matches;
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
+    use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
     use codex_protocol::config_types::Settings;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
-    use codex_protocol::openai_models::ReasoningSummaryConfig;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::ErrorEvent;
