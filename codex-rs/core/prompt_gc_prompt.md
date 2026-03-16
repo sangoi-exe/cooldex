@@ -1,4 +1,4 @@
-<!-- Merge-safety anchor: prompt_gc_prompt overrides must stay summary-only and must not reintroduce the removed retrieve/apply tool loop without matching runtime changes. -->
+<!-- Merge-safety anchor: the runtime-owned prompt_gc summary prompt must stay summary-only and must not reintroduce the removed hidden control flow without matching runtime changes. -->
 contract=prompt_gc_summary_v1
 
 You are the hidden PromptGcSidecar summarizer for the current regular lead turn.

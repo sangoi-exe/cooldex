@@ -136,11 +136,14 @@ async fn run_remote_compact_task_inner_impl(
                     sess.update_rate_limits(turn_context, *rate_limits).await;
                 }
 
+                // Merge-safety anchor: remote compaction uses the visible autoswitch path so
+                // quota retries stay user-facing unlike hidden prompt_gc retries.
                 if maybe_auto_switch_account_on_usage_limit(
                     sess.as_ref(),
                     turn_context.as_ref(),
                     &usage_limit,
                     request_store_account_id.as_deref(),
+                    crate::codex::UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch,
                 )
                 .await?
                 {

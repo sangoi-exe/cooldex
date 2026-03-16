@@ -1891,6 +1891,93 @@ async fn clear_prompt_gc_private_context_usage_info_clears_private_usage() {
 }
 
 #[tokio::test]
+async fn prompt_gc_second_cycle_clear_omits_unknown_context_left() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
+    chat.show_welcome_banner = false;
+
+    chat.replay_prompt_gc_context_usage_info(TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 950_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 12_400,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(13_000),
+    });
+    chat.clear_prompt_gc_private_context_usage_info();
+
+    let height = chat.desired_height(80);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, height))
+        .expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw prompt_gc unknown-context snapshot");
+    assert_snapshot!(
+        "prompt_gc_second_cycle_clear_omits_unknown_context_left",
+        terminal.backend()
+    );
+}
+
+#[tokio::test]
+async fn prompt_gc_clear_then_turn_started_without_window_restores_default_context_line() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
+    chat.show_welcome_banner = false;
+
+    chat.replay_prompt_gc_context_usage_info(TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 950_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 12_400,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(13_000),
+    });
+    chat.clear_prompt_gc_private_context_usage_info();
+    assert!(!render_bottom_popup(&chat, 80).contains("100% context left"));
+
+    chat.apply_turn_started_context_window(None);
+
+    let rendered = render_bottom_popup(&chat, 80);
+    assert!(
+        rendered.contains("100% context left"),
+        "expected default context footer to be restored after unknown clear, got:\n{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn status_state_does_not_survive_task_completion() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.on_task_started();
+    chat.set_status(
+        "Indexing".to_string(),
+        Some("old detail".to_string()),
+        StatusDetailsCapitalization::CapitalizeFirst,
+        STATUS_DETAILS_DEFAULT_MAX_LINES,
+    );
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be visible");
+    assert_eq!(status.header(), "Indexing");
+    assert_eq!(status.details(), Some("Old detail"));
+
+    chat.on_task_complete(None, false);
+    chat.on_task_started();
+
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be visible");
+    assert_eq!(status.header(), "Working");
+    assert_eq!(status.details(), None);
+}
+
+#[tokio::test]
 async fn turn_started_keeps_visible_usage_when_token_info_is_not_prompt_gc_private() {
     let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
 
@@ -2109,6 +2196,7 @@ async fn make_chatwidget_manual(
         initial_user_message: None,
         token_info: None,
         token_info_is_prompt_gc_private: false,
+        prompt_gc_context_usage_unknown: false,
         rate_limit_snapshots_by_limit_id: BTreeMap::new(),
         plan_type: None,
         rate_limit_warnings: RateLimitWarningState::default(),
@@ -2219,9 +2307,17 @@ fn set_chatgpt_auth(chat: &mut ChatWidget) {
 }
 
 fn set_chatgpt_auth_with_secondary_account(chat: &mut ChatWidget) {
+    // Merge-safety anchor: multi-account ChatGPT TUI fixtures must seed a Plus/Pro plan so the
+    // auth-manager saved-account gate preserves popup/logout coverage under the workspace-local
+    // ChatGPT account policy.
     let id_token_for_email = |email: &str| {
         let header = serde_json::json!({"alg":"HS256","typ":"JWT"});
-        let payload = serde_json::json!({"email": email});
+        let payload = serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": "pro"
+            }
+        });
         let jwt = format!(
             "{}.{}.{}",
             URL_SAFE_NO_PAD.encode(header.to_string()),
@@ -9709,6 +9805,20 @@ async fn prompt_gc_second_cycle_start_clears_private_usage_from_widget() {
 }
 
 #[tokio::test]
+async fn prompt_gc_active_on_fresh_widget_hides_unknown_context_line() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.show_welcome_banner = false;
+
+    chat.set_prompt_gc_activity(true);
+
+    let rendered = render_bottom_popup(&chat, 80);
+    assert!(
+        !rendered.contains("100% context left"),
+        "active prompt_gc with no trusted usage should hide the synthetic full-context footer, got:\n{rendered}"
+    );
+}
+
+#[tokio::test]
 async fn apply_patch_events_emit_history_cells() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
@@ -10304,12 +10414,8 @@ async fn thread_snapshot_replayed_stream_recovery_restores_previous_status_heade
         }),
     });
 
-    let status = chat
-        .bottom_pane
-        .status_widget()
-        .expect("status indicator should be visible");
-    assert_eq!(status.header(), "Working");
-    assert_eq!(status.details(), None);
+    assert_eq!(chat.current_status_header, "Working");
+    assert!(chat.bottom_pane.status_widget().is_none());
     assert!(chat.retry_status_header.is_none());
 }
 
@@ -10557,12 +10663,8 @@ async fn stream_recovery_restores_previous_status_header() {
         }),
     });
 
-    let status = chat
-        .bottom_pane
-        .status_widget()
-        .expect("status indicator should be visible");
-    assert_eq!(status.header(), "Working");
-    assert_eq!(status.details(), None);
+    assert_eq!(chat.current_status_header, "Working");
+    assert!(chat.bottom_pane.status_widget().is_none());
     assert!(chat.retry_status_header.is_none());
 }
 

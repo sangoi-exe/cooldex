@@ -512,7 +512,6 @@ impl Codex {
             personality: config.personality,
             base_instructions,
             compact_prompt: config.compact_prompt.clone(),
-            prompt_gc_prompt: config.prompt_gc_prompt.clone(),
             approval_policy: config.permissions.approval_policy.clone(),
             sandbox_policy: config.permissions.sandbox_policy.clone(),
             file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
@@ -735,7 +734,6 @@ pub(crate) struct TurnContext {
     pub(crate) app_server_client_name: Option<String>,
     pub(crate) developer_instructions: Option<String>,
     pub(crate) compact_prompt: Option<String>,
-    pub(crate) prompt_gc_prompt: Option<String>,
     pub(crate) user_instructions: Option<String>,
     pub(crate) collaboration_mode: CollaborationMode,
     pub(crate) personality: Option<Personality>,
@@ -829,7 +827,6 @@ impl TurnContext {
             app_server_client_name: self.app_server_client_name.clone(),
             developer_instructions: self.developer_instructions.clone(),
             compact_prompt: self.compact_prompt.clone(),
-            prompt_gc_prompt: self.prompt_gc_prompt.clone(),
             user_instructions: self.user_instructions.clone(),
             collaboration_mode,
             personality: self.personality,
@@ -865,12 +862,6 @@ impl TurnContext {
         self.compact_prompt
             .as_deref()
             .unwrap_or(compact::SUMMARIZATION_PROMPT)
-    }
-
-    pub(crate) fn prompt_gc_prompt(&self) -> &str {
-        self.prompt_gc_prompt
-            .as_deref()
-            .unwrap_or(crate::client_common::PROMPT_GC_PROMPT)
     }
 
     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {
@@ -943,9 +934,6 @@ pub(crate) struct SessionConfiguration {
 
     /// Compact prompt override.
     compact_prompt: Option<String>,
-
-    /// PromptGcSidecar prompt override.
-    prompt_gc_prompt: Option<String>,
 
     /// When to escalate for approval for execution
     approval_policy: Constrained<AskForApproval>,
@@ -1246,7 +1234,6 @@ impl Session {
             app_server_client_name: session_configuration.app_server_client_name.clone(),
             developer_instructions: session_configuration.developer_instructions.clone(),
             compact_prompt: session_configuration.compact_prompt.clone(),
-            prompt_gc_prompt: session_configuration.prompt_gc_prompt.clone(),
             user_instructions: session_configuration.user_instructions.clone(),
             collaboration_mode: session_configuration.collaboration_mode.clone(),
             personality: session_configuration.personality,
@@ -5341,7 +5328,6 @@ async fn spawn_review_thread(
         developer_instructions: None,
         user_instructions: None,
         compact_prompt: parent_turn_context.compact_prompt.clone(),
-        prompt_gc_prompt: parent_turn_context.prompt_gc_prompt.clone(),
         collaboration_mode: parent_turn_context.collaboration_mode.clone(),
         personality: parent_turn_context.personality,
         approval_policy: parent_turn_context.approval_policy.clone(),
@@ -6202,29 +6188,6 @@ async fn run_prompt_gc_sidecar_if_needed(
     }
     let _prompt_gc_activity_guard = PromptGcActivityGuard::new(sess.as_ref());
 
-    if let Some(error) = prompt_gc_prompt_override_error(turn_context.as_ref()) {
-        warn!(
-            turn_id = %turn_context.sub_id,
-            checkpoint_id = %checkpoint.checkpoint_id,
-            error,
-            "prompt_gc sidecar rejected an incompatible prompt override"
-        );
-        sidecar
-            .lock()
-            .await
-            .fail_cycle(&checkpoint.checkpoint_id, error.to_string());
-        sess.persist_prompt_gc_rollout_marker(
-            &checkpoint,
-            PromptGcOutcomeKind::Failed,
-            Some(PromptGcExecutionPhase::Prepare),
-            Some("legacy_prompt_override".to_string()),
-            Some(error.to_string()),
-            None,
-        )
-        .await;
-        return;
-    }
-
     let plan = match crate::tools::handlers::prompt_gc::build_runtime_plan(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -6311,7 +6274,7 @@ async fn run_prompt_gc_sidecar_if_needed(
         crate::tools::registry::ToolRegistryBuilder::new(),
     ));
     let base_instructions = codex_protocol::models::BaseInstructions {
-        text: turn_context.prompt_gc_prompt().to_string(),
+        text: crate::client_common::PROMPT_GC_PROMPT.to_string(),
     };
     let mut client_session = parent_client_session.new_hidden_child_session();
     let mut server_model_warning_emitted = false;
@@ -6336,11 +6299,34 @@ async fn run_prompt_gc_sidecar_if_needed(
         &mut server_model_warning_emitted,
         cancellation_token.child_token(),
         SamplingExecutionMode::Hidden,
+        UsageLimitHandlingPolicy::HiddenSilentAutoSwitch,
     )
     .await;
 
     let result = match result {
         Ok(result) => result,
+        Err(CodexErr::UsageLimitReached(error)) => {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                checkpoint_id = %checkpoint.checkpoint_id,
+                error = %error,
+                "prompt_gc sidecar request hit an unrecoverable usage limit"
+            );
+            sidecar
+                .lock()
+                .await
+                .block_remaining_turn(&checkpoint.checkpoint_id, error.to_string());
+            sess.persist_prompt_gc_rollout_marker(
+                &checkpoint,
+                PromptGcOutcomeKind::Failed,
+                Some(PromptGcExecutionPhase::Request),
+                Some("usage_limit_reached".to_string()),
+                Some(error.to_string()),
+                None,
+            )
+            .await;
+            return;
+        }
         Err(error) => {
             warn!(
                 turn_id = %turn_context.sub_id,
@@ -6440,38 +6426,6 @@ async fn run_prompt_gc_sidecar_if_needed(
             .await;
         }
     }
-}
-
-const PROMPT_GC_SUMMARY_PROMPT_CONTRACT_VERSION: &str = "contract=prompt_gc_summary_v1";
-const PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR: &str = "prompt_gc_prompt overrides must start with 'contract=prompt_gc_summary_v1' to opt into the summary-only runtime contract";
-
-fn prompt_gc_prompt_override_error(turn_context: &TurnContext) -> Option<&'static str> {
-    let prompt = turn_context.prompt_gc_prompt.as_deref()?;
-    let mut inside_html_comment = false;
-    let contract_line = prompt.lines().find_map(|line| {
-        let trimmed = line.trim_start_matches('\u{feff}').trim();
-        if inside_html_comment {
-            if trimmed.contains("-->") {
-                inside_html_comment = false;
-            }
-            return None;
-        }
-        if trimmed.is_empty() {
-            return None;
-        }
-        if trimmed.starts_with("<!--") {
-            if !trimmed.contains("-->") {
-                inside_html_comment = true;
-            }
-            return None;
-        }
-        Some(trimmed)
-    });
-    let Some(contract_line) = contract_line else {
-        return Some(PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR);
-    };
-    (contract_line != PROMPT_GC_SUMMARY_PROMPT_CONTRACT_VERSION)
-        .then_some(PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR)
 }
 
 #[derive(Debug, Deserialize)]
@@ -6639,8 +6593,15 @@ pub(crate) async fn run_sampling_request(
         server_model_warning_emitted_for_turn,
         cancellation_token,
         SamplingExecutionMode::Visible,
+        UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch,
     )
     .await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UsageLimitHandlingPolicy {
+    VisibleWarnAndAutoSwitch,
+    HiddenSilentAutoSwitch,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6656,6 +6617,7 @@ async fn run_sampling_request_with_router_and_prompt(
     server_model_warning_emitted_for_turn: &mut bool,
     cancellation_token: CancellationToken,
     execution_mode: SamplingExecutionMode,
+    usage_limit_handling_policy: UsageLimitHandlingPolicy,
 ) -> CodexResult<SamplingRequestResult> {
     let mut retries = 0;
     loop {
@@ -6699,6 +6661,7 @@ async fn run_sampling_request_with_router_and_prompt(
                     &e,
                     request_store_account_id.as_deref(),
                     execution_mode,
+                    usage_limit_handling_policy,
                 )
                 .await?
                 {
@@ -7448,6 +7411,7 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit(
     turn_context: &TurnContext,
     usage_limit: &crate::error::UsageLimitReachedError,
     request_store_account_id: Option<&str>,
+    usage_limit_handling_policy: UsageLimitHandlingPolicy,
 ) -> CodexResult<bool> {
     if sess.services.auth_manager.auth_mode() != Some(crate::auth::AuthMode::Chatgpt) {
         return Ok(false);
@@ -7461,6 +7425,7 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit(
         usage_limit,
         request_store_account_id,
         &freshly_unsupported_store_account_ids,
+        usage_limit_handling_policy,
     )
     .await
 }
@@ -7471,6 +7436,7 @@ async fn maybe_auto_switch_account_on_usage_limit_with_freshly_unsupported_ids(
     usage_limit: &crate::error::UsageLimitReachedError,
     request_store_account_id: Option<&str>,
     freshly_unsupported_store_account_ids: &HashSet<String>,
+    usage_limit_handling_policy: UsageLimitHandlingPolicy,
 ) -> CodexResult<bool> {
     let accounts_before = sess.services.auth_manager.list_accounts();
     let account_display_name = |account: &crate::auth::AccountSummary| {
@@ -7570,15 +7536,17 @@ async fn maybe_auto_switch_account_on_usage_limit_with_freshly_unsupported_ids(
         .find(|account| account.id == next_store_account_id)
         .map(account_display_name)
         .unwrap_or_else(|| next_store_account_id.clone());
-    sess.send_event(
-        turn_context,
-        EventMsg::Warning(WarningEvent {
-            message: format!(
-                "Usage limit reached for account '{from_account_name}'. Auto-switched to account '{next_account_name}' and retrying."
-            ),
-        }),
-    )
-    .await;
+    if usage_limit_handling_policy == UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch {
+        sess.send_event(
+            turn_context,
+            EventMsg::Warning(WarningEvent {
+                message: format!(
+                    "Usage limit reached for account '{from_account_name}'. Auto-switched to account '{next_account_name}' and retrying."
+                ),
+            }),
+        )
+        .await;
+    }
 
     Ok(true)
 }
@@ -7601,6 +7569,7 @@ pub(crate) async fn handle_usage_limit_for_execution_mode(
     usage_limit: &crate::error::UsageLimitReachedError,
     request_store_account_id: Option<&str>,
     execution_mode: SamplingExecutionMode,
+    usage_limit_handling_policy: UsageLimitHandlingPolicy,
 ) -> CodexResult<bool> {
     if let Some(rate_limits) = usage_limit.rate_limits.clone() {
         sess.update_rate_limits_with_visibility(
@@ -7610,14 +7579,15 @@ pub(crate) async fn handle_usage_limit_for_execution_mode(
         )
         .await;
     }
-    // Merge-safety anchor: hidden prompt_gc usage-limit handling must refresh
-    // internal limits without auto-switching accounts or warning the user.
-    if execution_mode == SamplingExecutionMode::Visible {
+    if usage_limit_handling_policy == UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch
+        || usage_limit_handling_policy == UsageLimitHandlingPolicy::HiddenSilentAutoSwitch
+    {
         return maybe_auto_switch_account_on_usage_limit(
             sess,
             turn_context,
             usage_limit,
             request_store_account_id,
+            usage_limit_handling_policy,
         )
         .await;
     }

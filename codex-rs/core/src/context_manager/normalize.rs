@@ -11,6 +11,12 @@ use tracing::info;
 const IMAGE_CONTENT_OMITTED_PLACEHOLDER: &str =
     "image content omitted because you do not support image input";
 
+// Merge-safety anchor: legacy LocalShellCall items may carry only `id`; normalization must
+// preserve their paired FunctionCallOutput instead of dropping hidden prompt_gc rewrite context.
+fn local_shell_call_output_id(id: &Option<String>, call_id: &Option<String>) -> Option<String> {
+    call_id.clone().or_else(|| id.clone())
+}
+
 pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
     // Collect synthetic outputs to insert immediately after their calls.
     // Store the insertion position (index of call) alongside the item so
@@ -60,12 +66,12 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
                 }
             }
             // LocalShellCall is represented in upstream streams by a FunctionCallOutput
-            ResponseItem::LocalShellCall { call_id, .. } => {
-                if let Some(call_id) = call_id.as_ref() {
+            ResponseItem::LocalShellCall { id, call_id, .. } => {
+                if let Some(call_id) = local_shell_call_output_id(id, call_id) {
                     let has_output = items.iter().any(|i| match i {
                         ResponseItem::FunctionCallOutput {
                             call_id: existing, ..
-                        } => existing == call_id,
+                        } => *existing == call_id,
                         _ => false,
                     });
 
@@ -76,7 +82,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
                         missing_outputs_to_insert.push((
                             idx,
                             ResponseItem::FunctionCallOutput {
-                                call_id: call_id.clone(),
+                                call_id,
                                 output: FunctionCallOutputPayload::from_text("aborted".to_string()),
                             },
                         ));
@@ -141,11 +147,11 @@ pub(crate) fn ensure_call_outputs_present_lenient(items: &mut Vec<ResponseItem>)
                     ));
                 }
             }
-            ResponseItem::LocalShellCall {
-                call_id: Some(call_id),
-                ..
-            } => {
-                if !function_call_output_ids.contains(call_id) {
+            ResponseItem::LocalShellCall { id, call_id, .. } => {
+                let Some(call_id) = local_shell_call_output_id(id, call_id) else {
+                    continue;
+                };
+                if !function_call_output_ids.contains(&call_id) {
                     function_call_output_ids.insert(call_id.clone());
                     missing_outputs_to_insert.push((
                         index,
@@ -177,10 +183,9 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
     let local_shell_call_ids: HashSet<String> = items
         .iter()
         .filter_map(|i| match i {
-            ResponseItem::LocalShellCall {
-                call_id: Some(call_id),
-                ..
-            } => Some(call_id.clone()),
+            ResponseItem::LocalShellCall { id, call_id, .. } => {
+                local_shell_call_output_id(id, call_id)
+            }
             _ => None,
         })
         .collect();
@@ -230,10 +235,9 @@ pub(crate) fn remove_orphan_outputs_lenient(items: &mut Vec<ResponseItem>) {
     let local_shell_call_ids: HashSet<String> = items
         .iter()
         .filter_map(|item| match item {
-            ResponseItem::LocalShellCall {
-                call_id: Some(call_id),
-                ..
-            } => Some(call_id.clone()),
+            ResponseItem::LocalShellCall { id, call_id, .. } => {
+                local_shell_call_output_id(id, call_id)
+            }
             _ => None,
         })
         .collect();
@@ -275,7 +279,11 @@ pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItem>, item: &Res
             }) {
                 items.remove(pos);
             } else if let Some(pos) = items.iter().position(|i| {
-                matches!(i, ResponseItem::LocalShellCall { call_id: Some(existing), .. } if existing == call_id)
+                matches!(
+                    i,
+                    ResponseItem::LocalShellCall { id, call_id: existing_call_id, .. }
+                    if local_shell_call_output_id(id, existing_call_id).as_ref() == Some(call_id)
+                )
             }) {
                 items.remove(pos);
             }
@@ -296,18 +304,17 @@ pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItem>, item: &Res
                 |i| matches!(i, ResponseItem::CustomToolCall { call_id: existing, .. } if existing == call_id),
             );
         }
-        ResponseItem::LocalShellCall {
-            call_id: Some(call_id),
-            ..
-        } => {
-            remove_first_matching(items, |i| {
-                matches!(
-                    i,
-                    ResponseItem::FunctionCallOutput {
-                        call_id: existing, ..
-                    } if existing == call_id
-                )
-            });
+        ResponseItem::LocalShellCall { id, call_id, .. } => {
+            if let Some(call_id) = local_shell_call_output_id(id, call_id) {
+                remove_first_matching(items, |i| {
+                    matches!(
+                        i,
+                        ResponseItem::FunctionCallOutput {
+                            call_id: existing, ..
+                        } if existing == &call_id
+                    )
+                });
+            }
         }
         _ => {}
     }

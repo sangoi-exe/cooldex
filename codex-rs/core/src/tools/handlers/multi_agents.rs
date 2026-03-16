@@ -1290,10 +1290,11 @@ fn apply_spawn_agent_runtime_overrides(
         .map_err(|err| {
             FunctionCallError::RespondToModel(format!("sandbox_policy is invalid: {err}"))
         })?;
-    config.permissions.file_system_sandbox_policy =
-        crate::protocol::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
-    config.permissions.network_sandbox_policy =
-        crate::protocol::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
+    // Merge-safety anchor: child spawn/resume must preserve the exact per-turn filesystem and
+    // network sandbox policies instead of reconstructing them from the lossy legacy
+    // `SandboxPolicy`.
+    config.permissions.file_system_sandbox_policy = turn.file_system_sandbox_policy.clone();
+    config.permissions.network_sandbox_policy = turn.network_sandbox_policy;
     // Child session startup re-derives the effective Windows sandbox level from config. Keep the
     // config-side mode aligned with the live turn override so spawned and resumed children do not
     // silently fall back to stale Windows sandbox policy.
@@ -1374,7 +1375,10 @@ mod tests {
     use crate::config::profile::ConfigProfile;
     use crate::config::types::ShellEnvironmentPolicy;
     use crate::config::types::WindowsSandboxModeToml;
+    use crate::config_loader::ConfigLayerEntry;
     use crate::config_loader::ConfigLayerStack;
+    use crate::config_loader::ConfigRequirements;
+    use crate::config_loader::ConfigRequirementsToml;
     use crate::features::Feature;
     use crate::function_tool::FunctionCallError;
     use crate::protocol::AskForApproval;
@@ -1383,6 +1387,7 @@ mod tests {
     use crate::protocol::SessionSource;
     use crate::protocol::SubAgentSource;
     use crate::turn_diff_tracker::TurnDiffTracker;
+    use codex_app_server_protocol::ConfigLayerSource;
     use codex_protocol::ThreadId;
     use codex_protocol::config_types::WindowsSandboxLevel;
     use codex_protocol::models::ContentItem;
@@ -1445,6 +1450,22 @@ mod tests {
         codex_home: &tempfile::TempDir,
         workspace: &tempfile::TempDir,
     ) -> Config {
+        let user_config_path = codex_home.path().join("config.toml");
+        let raw_toml = toml::to_string(&cfg).expect("serialize test config");
+        std::fs::write(&user_config_path, &raw_toml).expect("write test user config");
+        let user_layer = ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: AbsolutePathBuf::from_absolute_path(&user_config_path)
+                    .expect("absolute user config path"),
+            },
+            toml::Value::Table(toml::from_str(&raw_toml).expect("parse test config layer")),
+        );
+        let config_layer_stack = ConfigLayerStack::new(
+            vec![user_layer],
+            ConfigRequirements::default(),
+            ConfigRequirementsToml::default(),
+        )
+        .expect("config layer stack");
         Config::load_config_with_layer_stack(
             cfg,
             ConfigOverrides {
@@ -1452,9 +1473,53 @@ mod tests {
                 ..Default::default()
             },
             codex_home.path().to_path_buf(),
-            ConfigLayerStack::default(),
+            config_layer_stack,
         )
         .expect("test config")
+    }
+
+    fn custom_runtime_file_system_policy() -> crate::protocol::FileSystemSandboxPolicy {
+        crate::protocol::FileSystemSandboxPolicy::restricted(vec![
+            crate::protocol::FileSystemSandboxEntry {
+                path: crate::protocol::FileSystemPath::Special {
+                    value: crate::protocol::FileSystemSpecialPath::CurrentWorkingDirectory,
+                },
+                access: crate::protocol::FileSystemAccessMode::Write,
+            },
+            crate::protocol::FileSystemSandboxEntry {
+                path: crate::protocol::FileSystemPath::Special {
+                    value: crate::protocol::FileSystemSpecialPath::project_roots(Some(
+                        PathBuf::from("sandbox-subdir"),
+                    )),
+                },
+                access: crate::protocol::FileSystemAccessMode::Read,
+            },
+        ])
+    }
+
+    fn assert_shutdown_activity(state: &AgentRuntimeState) {
+        let activity = state
+            .last_activity
+            .as_ref()
+            .expect("shutdown state should retain last activity");
+        assert_eq!(
+            activity.kind,
+            codex_protocol::protocol::CollabAgentActivityKind::Status
+        );
+        assert_eq!(activity.summary, "Shutdown complete");
+        assert!(activity.occurred_at > 0);
+    }
+
+    fn assert_agent_status(
+        agents: &HashMap<ThreadId, AgentRuntimeState>,
+        thread_id: ThreadId,
+        expected_status: AgentStatus,
+    ) -> &AgentRuntimeState {
+        let state = agents
+            .get(&thread_id)
+            .unwrap_or_else(|| panic!("missing agent state for {thread_id}"));
+        assert_eq!(state.status, expected_status);
+        state
     }
 
     #[tokio::test]
@@ -2621,28 +2686,17 @@ mod tests {
         };
         let result: wait::WaitResult =
             serde_json::from_str(&content).expect("wait result should be json");
+        assert!(!result.timed_out);
+        assert_eq!(result.agents.len(), 2);
         assert_eq!(
-            result,
-            wait::WaitResult {
-                agents: HashMap::from([
-                    (
-                        missing_id,
-                        AgentRuntimeState {
-                            status: AgentStatus::NotFound,
-                            last_activity: None,
-                        },
-                    ),
-                    (
-                        existing_id,
-                        AgentRuntimeState {
-                            status: AgentStatus::Shutdown,
-                            last_activity: None,
-                        },
-                    ),
-                ]),
-                timed_out: false,
-            }
+            assert_agent_status(&result.agents, missing_id, AgentStatus::NotFound).last_activity,
+            None
         );
+        assert_shutdown_activity(assert_agent_status(
+            &result.agents,
+            existing_id,
+            AgentStatus::Shutdown,
+        ));
         assert_eq!(success, None);
     }
 
@@ -2780,19 +2834,13 @@ mod tests {
         };
         let result: wait::WaitResult =
             serde_json::from_str(&content).expect("wait result should be json");
-        assert_eq!(
-            result,
-            wait::WaitResult {
-                agents: HashMap::from([(
-                    agent_id,
-                    AgentRuntimeState {
-                        status: AgentStatus::Shutdown,
-                        last_activity: None,
-                    },
-                )]),
-                timed_out: false
-            }
-        );
+        assert!(!result.timed_out);
+        assert_eq!(result.agents.len(), 1);
+        assert_shutdown_activity(assert_agent_status(
+            &result.agents,
+            agent_id,
+            AgentStatus::Shutdown,
+        ));
         assert_eq!(success, None);
     }
 
@@ -2842,19 +2890,13 @@ mod tests {
         };
         let result: wait::WaitResult =
             serde_json::from_str(&content).expect("wait result should be json");
-        assert_eq!(
-            result,
-            wait::WaitResult {
-                agents: HashMap::from([(
-                    agent_id,
-                    AgentRuntimeState {
-                        status: AgentStatus::Shutdown,
-                        last_activity: None,
-                    },
-                )]),
-                timed_out: false,
-            }
-        );
+        assert!(!result.timed_out);
+        assert_eq!(result.agents.len(), 1);
+        assert_shutdown_activity(assert_agent_status(
+            &result.agents,
+            agent_id,
+            AgentStatus::Shutdown,
+        ));
         assert_eq!(success, None);
     }
 
@@ -2913,27 +2955,16 @@ mod tests {
         };
         let result: wait::WaitResult =
             serde_json::from_str(&content).expect("wait result should be json");
+        assert!(result.timed_out);
+        assert_eq!(result.agents.len(), 2);
+        assert_shutdown_activity(assert_agent_status(
+            &result.agents,
+            completed_id,
+            AgentStatus::Shutdown,
+        ));
         assert_eq!(
-            result,
-            wait::WaitResult {
-                agents: HashMap::from([
-                    (
-                        completed_id,
-                        AgentRuntimeState {
-                            status: AgentStatus::Shutdown,
-                            last_activity: None,
-                        },
-                    ),
-                    (
-                        running_id,
-                        AgentRuntimeState {
-                            status: AgentStatus::PendingInit,
-                            last_activity: None,
-                        },
-                    ),
-                ]),
-                timed_out: true,
-            }
+            assert_agent_status(&result.agents, running_id, AgentStatus::PendingInit).last_activity,
+            None
         );
         assert_eq!(success, None);
 
@@ -3014,28 +3045,18 @@ mod tests {
         };
         let result: wait::WaitResult =
             serde_json::from_str(&content).expect("wait result should be json");
-        assert_eq!(
-            result,
-            wait::WaitResult {
-                agents: HashMap::from([
-                    (
-                        first_id,
-                        AgentRuntimeState {
-                            status: AgentStatus::Shutdown,
-                            last_activity: None,
-                        },
-                    ),
-                    (
-                        second_id,
-                        AgentRuntimeState {
-                            status: AgentStatus::Shutdown,
-                            last_activity: None,
-                        },
-                    ),
-                ]),
-                timed_out: false,
-            }
-        );
+        assert!(!result.timed_out);
+        assert_eq!(result.agents.len(), 2);
+        assert_shutdown_activity(assert_agent_status(
+            &result.agents,
+            first_id,
+            AgentStatus::Shutdown,
+        ));
+        assert_shutdown_activity(assert_agent_status(
+            &result.agents,
+            second_id,
+            AgentStatus::Shutdown,
+        ));
         assert_eq!(success, None);
     }
 
@@ -3093,27 +3114,16 @@ mod tests {
         };
         let result: wait::WaitResult =
             serde_json::from_str(&content).expect("wait result should be json");
+        assert!(!result.timed_out);
+        assert_eq!(result.agents.len(), 2);
+        assert_shutdown_activity(assert_agent_status(
+            &result.agents,
+            completed_id,
+            AgentStatus::Shutdown,
+        ));
         assert_eq!(
-            result,
-            wait::WaitResult {
-                agents: HashMap::from([
-                    (
-                        completed_id,
-                        AgentRuntimeState {
-                            status: AgentStatus::Shutdown,
-                            last_activity: None,
-                        },
-                    ),
-                    (
-                        running_id,
-                        AgentRuntimeState {
-                            status: AgentStatus::PendingInit,
-                            last_activity: None,
-                        },
-                    ),
-                ]),
-                timed_out: false,
-            }
+            assert_agent_status(&result.agents, running_id, AgentStatus::PendingInit).last_activity,
+            None
         );
         assert_eq!(success, None);
 
@@ -3289,10 +3299,18 @@ mod tests {
         turn.sandbox_policy
             .set(sandbox_policy)
             .expect("sandbox policy set");
+        let legacy_file_system_policy =
+            crate::protocol::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
+        let legacy_network_policy =
+            crate::protocol::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
+        turn.file_system_sandbox_policy = custom_runtime_file_system_policy();
+        turn.network_sandbox_policy = crate::protocol::NetworkSandboxPolicy::Enabled;
         turn.approval_policy
             .set(AskForApproval::OnRequest)
             .expect("approval policy set");
         turn.windows_sandbox_level = WindowsSandboxLevel::Elevated;
+        assert_ne!(turn.file_system_sandbox_policy, legacy_file_system_policy);
+        assert_ne!(turn.network_sandbox_policy, legacy_network_policy);
 
         let config = build_agent_spawn_config(&turn).expect("spawn config");
         let mut expected = (*turn.config).clone();
@@ -3319,11 +3337,10 @@ mod tests {
             .sandbox_policy
             .set(turn.sandbox_policy.get().clone())
             .expect("sandbox policy set");
-        expected.permissions.file_system_sandbox_policy =
-            crate::protocol::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
-        expected.permissions.network_sandbox_policy =
-            crate::protocol::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
+        expected.permissions.file_system_sandbox_policy = turn.file_system_sandbox_policy.clone();
+        expected.permissions.network_sandbox_policy = turn.network_sandbox_policy;
         expected.permissions.windows_sandbox_mode = Some(WindowsSandboxModeToml::Elevated);
+        let _ = expected.features.enable(Feature::WindowsSandboxElevated);
         assert_eq!(config, expected);
     }
 
@@ -3333,7 +3350,7 @@ mod tests {
         let mut base_config = (*turn.config).clone();
         base_config.user_instructions = Some("base-user".to_string());
         turn.user_instructions = Some("resolved-user".to_string());
-        turn.config = Arc::new(base_config.clone());
+        turn.config = Arc::new(base_config);
 
         let config = build_agent_spawn_config(&turn).expect("spawn config");
 
@@ -3476,6 +3493,14 @@ mod tests {
             .set(AskForApproval::OnRequest)
             .expect("approval policy set");
         turn.windows_sandbox_level = WindowsSandboxLevel::RestrictedToken;
+        let legacy_file_system_policy =
+            crate::protocol::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
+        let legacy_network_policy =
+            crate::protocol::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
+        turn.file_system_sandbox_policy = custom_runtime_file_system_policy();
+        turn.network_sandbox_policy = crate::protocol::NetworkSandboxPolicy::Enabled;
+        assert_ne!(turn.file_system_sandbox_policy, legacy_file_system_policy);
+        assert_ne!(turn.network_sandbox_policy, legacy_network_policy);
 
         let config = build_agent_resume_config(&turn, 0).expect("resume config");
 
@@ -3503,11 +3528,11 @@ mod tests {
             .sandbox_policy
             .set(turn.sandbox_policy.get().clone())
             .expect("sandbox policy set");
-        expected.permissions.file_system_sandbox_policy =
-            crate::protocol::FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
-        expected.permissions.network_sandbox_policy =
-            crate::protocol::NetworkSandboxPolicy::from(turn.sandbox_policy.get());
+        expected.permissions.file_system_sandbox_policy = turn.file_system_sandbox_policy.clone();
+        expected.permissions.network_sandbox_policy = turn.network_sandbox_policy;
         expected.permissions.windows_sandbox_mode = Some(WindowsSandboxModeToml::Unelevated);
+        let _ = expected.features.enable(Feature::WindowsSandbox);
+        let _ = expected.features.disable(Feature::WindowsSandboxElevated);
         assert_eq!(config, expected);
     }
 

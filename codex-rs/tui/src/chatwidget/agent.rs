@@ -199,7 +199,7 @@ pub(crate) fn spawn_agent(
             }
         });
 
-        forward_thread_runtime(thread, app_event_tx_clone, None, false).await;
+        forward_thread_runtime(thread, app_event_tx_clone, None, true).await;
     });
 
     codex_op_tx
@@ -236,7 +236,7 @@ pub(crate) fn spawn_agent_from_existing(
             }
         });
 
-        forward_thread_runtime(thread, app_event_tx_clone, None, false).await;
+        forward_thread_runtime(thread, app_event_tx_clone, None, true).await;
     });
 
     codex_op_tx
@@ -297,6 +297,34 @@ mod tests {
                 assert_eq!(event_token_usage_info, Some(token_usage_info));
             }
             other => panic!("expected thread prompt-GC usage refresh, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn initial_prompt_gc_bootstrap_event_emits_primary_usage_refresh_when_listener_attaches_idle() {
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+
+        let event =
+            initial_prompt_gc_bootstrap_event(None, false, true, Some(token_usage_info.clone()))
+                .expect("idle bootstrap should emit a primary private usage refresh");
+
+        match event {
+            AppEvent::PromptGcContextUsageUpdated {
+                token_usage_info: event_token_usage_info,
+            } => {
+                assert_eq!(event_token_usage_info, Some(token_usage_info));
+            }
+            other => panic!("expected primary prompt-GC usage refresh, got {other:?}"),
         }
     }
 }

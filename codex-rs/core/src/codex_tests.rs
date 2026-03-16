@@ -562,13 +562,14 @@ async fn prompt_gc_hidden_usage_limit_updates_rate_limits_without_visible_events
         &usage_limit,
         None,
         SamplingExecutionMode::Hidden,
+        UsageLimitHandlingPolicy::HiddenSilentAutoSwitch,
     )
     .await
     .expect("hidden usage-limit handling should succeed");
 
     assert!(
         !should_retry,
-        "hidden prompt_gc should not auto-switch accounts or silently retry"
+        "hidden prompt_gc should not retry when there is no eligible fallback account"
     );
     assert!(
         rx.try_recv().is_err(),
@@ -670,6 +671,7 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
         &usage_limit,
         Some("acc-1"),
         &freshly_unsupported_store_account_ids,
+        UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch,
     )
     .await
     .expect("stale request should still retry against the already-active account");
@@ -769,6 +771,7 @@ async fn prompt_gc_sidecar_invalid_summary_payload_is_terminal_after_request() {
     )
     .await;
 
+    session.flush_rollout().await;
     let status = sidecar.lock().await.status.clone();
     assert_eq!(status.last_applied_checkpoint_seq, None);
     assert_eq!(
@@ -976,16 +979,71 @@ async fn prompt_gc_sidecar_incomplete_summary_payload_fails_apply_validation() {
 }
 
 #[tokio::test]
-async fn prompt_gc_sidecar_rejects_legacy_prompt_override_contract() {
-    let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+async fn prompt_gc_hidden_usage_limit_auto_switches_and_retries() {
+    let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let server = MockServer::start().await;
+    let observed_headers = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let auth_home = tempfile::tempdir().expect("create auth tempdir");
+    let auth_store = crate::auth::AuthStore {
+        active_account_id: Some("acc-0".to_string()),
+        accounts: vec![
+            crate::auth::StoredAccount {
+                id: "acc-0".to_string(),
+                label: None,
+                tokens: test_chatgpt_token_data("acc-0"),
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+            crate::auth::StoredAccount {
+                id: "acc-1".to_string(),
+                label: None,
+                tokens: test_chatgpt_token_data("acc-1"),
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+        ],
+        ..crate::auth::AuthStore::default()
+    };
+    crate::auth::save_auth(
+        auth_home.path(),
+        &auth_store,
+        crate::auth::AuthCredentialsStoreMode::File,
+    )
+    .expect("persist auth store");
+    let auth_manager = crate::AuthManager::shared(
+        auth_home.path().to_path_buf(),
+        false,
+        crate::auth::AuthCredentialsStoreMode::File,
+    );
+    let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
+    session_mut.services.auth_manager = Arc::clone(&auth_manager);
     let turn_context_mut =
         Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
-    turn_context_mut.prompt_gc_prompt = Some(
-        "Use the internal prompt_gc tool in a retrieve/apply loop until compaction succeeds."
-            .to_string(),
-    );
-    let rollout_path = attach_rollout_recorder(&session).await;
-    let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
+    turn_context_mut.auth_manager = Some(Arc::clone(&auth_manager));
+
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(PromptGcRetryResponder {
+            calls: AtomicUsize::new(0),
+            observed_headers: Arc::clone(&observed_headers),
+            resets_at: Utc
+                .with_ymd_and_hms(2024, 1, 1, 0, 15, 0)
+                .unwrap()
+                .timestamp(),
+            response_body: sse(&[
+                response_created("resp-1"),
+                assistant_message_event(
+                    "msg-1",
+                    "{\"summaries\":[{\"chunk_id\":\"prompt_gc_chunk_0\",\"tool_context\":\"\",\"reasoning_context\":\"summary\"}]}",
+                ),
+                response_completed_with_usage("resp-1", 17),
+            ]),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
     let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
     let observed_items = session
         .record_into_history(
@@ -1022,50 +1080,68 @@ async fn prompt_gc_sidecar_rejects_legacy_prompt_override_contract() {
     .await;
 
     let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, None);
+    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
+    assert_eq!(status.last_error, None);
+    assert_eq!(status.blocked_reason, None);
     assert_eq!(
-        status.last_error.as_deref(),
-        Some(PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR)
+        auth_manager
+            .list_accounts()
+            .into_iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id),
+        Some("acc-1".to_string())
     );
-    session.flush_rollout().await;
     assert_eq!(
-        prompt_gc_rollout_markers(&rollout_path).await,
+        *observed_headers
+            .lock()
+            .expect("prompt_gc retry headers should be recorded"),
         vec![
-            PromptGcCompactionMetadata {
-                checkpoint_id: checkpoint_id.clone(),
-                checkpoint_seq: 0,
-                kind: PromptGcOutcomeKind::Started,
-                phase: Some(PromptGcExecutionPhase::Prepare),
-                stop_reason: None,
-                error_message: None,
-                applied_unit_count: None,
-            },
-            PromptGcCompactionMetadata {
-                checkpoint_id,
-                checkpoint_seq: 0,
-                kind: PromptGcOutcomeKind::Failed,
-                phase: Some(PromptGcExecutionPhase::Prepare),
-                stop_reason: Some("legacy_prompt_override".to_string()),
-                error_message: Some(PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR.to_string()),
-                applied_unit_count: None,
-            },
+            ("acc-0".to_string(), "Bearer access-acc-0".to_string()),
+            ("acc-1".to_string(), "Bearer access-acc-1".to_string()),
         ]
     );
-    assert!(rx.try_recv().is_err());
+    assert!(
+        rx.try_recv().is_err(),
+        "hidden prompt_gc autoswitch must stay silent in visible events"
+    );
 }
 
 #[tokio::test]
-async fn prompt_gc_sidecar_rejects_legacy_prompt_override_contract_before_no_eligible_return() {
-    let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
-    let turn_context_mut =
-        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
-    turn_context_mut.prompt_gc_prompt = Some(
-        "Use the internal prompt_gc tool in a retrieve/apply loop until compaction succeeds."
-            .to_string(),
-    );
+async fn prompt_gc_hidden_usage_limit_blocks_remaining_turn_after_unrecoverable_failure() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let server = MockServer::start().await;
     let rollout_path = attach_rollout_recorder(&session).await;
     let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("content-type", "application/json")
+                .insert_header("x-codex-primary-used-percent", "100.0")
+                .insert_header("x-codex-primary-window-minutes", "15")
+                .set_body_json(json!({
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "plan_type": "pro",
+                        "resets_at": Utc
+                            .with_ymd_and_hms(2024, 1, 1, 0, 15, 0)
+                            .unwrap()
+                            .timestamp(),
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
     let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let reasoning = ResponseItem::Reasoning {
+        id: "reasoning-1".to_string(),
+        summary: Vec::new(),
+        content: None,
+        encrypted_content: None,
+    };
     let phase_message = ResponseItem::Message {
         id: Some("phase-1".to_string()),
         role: "assistant".to_string(),
@@ -1076,7 +1152,7 @@ async fn prompt_gc_sidecar_rejects_legacy_prompt_override_contract_before_no_eli
         phase: Some(codex_protocol::models::MessagePhase::Commentary),
     };
     let observed_items = session
-        .record_into_history(std::slice::from_ref(&phase_message), &turn_context)
+        .record_into_history(&[reasoning, phase_message], &turn_context)
         .await;
     sidecar.lock().await.observe_recorded_batch(&observed_items);
     let parent_client_session = session.services.model_client.new_session();
@@ -1092,10 +1168,38 @@ async fn prompt_gc_sidecar_rejects_legacy_prompt_override_contract_before_no_eli
 
     let status = sidecar.lock().await.status.clone();
     assert_eq!(status.last_applied_checkpoint_seq, None);
-    assert_eq!(
-        status.last_error.as_deref(),
-        Some(PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR)
+    assert!(status.last_error.is_some());
+    assert!(status.blocked_reason.is_some());
+    assert!(
+        status
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|error| error.contains("You've hit your usage limit"))
     );
+
+    let second_phase_message = ResponseItem::Message {
+        id: Some("phase-2".to_string()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "later checkpoint".to_string(),
+        }],
+        end_turn: None,
+        phase: Some(codex_protocol::models::MessagePhase::FinalAnswer),
+    };
+    let observed_items = session
+        .record_into_history(std::slice::from_ref(&second_phase_message), &turn_context)
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
     session.flush_rollout().await;
     assert_eq!(
         prompt_gc_rollout_markers(&rollout_path).await,
@@ -1113,44 +1217,16 @@ async fn prompt_gc_sidecar_rejects_legacy_prompt_override_contract_before_no_eli
                 checkpoint_id,
                 checkpoint_seq: 0,
                 kind: PromptGcOutcomeKind::Failed,
-                phase: Some(PromptGcExecutionPhase::Prepare),
-                stop_reason: Some("legacy_prompt_override".to_string()),
-                error_message: Some(PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR.to_string()),
+                phase: Some(PromptGcExecutionPhase::Request),
+                stop_reason: Some("usage_limit_reached".to_string()),
+                error_message: status.last_error,
                 applied_unit_count: None,
             },
         ]
     );
-    assert!(rx.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn prompt_gc_prompt_override_contract_allows_summary_only_override_with_obsolete_terms() {
-    let (_session, mut turn_context) = make_session_and_context().await;
-    turn_context.prompt_gc_prompt = Some(format!(
-        "{PROMPT_GC_SUMMARY_PROMPT_CONTRACT_VERSION}\nReturn JSON summaries only. Do not use plan_id or state_hash; they are obsolete."
-    ));
-
-    assert_eq!(prompt_gc_prompt_override_error(&turn_context), None);
-}
-
-#[tokio::test]
-async fn prompt_gc_prompt_override_contract_accepts_verbatim_builtin_prompt_copy() {
-    let (_session, mut turn_context) = make_session_and_context().await;
-    turn_context.prompt_gc_prompt = Some(crate::client_common::PROMPT_GC_PROMPT.to_string());
-
-    assert_eq!(prompt_gc_prompt_override_error(&turn_context), None);
-}
-
-#[tokio::test]
-async fn prompt_gc_prompt_override_contract_rejects_comment_only_override() {
-    let (_session, mut turn_context) = make_session_and_context().await;
-    turn_context.prompt_gc_prompt = Some(
-        "<!-- Merge-safety anchor: copied prompt without the contract header. -->".to_string(),
-    );
-
-    assert_eq!(
-        prompt_gc_prompt_override_error(&turn_context),
-        Some(PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR)
+    assert!(
+        rx.try_recv().is_err(),
+        "blocked hidden prompt_gc must not emit visible events"
     );
 }
 
@@ -1571,6 +1647,51 @@ impl Respond for StaticSseResponder {
             response = response.insert_header(name.clone(), value.clone());
         }
         response
+    }
+}
+
+struct PromptGcRetryResponder {
+    calls: AtomicUsize,
+    observed_headers: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    resets_at: i64,
+    response_body: String,
+}
+
+impl Respond for PromptGcRetryResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let account_id = request
+            .headers
+            .get("chatgpt-account-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("chatgpt-account-id header")
+            .to_string();
+        let authorization = request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .expect("authorization header")
+            .to_string();
+        self.observed_headers
+            .lock()
+            .expect("prompt_gc retry headers should be writable")
+            .push((account_id, authorization));
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => ResponseTemplate::new(429)
+                .insert_header("content-type", "application/json")
+                .insert_header("x-codex-primary-used-percent", "100.0")
+                .insert_header("x-codex-primary-window-minutes", "15")
+                .set_body_json(json!({
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "plan_type": "pro",
+                        "resets_at": self.resets_at,
+                    }
+                })),
+            1 => ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(self.response_body.clone()),
+            call_num => panic!("unexpected extra prompt_gc request {call_num}"),
+        }
     }
 }
 
@@ -2322,21 +2443,14 @@ async fn recompute_token_usage_updates_model_context_window() {
     assert_eq!(actual.model_context_window, Some(128_000));
 }
 
-#[tokio::test]
-async fn prompt_gc_prompt_defaults_to_builtin_prompt() {
-    let (_session, turn_context) = make_session_and_context().await;
-    assert_eq!(
-        turn_context.prompt_gc_prompt(),
-        crate::client_common::PROMPT_GC_PROMPT
-    );
-}
-
-#[tokio::test]
-async fn prompt_gc_prompt_prefers_turn_context_override() {
-    let (_session, mut turn_context) = make_session_and_context().await;
-    turn_context.prompt_gc_prompt = Some("override prompt".to_string());
-
-    assert_eq!(turn_context.prompt_gc_prompt(), "override prompt");
+#[test]
+fn prompt_gc_builtin_prompt_is_summary_only() {
+    assert!(crate::client_common::PROMPT_GC_PROMPT.starts_with("<!--"));
+    assert!(crate::client_common::PROMPT_GC_PROMPT.contains("contract=prompt_gc_summary_v1"));
+    assert!(crate::client_common::PROMPT_GC_PROMPT.contains("Return JSON only"));
+    assert!(crate::client_common::PROMPT_GC_PROMPT.contains("Summarize only the chunks"));
+    assert!(!crate::client_common::PROMPT_GC_PROMPT.contains("retrieve/apply loop"));
+    assert!(!crate::client_common::PROMPT_GC_PROMPT.contains("manage_context"));
 }
 
 #[tokio::test]
@@ -2810,7 +2924,6 @@ async fn set_rate_limits_retains_previous_credits() {
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
         compact_prompt: config.compact_prompt.clone(),
-        prompt_gc_prompt: config.prompt_gc_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         sandbox_policy: config.permissions.sandbox_policy.clone(),
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
@@ -2910,7 +3023,6 @@ async fn set_rate_limits_updates_plan_type_when_present() {
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
         compact_prompt: config.compact_prompt.clone(),
-        prompt_gc_prompt: config.prompt_gc_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         sandbox_policy: config.permissions.sandbox_policy.clone(),
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
@@ -3286,7 +3398,6 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
         compact_prompt: config.compact_prompt.clone(),
-        prompt_gc_prompt: config.prompt_gc_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         sandbox_policy: config.permissions.sandbox_policy.clone(),
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
@@ -3349,7 +3460,6 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
         compact_prompt: config.compact_prompt.clone(),
-        prompt_gc_prompt: config.prompt_gc_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         sandbox_policy: config.permissions.sandbox_policy.clone(),
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
@@ -3454,7 +3564,6 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
         compact_prompt: config.compact_prompt.clone(),
-        prompt_gc_prompt: config.prompt_gc_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         sandbox_policy: config.permissions.sandbox_policy.clone(),
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
@@ -3879,7 +3988,6 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
         compact_prompt: config.compact_prompt.clone(),
-        prompt_gc_prompt: config.prompt_gc_prompt.clone(),
         approval_policy: config.permissions.approval_policy.clone(),
         sandbox_policy: config.permissions.sandbox_policy.clone(),
         file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),

@@ -597,6 +597,7 @@ pub(crate) struct ChatWidget {
     initial_user_message: Option<UserMessage>,
     token_info: Option<TokenUsageInfo>,
     token_info_is_prompt_gc_private: bool,
+    prompt_gc_context_usage_unknown: bool,
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
     plan_type: Option<PlanType>,
     rate_limit_warnings: RateLimitWarningState,
@@ -1610,6 +1611,7 @@ impl ChatWidget {
         self.bottom_pane.clear_quit_shortcut_hint();
         self.quit_shortcut_expires_at = None;
         self.quit_shortcut_key = None;
+        self.bottom_pane.clear_status_state();
         self.update_task_running_state();
         self.retry_status_header = None;
         self.pending_status_indicator_restore = false;
@@ -1664,6 +1666,7 @@ impl ChatWidget {
         self.bottom_pane.set_prompt_gc_active(false);
         self.agent_turn_running = false;
         self.turn_sleep_inhibitor.set_turn_running(false);
+        self.bottom_pane.clear_status_state();
         self.update_task_running_state();
         self.function_call_names_by_id.clear();
         self.running_commands.clear();
@@ -1808,12 +1811,14 @@ impl ChatWidget {
         match info {
             Some(info) => {
                 self.token_info_is_prompt_gc_private = false;
+                self.prompt_gc_context_usage_unknown = false;
                 self.apply_token_info(info);
             }
             None => {
                 self.bottom_pane.set_context_window(None, None);
                 self.token_info = None;
                 self.token_info_is_prompt_gc_private = false;
+                self.prompt_gc_context_usage_unknown = false;
             }
         }
     }
@@ -1822,9 +1827,14 @@ impl ChatWidget {
         if !self.token_info_is_prompt_gc_private {
             return;
         }
-        self.bottom_pane.set_context_window(None, None);
+        self.mark_prompt_gc_context_usage_unknown();
         self.token_info = None;
         self.token_info_is_prompt_gc_private = false;
+    }
+
+    fn mark_prompt_gc_context_usage_unknown(&mut self) {
+        self.bottom_pane.hide_context_window_when_unknown();
+        self.prompt_gc_context_usage_unknown = true;
     }
 
     // Merge-safety anchor: prompt-GC completion refresh must preserve the full token-usage split
@@ -1834,6 +1844,7 @@ impl ChatWidget {
             token_usage_info.model_context_window = self.status_line_context_window_size();
         }
         self.token_info_is_prompt_gc_private = true;
+        self.prompt_gc_context_usage_unknown = false;
         self.apply_token_info(token_usage_info);
     }
 
@@ -1858,6 +1869,7 @@ impl ChatWidget {
             }
             None => {
                 let Some(model_context_window) = model_context_window else {
+                    self.prompt_gc_context_usage_unknown = false;
                     self.bottom_pane.set_context_window(None, None);
                     self.token_info = None;
                     return;
@@ -1877,6 +1889,7 @@ impl ChatWidget {
         let percent = self.context_remaining_percent(&info);
         let used_tokens = self.context_used_tokens(&info, percent.is_some());
         self.bottom_pane.set_context_window(percent, used_tokens);
+        self.prompt_gc_context_usage_unknown = false;
         self.token_info = Some(info);
     }
 
@@ -1910,6 +1923,7 @@ impl ChatWidget {
                     self.bottom_pane.set_context_window(None, None);
                     self.token_info = None;
                     self.token_info_is_prompt_gc_private = false;
+                    self.prompt_gc_context_usage_unknown = false;
                 }
             }
         }
@@ -2680,7 +2694,11 @@ impl ChatWidget {
 
     pub(crate) fn set_prompt_gc_activity(&mut self, active: bool) {
         if active {
-            self.clear_prompt_gc_private_context_usage_info();
+            if self.token_info_is_prompt_gc_private {
+                self.clear_prompt_gc_private_context_usage_info();
+            } else if self.token_info.is_none() {
+                self.mark_prompt_gc_context_usage_unknown();
+            }
             self.bottom_pane.set_prompt_gc_active(true);
             self.bottom_pane.ensure_status_indicator();
             self.bottom_pane.set_interrupt_hint_visible(true);
@@ -3310,6 +3328,7 @@ impl ChatWidget {
             initial_user_message,
             token_info: None,
             token_info_is_prompt_gc_private: false,
+            prompt_gc_context_usage_unknown: false,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
@@ -3496,6 +3515,7 @@ impl ChatWidget {
             initial_user_message,
             token_info: None,
             token_info_is_prompt_gc_private: false,
+            prompt_gc_context_usage_unknown: false,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
@@ -3674,6 +3694,7 @@ impl ChatWidget {
             initial_user_message,
             token_info: None,
             token_info_is_prompt_gc_private: false,
+            prompt_gc_context_usage_unknown: false,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
@@ -5631,6 +5652,9 @@ impl ChatWidget {
     }
 
     fn status_line_context_remaining_percent(&self) -> Option<i64> {
+        if self.prompt_gc_context_usage_unknown {
+            return None;
+        }
         let Some(context_window) = self.status_line_context_window_size() else {
             return Some(100);
         };
@@ -5648,7 +5672,7 @@ impl ChatWidget {
     }
 
     fn status_line_context_used_percent(&self) -> Option<i64> {
-        let remaining = self.status_line_context_remaining_percent().unwrap_or(100);
+        let remaining = self.status_line_context_remaining_percent()?;
         Some((100 - remaining).clamp(0, 100))
     }
 

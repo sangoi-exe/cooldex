@@ -1,5 +1,8 @@
 //! The chat composer is the bottom-pane text input state machine.
 //!
+//! Merge-safety anchor: when prompt_gc clears its private usage snapshot, the composer must be
+//! able to hide unknown context-window state instead of rendering a fake `100% left`.
+//!
 //! It is responsible for:
 //!
 //! - Editing the input buffer (a [`TextArea`]), including placeholder "elements" for attachments.
@@ -158,6 +161,7 @@ use super::footer::CollaborationModeIndicator;
 use super::footer::FooterMode;
 use super::footer::FooterProps;
 use super::footer::SummaryLeft;
+use super::footer::UnknownContextWindowDisplay;
 use super::footer::can_show_left_with_context;
 use super::footer::context_window_line;
 use super::footer::esc_hint_mode;
@@ -387,6 +391,8 @@ pub(crate) struct ChatComposer {
     selected_remote_image_index: Option<usize>,
     footer_flash: Option<FooterFlash>,
     context_window_percent: Option<i64>,
+    unknown_context_window_display: UnknownContextWindowDisplay,
+    is_wsl: bool,
     // Monotonically increasing identifier for textarea elements we insert.
     #[cfg(not(target_os = "linux"))]
     next_element_id: u64,
@@ -508,6 +514,8 @@ impl ChatComposer {
             selected_remote_image_index: None,
             footer_flash: None,
             context_window_percent: None,
+            unknown_context_window_display: UnknownContextWindowDisplay::ShowAsFull,
+            is_wsl: crate::clipboard_paste::is_probably_wsl(),
             #[cfg(not(target_os = "linux"))]
             next_element_id: 0,
             context_window_used_tokens: None,
@@ -3166,16 +3174,7 @@ impl ChatComposer {
 
     fn footer_props(&self) -> FooterProps {
         let mode = self.footer_mode();
-        let is_wsl = {
-            #[cfg(target_os = "linux")]
-            {
-                mode == FooterMode::ShortcutOverlay && crate::clipboard_paste::is_probably_wsl()
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                false
-            }
-        };
+        let is_wsl = mode == FooterMode::ShortcutOverlay && self.is_wsl;
 
         FooterProps {
             mode,
@@ -3187,9 +3186,14 @@ impl ChatComposer {
             is_wsl,
             context_window_percent: self.context_window_percent,
             context_window_used_tokens: self.context_window_used_tokens,
+            unknown_context_window_display: self.unknown_context_window_display,
             status_line_value: self.status_line_value.clone(),
             status_line_enabled: self.status_line_enabled,
         }
+    }
+
+    pub(crate) fn shows_unknown_context_window_as_full(&self) -> bool {
+        self.unknown_context_window_display == UnknownContextWindowDisplay::ShowAsFull
     }
 
     /// Resolve the effective footer mode via a small priority waterfall.
@@ -3711,12 +3715,32 @@ impl ChatComposer {
     }
 
     pub(crate) fn set_context_window(&mut self, percent: Option<i64>, used_tokens: Option<i64>) {
-        if self.context_window_percent == percent && self.context_window_used_tokens == used_tokens
+        if self.context_window_percent == percent
+            && self.context_window_used_tokens == used_tokens
+            && self.unknown_context_window_display == UnknownContextWindowDisplay::ShowAsFull
         {
             return;
         }
         self.context_window_percent = percent;
         self.context_window_used_tokens = used_tokens;
+        self.unknown_context_window_display = UnknownContextWindowDisplay::ShowAsFull;
+    }
+
+    pub(crate) fn hide_context_window_when_unknown(&mut self) {
+        if self.context_window_percent.is_none()
+            && self.context_window_used_tokens.is_none()
+            && self.unknown_context_window_display == UnknownContextWindowDisplay::Hide
+        {
+            return;
+        }
+        self.context_window_percent = None;
+        self.context_window_used_tokens = None;
+        self.unknown_context_window_display = UnknownContextWindowDisplay::Hide;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_is_wsl_for_test(&mut self, is_wsl: bool) {
+        self.is_wsl = is_wsl;
     }
 
     pub(crate) fn set_esc_backtrack_hint(&mut self, show: bool) {
@@ -4259,10 +4283,11 @@ impl ChatComposer {
                         compact
                     }
                 } else {
-                    Some(context_window_line(
+                    context_window_line(
                         footer_props.context_window_percent,
                         footer_props.context_window_used_tokens,
-                    ))
+                        footer_props.unknown_context_window_display,
+                    )
                 };
                 let right_width = right_line.as_ref().map(|l| l.width() as u16).unwrap_or(0);
                 if status_line_active
@@ -4687,6 +4712,7 @@ mod tests {
         use crossterm::event::KeyModifiers;
 
         snapshot_composer_state("footer_mode_shortcut_overlay", true, |composer| {
+            composer.set_is_wsl_for_test(false);
             composer.set_esc_backtrack_hint(true);
             let _ =
                 composer.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));

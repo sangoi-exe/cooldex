@@ -2025,8 +2025,11 @@ impl App {
             self.set_thread_prompt_gc_context_usage(thread_id, token_usage_info)
                 .await;
         } else {
-            let should_accept = self.primary_prompt_gc_completion_pending
-                && !self.primary_prompt_gc_visible_token_count_seen;
+            let allow_idle_bootstrap = !self.primary_prompt_gc_completion_pending
+                && !self.primary_prompt_gc_visible_token_count_seen
+                && self.chat_widget.token_usage() == TokenUsage::default();
+            let should_accept = !self.primary_prompt_gc_visible_token_count_seen
+                && (self.primary_prompt_gc_completion_pending || allow_idle_bootstrap);
             if self.primary_prompt_gc_completion_pending {
                 self.primary_prompt_gc_completion_pending = false;
             }
@@ -5430,6 +5433,27 @@ mod tests {
         };
         assert_eq!(store_usage, Some(token_usage_info));
         assert_eq!(app.chat_widget.context_window_percent_for_test(), None);
+    }
+
+    #[tokio::test]
+    async fn primary_prompt_gc_context_usage_bootstrap_updates_active_widget() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+
+        app.set_primary_prompt_gc_context_usage(Some(token_usage_info))
+            .await;
+
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(60));
     }
 
     #[tokio::test]

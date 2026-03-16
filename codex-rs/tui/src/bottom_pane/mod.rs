@@ -670,6 +670,15 @@ impl BottomPane {
         }
     }
 
+    pub(crate) fn clear_status_state(&mut self) {
+        self.status_state = None;
+        if let Some(status) = self.status.as_mut() {
+            status.update_header("Working".to_string());
+            status.update_details(None, StatusDetailsCapitalization::CapitalizeFirst, 1);
+            self.request_redraw();
+        }
+    }
+
     /// Show the transient "press again to quit" hint for `key`.
     ///
     /// `ChatWidget` owns the quit shortcut state machine (it decides when quit is
@@ -803,7 +812,9 @@ impl BottomPane {
     }
 
     pub(crate) fn set_context_window(&mut self, percent: Option<i64>, used_tokens: Option<i64>) {
-        if self.context_window_percent == percent && self.context_window_used_tokens == used_tokens
+        if self.context_window_percent == percent
+            && self.context_window_used_tokens == used_tokens
+            && self.composer.shows_unknown_context_window_as_full()
         {
             return;
         }
@@ -812,6 +823,19 @@ impl BottomPane {
         self.context_window_used_tokens = used_tokens;
         self.composer
             .set_context_window(percent, self.context_window_used_tokens);
+        self.request_redraw();
+    }
+
+    pub(crate) fn hide_context_window_when_unknown(&mut self) {
+        if self.context_window_percent.is_none() && self.context_window_used_tokens.is_none() {
+            self.composer.hide_context_window_when_unknown();
+            self.request_redraw();
+            return;
+        }
+
+        self.context_window_percent = None;
+        self.context_window_used_tokens = None;
+        self.composer.hide_context_window_when_unknown();
         self.request_redraw();
     }
 

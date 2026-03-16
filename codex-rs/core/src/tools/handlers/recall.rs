@@ -224,6 +224,10 @@ fn build_recall_payload(
         return Ok(json!({
             "mode": "recall_pre_compact_compact",
             "source": "current_session_rollout",
+            "legend": {
+                "[r]": "reasoning",
+                "[am]": "assistant message",
+            },
             "items": compact.items,
         }));
     }
@@ -1049,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn recall_ignores_prompt_gc_replacement_history_as_lower_boundary() {
+    fn recall_ignores_prompt_gc_replacement_history_as_lower_boundary_until_notes_are_hydratable() {
         let rollout_items = vec![
             replacement_history_compacted_marker_with_history(vec![ResponseItem::Message {
                 id: None,
@@ -1168,6 +1172,11 @@ mod tests {
         assert_eq!(
             payload.get("source").and_then(Value::as_str),
             Some("current_session_rollout")
+        );
+        assert_eq!(payload.pointer("/legend/[r]"), Some(&json!("reasoning")));
+        assert_eq!(
+            payload.pointer("/legend/[am]"),
+            Some(&json!("assistant message"))
         );
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].as_str(), Some("1: [am] assistant one"));

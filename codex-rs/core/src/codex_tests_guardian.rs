@@ -188,14 +188,28 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
 
     let mut config = build_test_config(codex_home.path()).await;
     config.cwd = project_dir.path().to_path_buf();
+    // Merge-safety anchor: guardian subagent tests must build both user and project config layers
+    // so child isolation keeps matching the customized multi-agent reload path.
     config.config_layer_stack = ConfigLayerStack::new(
-        vec![ConfigLayerEntry::new(
-            ConfigLayerSource::Project {
-                dot_codex_folder: AbsolutePathBuf::from_absolute_path(project_dir.path())
-                    .expect("absolute project path"),
-            },
-            toml::Value::Table(Default::default()),
-        )],
+        vec![
+            ConfigLayerEntry::new(
+                ConfigLayerSource::User {
+                    file: AbsolutePathBuf::resolve_path_against_base(
+                        "config.toml",
+                        codex_home.path(),
+                    )
+                    .expect("absolute user config path"),
+                },
+                toml::Value::Table(Default::default()),
+            ),
+            ConfigLayerEntry::new(
+                ConfigLayerSource::Project {
+                    dot_codex_folder: AbsolutePathBuf::from_absolute_path(project_dir.path())
+                        .expect("absolute project path"),
+                },
+                toml::Value::Table(Default::default()),
+            ),
+        ],
         ConfigRequirements::default(),
         ConfigRequirementsToml::default(),
     )

@@ -14,7 +14,7 @@ This document describes the current `recall` contract and the required maintenan
 - For standard compactions, the matching `EventMsg::ContextCompacted(_)` is a legacy event emitted after the `ContextCompaction` item completes, so the current compaction's own legacy event is not part of the pre-`Compacted` scan.
 - The lower boundary is the most recent earlier marker before that upper boundary where the marker is either:
   - `EventMsg::ContextCompacted(_)` from a previous compaction, or
-  - `RolloutItem::Compacted` with `replacement_history: Some(...)` that is not any prompt-gc marker.
+  - `RolloutItem::Compacted` with `replacement_history: Some(...)` from a previous standard compaction.
 - If that lower boundary is `replacement_history_compacted`, recall hydrates the sanitized `replacement_history` stored on that marker as the base of the returned reasoning/assistant window, then appends newer matching rollout items after the marker.
 - Otherwise, returned rollout scan starts immediately after the lower boundary marker; when no lower boundary exists, scan starts at index `0`.
 - Returned items include only assistant messages and reasoning text.
@@ -22,6 +22,7 @@ This document describes the current `recall` contract and the required maintenan
 - `recall_kbytes_limit` applies a KiB byte cap from the tail of matching items.
 - `recall_debug` controls output shape:
   - unset/`false` (default): compact payload (`mode = "recall_pre_compact_compact"`)
+    - includes `legend["[r]"] = "reasoning"` and `legend["[am]"] = "assistant message"`
   - `true`: debug payload (`mode = "recall_pre_compact"`)
 - In debug mode, replacement-history-derived items must report `source = "replacement_history"` and may use `rollout_index = null`; raw rollout-derived items use `source = "rollout"` with a concrete rollout index.
 - Rollout parse errors do not hard-fail recall; debug mode reports degraded integrity with `integrity.rollout_parse_errors`.

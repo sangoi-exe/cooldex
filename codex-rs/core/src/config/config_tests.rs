@@ -2624,25 +2624,57 @@ fn loads_compact_prompt_from_file() -> std::io::Result<()> {
 }
 
 #[test]
-fn loads_prompt_gc_prompt_from_config_toml() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cfg = ConfigToml {
-        prompt_gc_prompt: Some("  Use the prompt gc override  ".to_string()),
-        ..Default::default()
-    };
+fn stale_prompt_gc_prompt_config_fails_to_load() {
+    // Merge-safety anchor: removing hidden prompt_gc config seams must stay fail-loud for stale
+    // configs instead of silently accepting unknown fields.
+    let value = toml::from_str::<toml::Value>("prompt_gc_prompt = \"Use the prompt gc override\"")
+        .expect("parse stale config fragment as toml value");
+    let err = crate::config::deserialize_strict_config_toml(value)
+        .expect_err("stale prompt_gc_prompt field must fail to deserialize");
+    let err = err.to_string();
+    assert!(err.contains("unknown field"));
+    assert!(err.contains("prompt_gc_prompt"));
+}
 
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.path().to_path_buf(),
-    )?;
+#[test]
+fn strict_config_preserves_nested_path_context_for_partial_mcp_server_errors() {
+    let value = toml::from_str::<toml::Value>(
+        r#"
+[mcp_servers.sentry]
+enabled = true
+"#,
+    )
+    .expect("parse partial MCP server fragment as toml value");
+    let err = crate::config::deserialize_strict_config_toml(value)
+        .expect_err("partial MCP server config must fail to deserialize");
+    let err = err.to_string();
+    assert!(err.contains("invalid transport"));
+    assert!(err.contains("mcp_servers.sentry"));
+}
 
-    assert_eq!(
-        config.prompt_gc_prompt.as_deref(),
-        Some("Use the prompt gc override")
-    );
+#[tokio::test]
+async fn stale_prompt_gc_prompt_config_public_loader_error_stays_source_truthful() {
+    let codex_home = TempDir::new().expect("tempdir");
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        "prompt_gc_prompt = \"Use the prompt gc override\"\n",
+    )
+    .expect("write stale config");
 
-    Ok(())
+    let err = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .cli_overrides(vec![(
+            "model".to_string(),
+            toml::Value::String("gpt-5".to_string()),
+        )])
+        .build()
+        .await
+        .expect_err("stale prompt_gc_prompt field must fail through public loader");
+    let err = err.to_string();
+    assert!(err.contains("unknown field"));
+    assert!(err.contains("prompt_gc_prompt"));
+    assert!(!err.contains("after applying CLI overrides"));
 }
 
 #[test]
@@ -3169,7 +3201,6 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             subagent_base_instructions: None,
             developer_instructions: None,
             compact_prompt: None,
-            prompt_gc_prompt: None,
             pos_compact_instructions: None,
             commit_attribution: None,
             forced_chatgpt_workspace_id: None,
@@ -3311,7 +3342,6 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         subagent_base_instructions: None,
         developer_instructions: None,
         compact_prompt: None,
-        prompt_gc_prompt: None,
         pos_compact_instructions: None,
         commit_attribution: None,
         forced_chatgpt_workspace_id: None,
@@ -3451,7 +3481,6 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         subagent_base_instructions: None,
         developer_instructions: None,
         compact_prompt: None,
-        prompt_gc_prompt: None,
         pos_compact_instructions: None,
         commit_attribution: None,
         forced_chatgpt_workspace_id: None,
@@ -3577,7 +3606,6 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         subagent_base_instructions: None,
         developer_instructions: None,
         compact_prompt: None,
-        prompt_gc_prompt: None,
         pos_compact_instructions: None,
         commit_attribution: None,
         forced_chatgpt_workspace_id: None,

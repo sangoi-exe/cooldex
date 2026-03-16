@@ -29,6 +29,8 @@ This section is the canonical cluster-level inventory of durable workspace-local
 ## Workspace Test Safety
 
 - Do not delegate test execution to sub-agents in this workspace.
+- Do `cargo clean` before and after every test trial.
+- Because each Cargo test trial in this workspace requires `cargo clean` before and after, batch clearly same-class mechanical fallout before starting another Cargo validation run; rerun only when the batch is ready, fresh Cargo diagnostics are needed, or final targeted/fan-in validation is reached.
 
 # Rust/codex-rs
 

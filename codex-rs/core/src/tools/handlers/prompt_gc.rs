@@ -295,7 +295,7 @@ pub(crate) async fn apply_runtime_plan(
         state.set_context_inclusion(&exclusion_indices, false);
         state.add_context_notes(notes);
         let replacement_history = state.prompt_snapshot_lenient();
-        state.restore_manage_context_checkpoint(manage_context_checkpoint.clone());
+        state.restore_manage_context_checkpoint(manage_context_checkpoint);
         replacement_history
     };
 
@@ -780,6 +780,88 @@ mod tests {
         assert_eq!(second_plan.chunk_manifest.len(), 1);
         assert_eq!(second_plan.chunk_manifest[0].manifest.kind, "reasoning");
         assert!(!session.clone_history().await.raw_items().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prompt_gc_rewrite_preserves_legacy_local_shell_id_only_pairs() {
+        let (session, turn_context) = make_session_and_context().await;
+        let turn_context = Arc::new(turn_context);
+        let sidecar = install_prompt_gc_active_turn(&session, Arc::clone(&turn_context)).await;
+
+        let mut items = (0..MAX_UNITS_PER_RETRIEVE)
+            .map(|index| ResponseItem::Reasoning {
+                id: format!("reasoning-{index}"),
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: None,
+            })
+            .collect::<Vec<_>>();
+        items.push(ResponseItem::LocalShellCall {
+            id: Some("legacy-shell".to_string()),
+            call_id: None,
+            status: LocalShellStatus::Completed,
+            action: LocalShellAction::Exec(LocalShellExecAction {
+                command: vec!["pwd".to_string()],
+                working_directory: None,
+                timeout_ms: None,
+                env: None,
+                user: None,
+            }),
+        });
+        items.push(ResponseItem::FunctionCallOutput {
+            call_id: "legacy-shell".to_string(),
+            output: FunctionCallOutputPayload::from_text("/tmp".to_string()),
+        });
+        items.push(commentary_phase_message("phase-1"));
+        session
+            .record_conversation_items(turn_context.as_ref(), &items)
+            .await;
+
+        let checkpoint_id = activate_pending_checkpoint(&sidecar).await.checkpoint_id;
+        let plan = build_runtime_plan(&session, turn_context.as_ref(), &checkpoint_id)
+            .await
+            .expect("retrieve plan");
+        assert_eq!(plan.chunk_manifest.len(), MAX_UNITS_PER_RETRIEVE);
+        let checkpoint =
+            prompt_gc_checkpoint_for_id(&session, turn_context.as_ref(), &checkpoint_id)
+                .await
+                .expect("checkpoint");
+
+        apply_runtime_plan(
+            &session,
+            turn_context.as_ref(),
+            &checkpoint,
+            &plan,
+            &plan
+                .chunk_manifest
+                .iter()
+                .map(|chunk| PromptGcChunkSummary {
+                    chunk_id: chunk.manifest.chunk_id.clone(),
+                    tool_context: String::new(),
+                    reasoning_context: format!("reasoning {}", chunk.manifest.chunk_id),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .expect("apply");
+
+        let prompt = session.state.lock().await.prompt_snapshot_lenient();
+        assert!(prompt.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::LocalShellCall {
+                    id: Some(id),
+                    call_id: None,
+                    ..
+                } if id == "legacy-shell"
+            )
+        }));
+        assert!(prompt.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "legacy-shell"
+            )
+        }));
     }
 
     #[tokio::test]

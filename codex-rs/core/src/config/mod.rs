@@ -269,10 +269,6 @@ pub struct Config {
     /// Compact prompt override.
     pub compact_prompt: Option<String>,
 
-    /// PromptGcSidecar prompt override. Defaults to the built-in
-    /// `prompt_gc_prompt.md` when unset.
-    pub prompt_gc_prompt: Option<String>,
-
     /// Optional instructions appended after successful remote auto-compaction.
     pub pos_compact_instructions: Option<String>,
 
@@ -652,7 +648,7 @@ impl ConfigBuilder {
         // relative paths to absolute paths based on the parent folder of the
         // respective config file, so we should be safe to deserialize without
         // AbsolutePathBufGuard here.
-        let config_toml: ConfigToml = match merged_toml.try_into() {
+        let config_toml = match parse_strict_config_toml(merged_toml) {
             Ok(config_toml) => config_toml,
             Err(err) => {
                 if let Some(config_error) =
@@ -661,7 +657,7 @@ impl ConfigBuilder {
                     return Err(crate::config_loader::io_error_from_config_error(
                         std::io::ErrorKind::InvalidData,
                         config_error,
-                        Some(err),
+                        None,
                     ));
                 }
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));
@@ -748,7 +744,7 @@ pub async fn load_config_as_toml_with_cli_overrides(
     .await?;
 
     let merged_toml = config_layer_stack.effective_config();
-    let cfg: ConfigToml = merged_toml.try_into().map_err(|err| {
+    let cfg = parse_strict_config_toml(merged_toml).map_err(|err| {
         tracing::error!("Failed to deserialize overridden config: {err}");
         std::io::Error::new(std::io::ErrorKind::InvalidData, err)
     })?;
@@ -763,9 +759,21 @@ pub(crate) fn deserialize_config_toml_with_base(
     // This guard ensures that any relative paths that is deserialized into an
     // [AbsolutePathBuf] is resolved against `config_base_dir`.
     let _guard = AbsolutePathBufGuard::new(config_base_dir);
-    root_value
-        .try_into()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    deserialize_strict_config_toml(root_value)
+}
+
+fn parse_strict_config_toml(root_value: TomlValue) -> Result<ConfigToml, toml::de::Error> {
+    // Merge-safety anchor: final config load must stay fail-loud for removed hidden prompt_gc
+    // fields, but ordinary nested parse failures must keep the original serde path context.
+    let config = root_value.clone().try_into::<ConfigToml>()?;
+    let strict = root_value.try_into::<StrictConfigToml>()?;
+    debug_assert_eq!(&strict.config, &config);
+    Ok(config)
+}
+
+pub(crate) fn deserialize_strict_config_toml(root_value: TomlValue) -> std::io::Result<ConfigToml> {
+    parse_strict_config_toml(root_value)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
 }
 
 fn load_catalog_json(path: &AbsolutePathBuf) -> std::io::Result<ModelsResponse> {
@@ -1069,6 +1077,9 @@ pub fn set_default_oss_provider(codex_home: &Path, provider: &str) -> std::io::R
 }
 
 /// Base config deserialized from ~/.codex/config.toml.
+// Merge-safety anchor: final config load must reject unknown fields like removed hidden prompt_gc
+// knobs, but path normalization still needs a permissive `ConfigToml` round-trip so unknown fields
+// survive until the final strict load boundary.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ConfigToml {
@@ -1142,10 +1153,6 @@ pub struct ConfigToml {
 
     /// Compact prompt used for history compaction.
     pub compact_prompt: Option<String>,
-
-    /// PromptGcSidecar prompt override used for hidden prompt-gc turns.
-    /// Defaults to the built-in `prompt_gc_prompt.md` when unset.
-    pub prompt_gc_prompt: Option<String>,
 
     /// Optional instructions appended after successful remote auto-compaction.
     pub pos_compact_instructions: Option<String>,
@@ -1392,6 +1399,13 @@ pub struct ConfigToml {
     pub experimental_use_freeform_apply_patch: Option<bool>,
     /// Preferred OSS provider for local models, e.g. "lmstudio" or "ollama".
     pub oss_provider: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictConfigToml {
+    #[serde(flatten)]
+    config: ConfigToml,
 }
 
 impl From<ConfigToml> for UserSavedConfig {
@@ -2361,14 +2375,6 @@ impl Config {
                 Some(trimmed.to_string())
             }
         });
-        let prompt_gc_prompt = cfg.prompt_gc_prompt.as_ref().and_then(|value| {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        });
         let pos_compact_instructions = cfg.pos_compact_instructions.as_ref().and_then(|value| {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -2556,7 +2562,6 @@ impl Config {
             personality,
             developer_instructions,
             compact_prompt,
-            prompt_gc_prompt,
             pos_compact_instructions,
             commit_attribution,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"

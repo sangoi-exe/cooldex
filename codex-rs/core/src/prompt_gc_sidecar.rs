@@ -73,6 +73,7 @@ pub(crate) struct PromptGcPendingCall {
 pub(crate) struct PromptGcStatus {
     pub(crate) last_error: Option<String>,
     pub(crate) last_applied_checkpoint_seq: Option<u64>,
+    pub(crate) blocked_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,9 +103,13 @@ pub(crate) struct PromptGcSidecar {
 impl PromptGcSidecar {
     pub(crate) fn bind_turn(&mut self, turn_id: impl Into<String>) {
         self.turn_id = Some(turn_id.into());
+        self.status.blocked_reason = None;
     }
 
     pub(crate) fn observe_recorded_item(&mut self, _history_index: usize, item: &ResponseItem) {
+        if self.status.blocked_reason.is_some() {
+            return;
+        }
         match item {
             ResponseItem::Reasoning { .. } => {
                 self.push_reasoning_unit(item);
@@ -211,6 +216,9 @@ impl PromptGcSidecar {
     }
 
     pub(crate) fn observe_recorded_batch(&mut self, observed_items: &[PromptGcObservedItem]) {
+        if self.status.blocked_reason.is_some() {
+            return;
+        }
         for observed in observed_items {
             match observed {
                 PromptGcObservedItem::Recorded {
@@ -222,7 +230,7 @@ impl PromptGcSidecar {
     }
 
     pub(crate) fn take_pending_checkpoint(&mut self) -> Option<PromptGcCheckpoint> {
-        if self.running {
+        if self.running || self.status.blocked_reason.is_some() {
             return None;
         }
         let checkpoint = self.pending_checkpoint.take()?;
@@ -270,6 +278,7 @@ impl PromptGcSidecar {
         }
         self.status.last_applied_checkpoint_seq = Some(outcome.checkpoint_seq);
         self.status.last_error = None;
+        self.status.blocked_reason = None;
         self.running = false;
         if self
             .pending_apply_outcome
@@ -293,7 +302,23 @@ impl PromptGcSidecar {
     }
 
     pub(crate) fn fail_cycle(&mut self, checkpoint_id: &str, error: impl Into<String>) {
+        let failed_checkpoint_seq = self
+            .active_checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)
+            .map(|checkpoint| checkpoint.checkpoint_seq)
+            .or_else(|| {
+                self.pending_apply_outcome
+                    .as_ref()
+                    .filter(|pending| pending.checkpoint_id == checkpoint_id)
+                    .map(|pending| pending.checkpoint_seq)
+            });
         self.status.last_error = Some(error.into());
+        if failed_checkpoint_seq.is_some()
+            && self.status.last_applied_checkpoint_seq == failed_checkpoint_seq
+        {
+            self.status.last_applied_checkpoint_seq = None;
+        }
         self.running = false;
         if self
             .pending_apply_outcome
@@ -309,6 +334,15 @@ impl PromptGcSidecar {
         {
             self.active_checkpoint = None;
         }
+    }
+
+    pub(crate) fn block_remaining_turn(&mut self, checkpoint_id: &str, error: impl Into<String>) {
+        let error = error.into();
+        self.fail_cycle(checkpoint_id, error.clone());
+        self.pending_function_calls.clear();
+        self.pending_custom_calls.clear();
+        self.pending_checkpoint = None;
+        self.status.blocked_reason = Some(error);
     }
 
     pub(crate) fn note_apply_outcome(&mut self, checkpoint_id: &str, applied_unit_keys: Vec<u64>) {
@@ -342,6 +376,9 @@ impl PromptGcSidecar {
     }
 
     fn observe_phase_checkpoint(&mut self, phase: MessagePhase, assistant_item_id: Option<String>) {
+        if self.status.blocked_reason.is_some() {
+            return;
+        }
         let checkpoint_seq = self.next_checkpoint_seq;
         self.next_checkpoint_seq += 1;
         let turn_id = self.turn_id.as_deref().unwrap_or("active-turn");
@@ -714,5 +751,116 @@ mod tests {
         assert_eq!(units.len(), 1);
         assert!(units[0].payload_text.contains("{\"cmd\":\"new\"}"));
         assert!(!units[0].payload_text.contains("{\"cmd\":\"old\"}"));
+    }
+
+    #[test]
+    fn blocked_turn_suppresses_future_checkpoints() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(0, &phase_message);
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        sidecar.block_remaining_turn(&checkpoint.checkpoint_id, "usage limit");
+
+        let later_phase_message = ResponseItem::Message {
+            id: Some("msg-2".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "later phase".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::FinalAnswer),
+        };
+        sidecar.observe_recorded_item(1, &later_phase_message);
+
+        assert!(sidecar.take_pending_checkpoint().is_none());
+        assert_eq!(
+            sidecar.status.blocked_reason.as_deref(),
+            Some("usage limit")
+        );
+    }
+
+    #[test]
+    fn blocked_turn_stops_recording_dead_units_and_pending_calls() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let call = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: "{\"cmd\":\"pwd\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(0, &call);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(1, &phase_message);
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        sidecar.block_remaining_turn(&checkpoint.checkpoint_id, "usage limit");
+
+        assert!(sidecar.pending_function_calls.is_empty());
+        assert!(sidecar.pending_custom_calls.is_empty());
+
+        let reasoning = ResponseItem::Reasoning {
+            id: "reasoning-2".to_string(),
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: None,
+        };
+        sidecar.observe_recorded_item(2, &reasoning);
+
+        let later_call = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "call-2".to_string(),
+            name: "shell".to_string(),
+            arguments: "{\"cmd\":\"later\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(3, &later_call);
+
+        assert_eq!(sidecar.units.len(), 0);
+        assert!(sidecar.pending_function_calls.is_empty());
+        assert!(sidecar.pending_custom_calls.is_empty());
+    }
+
+    #[test]
+    fn fail_cycle_clears_applied_seq_for_the_same_checkpoint() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(0, &phase_message);
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        sidecar.active_checkpoint = Some(checkpoint.clone());
+        sidecar.status.last_applied_checkpoint_seq = Some(checkpoint.checkpoint_seq);
+
+        sidecar.fail_cycle(&checkpoint.checkpoint_id, "request failed");
+
+        assert_eq!(sidecar.status.last_applied_checkpoint_seq, None);
+        assert_eq!(sidecar.status.last_error.as_deref(), Some("request failed"));
     }
 }
