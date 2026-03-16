@@ -2315,6 +2315,36 @@
       ],
       "type": "string"
     },
+    "CollabWaitReturnWhen": {
+      "enum": [
+        "anyFinal",
+        "allFinal"
+      ],
+      "type": "string"
+    },
+    "CollabWaitState": {
+      "properties": {
+        "disableTimeout": {
+          "type": "boolean"
+        },
+        "returnWhen": {
+          "$ref": "#/definitions/CollabWaitReturnWhen"
+        },
+        "timedOut": {
+          "description": "Null until the wait call finishes.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "disableTimeout",
+        "returnWhen",
+        "timedOut"
+      ],
+      "type": "object"
+    },
     "CollaborationMode": {
       "description": "Collaboration mode for a Codex session.",
       "properties": {
@@ -6344,6 +6374,17 @@
               ],
               "title": "CollabWaitingBeginEventMsgType",
               "type": "string"
+            },
+            "wait_state": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CollabWaitState"
+                }
+              ],
+              "default": {
+                "disableTimeout": false,
+                "returnWhen": "any_final"
+              }
             }
           },
           "required": [
@@ -6390,6 +6431,17 @@
               ],
               "title": "CollabWaitingEndEventMsgType",
               "type": "string"
+            },
+            "wait_state": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CollabWaitState"
+                }
+              ],
+              "default": {
+                "disableTimeout": false,
+                "returnWhen": "any_final"
+              }
             }
           },
           "required": [
@@ -7670,7 +7722,7 @@
           "description": "[UNSTABLE] FOR OPENAI INTERNAL USE ONLY - DO NOT USE. The access token must contain the same scopes that Codex-managed ChatGPT auth tokens have.",
           "properties": {
             "accessToken": {
-              "description": "Access token (JWT) supplied by the client. This token is used for backend API requests and email extraction.",
+              "description": "Access token (JWT) supplied by the client. This token is used for backend API requests and email extraction. Malformed tokens are rejected as invalid input.",
               "type": "string"
             },
             "chatgptAccountId": {
@@ -7678,7 +7730,7 @@
               "type": "string"
             },
             "chatgptPlanType": {
-              "description": "Optional plan type supplied by the client.\n\nWhen `null`, Codex attempts to derive the plan type from access-token claims. If unavailable, the plan defaults to `unknown`.",
+              "description": "Optional plan type supplied by the client.\n\nWhen present, this value remains authoritative over JWT-derived plan claims. When `null`, Codex attempts to derive the plan type from the access-token claims. If the effective plan is missing, `unknown`, or unsupported, the login request is rejected.",
               "type": [
                 "string",
                 "null"
@@ -13077,6 +13129,17 @@
               ],
               "title": "CollabAgentToolCallThreadItemType",
               "type": "string"
+            },
+            "waitState": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CollabWaitState"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Null when the collab tool call is not `wait`."
             }
           },
           "required": [
@@ -13086,7 +13149,8 @@
             "senderThreadId",
             "status",
             "tool",
-            "type"
+            "type",
+            "waitState"
           ],
           "title": "CollabAgentToolCallThreadItem",
           "type": "object"

@@ -578,6 +578,7 @@ mod tests {
         RolloutItem::Compacted(CompactedItem {
             message: "auto compacted".to_string(),
             replacement_history: None,
+            prompt_gc: None,
         })
     }
 
@@ -591,6 +592,7 @@ mod tests {
         RolloutItem::Compacted(CompactedItem {
             message: "replacement history compacted".to_string(),
             replacement_history: Some(replacement_history),
+            prompt_gc: None,
         })
     }
 

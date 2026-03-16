@@ -24,6 +24,8 @@ use crate::protocol::CompactedItem;
 use crate::protocol::CreditsSnapshot;
 use crate::protocol::InitialHistory;
 use crate::protocol::NetworkApprovalProtocol;
+use crate::protocol::PromptGcCompactionMetadata;
+use crate::protocol::PromptGcOutcomeKind;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::RateLimitWindow;
 use crate::protocol::ResumedHistory;
@@ -47,6 +49,7 @@ use crate::tools::handlers::UnifiedExecHandler;
 use crate::tools::registry::ToolHandler;
 use crate::tools::router::ToolCallSource;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use base64::Engine;
 use chrono::TimeZone;
 use chrono::Utc;
 use codex_app_server_protocol::AppInfo;
@@ -81,6 +84,7 @@ use pretty_assertions::assert_eq;
 use rmcp::model::JsonObject;
 use rmcp::model::Tool;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::path::PathBuf;
@@ -173,6 +177,44 @@ fn make_connector(id: &str, name: &str) -> AppInfo {
     }
 }
 
+fn test_chatgpt_token_data(chatgpt_account_id: &str) -> crate::token_data::TokenData {
+    #[derive(Serialize)]
+    struct Header {
+        alg: &'static str,
+        typ: &'static str,
+    }
+
+    let header = Header {
+        alg: "none",
+        typ: "JWT",
+    };
+    let payload = json!({
+        "email": "user@example.com",
+        "email_verified": true,
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_user_id": "user-12345",
+            "user_id": "user-12345",
+            "chatgpt_account_id": chatgpt_account_id,
+        }
+    });
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header_b64 = b64(&serde_json::to_vec(&header).expect("serialize header"));
+    let payload_b64 = b64(&serde_json::to_vec(&payload).expect("serialize payload"));
+    let signature_b64 = b64(b"sig");
+    let fake_jwt = format!("{header_b64}.{payload_b64}.{signature_b64}");
+
+    crate::token_data::TokenData {
+        id_token: crate::token_data::IdTokenInfo {
+            raw_jwt: fake_jwt,
+            ..crate::token_data::IdTokenInfo::default()
+        },
+        access_token: format!("access-{chatgpt_account_id}"),
+        refresh_token: format!("refresh-{chatgpt_account_id}"),
+        account_id: Some(chatgpt_account_id.to_string()),
+    }
+}
+
 #[test]
 fn assistant_message_stream_parsers_can_be_seeded_from_output_item_added_text() {
     let mut parsers = AssistantMessageStreamParsers::new(false);
@@ -253,11 +295,12 @@ fn prompt_gc_capability_is_explicitly_opt_in() {
 async fn prompt_gc_sidecar_empty_retrieve_completes_without_visible_accounting() {
     let server = MockServer::start().await;
     let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
     let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
     let retrieve_args = json!({
         "mode": "retrieve",
         "policy_id": turn_context.config.manage_context_policy.quality_rubric_id,
-        "checkpoint_id": checkpoint_id,
+        "checkpoint_id": checkpoint_id.clone(),
     })
     .to_string();
     let hidden_rate_limits = RateLimitSnapshot {
@@ -331,6 +374,24 @@ async fn prompt_gc_sidecar_empty_retrieve_completes_without_visible_accounting()
     let status = sidecar.lock().await.status.clone();
     assert_eq!(status.last_applied_checkpoint_seq, Some(0));
     assert_eq!(status.last_error, None);
+    session.flush_rollout().await;
+    assert_eq!(
+        prompt_gc_rollout_markers(&rollout_path).await,
+        vec![
+            PromptGcCompactionMetadata {
+                checkpoint_id: checkpoint_id.clone(),
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Started,
+                applied_unit_count: None,
+            },
+            PromptGcCompactionMetadata {
+                checkpoint_id,
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::EmptyRetrieve,
+                applied_unit_count: Some(0),
+            },
+        ]
+    );
 
     let tool_calls = {
         let active = session.active_turn.lock().await;
@@ -341,10 +402,7 @@ async fn prompt_gc_sidecar_empty_retrieve_completes_without_visible_accounting()
         tool_calls, 0,
         "hidden prompt_gc should not increment visible tool accounting"
     );
-    assert!(
-        rx.try_recv().is_err(),
-        "hidden prompt_gc should not emit visible events such as TokenCount"
-    );
+    assert!(rx.try_recv().is_err());
     let latest_rate_limits = session.state.lock().await.latest_rate_limits.clone();
     assert_eq!(latest_rate_limits, Some(hidden_rate_limits));
 }
@@ -376,7 +434,7 @@ async fn prompt_gc_sidecar_skips_after_tool_use_hooks() {
     let retrieve_args = json!({
         "mode": "retrieve",
         "policy_id": turn_context.config.manage_context_policy.quality_rubric_id,
-        "checkpoint_id": checkpoint_id,
+        "checkpoint_id": checkpoint_id.clone(),
     })
     .to_string();
     Mock::given(method("POST"))
@@ -429,15 +487,19 @@ async fn prompt_gc_sidecar_skips_after_tool_use_hooks() {
         0,
         "hidden prompt_gc must not dispatch after_tool_use hooks"
     );
-    assert!(
-        rx.try_recv().is_err(),
-        "hidden prompt_gc should stay silent in visible events when hooks are configured"
-    );
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test]
 async fn prompt_gc_persist_replacement_history_flush_failure_keeps_live_history_unchanged() {
     let (session, turn_context) = make_session_and_context().await;
+    let checkpoint = crate::prompt_gc_sidecar::PromptGcCheckpoint {
+        checkpoint_id: format!("{}:prompt_gc:7", turn_context.sub_id),
+        checkpoint_seq: 7,
+        eligible_unit_count: 0,
+        phase: codex_protocol::models::MessagePhase::Commentary,
+        assistant_item_id: None,
+    };
     let history_before = {
         let mut state = session.state.lock().await;
         state.record_items(
@@ -450,6 +512,8 @@ async fn prompt_gc_persist_replacement_history_flush_failure_keeps_live_history_
     let error = session
         .persist_prompt_gc_replacement_history_with_sink(
             &turn_context,
+            &checkpoint,
+            1,
             vec![assistant_message("replacement history")],
             Some(&FlushFailingPromptGcRolloutSink),
         )
@@ -465,6 +529,67 @@ async fn prompt_gc_persist_replacement_history_flush_failure_keeps_live_history_
         state.history_snapshot_lenient()
     };
     assert_eq!(history_after, history_before);
+}
+
+#[tokio::test]
+async fn prompt_gc_persist_replacement_history_records_apply_succeeded_marker() {
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    let checkpoint = crate::prompt_gc_sidecar::PromptGcCheckpoint {
+        checkpoint_id: format!("{}:prompt_gc:3", turn_context.sub_id),
+        checkpoint_seq: 3,
+        eligible_unit_count: 0,
+        phase: codex_protocol::models::MessagePhase::Commentary,
+        assistant_item_id: None,
+    };
+    let replacement_history = vec![assistant_message("replacement history")];
+
+    session
+        .persist_prompt_gc_replacement_history(
+            &turn_context,
+            &checkpoint,
+            2,
+            replacement_history.clone(),
+        )
+        .await
+        .expect("persist prompt_gc replacement history");
+    session.flush_rollout().await;
+
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    let prompt_gc_items = resumed
+        .history
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::Compacted(compacted)
+                if compacted.prompt_gc.is_some()
+                    || compacted.message
+                        == crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER =>
+            {
+                Some(compacted)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(prompt_gc_items.len(), 1);
+    assert_eq!(
+        prompt_gc_items[0].replacement_history,
+        Some(replacement_history)
+    );
+    assert_eq!(
+        prompt_gc_items[0].prompt_gc,
+        Some(PromptGcCompactionMetadata {
+            checkpoint_id: checkpoint.checkpoint_id,
+            checkpoint_seq: checkpoint.checkpoint_seq,
+            kind: PromptGcOutcomeKind::ApplySucceeded,
+            applied_unit_count: Some(2),
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -511,10 +636,147 @@ async fn prompt_gc_hidden_usage_limit_updates_rate_limits_without_visible_events
     assert_eq!(latest_rate_limits, Some(rate_limits));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_own_turn() {
+    let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let auth_home = tempfile::tempdir().expect("create auth tempdir");
+    let auth_store = crate::auth::AuthStore {
+        active_account_id: Some("acc-2".to_string()),
+        accounts: vec![
+            crate::auth::StoredAccount {
+                id: "acc-0".to_string(),
+                label: None,
+                tokens: test_chatgpt_token_data("acc-0"),
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+            crate::auth::StoredAccount {
+                id: "acc-1".to_string(),
+                label: None,
+                tokens: test_chatgpt_token_data("acc-1"),
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+            crate::auth::StoredAccount {
+                id: "acc-2".to_string(),
+                label: None,
+                tokens: test_chatgpt_token_data("acc-2"),
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+        ],
+        ..crate::auth::AuthStore::default()
+    };
+    crate::auth::save_auth(
+        auth_home.path(),
+        &auth_store,
+        crate::auth::AuthCredentialsStoreMode::File,
+    )
+    .expect("persist auth store");
+    let auth_manager = crate::AuthManager::shared(
+        auth_home.path().to_path_buf(),
+        false,
+        crate::auth::AuthCredentialsStoreMode::File,
+    );
+    let accounts = auth_manager.list_accounts();
+    assert_eq!(
+        accounts.len(),
+        3,
+        "the auth store must stay intact before stale-request retry handling runs"
+    );
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id.as_str()),
+        Some("acc-2")
+    );
+    assert!(
+        accounts.iter().any(|account| account.id == "acc-1"),
+        "the failing account must still exist before the stale-request retry call"
+    );
+
+    let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
+    session_mut.services.auth_manager = Arc::clone(&auth_manager);
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.auth_manager = Some(Arc::clone(&auth_manager));
+
+    let usage_limit = crate::error::UsageLimitReachedError {
+        plan_type: None,
+        resets_at: Some(Utc.with_ymd_and_hms(2024, 1, 1, 0, 15, 0).unwrap()),
+        rate_limits: Some(Box::new(RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(15),
+                resets_at: Some(1_700_000_123),
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: None,
+        })),
+        promo_message: None,
+    };
+    let freshly_unsupported_store_account_ids =
+        std::collections::HashSet::from([String::from("acc-2")]);
+
+    let should_retry = maybe_auto_switch_account_on_usage_limit_with_freshly_unsupported_ids(
+        &session,
+        &turn_context,
+        &usage_limit,
+        Some("acc-1"),
+        &freshly_unsupported_store_account_ids,
+    )
+    .await
+    .expect("stale request should still retry against the already-active account");
+
+    assert!(
+        should_retry,
+        "changed active account should stay retryable until its own usage-limit path runs"
+    );
+    let accounts = auth_manager.list_accounts();
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id.as_str()),
+        Some("acc-2")
+    );
+    assert!(
+        accounts.iter().any(|account| account.id == "acc-2"),
+        "the already-active account must not be pruned during stale-request recovery"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "stale-request retry should not emit a duplicate warning event"
+    );
+}
+
+#[test]
+fn auto_switch_refresh_does_not_mark_missing_plan_as_unsupported() {
+    let snapshot = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: None,
+        secondary: None,
+        credits: None,
+        plan_type: None,
+    };
+
+    assert!(
+        !auto_switch_refresh_marks_account_unsupported(&snapshot),
+        "missing plan data must not create a fresh unsupported-account eviction signal"
+    );
+}
+
 #[tokio::test]
 async fn prompt_gc_sidecar_contract_error_is_terminal_after_first_request() {
     let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
     let server = MockServer::start().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
         .respond_with(StaticSseResponder {
@@ -526,7 +788,7 @@ async fn prompt_gc_sidecar_contract_error_is_terminal_after_first_request() {
                     crate::prompt_gc_sidecar::PROMPT_GC_TOOL_NAME,
                     &json!({
                         "mode": "retrieve",
-                        "checkpoint_id": format!("{}:prompt_gc:0", turn_context.sub_id),
+                        "checkpoint_id": checkpoint_id.clone(),
                     })
                     .to_string(),
                 ),
@@ -570,10 +832,25 @@ async fn prompt_gc_sidecar_contract_error_is_terminal_after_first_request() {
         status.last_error.as_deref(),
         Some("invalid_contract: missing or empty 'policy_id'")
     );
-    assert!(
-        rx.try_recv().is_err(),
-        "hidden prompt_gc contract errors must stay silent in visible events"
+    session.flush_rollout().await;
+    assert_eq!(
+        prompt_gc_rollout_markers(&rollout_path).await,
+        vec![
+            PromptGcCompactionMetadata {
+                checkpoint_id: checkpoint_id.clone(),
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Started,
+                applied_unit_count: None,
+            },
+            PromptGcCompactionMetadata {
+                checkpoint_id,
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Failed,
+                applied_unit_count: None,
+            },
+        ]
     );
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1457,6 +1734,7 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
     let rollout_items = vec![RolloutItem::Compacted(CompactedItem {
         message: String::new(),
         replacement_history: Some(replacement_history.clone()),
+        prompt_gc: None,
     })];
 
     let reconstructed = session
@@ -2525,6 +2803,24 @@ async fn attach_rollout_recorder(session: &Arc<Session>) -> PathBuf {
     rollout_path
 }
 
+async fn prompt_gc_rollout_markers(rollout_path: &Path) -> Vec<PromptGcCompactionMetadata> {
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+
+    resumed
+        .history
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::Compacted(compacted) => compacted.prompt_gc,
+            _ => None,
+        })
+        .collect()
+}
+
 fn text_block(s: &str) -> serde_json::Value {
     json!({
         "type": "text",
@@ -2695,6 +2991,8 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
     ));
     let (agent_last_activity_tx, _agent_last_activity_rx) =
         watch::channel::<Option<codex_protocol::protocol::CollabAgentActivity>>(None);
+    let (prompt_gc_active_tx, _prompt_gc_active_rx) = watch::channel(false);
+    let (prompt_gc_activity_edges, _) = tokio::sync::broadcast::channel(16);
     let result = Session::new(
         session_configuration,
         Arc::clone(&config),
@@ -2704,6 +3002,8 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         tx_event,
         agent_status_tx,
         agent_last_activity_tx,
+        prompt_gc_active_tx,
+        prompt_gc_activity_edges,
         InitialHistory::New,
         SessionSource::Exec,
         skills_manager,
@@ -2874,12 +3174,16 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         Arc::clone(&js_repl),
         skills_outcome,
     );
+    let (prompt_gc_active_tx, _prompt_gc_active_rx) = watch::channel(false);
+    let (prompt_gc_activity_edges, _) = tokio::sync::broadcast::channel(16);
 
     let session = Session {
         conversation_id,
         tx_event,
         agent_status: agent_status_tx,
         agent_last_activity: agent_last_activity_tx,
+        prompt_gc_active: prompt_gc_active_tx,
+        prompt_gc_activity_edges,
         state: Mutex::new(state),
         features: config.features.clone(),
         pending_mcp_server_refresh_config: Mutex::new(None),
@@ -2901,11 +3205,15 @@ async fn submit_with_id_captures_current_span_trace_context() {
     let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
     let (_agent_last_activity_tx, agent_last_activity) =
         watch::channel::<Option<codex_protocol::protocol::CollabAgentActivity>>(None);
+    let (_prompt_gc_active_tx, prompt_gc_active) = watch::channel(false);
+    let (prompt_gc_activity_edges, _) = tokio::sync::broadcast::channel(16);
     let codex = Codex {
         tx_sub,
         rx_event,
         agent_status,
         agent_last_activity,
+        prompt_gc_active,
+        prompt_gc_activity_edges,
         session: Arc::new(session),
     };
 
@@ -3291,12 +3599,16 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         Arc::clone(&js_repl),
         skills_outcome,
     ));
+    let (prompt_gc_active_tx, _prompt_gc_active_rx) = watch::channel(false);
+    let (prompt_gc_activity_edges, _) = tokio::sync::broadcast::channel(16);
 
     let session = Arc::new(Session {
         conversation_id,
         tx_event,
         agent_status: agent_status_tx,
         agent_last_activity: agent_last_activity_tx,
+        prompt_gc_active: prompt_gc_active_tx,
+        prompt_gc_activity_edges,
         state: Mutex::new(state),
         features: config.features.clone(),
         pending_mcp_server_refresh_config: Mutex::new(None),
@@ -4443,6 +4755,7 @@ async fn sample_rollout(
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
         message: summary1.to_string(),
         replacement_history: None,
+        prompt_gc: None,
     }));
 
     let user2 = ResponseItem::Message {
@@ -4485,6 +4798,7 @@ async fn sample_rollout(
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
         message: summary2.to_string(),
         replacement_history: None,
+        prompt_gc: None,
     }));
 
     let user3 = ResponseItem::Message {

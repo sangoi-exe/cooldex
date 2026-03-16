@@ -270,6 +270,7 @@ use crate::tui::FrameRequester;
 mod interrupts;
 use self::interrupts::InterruptManager;
 mod agent;
+pub(crate) use self::agent::forward_thread_runtime;
 use self::agent::spawn_agent;
 use self::agent::spawn_agent_from_existing;
 pub(crate) use self::agent::spawn_op_forwarder;
@@ -595,6 +596,7 @@ pub(crate) struct ChatWidget {
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
     token_info: Option<TokenUsageInfo>,
+    token_info_is_prompt_gc_private: bool,
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
     plan_type: Option<PlanType>,
     rate_limit_warnings: RateLimitWarningState,
@@ -687,6 +689,7 @@ pub(crate) struct ChatWidget {
     is_review_mode: bool,
     // Snapshot of token usage to restore after review mode exits.
     pre_review_token_info: Option<Option<TokenUsageInfo>>,
+    pre_review_token_info_is_prompt_gc_private: Option<bool>,
     // Whether the next streamed assistant content should be preceded by a final message separator.
     //
     // This is set whenever we insert a visible history cell that conceptually belongs to a turn.
@@ -1013,20 +1016,16 @@ impl ChatWidget {
         self.adaptive_chunking.reset();
     }
 
+    fn commentary_stream_active(&self) -> bool {
+        self.stream_controller.is_some() || self.plan_stream_controller.is_some()
+    }
+
     fn stream_controllers_idle(&self) -> bool {
-        self.stream_controller
-            .as_ref()
-            .map(|controller| controller.queued_lines() == 0)
-            .unwrap_or(true)
-            && self
-                .plan_stream_controller
-                .as_ref()
-                .map(|controller| controller.queued_lines() == 0)
-                .unwrap_or(true)
+        !self.commentary_stream_active()
     }
 
     /// Restore the status indicator only after commentary completion is pending,
-    /// the turn is still running, and all stream queues have drained.
+    /// the turn is still running, and no commentary stream remains active.
     ///
     /// This gate prevents flicker while normal output is still actively
     /// streaming, but still restores a visible "working" affordance when a
@@ -1511,6 +1510,11 @@ impl ChatWidget {
             self.app_event_tx.send(AppEvent::StartCommitAnimation);
             self.run_catch_up_commit_tick();
         }
+        if self.commentary_stream_active() && !self.bottom_pane.prompt_gc_active() {
+            // Merge-safety anchor: prompt-GC restoration must preserve the hidden-status contract
+            // for live commentary streams even before a newline produces committed plan cells.
+            self.bottom_pane.hide_status_indicator();
+        }
         self.request_redraw();
     }
 
@@ -1609,6 +1613,7 @@ impl ChatWidget {
         self.update_task_running_state();
         self.retry_status_header = None;
         self.pending_status_indicator_restore = false;
+        self.bottom_pane.set_prompt_gc_active(false);
         self.bottom_pane.set_interrupt_hint_visible(true);
         self.set_status_header(String::from("Working"));
         self.full_reasoning_buffer.clear();
@@ -1656,6 +1661,7 @@ impl ChatWidget {
         }
         // Mark task stopped and request redraw now that all content is in history.
         self.pending_status_indicator_restore = false;
+        self.bottom_pane.set_prompt_gc_active(false);
         self.agent_turn_running = false;
         self.turn_sleep_inhibitor.set_turn_running(false);
         self.update_task_running_state();
@@ -1800,15 +1806,51 @@ impl ChatWidget {
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
         match info {
-            Some(info) => self.apply_token_info(info),
+            Some(info) => {
+                self.token_info_is_prompt_gc_private = false;
+                self.apply_token_info(info);
+            }
             None => {
                 self.bottom_pane.set_context_window(None, None);
                 self.token_info = None;
+                self.token_info_is_prompt_gc_private = false;
             }
         }
     }
 
+    pub(crate) fn clear_prompt_gc_private_context_usage_info(&mut self) {
+        if !self.token_info_is_prompt_gc_private {
+            return;
+        }
+        self.bottom_pane.set_context_window(None, None);
+        self.token_info = None;
+        self.token_info_is_prompt_gc_private = false;
+    }
+
+    // Merge-safety anchor: prompt-GC completion refresh must preserve the full token-usage split
+    // so `% left` keeps using `last_token_usage` while total-usage displays retain cumulative data.
+    fn apply_prompt_gc_token_usage_info(&mut self, mut token_usage_info: TokenUsageInfo) {
+        if token_usage_info.model_context_window.is_none() {
+            token_usage_info.model_context_window = self.status_line_context_window_size();
+        }
+        self.token_info_is_prompt_gc_private = true;
+        self.apply_token_info(token_usage_info);
+    }
+
+    pub(crate) fn refresh_prompt_gc_context_usage_info(
+        &mut self,
+        token_usage_info: TokenUsageInfo,
+    ) {
+        self.apply_prompt_gc_token_usage_info(token_usage_info);
+    }
+
+    pub(crate) fn replay_prompt_gc_context_usage_info(&mut self, token_usage_info: TokenUsageInfo) {
+        self.apply_prompt_gc_token_usage_info(token_usage_info);
+    }
+
     fn apply_turn_started_context_window(&mut self, model_context_window: Option<i64>) {
+        self.clear_prompt_gc_private_context_usage_info();
+
         let info = match self.token_info.take() {
             Some(mut info) => {
                 info.model_context_window = model_context_window;
@@ -1816,6 +1858,8 @@ impl ChatWidget {
             }
             None => {
                 let Some(model_context_window) = model_context_window else {
+                    self.bottom_pane.set_context_window(None, None);
+                    self.token_info = None;
                     return;
                 };
                 TokenUsageInfo {
@@ -1853,11 +1897,19 @@ impl ChatWidget {
 
     fn restore_pre_review_token_info(&mut self) {
         if let Some(saved) = self.pre_review_token_info.take() {
+            let saved_is_prompt_gc_private = self
+                .pre_review_token_info_is_prompt_gc_private
+                .take()
+                .unwrap_or(false);
             match saved {
-                Some(info) => self.apply_token_info(info),
+                Some(info) => {
+                    self.token_info_is_prompt_gc_private = saved_is_prompt_gc_private;
+                    self.apply_token_info(info);
+                }
                 None => {
                     self.bottom_pane.set_context_window(None, None);
                     self.token_info = None;
+                    self.token_info_is_prompt_gc_private = false;
                 }
             }
         }
@@ -1964,6 +2016,7 @@ impl ChatWidget {
         // Ensure any spinner is replaced by a red ✗ and flushed into history.
         self.finalize_active_cell_as_failed();
         // Reset running state and clear streaming buffers.
+        self.bottom_pane.set_prompt_gc_active(false);
         self.agent_turn_running = false;
         self.turn_sleep_inhibitor.set_turn_running(false);
         self.update_task_running_state();
@@ -2603,6 +2656,7 @@ impl ChatWidget {
     }
 
     fn on_shutdown_complete(&mut self) {
+        self.bottom_pane.set_prompt_gc_active(false);
         self.request_immediate_exit();
     }
 
@@ -2622,6 +2676,20 @@ impl ChatWidget {
         self.bottom_pane.ensure_status_indicator();
         self.bottom_pane.set_interrupt_hint_visible(true);
         self.set_status_header(message);
+    }
+
+    pub(crate) fn set_prompt_gc_activity(&mut self, active: bool) {
+        if active {
+            self.clear_prompt_gc_private_context_usage_info();
+            self.bottom_pane.set_prompt_gc_active(true);
+            self.bottom_pane.ensure_status_indicator();
+            self.bottom_pane.set_interrupt_hint_visible(true);
+            return;
+        }
+        self.bottom_pane.set_prompt_gc_active(false);
+        if self.commentary_stream_active() {
+            self.bottom_pane.hide_status_indicator();
+        }
     }
 
     fn on_undo_started(&mut self, event: UndoStartedEvent) {
@@ -2709,9 +2777,8 @@ impl ChatWidget {
     /// Runs a commit tick for the current stream queue snapshot.
     ///
     /// `scope` controls whether this call may commit in smooth mode or only when catch-up
-    /// is currently active. While lines are actively streaming we hide the status row to avoid
-    /// duplicate "in progress" affordances. Restoration is gated separately so we only re-show
-    /// the row after commentary completion once stream queues are idle.
+    /// is currently active. Restoration is gated separately so we only re-show the status row
+    /// after commentary completion once the stream controller is gone.
     fn run_commit_tick_with_scope(&mut self, scope: CommitTickScope) {
         let now = Instant::now();
         let outcome = run_commit_tick(
@@ -2722,13 +2789,15 @@ impl ChatWidget {
             now,
         );
         for cell in outcome.cells {
-            self.bottom_pane.hide_status_indicator();
             self.add_boxed_history(cell);
         }
 
         if outcome.has_controller && outcome.all_idle {
             self.maybe_restore_status_indicator_after_stream_idle();
             self.app_event_tx.send(AppEvent::StopCommitAnimation);
+        }
+        if self.commentary_stream_active() && !self.bottom_pane.prompt_gc_active() {
+            self.bottom_pane.hide_status_indicator();
         }
 
         if self.agent_turn_running {
@@ -2801,6 +2870,11 @@ impl ChatWidget {
         {
             self.app_event_tx.send(AppEvent::StartCommitAnimation);
             self.run_catch_up_commit_tick();
+        }
+        if self.commentary_stream_active() && !self.bottom_pane.prompt_gc_active() {
+            // Merge-safety anchor: prompt-GC restoration must preserve the hidden-status contract
+            // for live commentary streams even before a newline produces committed message cells.
+            self.bottom_pane.hide_status_indicator();
         }
         self.request_redraw();
     }
@@ -3235,6 +3309,7 @@ impl ChatWidget {
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             token_info: None,
+            token_info_is_prompt_gc_private: false,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
@@ -3279,6 +3354,7 @@ impl ChatWidget {
             quit_shortcut_key: None,
             is_review_mode: false,
             pre_review_token_info: None,
+            pre_review_token_info_is_prompt_gc_private: None,
             needs_final_message_separator: false,
             had_work_activity: false,
             saw_plan_update_this_turn: false,
@@ -3419,6 +3495,7 @@ impl ChatWidget {
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             token_info: None,
+            token_info_is_prompt_gc_private: false,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
@@ -3467,6 +3544,7 @@ impl ChatWidget {
             quit_shortcut_key: None,
             is_review_mode: false,
             pre_review_token_info: None,
+            pre_review_token_info_is_prompt_gc_private: None,
             needs_final_message_separator: false,
             had_work_activity: false,
             last_separator_elapsed_secs: None,
@@ -3595,6 +3673,7 @@ impl ChatWidget {
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             token_info: None,
+            token_info_is_prompt_gc_private: false,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             plan_type: None,
             rate_limit_warnings: RateLimitWarningState::default(),
@@ -3639,6 +3718,7 @@ impl ChatWidget {
             quit_shortcut_key: None,
             is_review_mode: false,
             pre_review_token_info: None,
+            pre_review_token_info_is_prompt_gc_private: None,
             needs_final_message_separator: false,
             had_work_activity: false,
             saw_plan_update_this_turn: false,
@@ -4172,7 +4252,7 @@ impl ChatWidget {
                 }
             }
             SlashCommand::Debug => {
-                // Merge anchor: `/debug` reads the cache fed by `EventMsg::RawResponseItem` and
+                // Merge-safety anchor: `/debug` reads the cache fed by `EventMsg::RawResponseItem` and
                 // reset on rollback, so availability must follow that exact lifecycle.
                 let Some(latest_raw_response) = self.last_debug_raw_response_item.as_ref() else {
                     self.add_info_message(
@@ -5131,6 +5211,8 @@ impl ChatWidget {
         // Enter review mode and emit a concise banner
         if self.pre_review_token_info.is_none() {
             self.pre_review_token_info = Some(self.token_info.clone());
+            self.pre_review_token_info_is_prompt_gc_private =
+                Some(self.token_info_is_prompt_gc_private);
         }
         // Avoid toggling running state for replayed history events on resume.
         if !from_replay && !self.bottom_pane.is_task_running() {
@@ -6982,7 +7064,7 @@ impl ChatWidget {
             return;
         }
 
-        // Merge anchor: `/accounts` descriptions depend on `AccountSummary` cache semantics from
+        // Merge-safety anchor: `/accounts` descriptions depend on `AccountSummary` cache semantics from
         // `AuthManager::list_accounts()` (active flag, exhausted_until, last_rate_limits).
         let accounts = self.auth_manager.list_accounts();
         if accounts.is_empty() {
@@ -9059,6 +9141,44 @@ impl ChatWidget {
     #[cfg(test)]
     pub(crate) fn status_line_text(&self) -> Option<String> {
         self.bottom_pane.status_line_text()
+    }
+
+    // Merge-safety anchor: prompt-GC app tests must go through widget-owned test helpers so
+    // bottom-pane field privacy stays intact while the replay/context-left seam remains covered.
+    #[cfg(test)]
+    pub(crate) fn prompt_gc_active_for_test(&self) -> bool {
+        self.bottom_pane.prompt_gc_active()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context_window_percent_for_test(&self) -> Option<i64> {
+        self.bottom_pane.context_window_percent()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status_indicator_visible_for_test(&self) -> bool {
+        self.bottom_pane.status_indicator_visible()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ensure_status_indicator_for_test(&mut self) {
+        self.bottom_pane.ensure_status_indicator();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn update_status_for_test(
+        &mut self,
+        header: String,
+        details: Option<String>,
+        details_capitalization: StatusDetailsCapitalization,
+        details_max_lines: usize,
+    ) {
+        self.set_status(header, details, details_capitalization, details_max_lines);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hide_status_indicator_for_test(&mut self) {
+        self.bottom_pane.hide_status_indicator();
     }
 
     pub(crate) fn clear_token_usage(&mut self) {

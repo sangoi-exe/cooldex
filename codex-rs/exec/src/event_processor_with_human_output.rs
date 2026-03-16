@@ -12,6 +12,7 @@ use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
 use codex_protocol::protocol::CollabCloseBeginEvent;
 use codex_protocol::protocol::CollabCloseEndEvent;
+use codex_protocol::protocol::CollabWaitReturnWhen;
 use codex_protocol::protocol::CollabWaitingBeginEvent;
 use codex_protocol::protocol::CollabWaitingEndEvent;
 use codex_protocol::protocol::DeprecationNoticeEvent;
@@ -765,6 +766,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 sender_thread_id: _,
                 receiver_thread_ids,
                 call_id,
+                wait_state,
                 ..
             }) => {
                 ts_msg!(
@@ -777,30 +779,42 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     "  receivers: {}",
                     format_receiver_list(&receiver_thread_ids).style(self.dimmed)
                 );
+                eprintln!(
+                    "  wait: {}",
+                    format_wait_mode(&wait_state.return_when).style(self.dimmed)
+                );
+                if wait_state.disable_timeout {
+                    eprintln!("  timeout: {}", "disabled".style(self.dimmed));
+                }
             }
             EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
                 sender_thread_id: _,
                 call_id,
                 statuses,
+                wait_state,
                 ..
             }) => {
-                if statuses.is_empty() {
+                let timed_out = wait_state.timed_out == Some(true);
+                if timed_out {
                     ts_msg!(
                         self,
-                        "{} {}:",
+                        "{} {}, {} agents reported:",
                         format_collab_invocation("wait", &call_id, None),
-                        "timed out".style(self.yellow)
+                        format!("timed out ({})", format_wait_mode(&wait_state.return_when))
+                            .style(self.yellow),
+                        statuses.len()
                     );
-                    return CodexStatus::Running;
+                } else {
+                    let success = !statuses.values().any(is_collab_status_failure);
+                    let title_style = if success { self.green } else { self.red };
+                    let title = format!(
+                        "{} condition met ({}), {} agents reported:",
+                        format_collab_invocation("wait", &call_id, None),
+                        format_wait_mode(&wait_state.return_when),
+                        statuses.len()
+                    );
+                    ts_msg!(self, "{}", title.style(title_style));
                 }
-                let success = !statuses.values().any(is_collab_status_failure);
-                let title_style = if success { self.green } else { self.red };
-                let title = format!(
-                    "{} {} agents complete:",
-                    format_collab_invocation("wait", &call_id, None),
-                    statuses.len()
-                );
-                ts_msg!(self, "{}", title.style(title_style));
                 let mut sorted = statuses
                     .into_iter()
                     .map(|(thread_id, status)| (thread_id.to_string(), status))
@@ -813,6 +827,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                         format_collab_status(&status).style(style_for_agent_status(&status, self))
                     );
                 }
+                return CodexStatus::Running;
             }
             EventMsg::CollabCloseBegin(CollabCloseBeginEvent {
                 call_id,
@@ -918,6 +933,16 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 println!("{message}");
             }
         }
+    }
+}
+
+// Merge-safety anchor: human wait output must key off explicit wait metadata instead of inferring
+// timeout from empty status maps, or timeout returns become indistinguishable from any_final
+// completions once current agent states are included.
+fn format_wait_mode(return_when: &CollabWaitReturnWhen) -> &'static str {
+    match return_when {
+        CollabWaitReturnWhen::AnyFinal => "any final",
+        CollabWaitReturnWhen::AllFinal => "all final",
     }
 }
 

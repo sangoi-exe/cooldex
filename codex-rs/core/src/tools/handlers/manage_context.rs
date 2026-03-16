@@ -411,6 +411,7 @@ async fn handle_apply(
         let compacted_item = RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(replacement_history),
+            prompt_gc: None,
         });
         if let Err(error) = recorder.record_items(&[compacted_item]).await {
             let mut state = session.state.lock().await;

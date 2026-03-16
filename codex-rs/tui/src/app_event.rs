@@ -16,6 +16,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::TokenUsageInfo;
 use codex_utils_approval_presets::ApprovalPreset;
 
 use crate::bottom_pane::ApprovalRequest;
@@ -95,6 +96,29 @@ pub(crate) enum AppEvent {
     ThreadEvent {
         thread_id: ThreadId,
         event: Event,
+    },
+
+    /// Private live prompt-GC activity for the primary thread.
+    PromptGcActivity {
+        active: bool,
+    },
+
+    /// Merge-safety anchor: prompt-GC completion refresh stays on the TUI-private app event bus
+    /// so hidden prompt-GC can update `window left` without emitting a persisted protocol event.
+    PromptGcContextUsageUpdated {
+        token_usage_info: Option<TokenUsageInfo>,
+    },
+
+    /// Private live prompt-GC activity for a non-primary thread.
+    ThreadPromptGcActivity {
+        thread_id: ThreadId,
+        active: bool,
+    },
+
+    /// Private prompt-GC completion context-usage refresh for a non-primary thread.
+    ThreadPromptGcContextUsageUpdated {
+        thread_id: ThreadId,
+        token_usage_info: Option<TokenUsageInfo>,
     },
 
     /// Start a new session.
@@ -199,7 +223,7 @@ pub(crate) enum AppEvent {
     UpdatePersonality(Personality),
 
     /// Open `/accounts`, using cached status data when available.
-    /// Merge anchor: this event starts the app-level refresh flow that must stay
+    /// Merge-safety anchor: this event starts the app-level refresh flow that must stay
     /// aligned with `AuthManager::list_accounts()` fields rendered by account popups.
     StartOpenAccountsPopup,
 

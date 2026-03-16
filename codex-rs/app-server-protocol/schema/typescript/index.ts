@@ -36,6 +36,8 @@ export type { CollabCloseBeginEvent } from "./CollabCloseBeginEvent";
 export type { CollabCloseEndEvent } from "./CollabCloseEndEvent";
 export type { CollabResumeBeginEvent } from "./CollabResumeBeginEvent";
 export type { CollabResumeEndEvent } from "./CollabResumeEndEvent";
+export type { CollabWaitReturnWhen } from "./CollabWaitReturnWhen";
+export type { CollabWaitState } from "./CollabWaitState";
 export type { CollabWaitingBeginEvent } from "./CollabWaitingBeginEvent";
 export type { CollabWaitingEndEvent } from "./CollabWaitingEndEvent";
 export type { CollaborationMode } from "./CollaborationMode";

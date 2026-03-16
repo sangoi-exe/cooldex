@@ -184,6 +184,9 @@ use codex_core::ThreadManager;
 use codex_core::ThreadSortKey as CoreThreadSortKey;
 use codex_core::auth::AuthMode as CoreAuthMode;
 use codex_core::auth::CLIENT_ID;
+use codex_core::auth::EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE;
+use codex_core::auth::EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE;
+use codex_core::auth::ExternalAuthLoginError;
 use codex_core::auth::login_with_api_key;
 use codex_core::auth::login_with_chatgpt_auth_tokens;
 use codex_core::config::Config;
@@ -1211,19 +1214,40 @@ impl CodexMessageProcessor {
             return;
         }
 
-        if let Err(err) = login_with_chatgpt_auth_tokens(
+        match login_with_chatgpt_auth_tokens(
             &self.config.codex_home,
             &access_token,
             &chatgpt_account_id,
             chatgpt_plan_type.as_deref(),
         ) {
-            let error = JSONRPCErrorError {
-                code: INTERNAL_ERROR_CODE,
-                message: format!("failed to set external auth: {err}"),
-                data: None,
-            };
-            self.outgoing.send_error(request_id, error).await;
-            return;
+            Ok(()) => {}
+            Err(ExternalAuthLoginError::UnsupportedPlan) => {
+                let error = JSONRPCErrorError {
+                    code: INVALID_REQUEST_ERROR_CODE,
+                    message: EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE.to_string(),
+                    data: None,
+                };
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+            Err(ExternalAuthLoginError::InvalidAccessToken) => {
+                let error = JSONRPCErrorError {
+                    code: INVALID_REQUEST_ERROR_CODE,
+                    message: EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE.to_string(),
+                    data: None,
+                };
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+            Err(ExternalAuthLoginError::Io(err)) => {
+                let error = JSONRPCErrorError {
+                    code: INTERNAL_ERROR_CODE,
+                    message: format!("failed to set external auth: {err}"),
+                    data: None,
+                };
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
         }
         self.auth_manager.reload();
         replace_cloud_requirements_loader(

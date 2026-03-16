@@ -19,6 +19,7 @@ use codex_protocol::protocol::CollabAgentActivity;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::user_input::UserInput;
 use std::path::PathBuf;
 use tokio::sync::watch;
@@ -99,12 +100,34 @@ impl CodexThread {
         self.codex.agent_last_activity().await
     }
 
+    #[doc(hidden)]
+    /// Workspace-internal current-state snapshot for prompt-GC activity.
+    pub fn subscribe_prompt_gc_activity(&self) -> watch::Receiver<bool> {
+        self.codex.subscribe_prompt_gc_activity()
+    }
+
+    #[doc(hidden)]
+    /// Workspace-internal ordered prompt-GC activity edges for live UI updates.
+    pub fn subscribe_prompt_gc_activity_edges(&self) -> tokio::sync::broadcast::Receiver<bool> {
+        self.codex.subscribe_prompt_gc_activity_edges()
+    }
+
     pub(crate) fn subscribe_status(&self) -> watch::Receiver<AgentStatus> {
         self.codex.agent_status.clone()
     }
 
+    // Merge-safety anchor: prompt-GC completion usage snapshots stay on this crate-private thread
+    // seam so internal runtime paths can refresh context-left without emitting a protocol TokenCount.
+    #[doc(hidden)]
+    /// Workspace-internal prompt-GC completion usage snapshot for private TUI refresh paths.
     pub(crate) async fn total_token_usage(&self) -> Option<TokenUsage> {
         self.codex.session.total_token_usage().await
+    }
+
+    #[doc(hidden)]
+    /// Workspace-internal prompt-GC completion usage info for private TUI refresh paths.
+    pub async fn token_usage_info(&self) -> Option<TokenUsageInfo> {
+        self.codex.session.token_usage_info().await
     }
 
     /// Records a user-role session-prefix message without creating a new user turn boundary.

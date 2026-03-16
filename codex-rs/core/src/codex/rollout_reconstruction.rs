@@ -40,7 +40,8 @@ fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&s
 }
 
 fn is_prompt_gc_compaction_marker(compacted: &CompactedItem) -> bool {
-    compacted.message == crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER
+    compacted.prompt_gc.is_some()
+        || compacted.message == crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER
 }
 
 fn finalize_active_segment<'a>(
@@ -113,6 +114,11 @@ impl Session {
         for (index, item) in rollout_items.iter().enumerate().rev() {
             match item {
                 RolloutItem::Compacted(compacted) => {
+                    if is_prompt_gc_compaction_marker(compacted)
+                        && compacted.replacement_history.is_none()
+                    {
+                        continue;
+                    }
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     // Looking backward, compaction clears any older baseline unless a newer
@@ -259,10 +265,10 @@ impl Session {
                     );
                 }
                 RolloutItem::Compacted(compacted) => {
+                    if is_prompt_gc_compaction_marker(compacted) {
+                        continue;
+                    }
                     if let Some(replacement_history) = &compacted.replacement_history {
-                        if is_prompt_gc_compaction_marker(compacted) {
-                            continue;
-                        }
                         // This should actually never happen, because the reverse loop above (to build rollout_suffix)
                         // should stop before any compaction that has Some replacement_history
                         history.replace(replacement_history.clone());

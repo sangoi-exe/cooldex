@@ -249,6 +249,32 @@ fn total_token_usage_includes_all_items_after_last_model_generated_item() {
 }
 
 #[test]
+fn total_token_usage_projects_large_tool_output_after_last_model_generated_item() {
+    let mut history = create_history_with_items(vec![assistant_msg("already counted by API")]);
+    history.update_token_info(
+        &TokenUsage {
+            total_tokens: 100,
+            ..Default::default()
+        },
+        None,
+    );
+    let large_output = "tool output line with a lot of content\n".repeat(1_500);
+    let added_tool_output = custom_tool_call_output("tool-tail", &large_output);
+    history.record_items([&added_tool_output], TruncationPolicy::Tokens(10_000));
+
+    let expected = 100
+        + history
+            .items_after_last_model_generated_item()
+            .iter()
+            .map(estimate_item_token_count)
+            .fold(0i64, i64::saturating_add);
+    let raw_serialized_len = serde_json::to_string(&added_tool_output).unwrap().len() as i64;
+
+    assert_eq!(history.get_total_token_usage(true), expected);
+    assert!(expected < 100 + raw_serialized_len);
+}
+
+#[test]
 fn for_prompt_strips_images_when_model_does_not_support_images() {
     let items = vec![
         ResponseItem::Message {
@@ -841,6 +867,64 @@ fn normalization_retains_local_shell_outputs() {
     let history = create_history_with_items(items.clone());
     let normalized = history.for_prompt(&modalities);
     assert_eq!(normalized, items);
+}
+
+#[test]
+fn for_prompt_projects_large_function_call_output_text() {
+    let long_output = "tool output line with a lot of content\n".repeat(1_500);
+    let history = create_history_with_items(vec![
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "read_big_file".to_string(),
+            arguments: "{}".to_string(),
+            call_id: "call-large".to_string(),
+        },
+        ResponseItem::FunctionCallOutput {
+            call_id: "call-large".to_string(),
+            output: FunctionCallOutputPayload::from_text(long_output.clone()),
+        },
+    ]);
+
+    let prompt = history.for_prompt(&default_input_modalities());
+
+    assert_eq!(prompt.len(), 2);
+    match &prompt[1] {
+        ResponseItem::FunctionCallOutput { call_id, output } => {
+            assert_eq!(call_id, "call-large");
+            assert_eq!(output.success, None);
+            let projected = output.text_content().unwrap_or_default();
+            assert_ne!(projected, long_output);
+            assert!(projected.contains("tokens truncated"));
+            assert!(projected.len() < long_output.len());
+        }
+        other => panic!("unexpected prompt item: {other:?}"),
+    }
+}
+
+#[test]
+fn estimate_response_item_model_visible_bytes_projects_large_function_output_text() {
+    let long_output = "tool output line with a lot of content\n".repeat(1_500);
+    let item = ResponseItem::FunctionCallOutput {
+        call_id: "call-large".to_string(),
+        output: FunctionCallOutputPayload::from_text(long_output),
+    };
+
+    let estimated = estimate_response_item_model_visible_bytes(&item);
+    let projected = ResponseItem::FunctionCallOutput {
+        call_id: "call-large".to_string(),
+        output: truncate_function_output_payload(
+            match &item {
+                ResponseItem::FunctionCallOutput { output, .. } => output,
+                other => panic!("unexpected item: {other:?}"),
+            },
+            TruncationPolicy::Tokens(MODEL_VISIBLE_TOOL_OUTPUT_MAX_TOKENS),
+        ),
+    };
+    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
+    let projected_len = serde_json::to_string(&projected).unwrap().len() as i64;
+
+    assert_eq!(estimated, projected_len);
+    assert!(estimated < raw_len);
 }
 
 #[test]

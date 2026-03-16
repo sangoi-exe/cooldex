@@ -221,6 +221,36 @@
       ],
       "type": "string"
     },
+    "CollabWaitReturnWhen": {
+      "enum": [
+        "anyFinal",
+        "allFinal"
+      ],
+      "type": "string"
+    },
+    "CollabWaitState": {
+      "properties": {
+        "disableTimeout": {
+          "type": "boolean"
+        },
+        "returnWhen": {
+          "$ref": "#/definitions/CollabWaitReturnWhen"
+        },
+        "timedOut": {
+          "description": "Null until the wait call finishes.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "disableTimeout",
+        "returnWhen",
+        "timedOut"
+      ],
+      "type": "object"
+    },
     "CommandAction": {
       "oneOf": [
         {
@@ -946,6 +976,17 @@
               ],
               "title": "CollabAgentToolCallThreadItemType",
               "type": "string"
+            },
+            "waitState": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CollabWaitState"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Null when the collab tool call is not `wait`."
             }
           },
           "required": [
@@ -955,7 +996,8 @@
             "senderThreadId",
             "status",
             "tool",
-            "type"
+            "type",
+            "waitState"
           ],
           "title": "CollabAgentToolCallThreadItem",
           "type": "object"

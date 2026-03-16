@@ -554,6 +554,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: Vec::new(),
             prompt: Some(payload.prompt.clone()),
             agents_states: HashMap::new(),
+            wait_state: None,
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -587,6 +588,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids,
             prompt: Some(payload.prompt.clone()),
             agents_states,
+            wait_state: None,
         });
     }
 
@@ -602,6 +604,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
             prompt: Some(payload.prompt.clone()),
             agents_states: HashMap::new(),
+            wait_state: None,
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -624,6 +627,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: vec![receiver_id.clone()],
             prompt: Some(payload.prompt.clone()),
             agents_states: [(receiver_id, received_status)].into_iter().collect(),
+            wait_state: None,
         });
     }
 
@@ -643,6 +647,9 @@ impl ThreadHistoryBuilder {
                 .collect(),
             prompt: None,
             agents_states: HashMap::new(),
+            // Merge-safety anchor: thread-history wait items must preserve wait-state metadata so
+            // replayed history can still distinguish any_final/all_final and timeout returns.
+            wait_state: Some(payload.wait_state.clone().into()),
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -695,6 +702,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids,
             prompt: None,
             agents_states,
+            wait_state: Some(payload.wait_state.clone().into()),
         });
     }
 
@@ -710,6 +718,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
             prompt: None,
             agents_states: HashMap::new(),
+            wait_state: None,
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -734,6 +743,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: vec![receiver_id],
             prompt: None,
             agents_states,
+            wait_state: None,
         });
     }
 
@@ -749,6 +759,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
             prompt: None,
             agents_states: HashMap::new(),
+            wait_state: None,
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -776,6 +787,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: vec![receiver_id],
             prompt: None,
             agents_states,
+            wait_state: None,
         });
     }
 
@@ -1144,6 +1156,10 @@ mod tests {
     use codex_protocol::protocol::AgentReasoningRawContentEvent;
     use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
     use codex_protocol::protocol::CodexErrorInfo;
+    use codex_protocol::protocol::CollabWaitReturnWhen as CoreCollabWaitReturnWhen;
+    use codex_protocol::protocol::CollabWaitState as CoreCollabWaitState;
+    use codex_protocol::protocol::CollabWaitingBeginEvent;
+    use codex_protocol::protocol::CollabWaitingEndEvent;
     use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::DynamicToolCallResponseEvent;
     use codex_protocol::protocol::ExecCommandEndEvent;
@@ -2287,6 +2303,7 @@ mod tests {
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
                 replacement_history: None,
+                prompt_gc: None,
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-compact".into(),
@@ -2353,6 +2370,103 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                wait_state: None,
+            }
+        );
+    }
+
+    #[test]
+    fn reconstructs_collab_wait_items_with_wait_state() {
+        let sender_thread_id = ThreadId::try_from("00000000-0000-0000-0000-000000000010")
+            .expect("valid sender thread id");
+        let receiver_thread_id = ThreadId::try_from("00000000-0000-0000-0000-000000000011")
+            .expect("valid receiver thread id");
+        let wait_begin = CollabWaitingBeginEvent {
+            sender_thread_id: sender_thread_id.clone(),
+            receiver_thread_ids: vec![receiver_thread_id.clone()],
+            receiver_agents: Vec::new(),
+            call_id: "wait-1".into(),
+            wait_state: CoreCollabWaitState {
+                return_when: CoreCollabWaitReturnWhen::AllFinal,
+                disable_timeout: true,
+                timed_out: None,
+            },
+        };
+        let wait_end = CollabWaitingEndEvent {
+            sender_thread_id: sender_thread_id.clone(),
+            call_id: "wait-1".into(),
+            agent_statuses: Vec::new(),
+            statuses: [(
+                receiver_thread_id.clone(),
+                AgentStatus::Completed(Some("done".into())),
+            )]
+            .into_iter()
+            .collect(),
+            wait_state: CoreCollabWaitState {
+                return_when: CoreCollabWaitReturnWhen::AllFinal,
+                disable_timeout: true,
+                timed_out: Some(true),
+            },
+        };
+
+        let mut builder = ThreadHistoryBuilder::new();
+        builder.handle_event(&EventMsg::UserMessage(UserMessageEvent {
+            message: "wait".into(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+        }));
+        builder.handle_event(&EventMsg::CollabWaitingBegin(wait_begin));
+
+        let active_turn = builder
+            .active_turn_snapshot()
+            .expect("active turn snapshot after wait begin");
+        assert_eq!(
+            active_turn.items[1],
+            ThreadItem::CollabAgentToolCall {
+                id: "wait-1".into(),
+                tool: CollabAgentTool::Wait,
+                status: CollabAgentToolCallStatus::InProgress,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![receiver_thread_id.to_string()],
+                prompt: None,
+                agents_states: HashMap::new(),
+                wait_state: Some(crate::protocol::v2::CollabWaitState {
+                    return_when: crate::protocol::v2::CollabWaitReturnWhen::AllFinal,
+                    disable_timeout: true,
+                    timed_out: None,
+                }),
+            }
+        );
+
+        builder.handle_event(&EventMsg::CollabWaitingEnd(wait_end));
+
+        let turns = builder.finish();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items[1],
+            ThreadItem::CollabAgentToolCall {
+                id: "wait-1".into(),
+                tool: CollabAgentTool::Wait,
+                status: CollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![receiver_thread_id.to_string()],
+                prompt: None,
+                agents_states: [(
+                    receiver_thread_id.to_string(),
+                    CollabAgentState {
+                        status: crate::protocol::v2::CollabAgentStatus::Completed,
+                        message: Some("done".into()),
+                        last_activity: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                wait_state: Some(crate::protocol::v2::CollabWaitState {
+                    return_when: crate::protocol::v2::CollabWaitReturnWhen::AllFinal,
+                    disable_timeout: true,
+                    timed_out: Some(true),
+                }),
             }
         );
     }

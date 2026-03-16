@@ -311,6 +311,7 @@ async fn materialize_sanitize_history_if_changed(
         let compacted_item = RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(materialization.replacement_history),
+            prompt_gc: None,
         });
         let recorder = {
             let guard = sess.services.rollout.lock().await;

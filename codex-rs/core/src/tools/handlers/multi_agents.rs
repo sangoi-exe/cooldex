@@ -36,6 +36,8 @@ use codex_protocol::protocol::CollabCloseBeginEvent;
 use codex_protocol::protocol::CollabCloseEndEvent;
 use codex_protocol::protocol::CollabResumeBeginEvent;
 use codex_protocol::protocol::CollabResumeEndEvent;
+use codex_protocol::protocol::CollabWaitReturnWhen;
+use codex_protocol::protocol::CollabWaitState;
 use codex_protocol::protocol::CollabWaitingBeginEvent;
 use codex_protocol::protocol::CollabWaitingEndEvent;
 use codex_protocol::protocol::SessionSource;
@@ -44,6 +46,7 @@ use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 /// Function-tool handler for the multi-agent collaboration API.
 pub struct MultiAgentHandler;
@@ -507,6 +510,10 @@ pub(crate) mod wait {
     #[derive(Debug, Deserialize)]
     struct WaitArgs {
         ids: Vec<String>,
+        #[serde(default)]
+        disable_timeout: bool,
+        #[serde(default)]
+        return_when: CollabWaitReturnWhen,
         timeout_ms: Option<i64>,
     }
 
@@ -528,13 +535,24 @@ pub(crate) mod wait {
                 "ids must be non-empty".to_owned(),
             ));
         }
+        if args.disable_timeout && args.timeout_ms.is_some() {
+            return Err(FunctionCallError::RespondToModel(
+                "disable_timeout cannot be combined with timeout_ms".to_owned(),
+            ));
+        }
         let receiver_thread_ids = args
             .ids
             .iter()
             .map(|id| agent_id(id))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut seen_receiver_thread_ids = HashSet::with_capacity(receiver_thread_ids.len());
         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
         for receiver_thread_id in &receiver_thread_ids {
+            if !seen_receiver_thread_ids.insert(*receiver_thread_id) {
+                return Err(FunctionCallError::RespondToModel(
+                    "ids must not contain duplicates".to_owned(),
+                ));
+            }
             let (agent_nickname, agent_role) = session
                 .services
                 .agent_control
@@ -551,14 +569,19 @@ pub(crate) mod wait {
         // Validate timeout.
         // Very short timeouts encourage busy-polling loops in the orchestrator prompt and can
         // cause high CPU usage even with a single active worker, so clamp to a minimum.
-        let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
-        let timeout_ms = match timeout_ms {
-            ms if ms <= 0 => {
-                return Err(FunctionCallError::RespondToModel(
-                    "timeout_ms must be greater than zero".to_owned(),
-                ));
-            }
-            ms => ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
+        let timeout_ms = if args.disable_timeout {
+            None
+        } else {
+            let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
+            let timeout_ms = match timeout_ms {
+                ms if ms <= 0 => {
+                    return Err(FunctionCallError::RespondToModel(
+                        "timeout_ms must be greater than zero".to_owned(),
+                    ));
+                }
+                ms => ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
+            };
+            Some(timeout_ms)
         };
 
         session
@@ -569,24 +592,28 @@ pub(crate) mod wait {
                     receiver_thread_ids: receiver_thread_ids.clone(),
                     receiver_agents: receiver_agents.clone(),
                     call_id: call_id.clone(),
+                    // Merge-safety anchor: wait-mode metadata must stay aligned with operator
+                    // surfaces so any_final/all_final and timeout-disabled waits do not collapse
+                    // back into the old generic "finished waiting" behavior.
+                    wait_state: collab_wait_state(args.return_when, args.disable_timeout, None),
                 }
                 .into(),
             )
             .await;
 
         let mut status_rxs = Vec::with_capacity(receiver_thread_ids.len());
-        let mut saw_final_status = false;
+        let mut final_status_count = 0;
         for id in &receiver_thread_ids {
             match session.services.agent_control.subscribe_status(*id).await {
                 Ok(rx) => {
                     let status = rx.borrow().clone();
                     if is_final(&status) {
-                        saw_final_status = true;
+                        final_status_count += 1;
                     }
                     status_rxs.push((*id, rx));
                 }
                 Err(CodexErr::ThreadNotFound(_)) => {
-                    saw_final_status = true;
+                    final_status_count += 1;
                 }
                 Err(err) => {
                     let agent_states =
@@ -603,6 +630,11 @@ pub(crate) mod wait {
                                     &receiver_agents,
                                 ),
                                 statuses,
+                                wait_state: collab_wait_state(
+                                    args.return_when,
+                                    args.disable_timeout,
+                                    None,
+                                ),
                             }
                             .into(),
                         )
@@ -612,35 +644,20 @@ pub(crate) mod wait {
             }
         }
 
-        if !saw_final_status {
-            // Wait for the first agent to reach a final status.
-            let mut futures = FuturesUnordered::new();
-            for (id, rx) in status_rxs.into_iter() {
-                let session = session.clone();
-                futures.push(wait_for_final_status(session, id, rx));
-            }
-            let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-            loop {
-                match timeout_at(deadline, futures.next()).await {
-                    Ok(Some(Some(result))) => {
-                        let _ = result;
-                        saw_final_status = true;
-                        break;
-                    }
-                    Ok(Some(None)) => continue,
-                    Ok(None) | Err(_) => break,
-                }
-            }
-            if saw_final_status {
-                // Drain the unlikely last elements to prevent race.
-                loop {
-                    match futures.next().now_or_never() {
-                        Some(Some(Some(_result))) => {}
-                        Some(Some(None)) => continue,
-                        Some(None) | None => break,
-                    }
-                }
-            }
+        let mut condition_met = wait_condition_already_met(
+            args.return_when,
+            final_status_count,
+            receiver_thread_ids.len(),
+        );
+        if !condition_met {
+            condition_met = wait_for_condition(
+                session.clone(),
+                status_rxs,
+                args.return_when,
+                timeout_ms
+                    .map(|timeout_ms| Instant::now() + Duration::from_millis(timeout_ms as u64)),
+            )
+            .await?;
         }
 
         let agents = collect_current_agent_states(session.as_ref(), &receiver_thread_ids).await;
@@ -648,7 +665,7 @@ pub(crate) mod wait {
         let agent_statuses = build_wait_agent_statuses(&agents, &receiver_agents);
         let result = WaitResult {
             agents,
-            timed_out: !saw_final_status,
+            timed_out: !condition_met,
         };
 
         // Final event emission.
@@ -660,6 +677,11 @@ pub(crate) mod wait {
                     call_id,
                     agent_statuses,
                     statuses: statuses_map,
+                    wait_state: collab_wait_state(
+                        args.return_when,
+                        args.disable_timeout,
+                        Some(result.timed_out),
+                    ),
                 }
                 .into(),
             )
@@ -693,6 +715,148 @@ pub(crate) mod wait {
             status = status_rx.borrow().clone();
             if is_final(&status) {
                 return Some((thread_id, status));
+            }
+        }
+    }
+
+    fn wait_condition_already_met(
+        return_when: CollabWaitReturnWhen,
+        final_status_count: usize,
+        total_status_count: usize,
+    ) -> bool {
+        match return_when {
+            CollabWaitReturnWhen::AnyFinal => final_status_count > 0,
+            CollabWaitReturnWhen::AllFinal => final_status_count == total_status_count,
+        }
+    }
+
+    fn collab_wait_state(
+        return_when: CollabWaitReturnWhen,
+        disable_timeout: bool,
+        timed_out: Option<bool>,
+    ) -> CollabWaitState {
+        CollabWaitState {
+            return_when,
+            disable_timeout,
+            timed_out,
+        }
+    }
+
+    async fn wait_for_condition(
+        session: Arc<Session>,
+        status_rxs: Vec<(ThreadId, Receiver<AgentStatus>)>,
+        return_when: CollabWaitReturnWhen,
+        deadline: Option<Instant>,
+    ) -> Result<bool, FunctionCallError> {
+        match return_when {
+            CollabWaitReturnWhen::AnyFinal => {
+                wait_for_any_final(session, status_rxs, deadline).await
+            }
+            CollabWaitReturnWhen::AllFinal => {
+                wait_for_all_final(session, status_rxs, deadline).await
+            }
+        }
+    }
+
+    async fn wait_for_any_final(
+        session: Arc<Session>,
+        status_rxs: Vec<(ThreadId, Receiver<AgentStatus>)>,
+        deadline: Option<Instant>,
+    ) -> Result<bool, FunctionCallError> {
+        let mut futures = FuturesUnordered::new();
+        for (id, rx) in status_rxs {
+            let session = session.clone();
+            futures.push(wait_for_final_status(session, id, rx));
+        }
+        wait_for_any_final_from_futures(&mut futures, deadline).await
+    }
+
+    async fn wait_for_any_final_from_futures<F>(
+        futures: &mut FuturesUnordered<F>,
+        deadline: Option<Instant>,
+    ) -> Result<bool, FunctionCallError>
+    where
+        F: std::future::Future<Output = Option<(ThreadId, AgentStatus)>> + Unpin,
+    {
+        if let Some(deadline) = deadline {
+            loop {
+                match timeout_at(deadline, futures.next()).await {
+                    Ok(Some(Some(_result))) => return Ok(true),
+                    Ok(Some(None)) => continue,
+                    Ok(None) => {
+                        return Err(FunctionCallError::Fatal(
+                            "wait exhausted all status subscriptions before any requested agent reached a final status".to_string(),
+                        ));
+                    }
+                    Err(_) => return Ok(false),
+                }
+            }
+        }
+
+        loop {
+            match futures.next().await {
+                Some(Some(_result)) => return Ok(true),
+                Some(None) => continue,
+                None => {
+                    return Err(FunctionCallError::Fatal(
+                        "wait exhausted all status subscriptions before any requested agent reached a final status".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    async fn wait_for_all_final(
+        session: Arc<Session>,
+        status_rxs: Vec<(ThreadId, Receiver<AgentStatus>)>,
+        deadline: Option<Instant>,
+    ) -> Result<bool, FunctionCallError> {
+        let mut futures = FuturesUnordered::new();
+        for (id, rx) in status_rxs {
+            if is_final(&rx.borrow().clone()) {
+                continue;
+            }
+            let session = session.clone();
+            futures.push(wait_for_final_status(session, id, rx));
+        }
+
+        let mut remaining = futures.len();
+        if remaining == 0 {
+            return Ok(true);
+        }
+
+        if let Some(deadline) = deadline {
+            loop {
+                match timeout_at(deadline, futures.next()).await {
+                    Ok(Some(Some(_result))) => {
+                        remaining -= 1;
+                        if remaining == 0 {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(Some(None)) | Ok(None) => {
+                        return Err(FunctionCallError::Fatal(
+                            "wait exhausted a status subscription before all requested agents reached a final status".to_string(),
+                        ));
+                    }
+                    Err(_) => return Ok(false),
+                }
+            }
+        }
+
+        loop {
+            match futures.next().await {
+                Some(Some(_result)) => {
+                    remaining -= 1;
+                    if remaining == 0 {
+                        return Ok(true);
+                    }
+                }
+                Some(None) | None => {
+                    return Err(FunctionCallError::Fatal(
+                        "wait exhausted a status subscription before all requested agents reached a final status".to_string(),
+                    ));
+                }
             }
         }
     }
@@ -2284,6 +2448,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_rejects_disable_timeout_with_timeout_ms() {
+        let (session, turn) = make_session_and_context().await;
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait",
+            function_payload(json!({
+                "ids": [ThreadId::new().to_string()],
+                "disable_timeout": true,
+                "timeout_ms": 1000
+            })),
+        );
+        let Err(err) = MultiAgentHandler.handle(invocation).await else {
+            panic!("disable_timeout + timeout_ms should be rejected");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(
+                "disable_timeout cannot be combined with timeout_ms".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn wait_rejects_invalid_id() {
         let (session, turn) = make_session_and_context().await;
         let invocation = invocation(
@@ -2316,6 +2504,27 @@ mod tests {
         assert_eq!(
             err,
             FunctionCallError::RespondToModel("ids must be non-empty".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_rejects_duplicate_ids() {
+        let (session, turn) = make_session_and_context().await;
+        let duplicate_id = ThreadId::new();
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait",
+            function_payload(json!({
+                "ids": [duplicate_id.to_string(), duplicate_id.to_string()]
+            })),
+        );
+        let Err(err) = MultiAgentHandler.handle(invocation).await else {
+            panic!("duplicate ids should be rejected");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel("ids must not contain duplicates".to_string())
         );
     }
 
@@ -2369,6 +2578,70 @@ mod tests {
                     ),
                 ]),
                 timed_out: false
+            }
+        );
+        assert_eq!(success, None);
+    }
+
+    #[tokio::test]
+    async fn wait_with_all_final_treats_not_found_as_final() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let thread = manager.start_thread(config).await.expect("start thread");
+        let existing_id = thread.thread_id;
+        let missing_id = ThreadId::new();
+
+        let _ = thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("shutdown should submit");
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait",
+            function_payload(json!({
+                "ids": [missing_id.to_string(), existing_id.to_string()],
+                "return_when": "all_final"
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("wait should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: wait::WaitResult =
+            serde_json::from_str(&content).expect("wait result should be json");
+        assert_eq!(
+            result,
+            wait::WaitResult {
+                agents: HashMap::from([
+                    (
+                        missing_id,
+                        AgentRuntimeState {
+                            status: AgentStatus::NotFound,
+                            last_activity: None,
+                        },
+                    ),
+                    (
+                        existing_id,
+                        AgentRuntimeState {
+                            status: AgentStatus::Shutdown,
+                            last_activity: None,
+                        },
+                    ),
+                ]),
+                timed_out: false,
             }
         );
         assert_eq!(success, None);
@@ -2463,7 +2736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_returns_final_status_without_timeout() {
+    async fn wait_returns_immediately_when_agent_is_already_final() {
         let (mut session, turn) = make_session_and_context().await;
         let manager = thread_manager();
         session.services.agent_control = manager.agent_control();
@@ -2519,6 +2792,249 @@ mod tests {
                     },
                 )]),
                 timed_out: false
+            }
+        );
+        assert_eq!(success, None);
+    }
+
+    #[tokio::test]
+    async fn wait_with_disable_timeout_returns_after_in_flight_any_final_transition() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let thread = manager.start_thread(config).await.expect("start thread");
+        let agent_id = thread.thread_id;
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait",
+            function_payload(json!({
+                "ids": [agent_id.to_string()],
+                "disable_timeout": true
+            })),
+        );
+
+        let mut wait_task = tokio::spawn(async move { MultiAgentHandler.handle(invocation).await });
+        let early = timeout(Duration::from_millis(50), &mut wait_task).await;
+        assert!(
+            early.is_err(),
+            "disable_timeout wait should remain pending until a final status arrives"
+        );
+
+        let _ = thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("shutdown should submit");
+
+        let output = timeout(Duration::from_secs(1), &mut wait_task)
+            .await
+            .expect("wait should complete after final status")
+            .expect("wait task should join")
+            .expect("wait should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: wait::WaitResult =
+            serde_json::from_str(&content).expect("wait result should be json");
+        assert_eq!(
+            result,
+            wait::WaitResult {
+                agents: HashMap::from([(
+                    agent_id,
+                    AgentRuntimeState {
+                        status: AgentStatus::Shutdown,
+                        last_activity: None,
+                    },
+                )]),
+                timed_out: false,
+            }
+        );
+        assert_eq!(success, None);
+    }
+
+    #[tokio::test]
+    async fn wait_with_all_final_times_out_while_any_requested_agent_is_non_final() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let completed_thread = manager
+            .start_thread(config.clone())
+            .await
+            .expect("start completed thread");
+        let running_thread = manager
+            .start_thread(config)
+            .await
+            .expect("start running thread");
+        let completed_id = completed_thread.thread_id;
+        let running_id = running_thread.thread_id;
+        let mut status_rx = manager
+            .agent_control()
+            .subscribe_status(completed_id)
+            .await
+            .expect("subscribe should succeed");
+
+        let _ = completed_thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("shutdown should submit");
+        let _ = timeout(Duration::from_secs(1), status_rx.changed())
+            .await
+            .expect("shutdown status should arrive");
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait",
+            function_payload(json!({
+                "ids": [completed_id.to_string(), running_id.to_string()],
+                "return_when": "all_final",
+                "timeout_ms": MIN_WAIT_TIMEOUT_MS
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(invocation)
+            .await
+            .expect("wait should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: wait::WaitResult =
+            serde_json::from_str(&content).expect("wait result should be json");
+        assert_eq!(
+            result,
+            wait::WaitResult {
+                agents: HashMap::from([
+                    (
+                        completed_id,
+                        AgentRuntimeState {
+                            status: AgentStatus::Shutdown,
+                            last_activity: None,
+                        },
+                    ),
+                    (
+                        running_id,
+                        AgentRuntimeState {
+                            status: AgentStatus::PendingInit,
+                            last_activity: None,
+                        },
+                    ),
+                ]),
+                timed_out: true,
+            }
+        );
+        assert_eq!(success, None);
+
+        let _ = running_thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("shutdown should submit");
+    }
+
+    #[tokio::test]
+    async fn wait_with_disable_timeout_and_all_final_returns_after_every_agent_is_final() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let config = turn.config.as_ref().clone();
+        let first_thread = manager
+            .start_thread(config.clone())
+            .await
+            .expect("start first thread");
+        let second_thread = manager
+            .start_thread(config)
+            .await
+            .expect("start second thread");
+        let first_id = first_thread.thread_id;
+        let second_id = second_thread.thread_id;
+        let mut first_status_rx = manager
+            .agent_control()
+            .subscribe_status(first_id)
+            .await
+            .expect("subscribe first should succeed");
+
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait",
+            function_payload(json!({
+                "ids": [first_id.to_string(), second_id.to_string()],
+                "disable_timeout": true,
+                "return_when": "all_final"
+            })),
+        );
+        let mut wait_task = tokio::spawn(async move { MultiAgentHandler.handle(invocation).await });
+
+        let _ = first_thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("first shutdown should submit");
+        let _ = timeout(Duration::from_secs(1), first_status_rx.changed())
+            .await
+            .expect("first shutdown status should arrive");
+
+        let early = timeout(Duration::from_millis(50), &mut wait_task).await;
+        assert!(
+            early.is_err(),
+            "all_final should remain pending until every requested agent reaches a final status"
+        );
+
+        let _ = second_thread
+            .thread
+            .submit(Op::Shutdown {})
+            .await
+            .expect("second shutdown should submit");
+
+        let output = timeout(Duration::from_secs(1), &mut wait_task)
+            .await
+            .expect("wait should complete after every final status")
+            .expect("wait task should join")
+            .expect("wait should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: wait::WaitResult =
+            serde_json::from_str(&content).expect("wait result should be json");
+        assert_eq!(
+            result,
+            wait::WaitResult {
+                agents: HashMap::from([
+                    (
+                        first_id,
+                        AgentRuntimeState {
+                            status: AgentStatus::Shutdown,
+                            last_activity: None,
+                        },
+                    ),
+                    (
+                        second_id,
+                        AgentRuntimeState {
+                            status: AgentStatus::Shutdown,
+                            last_activity: None,
+                        },
+                    ),
+                ]),
+                timed_out: false,
             }
         );
         assert_eq!(success, None);

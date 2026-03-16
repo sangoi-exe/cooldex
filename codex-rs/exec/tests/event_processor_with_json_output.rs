@@ -44,6 +44,8 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
+use codex_protocol::protocol::CollabWaitReturnWhen;
+use codex_protocol::protocol::CollabWaitState;
 use codex_protocol::protocol::CollabWaitingEndEvent;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
@@ -562,6 +564,7 @@ fn collab_spawn_begin_and_end_emit_item_events() {
                     prompt: Some(prompt.clone()),
                     agents_states: std::collections::HashMap::new(),
                     status: CollabToolCallStatus::InProgress,
+                    wait_state: None,
                 }),
             },
         })]
@@ -600,6 +603,7 @@ fn collab_spawn_begin_and_end_emit_item_events() {
                     .into_iter()
                     .collect(),
                     status: CollabToolCallStatus::Completed,
+                    wait_state: None,
                 }),
             },
         })]
@@ -628,6 +632,11 @@ fn collab_wait_end_without_begin_synthesizes_failed_item() {
             call_id: "call-11".to_string(),
             agent_statuses: Vec::new(),
             statuses: statuses.clone(),
+            wait_state: CollabWaitState {
+                return_when: CollabWaitReturnWhen::AnyFinal,
+                disable_timeout: false,
+                timed_out: Some(false),
+            },
         }),
     );
     let events = ep.collect_thread_events(&end);
@@ -660,6 +669,11 @@ fn collab_wait_end_without_begin_synthesizes_failed_item() {
                     .into_iter()
                     .collect(),
                     status: CollabToolCallStatus::Failed,
+                    wait_state: Some(CollabWaitState {
+                        return_when: CollabWaitReturnWhen::AnyFinal,
+                        disable_timeout: false,
+                        timed_out: Some(false),
+                    }),
                 }),
             },
         })]

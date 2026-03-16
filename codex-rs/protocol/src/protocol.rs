@@ -2235,11 +2235,32 @@ pub enum RolloutItem {
     EventMsg(EventMsg),
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum PromptGcOutcomeKind {
+    Started,
+    EmptyRetrieve,
+    ApplySucceeded,
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct PromptGcCompactionMetadata {
+    pub checkpoint_id: String,
+    pub checkpoint_seq: u64,
+    pub kind: PromptGcOutcomeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_unit_count: Option<u64>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
 pub struct CompactedItem {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement_history: Option<Vec<ResponseItem>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_gc: Option<PromptGcCompactionMetadata>,
 }
 
 impl From<CompactedItem> for ResponseItem {
@@ -3125,6 +3146,29 @@ pub struct CollabAgentInteractionEndEvent {
     pub status: AgentStatus,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum CollabWaitReturnWhen {
+    #[default]
+    AnyFinal,
+    AllFinal,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct CollabWaitState {
+    // Merge-safety anchor: collab wait metadata must stay additive and serde-defaulted so
+    // historical wait events remain readable while operator surfaces keep the real wait mode.
+    #[serde(default)]
+    pub return_when: CollabWaitReturnWhen,
+    #[serde(default)]
+    pub disable_timeout: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<bool>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 pub struct CollabWaitingBeginEvent {
     /// Thread ID of the sender.
@@ -3136,6 +3180,8 @@ pub struct CollabWaitingBeginEvent {
     pub receiver_agents: Vec<CollabAgentRef>,
     /// ID of the waiting call.
     pub call_id: String,
+    #[serde(default)]
+    pub wait_state: CollabWaitState,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -3149,6 +3195,8 @@ pub struct CollabWaitingEndEvent {
     pub agent_statuses: Vec<CollabAgentStatusEntry>,
     /// Last known status of the receiver agents reported to the sender agent.
     pub statuses: HashMap<ThreadId, AgentStatus>,
+    #[serde(default)]
+    pub wait_state: CollabWaitState,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]

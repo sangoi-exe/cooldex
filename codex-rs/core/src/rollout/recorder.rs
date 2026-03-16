@@ -1804,6 +1804,7 @@ mod tests {
                         end_turn: None,
                         phase: None,
                     }]),
+                    prompt_gc: None,
                 }),
                 RolloutItem::TurnContext(TurnContextItem {
                     turn_id: Some("turn-1".to_string()),

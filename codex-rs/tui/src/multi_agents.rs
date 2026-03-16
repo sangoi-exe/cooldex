@@ -11,6 +11,8 @@ use codex_protocol::protocol::CollabAgentStatusEntry;
 use codex_protocol::protocol::CollabCloseEndEvent;
 use codex_protocol::protocol::CollabResumeBeginEvent;
 use codex_protocol::protocol::CollabResumeEndEvent;
+use codex_protocol::protocol::CollabWaitReturnWhen;
+use codex_protocol::protocol::CollabWaitState;
 use codex_protocol::protocol::CollabWaitingBeginEvent;
 use codex_protocol::protocol::CollabWaitingEndEvent;
 use ratatui::style::Stylize;
@@ -139,16 +141,13 @@ pub(crate) fn waiting_begin(ev: CollabWaitingBeginEvent) -> PlainHistoryCell {
         receiver_thread_ids,
         receiver_agents,
         call_id: _,
+        wait_state,
     } = ev;
     let receiver_agents = merge_wait_receivers(&receiver_thread_ids, receiver_agents);
 
-    let title = match receiver_agents.as_slice() {
-        [receiver] => title_with_agent("Waiting for", agent_label_from_ref(receiver)),
-        [] => title_text("Waiting for agents"),
-        _ => title_text(format!("Waiting for {} agents", receiver_agents.len())),
-    };
+    let title = wait_begin_title(&receiver_agents, &wait_state);
 
-    let details = if receiver_agents.len() > 1 {
+    let mut details = if receiver_agents.len() > 1 {
         receiver_agents
             .iter()
             .map(|receiver| agent_label_line(agent_label_from_ref(receiver)))
@@ -156,6 +155,15 @@ pub(crate) fn waiting_begin(ev: CollabWaitingBeginEvent) -> PlainHistoryCell {
     } else {
         Vec::new()
     };
+    if receiver_agents.len() != 1
+        || wait_state.disable_timeout
+        || wait_state.return_when == CollabWaitReturnWhen::AllFinal
+    {
+        details.push(wait_mode_line(&wait_state));
+    }
+    if wait_state.disable_timeout {
+        details.push(Line::from("Timeout: disabled".dim()));
+    }
 
     collab_event(title, details)
 }
@@ -166,9 +174,10 @@ pub(crate) fn waiting_end(ev: CollabWaitingEndEvent) -> PlainHistoryCell {
         sender_thread_id: _,
         agent_statuses,
         statuses,
+        wait_state,
     } = ev;
     let details = wait_complete_lines(&statuses, &agent_statuses);
-    collab_event(title_text("Finished waiting"), details)
+    collab_event(wait_end_title(&wait_state), details)
 }
 
 pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
@@ -341,6 +350,50 @@ fn merge_wait_receivers(
         }
     }
     receiver_agents
+}
+
+// Merge-safety anchor: wait titles and details in the TUI must stay aligned with collab wait
+// metadata so any_final/all_final and timeout returns remain visible to operators.
+fn wait_begin_title(
+    receiver_agents: &[CollabAgentRef],
+    wait_state: &CollabWaitState,
+) -> Line<'static> {
+    match (receiver_agents, wait_state.return_when) {
+        ([receiver], _) => title_with_agent("Waiting for", agent_label_from_ref(receiver)),
+        ([], CollabWaitReturnWhen::AllFinal) => title_text("Waiting for all agents"),
+        ([], CollabWaitReturnWhen::AnyFinal) => title_text("Waiting for agents"),
+        (_, CollabWaitReturnWhen::AllFinal) => {
+            title_text(format!("Waiting for all {} agents", receiver_agents.len()))
+        }
+        (_, CollabWaitReturnWhen::AnyFinal) => title_text(format!(
+            "Waiting for any of {} agents",
+            receiver_agents.len()
+        )),
+    }
+}
+
+fn wait_end_title(wait_state: &CollabWaitState) -> Line<'static> {
+    match (wait_state.timed_out, wait_state.return_when) {
+        (Some(true), CollabWaitReturnWhen::AnyFinal) => title_text("Wait timed out (any final)"),
+        (Some(true), CollabWaitReturnWhen::AllFinal) => title_text("Wait timed out (all final)"),
+        (Some(false), CollabWaitReturnWhen::AnyFinal) => {
+            title_text("Wait condition met (any final)")
+        }
+        (Some(false), CollabWaitReturnWhen::AllFinal) => {
+            title_text("Wait condition met (all final)")
+        }
+        (None, _) => title_text("Finished waiting"),
+    }
+}
+
+fn wait_mode_line(wait_state: &CollabWaitState) -> Line<'static> {
+    Line::from(format!(
+        "Wait mode: {}",
+        match wait_state.return_when {
+            CollabWaitReturnWhen::AnyFinal => "any final status",
+            CollabWaitReturnWhen::AllFinal => "all final statuses",
+        }
+    ))
 }
 
 fn wait_complete_lines(
@@ -517,6 +570,7 @@ mod tests {
                 agent_role: Some("explorer".to_string()),
             }],
             call_id: "call-wait".to_string(),
+            wait_state: CollabWaitState::default(),
         });
 
         let mut statuses = HashMap::new();
@@ -557,6 +611,11 @@ mod tests {
                 },
             ],
             statuses,
+            wait_state: CollabWaitState {
+                return_when: CollabWaitReturnWhen::AnyFinal,
+                disable_timeout: false,
+                timed_out: Some(false),
+            },
         });
 
         let close = close_end(CollabCloseEndEvent {
@@ -574,6 +633,70 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n\n");
         assert_snapshot!("collab_agent_transcript", snapshot);
+    }
+
+    #[test]
+    fn waiting_begin_renders_all_final_with_timeout_disabled() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
+            .expect("valid robie thread id");
+        let bob_id = ThreadId::from_string("00000000-0000-0000-0000-000000000003")
+            .expect("valid bob thread id");
+
+        let cell = waiting_begin(CollabWaitingBeginEvent {
+            sender_thread_id,
+            receiver_thread_ids: vec![robie_id, bob_id],
+            receiver_agents: vec![
+                CollabAgentRef {
+                    thread_id: robie_id,
+                    agent_nickname: Some("Robie".to_string()),
+                    agent_role: Some("explorer".to_string()),
+                },
+                CollabAgentRef {
+                    thread_id: bob_id,
+                    agent_nickname: Some("Bob".to_string()),
+                    agent_role: Some("worker".to_string()),
+                },
+            ],
+            call_id: "call-wait".to_string(),
+            wait_state: CollabWaitState {
+                return_when: CollabWaitReturnWhen::AllFinal,
+                disable_timeout: true,
+                timed_out: None,
+            },
+        });
+        let text = cell_to_text(&cell);
+        assert!(text.contains("Waiting for all 2 agents"));
+        assert!(text.contains("Wait mode: all final statuses"));
+        assert!(text.contains("Timeout: disabled"));
+    }
+
+    #[test]
+    fn waiting_end_renders_timed_out_all_final() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
+            .expect("valid robie thread id");
+        let text = cell_to_text(&waiting_end(CollabWaitingEndEvent {
+            sender_thread_id,
+            call_id: "call-wait".to_string(),
+            agent_statuses: vec![CollabAgentStatusEntry {
+                thread_id: robie_id,
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+                status: AgentStatus::Running,
+                last_activity: None,
+            }],
+            statuses: HashMap::from([(robie_id, AgentStatus::Running)]),
+            wait_state: CollabWaitState {
+                return_when: CollabWaitReturnWhen::AllFinal,
+                disable_timeout: false,
+                timed_out: Some(true),
+            },
+        }));
+        assert!(text.contains("Wait timed out (all final)"));
+        assert!(text.contains("Robie [explorer]: Running"));
     }
 
     #[test]

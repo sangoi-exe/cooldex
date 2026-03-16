@@ -778,7 +778,8 @@ Today both notifications carry an empty `items` array even when item events were
 - `commandExecution` — `{id, command, cwd, status, commandActions, aggregatedOutput?, exitCode?, durationMs?}` for sandboxed commands; `status` is `inProgress`, `completed`, `failed`, or `declined`.
 - `fileChange` — `{id, changes, status}` describing proposed edits; `changes` list `{path, kind, diff}` and `status` is `inProgress`, `completed`, `failed`, or `declined`.
 - `mcpToolCall` — `{id, server, tool, status, arguments, result?, error?}` describing MCP calls; `status` is `inProgress`, `completed`, or `failed`.
-- `collabToolCall` — `{id, tool, status, senderThreadId, receiverThreadIds, prompt?, agentsStates}` describing collab tool calls (`spawn_agent`, `send_input`, `resume_agent`, `wait`, `close_agent`); `receiverThreadIds` is the list of target thread IDs (including newly spawned agents), `agentsStates` maps each target thread ID to `{status, message?, lastActivity?}`, and `status` is `inProgress`, `completed`, or `failed`.
+<!-- Merge-safety anchor: collab wait API docs must stay aligned with waitState fields so client renderers can distinguish wait mode and timeout outcome from generic collab completion. -->
+- `collabToolCall` — `{id, tool, status, senderThreadId, receiverThreadIds, prompt?, agentsStates, waitState}` describing collab tool calls (`spawn_agent`, `send_input`, `resume_agent`, `wait`, `close_agent`); `receiverThreadIds` is the list of target thread IDs (including newly spawned agents), `agentsStates` maps each target thread ID to `{status, message?, lastActivity?}`, and `status` is `inProgress`, `completed`, or `failed`. `waitState` is `null` for non-`wait` tool calls; for `tool: "wait"`, it carries `{returnWhen, disableTimeout, timedOut}` and `timedOut` is `null` until the wait ends, so clients can distinguish `any_final` vs `all_final` waits and timeout returns from ordinary completions.
 - `webSearch` — `{id, query, action?}` for a web search request issued by the agent; `action` mirrors the Responses API web_search action payload (`search`, `open_page`, `find_in_page`) and may be omitted until completion.
 - `imageView` — `{id, path}` emitted when the agent invokes the image viewer tool.
 - `enteredReviewMode` — `{id, review}` sent when the reviewer starts; `review` is a short user-facing label such as `"current changes"` or the requested target description.
@@ -1113,15 +1114,16 @@ The JSON-RPC auth/account surface exposes request/response methods plus server-i
 
 Codex supports these authentication modes. The current mode is surfaced in `account/updated` (`authMode`: `apikey`, `chatgpt`, `chatgptAuthTokens`, or `null`), which also includes the current ChatGPT `planType` when available.
 
+<!-- Merge-safety anchor: external ChatGPT token auth must stay aligned with the Plus/Pro-only admission policy so app-server login and hidden auth consumers do not diverge. -->
 - **API key (`apiKey`)**: Caller supplies an OpenAI API key via `account/login/start` with `type: "apiKey"`. The API key is saved and used for API requests.
 - **ChatGPT managed (`chatgpt`)** (recommended): Codex owns the ChatGPT OAuth flow and refresh tokens. Start via `account/login/start` with `type: "chatgpt"`; Codex persists tokens to disk and refreshes them automatically.
-- **ChatGPT external tokens (`chatgptAuthTokens`)**: Caller provides ChatGPT tokens via `account/login/start` with `type: "chatgptAuthTokens"`. Tokens are kept in memory and the external host app is responsible for refresh.
+- **ChatGPT external tokens (`chatgptAuthTokens`)**: Caller provides ChatGPT tokens via `account/login/start` with `type: "chatgptAuthTokens"`. Tokens are kept in memory and the external host app is responsible for refresh. Only **Plus** and **Pro** plans are accepted; missing, unsupported, or malformed tokens fail the login request.
 
 ### API Overview
 
 - `account/read` — fetch current account info; optionally request a proactive token refresh.
 - `account/login/start` — begin login (`apiKey`, `chatgpt`, `chatgptAuthTokens`).
-- `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
+- `account/login/completed` (notify) — emitted when an asynchronous ChatGPT login attempt completes or when a direct login succeeds. Synchronous input-validation failures return a JSON-RPC error instead.
 - `account/login/cancel` — cancel a pending ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated`.
 - `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, `chatgptAuthTokens`, or `null`) and includes the current ChatGPT `planType` when available.

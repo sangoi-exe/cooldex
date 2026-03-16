@@ -51,6 +51,8 @@ pub(crate) struct TotalTokenUsageBreakdown {
     pub estimated_bytes_of_items_added_since_last_successful_api_response: i64,
 }
 
+const MODEL_VISIBLE_TOOL_OUTPUT_MAX_TOKENS: usize = 2_500;
+
 impl ContextManager {
     pub(crate) fn new() -> Self {
         Self {
@@ -112,6 +114,9 @@ impl ContextManager {
         self.items
             .retain(|item| !matches!(item, ResponseItem::GhostSnapshot { .. }));
         self.items
+            .into_iter()
+            .map(project_model_visible_item)
+            .collect()
     }
 
     /// Returns raw items in the history.
@@ -405,6 +410,31 @@ fn truncate_function_output_payload(
     }
 }
 
+fn project_model_visible_item(item: ResponseItem) -> ResponseItem {
+    match item {
+        ResponseItem::FunctionCallOutput { call_id, output } => ResponseItem::FunctionCallOutput {
+            call_id,
+            output: project_model_visible_tool_output_payload(&output),
+        },
+        ResponseItem::CustomToolCallOutput { call_id, output } => {
+            ResponseItem::CustomToolCallOutput {
+                call_id,
+                output: project_model_visible_tool_output_payload(&output),
+            }
+        }
+        other => other,
+    }
+}
+
+fn project_model_visible_tool_output_payload(
+    output: &FunctionCallOutputPayload,
+) -> FunctionCallOutputPayload {
+    truncate_function_output_payload(
+        output,
+        TruncationPolicy::Tokens(MODEL_VISIBLE_TOOL_OUTPUT_MAX_TOKENS),
+    )
+}
+
 /// API messages include every non-system item (user/assistant messages, reasoning,
 /// tool calls, tool outputs, shell calls, web-search calls, and image-generation
 /// calls).
@@ -466,21 +496,37 @@ pub(crate) fn estimate_response_item_model_visible_bytes(item: &ResponseItem) ->
         | ResponseItem::Compaction {
             encrypted_content: content,
         } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
-        item => {
-            let raw = serde_json::to_string(item)
-                .map(|serialized| i64::try_from(serialized.len()).unwrap_or(i64::MAX))
-                .unwrap_or_default();
-            let (payload_bytes, replacement_bytes) = image_data_url_estimate_adjustment(item);
-            if payload_bytes == 0 || replacement_bytes == 0 {
-                raw
-            } else {
-                // Replace raw base64 payload bytes with a per-image estimate.
-                // We intentionally preserve the data URL prefix and JSON
-                // wrapper bytes already included in `raw`.
-                raw.saturating_sub(payload_bytes)
-                    .saturating_add(replacement_bytes)
-            }
+        ResponseItem::FunctionCallOutput { call_id, output } => {
+            let projected = ResponseItem::FunctionCallOutput {
+                call_id: call_id.clone(),
+                output: project_model_visible_tool_output_payload(output),
+            };
+            estimate_serialized_item_model_visible_bytes(&projected)
         }
+        ResponseItem::CustomToolCallOutput { call_id, output } => {
+            let projected = ResponseItem::CustomToolCallOutput {
+                call_id: call_id.clone(),
+                output: project_model_visible_tool_output_payload(output),
+            };
+            estimate_serialized_item_model_visible_bytes(&projected)
+        }
+        item => estimate_serialized_item_model_visible_bytes(item),
+    }
+}
+
+fn estimate_serialized_item_model_visible_bytes(item: &ResponseItem) -> i64 {
+    let raw = serde_json::to_string(item)
+        .map(|serialized| i64::try_from(serialized.len()).unwrap_or(i64::MAX))
+        .unwrap_or_default();
+    let (payload_bytes, replacement_bytes) = image_data_url_estimate_adjustment(item);
+    if payload_bytes == 0 || replacement_bytes == 0 {
+        raw
+    } else {
+        // Replace raw base64 payload bytes with a per-image estimate.
+        // We intentionally preserve the data URL prefix and JSON
+        // wrapper bytes already included in `raw`.
+        raw.saturating_sub(payload_bytes)
+            .saturating_add(replacement_bytes)
     }
 }
 

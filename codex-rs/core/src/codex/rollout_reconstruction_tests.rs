@@ -2,6 +2,8 @@ use super::*;
 
 use crate::protocol::CompactedItem;
 use crate::protocol::InitialHistory;
+use crate::protocol::PromptGcCompactionMetadata;
+use crate::protocol::PromptGcOutcomeKind;
 use crate::protocol::ResumedHistory;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
@@ -591,6 +593,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            prompt_gc: None,
         }),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
             codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
@@ -646,6 +649,7 @@ async fn record_initial_history_resumed_does_not_seed_reference_context_item_aft
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            prompt_gc: None,
         }),
     ];
 
@@ -671,6 +675,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
         RolloutItem::Compacted(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
+            prompt_gc: None,
         }),
     ];
 
@@ -702,6 +707,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
         RolloutItem::Compacted(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
+            prompt_gc: None,
         }),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
@@ -783,6 +789,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            prompt_gc: None,
         }),
         RolloutItem::TurnContext(previous_context_item),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
@@ -913,6 +920,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            prompt_gc: None,
         }),
     ];
 
@@ -1115,6 +1123,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            prompt_gc: None,
         }),
     ];
 
@@ -1260,6 +1269,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            prompt_gc: None,
         }),
         // A newer TurnStarted replaces the incomplete compacted turn without a matching
         // completion/abort for the old one.
@@ -1313,6 +1323,7 @@ async fn record_initial_history_resumed_ignores_truncated_prompt_gc_compaction_w
         RolloutItem::Compacted(CompactedItem {
             message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
             replacement_history: Some(vec![assistant_message("should not replace")]),
+            prompt_gc: None,
         }),
     ];
 
@@ -1332,6 +1343,44 @@ async fn record_initial_history_resumed_ignores_truncated_prompt_gc_compaction_w
             .any(|item| item == &assistant_message("should not replace"))
     );
     assert!(session.reference_context_item().await.is_none());
+}
+
+#[tokio::test]
+async fn reconstruct_history_ignores_prompt_gc_observational_markers() {
+    let (session, turn_context) = make_session_and_context().await;
+    let before = user_message("before prompt gc");
+    let after = assistant_message("after prompt gc");
+    let rollout_items = vec![
+        RolloutItem::ResponseItem(before.clone()),
+        RolloutItem::Compacted(CompactedItem {
+            message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
+            replacement_history: None,
+            prompt_gc: Some(PromptGcCompactionMetadata {
+                checkpoint_id: "turn-1:prompt_gc:0".to_string(),
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Started,
+                applied_unit_count: None,
+            }),
+        }),
+        RolloutItem::Compacted(CompactedItem {
+            message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
+            replacement_history: None,
+            prompt_gc: Some(PromptGcCompactionMetadata {
+                checkpoint_id: "turn-1:prompt_gc:0".to_string(),
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Failed,
+                applied_unit_count: None,
+            }),
+        }),
+        RolloutItem::ResponseItem(after.clone()),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(reconstructed.history, vec![before, after]);
+    assert!(reconstructed.reference_context_item.is_none());
 }
 
 #[tokio::test]
@@ -1362,6 +1411,7 @@ async fn record_initial_history_resumed_uses_prompt_gc_compaction_with_matching_
         RolloutItem::Compacted(CompactedItem {
             message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
             replacement_history: Some(replacement_history.clone()),
+            prompt_gc: None,
         }),
         RolloutItem::TurnContext(current_context_item.clone()),
     ];

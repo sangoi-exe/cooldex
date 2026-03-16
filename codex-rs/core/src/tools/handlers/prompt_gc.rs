@@ -242,6 +242,8 @@ async fn handle_apply(
         .iter()
         .map(|chunk| chunk.manifest.unit_key)
         .collect::<Vec<_>>();
+    let checkpoint = prompt_gc_checkpoint_for_id(session, turn, checkpoint_id).await?;
+    let applied_unit_count = u64::try_from(applied_unit_keys.len()).unwrap_or(u64::MAX);
 
     let replacement_history = {
         let mut state = session.state.lock().await;
@@ -254,7 +256,12 @@ async fn handle_apply(
     };
 
     session
-        .persist_prompt_gc_replacement_history(turn, replacement_history)
+        .persist_prompt_gc_replacement_history(
+            turn,
+            &checkpoint,
+            applied_unit_count,
+            replacement_history,
+        )
         .await
         .map_err(|error| {
             contract_error(
@@ -385,6 +392,7 @@ async fn build_retrieve_plan(
     turn: &TurnContext,
     checkpoint_id: &str,
 ) -> Result<PromptGcRetrievePlan, crate::function_tool::FunctionCallError> {
+    let checkpoint = prompt_gc_checkpoint_for_id(session, turn, checkpoint_id).await?;
     let sidecar = session
         .prompt_gc_sidecar_for_sub_id(&turn.sub_id)
         .await
@@ -395,12 +403,6 @@ async fn build_retrieve_plan(
             )
         })?;
     let sidecar = sidecar.lock().await;
-    let checkpoint = sidecar.checkpoint(checkpoint_id).ok_or_else(|| {
-        contract_error(
-            StopReason::InvalidContract,
-            format!("unknown checkpoint_id '{checkpoint_id}'"),
-        )
-    })?;
     let units = sidecar
         .selectable_units(
             checkpoint_id,
@@ -450,6 +452,32 @@ async fn build_retrieve_plan(
         state_hash,
         chunk_manifest,
     })
+}
+
+async fn prompt_gc_checkpoint_for_id(
+    session: &Session,
+    turn: &TurnContext,
+    checkpoint_id: &str,
+) -> Result<PromptGcCheckpoint, crate::function_tool::FunctionCallError> {
+    let sidecar = session
+        .prompt_gc_sidecar_for_sub_id(&turn.sub_id)
+        .await
+        .ok_or_else(|| {
+            contract_error(
+                StopReason::InvalidContract,
+                "prompt_gc sidecar is not active for this turn",
+            )
+        })?;
+    sidecar
+        .lock()
+        .await
+        .checkpoint(checkpoint_id)
+        .ok_or_else(|| {
+            contract_error(
+                StopReason::InvalidContract,
+                format!("unknown checkpoint_id '{checkpoint_id}'"),
+            )
+        })
 }
 
 fn resolve_unit_indices(

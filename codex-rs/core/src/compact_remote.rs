@@ -194,6 +194,7 @@ async fn run_remote_compact_task_inner_impl(
     let compacted_item = CompactedItem {
         message: String::new(),
         replacement_history: Some(new_history.clone()),
+        prompt_gc: None,
     };
     sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
         .await;

@@ -7,6 +7,7 @@ use codex_core::config::Config;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::TokenUsageInfo;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -21,6 +22,131 @@ async fn initialize_app_server_client_name(thread: &CodexThread) {
         .await
     {
         tracing::error!("failed to set app server client name: {err}");
+    }
+}
+
+fn prompt_gc_activity_event(thread_id: Option<codex_protocol::ThreadId>, active: bool) -> AppEvent {
+    match thread_id {
+        Some(thread_id) => AppEvent::ThreadPromptGcActivity { thread_id, active },
+        None => AppEvent::PromptGcActivity { active },
+    }
+}
+
+fn prompt_gc_context_usage_event(
+    thread_id: Option<codex_protocol::ThreadId>,
+    token_usage_info: Option<TokenUsageInfo>,
+) -> AppEvent {
+    match thread_id {
+        Some(thread_id) => AppEvent::ThreadPromptGcContextUsageUpdated {
+            thread_id,
+            token_usage_info,
+        },
+        None => AppEvent::PromptGcContextUsageUpdated { token_usage_info },
+    }
+}
+
+fn initial_prompt_gc_bootstrap_event(
+    thread_id: Option<codex_protocol::ThreadId>,
+    prompt_gc_active: bool,
+    seed_prompt_gc_context_usage_if_idle: bool,
+    token_usage_info: Option<TokenUsageInfo>,
+) -> Option<AppEvent> {
+    if prompt_gc_active {
+        Some(prompt_gc_activity_event(thread_id, true))
+    } else if seed_prompt_gc_context_usage_if_idle {
+        Some(prompt_gc_context_usage_event(thread_id, token_usage_info))
+    } else {
+        None
+    }
+}
+
+// Merge-safety anchor: prompt-GC completion usage refresh must stay on the private TUI runtime
+// path so hidden prompt-GC can refresh context-left without surfacing a protocol TokenCount.
+async fn emit_prompt_gc_context_usage_update(
+    thread: &CodexThread,
+    app_event_tx: &AppEventSender,
+    thread_id: Option<codex_protocol::ThreadId>,
+) {
+    let token_usage_info = thread.token_usage_info().await;
+    app_event_tx.send(prompt_gc_context_usage_event(thread_id, token_usage_info));
+}
+
+pub(crate) async fn forward_thread_runtime(
+    thread: Arc<CodexThread>,
+    app_event_tx: AppEventSender,
+    thread_id: Option<codex_protocol::ThreadId>,
+    seed_prompt_gc_context_usage_if_idle: bool,
+) {
+    let prompt_gc_state_rx = thread.subscribe_prompt_gc_activity();
+    let mut prompt_gc_edge_rx = thread.subscribe_prompt_gc_activity_edges();
+    let prompt_gc_active = *prompt_gc_state_rx.borrow();
+    let initial_token_usage_info = if !prompt_gc_active && seed_prompt_gc_context_usage_if_idle {
+        thread.token_usage_info().await
+    } else {
+        None
+    };
+    if let Some(initial_event) = initial_prompt_gc_bootstrap_event(
+        thread_id,
+        prompt_gc_active,
+        seed_prompt_gc_context_usage_if_idle,
+        initial_token_usage_info,
+    ) {
+        app_event_tx.send(initial_event);
+    }
+
+    loop {
+        tokio::select! {
+            event = thread.next_event() => {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(err) => {
+                        tracing::debug!("thread runtime listener stopped: {err}");
+                        break;
+                    }
+                };
+                let is_shutdown_complete = matches!(event.msg, EventMsg::ShutdownComplete);
+                match thread_id {
+                    Some(thread_id) => app_event_tx.send(AppEvent::ThreadEvent { thread_id, event }),
+                    None => app_event_tx.send(AppEvent::CodexEvent(event)),
+                }
+                if is_shutdown_complete {
+                    break;
+                }
+            }
+            edge = prompt_gc_edge_rx.recv() => {
+                match edge {
+                    Ok(active) => {
+                        app_event_tx.send(prompt_gc_activity_event(thread_id, active));
+                        if !active {
+                            emit_prompt_gc_context_usage_update(
+                                thread.as_ref(),
+                                &app_event_tx,
+                                thread_id,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let active = *prompt_gc_state_rx.borrow();
+                        app_event_tx.send(prompt_gc_activity_event(thread_id, active));
+                        if !active {
+                            emit_prompt_gc_context_usage_update(
+                                thread.as_ref(),
+                                &app_event_tx,
+                                thread_id,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+
+    if *prompt_gc_state_rx.borrow() {
+        app_event_tx.send(prompt_gc_activity_event(thread_id, false));
+        emit_prompt_gc_context_usage_update(thread.as_ref(), &app_event_tx, thread_id).await;
     }
 }
 
@@ -73,15 +199,7 @@ pub(crate) fn spawn_agent(
             }
         });
 
-        while let Ok(event) = thread.next_event().await {
-            let is_shutdown_complete = matches!(event.msg, EventMsg::ShutdownComplete);
-            app_event_tx_clone.send(AppEvent::CodexEvent(event));
-            if is_shutdown_complete {
-                // ShutdownComplete is terminal for a thread; drop this receiver task so
-                // the Arc<CodexThread> can be released and thread resources can clean up.
-                break;
-            }
-        }
+        forward_thread_runtime(thread, app_event_tx_clone, None, false).await;
     });
 
     codex_op_tx
@@ -118,15 +236,7 @@ pub(crate) fn spawn_agent_from_existing(
             }
         });
 
-        while let Ok(event) = thread.next_event().await {
-            let is_shutdown_complete = matches!(event.msg, EventMsg::ShutdownComplete);
-            app_event_tx_clone.send(AppEvent::CodexEvent(event));
-            if is_shutdown_complete {
-                // ShutdownComplete is terminal for a thread; drop this receiver task so
-                // the Arc<CodexThread> can be released and thread resources can clean up.
-                break;
-            }
-        }
+        forward_thread_runtime(thread, app_event_tx_clone, None, false).await;
     });
 
     codex_op_tx
@@ -146,4 +256,47 @@ pub(crate) fn spawn_op_forwarder(thread: std::sync::Arc<CodexThread>) -> Unbound
     });
 
     codex_op_tx
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_protocol::ThreadId;
+    use codex_protocol::protocol::TokenUsage;
+
+    use super::*;
+
+    #[test]
+    fn initial_prompt_gc_bootstrap_event_emits_thread_usage_refresh_when_listener_attaches_idle() {
+        let thread_id = ThreadId::new();
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+
+        let event = initial_prompt_gc_bootstrap_event(
+            Some(thread_id),
+            false,
+            true,
+            Some(token_usage_info.clone()),
+        )
+        .expect("idle bootstrap should emit a private usage refresh");
+
+        match event {
+            AppEvent::ThreadPromptGcContextUsageUpdated {
+                thread_id: event_thread_id,
+                token_usage_info: event_token_usage_info,
+            } => {
+                assert_eq!(event_thread_id, thread_id);
+                assert_eq!(event_token_usage_info, Some(token_usage_info));
+            }
+            other => panic!("expected thread prompt-GC usage refresh, got {other:?}"),
+        }
+    }
 }

@@ -49,6 +49,8 @@ use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::CollabAgentActivity as CoreCollabAgentActivity;
 use codex_protocol::protocol::CollabAgentActivityKind as CoreCollabAgentActivityKind;
 use codex_protocol::protocol::CollabAgentStatusEntry as CoreCollabAgentStatusEntry;
+use codex_protocol::protocol::CollabWaitReturnWhen as CoreCollabWaitReturnWhen;
+use codex_protocol::protocol::CollabWaitState as CoreCollabWaitState;
 use codex_protocol::protocol::CreditsSnapshot as CoreCreditsSnapshot;
 use codex_protocol::protocol::ExecCommandStatus as CoreExecCommandStatus;
 use codex_protocol::protocol::ModelRerouteReason as CoreModelRerouteReason;
@@ -75,6 +77,8 @@ use codex_protocol::user_input::TextElement as CoreTextElement;
 use codex_protocol::user_input::UserInput as CoreUserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
+use schemars::r#gen::SchemaGenerator;
+use schemars::schema::Schema;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -1282,13 +1286,16 @@ pub enum LoginAccountParams {
     ChatgptAuthTokens {
         /// Access token (JWT) supplied by the client.
         /// This token is used for backend API requests and email extraction.
+        /// Malformed tokens are rejected as invalid input.
         access_token: String,
         /// Workspace/account identifier supplied by the client.
         chatgpt_account_id: String,
         /// Optional plan type supplied by the client.
         ///
-        /// When `null`, Codex attempts to derive the plan type from access-token
-        /// claims. If unavailable, the plan defaults to `unknown`.
+        /// When present, this value remains authoritative over JWT-derived plan
+        /// claims. When `null`, Codex attempts to derive the plan type from the
+        /// access-token claims. If the effective plan is missing, `unknown`, or
+        /// unsupported, the login request is rejected.
         #[ts(optional = nullable)]
         chatgpt_plan_type: Option<String>,
     },
@@ -3603,6 +3610,12 @@ pub enum ThreadItem {
         prompt: Option<String>,
         /// Last known status of the target agents, when available.
         agents_states: HashMap<String, CollabAgentState>,
+        // Merge-safety anchor: wait-specific metadata must stay structured here so app-server
+        // history does not collapse any_final/all_final and timeout outcomes into a generic
+        // completed collab item.
+        /// Null when the collab tool call is not `wait`.
+        #[schemars(required, schema_with = "required_nullable_collab_wait_state_schema")]
+        wait_state: Option<CollabWaitState>,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -3847,6 +3860,42 @@ pub enum CollabAgentToolCallStatus {
     InProgress,
     Completed,
     Failed,
+}
+
+v2_enum_from_core! {
+    pub enum CollabWaitReturnWhen from CoreCollabWaitReturnWhen {
+        AnyFinal,
+        AllFinal
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct CollabWaitState {
+    pub return_when: CollabWaitReturnWhen,
+    pub disable_timeout: bool,
+    /// Null until the wait call finishes.
+    #[schemars(required, schema_with = "required_nullable_bool_schema")]
+    pub timed_out: Option<bool>,
+}
+
+impl From<CoreCollabWaitState> for CollabWaitState {
+    fn from(value: CoreCollabWaitState) -> Self {
+        Self {
+            return_when: value.return_when.into(),
+            disable_timeout: value.disable_timeout,
+            timed_out: value.timed_out,
+        }
+    }
+}
+
+fn required_nullable_collab_wait_state_schema(schema_gen: &mut SchemaGenerator) -> Schema {
+    schema_gen.subschema_for::<Option<CollabWaitState>>()
+}
+
+fn required_nullable_bool_schema(schema_gen: &mut SchemaGenerator) -> Schema {
+    schema_gen.subschema_for::<Option<bool>>()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

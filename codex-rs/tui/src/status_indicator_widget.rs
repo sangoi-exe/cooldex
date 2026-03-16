@@ -1,8 +1,9 @@
 //! A live task status row rendered above the composer while the agent is busy.
 //!
 //! The row owns spinner timing, the optional interrupt hint, and short inline
-//! context (for example, the unified-exec background-process summary). Keeping
-//! these pieces on one line avoids vertical layout churn in the bottom pane.
+//! context (for example, the prompt-GC badge and unified-exec background-process
+//! summary). Keeping these pieces on one line avoids vertical layout churn in
+//! the bottom pane.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -46,6 +47,8 @@ pub(crate) struct StatusIndicatorWidget {
     header: String,
     details: Option<String>,
     details_max_lines: usize,
+    /// Optional high-priority badge rendered before inline context.
+    inline_badge: Option<String>,
     /// Optional suffix rendered after the elapsed/interrupt segment.
     inline_message: Option<String>,
     show_interrupt_hint: bool,
@@ -85,6 +88,7 @@ impl StatusIndicatorWidget {
             header: String::from("Working"),
             details: None,
             details_max_lines: STATUS_DETAILS_DEFAULT_MAX_LINES,
+            inline_badge: None,
             inline_message: None,
             show_interrupt_hint: true,
             elapsed_running: Duration::ZERO,
@@ -125,7 +129,14 @@ impl StatusIndicatorWidget {
             });
     }
 
-    /// Update the inline suffix text shown after `({elapsed} • esc to interrupt)`.
+    /// Update the high-priority inline badge shown after `({elapsed} • esc to interrupt)`.
+    pub(crate) fn update_inline_badge(&mut self, badge: Option<String>) {
+        self.inline_badge = badge
+            .map(|badge| badge.trim().to_string())
+            .filter(|badge| !badge.is_empty());
+    }
+
+    /// Update the inline suffix text shown after any badge segment.
     ///
     /// Callers should provide plain, already-contextualized text. Passing
     /// verbose status prose here can cause frequent width truncation and hide
@@ -265,6 +276,10 @@ impl Renderable for StatusIndicatorWidget {
             ]);
         } else {
             spans.push(format!("({pretty_elapsed})").dim());
+        }
+        if let Some(badge) = &self.inline_badge {
+            spans.push(" · ".dim());
+            spans.push(badge.clone().yellow().bold());
         }
         if let Some(message) = &self.inline_message {
             // Keep optional context after elapsed/interrupt text so that core

@@ -15,6 +15,7 @@ use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
 use crate::chatwidget::ThreadInputState;
+use crate::chatwidget::forward_thread_runtime;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
@@ -87,6 +88,7 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillErrorInfo;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TokenUsageInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
@@ -398,6 +400,11 @@ struct ThreadEventSnapshot {
     session_configured: Option<Event>,
     events: Vec<Event>,
     input_state: Option<ThreadInputState>,
+    prompt_gc_active: bool,
+    // Merge-safety anchor: prompt-GC thread replay must preserve the full post-GC usage split
+    // outside the event ring so evicted TurnStarted events do not collapse total usage into
+    // context-left math on restore.
+    prompt_gc_token_usage_info: Option<TokenUsageInfo>,
 }
 
 #[derive(Debug)]
@@ -407,6 +414,10 @@ struct ThreadEventStore {
     user_message_ids: HashSet<String>,
     pending_interactive_replay: PendingInteractiveReplayState,
     input_state: Option<ThreadInputState>,
+    prompt_gc_active: bool,
+    prompt_gc_token_usage_info: Option<TokenUsageInfo>,
+    prompt_gc_completion_pending: bool,
+    prompt_gc_visible_token_count_seen: bool,
     capacity: usize,
     active: bool,
 }
@@ -419,6 +430,10 @@ impl ThreadEventStore {
             user_message_ids: HashSet::new(),
             pending_interactive_replay: PendingInteractiveReplayState::default(),
             input_state: None,
+            prompt_gc_active: false,
+            prompt_gc_token_usage_info: None,
+            prompt_gc_completion_pending: false,
+            prompt_gc_visible_token_count_seen: false,
             capacity,
             active: false,
         }
@@ -436,6 +451,17 @@ impl ThreadEventStore {
             EventMsg::SessionConfigured(_) => {
                 self.session_configured = Some(event);
                 return;
+            }
+            EventMsg::TokenCount(_) => {
+                self.prompt_gc_token_usage_info = None;
+                if self.prompt_gc_completion_pending {
+                    self.prompt_gc_visible_token_count_seen = true;
+                }
+            }
+            EventMsg::TurnStarted(_) => {
+                self.prompt_gc_token_usage_info = None;
+                self.prompt_gc_completion_pending = false;
+                self.prompt_gc_visible_token_count_seen = false;
             }
             EventMsg::ItemCompleted(completed) => {
                 if let TurnItem::UserMessage(item) = &completed.item {
@@ -489,6 +515,8 @@ impl ThreadEventStore {
                 .cloned()
                 .collect(),
             input_state: self.input_state.clone(),
+            prompt_gc_active: self.prompt_gc_active,
+            prompt_gc_token_usage_info: self.prompt_gc_token_usage_info.clone(),
         }
     }
 
@@ -838,6 +866,8 @@ pub(crate) struct App {
     active_thread_rx: Option<mpsc::Receiver<Event>>,
     primary_thread_id: Option<ThreadId>,
     primary_session_configured: Option<SessionConfiguredEvent>,
+    primary_prompt_gc_completion_pending: bool,
+    primary_prompt_gc_visible_token_count_seen: bool,
     pending_primary_events: VecDeque<Event>,
     accounts_status_cache_expires_at: Option<DateTime<Utc>>,
     accounts_status_cache_last_updated_at: Option<DateTime<Utc>>,
@@ -1068,7 +1098,7 @@ impl App {
             self.open_accounts_popup_when_cache_ready = true;
         }
 
-        // Merge anchor: `/accounts` UX depends on this refresh gate to avoid stale account
+        // Merge-safety anchor: `/accounts` UX depends on this refresh gate to avoid stale account
         // usage data before `chat_widget.open_accounts_popup()`.
         if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
             self.pending_forced_accounts_status_refresh = false;
@@ -1895,10 +1925,119 @@ impl App {
             self.handle_codex_event_replay(event);
         }
         self.chat_widget.set_queue_autosend_suppressed(false);
+        if let Some(token_usage_info) = snapshot.prompt_gc_token_usage_info {
+            self.chat_widget
+                .replay_prompt_gc_context_usage_info(token_usage_info);
+        }
+        self.chat_widget
+            .set_prompt_gc_activity(snapshot.prompt_gc_active);
         if resume_restored_queue {
             self.chat_widget.maybe_send_next_queued_input();
         }
         self.refresh_status_line();
+    }
+
+    async fn set_thread_prompt_gc_activity(&mut self, thread_id: ThreadId, active: bool) {
+        if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+            let mut store = channel.store.lock().await;
+            store.prompt_gc_active = active;
+            if active {
+                store.prompt_gc_token_usage_info = None;
+                store.prompt_gc_completion_pending = true;
+                store.prompt_gc_visible_token_count_seen = false;
+            }
+        }
+        if self.active_thread_id == Some(thread_id) {
+            self.chat_widget.set_prompt_gc_activity(active);
+            self.refresh_status_line();
+        }
+    }
+
+    // Merge-safety anchor: per-thread prompt-GC usage refresh must stay replayable in the TUI so
+    // thread switches preserve reclaimed-context indicators without injecting protocol TokenCount.
+    async fn set_thread_prompt_gc_context_usage(
+        &mut self,
+        thread_id: ThreadId,
+        token_usage_info: Option<TokenUsageInfo>,
+    ) {
+        let mut active_thread_token_usage_info = None;
+        let mut clear_active_thread_token_usage_info = false;
+        if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+            let mut store = channel.store.lock().await;
+            // Late thread attachment seeds one idle prompt-GC snapshot before any thread events
+            // arrive. After the thread crosses a visible turn/token boundary, only an in-flight
+            // prompt-GC cycle may refresh this private usage state again.
+            let allow_idle_bootstrap = !store.prompt_gc_completion_pending
+                && !store.prompt_gc_visible_token_count_seen
+                && store.prompt_gc_token_usage_info.is_none()
+                && store.buffer.is_empty();
+            let should_accept = !store.prompt_gc_visible_token_count_seen
+                && (store.prompt_gc_completion_pending || allow_idle_bootstrap);
+            if should_accept {
+                if let Some(token_usage_info) = token_usage_info {
+                    store.prompt_gc_token_usage_info = Some(token_usage_info.clone());
+                    if self.active_thread_id == Some(thread_id) {
+                        active_thread_token_usage_info = Some(token_usage_info);
+                    }
+                } else {
+                    store.prompt_gc_token_usage_info = None;
+                    clear_active_thread_token_usage_info = self.active_thread_id == Some(thread_id);
+                }
+            }
+            if store.prompt_gc_completion_pending {
+                store.prompt_gc_completion_pending = false;
+            }
+        }
+        if let Some(token_usage_info) = active_thread_token_usage_info {
+            self.chat_widget
+                .refresh_prompt_gc_context_usage_info(token_usage_info);
+            self.refresh_status_line();
+        } else if clear_active_thread_token_usage_info {
+            self.chat_widget
+                .clear_prompt_gc_private_context_usage_info();
+            self.refresh_status_line();
+        }
+    }
+
+    async fn set_primary_prompt_gc_activity(&mut self, active: bool) {
+        if let Some(thread_id) = self.primary_thread_id {
+            self.set_thread_prompt_gc_activity(thread_id, active).await;
+        } else {
+            if active {
+                self.primary_prompt_gc_completion_pending = true;
+                self.primary_prompt_gc_visible_token_count_seen = false;
+            }
+            self.chat_widget.set_prompt_gc_activity(active);
+            self.refresh_status_line();
+        }
+    }
+
+    async fn set_primary_prompt_gc_context_usage(
+        &mut self,
+        token_usage_info: Option<TokenUsageInfo>,
+    ) {
+        if let Some(thread_id) = self.primary_thread_id {
+            self.set_thread_prompt_gc_context_usage(thread_id, token_usage_info)
+                .await;
+        } else {
+            let should_accept = self.primary_prompt_gc_completion_pending
+                && !self.primary_prompt_gc_visible_token_count_seen;
+            if self.primary_prompt_gc_completion_pending {
+                self.primary_prompt_gc_completion_pending = false;
+            }
+            if !should_accept {
+                return;
+            }
+            if let Some(token_usage_info) = token_usage_info {
+                self.chat_widget
+                    .refresh_prompt_gc_context_usage_info(token_usage_info);
+                self.refresh_status_line();
+            } else {
+                self.chat_widget
+                    .clear_prompt_gc_private_context_usage_info();
+                self.refresh_status_line();
+            }
+        }
     }
 
     fn should_wait_for_initial_session(session_selection: &SessionSelection) -> bool {
@@ -2163,6 +2302,8 @@ impl App {
             active_thread_rx: None,
             primary_thread_id: None,
             primary_session_configured: None,
+            primary_prompt_gc_completion_pending: false,
+            primary_prompt_gc_visible_token_count_seen: false,
             pending_primary_events: VecDeque::new(),
             accounts_status_cache_expires_at: None,
             accounts_status_cache_last_updated_at: None,
@@ -2584,8 +2725,25 @@ impl App {
             AppEvent::CodexEvent(event) => {
                 self.enqueue_primary_event(event).await?;
             }
+            AppEvent::PromptGcActivity { active } => {
+                self.set_primary_prompt_gc_activity(active).await;
+            }
+            AppEvent::PromptGcContextUsageUpdated { token_usage_info } => {
+                self.set_primary_prompt_gc_context_usage(token_usage_info)
+                    .await;
+            }
             AppEvent::ThreadEvent { thread_id, event } => {
                 self.handle_routed_thread_event(thread_id, event).await?;
+            }
+            AppEvent::ThreadPromptGcActivity { thread_id, active } => {
+                self.set_thread_prompt_gc_activity(thread_id, active).await;
+            }
+            AppEvent::ThreadPromptGcContextUsageUpdated {
+                thread_id,
+                token_usage_info,
+            } => {
+                self.set_thread_prompt_gc_context_usage(thread_id, token_usage_info)
+                    .await;
             }
             AppEvent::Exit(mode) => {
                 return Ok(self.handle_exit_mode(mode));
@@ -3869,6 +4027,16 @@ impl App {
             let errors = errors_for_cwd(&cwd, response);
             emit_skill_load_warnings(&self.app_event_tx, &errors);
         }
+        if self.primary_thread_id.is_none()
+            && matches!(event.msg, EventMsg::TokenCount(_))
+            && self.primary_prompt_gc_completion_pending
+        {
+            self.primary_prompt_gc_visible_token_count_seen = true;
+        }
+        if self.primary_thread_id.is_none() && matches!(event.msg, EventMsg::TurnStarted(_)) {
+            self.primary_prompt_gc_completion_pending = false;
+            self.primary_prompt_gc_visible_token_count_seen = false;
+        }
         self.handle_backtrack_event(&event.msg);
         self.chat_widget.handle_codex_event(event);
 
@@ -3976,16 +4144,7 @@ impl App {
         let app_event_tx = self.app_event_tx.clone();
         self.thread_event_channels.insert(thread_id, channel);
         let listener_handle = tokio::spawn(async move {
-            loop {
-                let event = match thread.next_event().await {
-                    Ok(event) => event,
-                    Err(err) => {
-                        tracing::debug!("external thread {thread_id} listener stopped: {err}");
-                        break;
-                    }
-                };
-                app_event_tx.send(AppEvent::ThreadEvent { thread_id, event });
-            }
+            forward_thread_runtime(thread, app_event_tx, Some(thread_id), true).await;
         });
         self.thread_event_listener_tasks
             .insert(thread_id, listener_handle);
@@ -4260,6 +4419,8 @@ mod tests {
     use crate::history_cell::HistoryCell;
     use crate::history_cell::UserHistoryCell;
     use crate::history_cell::new_session_info;
+    use crate::status_indicator_widget::STATUS_DETAILS_DEFAULT_MAX_LINES;
+    use crate::status_indicator_widget::StatusDetailsCapitalization;
     use assert_matches::assert_matches;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -4290,11 +4451,14 @@ mod tests {
     use codex_protocol::protocol::SessionConfiguredEvent;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadRolledBackEvent;
+    use codex_protocol::protocol::TokenCountEvent;
+    use codex_protocol::protocol::TokenUsageInfo;
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
     use codex_protocol::protocol::TurnCompleteEvent;
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
+    use codex_protocol::protocol::WarningEvent;
     use codex_protocol::user_input::TextElement;
     use codex_protocol::user_input::UserInput;
     use crossterm::event::KeyModifiers;
@@ -4759,6 +4923,878 @@ mod tests {
         }
     }
 
+    #[test]
+    fn thread_event_store_snapshot_carries_prompt_gc_activity_outside_event_buffer() {
+        let mut store = ThreadEventStore::new(8);
+        store.prompt_gc_active = true;
+
+        let snapshot = store.snapshot();
+        assert!(snapshot.events.is_empty());
+        assert!(snapshot.prompt_gc_active);
+        assert_eq!(snapshot.prompt_gc_token_usage_info, None);
+    }
+
+    #[test]
+    fn thread_event_store_snapshot_carries_prompt_gc_token_usage_info_outside_event_buffer() {
+        let mut store = ThreadEventStore::new(8);
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 40_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+        store.prompt_gc_token_usage_info = Some(token_usage_info.clone());
+
+        let snapshot = store.snapshot();
+        assert!(snapshot.events.is_empty());
+        assert_eq!(snapshot.prompt_gc_token_usage_info, Some(token_usage_info));
+    }
+
+    #[test]
+    fn thread_event_store_clears_prompt_gc_token_usage_info_on_visible_token_count() {
+        let mut store = ThreadEventStore::new(8);
+        store.prompt_gc_completion_pending = true;
+        store.prompt_gc_token_usage_info = Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 50_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        });
+
+        store.push_event(Event {
+            id: "token-count".to_string(),
+            msg: EventMsg::TokenCount(TokenCountEvent {
+                info: None,
+                rate_limits: None,
+            }),
+        });
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.prompt_gc_token_usage_info, None);
+        assert!(store.prompt_gc_visible_token_count_seen);
+    }
+
+    #[tokio::test]
+    async fn thread_event_store_clears_prompt_gc_token_usage_info_on_turn_started() {
+        let mut store = ThreadEventStore::new(8);
+        store.prompt_gc_completion_pending = true;
+        store.prompt_gc_visible_token_count_seen = true;
+        store.prompt_gc_token_usage_info = Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 50_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        });
+
+        store.push_event(Event {
+            id: "turn-started".to_string(),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-2".to_string(),
+                model_context_window: Some(13_000),
+                collaboration_mode_kind: Default::default(),
+            }),
+        });
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.prompt_gc_token_usage_info, None);
+        assert!(!store.prompt_gc_completion_pending);
+        assert!(!store.prompt_gc_visible_token_count_seen);
+    }
+
+    #[tokio::test]
+    async fn primary_prompt_gc_activity_updates_primary_store_without_touching_inactive_widget() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let primary_thread_id = ThreadId::new();
+        let active_thread_id = ThreadId::new();
+        app.ensure_thread_channel(primary_thread_id);
+        app.ensure_thread_channel(active_thread_id);
+        app.primary_thread_id = Some(primary_thread_id);
+        app.active_thread_id = Some(active_thread_id);
+
+        app.set_primary_prompt_gc_activity(true).await;
+
+        let primary_active = {
+            let channel = app
+                .thread_event_channels
+                .get(&primary_thread_id)
+                .expect("primary thread channel should exist");
+            let store = channel.store.lock().await;
+            store.prompt_gc_active
+        };
+        assert!(primary_active);
+        assert!(!app.chat_widget.prompt_gc_active_for_test());
+    }
+
+    #[tokio::test]
+    async fn primary_prompt_gc_context_usage_updates_primary_store_without_touching_inactive_widget()
+     {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let primary_thread_id = ThreadId::new();
+        let active_thread_id = ThreadId::new();
+        let last_token_usage = TokenUsage {
+            total_tokens: 12_400,
+            ..TokenUsage::default()
+        };
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 1_200_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: last_token_usage.clone(),
+            model_context_window: Some(13_000),
+        };
+        app.ensure_thread_channel(primary_thread_id);
+        app.ensure_thread_channel(active_thread_id);
+        app.primary_thread_id = Some(primary_thread_id);
+        app.active_thread_id = Some(active_thread_id);
+        app.set_primary_prompt_gc_activity(true).await;
+        app.set_primary_prompt_gc_activity(false).await;
+
+        app.set_primary_prompt_gc_context_usage(Some(token_usage_info.clone()))
+            .await;
+
+        let primary_usage = {
+            let channel = app
+                .thread_event_channels
+                .get(&primary_thread_id)
+                .expect("primary thread channel should exist");
+            let store = channel.store.lock().await;
+            store.prompt_gc_token_usage_info.clone()
+        };
+        assert_eq!(primary_usage, Some(token_usage_info));
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), None);
+    }
+
+    #[tokio::test]
+    async fn primary_turn_started_clears_stale_prompt_gc_context_usage_before_visible_token_count()
+    {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+        app.chat_widget
+            .setup_status_line(vec![crate::bottom_pane::StatusLineItem::ContextRemaining]);
+        app.set_primary_prompt_gc_activity(true).await;
+        app.set_primary_prompt_gc_activity(false).await;
+
+        app.set_primary_prompt_gc_context_usage(Some(token_usage_info))
+            .await;
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(60));
+
+        app.handle_codex_event_now(Event {
+            id: "turn-started".to_string(),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-2".to_string(),
+                model_context_window: Some(13_000),
+                collaboration_mode_kind: Default::default(),
+            }),
+        });
+
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(100));
+        assert_eq!(app.chat_widget.token_usage(), TokenUsage::default());
+    }
+
+    #[tokio::test]
+    async fn thread_prompt_gc_activity_updates_active_thread_store_and_widget() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let thread_id = ThreadId::new();
+        app.ensure_thread_channel(thread_id);
+        app.active_thread_id = Some(thread_id);
+
+        app.set_thread_prompt_gc_activity(thread_id, true).await;
+
+        let store_active = {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("thread channel should exist");
+            let store = channel.store.lock().await;
+            store.prompt_gc_active
+        };
+        assert!(store_active);
+        assert!(app.chat_widget.prompt_gc_active_for_test());
+
+        app.set_thread_prompt_gc_activity(thread_id, false).await;
+
+        let store_active = {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("thread channel should exist");
+            let store = channel.store.lock().await;
+            store.prompt_gc_active
+        };
+        assert!(!store_active);
+        assert!(!app.chat_widget.prompt_gc_active_for_test());
+    }
+
+    #[tokio::test]
+    async fn thread_prompt_gc_activity_clears_stale_prompt_gc_snapshot_for_new_cycle() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let thread_id = ThreadId::new();
+        app.ensure_thread_channel(thread_id);
+
+        {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("thread channel should exist");
+            let mut store = channel.store.lock().await;
+            store.prompt_gc_token_usage_info = Some(TokenUsageInfo {
+                total_token_usage: TokenUsage {
+                    total_tokens: 950_000,
+                    ..TokenUsage::default()
+                },
+                last_token_usage: TokenUsage {
+                    total_tokens: 12_400,
+                    ..TokenUsage::default()
+                },
+                model_context_window: Some(13_000),
+            });
+        }
+
+        app.set_thread_prompt_gc_activity(thread_id, true).await;
+
+        let snapshot = {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("thread channel should exist");
+            let store = channel.store.lock().await;
+            assert_eq!(store.prompt_gc_token_usage_info, None);
+            assert!(store.prompt_gc_completion_pending);
+            assert!(!store.prompt_gc_visible_token_count_seen);
+            store.snapshot()
+        };
+
+        assert_eq!(snapshot.prompt_gc_token_usage_info, None);
+        assert!(snapshot.prompt_gc_active);
+    }
+
+    #[tokio::test]
+    async fn thread_prompt_gc_second_cycle_start_clears_private_status_line() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let thread_id = ThreadId::new();
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+
+        app.chat_widget
+            .setup_status_line(vec![crate::bottom_pane::StatusLineItem::ContextRemaining]);
+        app.ensure_thread_channel(thread_id);
+        app.active_thread_id = Some(thread_id);
+        app.set_thread_prompt_gc_activity(thread_id, true).await;
+        app.set_thread_prompt_gc_activity(thread_id, false).await;
+        app.set_thread_prompt_gc_context_usage(thread_id, Some(token_usage_info))
+            .await;
+        assert_eq!(app.chat_widget.status_line_text(), Some("60% left".into()));
+
+        app.set_thread_prompt_gc_activity(thread_id, true).await;
+
+        let status_line = app.chat_widget.status_line_text().unwrap_or_default();
+        assert!(
+            !status_line.contains("60% left"),
+            "expected second cycle start to clear stale prompt-GC status line, got {status_line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_turn_started_clears_stale_prompt_gc_context_usage_before_visible_token_count()
+    -> Result<()> {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let thread_id = ThreadId::new();
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+        app.chat_widget
+            .setup_status_line(vec![crate::bottom_pane::StatusLineItem::ContextRemaining]);
+        app.ensure_thread_channel(thread_id);
+        app.active_thread_id = Some(thread_id);
+        app.set_thread_active(thread_id, true).await;
+        app.set_thread_prompt_gc_activity(thread_id, true).await;
+        app.set_thread_prompt_gc_activity(thread_id, false).await;
+
+        app.set_thread_prompt_gc_context_usage(thread_id, Some(token_usage_info))
+            .await;
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(60));
+
+        let turn_started_event = Event {
+            id: "turn-started".to_string(),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-2".to_string(),
+                model_context_window: Some(13_000),
+                collaboration_mode_kind: Default::default(),
+            }),
+        };
+        {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("thread channel should exist");
+            let mut store = channel.store.lock().await;
+            store.push_event(turn_started_event.clone());
+        }
+        app.handle_codex_event_now(turn_started_event);
+
+        let store = app
+            .thread_event_channels
+            .get(&thread_id)
+            .expect("thread channel should exist")
+            .store
+            .lock()
+            .await;
+        assert_eq!(store.prompt_gc_token_usage_info, None);
+        drop(store);
+
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(100));
+        assert_eq!(app.chat_widget.token_usage(), TokenUsage::default());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_prompt_gc_context_usage_updates_active_thread_store_and_widget() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let thread_id = ThreadId::new();
+        let last_token_usage = TokenUsage {
+            total_tokens: 12_400,
+            ..TokenUsage::default()
+        };
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: last_token_usage.clone(),
+            model_context_window: Some(13_000),
+        };
+        app.ensure_thread_channel(thread_id);
+        app.active_thread_id = Some(thread_id);
+        app.handle_codex_event_now(Event {
+            id: "turn-started".to_string(),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-1".to_string(),
+                model_context_window: Some(13_000),
+                collaboration_mode_kind: Default::default(),
+            }),
+        });
+        app.set_thread_prompt_gc_activity(thread_id, true).await;
+        app.set_thread_prompt_gc_activity(thread_id, false).await;
+
+        app.set_thread_prompt_gc_context_usage(thread_id, Some(token_usage_info.clone()))
+            .await;
+
+        let store_usage = {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("thread channel should exist");
+            let store = channel.store.lock().await;
+            store.prompt_gc_token_usage_info.clone()
+        };
+        assert_eq!(store_usage, Some(token_usage_info));
+        let status_line = app
+            .chat_widget
+            .status_line_text()
+            .expect("status line should be present");
+        assert!(
+            status_line.contains("60% left"),
+            "expected prompt-GC status line to include context-left, got: {status_line}"
+        );
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(60));
+        assert_eq!(
+            app.chat_widget.token_usage(),
+            TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_prompt_gc_none_context_usage_clears_active_widget() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let thread_id = ThreadId::new();
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+
+        app.ensure_thread_channel(thread_id);
+        app.active_thread_id = Some(thread_id);
+        app.set_thread_prompt_gc_activity(thread_id, true).await;
+        app.set_thread_prompt_gc_activity(thread_id, false).await;
+        app.set_thread_prompt_gc_context_usage(thread_id, Some(token_usage_info))
+            .await;
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(60));
+
+        app.set_thread_prompt_gc_activity(thread_id, true).await;
+        app.set_thread_prompt_gc_activity(thread_id, false).await;
+        app.set_thread_prompt_gc_context_usage(thread_id, None)
+            .await;
+
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), None);
+        assert_eq!(app.chat_widget.token_usage(), TokenUsage::default());
+    }
+
+    #[tokio::test]
+    async fn thread_prompt_gc_context_usage_bootstrap_updates_inactive_thread_store() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let thread_id = ThreadId::new();
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+
+        app.ensure_thread_channel(thread_id);
+
+        app.set_thread_prompt_gc_context_usage(thread_id, Some(token_usage_info.clone()))
+            .await;
+
+        let store_usage = {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("thread channel should exist");
+            let store = channel.store.lock().await;
+            store.prompt_gc_token_usage_info.clone()
+        };
+        assert_eq!(store_usage, Some(token_usage_info));
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), None);
+    }
+
+    #[tokio::test]
+    async fn thread_prompt_gc_context_usage_update_is_ignored_after_turn_started_boundary_without_new_cycle()
+    -> Result<()> {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let thread_id = ThreadId::new();
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+
+        app.ensure_thread_channel(thread_id);
+        app.active_thread_id = Some(thread_id);
+        app.set_thread_active(thread_id, true).await;
+        app.set_thread_prompt_gc_activity(thread_id, true).await;
+        app.set_thread_prompt_gc_activity(thread_id, false).await;
+        app.set_thread_prompt_gc_context_usage(thread_id, Some(token_usage_info))
+            .await;
+
+        let turn_started_event = Event {
+            id: "turn-started".to_string(),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-2".to_string(),
+                model_context_window: Some(13_000),
+                collaboration_mode_kind: Default::default(),
+            }),
+        };
+        {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("thread channel should exist");
+            let mut store = channel.store.lock().await;
+            store.push_event(turn_started_event.clone());
+        }
+        app.handle_codex_event_now(turn_started_event);
+
+        app.set_thread_prompt_gc_context_usage(
+            thread_id,
+            Some(TokenUsageInfo {
+                total_token_usage: TokenUsage {
+                    total_tokens: 970_000,
+                    ..TokenUsage::default()
+                },
+                last_token_usage: TokenUsage {
+                    total_tokens: 12_500,
+                    ..TokenUsage::default()
+                },
+                model_context_window: Some(13_000),
+            }),
+        )
+        .await;
+
+        let store_usage = {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("thread channel should exist");
+            let store = channel.store.lock().await;
+            store.prompt_gc_token_usage_info.clone()
+        };
+        assert_eq!(store_usage, None);
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(100));
+        assert_eq!(app.chat_widget.token_usage(), TokenUsage::default());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn primary_prompt_gc_context_usage_is_suppressed_after_visible_token_count() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let visible_token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 70_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_600,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+        let late_prompt_gc_token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+
+        app.set_primary_prompt_gc_activity(true).await;
+        app.set_primary_prompt_gc_activity(false).await;
+        app.handle_codex_event_now(Event {
+            id: "token-count".to_string(),
+            msg: EventMsg::TokenCount(TokenCountEvent {
+                info: Some(visible_token_usage_info.clone()),
+                rate_limits: None,
+            }),
+        });
+
+        app.set_primary_prompt_gc_context_usage(Some(late_prompt_gc_token_usage_info))
+            .await;
+
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(40));
+        assert_eq!(
+            app.chat_widget.token_usage(),
+            visible_token_usage_info.total_token_usage
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_prompt_gc_none_context_usage_clears_active_widget() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+
+        app.set_primary_prompt_gc_activity(true).await;
+        app.set_primary_prompt_gc_activity(false).await;
+        app.set_primary_prompt_gc_context_usage(Some(token_usage_info))
+            .await;
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(60));
+
+        app.set_primary_prompt_gc_activity(true).await;
+        app.set_primary_prompt_gc_activity(false).await;
+        app.set_primary_prompt_gc_context_usage(None).await;
+
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), None);
+        assert_eq!(app.chat_widget.token_usage(), TokenUsage::default());
+    }
+
+    #[tokio::test]
+    async fn primary_prompt_gc_second_cycle_start_clears_private_status_line() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+
+        app.chat_widget
+            .setup_status_line(vec![crate::bottom_pane::StatusLineItem::ContextRemaining]);
+        app.set_primary_prompt_gc_activity(true).await;
+        app.set_primary_prompt_gc_activity(false).await;
+        app.set_primary_prompt_gc_context_usage(Some(token_usage_info))
+            .await;
+        assert_eq!(app.chat_widget.status_line_text(), Some("60% left".into()));
+
+        app.set_primary_prompt_gc_activity(true).await;
+
+        let status_line = app.chat_widget.status_line_text().unwrap_or_default();
+        assert!(
+            !status_line.contains("60% left"),
+            "expected second cycle start to clear stale primary prompt-GC status line, got {status_line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_prompt_gc_context_usage_is_suppressed_after_visible_token_count() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let thread_id = ThreadId::new();
+        let visible_token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 70_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_600,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+        let late_prompt_gc_token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+        let token_count_event = Event {
+            id: "token-count".to_string(),
+            msg: EventMsg::TokenCount(TokenCountEvent {
+                info: Some(visible_token_usage_info.clone()),
+                rate_limits: None,
+            }),
+        };
+
+        app.ensure_thread_channel(thread_id);
+        app.active_thread_id = Some(thread_id);
+        app.set_thread_prompt_gc_activity(thread_id, true).await;
+        app.set_thread_prompt_gc_activity(thread_id, false).await;
+
+        {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("thread channel should exist");
+            let mut store = channel.store.lock().await;
+            store.push_event(token_count_event.clone());
+        }
+        app.handle_codex_event_now(token_count_event);
+
+        app.set_thread_prompt_gc_context_usage(thread_id, Some(late_prompt_gc_token_usage_info))
+            .await;
+
+        let store_usage = {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("thread channel should exist");
+            let store = channel.store.lock().await;
+            store.prompt_gc_token_usage_info.clone()
+        };
+        assert_eq!(store_usage, None);
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(40));
+        assert_eq!(
+            app.chat_widget.token_usage(),
+            visible_token_usage_info.total_token_usage
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_thread_snapshot_restores_prompt_gc_activity() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        app.chat_widget.ensure_status_indicator_for_test();
+        app.chat_widget.update_status_for_test(
+            "Waiting for terminal".to_string(),
+            Some("sleep 5".to_string()),
+            StatusDetailsCapitalization::Preserve,
+            STATUS_DETAILS_DEFAULT_MAX_LINES,
+        );
+        app.chat_widget.hide_status_indicator_for_test();
+
+        app.replay_thread_snapshot(
+            ThreadEventSnapshot {
+                session_configured: None,
+                events: Vec::new(),
+                input_state: None,
+                prompt_gc_active: true,
+                prompt_gc_token_usage_info: None,
+            },
+            false,
+        );
+
+        assert!(app.chat_widget.prompt_gc_active_for_test());
+        assert!(app.chat_widget.status_indicator_visible_for_test());
+    }
+
+    #[tokio::test]
+    async fn replay_thread_snapshot_restores_prompt_gc_context_usage() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+        app.replay_thread_snapshot(
+            ThreadEventSnapshot {
+                session_configured: None,
+                events: vec![Event {
+                    id: "turn-started".to_string(),
+                    msg: EventMsg::TurnStarted(TurnStartedEvent {
+                        turn_id: "turn-1".to_string(),
+                        model_context_window: Some(13_000),
+                        collaboration_mode_kind: Default::default(),
+                    }),
+                }],
+                input_state: None,
+                prompt_gc_active: false,
+                prompt_gc_token_usage_info: Some(TokenUsageInfo {
+                    total_token_usage: TokenUsage {
+                        total_tokens: 950_000,
+                        ..TokenUsage::default()
+                    },
+                    last_token_usage: TokenUsage {
+                        total_tokens: 12_400,
+                        ..TokenUsage::default()
+                    },
+                    model_context_window: Some(13_000),
+                }),
+            },
+            false,
+        );
+
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(60));
+        assert_eq!(
+            app.chat_widget.token_usage(),
+            TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_thread_snapshot_restores_prompt_gc_context_usage_without_retained_turn_started()
+    {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        app.chat_widget
+            .setup_status_line(vec![crate::bottom_pane::StatusLineItem::ContextRemaining]);
+        app.handle_codex_event_now(Event {
+            id: "current-turn-started".to_string(),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "current-turn".to_string(),
+                model_context_window: Some(950_000),
+                collaboration_mode_kind: Default::default(),
+            }),
+        });
+
+        let mut store = ThreadEventStore::new(1);
+        store.push_event(Event {
+            id: "replayed-turn-started".to_string(),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-1".to_string(),
+                model_context_window: Some(13_000),
+                collaboration_mode_kind: Default::default(),
+            }),
+        });
+        store.push_event(Event {
+            id: "warning".to_string(),
+            msg: EventMsg::Warning(WarningEvent {
+                message: "turn started evicted".to_string(),
+            }),
+        });
+        store.prompt_gc_token_usage_info = Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        });
+
+        let snapshot = store.snapshot();
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .all(|event| !matches!(event.msg, EventMsg::TurnStarted(_)))
+        );
+
+        app.replay_thread_snapshot(snapshot, false);
+
+        assert_eq!(app.chat_widget.status_line_text(), Some("60% left".into()));
+        assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(60));
+        assert_eq!(
+            app.chat_widget.token_usage(),
+            TokenUsage {
+                total_tokens: 950_000,
+                ..TokenUsage::default()
+            }
+        );
+    }
+
     #[tokio::test]
     async fn replayed_turn_complete_submits_restored_queued_follow_up() {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
@@ -4824,6 +5860,8 @@ mod tests {
                     }),
                 }],
                 input_state: Some(input_state),
+                prompt_gc_active: false,
+                prompt_gc_token_usage_info: None,
             },
             true,
         );
@@ -4906,6 +5944,8 @@ mod tests {
                     }),
                 }],
                 input_state: Some(input_state),
+                prompt_gc_active: false,
+                prompt_gc_token_usage_info: None,
             },
             false,
         );
@@ -4980,6 +6020,8 @@ mod tests {
                 session_configured: None,
                 events: vec![],
                 input_state: Some(input_state),
+                prompt_gc_active: false,
+                prompt_gc_token_usage_info: None,
             },
             true,
         );
@@ -5070,6 +6112,8 @@ mod tests {
                     },
                 ],
                 input_state: Some(input_state),
+                prompt_gc_active: false,
+                prompt_gc_token_usage_info: None,
             },
             true,
         );
@@ -5240,6 +6284,8 @@ mod tests {
                 session_configured: None,
                 events: vec![],
                 input_state: Some(input_state),
+                prompt_gc_active: false,
+                prompt_gc_token_usage_info: None,
             },
             true,
         );
@@ -5340,6 +6386,8 @@ mod tests {
                 session_configured: None,
                 events: vec![],
                 input_state: Some(input_state),
+                prompt_gc_active: false,
+                prompt_gc_token_usage_info: None,
             },
             true,
         );
@@ -5421,6 +6469,8 @@ mod tests {
                     }),
                 }],
                 input_state: Some(input_state),
+                prompt_gc_active: false,
+                prompt_gc_token_usage_info: None,
             },
             true,
         );
@@ -6068,6 +7118,8 @@ mod tests {
             active_thread_rx: None,
             primary_thread_id: None,
             primary_session_configured: None,
+            primary_prompt_gc_completion_pending: false,
+            primary_prompt_gc_visible_token_count_seen: false,
             pending_primary_events: VecDeque::new(),
             accounts_status_cache_expires_at: None,
             accounts_status_cache_last_updated_at: None,
@@ -6133,6 +7185,8 @@ mod tests {
                 active_thread_rx: None,
                 primary_thread_id: None,
                 primary_session_configured: None,
+                primary_prompt_gc_completion_pending: false,
+                primary_prompt_gc_visible_token_count_seen: false,
                 pending_primary_events: VecDeque::new(),
                 accounts_status_cache_expires_at: None,
                 accounts_status_cache_last_updated_at: None,

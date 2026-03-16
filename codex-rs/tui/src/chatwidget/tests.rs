@@ -1771,6 +1771,195 @@ async fn turn_started_uses_runtime_context_window_before_first_token_count() {
     );
 }
 
+#[tokio::test]
+async fn replay_prompt_gc_context_usage_info_uses_model_context_window_before_config_fallback() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
+    chat.config.model_context_window = Some(1_000_000);
+    chat.setup_status_line(vec![
+        crate::bottom_pane::StatusLineItem::ContextRemaining,
+        crate::bottom_pane::StatusLineItem::ContextWindowSize,
+    ]);
+
+    chat.replay_prompt_gc_context_usage_info(TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 950_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 12_400,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(13_000),
+    });
+
+    assert_eq!(
+        chat.status_line_value_for_item(&crate::bottom_pane::StatusLineItem::ContextRemaining),
+        Some("60% left".to_string())
+    );
+    assert_eq!(
+        chat.status_line_value_for_item(&crate::bottom_pane::StatusLineItem::ContextWindowSize),
+        Some("13K window".to_string())
+    );
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(60));
+    assert_eq!(chat.token_usage().total_tokens, 950_000);
+}
+
+#[tokio::test]
+async fn turn_started_clears_prompt_gc_private_usage_and_starts_fresh_window() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.replay_prompt_gc_context_usage_info(TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 950_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 12_400,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(13_000),
+    });
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(60));
+
+    chat.handle_codex_event(Event {
+        id: "turn-start".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-2".to_string(),
+            model_context_window: Some(13_000),
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(100));
+    assert_eq!(chat.token_usage(), TokenUsage::default());
+}
+
+#[tokio::test]
+async fn turn_started_without_window_clears_prompt_gc_private_usage() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.replay_prompt_gc_context_usage_info(TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 950_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 12_400,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(13_000),
+    });
+
+    chat.handle_codex_event(Event {
+        id: "turn-start".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-2".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+
+    assert_eq!(chat.bottom_pane.context_window_percent(), None);
+    assert_eq!(chat.bottom_pane.context_window_used_tokens(), None);
+    assert_eq!(chat.token_usage(), TokenUsage::default());
+}
+
+#[tokio::test]
+async fn turn_started_keeps_visible_usage_when_token_info_is_not_prompt_gc_private() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "token-usage".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(TokenUsageInfo {
+                total_token_usage: TokenUsage {
+                    total_tokens: 70_000,
+                    ..TokenUsage::default()
+                },
+                last_token_usage: TokenUsage {
+                    total_tokens: 12_600,
+                    ..TokenUsage::default()
+                },
+                model_context_window: Some(13_000),
+            }),
+            rate_limits: None,
+        }),
+    });
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(40));
+
+    chat.handle_codex_event(Event {
+        id: "turn-start".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-2".to_string(),
+            model_context_window: Some(950_000),
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(100));
+    assert_eq!(
+        chat.status_line_value_for_item(&crate::bottom_pane::StatusLineItem::ContextWindowSize),
+        Some("950K window".to_string())
+    );
+    assert_eq!(
+        chat.token_usage(),
+        TokenUsage {
+            total_tokens: 70_000,
+            ..TokenUsage::default()
+        }
+    );
+}
+
+#[tokio::test]
+async fn review_restore_preserves_prompt_gc_token_info_provenance() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.replay_prompt_gc_context_usage_info(TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 950_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 12_400,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(13_000),
+    });
+    chat.pre_review_token_info = Some(chat.token_info.clone());
+    chat.pre_review_token_info_is_prompt_gc_private = Some(chat.token_info_is_prompt_gc_private);
+
+    chat.handle_codex_event(Event {
+        id: "token-usage".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(TokenUsageInfo {
+                total_token_usage: TokenUsage {
+                    total_tokens: 70_000,
+                    ..TokenUsage::default()
+                },
+                last_token_usage: TokenUsage {
+                    total_tokens: 12_600,
+                    ..TokenUsage::default()
+                },
+                model_context_window: Some(13_000),
+            }),
+            rate_limits: None,
+        }),
+    });
+
+    chat.restore_pre_review_token_info();
+    chat.handle_codex_event(Event {
+        id: "turn-start".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-2".to_string(),
+            model_context_window: Some(13_000),
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(100));
+    assert_eq!(chat.token_usage(), TokenUsage::default());
+}
+
 #[cfg_attr(
     target_os = "macos",
     ignore = "system configuration APIs are blocked under macOS seatbelt"
@@ -1893,6 +2082,7 @@ async fn make_chatwidget_manual(
         session_header: SessionHeader::new(resolved_model.clone()),
         initial_user_message: None,
         token_info: None,
+        token_info_is_prompt_gc_private: false,
         rate_limit_snapshots_by_limit_id: BTreeMap::new(),
         plan_type: None,
         rate_limit_warnings: RateLimitWarningState::default(),
@@ -1940,6 +2130,7 @@ async fn make_chatwidget_manual(
         quit_shortcut_key: None,
         is_review_mode: false,
         pre_review_token_info: None,
+        pre_review_token_info_is_prompt_gc_private: None,
         needs_final_message_separator: false,
         had_work_activity: false,
         saw_plan_update_this_turn: false,
@@ -9301,6 +9492,145 @@ async fn background_event_updates_status_header() {
     assert!(chat.bottom_pane.status_indicator_visible());
     assert_eq!(chat.current_status_header, "Waiting for `vim`");
     assert!(drain_insert_history(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn prompt_gc_begin_restores_hidden_status_indicator_and_shows_badge() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_task_started();
+    chat.on_agent_message_delta("checkpoint".to_string());
+    assert!(!chat.bottom_pane.status_indicator_visible());
+
+    chat.set_prompt_gc_activity(true);
+
+    assert!(chat.bottom_pane.status_indicator_visible());
+    let header = render_bottom_first_row(&chat, 100);
+    assert!(
+        header.contains("prompt GC"),
+        "expected prompt GC badge in status row, got {header:?}"
+    );
+}
+
+#[tokio::test]
+async fn prompt_gc_begin_preserves_hidden_status_details() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_task_started();
+    chat.set_status(
+        "Waiting for terminal".to_string(),
+        Some("sleep 5".to_string()),
+        StatusDetailsCapitalization::Preserve,
+        STATUS_DETAILS_DEFAULT_MAX_LINES,
+    );
+    chat.on_agent_message_delta("checkpoint".to_string());
+    assert!(!chat.bottom_pane.status_indicator_visible());
+
+    chat.set_prompt_gc_activity(true);
+
+    assert!(chat.bottom_pane.status_indicator_visible());
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be restored");
+    assert_eq!(status.details(), Some("sleep 5"));
+}
+
+#[tokio::test]
+async fn prompt_gc_end_rehides_status_row_while_partial_stream_is_still_active() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_task_started();
+    chat.on_agent_message_delta("checkpoint".to_string());
+    assert!(!chat.bottom_pane.status_indicator_visible());
+
+    chat.set_prompt_gc_activity(true);
+    assert!(chat.bottom_pane.status_indicator_visible());
+
+    chat.set_prompt_gc_activity(false);
+    assert!(!chat.bottom_pane.status_indicator_visible());
+}
+
+#[tokio::test]
+async fn prompt_gc_end_clears_badge_from_status_row_without_losing_details() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_task_started();
+    chat.set_status(
+        "Waiting for terminal".to_string(),
+        Some("sleep 5".to_string()),
+        StatusDetailsCapitalization::Preserve,
+        STATUS_DETAILS_DEFAULT_MAX_LINES,
+    );
+    chat.bottom_pane
+        .set_unified_exec_processes(vec!["sleep 5".to_string()]);
+    chat.set_prompt_gc_activity(true);
+    let header = render_bottom_first_row(&chat, 120);
+    assert!(header.contains("prompt GC"));
+    assert!(header.contains("background terminal running"));
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should stay visible");
+    assert_eq!(status.details(), Some("sleep 5"));
+
+    chat.set_prompt_gc_activity(false);
+
+    drain_insert_history(&mut rx);
+    let header = render_bottom_first_row(&chat, 120);
+    assert!(
+        !header.contains("prompt GC"),
+        "expected prompt GC badge to clear after end event, got {header:?}"
+    );
+    assert!(
+        header.contains("background terminal running"),
+        "expected unrelated inline status to remain after prompt GC ends, got {header:?}"
+    );
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should stay visible");
+    assert_eq!(status.details(), Some("sleep 5"));
+}
+
+#[tokio::test]
+async fn prompt_gc_background_event_during_commentary_stream_rehides_status_on_commit_tick() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.on_task_started();
+    chat.on_agent_message_delta("checkpoint".to_string());
+    assert!(!chat.bottom_pane.status_indicator_visible());
+
+    chat.handle_codex_event(Event {
+        id: "bg-1".into(),
+        msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
+            message: "Waiting for `vim`".to_string(),
+        }),
+    });
+    assert!(chat.bottom_pane.status_indicator_visible());
+
+    chat.on_commit_tick();
+
+    assert!(!chat.bottom_pane.status_indicator_visible());
+}
+
+#[tokio::test]
+async fn prompt_gc_second_cycle_start_clears_private_usage_from_widget() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.replay_prompt_gc_context_usage_info(TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 950_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 12_400,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(13_000),
+    });
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(60));
+
+    chat.set_prompt_gc_activity(true);
+
+    assert_eq!(chat.bottom_pane.context_window_percent(), None);
+    assert_eq!(chat.bottom_pane.context_window_used_tokens(), None);
+    assert_eq!(chat.token_usage(), TokenUsage::default());
 }
 
 #[tokio::test]

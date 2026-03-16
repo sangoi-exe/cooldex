@@ -10,7 +10,7 @@ expression: snapshot
 
 • Waiting for Robie [explorer]
 
-• Finished waiting
+• Wait condition met (any final)
   └ Robie [explorer]: Completed - 39916800
     Bob [worker]: Error - tool timeout
     Alice [reviewer]: Running - Collecting references for the final report

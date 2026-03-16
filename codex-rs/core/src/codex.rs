@@ -236,6 +236,8 @@ use crate::protocol::ModelRerouteReason;
 use crate::protocol::NetworkApprovalContext;
 use crate::protocol::Op;
 use crate::protocol::PlanDeltaEvent;
+use crate::protocol::PromptGcCompactionMetadata;
+use crate::protocol::PromptGcOutcomeKind;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::ReasoningContentDeltaEvent;
 use crate::protocol::ReasoningRawContentDeltaEvent;
@@ -333,6 +335,8 @@ pub struct Codex {
     pub(crate) agent_status: watch::Receiver<AgentStatus>,
     // Last known activity of the agent.
     pub(crate) agent_last_activity: watch::Receiver<Option<CollabAgentActivity>>,
+    pub(crate) prompt_gc_active: watch::Receiver<bool>,
+    pub(crate) prompt_gc_activity_edges: tokio::sync::broadcast::Sender<bool>,
     pub(crate) session: Arc<Session>,
 }
 
@@ -528,6 +532,8 @@ impl Codex {
         let (agent_status_tx, agent_status_rx) = watch::channel(AgentStatus::PendingInit);
         let (agent_last_activity_tx, agent_last_activity_rx) =
             watch::channel::<Option<CollabAgentActivity>>(None);
+        let (prompt_gc_active_tx, prompt_gc_active_rx) = watch::channel(false);
+        let (prompt_gc_activity_edges, _) = tokio::sync::broadcast::channel(16);
 
         let session_init_span = info_span!("session_init");
         let session = Session::new(
@@ -539,6 +545,8 @@ impl Codex {
             tx_event.clone(),
             agent_status_tx.clone(),
             agent_last_activity_tx.clone(),
+            prompt_gc_active_tx,
+            prompt_gc_activity_edges.clone(),
             conversation_history,
             session_source_clone,
             skills_manager,
@@ -565,6 +573,8 @@ impl Codex {
             rx_event,
             agent_status: agent_status_rx,
             agent_last_activity: agent_last_activity_rx,
+            prompt_gc_active: prompt_gc_active_rx,
+            prompt_gc_activity_edges,
             session,
         };
 
@@ -638,6 +648,16 @@ impl Codex {
         self.agent_last_activity.borrow().clone()
     }
 
+    #[doc(hidden)]
+    pub fn subscribe_prompt_gc_activity(&self) -> watch::Receiver<bool> {
+        self.prompt_gc_active.clone()
+    }
+
+    #[doc(hidden)]
+    pub fn subscribe_prompt_gc_activity_edges(&self) -> tokio::sync::broadcast::Receiver<bool> {
+        self.prompt_gc_activity_edges.subscribe()
+    }
+
     pub(crate) async fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
         let state = self.session.state.lock().await;
         state.session_configuration.thread_config_snapshot()
@@ -660,6 +680,8 @@ pub(crate) struct Session {
     tx_event: Sender<Event>,
     agent_status: watch::Sender<AgentStatus>,
     agent_last_activity: watch::Sender<Option<CollabAgentActivity>>,
+    prompt_gc_active: watch::Sender<bool>,
+    prompt_gc_activity_edges: tokio::sync::broadcast::Sender<bool>,
     pub(crate) state: Mutex<SessionState>,
     /// The set of enabled features should be invariant for the lifetime of the
     /// session.
@@ -1256,6 +1278,8 @@ impl Session {
         tx_event: Sender<Event>,
         agent_status: watch::Sender<AgentStatus>,
         agent_last_activity: watch::Sender<Option<CollabAgentActivity>>,
+        prompt_gc_active: watch::Sender<bool>,
+        prompt_gc_activity_edges: tokio::sync::broadcast::Sender<bool>,
         initial_history: InitialHistory,
         session_source: SessionSource,
         skills_manager: Arc<SkillsManager>,
@@ -1640,6 +1664,8 @@ impl Session {
             tx_event: tx_event.clone(),
             agent_status,
             agent_last_activity,
+            prompt_gc_active,
+            prompt_gc_activity_edges,
             state: Mutex::new(state),
             features: config.features.clone(),
             pending_mcp_server_refresh_config: Mutex::new(None),
@@ -1828,6 +1854,11 @@ impl Session {
     pub(crate) async fn total_token_usage(&self) -> Option<TokenUsage> {
         let state = self.state.lock().await;
         state.token_info().map(|info| info.total_token_usage)
+    }
+
+    pub(crate) async fn token_usage_info(&self) -> Option<TokenUsageInfo> {
+        let state = self.state.lock().await;
+        state.token_info()
     }
 
     pub(crate) async fn get_estimated_token_count(
@@ -2535,6 +2566,13 @@ impl Session {
         if let Err(e) = self.tx_event.send(event).await {
             debug!("dropping event because channel is closed: {e}");
         }
+    }
+
+    // Merge-safety anchor: prompt-GC activity must stay on private watcher channels so the
+    // hidden sidecar can drive live TUI state without emitting visible protocol events.
+    fn set_prompt_gc_activity(&self, active: bool) {
+        self.prompt_gc_active.send_replace(active);
+        let _ = self.prompt_gc_activity_edges.send(active);
     }
 
     /// Persist the event to the rollout file, flush it, and only then deliver it to clients.
@@ -3252,6 +3290,8 @@ impl Session {
     pub(crate) async fn persist_prompt_gc_replacement_history(
         &self,
         turn_context: &TurnContext,
+        checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
+        applied_unit_count: u64,
         replacement_history: Vec<ResponseItem>,
     ) -> Result<(), String> {
         let recorder = {
@@ -3260,6 +3300,8 @@ impl Session {
         };
         self.persist_prompt_gc_replacement_history_with_sink(
             turn_context,
+            checkpoint,
+            applied_unit_count,
             replacement_history,
             recorder
                 .as_ref()
@@ -3271,6 +3313,8 @@ impl Session {
     async fn persist_prompt_gc_replacement_history_with_sink(
         &self,
         turn_context: &TurnContext,
+        checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
+        applied_unit_count: u64,
         replacement_history: Vec<ResponseItem>,
         recorder: Option<&dyn PromptGcRolloutSink>,
     ) -> Result<(), String> {
@@ -3281,6 +3325,11 @@ impl Session {
             // partial prompt_gc writes without weakening other compaction paths.
             message: PROMPT_GC_COMPACTION_MARKER.to_string(),
             replacement_history: Some(replacement_history.clone()),
+            prompt_gc: Some(prompt_gc_compaction_metadata(
+                checkpoint,
+                PromptGcOutcomeKind::ApplySucceeded,
+                Some(applied_unit_count),
+            )),
         })];
         if let Some(turn_context_item) = reference_context_item.clone() {
             rollout_items.push(RolloutItem::TurnContext(turn_context_item));
@@ -3305,6 +3354,27 @@ impl Session {
         }
         self.recompute_token_usage_silently(turn_context).await;
         Ok(())
+    }
+
+    async fn persist_prompt_gc_rollout_marker(
+        &self,
+        checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
+        kind: PromptGcOutcomeKind,
+        applied_unit_count: Option<u64>,
+    ) {
+        self.persist_rollout_items(&[RolloutItem::Compacted(CompactedItem {
+            // Merge-safety anchor: prompt_gc observational rollout markers must
+            // stay on the private compaction seam so they do not replay as live
+            // protocol events or leak hidden sidecar execution into the UI.
+            message: PROMPT_GC_COMPACTION_MARKER.to_string(),
+            replacement_history: None,
+            prompt_gc: Some(prompt_gc_compaction_metadata(
+                checkpoint,
+                kind,
+                applied_unit_count,
+            )),
+        })])
+        .await;
     }
 
     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
@@ -4038,6 +4108,19 @@ async fn persist_prompt_gc_rollout_items(
         ));
     }
     Ok(())
+}
+
+fn prompt_gc_compaction_metadata(
+    checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
+    kind: PromptGcOutcomeKind,
+    applied_unit_count: Option<u64>,
+) -> PromptGcCompactionMetadata {
+    PromptGcCompactionMetadata {
+        checkpoint_id: checkpoint.checkpoint_id.clone(),
+        checkpoint_seq: checkpoint.checkpoint_seq,
+        kind,
+        applied_unit_count,
+    }
 }
 
 async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiver<Submission>) {
@@ -6070,6 +6153,23 @@ async fn run_prompt_gc_sidecar_if_needed(
     let Some(checkpoint) = sidecar.lock().await.take_pending_checkpoint() else {
         return;
     };
+    sess.persist_prompt_gc_rollout_marker(&checkpoint, PromptGcOutcomeKind::Started, None)
+        .await;
+    struct PromptGcActivityGuard<'a> {
+        session: &'a Session,
+    }
+    impl<'a> PromptGcActivityGuard<'a> {
+        fn new(session: &'a Session) -> Self {
+            session.set_prompt_gc_activity(true);
+            Self { session }
+        }
+    }
+    impl<'a> Drop for PromptGcActivityGuard<'a> {
+        fn drop(&mut self) {
+            self.session.set_prompt_gc_activity(false);
+        }
+    }
+    let _prompt_gc_activity_guard = PromptGcActivityGuard::new(sess.as_ref());
 
     let router = Arc::new(crate::tools::spec::build_prompt_gc_sidecar_router());
     let allowed_tool_names =
@@ -6117,6 +6217,8 @@ async fn run_prompt_gc_sidecar_if_needed(
                 .lock()
                 .await
                 .fail_cycle(&checkpoint.checkpoint_id, error.to_string());
+            sess.persist_prompt_gc_rollout_marker(&checkpoint, PromptGcOutcomeKind::Failed, None)
+                .await;
             return;
         }
     };
@@ -6138,6 +6240,8 @@ async fn run_prompt_gc_sidecar_if_needed(
             .lock()
             .await
             .fail_cycle(&checkpoint.checkpoint_id, error);
+        sess.persist_prompt_gc_rollout_marker(&checkpoint, PromptGcOutcomeKind::Failed, None)
+            .await;
         return;
     }
 
@@ -6148,6 +6252,12 @@ async fn run_prompt_gc_sidecar_if_needed(
             applied_unit_keys: Vec::new(),
         };
         sidecar.lock().await.complete_cycle(outcome);
+        sess.persist_prompt_gc_rollout_marker(
+            &checkpoint,
+            PromptGcOutcomeKind::EmptyRetrieve,
+            Some(0),
+        )
+        .await;
         return;
     }
 
@@ -6156,6 +6266,8 @@ async fn run_prompt_gc_sidecar_if_needed(
             &checkpoint.checkpoint_id,
             "prompt_gc sidecar stopped after retrieve without an apply follow-up",
         );
+        sess.persist_prompt_gc_rollout_marker(&checkpoint, PromptGcOutcomeKind::Failed, None)
+            .await;
         return;
     }
 
@@ -6201,6 +6313,12 @@ async fn run_prompt_gc_sidecar_if_needed(
                     .lock()
                     .await
                     .fail_cycle(&checkpoint.checkpoint_id, error);
+                sess.persist_prompt_gc_rollout_marker(
+                    &checkpoint,
+                    PromptGcOutcomeKind::Failed,
+                    None,
+                )
+                .await;
             } else {
                 warn!(
                     turn_id = %turn_context.sub_id,
@@ -6211,6 +6329,12 @@ async fn run_prompt_gc_sidecar_if_needed(
                     &checkpoint.checkpoint_id,
                     "prompt_gc sidecar completed without apply",
                 );
+                sess.persist_prompt_gc_rollout_marker(
+                    &checkpoint,
+                    PromptGcOutcomeKind::Failed,
+                    None,
+                )
+                .await;
             }
         }
         Err(error) => {
@@ -6234,6 +6358,8 @@ async fn run_prompt_gc_sidecar_if_needed(
                 .lock()
                 .await
                 .fail_cycle(&checkpoint.checkpoint_id, error.to_string());
+            sess.persist_prompt_gc_rollout_marker(&checkpoint, PromptGcOutcomeKind::Failed, None)
+                .await;
         }
     }
 }
@@ -7273,8 +7399,25 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit(
         return Ok(false);
     }
 
-    refresh_accounts_rate_limits_before_auto_switch(sess, turn_context).await;
+    let freshly_unsupported_store_account_ids =
+        refresh_accounts_rate_limits_before_auto_switch(sess, turn_context).await;
+    maybe_auto_switch_account_on_usage_limit_with_freshly_unsupported_ids(
+        sess,
+        turn_context,
+        usage_limit,
+        request_store_account_id,
+        &freshly_unsupported_store_account_ids,
+    )
+    .await
+}
 
+async fn maybe_auto_switch_account_on_usage_limit_with_freshly_unsupported_ids(
+    sess: &Session,
+    turn_context: &TurnContext,
+    usage_limit: &crate::error::UsageLimitReachedError,
+    request_store_account_id: Option<&str>,
+    freshly_unsupported_store_account_ids: &HashSet<String>,
+) -> CodexResult<bool> {
     let accounts_before = sess.services.auth_manager.list_accounts();
     let account_display_name = |account: &crate::auth::AccountSummary| {
         account
@@ -7302,6 +7445,12 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit(
                 .any(|account| account.id == *store_account_id)
         })
         .or(active_store_account_id.clone());
+    let protected_store_account_id =
+        active_store_account_id
+            .as_deref()
+            .filter(|active_store_account_id| {
+                Some(*active_store_account_id) != failing_store_account_id.as_deref()
+            });
 
     let required_workspace_id = turn_context.config.forced_chatgpt_workspace_id.as_deref();
     let switch_result = sess.services.auth_manager.switch_account_on_usage_limit(
@@ -7309,6 +7458,8 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit(
         failing_store_account_id.as_deref(),
         usage_limit.resets_at,
         usage_limit.rate_limits.as_deref().cloned(),
+        freshly_unsupported_store_account_ids,
+        protected_store_account_id,
     )?;
     let Some(next_store_account_id) = switch_result else {
         let current_active_store_account_id = sess
@@ -7438,12 +7589,14 @@ pub(crate) async fn maybe_emit_transport_fallback_warning_for_execution_mode(
     }
 }
 
+// Merge-safety anchor: usage-limit auto-switch must carry just-refreshed unsupported account ids
+// from `/api/codex/usage` into the same auth-store mutation that selects the fallback account.
 async fn refresh_accounts_rate_limits_before_auto_switch(
     sess: &Session,
     turn_context: &TurnContext,
-) {
+) -> HashSet<String> {
     if cfg!(test) {
-        return;
+        return HashSet::new();
     }
 
     let account_summaries = sess.services.auth_manager.list_accounts();
@@ -7452,7 +7605,7 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
         .map(|account| account.id.clone())
         .collect::<Vec<_>>();
     if account_ids.is_empty() {
-        return;
+        return HashSet::new();
     }
     let exhausted_until_by_account_id = account_summaries
         .into_iter()
@@ -7465,6 +7618,7 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
     let now_unix_seconds = Utc::now().timestamp();
 
     let mut updates = Vec::new();
+    let mut freshly_unsupported_store_account_ids = HashSet::new();
     for store_account_id in account_ids {
         let Some(auth) = sess
             .services
@@ -7476,6 +7630,9 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
         match fetch_account_rate_limits_snapshot(&turn_context.config.chatgpt_base_url, &auth).await
         {
             Ok(Some(snapshot)) => {
+                if auto_switch_refresh_marks_account_unsupported(&snapshot) {
+                    freshly_unsupported_store_account_ids.insert(store_account_id.clone());
+                }
                 let should_skip_update = should_skip_auto_switch_refresh_update(
                     exhausted_until_by_account_id
                         .get(&store_account_id)
@@ -7504,7 +7661,7 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
     }
 
     if updates.is_empty() {
-        return;
+        return freshly_unsupported_store_account_ids;
     }
 
     match sess
@@ -7525,6 +7682,14 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
             );
         }
     }
+
+    freshly_unsupported_store_account_ids
+}
+
+fn auto_switch_refresh_marks_account_unsupported(
+    snapshot: &crate::protocol::RateLimitSnapshot,
+) -> bool {
+    crate::auth::usage_limit_auto_switch_removes_plan_type(snapshot.plan_type.as_ref())
 }
 
 fn should_skip_auto_switch_refresh_update(

@@ -116,6 +116,9 @@ const REFRESH_TOKEN_UNKNOWN_MESSAGE: &str =
     "Your access token could not be refreshed. Please log out and sign in again.";
 const REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE: &str = "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.";
 pub const NON_PLUS_ACCOUNT_REMOVED_MESSAGE: &str = "Your ChatGPT account is not Plus or Pro and was removed from saved accounts. Please sign in again with a Plus or Pro account.";
+pub const EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE: &str = "Only Plus and Pro ChatGPT accounts are supported for external auth. Please sign in again with a Plus or Pro account.";
+pub const EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE: &str =
+    "External ChatGPT auth requires a valid ChatGPT access token JWT.";
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
 
@@ -125,6 +128,16 @@ pub enum RefreshTokenError {
     Permanent(#[from] RefreshTokenFailedError),
     #[error(transparent)]
     Transient(#[from] std::io::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum ExternalAuthLoginError {
+    #[error("{EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE}")]
+    UnsupportedPlan,
+    #[error("{EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE}")]
+    InvalidAccessToken,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -442,14 +455,31 @@ pub fn login_with_chatgpt_auth_tokens(
     access_token: &str,
     chatgpt_account_id: &str,
     chatgpt_plan_type: Option<&str>,
-) -> std::io::Result<()> {
+) -> Result<(), ExternalAuthLoginError> {
+    // Merge-safety anchor: external ChatGPT token auth must enforce the same Plus/Pro-only
+    // admission policy as the saved-account store before ephemeral auth can become active.
     let auth_dot_json = AuthDotJson::from_external_access_token(
         access_token,
         chatgpt_account_id,
         chatgpt_plan_type,
-    )?;
-    let store = AuthStore::from_legacy(auth_dot_json);
-    save_auth(codex_home, &store, AuthCredentialsStoreMode::Ephemeral)
+    )
+    .map_err(|error| {
+        if error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<crate::token_data::IdTokenInfoError>())
+            .is_some()
+        {
+            ExternalAuthLoginError::InvalidAccessToken
+        } else {
+            ExternalAuthLoginError::Io(error)
+        }
+    })?;
+    let mut store = AuthStore::from_legacy(auth_dot_json);
+    if !enforce_plus_or_pro_saved_accounts(&mut store).is_empty() {
+        return Err(ExternalAuthLoginError::UnsupportedPlan);
+    }
+    save_auth(codex_home, &store, AuthCredentialsStoreMode::Ephemeral)?;
+    Ok(())
 }
 
 /// Persist the provided auth payload using the specified backend.
@@ -649,7 +679,20 @@ fn load_auth(
             ))
         };
 
-    if let Some(store) = ephemeral_storage.load()? {
+    if let Some(mut store) = ephemeral_storage.load()? {
+        let removed_account_ids = enforce_plus_or_pro_saved_accounts(&mut store);
+        if !removed_account_ids.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_account_ids,
+                "removed non-Plus/Pro accounts while loading external auth store"
+            );
+            if let Err(error) = save_auth(codex_home, &store, AuthCredentialsStoreMode::Ephemeral) {
+                tracing::warn!(
+                    error = %error,
+                    "failed to persist plus/pro auth account policy while loading external auth store"
+                );
+            }
+        }
         if let Some((store_account_id, auth_dot_json)) =
             auth_dot_json_from_store(store.clone(), ApiAuthMode::ChatgptAuthTokens)
         {
@@ -862,6 +905,7 @@ fn refresh_token_endpoint() -> String {
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 impl AuthDotJson {
     fn from_external_tokens(external: &ExternalAuthTokens) -> std::io::Result<Self> {
@@ -1422,6 +1466,8 @@ impl AuthManager {
         failing_store_account_id: Option<&str>,
         resets_at: Option<DateTime<Utc>>,
         snapshot: Option<crate::protocol::RateLimitSnapshot>,
+        freshly_unsupported_store_account_ids: &HashSet<String>,
+        protected_store_account_id: Option<&str>,
     ) -> std::io::Result<Option<String>> {
         if self.get_auth_mode() != Some(ApiAuthMode::Chatgpt) {
             return Ok(None);
@@ -1482,6 +1528,73 @@ impl AuthManager {
                 mutation_now,
             ));
 
+            // Merge-safety anchor: usage-limit auto-switch must purge fallback accounts whose
+            // just-refreshed usage snapshot proves they are `free` or `unknown`, or `/accounts`
+            // can immediately retry into a GPT-5.4-ineligible account.
+            let removed_fallback_account_ids = store
+                .accounts
+                .iter()
+                .filter(|account| {
+                    account.id != failing_store_account_id
+                        && Some(account.id.as_str()) != protected_store_account_id
+                        && freshly_unsupported_store_account_ids.contains(&account.id)
+                        && account_matches_required_workspace(account, required_workspace_id)
+                })
+                .map(|account| account.id.clone())
+                .collect::<Vec<_>>();
+            if !removed_fallback_account_ids.is_empty() {
+                store.accounts.retain(|account| {
+                    account.id == failing_store_account_id
+                        || Some(account.id.as_str()) == protected_store_account_id
+                        || !freshly_unsupported_store_account_ids.contains(&account.id)
+                        || !account_matches_required_workspace(account, required_workspace_id)
+                });
+                let active_account_still_present =
+                    store
+                        .active_account_id
+                        .as_ref()
+                        .is_some_and(|active_account_id| {
+                            store
+                                .accounts
+                                .iter()
+                                .any(|account| &account.id == active_account_id)
+                        });
+                if !active_account_still_present {
+                    store.active_account_id = Some(failing_store_account_id.clone())
+                        .filter(|active_account_id| {
+                            store
+                                .accounts
+                                .iter()
+                                .any(|account| &account.id == active_account_id)
+                        })
+                        .or_else(|| store.accounts.first().map(|account| account.id.clone()));
+                }
+                tracing::info!(
+                    removed_account_ids = ?removed_fallback_account_ids,
+                    "removed freshly unsupported fallback accounts during usage-limit auto-switch"
+                );
+            }
+
+            if let Some(protected_store_account_id) = protected_store_account_id
+                && store.accounts.iter().any(|account| {
+                    account.id == protected_store_account_id
+                        && account_selectable(account, required_workspace_id, mutation_now)
+                })
+            {
+                store.active_account_id = Some(protected_store_account_id.to_string());
+                if let Some(next_account) = store
+                    .accounts
+                    .iter_mut()
+                    .find(|account| account.id == protected_store_account_id)
+                {
+                    let usage = next_account
+                        .usage
+                        .get_or_insert_with(AccountUsageCache::default);
+                    usage.last_seen_at = Some(mutation_now);
+                }
+                return Ok(Some(protected_store_account_id.to_string()));
+            }
+
             let mut candidates = store
                 .accounts
                 .iter()
@@ -1510,7 +1623,10 @@ impl AuthManager {
 
             Ok(Some(next_account_id))
         })?;
-        if switched_to.is_some() {
+        let should_start_cooldown = switched_to
+            .as_deref()
+            .is_some_and(|switched_to| Some(switched_to) != protected_store_account_id);
+        if should_start_cooldown {
             let cooldown_started_at = Utc::now();
             *cooldown_until = Some(
                 cooldown_started_at
@@ -2191,7 +2307,7 @@ impl AuthManager {
         {
             return Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                 RefreshTokenFailedReason::Other,
-                NON_PLUS_ACCOUNT_REMOVED_MESSAGE.to_string(),
+                EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE.to_string(),
             )));
         }
         Ok(())
@@ -2235,7 +2351,7 @@ impl AuthManager {
     }
 }
 
-/// Merge anchor: `/accounts` and `/logout` render this exact summary from
+/// Merge-safety anchor: `/accounts` and `/logout` render this exact summary from
 /// `AuthManager::list_accounts`; keep field semantics aligned with TUI account flows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountSummary {
@@ -2424,14 +2540,34 @@ fn snapshot_next_reset_at(
     .min()
 }
 
+fn account_matches_required_workspace(
+    account: &StoredAccount,
+    required_workspace_id: Option<&str>,
+) -> bool {
+    if let Some(required) = required_workspace_id
+        && account.tokens.id_token.chatgpt_account_id.as_deref() != Some(required)
+    {
+        return false;
+    }
+
+    true
+}
+
+pub(crate) fn usage_limit_auto_switch_removes_plan_type(
+    plan_type: Option<&AccountPlanType>,
+) -> bool {
+    matches!(
+        plan_type,
+        Some(AccountPlanType::Free | AccountPlanType::Unknown)
+    )
+}
+
 fn account_selectable(
     account: &StoredAccount,
     required_workspace_id: Option<&str>,
     now: DateTime<Utc>,
 ) -> bool {
-    if let Some(required) = required_workspace_id
-        && account.tokens.id_token.chatgpt_account_id.as_deref() != Some(required)
-    {
+    if !account_matches_required_workspace(account, required_workspace_id) {
         return false;
     }
 
@@ -2573,6 +2709,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde::Serialize;
     use serde_json::json;
+    use std::collections::HashSet;
     use tempfile::tempdir;
 
     fn token_data_for_account(chatgpt_account_id: &str) -> TokenData {
@@ -2609,6 +2746,36 @@ mod tests {
             access_token: format!("access-{chatgpt_account_id}"),
             refresh_token: format!("refresh-{chatgpt_account_id}"),
             account_id: Some(chatgpt_account_id.to_string()),
+        }
+    }
+
+    fn cached_plan_snapshot(
+        plan_type: Option<AccountPlanType>,
+    ) -> crate::protocol::RateLimitSnapshot {
+        crate::protocol::RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: None,
+            secondary: None,
+            credits: None,
+            plan_type,
+        }
+    }
+
+    fn blocked_usage_limit_snapshot(reset: DateTime<Utc>) -> crate::protocol::RateLimitSnapshot {
+        use crate::protocol::RateLimitWindow;
+
+        crate::protocol::RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(300),
+                resets_at: Some(reset.timestamp()),
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: None,
         }
     }
 
@@ -3068,6 +3235,7 @@ mod tests {
             false,
             AuthCredentialsStoreMode::File,
         );
+        let freshly_unsupported_store_account_ids = HashSet::new();
         let reset = Utc::now() + chrono::Duration::minutes(90);
         let snapshot = RateLimitSnapshot {
             limit_id: Some("codex".to_string()),
@@ -3087,6 +3255,8 @@ mod tests {
             Some("acc-1"),
             Some(reset),
             Some(snapshot),
+            &freshly_unsupported_store_account_ids,
+            None,
         )?;
         assert_eq!(switched_to, Some("acc-2".to_string()));
 
@@ -3140,6 +3310,7 @@ mod tests {
             false,
             AuthCredentialsStoreMode::File,
         );
+        let freshly_unsupported_store_account_ids = HashSet::new();
         let reset = Utc::now() + chrono::Duration::minutes(90);
         let snapshot = RateLimitSnapshot {
             limit_id: Some("codex".to_string()),
@@ -3159,6 +3330,8 @@ mod tests {
             Some("missing-account"),
             Some(reset),
             Some(snapshot),
+            &freshly_unsupported_store_account_ids,
+            None,
         )?;
         assert_eq!(switched_to, None);
 
@@ -3208,6 +3381,7 @@ mod tests {
             false,
             AuthCredentialsStoreMode::File,
         );
+        let freshly_unsupported_store_account_ids = HashSet::new();
         let reset = Utc::now() + chrono::Duration::minutes(90);
         let snapshot = RateLimitSnapshot {
             limit_id: Some("codex".to_string()),
@@ -3227,6 +3401,8 @@ mod tests {
             Some("acc-1"),
             Some(reset),
             Some(snapshot.clone()),
+            &freshly_unsupported_store_account_ids,
+            None,
         )?;
         assert_eq!(first_switch, Some("acc-2".to_string()));
 
@@ -3235,6 +3411,8 @@ mod tests {
             Some("acc-2"),
             Some(reset),
             Some(snapshot),
+            &freshly_unsupported_store_account_ids,
+            None,
         )?;
         assert_eq!(
             second_switch, None,
@@ -3248,6 +3426,445 @@ mod tests {
                 .find(|account| account.is_active)
                 .map(|account| account.id.as_str()),
             Some("acc-2")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn switch_account_on_usage_limit_preserving_active_account_does_not_start_cooldown()
+    -> std::io::Result<()> {
+        let dir = tempdir().unwrap();
+        let store = AuthStore {
+            active_account_id: Some("acc-2".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-0".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-0"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        super::save_auth(dir.path(), &store, AuthCredentialsStoreMode::File)?;
+
+        let manager = AuthManager::shared(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        let freshly_unsupported_store_account_ids = HashSet::new();
+        let reset = Utc::now() + chrono::Duration::minutes(90);
+
+        let preserved_active = manager.switch_account_on_usage_limit(
+            None,
+            Some("acc-1"),
+            Some(reset),
+            Some(blocked_usage_limit_snapshot(reset)),
+            &freshly_unsupported_store_account_ids,
+            Some("acc-2"),
+        )?;
+        assert_eq!(
+            preserved_active,
+            Some("acc-2".to_string()),
+            "stale-request recovery should preserve the already-active account"
+        );
+
+        let switched_after_preserve = manager.switch_account_on_usage_limit(
+            None,
+            Some("acc-2"),
+            Some(reset),
+            Some(blocked_usage_limit_snapshot(reset)),
+            &freshly_unsupported_store_account_ids,
+            None,
+        )?;
+        assert_eq!(
+            switched_after_preserve,
+            Some("acc-0".to_string()),
+            "preserving the already-active account must not consume the real auto-switch turn"
+        );
+
+        let loaded = super::load_auth_store(dir.path(), AuthCredentialsStoreMode::File)?
+            .expect("auth store should exist");
+        assert_eq!(loaded.active_account_id.as_deref(), Some("acc-0"));
+        Ok(())
+    }
+
+    #[test]
+    fn usage_limit_auto_switch_removes_only_free_and_unknown_plans() {
+        assert!(super::usage_limit_auto_switch_removes_plan_type(Some(
+            &AccountPlanType::Free
+        )));
+        assert!(super::usage_limit_auto_switch_removes_plan_type(Some(
+            &AccountPlanType::Unknown
+        )));
+        assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+            &AccountPlanType::Go
+        )));
+        assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+            &AccountPlanType::Plus
+        )));
+        assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+            &AccountPlanType::Pro
+        )));
+        assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+            &AccountPlanType::Team
+        )));
+        assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+            &AccountPlanType::Business
+        )));
+        assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+            &AccountPlanType::Enterprise
+        )));
+        assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+            &AccountPlanType::Edu
+        )));
+        assert!(!super::usage_limit_auto_switch_removes_plan_type(None));
+    }
+
+    #[test]
+    fn switch_account_on_usage_limit_removes_fresh_free_fallback_candidate() -> std::io::Result<()>
+    {
+        let dir = tempdir().unwrap();
+        let store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: Some(AccountUsageCache {
+                        last_rate_limits: Some(cached_plan_snapshot(Some(AccountPlanType::Free))),
+                        exhausted_until: None,
+                        last_seen_at: Some(Utc::now()),
+                    }),
+                },
+                StoredAccount {
+                    id: "acc-3".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-3"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        super::save_auth(dir.path(), &store, AuthCredentialsStoreMode::File)?;
+
+        let manager = AuthManager::shared(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        let freshly_unsupported_store_account_ids = HashSet::from([String::from("acc-2")]);
+        let reset = Utc::now() + chrono::Duration::minutes(90);
+
+        let switched_to = manager.switch_account_on_usage_limit(
+            None,
+            Some("acc-1"),
+            Some(reset),
+            Some(blocked_usage_limit_snapshot(reset)),
+            &freshly_unsupported_store_account_ids,
+            None,
+        )?;
+        assert_eq!(switched_to, Some("acc-3".to_string()));
+
+        let loaded = super::load_auth_store(dir.path(), AuthCredentialsStoreMode::File)?
+            .expect("auth store should exist");
+        assert_eq!(loaded.active_account_id.as_deref(), Some("acc-3"));
+        assert!(
+            loaded.accounts.iter().all(|account| account.id != "acc-2"),
+            "freshly unsupported fallback should be removed from auth.json"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn switch_account_on_usage_limit_removes_fresh_unknown_fallback_candidate()
+    -> std::io::Result<()> {
+        let dir = tempdir().unwrap();
+        let store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: Some(AccountUsageCache {
+                        last_rate_limits: Some(cached_plan_snapshot(Some(
+                            AccountPlanType::Unknown,
+                        ))),
+                        exhausted_until: None,
+                        last_seen_at: Some(Utc::now()),
+                    }),
+                },
+                StoredAccount {
+                    id: "acc-3".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-3"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+            ],
+            ..AuthStore::default()
+        };
+        super::save_auth(dir.path(), &store, AuthCredentialsStoreMode::File)?;
+
+        let manager = AuthManager::shared(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        let freshly_unsupported_store_account_ids = HashSet::from([String::from("acc-2")]);
+        let reset = Utc::now() + chrono::Duration::minutes(90);
+
+        let switched_to = manager.switch_account_on_usage_limit(
+            None,
+            Some("acc-1"),
+            Some(reset),
+            Some(blocked_usage_limit_snapshot(reset)),
+            &freshly_unsupported_store_account_ids,
+            None,
+        )?;
+        assert_eq!(switched_to, Some("acc-3".to_string()));
+
+        let loaded = super::load_auth_store(dir.path(), AuthCredentialsStoreMode::File)?
+            .expect("auth store should exist");
+        assert_eq!(loaded.active_account_id.as_deref(), Some("acc-3"));
+        assert!(
+            loaded.accounts.iter().all(|account| account.id != "acc-2"),
+            "freshly unsupported fallback should be removed from auth.json"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn switch_account_on_usage_limit_keeps_stale_unsupported_candidate_without_fresh_evidence()
+    -> std::io::Result<()> {
+        let dir = tempdir().unwrap();
+        let store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: Some(AccountUsageCache {
+                        last_rate_limits: Some(cached_plan_snapshot(Some(AccountPlanType::Free))),
+                        exhausted_until: None,
+                        last_seen_at: Some(Utc::now()),
+                    }),
+                },
+            ],
+            ..AuthStore::default()
+        };
+        super::save_auth(dir.path(), &store, AuthCredentialsStoreMode::File)?;
+
+        let manager = AuthManager::shared(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        let freshly_unsupported_store_account_ids = HashSet::new();
+        let reset = Utc::now() + chrono::Duration::minutes(90);
+
+        let switched_to = manager.switch_account_on_usage_limit(
+            None,
+            Some("acc-1"),
+            Some(reset),
+            Some(blocked_usage_limit_snapshot(reset)),
+            &freshly_unsupported_store_account_ids,
+            None,
+        )?;
+        assert_eq!(
+            switched_to,
+            Some("acc-2".to_string()),
+            "stale cached plan data alone should not trigger removal"
+        );
+
+        let loaded = super::load_auth_store(dir.path(), AuthCredentialsStoreMode::File)?
+            .expect("auth store should exist");
+        assert_eq!(loaded.active_account_id.as_deref(), Some("acc-2"));
+        assert!(
+            loaded.accounts.iter().any(|account| account.id == "acc-2"),
+            "candidate should be kept when there is no fresh unsupported evidence"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn switch_account_on_usage_limit_keeps_missing_plan_candidate_without_fresh_evidence()
+    -> std::io::Result<()> {
+        let dir = tempdir().unwrap();
+        let store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: Some(AccountUsageCache {
+                        last_rate_limits: Some(cached_plan_snapshot(None)),
+                        exhausted_until: None,
+                        last_seen_at: Some(Utc::now()),
+                    }),
+                },
+            ],
+            ..AuthStore::default()
+        };
+        super::save_auth(dir.path(), &store, AuthCredentialsStoreMode::File)?;
+
+        let manager = AuthManager::shared(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        let freshly_unsupported_store_account_ids = HashSet::new();
+        let reset = Utc::now() + chrono::Duration::minutes(90);
+
+        let switched_to = manager.switch_account_on_usage_limit(
+            None,
+            Some("acc-1"),
+            Some(reset),
+            Some(blocked_usage_limit_snapshot(reset)),
+            &freshly_unsupported_store_account_ids,
+            None,
+        )?;
+        assert_eq!(
+            switched_to,
+            Some("acc-2".to_string()),
+            "missing plan data alone should not trigger removal"
+        );
+
+        let loaded = super::load_auth_store(dir.path(), AuthCredentialsStoreMode::File)?
+            .expect("auth store should exist");
+        assert_eq!(loaded.active_account_id.as_deref(), Some("acc-2"));
+        assert!(
+            loaded.accounts.iter().any(|account| account.id == "acc-2"),
+            "candidate should be kept when there is no fresh unsupported evidence"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn switch_account_on_usage_limit_removes_all_freshly_unsupported_fallbacks()
+    -> std::io::Result<()> {
+        let dir = tempdir().unwrap();
+        let store = AuthStore {
+            active_account_id: Some("acc-1".to_string()),
+            accounts: vec![
+                StoredAccount {
+                    id: "acc-1".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-1"),
+                    last_refresh: Some(Utc::now()),
+                    usage: None,
+                },
+                StoredAccount {
+                    id: "acc-2".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-2"),
+                    last_refresh: Some(Utc::now()),
+                    usage: Some(AccountUsageCache {
+                        last_rate_limits: Some(cached_plan_snapshot(Some(AccountPlanType::Free))),
+                        exhausted_until: None,
+                        last_seen_at: Some(Utc::now()),
+                    }),
+                },
+                StoredAccount {
+                    id: "acc-3".to_string(),
+                    label: None,
+                    tokens: token_data_for_account("acc-3"),
+                    last_refresh: Some(Utc::now()),
+                    usage: Some(AccountUsageCache {
+                        last_rate_limits: Some(cached_plan_snapshot(Some(
+                            AccountPlanType::Unknown,
+                        ))),
+                        exhausted_until: None,
+                        last_seen_at: Some(Utc::now()),
+                    }),
+                },
+            ],
+            ..AuthStore::default()
+        };
+        super::save_auth(dir.path(), &store, AuthCredentialsStoreMode::File)?;
+
+        let manager = AuthManager::shared(
+            dir.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        let freshly_unsupported_store_account_ids =
+            HashSet::from([String::from("acc-2"), String::from("acc-3")]);
+        let reset = Utc::now() + chrono::Duration::minutes(90);
+
+        let switched_to = manager.switch_account_on_usage_limit(
+            None,
+            Some("acc-1"),
+            Some(reset),
+            Some(blocked_usage_limit_snapshot(reset)),
+            &freshly_unsupported_store_account_ids,
+            None,
+        )?;
+        assert_eq!(switched_to, None);
+
+        let loaded = super::load_auth_store(dir.path(), AuthCredentialsStoreMode::File)?
+            .expect("auth store should exist");
+        assert_eq!(loaded.active_account_id.as_deref(), Some("acc-1"));
+        assert_eq!(
+            loaded
+                .accounts
+                .iter()
+                .map(|account| account.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["acc-1"]
         );
         Ok(())
     }
@@ -3759,6 +4376,220 @@ mod tests {
         assert_eq!(store.active_account_id, None);
     }
 
+    #[test]
+    fn login_with_chatgpt_auth_tokens_rejects_free_plan() {
+        let codex_home = tempdir().unwrap();
+        let access_token =
+            make_test_chatgpt_jwt(Some("free".to_string()), Some("org_workspace".to_string()))
+                .expect("build external access token");
+
+        let err = super::login_with_chatgpt_auth_tokens(
+            codex_home.path(),
+            &access_token,
+            "org_workspace",
+            Some("free"),
+        )
+        .expect_err("free external auth should be rejected");
+        assert!(matches!(
+            err,
+            super::ExternalAuthLoginError::UnsupportedPlan
+        ));
+        assert_eq!(
+            err.to_string(),
+            super::EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE
+        );
+        assert_eq!(
+            super::load_auth_store(codex_home.path(), AuthCredentialsStoreMode::Ephemeral)
+                .expect("load external auth store"),
+            None
+        );
+    }
+
+    #[test]
+    fn login_with_chatgpt_auth_tokens_rejects_missing_plan() {
+        let codex_home = tempdir().unwrap();
+        let access_token =
+            make_test_chatgpt_jwt(None, Some("org_workspace".to_string())).expect("jwt");
+
+        let err = super::login_with_chatgpt_auth_tokens(
+            codex_home.path(),
+            &access_token,
+            "org_workspace",
+            None,
+        )
+        .expect_err("external auth without a supported plan should be rejected");
+        assert!(matches!(
+            err,
+            super::ExternalAuthLoginError::UnsupportedPlan
+        ));
+        assert_eq!(
+            super::load_auth_store(codex_home.path(), AuthCredentialsStoreMode::Ephemeral)
+                .expect("load external auth store"),
+            None
+        );
+    }
+
+    #[test]
+    fn login_with_chatgpt_auth_tokens_rejects_unknown_plan_argument() {
+        let codex_home = tempdir().unwrap();
+        let access_token =
+            make_test_chatgpt_jwt(Some("pro".to_string()), Some("org_workspace".to_string()))
+                .expect("jwt");
+
+        let err = super::login_with_chatgpt_auth_tokens(
+            codex_home.path(),
+            &access_token,
+            "org_workspace",
+            Some("mystery-tier"),
+        )
+        .expect_err("external auth with an unknown caller-supplied plan should be rejected");
+        assert!(matches!(
+            err,
+            super::ExternalAuthLoginError::UnsupportedPlan
+        ));
+        assert_eq!(
+            super::load_auth_store(codex_home.path(), AuthCredentialsStoreMode::Ephemeral)
+                .expect("load external auth store"),
+            None
+        );
+    }
+
+    #[test]
+    fn login_with_chatgpt_auth_tokens_rejects_unknown_jwt_plan_when_argument_missing() {
+        let codex_home = tempdir().unwrap();
+        let access_token = make_test_chatgpt_jwt(
+            Some("mystery-tier".to_string()),
+            Some("org_workspace".to_string()),
+        )
+        .expect("jwt");
+
+        let err = super::login_with_chatgpt_auth_tokens(
+            codex_home.path(),
+            &access_token,
+            "org_workspace",
+            None,
+        )
+        .expect_err("external auth with an unknown JWT-derived plan should be rejected");
+        assert!(matches!(
+            err,
+            super::ExternalAuthLoginError::UnsupportedPlan
+        ));
+        assert_eq!(
+            super::load_auth_store(codex_home.path(), AuthCredentialsStoreMode::Ephemeral)
+                .expect("load external auth store"),
+            None
+        );
+    }
+
+    #[test]
+    fn login_with_chatgpt_auth_tokens_rejects_malformed_token() {
+        let codex_home = tempdir().unwrap();
+
+        let err = super::login_with_chatgpt_auth_tokens(
+            codex_home.path(),
+            "not-a-jwt",
+            "org_workspace",
+            Some("pro"),
+        )
+        .expect_err("malformed external auth should be rejected");
+        assert!(matches!(
+            err,
+            super::ExternalAuthLoginError::InvalidAccessToken
+        ));
+        assert_eq!(
+            err.to_string(),
+            super::EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE
+        );
+        assert_eq!(
+            super::load_auth_store(codex_home.path(), AuthCredentialsStoreMode::Ephemeral)
+                .expect("load external auth store"),
+            None
+        );
+    }
+
+    #[test]
+    #[serial(codex_api_key)]
+    fn load_auth_purges_unsupported_external_chatgpt_tokens_without_fallback() {
+        let codex_home = tempdir().unwrap();
+        let access_token =
+            make_test_chatgpt_jwt(Some("free".to_string()), Some("org_workspace".to_string()))
+                .expect("jwt");
+        let auth_dot_json =
+            AuthDotJson::from_external_access_token(&access_token, "org_workspace", Some("free"))
+                .expect("external auth dot json");
+        let store = AuthStore::from_legacy(auth_dot_json);
+        super::save_auth(
+            codex_home.path(),
+            &store,
+            AuthCredentialsStoreMode::Ephemeral,
+        )
+        .expect("save stale external auth");
+
+        let auth = super::load_auth(codex_home.path(), false, AuthCredentialsStoreMode::File)
+            .expect("load auth");
+        assert_eq!(auth, None);
+
+        let store = super::load_auth_store(codex_home.path(), AuthCredentialsStoreMode::Ephemeral)
+            .expect("load external auth store")
+            .expect("sanitized external auth store should remain present");
+        assert_eq!(store.accounts, Vec::new());
+        assert_eq!(store.active_account_id, None);
+    }
+
+    #[test]
+    #[serial(codex_api_key)]
+    fn load_auth_falls_back_to_persisted_chatgpt_auth_when_external_tokens_are_unsupported() {
+        let codex_home = tempdir().unwrap();
+        write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: Some("pro".to_string()),
+                chatgpt_account_id: Some("persisted_workspace".to_string()),
+            },
+            codex_home.path(),
+        )
+        .expect("write persisted pro auth");
+
+        let access_token = make_test_chatgpt_jwt(
+            Some("free".to_string()),
+            Some("external_workspace".to_string()),
+        )
+        .expect("jwt");
+        let auth_dot_json = AuthDotJson::from_external_access_token(
+            &access_token,
+            "external_workspace",
+            Some("free"),
+        )
+        .expect("external auth dot json");
+        let store = AuthStore::from_legacy(auth_dot_json);
+        super::save_auth(
+            codex_home.path(),
+            &store,
+            AuthCredentialsStoreMode::Ephemeral,
+        )
+        .expect("save stale external auth");
+
+        let auth = super::load_auth(codex_home.path(), false, AuthCredentialsStoreMode::File)
+            .expect("load auth")
+            .expect("persisted auth should remain available");
+        assert_eq!(auth.internal_auth_mode(), AuthMode::Chatgpt);
+        assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Pro));
+        assert_eq!(
+            auth.get_token_data()
+                .expect("token data should exist")
+                .id_token
+                .chatgpt_account_id
+                .as_deref(),
+            Some("persisted_workspace")
+        );
+
+        let store = super::load_auth_store(codex_home.path(), AuthCredentialsStoreMode::Ephemeral)
+            .expect("load external auth store")
+            .expect("sanitized external auth store should remain present");
+        assert_eq!(store.accounts, Vec::new());
+        assert_eq!(store.active_account_id, None);
+    }
+
     #[tokio::test]
     #[serial(codex_api_key)]
     async fn loads_api_key_from_auth_json() {
@@ -3800,7 +4631,10 @@ mod tests {
         chatgpt_account_id: Option<String>,
     }
 
-    fn write_auth_file(params: AuthFileParams, codex_home: &Path) -> std::io::Result<String> {
+    fn make_test_chatgpt_jwt(
+        chatgpt_plan_type: Option<String>,
+        chatgpt_account_id: Option<String>,
+    ) -> std::io::Result<String> {
         // Create a minimal valid JWT for the id_token field.
         #[derive(Serialize)]
         struct Header {
@@ -3816,12 +4650,12 @@ mod tests {
             "user_id": "user-12345",
         });
 
-        if let Some(chatgpt_plan_type) = params.chatgpt_plan_type.as_ref() {
+        if let Some(chatgpt_plan_type) = chatgpt_plan_type.as_ref() {
             auth_payload["chatgpt_plan_type"] =
                 serde_json::Value::String(chatgpt_plan_type.clone());
         }
 
-        if let Some(chatgpt_account_id) = params.chatgpt_account_id.as_ref() {
+        if let Some(chatgpt_account_id) = chatgpt_account_id.as_ref() {
             auth_payload["chatgpt_account_id"] =
                 serde_json::Value::String(chatgpt_account_id.clone());
         }
@@ -3835,8 +4669,14 @@ mod tests {
         let header_b64 = b64(&serde_json::to_vec(&header)?);
         let payload_b64 = b64(&serde_json::to_vec(&payload)?);
         let signature_b64 = b64(b"sig");
-        let fake_jwt = format!("{header_b64}.{payload_b64}.{signature_b64}");
+        Ok(format!("{header_b64}.{payload_b64}.{signature_b64}"))
+    }
 
+    fn write_auth_file(params: AuthFileParams, codex_home: &Path) -> std::io::Result<String> {
+        let fake_jwt = make_test_chatgpt_jwt(
+            params.chatgpt_plan_type.clone(),
+            params.chatgpt_account_id.clone(),
+        )?;
         let id_token = parse_chatgpt_jwt_claims(&fake_jwt).map_err(std::io::Error::other)?;
         let tokens = TokenData {
             id_token,

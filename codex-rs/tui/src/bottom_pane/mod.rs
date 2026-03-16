@@ -150,6 +150,16 @@ pub(crate) use experimental_features_view::ExperimentalFeaturesView;
 pub(crate) use list_selection_view::SelectionAction;
 pub(crate) use list_selection_view::SelectionItem;
 
+const PROMPT_GC_INLINE_BADGE: &str = "prompt GC";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusIndicatorState {
+    header: String,
+    details: Option<String>,
+    details_capitalization: StatusDetailsCapitalization,
+    details_max_lines: usize,
+}
+
 /// Pane displayed in the lower half of the chat UI.
 ///
 /// This is the owning container for the prompt input (`ChatComposer`) and the view stack
@@ -175,6 +185,10 @@ pub(crate) struct BottomPane {
 
     /// Inline status indicator shown above the composer while a task is running.
     status: Option<StatusIndicatorWidget>,
+    status_state: Option<StatusIndicatorState>,
+    // Merge-safety anchor: BottomPane owns prompt-GC activity so status-widget
+    // hide/recreate cycles during streaming do not lose the transient badge.
+    prompt_gc_active: bool,
     /// Unified exec session summary source.
     ///
     /// When a status row exists, this summary is mirrored inline in that row;
@@ -230,6 +244,8 @@ impl BottomPane {
             disable_paste_burst,
             is_task_running: false,
             status: None,
+            status_state: None,
+            prompt_gc_active: false,
             unified_exec_footer: UnifiedExecFooter::new(),
             pending_input_preview: PendingInputPreview::new(),
             pending_thread_approvals: PendingThreadApprovals::new(),
@@ -632,7 +648,8 @@ impl BottomPane {
 
     /// Update the status indicator header (defaults to "Working") and details below it.
     ///
-    /// Passing `None` clears any existing details. No-ops if the status indicator is not active.
+    /// Passing `None` clears any existing details. The last status model is retained even when the
+    /// row is temporarily hidden so it can be restored later.
     pub(crate) fn update_status(
         &mut self,
         header: String,
@@ -640,6 +657,12 @@ impl BottomPane {
         details_capitalization: StatusDetailsCapitalization,
         details_max_lines: usize,
     ) {
+        self.status_state = Some(StatusIndicatorState {
+            header: header.clone(),
+            details: details.clone(),
+            details_capitalization,
+            details_max_lines: details_max_lines.max(1),
+        });
         if let Some(status) = self.status.as_mut() {
             status.update_header(header);
             status.update_details(details, details_capitalization, details_max_lines.max(1));
@@ -731,7 +754,8 @@ impl BottomPane {
                 if let Some(status) = self.status.as_mut() {
                     status.set_interrupt_hint_visible(true);
                 }
-                self.sync_status_inline_message();
+                self.sync_status_indicator_state();
+                self.sync_status_inline_affordances();
                 self.request_redraw();
             }
         } else {
@@ -754,7 +778,19 @@ impl BottomPane {
                 self.frame_requester.clone(),
                 self.animations_enabled,
             ));
-            self.sync_status_inline_message();
+            self.sync_status_indicator_state();
+            self.sync_status_inline_affordances();
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn set_prompt_gc_active(&mut self, active: bool) {
+        if self.prompt_gc_active == active {
+            return;
+        }
+        self.prompt_gc_active = active;
+        self.sync_status_inline_affordances();
+        if self.status.is_some() {
             self.request_redraw();
         }
     }
@@ -834,19 +870,38 @@ impl BottomPane {
     /// footer row depending on whether a status indicator is currently visible.
     pub(crate) fn set_unified_exec_processes(&mut self, processes: Vec<String>) {
         if self.unified_exec_footer.set_processes(processes) {
-            self.sync_status_inline_message();
+            self.sync_status_inline_affordances();
             self.request_redraw();
         }
     }
 
-    /// Copy unified-exec summary text into the active status row, if any.
+    /// Copy prompt-GC and unified-exec affordances into the active status row, if any.
     ///
     /// This keeps status-line inline text synchronized without forcing the
     /// standalone unified-exec footer row to be visible.
-    fn sync_status_inline_message(&mut self) {
+    fn sync_status_inline_affordances(&mut self) {
         if let Some(status) = self.status.as_mut() {
+            status.update_inline_badge(
+                self.prompt_gc_active
+                    .then_some(PROMPT_GC_INLINE_BADGE.to_string()),
+            );
             status.update_inline_message(self.unified_exec_footer.summary_text());
         }
+    }
+
+    fn sync_status_indicator_state(&mut self) {
+        let Some(status) = self.status.as_mut() else {
+            return;
+        };
+        let Some(state) = self.status_state.as_ref() else {
+            return;
+        };
+        status.update_header(state.header.clone());
+        status.update_details(
+            state.details.clone(),
+            state.details_capitalization,
+            state.details_max_lines,
+        );
     }
 
     /// Update custom prompts available for the slash popup.
@@ -861,6 +916,10 @@ impl BottomPane {
 
     pub(crate) fn is_task_running(&self) -> bool {
         self.is_task_running
+    }
+
+    pub(crate) fn prompt_gc_active(&self) -> bool {
+        self.prompt_gc_active
     }
 
     #[cfg(test)]
@@ -1450,6 +1509,38 @@ mod tests {
         let area = Rect::new(0, 0, width, after);
         let rendered = render_snapshot(&pane, area);
         assert!(rendered.contains("background terminal running · /ps to view"));
+    }
+
+    #[test]
+    fn prompt_gc_badge_precedes_unified_exec_summary() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = BottomPane::new(BottomPaneParams {
+            app_event_tx: tx,
+            frame_requester: FrameRequester::test_dummy(),
+            has_input_focus: true,
+            enhanced_keys_supported: false,
+            placeholder_text: "Ask Codex to do anything".to_string(),
+            disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
+        });
+
+        pane.set_task_running(true);
+        pane.set_unified_exec_processes(vec!["sleep 5".to_string()]);
+        pane.set_prompt_gc_active(true);
+
+        let width = 120;
+        let area = Rect::new(0, 0, width, pane.desired_height(width));
+        let rendered = render_snapshot(&pane, area);
+        let prompt_gc = rendered.find("prompt GC").expect("prompt GC badge");
+        let unified_exec = rendered
+            .find("background terminal running · /ps to view")
+            .expect("unified-exec summary");
+        assert!(
+            prompt_gc < unified_exec,
+            "expected prompt GC badge before unified-exec summary: {rendered}"
+        );
     }
 
     #[test]

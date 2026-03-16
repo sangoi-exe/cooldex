@@ -1219,6 +1219,7 @@ mod tests {
                         ).as_str()),
                         assistant_message("nested assistant context"),
                     ]),
+                    prompt_gc: None,
                 }),
             ],
             "spawn-call-1",

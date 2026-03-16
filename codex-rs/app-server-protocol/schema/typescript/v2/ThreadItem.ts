@@ -6,6 +6,7 @@ import type { JsonValue } from "../serde_json/JsonValue";
 import type { CollabAgentState } from "./CollabAgentState";
 import type { CollabAgentTool } from "./CollabAgentTool";
 import type { CollabAgentToolCallStatus } from "./CollabAgentToolCallStatus";
+import type { CollabWaitState } from "./CollabWaitState";
 import type { CommandAction } from "./CommandAction";
 import type { CommandExecutionStatus } from "./CommandExecutionStatus";
 import type { DynamicToolCallOutputContentItem } from "./DynamicToolCallOutputContentItem";
@@ -85,4 +86,8 @@ prompt: string | null,
 /**
  * Last known status of the target agents, when available.
  */
-agentsStates: { [key in string]?: CollabAgentState }, } | { "type": "webSearch", id: string, query: string, action: WebSearchAction | null, } | { "type": "imageView", id: string, path: string, } | { "type": "imageGeneration", id: string, status: string, revisedPrompt: string | null, result: string, } | { "type": "enteredReviewMode", id: string, review: string, } | { "type": "exitedReviewMode", id: string, review: string, } | { "type": "contextCompaction", id: string, };
+agentsStates: { [key in string]?: CollabAgentState },
+/**
+ * Null when the collab tool call is not `wait`.
+ */
+waitState: CollabWaitState | null, } | { "type": "webSearch", id: string, query: string, action: WebSearchAction | null, } | { "type": "imageView", id: string, path: string, } | { "type": "imageGeneration", id: string, status: string, revisedPrompt: string | null, result: string, } | { "type": "enteredReviewMode", id: string, review: string, } | { "type": "exitedReviewMode", id: string, review: string, } | { "type": "contextCompaction", id: string, };

@@ -1,4 +1,5 @@
 use codex_protocol::models::WebSearchAction;
+use codex_protocol::protocol::CollabWaitState;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -250,6 +251,9 @@ pub struct CollabToolCallItem {
     pub prompt: Option<String>,
     pub agents_states: HashMap<String, CollabAgentState>,
     pub status: CollabToolCallStatus,
+    // Merge-safety anchor: exec JSONL output must preserve wait-mode metadata so timeout returns
+    // and any_final/all_final completions remain distinguishable outside raw tool results.
+    pub wait_state: Option<CollabWaitState>,
 }
 
 /// Result payload produced by an MCP tool invocation.

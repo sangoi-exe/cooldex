@@ -5,7 +5,6 @@ use async_channel::Receiver;
 use async_channel::Sender;
 use codex_async_utils::OrCancelExt;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
-use codex_protocol::protocol::CollabAgentActivity;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
@@ -19,7 +18,6 @@ use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
 use serde_json::Value;
 use std::time::Duration;
-use tokio::sync::watch;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -103,6 +101,8 @@ pub(crate) async fn run_codex_thread_interactive(
         rx_event: rx_sub,
         agent_status: codex.agent_status.clone(),
         agent_last_activity: codex.agent_last_activity.clone(),
+        prompt_gc_active: codex.prompt_gc_active.clone(),
+        prompt_gc_activity_edges: codex.prompt_gc_activity_edges.clone(),
         session: Arc::clone(&codex.session),
     })
 }
@@ -149,6 +149,12 @@ pub(crate) async fn run_codex_thread_one_shot(
     let (tx_bridge, rx_bridge) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let ops_tx = io.tx_sub.clone();
     let agent_status = io.agent_status.clone();
+    let agent_last_activity = io.agent_last_activity.clone();
+    // Merge-safety anchor: one-shot child delegates must forward the spawned
+    // prompt-GC activity watchers verbatim so the TUI indicator tracks live
+    // child-side prompt_gc state instead of shadow channels.
+    let prompt_gc_active = io.prompt_gc_active.clone();
+    let prompt_gc_activity_edges = io.prompt_gc_activity_edges.clone();
     let session = Arc::clone(&io.session);
     let io_for_bridge = io;
     tokio::spawn(async move {
@@ -182,7 +188,9 @@ pub(crate) async fn run_codex_thread_one_shot(
         rx_event: rx_bridge,
         tx_sub: tx_closed,
         agent_status,
-        agent_last_activity: watch::channel::<Option<CollabAgentActivity>>(None).1,
+        agent_last_activity,
+        prompt_gc_active,
+        prompt_gc_activity_edges,
         session,
     })
 }
@@ -483,6 +491,7 @@ mod tests {
     use async_channel::bounded;
     use codex_protocol::models::ResponseItem;
     use codex_protocol::protocol::AgentStatus;
+    use codex_protocol::protocol::CollabAgentActivity;
     use codex_protocol::protocol::RawResponseItemEvent;
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
@@ -496,12 +505,16 @@ mod tests {
         let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
         let (_agent_last_activity_tx, agent_last_activity) =
             watch::channel::<Option<CollabAgentActivity>>(None);
+        let (_prompt_gc_active_tx, prompt_gc_active) = watch::channel(false);
+        let (prompt_gc_activity_edges, _) = tokio::sync::broadcast::channel(16);
         let (session, ctx, _rx_evt) = crate::codex::make_session_and_context_with_rx().await;
         let codex = Arc::new(Codex {
             tx_sub,
             rx_event: rx_events,
             agent_status,
             agent_last_activity,
+            prompt_gc_active,
+            prompt_gc_activity_edges,
             session: Arc::clone(&session),
         });
 
@@ -572,12 +585,16 @@ mod tests {
         let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
         let (_agent_last_activity_tx, agent_last_activity) =
             watch::channel::<Option<CollabAgentActivity>>(None);
+        let (_prompt_gc_active_tx, prompt_gc_active) = watch::channel(false);
+        let (prompt_gc_activity_edges, _) = tokio::sync::broadcast::channel(16);
         let (session, _ctx, _rx_evt) = crate::codex::make_session_and_context_with_rx().await;
         let codex = Arc::new(Codex {
             tx_sub,
             rx_event: rx_events,
             agent_status,
             agent_last_activity,
+            prompt_gc_active,
+            prompt_gc_activity_edges,
             session,
         });
         let (tx_ops, rx_ops) = bounded(1);

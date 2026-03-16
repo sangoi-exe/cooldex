@@ -6,6 +6,7 @@ export type LoginAccountParams = { "type": "apiKey", apiKey: string, } | { "type
 /**
  * Access token (JWT) supplied by the client.
  * This token is used for backend API requests and email extraction.
+ * Malformed tokens are rejected as invalid input.
  */
 accessToken: string, 
 /**
@@ -15,7 +16,9 @@ chatgptAccountId: string,
 /**
  * Optional plan type supplied by the client.
  *
- * When `null`, Codex attempts to derive the plan type from access-token
- * claims. If unavailable, the plan defaults to `unknown`.
+ * When present, this value remains authoritative over JWT-derived plan
+ * claims. When `null`, Codex attempts to derive the plan type from the
+ * access-token claims. If the effective plan is missing, `unknown`, or
+ * unsupported, the login request is rejected.
  */
 chatgptPlanType?: string | null, };

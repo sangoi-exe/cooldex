@@ -29,6 +29,8 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_core::auth::AuthCredentialsStoreMode;
+use codex_core::auth::EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE;
+use codex_core::auth::EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE;
 use codex_core::auth::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_login::login_with_api_key;
 use codex_protocol::account::PlanType as AccountPlanType;
@@ -47,6 +49,7 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 
 // Helper to create a minimal config.toml for the app server
 #[derive(Default)]
@@ -198,6 +201,19 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
 
     let note = timeout(
         DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("account/login/completed"),
+    )
+    .await??;
+    let parsed: ServerNotification = note.try_into()?;
+    let ServerNotification::AccountLoginCompleted(payload) = parsed else {
+        bail!("unexpected notification: {parsed:?}");
+    };
+    pretty_assertions::assert_eq!(payload.login_id, None);
+    pretty_assertions::assert_eq!(payload.success, true);
+    pretty_assertions::assert_eq!(payload.error, None);
+
+    let note = timeout(
+        DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("account/updated"),
     )
     .await??;
@@ -228,6 +244,222 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
             }),
             requires_openai_auth: true,
         }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_auth_token_rejects_unknown_plan() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mock_server = MockServer::start().await;
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            requires_openai_auth: Some(true),
+            base_url: Some(format!("{}/v1", mock_server.uri())),
+            ..Default::default()
+        },
+    )?;
+    write_models_cache(codex_home.path())?;
+
+    let access_token = encode_id_token(
+        &ChatGptIdTokenClaims::new()
+            .email("unknown@example.com")
+            .plan_type("pro")
+            .chatgpt_account_id("org-unknown"),
+    )?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
+
+    let set_id = mcp
+        .send_chatgpt_auth_tokens_login_request(
+            access_token,
+            "org-unknown".to_string(),
+            Some("mystery-tier".to_string()),
+        )
+        .await?;
+    let err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(set_id)),
+    )
+    .await??;
+    assert_eq!(
+        err.error,
+        JSONRPCErrorError {
+            code: INVALID_REQUEST_ERROR_CODE,
+            message: EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE.to_string(),
+            data: None,
+        }
+    );
+
+    let maybe_login_completed = timeout(
+        Duration::from_millis(500),
+        mcp.read_stream_until_notification_message("account/login/completed"),
+    )
+    .await;
+    assert!(
+        maybe_login_completed.is_err(),
+        "account/login/completed should not be emitted when external auth is rejected"
+    );
+
+    let maybe_updated = timeout(
+        Duration::from_millis(500),
+        mcp.read_stream_until_notification_message("account/updated"),
+    )
+    .await;
+    assert!(
+        maybe_updated.is_err(),
+        "account/updated should not be emitted when external auth is rejected"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_auth_token_rejects_unsupported_plan() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mock_server = MockServer::start().await;
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            requires_openai_auth: Some(true),
+            base_url: Some(format!("{}/v1", mock_server.uri())),
+            ..Default::default()
+        },
+    )?;
+    write_models_cache(codex_home.path())?;
+
+    let access_token = encode_id_token(
+        &ChatGptIdTokenClaims::new()
+            .email("free@example.com")
+            .plan_type("free")
+            .chatgpt_account_id("org-free"),
+    )?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
+
+    let set_id = mcp
+        .send_chatgpt_auth_tokens_login_request(
+            access_token,
+            "org-free".to_string(),
+            Some("free".to_string()),
+        )
+        .await?;
+    let err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(set_id)),
+    )
+    .await??;
+    assert_eq!(
+        err.error,
+        JSONRPCErrorError {
+            code: INVALID_REQUEST_ERROR_CODE,
+            message: EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE.to_string(),
+            data: None,
+        }
+    );
+
+    let maybe_login_completed = timeout(
+        Duration::from_millis(500),
+        mcp.read_stream_until_notification_message("account/login/completed"),
+    )
+    .await;
+    assert!(
+        maybe_login_completed.is_err(),
+        "account/login/completed should not be emitted when external auth is rejected"
+    );
+
+    let maybe_updated = timeout(
+        Duration::from_millis(500),
+        mcp.read_stream_until_notification_message("account/updated"),
+    )
+    .await;
+    assert!(
+        maybe_updated.is_err(),
+        "account/updated should not be emitted when external auth is rejected"
+    );
+
+    let get_id = mcp
+        .send_get_account_request(GetAccountParams {
+            refresh_token: false,
+        })
+        .await?;
+    let get_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(get_id)),
+    )
+    .await??;
+    let account: GetAccountResponse = to_response(get_resp)?;
+    assert_eq!(
+        account,
+        GetAccountResponse {
+            account: None,
+            requires_openai_auth: true,
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_auth_token_rejects_malformed_token() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mock_server = MockServer::start().await;
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            requires_openai_auth: Some(true),
+            base_url: Some(format!("{}/v1", mock_server.uri())),
+            ..Default::default()
+        },
+    )?;
+    write_models_cache(codex_home.path())?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
+
+    let set_id = mcp
+        .send_chatgpt_auth_tokens_login_request(
+            "not-a-jwt".to_string(),
+            "org-free".to_string(),
+            Some("pro".to_string()),
+        )
+        .await?;
+    let err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(set_id)),
+    )
+    .await??;
+    assert_eq!(
+        err.error,
+        JSONRPCErrorError {
+            code: INVALID_REQUEST_ERROR_CODE,
+            message: EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE.to_string(),
+            data: None,
+        }
+    );
+
+    let maybe_login_completed = timeout(
+        Duration::from_millis(500),
+        mcp.read_stream_until_notification_message("account/login/completed"),
+    )
+    .await;
+    assert!(
+        maybe_login_completed.is_err(),
+        "account/login/completed should not be emitted when external auth is rejected"
+    );
+
+    let maybe_updated = timeout(
+        Duration::from_millis(500),
+        mcp.read_stream_until_notification_message("account/updated"),
+    )
+    .await;
+    assert!(
+        maybe_updated.is_err(),
+        "account/updated should not be emitted when external auth is rejected"
     );
 
     Ok(())
@@ -873,6 +1105,122 @@ async fn external_auth_refresh_invalid_access_token_fails_turn() -> Result<()> {
     )?;
     assert_eq!(completed.turn.status, TurnStatus::Failed);
     assert!(completed.turn.error.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn external_auth_refresh_rejects_unsupported_plan() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mock_server = MockServer::start().await;
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            requires_openai_auth: Some(true),
+            base_url: Some(format!("{}/v1", mock_server.uri())),
+            ..Default::default()
+        },
+    )?;
+    write_models_cache(codex_home.path())?;
+
+    let unauthorized = ResponseTemplate::new(401).set_body_json(json!({
+        "error": { "message": "unauthorized" }
+    }));
+    let _responses_mock =
+        responses::mount_response_sequence(&mock_server, vec![unauthorized]).await;
+
+    let initial_access_token = encode_id_token(
+        &ChatGptIdTokenClaims::new()
+            .email("initial@example.com")
+            .plan_type("pro")
+            .chatgpt_account_id("org-initial"),
+    )?;
+    let downgraded_access_token = encode_id_token(
+        &ChatGptIdTokenClaims::new()
+            .email("downgraded@example.com")
+            .plan_type("free")
+            .chatgpt_account_id("org-initial"),
+    )?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
+
+    let set_id = mcp
+        .send_chatgpt_auth_tokens_login_request(
+            initial_access_token,
+            "org-initial".to_string(),
+            Some("pro".to_string()),
+        )
+        .await?;
+    let set_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(set_id)),
+    )
+    .await??;
+    let response: LoginAccountResponse = to_response(set_resp)?;
+    assert_eq!(response, LoginAccountResponse::ChatgptAuthTokens {});
+    let _updated = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("account/updated"),
+    )
+    .await??;
+
+    let thread_req = mcp
+        .send_thread_start_request(codex_app_server_protocol::ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let thread = to_response::<codex_app_server_protocol::ThreadStartResponse>(thread_resp)?;
+
+    let turn_req = mcp
+        .send_turn_start_request(codex_app_server_protocol::TurnStartParams {
+            thread_id: thread.thread.id.clone(),
+            input: vec![codex_app_server_protocol::UserInput::Text {
+                text: "Hello".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+
+    respond_to_refresh_request(
+        &mut mcp,
+        &downgraded_access_token,
+        "org-initial",
+        Some("free"),
+    )
+    .await?;
+
+    let _turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let completed_notif: JSONRPCNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let completed: TurnCompletedNotification = serde_json::from_value(
+        completed_notif
+            .params
+            .expect("turn/completed params must be present"),
+    )?;
+    assert_eq!(completed.turn.status, TurnStatus::Failed);
+    assert_eq!(
+        completed
+            .turn
+            .error
+            .as_ref()
+            .map(|error| error.message.as_str()),
+        Some(EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE)
+    );
 
     Ok(())
 }

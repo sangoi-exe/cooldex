@@ -999,7 +999,7 @@ fn create_wait_tool() -> ToolSpec {
         JsonSchema::Array {
             items: Box::new(JsonSchema::String { description: None }),
             description: Some(
-                "Agent ids to wait on. Pass multiple ids to wait for whichever finishes first."
+                "Agent ids to wait on. Pass multiple ids to wait for any requested final status by default, or set `return_when` to `all_final` to wait for every requested final status. Duplicate ids are rejected."
                     .to_string(),
             ),
         },
@@ -1012,10 +1012,31 @@ fn create_wait_tool() -> ToolSpec {
             )),
         },
     );
+    properties.insert(
+        "disable_timeout".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "When true, wait without a timeout cap until the requested wait condition is satisfied. Cannot be combined with `timeout_ms`."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "return_when".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional wait condition. Accepted values: `any_final` (default) or `all_final`."
+                    .to_string(),
+            ),
+        },
+    );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "wait".to_string(),
-        description: "Wait for agents to reach a final status. Returns current state for every requested agent, including running agents on timeout, with recent lastActivity metadata when available. Once an agent reaches a final status, a notification message will be received containing the same updated agent states."
+        // Merge-safety anchor: keep wait-tool docs aligned with the emitted wait metadata so
+        // timeout returns and all_final waits do not regress into stale “first finish wins”
+        // guidance.
+        description: "Wait for agents to reach the requested final-status condition. By default, `wait` returns when any requested agent reaches a final status; set `return_when` to `all_final` to wait for every requested agent. Returns current state for every requested agent, including running agents on timeout, with recent lastActivity metadata when available. When the wait returns, a notification message will be received containing the same updated agent states."
             .to_string(),
         strict: false,
         parameters: JsonSchema::Object {

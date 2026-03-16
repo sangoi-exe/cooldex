@@ -7,7 +7,23 @@ During any sync/merge with `main` and/or `upstream`, these rules are mandatory:
 1. These sync/merge instructions are specific to this workspace and must ALWAYS remain in `AGENTS.md` during future synchronizations.
 2. Always resolve conflicts **MANUALLY** every time. Using `ours/theirs` automation is forbidden (including `-X ours`, `-X theirs`, `git checkout --ours`, `git checkout --theirs`, and equivalents).
 3. In every conflict, find the best way to preserve the custom functionality we added while also reconciling significant upstream improvements.
-4. Remove from the workspace all CI/CD content under `.github` (workflows, actions, and any other pipeline artifacts).
+4. `Merge-safety anchor:` markers are MANDATORY, not optional, on every touched workspace-local divergence file and every touched seam whose behavior, docs, tests, schema, serialization, cache, or operator surface must stay aligned with those customizations. Use the file's native comment syntax (`//`, `///`, `#`, `<!-- -->`, etc.); the required marker text is `Merge-safety anchor:`, not literal `//` everywhere. If a file cannot carry inline comments, add the nearest durable technical note that names the invariant being preserved. Missing merge-safety markers in touched customized or customization-adjacent seams are STOP-SHIP.
+5. Existing `Merge anchor:` comments are legacy debt. Whenever you touch one of those files for customization-preserving work, normalize it to `Merge-safety anchor:` in the same change.
+6. Remove from the workspace all CI/CD content under `.github` (workflows, actions, and any other pipeline artifacts).
+
+<!-- Merge-safety anchor: AGENTS.md is the canonical source for the workspace-local customization inventory and merge-policy invariants; future sync work must update this section and keep scratchpads as redirects only. -->
+## Workspace-local Customization Inventory (Source of Truth)
+
+This section is the canonical cluster-level inventory of durable workspace-local divergence that must survive future syncs/merges with `upstream/main`. Re-derive it from the live diff against `upstream/main` whenever a cluster is added, removed, or materially re-scoped. Scratchpads may point here, but they must not duplicate the inventory body. This is a policy/inventory source of truth, not a claim that every legacy marker has already been normalized everywhere. The listed files are representative high-signal entrypoints, not an exhaustive manifest of every touched file in a cluster.
+
+- `manage_context`: strict retrieve/apply flow, `/sanitize` integration, replacement-history materialization/rollback, and the canonical home-doc stack. Representative files: `codex-rs/core/src/tools/handlers/manage_context.rs`, `codex-rs/core/src/tasks/sanitize.rs`, `codex-rs/core/sanitize_prompt.md`, `~/.codex/manage_context.md`, `~/.codex/manage_context_cheatsheet.md`.
+- `recall`: args-less recall, compact/debug output behavior, rollout/compaction coupling, fail-loud boundary handling, and the recall docs/config drift trap. Representative files: `codex-rs/core/src/tools/handlers/recall.rs`, `codex-rs/core/src/codex.rs`, `docs/recall.md`, `docs/guide_reapply_recall.md`, `retrieve`, `codex-rs/core/src/config/mod.rs`, `codex-rs/core/config.schema.json`, `codex-rs/core/tests/suite/compact.rs`, `codex-rs/core/tests/suite/compact_remote.rs`.
+- `prompt_gc` / `PromptGcSidecar`: automatic active-turn prompt GC, hidden `prompt_gc` tool routing, private runtime activity state, replacement-history persistence/reconstruction, configurable built-in prompt, and the TUI prompt-GC indicator. Representative files: `codex-rs/core/src/prompt_gc_sidecar.rs`, `codex-rs/core/src/tools/handlers/prompt_gc.rs`, `codex-rs/core/prompt_gc_prompt.md`, `codex-rs/core/src/client.rs`, `codex-rs/core/src/codex.rs`, `codex-rs/core/src/rollout/recorder.rs`, `codex-rs/core/src/codex/rollout_reconstruction.rs`, `codex-rs/core/src/tasks/mod.rs`, `codex-rs/core/src/tools/registry.rs`, `codex-rs/tui/src/bottom_pane/mod.rs`, `codex-rs/tui/src/chatwidget.rs`, `codex-rs/tui/src/app.rs`.
+- `/accounts`: multi-account ChatGPT management is a cross-file divergence cluster, not a single TUI command. Treat auth storage, TUI popup/cache flow, slash-command gating, app-server account surfaces, and auth docs as one subsystem. Representative files: `codex-rs/core/src/auth.rs`, `codex-rs/core/src/auth/storage.rs`, `codex-rs/tui/src/app.rs`, `codex-rs/tui/src/app_event.rs`, `codex-rs/tui/src/chatwidget.rs`, `codex-rs/tui/src/slash_command.rs`, `codex-rs/app-server/README.md`, `docs/authentication.md`, `docs/slash_commands.md`.
+- sub-agent/runtime orchestration: custom spawn/profile plumbing, background-agent handling, parallel tool execution, collaboration/thread APIs, and child-agent isolation live outside upstream. Preserve `subagent_instructions_file` as the child-only base-instructions source and keep child spawn/resume config from inheriting lead `developer_instructions`, AGENTS/project-doc-derived `user_instructions`, and `Feature::ChildAgentsMd`. Representative files: `codex-rs/core/src/tools/handlers/multi_agents.rs`, `codex-rs/core/src/tools/parallel.rs`, `codex-rs/core/src/config/mod.rs`, `codex-rs/core/src/config/profile.rs`, `codex-rs/core/config.schema.json`, `codex-rs/core/src/project_doc.rs`, `codex-rs/core/src/state/session.rs`, `codex-rs/core/src/rid.rs`, `codex-rs/app-server-protocol/src/protocol/v2.rs`, `codex-rs/app-server-protocol/schema/**`, `codex-rs/app-server/src/codex_message_processor.rs`, `codex-rs/state/src/runtime/threads.rs`, `AGENTS.md`.
+- TUI debugging/custom operator surfaces: `/debug`, raw-response inspection, and context-window/operator-facing debugging affordances are local customizations and must stay aligned with runtime event/cache semantics. Representative files: `codex-rs/tui/src/chatwidget.rs`, `codex-rs/tui/src/slash_command.rs`, `codex-rs/core/src/codex.rs`, `codex-rs/tui/src/app.rs`.
+- `mcp-standalone` bridge/runtime customization: session cwd/config-path resolution, operator metadata plumbing, bridge defaults, and local runtime/auth expectations are workspace-local behavior. Representative files: `mcp-standalone/src/app.js`, `mcp-standalone/src/bridge/runtime.js`, `mcp-standalone/src/app-server/client.js`, `mcp-standalone/src/config.js`, `mcp-standalone/src/logger.js`, `mcp-standalone/README.md`.
+- workspace sync policy and local instruction overlays: keep `.github/**` removed from this workspace, preserve the AGENTS-centric sync policy, and keep local config/instruction overlays aligned when those rules change. Representative files: `AGENTS.md`, `/home/lucas/.codex/config.toml`, diff against `upstream/main` for `.github/**`.
 
 ## Workspace Test Safety
 
@@ -22,22 +38,39 @@ In the codex-rs folder where the rust code lives:
 
 ## General Rules
 
-- Install any commands the repo relies on (for example `just`, `rg`, or `cargo-insta`) if they aren't already available before running instructions here.
 - Crate names are prefixed with `codex-`. For example, the `core` folder's crate is named `codex-core`
+- When using format! and you can inline variables into {}, always do that.
+- Install any commands the repo relies on (for example `just`, `rg`, or `cargo-insta`) if they aren't already available before running instructions here.
 - Never add or modify any code related to `CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR` or `CODEX_SANDBOX_ENV_VAR`.
   - You operate in a sandbox where `CODEX_SANDBOX_NETWORK_DISABLED=1` will be set whenever you use the `shell` tool. Any existing code that uses `CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR` was authored with this fact in mind. It is often used to early exit out of tests that the author knew you would not be able to run given your sandbox limitations.
   - Similarly, when you spawn a process using Seatbelt (`/usr/bin/sandbox-exec`), `CODEX_SANDBOX=seatbelt` will be set on the child process. Integration tests that want to run Seatbelt themselves cannot be run under Seatbelt, so checks for `CODEX_SANDBOX=seatbelt` are also often used to early exit out of tests, as appropriate.
 - Always collapse if statements per https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
 - Always inline format! args when possible per https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
-- When using format! and you can inline variables into {}, always do that.
 - Use method references over closures when possible per https://rust-lang.github.io/rust-clippy/master/index.html#redundant_closure_for_method_calls
 - When possible, make `match` statements exhaustive and avoid wildcard arms.
-- Do not create small helper methods that are referenced only once.
 - When writing tests, prefer comparing the equality of entire objects over fields one by one.
 - When making a change that adds or changes an API, ensure that the documentation in the `docs/` folder is up to date if applicable.
 - If you change `ConfigToml` or nested config types, run `just write-config-schema` to update `codex-rs/core/config.schema.json`.
-- If you change Rust dependencies (`Cargo.toml` or `Cargo.lock`), run `just bazel-lock-update` from the repo root to refresh `MODULE.bazel.lock`, and include that lockfile update in the same change.
-- After dependency changes, run `just bazel-lock-check` from the repo root so lockfile drift is caught locally before CI.
+- If you change Rust dependencies (`Cargo.toml` or `Cargo.lock`), run `just bazel-lock-update` from the
+  repo root to refresh `MODULE.bazel.lock`, and include that lockfile update in the same change.
+- After dependency changes, run `just bazel-lock-check` from the repo root so lockfile drift is caught
+  locally before CI.
+- Bazel does not automatically make source-tree files available to compile-time Rust file access. If
+  you add `include_str!`, `include_bytes!`, `sqlx::migrate!`, or similar build-time file or
+  directory reads, update the crate's `BUILD.bazel` (`compile_data`, `build_script_data`, or test
+  data) or Bazel may fail even when Cargo passes.
+- Do not create small helper methods that are referenced only once.
+- Avoid large modules:
+  - Prefer adding new modules instead of growing existing ones.
+  - Target Rust modules under 500 LoC, excluding tests.
+  - If a file exceeds roughly 800 LoC, add new functionality in a new module instead of extending
+    the existing file unless there is a strong documented reason not to.
+  - This rule applies especially to high-touch files that already attract unrelated changes, such
+    as `codex-rs/tui/src/app.rs`, `codex-rs/tui/src/bottom_pane/chat_composer.rs`,
+    `codex-rs/tui/src/bottom_pane/footer.rs`, `codex-rs/tui/src/chatwidget.rs`,
+    `codex-rs/tui/src/bottom_pane/mod.rs`, and similarly central orchestration modules.
+  - When extracting code from a large module, move the related tests and module/type docs toward
+    the new implementation so the invariants stay close to the code that owns them.
 
 ## Validation Workflow
 
@@ -47,36 +80,34 @@ Never run tests whose failure signal is redundant with build/compilation failure
 Run tests only when they provide additional, non-build signal (for example behavioral/runtime/integration/snapshot validation).
 Prefer leaving test execution to the user unless explicitly requested; when requested, keep tests targeted and avoid full-suite runs unless explicitly asked.
 
-Before finalizing a large change to `codex-rs`, run `just fix -p <project>` (in `codex-rs` directory) to fix any linter issues in the code. Prefer scoping with `-p` to avoid slow workspace-wide Clippy builds; only run `just fix` without `-p` if you changed shared crates. Do not run `cargo build` after `fix`/`fmt`; only run tests when they add non-build signal.
+Before finalizing a large change to `codex-rs`, run `just fix -p <project>` (in `codex-rs` directory) to fix any linter issues in the code. Prefer scoping with `-p` to avoid slow workspace‑wide Clippy builds; only run `just fix` without `-p` if you changed shared crates. Do not run `cargo build` after `fix`/`fmt`; only run tests when they add non-build signal.
 
-## TUI
-
-### Style Conventions
+## TUI style conventions
 
 See `codex-rs/tui/styles.md`.
 
-### Code Conventions
+## TUI code conventions
 
-- Use concise styling helpers from ratatui's Stylize trait.
+- Use concise styling helpers from ratatui’s Stylize trait.
   - Basic spans: use "text".into()
   - Styled spans: use "text".red(), "text".green(), "text".magenta(), "text".dim(), etc.
   - Prefer these over constructing styles with `Span::styled` and `Style` directly.
   - Example: patch summary file lines
     - Desired: vec!["  └ ".into(), "M".red(), " ".dim(), "tui/src/app.rs".dim()]
 
-#### Styling (ratatui)
+### TUI Styling (ratatui)
 
 - Prefer Stylize helpers: use "text".dim(), .bold(), .cyan(), .italic(), .underlined() instead of manual Style where possible.
-- Avoid hardcoded white: do not use `.white()`; prefer the default foreground (no color).
 - Prefer simple conversions: use "text".into() for spans and vec![…].into() for lines; when inference is ambiguous (e.g., Paragraph::new/Cell::from), use Line::from(spans) or Span::from(text).
-- Single items: prefer "text".into(); use Line::from(text) or Span::from(text) only when the target type isn't obvious from context, or when using .into() would require extra type annotations.
-- Building lines: use vec![…].into() to construct a Line when the target type is obvious and no extra type annotations are needed; otherwise use Line::from(vec![…]).
 - Computed styles: if the Style is computed at runtime, using `Span::styled` is OK (`Span::from(text).set_style(style)` is also acceptable).
+- Avoid hardcoded white: do not use `.white()`; prefer the default foreground (no color).
 - Chaining: combine helpers by chaining for readability (e.g., url.cyan().underlined()).
+- Single items: prefer "text".into(); use Line::from(text) or Span::from(text) only when the target type isn’t obvious from context, or when using .into() would require extra type annotations.
+- Building lines: use vec![…].into() to construct a Line when the target type is obvious and no extra type annotations are needed; otherwise use Line::from(vec![…]).
+- Avoid churn: don’t refactor between equivalent forms (Span::styled ↔ set_style, Line::from ↔ .into()) without a clear readability or functional gain; follow file‑local conventions and do not introduce type annotations solely to satisfy .into().
 - Compactness: prefer the form that stays on one line after rustfmt; if only one of Line::from(vec![…]) or vec![…].into() avoids wrapping, choose that. If both wrap, pick the one with fewer wrapped lines.
-- Avoid churn: don't refactor between equivalent forms (Span::styled ↔ set_style, Line::from ↔ .into()) without a clear readability or functional gain; follow file-local conventions and do not introduce type annotations solely to satisfy .into().
 
-#### Text Wrapping
+### Text wrapping
 
 - Always use textwrap::wrap to wrap plain strings.
 - If you have a ratatui Line and you want to wrap it, use the helpers in tui/src/wrapping.rs, e.g. word_wrap_lines / word_wrap_line.
@@ -85,50 +116,56 @@ See `codex-rs/tui/styles.md`.
 
 ## Tests
 
-### Snapshot Tests
+### Snapshot tests
 
 This repo uses snapshot tests (via `insta`), especially in `codex-rs/tui`, to validate rendered output.
 
-**Requirement:** any change that affects user-visible UI (including adding new UI) must include corresponding `insta` snapshot coverage (add a new snapshot test if one doesn't exist yet, or update the existing snapshot).
-Review and accept snapshot updates as part of the PR so UI impact is easy to review and future diffs stay visual.
+**Requirement:** any change that affects user-visible UI (including adding new UI) must include
+corresponding `insta` snapshot coverage (add a new snapshot test if one doesn't exist yet, or
+update the existing snapshot). Review and accept snapshot updates as part of the PR so UI impact
+is easy to review and future diffs stay visual.
 
 When UI or text output changes intentionally, update the snapshots as follows:
 
-- Apply the `cargo clean` guardrail above before and after any `cargo test` run in this workflow.
-- Run tests to generate any updated snapshots:
+<!-- Merge-safety anchor: snapshot-test instructions in this workspace stay gated by explicit re-authorization plus cargo-clean guardrails; do not revert to unconditional compile-triggering test runs. -->
+- In this workspace, only run the snapshot test command after explicit re-authorization per `## Workspace Test Safety`; otherwise leave the compile-triggering step to the user.
+- When that authorization exists, apply the workspace `cargo clean` guardrail around the test command:
+  - `cargo clean`
   - `cargo test -p codex-tui`
-- Check what's pending:
+  - `cargo clean`
+- Check what’s pending:
   - `cargo insta pending-snapshots -p codex-tui`
 - Review changes by reading the generated `*.snap.new` files directly in the repo, or preview a specific file:
   - `cargo insta show -p codex-tui path/to/file.snap.new`
 - Only if you intend to accept all new snapshots in this crate, run:
   - `cargo insta accept -p codex-tui`
 
-If you don't have the tool:
+If you don’t have the tool:
 
 - `cargo install cargo-insta`
 
-### Test Assertions
+### Test assertions
 
-- Prefer deep equals comparisons whenever possible. Perform `assert_eq!()` on entire objects, rather than individual fields.
 - Tests should use pretty_assertions::assert_eq for clearer diffs. Import this at the top of the test module if it isn't already.
+- Prefer deep equals comparisons whenever possible. Perform `assert_eq!()` on entire objects, rather than individual fields.
 - Avoid mutating process environment in tests; prefer passing environment-derived flags or dependencies from above.
 
-### Spawning Workspace Binaries in Tests (Cargo vs Bazel)
+### Spawning workspace binaries in tests (Cargo vs Bazel)
 
 - Prefer `codex_utils_cargo_bin::cargo_bin("...")` over `assert_cmd::Command::cargo_bin(...)` or `escargot` when tests need to spawn first-party binaries.
   - Under Bazel, binaries and resources may live under runfiles; use `codex_utils_cargo_bin::cargo_bin` to resolve absolute paths that remain stable after `chdir`.
 - When locating fixture files or test resources under Bazel, avoid `env!("CARGO_MANIFEST_DIR")`. Prefer `codex_utils_cargo_bin::find_resource!` so paths resolve correctly under both Cargo and Bazel runfiles.
 
-### Integration Tests (core)
+### Integration tests (core)
 
 - Prefer the utilities in `core_test_support::responses` when writing end-to-end Codex tests.
-- Build SSE payloads with the provided `ev_*` constructors and the `sse(...)`.
-- Prefer `mount_sse_once` over `mount_sse_once_match` or `mount_sse_sequence`
+
 - All `mount_sse*` helpers return a `ResponseMock`; hold onto it so you can assert against outbound `/responses` POST bodies.
 - Use `ResponseMock::single_request()` when a test should only issue one POST, or `ResponseMock::requests()` to inspect every captured `ResponsesRequest`.
 - `ResponsesRequest` exposes helpers (`body_json`, `input`, `function_call_output`, `custom_tool_call_output`, `call_output`, `header`, `path`, `query_param`) so assertions can target structured payloads instead of manual JSON digging.
+- Build SSE payloads with the provided `ev_*` constructors and the `sse(...)`.
 - Prefer `wait_for_event` over `wait_for_event_with_timeout`.
+- Prefer `mount_sse_once` over `mount_sse_once_match` or `mount_sse_sequence`
 
 - Typical pattern:
 
@@ -157,18 +194,18 @@ These guidelines apply to app-server protocol work in `codex-rs`, especially:
 ### Core Rules
 
 - All active API development should happen in app-server v2. Do not add new API surface area to v1.
-- Expose RPC methods as `<resource>/<method>` and keep `<resource>` singular (for example, `thread/read`, `app/list`).
 - Follow payload naming consistently:
   `*Params` for request payloads, `*Response` for responses, and `*Notification` for notifications.
+- Expose RPC methods as `<resource>/<method>` and keep `<resource>` singular (for example, `thread/read`, `app/list`).
 - Always expose fields as camelCase on the wire with `#[serde(rename_all = "camelCase")]` unless a tagged union or explicit compatibility requirement needs a targeted rename.
 - Exception: config RPC payloads are expected to use snake_case to mirror config.toml keys (see the config read/write/list APIs in `app-server-protocol/src/protocol/v2.rs`).
-- Keep Rust and TS wire renames aligned. If a field or variant uses `#[serde(rename = "...")]`, add matching `#[ts(rename = "...")]`.
-- For discriminated unions, use explicit tagging in both serializers:
-  `#[serde(tag = "type", ...)]` and `#[ts(tag = "type", ...)]`.
 - Always set `#[ts(export_to = "v2/")]` on v2 request/response/notification types so generated TypeScript lands in the correct namespace.
 - Never use `#[serde(skip_serializing_if = "Option::is_none")]` for v2 API payload fields.
   Exception: client->server requests that intentionally have no params may use:
   `params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>`.
+- Keep Rust and TS wire renames aligned. If a field or variant uses `#[serde(rename = "...")]`, add matching `#[ts(rename = "...")]`.
+- For discriminated unions, use explicit tagging in both serializers:
+  `#[serde(tag = "type", ...)]` and `#[ts(tag = "type", ...)]`.
 - Prefer plain `String` IDs at the API boundary (do UUID parsing/conversion internally if needed).
 - Timestamps should be integer Unix seconds (`i64`) and named `*_at` (for example, `created_at`, `updated_at`, `resets_at`).
 - For experimental API surface area:
@@ -189,5 +226,7 @@ These guidelines apply to app-server protocol work in `codex-rs`, especially:
 - Regenerate schema fixtures when API shapes change:
   `just write-app-server-schema`
   (and `just write-app-server-schema --experimental` when experimental API fixtures are affected).
-- Avoid boilerplate tests that only assert experimental field markers for individual request fields in `common.rs`; rely on schema generation/tests and behavioral coverage instead.
-- Do not use `cargo build` as a validation gate here; validate only with checks that add non-build signal.
+<!-- Merge-safety anchor: app-server protocol validation in this workspace is conditional on explicit re-authorization; do not restore unconditional compile-triggering test commands here. -->
+- In this workspace, only run `cargo test -p codex-app-server-protocol` after explicit re-authorization per `## Workspace Test Safety`, and only when that behavioral/schema signal adds more than build-time validation.
+- Avoid boilerplate tests that only assert experimental field markers for individual
+  request fields in `common.rs`; rely on schema generation/tests and behavioral coverage instead.

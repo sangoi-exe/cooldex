@@ -414,6 +414,36 @@
       ],
       "type": "object"
     },
+    "CollabWaitReturnWhen": {
+      "enum": [
+        "any_final",
+        "all_final"
+      ],
+      "type": "string"
+    },
+    "CollabWaitState": {
+      "properties": {
+        "disableTimeout": {
+          "default": false,
+          "type": "boolean"
+        },
+        "returnWhen": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CollabWaitReturnWhen"
+            }
+          ],
+          "default": "any_final"
+        },
+        "timedOut": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "ContentItem": {
       "oneOf": [
         {
@@ -3212,6 +3242,17 @@
               ],
               "title": "CollabWaitingBeginEventMsgType",
               "type": "string"
+            },
+            "wait_state": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CollabWaitState"
+                }
+              ],
+              "default": {
+                "disableTimeout": false,
+                "returnWhen": "any_final"
+              }
             }
           },
           "required": [
@@ -3258,6 +3299,17 @@
               ],
               "title": "CollabWaitingEndEventMsgType",
               "type": "string"
+            },
+            "wait_state": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CollabWaitState"
+                }
+              ],
+              "default": {
+                "disableTimeout": false,
+                "returnWhen": "any_final"
+              }
             }
           },
           "required": [
@@ -9024,6 +9076,17 @@
           ],
           "title": "CollabWaitingBeginEventMsgType",
           "type": "string"
+        },
+        "wait_state": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CollabWaitState"
+            }
+          ],
+          "default": {
+            "disableTimeout": false,
+            "returnWhen": "any_final"
+          }
         }
       },
       "required": [
@@ -9070,6 +9133,17 @@
           ],
           "title": "CollabWaitingEndEventMsgType",
           "type": "string"
+        },
+        "wait_state": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CollabWaitState"
+            }
+          ],
+          "default": {
+            "disableTimeout": false,
+            "returnWhen": "any_final"
+          }
         }
       },
       "required": [

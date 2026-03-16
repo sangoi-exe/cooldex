@@ -50,6 +50,7 @@ use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
 use codex_protocol::protocol::CollabCloseBeginEvent;
 use codex_protocol::protocol::CollabCloseEndEvent;
+use codex_protocol::protocol::CollabWaitState;
 use codex_protocol::protocol::CollabWaitingBeginEvent;
 use codex_protocol::protocol::CollabWaitingEndEvent;
 use serde_json::Value as JsonValue;
@@ -420,6 +421,7 @@ impl EventProcessorWithJsonOutput {
             ev.sender_thread_id.to_string(),
             Vec::new(),
             Some(ev.prompt.clone()),
+            None,
         )
     }
 
@@ -448,6 +450,7 @@ impl EventProcessorWithJsonOutput {
             Some(ev.prompt.clone()),
             agents_states,
             status,
+            None,
         )
     }
 
@@ -461,6 +464,7 @@ impl EventProcessorWithJsonOutput {
             ev.sender_thread_id.to_string(),
             vec![ev.receiver_thread_id.to_string()],
             Some(ev.prompt.clone()),
+            None,
         )
     }
 
@@ -483,10 +487,14 @@ impl EventProcessorWithJsonOutput {
             Some(ev.prompt.clone()),
             [(receiver_id, agent_state)].into_iter().collect(),
             status,
+            None,
         )
     }
 
     fn handle_collab_wait_begin(&mut self, ev: &CollabWaitingBeginEvent) -> Vec<ThreadEvent> {
+        // Merge-safety anchor: exec JSONL wait events must preserve explicit wait metadata so
+        // timeout returns are not flattened into the same machine-readable shape as condition-met
+        // completions.
         self.start_collab_tool_call(
             &ev.call_id,
             CollabTool::Wait,
@@ -496,6 +504,7 @@ impl EventProcessorWithJsonOutput {
                 .map(ToString::to_string)
                 .collect(),
             None,
+            Some(ev.wait_state.clone()),
         )
     }
 
@@ -529,6 +538,7 @@ impl EventProcessorWithJsonOutput {
             None,
             agents_states,
             status,
+            Some(ev.wait_state.clone()),
         )
     }
 
@@ -538,6 +548,7 @@ impl EventProcessorWithJsonOutput {
             CollabTool::CloseAgent,
             ev.sender_thread_id.to_string(),
             vec![ev.receiver_thread_id.to_string()],
+            None,
             None,
         )
     }
@@ -558,6 +569,7 @@ impl EventProcessorWithJsonOutput {
             None,
             [(receiver_id, agent_state)].into_iter().collect(),
             status,
+            None,
         )
     }
 
@@ -568,6 +580,7 @@ impl EventProcessorWithJsonOutput {
         sender_thread_id: String,
         receiver_thread_ids: Vec<String>,
         prompt: Option<String>,
+        wait_state: Option<CollabWaitState>,
     ) -> Vec<ThreadEvent> {
         let item_id = self.get_next_item_id();
         self.running_collab_tool_calls.insert(
@@ -586,6 +599,7 @@ impl EventProcessorWithJsonOutput {
                 prompt,
                 agents_states: HashMap::new(),
                 status: CollabToolCallStatus::InProgress,
+                wait_state,
             }),
         };
         vec![ThreadEvent::ItemStarted(ItemStartedEvent { item })]
@@ -601,6 +615,7 @@ impl EventProcessorWithJsonOutput {
         prompt: Option<String>,
         agents_states: HashMap<String, CollabAgentState>,
         status: CollabToolCallStatus,
+        wait_state: Option<CollabWaitState>,
     ) -> Vec<ThreadEvent> {
         let (tool, item_id) = match self.running_collab_tool_calls.remove(call_id) {
             Some(running) => (running.tool, running.item_id),
@@ -621,6 +636,7 @@ impl EventProcessorWithJsonOutput {
                 prompt,
                 agents_states,
                 status,
+                wait_state,
             }),
         };
         vec![ThreadEvent::ItemCompleted(ItemCompletedEvent { item })]

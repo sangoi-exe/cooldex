@@ -585,6 +585,7 @@ mod tests {
         let items = vec![RolloutItem::Compacted(CompactedItem {
             message: "noop".to_string(),
             replacement_history: None,
+            prompt_gc: None,
         })];
 
         let builder = builder_from_items(items.as_slice(), path.as_path()).expect("builder");
