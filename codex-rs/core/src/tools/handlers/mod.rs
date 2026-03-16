@@ -10,7 +10,9 @@ mod mcp;
 mod mcp_resource;
 pub(crate) mod multi_agents;
 mod plan;
-mod prompt_gc;
+// Merge-safety anchor: prompt_gc helper exposure must stay crate-visible for the
+// runtime-owned summary flow without re-registering the removed prompt_gc tool loop.
+pub(crate) mod prompt_gc;
 mod read_file;
 mod recall;
 mod request_user_input;
@@ -44,7 +46,6 @@ pub use mcp::McpHandler;
 pub use mcp_resource::McpResourceHandler;
 pub use multi_agents::MultiAgentHandler;
 pub use plan::PlanHandler;
-pub(crate) use prompt_gc::PromptGcHandler;
 pub use read_file::ReadFileHandler;
 pub use recall::RecallHandler;
 pub use request_user_input::RequestUserInputHandler;

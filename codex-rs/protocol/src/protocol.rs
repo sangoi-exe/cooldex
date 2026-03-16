@@ -2240,9 +2240,22 @@ pub enum RolloutItem {
 #[ts(rename_all = "snake_case")]
 pub enum PromptGcOutcomeKind {
     Started,
-    EmptyRetrieve,
+    #[serde(alias = "empty_retrieve")]
+    NoEligibleChunks,
     ApplySucceeded,
     Failed,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum PromptGcExecutionPhase {
+    Prepare,
+    Request,
+    Summarize,
+    Apply,
+    Persist,
+    Unknown,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
@@ -2250,6 +2263,12 @@ pub struct PromptGcCompactionMetadata {
     pub checkpoint_id: String,
     pub checkpoint_seq: u64,
     pub kind: PromptGcOutcomeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<PromptGcExecutionPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_unit_count: Option<u64>,
 }

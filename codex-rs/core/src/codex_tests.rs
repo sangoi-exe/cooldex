@@ -25,6 +25,7 @@ use crate::protocol::CreditsSnapshot;
 use crate::protocol::InitialHistory;
 use crate::protocol::NetworkApprovalProtocol;
 use crate::protocol::PromptGcCompactionMetadata;
+use crate::protocol::PromptGcExecutionPhase;
 use crate::protocol::PromptGcOutcomeKind;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::RateLimitWindow;
@@ -292,57 +293,11 @@ fn prompt_gc_capability_is_explicitly_opt_in() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prompt_gc_sidecar_empty_retrieve_completes_without_visible_accounting() {
+async fn prompt_gc_sidecar_no_eligible_chunks_complete_without_visible_accounting() {
     let server = MockServer::start().await;
     let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
     let rollout_path = attach_rollout_recorder(&session).await;
     let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
-    let retrieve_args = json!({
-        "mode": "retrieve",
-        "policy_id": turn_context.config.manage_context_policy.quality_rubric_id,
-        "checkpoint_id": checkpoint_id.clone(),
-    })
-    .to_string();
-    let hidden_rate_limits = RateLimitSnapshot {
-        limit_id: Some("codex".to_string()),
-        limit_name: None,
-        primary: Some(RateLimitWindow {
-            used_percent: 12.0,
-            window_minutes: Some(5),
-            resets_at: Some(1_700_000_000),
-        }),
-        secondary: None,
-        credits: None,
-        plan_type: None,
-    };
-    let response_body = sse(&[
-        response_created("resp-1"),
-        function_call_event("call-1", "prompt_gc", &retrieve_args),
-        response_completed_with_usage("resp-1", 17),
-    ]);
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(StaticSseResponder {
-            calls: AtomicUsize::new(0),
-            response_body,
-            headers: vec![
-                (
-                    "x-codex-primary-used-percent".to_string(),
-                    "12.0".to_string(),
-                ),
-                (
-                    "x-codex-primary-window-minutes".to_string(),
-                    "5".to_string(),
-                ),
-                (
-                    "x-codex-primary-reset-at".to_string(),
-                    "1700000000".to_string(),
-                ),
-            ],
-        })
-        .expect(1)
-        .mount(&server)
-        .await;
 
     configure_session_model_client_for_server(&mut session, &turn_context, &server);
 
@@ -382,12 +337,18 @@ async fn prompt_gc_sidecar_empty_retrieve_completes_without_visible_accounting()
                 checkpoint_id: checkpoint_id.clone(),
                 checkpoint_seq: 0,
                 kind: PromptGcOutcomeKind::Started,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: None,
+                error_message: None,
                 applied_unit_count: None,
             },
             PromptGcCompactionMetadata {
                 checkpoint_id,
                 checkpoint_seq: 0,
-                kind: PromptGcOutcomeKind::EmptyRetrieve,
+                kind: PromptGcOutcomeKind::NoEligibleChunks,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: Some("no_eligible_chunks".to_string()),
+                error_message: None,
                 applied_unit_count: Some(0),
             },
         ]
@@ -404,7 +365,7 @@ async fn prompt_gc_sidecar_empty_retrieve_completes_without_visible_accounting()
     );
     assert!(rx.try_recv().is_err());
     let latest_rate_limits = session.state.lock().await.latest_rate_limits.clone();
-    assert_eq!(latest_rate_limits, Some(hidden_rate_limits));
+    assert_eq!(latest_rate_limits, None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -429,28 +390,6 @@ async fn prompt_gc_sidecar_skips_after_tool_use_hooks() {
             }),
         }],
     );
-
-    let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
-    let retrieve_args = json!({
-        "mode": "retrieve",
-        "policy_id": turn_context.config.manage_context_policy.quality_rubric_id,
-        "checkpoint_id": checkpoint_id.clone(),
-    })
-    .to_string();
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(StaticSseResponder {
-            calls: AtomicUsize::new(0),
-            response_body: sse(&[
-                response_created("resp-1"),
-                function_call_event("call-1", "prompt_gc", &retrieve_args),
-                response_completed_with_usage("resp-1", 17),
-            ]),
-            headers: Vec::new(),
-        })
-        .expect(1)
-        .mount(&server)
-        .await;
 
     configure_session_model_client_for_server(&mut session, &turn_context, &server);
 
@@ -587,6 +526,9 @@ async fn prompt_gc_persist_replacement_history_records_apply_succeeded_marker() 
             checkpoint_id: checkpoint.checkpoint_id,
             checkpoint_seq: checkpoint.checkpoint_seq,
             kind: PromptGcOutcomeKind::ApplySucceeded,
+            phase: Some(PromptGcExecutionPhase::Persist),
+            stop_reason: Some("target_reached".to_string()),
+            error_message: None,
             applied_unit_count: Some(2),
         })
     );
@@ -771,8 +713,11 @@ fn auto_switch_refresh_does_not_mark_missing_plan_as_unsupported() {
     );
 }
 
+// Merge-safety anchor: prompt_gc tests in this file must stay aligned with the
+// summary-only hidden contract, override rejection, recovery path, and fail-loud
+// schema enforcement.
 #[tokio::test]
-async fn prompt_gc_sidecar_contract_error_is_terminal_after_first_request() {
+async fn prompt_gc_sidecar_invalid_summary_payload_is_terminal_after_request() {
     let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
     let server = MockServer::start().await;
     let rollout_path = attach_rollout_recorder(&session).await;
@@ -783,15 +728,7 @@ async fn prompt_gc_sidecar_contract_error_is_terminal_after_first_request() {
             calls: AtomicUsize::new(0),
             response_body: sse(&[
                 response_created("resp-1"),
-                function_call_event(
-                    "call-1",
-                    crate::prompt_gc_sidecar::PROMPT_GC_TOOL_NAME,
-                    &json!({
-                        "mode": "retrieve",
-                        "checkpoint_id": checkpoint_id.clone(),
-                    })
-                    .to_string(),
-                ),
+                assistant_message_event("msg-1", "{\"summaries\":[]}"),
                 response_completed_with_usage("resp-1", 17),
             ]),
             headers: Vec::new(),
@@ -802,6 +739,12 @@ async fn prompt_gc_sidecar_contract_error_is_terminal_after_first_request() {
     configure_session_model_client_for_server(&mut session, &turn_context, &server);
 
     let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let reasoning = ResponseItem::Reasoning {
+        id: "reasoning-1".to_string(),
+        summary: Vec::new(),
+        content: None,
+        encrypted_content: None,
+    };
     let phase_message = ResponseItem::Message {
         id: Some("phase-1".to_string()),
         role: "assistant".to_string(),
@@ -811,10 +754,10 @@ async fn prompt_gc_sidecar_contract_error_is_terminal_after_first_request() {
         end_turn: None,
         phase: Some(codex_protocol::models::MessagePhase::Commentary),
     };
-    sidecar
-        .lock()
-        .await
-        .observe_recorded_item(0, &phase_message);
+    let observed_items = session
+        .record_into_history(&[reasoning, phase_message], &turn_context)
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
     let parent_client_session = session.services.model_client.new_session();
 
     run_prompt_gc_sidecar_if_needed(
@@ -830,7 +773,7 @@ async fn prompt_gc_sidecar_contract_error_is_terminal_after_first_request() {
     assert_eq!(status.last_applied_checkpoint_seq, None);
     assert_eq!(
         status.last_error.as_deref(),
-        Some("invalid_contract: missing or empty 'policy_id'")
+        Some("prompt_gc summary response requires a non-empty summaries list")
     );
     session.flush_rollout().await;
     assert_eq!(
@@ -840,12 +783,449 @@ async fn prompt_gc_sidecar_contract_error_is_terminal_after_first_request() {
                 checkpoint_id: checkpoint_id.clone(),
                 checkpoint_seq: 0,
                 kind: PromptGcOutcomeKind::Started,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: None,
+                error_message: None,
                 applied_unit_count: None,
             },
             PromptGcCompactionMetadata {
                 checkpoint_id,
                 checkpoint_seq: 0,
                 kind: PromptGcOutcomeKind::Failed,
+                phase: Some(PromptGcExecutionPhase::Summarize),
+                stop_reason: Some("invalid_summary_payload".to_string()),
+                error_message: Some(
+                    "prompt_gc summary response requires a non-empty summaries list".to_string(),
+                ),
+                applied_unit_count: None,
+            },
+        ]
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn prompt_gc_summary_response_rejects_unknown_top_level_fields() {
+    let error = parse_prompt_gc_summary_response_text(
+        r#"{"summaries":[{"chunk_id":"chunk-1","tool_context":"tool","reasoning_context":"reasoning"}],"junk":1}"#,
+    )
+    .expect_err("unknown top-level fields must fail");
+    assert!(error.contains("unknown field"));
+}
+
+#[test]
+fn prompt_gc_summary_response_rejects_multiple_assistant_messages() {
+    let error = parse_prompt_gc_summary_response(&[
+        assistant_message("not json"),
+        assistant_message(
+            r#"{"summaries":[{"chunk_id":"chunk-1","tool_context":"tool","reasoning_context":"reasoning"}]}"#,
+        ),
+    ])
+    .expect_err("multiple assistant messages must fail");
+    assert!(error.contains("requires exactly one assistant summary payload"));
+}
+
+#[test]
+fn prompt_gc_summary_response_rejects_single_empty_assistant_message() {
+    let error = parse_prompt_gc_summary_response(&[ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: Vec::new(),
+        end_turn: None,
+        phase: None,
+    }])
+    .expect_err("empty assistant payload must fail");
+    assert!(error.contains("returned no assistant summary payload"));
+}
+
+#[test]
+fn prompt_gc_summary_response_rejects_multiple_assistant_messages_when_one_is_empty() {
+    let error = parse_prompt_gc_summary_response(&[
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: Vec::new(),
+            end_turn: None,
+            phase: None,
+        },
+        assistant_message(
+            r#"{"summaries":[{"chunk_id":"chunk-1","tool_context":"tool","reasoning_context":"reasoning"}]}"#,
+        ),
+    ])
+    .expect_err("multiple assistant messages must fail");
+    assert!(error.contains("requires exactly one assistant summary payload, got 2"));
+}
+
+#[test]
+fn prompt_gc_summary_response_rejects_multiple_assistant_messages_with_non_output_content() {
+    let error = parse_prompt_gc_summary_response(&[
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "non-output".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        },
+        assistant_message(
+            r#"{"summaries":[{"chunk_id":"chunk-1","tool_context":"tool","reasoning_context":"reasoning"}]}"#,
+        ),
+    ])
+    .expect_err("assistant message count must include non-output assistant messages");
+    assert!(error.contains("requires exactly one assistant summary payload, got 2"));
+}
+
+#[tokio::test]
+async fn prompt_gc_sidecar_incomplete_summary_payload_fails_apply_validation() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let server = MockServer::start().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(StaticSseResponder {
+            calls: AtomicUsize::new(0),
+            response_body: sse(&[
+                response_created("resp-1"),
+                assistant_message_event(
+                    "msg-1",
+                    "{\"summaries\":[{\"chunk_id\":\"prompt_gc_chunk_0\",\"tool_context\":\"tool\",\"reasoning_context\":\"reasoning\"}]}",
+                ),
+                response_completed_with_usage("resp-1", 17),
+            ]),
+            headers: Vec::new(),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let observed_items = session
+        .record_into_history(
+            &[
+                ResponseItem::Reasoning {
+                    id: "reasoning-1".to_string(),
+                    summary: Vec::new(),
+                    content: None,
+                    encrypted_content: None,
+                },
+                ResponseItem::Reasoning {
+                    id: "reasoning-2".to_string(),
+                    summary: Vec::new(),
+                    content: None,
+                    encrypted_content: None,
+                },
+                ResponseItem::Message {
+                    id: Some("phase-1".to_string()),
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: "checkpoint".to_string(),
+                    }],
+                    end_turn: None,
+                    phase: Some(codex_protocol::models::MessagePhase::Commentary),
+                },
+            ],
+            &turn_context,
+        )
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, None);
+    let last_error = status.last_error.expect("apply validation error");
+    assert!(last_error.contains("invalid_summary_schema"));
+    assert!(last_error.contains("prompt_gc requires summaries for every chunk_manifest entry"));
+    assert!(last_error.contains("prompt_gc_chunk_1"));
+    session.flush_rollout().await;
+    assert_eq!(
+        prompt_gc_rollout_markers(&rollout_path).await,
+        vec![
+            PromptGcCompactionMetadata {
+                checkpoint_id: checkpoint_id.clone(),
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Started,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: None,
+                error_message: None,
+                applied_unit_count: None,
+            },
+            PromptGcCompactionMetadata {
+                checkpoint_id,
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Failed,
+                phase: Some(PromptGcExecutionPhase::Apply),
+                stop_reason: Some("apply_failed".to_string()),
+                error_message: Some(last_error),
+                applied_unit_count: None,
+            },
+        ]
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn prompt_gc_sidecar_rejects_legacy_prompt_override_contract() {
+    let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.prompt_gc_prompt = Some(
+        "Use the internal prompt_gc tool in a retrieve/apply loop until compaction succeeds."
+            .to_string(),
+    );
+    let rollout_path = attach_rollout_recorder(&session).await;
+    let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let observed_items = session
+        .record_into_history(
+            &[
+                ResponseItem::Reasoning {
+                    id: "reasoning-1".to_string(),
+                    summary: Vec::new(),
+                    content: None,
+                    encrypted_content: None,
+                },
+                ResponseItem::Message {
+                    id: Some("phase-1".to_string()),
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: "checkpoint".to_string(),
+                    }],
+                    end_turn: None,
+                    phase: Some(codex_protocol::models::MessagePhase::Commentary),
+                },
+            ],
+            &turn_context,
+        )
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, None);
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some(PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR)
+    );
+    session.flush_rollout().await;
+    assert_eq!(
+        prompt_gc_rollout_markers(&rollout_path).await,
+        vec![
+            PromptGcCompactionMetadata {
+                checkpoint_id: checkpoint_id.clone(),
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Started,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: None,
+                error_message: None,
+                applied_unit_count: None,
+            },
+            PromptGcCompactionMetadata {
+                checkpoint_id,
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Failed,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: Some("legacy_prompt_override".to_string()),
+                error_message: Some(PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR.to_string()),
+                applied_unit_count: None,
+            },
+        ]
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn prompt_gc_sidecar_rejects_legacy_prompt_override_contract_before_no_eligible_return() {
+    let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.prompt_gc_prompt = Some(
+        "Use the internal prompt_gc tool in a retrieve/apply loop until compaction succeeds."
+            .to_string(),
+    );
+    let rollout_path = attach_rollout_recorder(&session).await;
+    let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let phase_message = ResponseItem::Message {
+        id: Some("phase-1".to_string()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "checkpoint".to_string(),
+        }],
+        end_turn: None,
+        phase: Some(codex_protocol::models::MessagePhase::Commentary),
+    };
+    let observed_items = session
+        .record_into_history(std::slice::from_ref(&phase_message), &turn_context)
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, None);
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some(PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR)
+    );
+    session.flush_rollout().await;
+    assert_eq!(
+        prompt_gc_rollout_markers(&rollout_path).await,
+        vec![
+            PromptGcCompactionMetadata {
+                checkpoint_id: checkpoint_id.clone(),
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Started,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: None,
+                error_message: None,
+                applied_unit_count: None,
+            },
+            PromptGcCompactionMetadata {
+                checkpoint_id,
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Failed,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: Some("legacy_prompt_override".to_string()),
+                error_message: Some(PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR.to_string()),
+                applied_unit_count: None,
+            },
+        ]
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn prompt_gc_prompt_override_contract_allows_summary_only_override_with_obsolete_terms() {
+    let (_session, mut turn_context) = make_session_and_context().await;
+    turn_context.prompt_gc_prompt = Some(format!(
+        "{PROMPT_GC_SUMMARY_PROMPT_CONTRACT_VERSION}\nReturn JSON summaries only. Do not use plan_id or state_hash; they are obsolete."
+    ));
+
+    assert_eq!(prompt_gc_prompt_override_error(&turn_context), None);
+}
+
+#[tokio::test]
+async fn prompt_gc_prompt_override_contract_accepts_verbatim_builtin_prompt_copy() {
+    let (_session, mut turn_context) = make_session_and_context().await;
+    turn_context.prompt_gc_prompt = Some(crate::client_common::PROMPT_GC_PROMPT.to_string());
+
+    assert_eq!(prompt_gc_prompt_override_error(&turn_context), None);
+}
+
+#[tokio::test]
+async fn prompt_gc_prompt_override_contract_rejects_comment_only_override() {
+    let (_session, mut turn_context) = make_session_and_context().await;
+    turn_context.prompt_gc_prompt = Some(
+        "<!-- Merge-safety anchor: copied prompt without the contract header. -->".to_string(),
+    );
+
+    assert_eq!(
+        prompt_gc_prompt_override_error(&turn_context),
+        Some(PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR)
+    );
+}
+
+#[tokio::test]
+async fn prompt_gc_hidden_request_error_does_not_apply() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let server = MockServer::start().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1..)
+        .mount(&server)
+        .await;
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let observed_items = session
+        .record_into_history(
+            &[
+                ResponseItem::Reasoning {
+                    id: "reasoning-1".to_string(),
+                    summary: Vec::new(),
+                    content: None,
+                    encrypted_content: None,
+                },
+                ResponseItem::Message {
+                    id: Some("phase-1".to_string()),
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: "checkpoint".to_string(),
+                    }],
+                    end_turn: None,
+                    phase: Some(codex_protocol::models::MessagePhase::Commentary),
+                },
+            ],
+            &turn_context,
+        )
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, None);
+    assert!(status.last_error.is_some());
+    session.flush_rollout().await;
+    assert_eq!(
+        prompt_gc_rollout_markers(&rollout_path).await,
+        vec![
+            PromptGcCompactionMetadata {
+                checkpoint_id: checkpoint_id.clone(),
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Started,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: None,
+                error_message: None,
+                applied_unit_count: None,
+            },
+            PromptGcCompactionMetadata {
+                checkpoint_id,
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Failed,
+                phase: Some(PromptGcExecutionPhase::Request),
+                stop_reason: Some("request_failed".to_string()),
+                error_message: status.last_error,
                 applied_unit_count: None,
             },
         ]
@@ -913,11 +1293,15 @@ async fn prompt_gc_sidecar_recovers_noted_apply_outcome_after_stream_failure() {
         .await
         .note_apply_outcome(&checkpoint.checkpoint_id, vec![7]);
 
-    let outcome =
-        take_noted_prompt_gc_apply_outcome(session.as_ref(), turn_context.as_ref(), &checkpoint)
-            .await
-            .expect("noted outcome");
-    sidecar.lock().await.complete_cycle(outcome);
+    let parent_client_session = session.services.model_client.new_session();
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
 
     let status = sidecar.lock().await.status.clone();
     assert_eq!(status.last_error, None);
@@ -1138,14 +1522,19 @@ fn response_completed_with_usage(id: &str, total_tokens: u32) -> Value {
     })
 }
 
-fn function_call_event(call_id: &str, name: &str, arguments: &str) -> Value {
+fn assistant_message_event(message_id: &str, text: &str) -> Value {
     json!({
         "type": "response.output_item.done",
         "item": {
-            "type": "function_call",
-            "call_id": call_id,
-            "name": name,
-            "arguments": arguments
+            "type": "message",
+            "id": message_id,
+            "role": "assistant",
+            "status": "completed",
+            "content": [{
+                "type": "output_text",
+                "text": text,
+                "annotations": []
+            }]
         }
     })
 }

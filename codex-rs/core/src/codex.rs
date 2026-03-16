@@ -52,6 +52,8 @@ use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item;
 use crate::terminal;
+use crate::tools::handlers::prompt_gc::PromptGcChunkManifestEntry;
+use crate::tools::handlers::prompt_gc::PromptGcChunkSummary;
 use crate::truncate::TruncationPolicy;
 use crate::turn_metadata::TurnMetadataState;
 use crate::util::error_or_panic;
@@ -126,6 +128,7 @@ use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
 use rmcp::model::RequestId;
+use serde::Deserialize;
 use serde_json;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -237,6 +240,7 @@ use crate::protocol::NetworkApprovalContext;
 use crate::protocol::Op;
 use crate::protocol::PlanDeltaEvent;
 use crate::protocol::PromptGcCompactionMetadata;
+use crate::protocol::PromptGcExecutionPhase;
 use crate::protocol::PromptGcOutcomeKind;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::ReasoningContentDeltaEvent;
@@ -3182,8 +3186,8 @@ impl Session {
         }
         // Merge-safety anchor: PromptGcSidecar must fingerprint the canonical
         // stored history tail, not the pre-processed input items. History write
-        // processing can truncate tool outputs, and prompt_gc.retrieve later
-        // resolves against the stored history snapshot.
+        // processing can truncate tool outputs, and the runtime-owned prompt_gc
+        // plan later resolves against the stored history snapshot.
         let (start_index, appended_items) =
             state.record_items_and_snapshot_appended(items.iter(), turn_context.truncation_policy);
         appended_items
@@ -3328,6 +3332,9 @@ impl Session {
             prompt_gc: Some(prompt_gc_compaction_metadata(
                 checkpoint,
                 PromptGcOutcomeKind::ApplySucceeded,
+                Some(PromptGcExecutionPhase::Persist),
+                Some("target_reached".to_string()),
+                None,
                 Some(applied_unit_count),
             )),
         })];
@@ -3360,6 +3367,9 @@ impl Session {
         &self,
         checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
         kind: PromptGcOutcomeKind,
+        phase: Option<PromptGcExecutionPhase>,
+        stop_reason: Option<String>,
+        error_message: Option<String>,
         applied_unit_count: Option<u64>,
     ) {
         self.persist_rollout_items(&[RolloutItem::Compacted(CompactedItem {
@@ -3371,6 +3381,9 @@ impl Session {
             prompt_gc: Some(prompt_gc_compaction_metadata(
                 checkpoint,
                 kind,
+                phase,
+                stop_reason,
+                error_message,
                 applied_unit_count,
             )),
         })])
@@ -4113,12 +4126,18 @@ async fn persist_prompt_gc_rollout_items(
 fn prompt_gc_compaction_metadata(
     checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
     kind: PromptGcOutcomeKind,
+    phase: Option<PromptGcExecutionPhase>,
+    stop_reason: Option<String>,
+    error_message: Option<String>,
     applied_unit_count: Option<u64>,
 ) -> PromptGcCompactionMetadata {
     PromptGcCompactionMetadata {
         checkpoint_id: checkpoint.checkpoint_id.clone(),
         checkpoint_seq: checkpoint.checkpoint_seq,
         kind,
+        phase,
+        stop_reason,
+        error_message,
         applied_unit_count,
     }
 }
@@ -6150,11 +6169,23 @@ async fn run_prompt_gc_sidecar_if_needed(
     else {
         return;
     };
-    let Some(checkpoint) = sidecar.lock().await.take_pending_checkpoint() else {
+    let checkpoint = {
+        let mut sidecar = sidecar.lock().await;
+        sidecar.recover_noted_apply_outcome();
+        sidecar.take_pending_checkpoint()
+    };
+    let Some(checkpoint) = checkpoint else {
         return;
     };
-    sess.persist_prompt_gc_rollout_marker(&checkpoint, PromptGcOutcomeKind::Started, None)
-        .await;
+    sess.persist_prompt_gc_rollout_marker(
+        &checkpoint,
+        PromptGcOutcomeKind::Started,
+        Some(PromptGcExecutionPhase::Prepare),
+        None,
+        None,
+        None,
+    )
+    .await;
     struct PromptGcActivityGuard<'a> {
         session: &'a Session,
     }
@@ -6171,40 +6202,144 @@ async fn run_prompt_gc_sidecar_if_needed(
     }
     let _prompt_gc_activity_guard = PromptGcActivityGuard::new(sess.as_ref());
 
-    let router = Arc::new(crate::tools::spec::build_prompt_gc_sidecar_router());
-    let allowed_tool_names =
-        HashSet::from([crate::prompt_gc_sidecar::PROMPT_GC_TOOL_NAME.to_string()]);
-    let prompt_tools = prompt_tools_for_request(router.as_ref(), Some(&allowed_tool_names));
+    if let Some(error) = prompt_gc_prompt_override_error(turn_context.as_ref()) {
+        warn!(
+            turn_id = %turn_context.sub_id,
+            checkpoint_id = %checkpoint.checkpoint_id,
+            error,
+            "prompt_gc sidecar rejected an incompatible prompt override"
+        );
+        sidecar
+            .lock()
+            .await
+            .fail_cycle(&checkpoint.checkpoint_id, error.to_string());
+        sess.persist_prompt_gc_rollout_marker(
+            &checkpoint,
+            PromptGcOutcomeKind::Failed,
+            Some(PromptGcExecutionPhase::Prepare),
+            Some("legacy_prompt_override".to_string()),
+            Some(error.to_string()),
+            None,
+        )
+        .await;
+        return;
+    }
+
+    let plan = match crate::tools::handlers::prompt_gc::build_runtime_plan(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        &checkpoint.checkpoint_id,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                checkpoint_id = %checkpoint.checkpoint_id,
+                error = %error,
+                "prompt_gc sidecar failed to build the runtime plan"
+            );
+            sidecar
+                .lock()
+                .await
+                .fail_cycle(&checkpoint.checkpoint_id, error.to_string());
+            sess.persist_prompt_gc_rollout_marker(
+                &checkpoint,
+                PromptGcOutcomeKind::Failed,
+                Some(PromptGcExecutionPhase::Prepare),
+                Some("plan_build_failed".to_string()),
+                Some(error.to_string()),
+                None,
+            )
+            .await;
+            return;
+        }
+    };
+
+    if plan.chunk_manifest.is_empty() {
+        let outcome = PromptGcApplyOutcome {
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            checkpoint_seq: checkpoint.checkpoint_seq,
+            applied_unit_keys: Vec::new(),
+        };
+        sidecar.lock().await.complete_cycle(outcome);
+        sess.persist_prompt_gc_rollout_marker(
+            &checkpoint,
+            PromptGcOutcomeKind::NoEligibleChunks,
+            Some(PromptGcExecutionPhase::Prepare),
+            Some("no_eligible_chunks".to_string()),
+            None,
+            Some(0),
+        )
+        .await;
+        return;
+    }
+
+    let chunk_manifest = plan
+        .chunk_manifest
+        .iter()
+        .map(|chunk| chunk.manifest.clone())
+        .collect::<Vec<_>>();
+    let input = match prompt_gc_summary_input(turn_context.as_ref(), &checkpoint, &chunk_manifest) {
+        Ok(input) => input,
+        Err(error) => {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                checkpoint_id = %checkpoint.checkpoint_id,
+                error = %error,
+                "prompt_gc sidecar failed to build summary input"
+            );
+            sidecar
+                .lock()
+                .await
+                .fail_cycle(&checkpoint.checkpoint_id, error.clone());
+            sess.persist_prompt_gc_rollout_marker(
+                &checkpoint,
+                PromptGcOutcomeKind::Failed,
+                Some(PromptGcExecutionPhase::Prepare),
+                Some("summary_input_build_failed".to_string()),
+                Some(error),
+                None,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let router = Arc::new(crate::tools::router::ToolRouter::from_builder(
+        crate::tools::registry::ToolRegistryBuilder::new(),
+    ));
     let base_instructions = codex_protocol::models::BaseInstructions {
         text: turn_context.prompt_gc_prompt().to_string(),
     };
     let mut client_session = parent_client_session.new_hidden_child_session();
     let mut server_model_warning_emitted = false;
 
-    let first_prompt = Prompt {
-        input: prompt_gc_sidecar_input(turn_context.as_ref(), &checkpoint),
-        tools: prompt_tools.clone(),
+    let prompt = Prompt {
+        input,
+        tools: Vec::new(),
         parallel_tool_calls: false,
-        base_instructions: base_instructions.clone(),
+        base_instructions,
         personality: None,
-        output_schema: None,
+        output_schema: Some(prompt_gc_summary_output_schema()),
     };
-    let first_result = run_sampling_request_with_router_and_prompt(
+    let result = run_sampling_request_with_router_and_prompt(
         Arc::clone(sess),
         Arc::clone(turn_context),
-        Arc::clone(&turn_diff_tracker),
+        turn_diff_tracker,
         &mut client_session,
         None,
-        Arc::clone(&router),
-        first_prompt,
-        Some(&allowed_tool_names),
+        router,
+        prompt,
+        None,
         &mut server_model_warning_emitted,
         cancellation_token.child_token(),
         SamplingExecutionMode::Hidden,
     )
     .await;
 
-    let first_result = match first_result {
+    let result = match result {
         Ok(result) => result,
         Err(error) => {
             warn!(
@@ -6217,296 +6352,215 @@ async fn run_prompt_gc_sidecar_if_needed(
                 .lock()
                 .await
                 .fail_cycle(&checkpoint.checkpoint_id, error.to_string());
-            sess.persist_prompt_gc_rollout_marker(&checkpoint, PromptGcOutcomeKind::Failed, None)
-                .await;
+            sess.persist_prompt_gc_rollout_marker(
+                &checkpoint,
+                PromptGcOutcomeKind::Failed,
+                Some(PromptGcExecutionPhase::Request),
+                Some("request_failed".to_string()),
+                Some(error.to_string()),
+                None,
+            )
+            .await;
             return;
         }
     };
 
-    if let Some(outcome) =
-        parse_prompt_gc_apply_outcome(&first_result.recorded_response_items, &checkpoint)
-    {
-        sidecar.lock().await.complete_cycle(outcome);
-        return;
-    }
-    if let Some(outcome) =
-        take_noted_prompt_gc_apply_outcome(sess.as_ref(), turn_context.as_ref(), &checkpoint).await
-    {
-        sidecar.lock().await.complete_cycle(outcome);
-        return;
-    }
-    if let Some(error) = parse_prompt_gc_error(&first_result.recorded_response_items) {
-        sidecar
-            .lock()
-            .await
-            .fail_cycle(&checkpoint.checkpoint_id, error);
-        sess.persist_prompt_gc_rollout_marker(&checkpoint, PromptGcOutcomeKind::Failed, None)
-            .await;
-        return;
-    }
-
-    if prompt_gc_retrieve_was_empty(&first_result.recorded_response_items) {
-        let outcome = PromptGcApplyOutcome {
-            checkpoint_id: checkpoint.checkpoint_id.clone(),
-            checkpoint_seq: checkpoint.checkpoint_seq,
-            applied_unit_keys: Vec::new(),
-        };
-        sidecar.lock().await.complete_cycle(outcome);
+    if result.needs_follow_up {
+        sidecar.lock().await.fail_cycle(
+            &checkpoint.checkpoint_id,
+            "prompt_gc sidecar requested an unexpected follow-up",
+        );
         sess.persist_prompt_gc_rollout_marker(
             &checkpoint,
-            PromptGcOutcomeKind::EmptyRetrieve,
-            Some(0),
+            PromptGcOutcomeKind::Failed,
+            Some(PromptGcExecutionPhase::Request),
+            Some("unexpected_follow_up".to_string()),
+            Some("prompt_gc sidecar requested an unexpected follow-up".to_string()),
+            None,
         )
         .await;
         return;
     }
 
-    if !first_result.needs_follow_up {
-        sidecar.lock().await.fail_cycle(
-            &checkpoint.checkpoint_id,
-            "prompt_gc sidecar stopped after retrieve without an apply follow-up",
-        );
-        sess.persist_prompt_gc_rollout_marker(&checkpoint, PromptGcOutcomeKind::Failed, None)
-            .await;
-        return;
-    }
-
-    let second_prompt = Prompt {
-        input: first_result.recorded_response_items,
-        tools: prompt_tools,
-        parallel_tool_calls: false,
-        base_instructions,
-        personality: None,
-        output_schema: None,
-    };
-    let second_result = run_sampling_request_with_router_and_prompt(
-        Arc::clone(sess),
-        Arc::clone(turn_context),
-        turn_diff_tracker,
-        &mut client_session,
-        None,
-        router,
-        second_prompt,
-        Some(&allowed_tool_names),
-        &mut server_model_warning_emitted,
-        cancellation_token.child_token(),
-        SamplingExecutionMode::Hidden,
-    )
-    .await;
-
-    match second_result {
-        Ok(result) => {
-            if let Some(outcome) =
-                parse_prompt_gc_apply_outcome(&result.recorded_response_items, &checkpoint)
-            {
-                sidecar.lock().await.complete_cycle(outcome);
-            } else if let Some(outcome) = take_noted_prompt_gc_apply_outcome(
-                sess.as_ref(),
-                turn_context.as_ref(),
-                &checkpoint,
-            )
-            .await
-            {
-                sidecar.lock().await.complete_cycle(outcome);
-            } else if let Some(error) = parse_prompt_gc_error(&result.recorded_response_items) {
-                sidecar
-                    .lock()
-                    .await
-                    .fail_cycle(&checkpoint.checkpoint_id, error);
-                sess.persist_prompt_gc_rollout_marker(
-                    &checkpoint,
-                    PromptGcOutcomeKind::Failed,
-                    None,
-                )
-                .await;
-            } else {
-                warn!(
-                    turn_id = %turn_context.sub_id,
-                    checkpoint_id = %checkpoint.checkpoint_id,
-                    "prompt_gc sidecar completed without an apply outcome"
-                );
-                sidecar.lock().await.fail_cycle(
-                    &checkpoint.checkpoint_id,
-                    "prompt_gc sidecar completed without apply",
-                );
-                sess.persist_prompt_gc_rollout_marker(
-                    &checkpoint,
-                    PromptGcOutcomeKind::Failed,
-                    None,
-                )
-                .await;
-            }
-        }
+    let summaries = match parse_prompt_gc_summary_response(&result.recorded_response_items) {
+        Ok(summaries) => summaries,
         Err(error) => {
-            if let Some(outcome) = take_noted_prompt_gc_apply_outcome(
-                sess.as_ref(),
-                turn_context.as_ref(),
-                &checkpoint,
-            )
-            .await
-            {
-                sidecar.lock().await.complete_cycle(outcome);
-                return;
-            }
             warn!(
                 turn_id = %turn_context.sub_id,
                 checkpoint_id = %checkpoint.checkpoint_id,
                 error = %error,
-                "prompt_gc sidecar apply request failed"
+                "prompt_gc sidecar returned an invalid summary payload"
+            );
+            sidecar
+                .lock()
+                .await
+                .fail_cycle(&checkpoint.checkpoint_id, error.clone());
+            sess.persist_prompt_gc_rollout_marker(
+                &checkpoint,
+                PromptGcOutcomeKind::Failed,
+                Some(PromptGcExecutionPhase::Summarize),
+                Some("invalid_summary_payload".to_string()),
+                Some(error),
+                None,
+            )
+            .await;
+            return;
+        }
+    };
+
+    match crate::tools::handlers::prompt_gc::apply_runtime_plan(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        &checkpoint,
+        &plan,
+        &summaries,
+    )
+    .await
+    {
+        Ok(outcome) => sidecar.lock().await.complete_cycle(outcome),
+        Err(error) => {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                checkpoint_id = %checkpoint.checkpoint_id,
+                error = %error,
+                "prompt_gc sidecar failed to apply the runtime summary"
             );
             sidecar
                 .lock()
                 .await
                 .fail_cycle(&checkpoint.checkpoint_id, error.to_string());
-            sess.persist_prompt_gc_rollout_marker(&checkpoint, PromptGcOutcomeKind::Failed, None)
-                .await;
+            sess.persist_prompt_gc_rollout_marker(
+                &checkpoint,
+                PromptGcOutcomeKind::Failed,
+                Some(PromptGcExecutionPhase::Apply),
+                Some("apply_failed".to_string()),
+                Some(error.to_string()),
+                None,
+            )
+            .await;
         }
     }
 }
 
-async fn take_noted_prompt_gc_apply_outcome(
-    session: &Session,
-    turn_context: &TurnContext,
-    checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
-) -> Option<PromptGcApplyOutcome> {
-    let sidecar = session
-        .prompt_gc_sidecar_for_sub_id(&turn_context.sub_id)
-        .await?;
-    sidecar
-        .lock()
-        .await
-        .take_noted_apply_outcome(&checkpoint.checkpoint_id)
+const PROMPT_GC_SUMMARY_PROMPT_CONTRACT_VERSION: &str = "contract=prompt_gc_summary_v1";
+const PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR: &str = "prompt_gc_prompt overrides must start with 'contract=prompt_gc_summary_v1' to opt into the summary-only runtime contract";
+
+fn prompt_gc_prompt_override_error(turn_context: &TurnContext) -> Option<&'static str> {
+    let prompt = turn_context.prompt_gc_prompt.as_deref()?;
+    let mut inside_html_comment = false;
+    let contract_line = prompt.lines().find_map(|line| {
+        let trimmed = line.trim_start_matches('\u{feff}').trim();
+        if inside_html_comment {
+            if trimmed.contains("-->") {
+                inside_html_comment = false;
+            }
+            return None;
+        }
+        if trimmed.is_empty() {
+            return None;
+        }
+        if trimmed.starts_with("<!--") {
+            if !trimmed.contains("-->") {
+                inside_html_comment = true;
+            }
+            return None;
+        }
+        Some(trimmed)
+    });
+    let Some(contract_line) = contract_line else {
+        return Some(PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR);
+    };
+    (contract_line != PROMPT_GC_SUMMARY_PROMPT_CONTRACT_VERSION)
+        .then_some(PROMPT_GC_PROMPT_OVERRIDE_CONTRACT_ERROR)
 }
 
-fn prompt_gc_sidecar_input(
-    turn_context: &TurnContext,
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptGcSummaryResponse {
+    summaries: Vec<PromptGcChunkSummary>,
+}
+
+fn prompt_gc_summary_output_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "summaries": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "chunk_id": { "type": "string" },
+                        "tool_context": { "type": "string" },
+                        "reasoning_context": { "type": "string" }
+                    },
+                    "required": ["chunk_id", "tool_context", "reasoning_context"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["summaries"],
+        "additionalProperties": false
+    })
+}
+
+fn parse_prompt_gc_summary_response(
+    items: &[ResponseItem],
+) -> Result<Vec<PromptGcChunkSummary>, String> {
+    let assistant_messages = items
+        .iter()
+        .filter(|item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"))
+        .collect::<Vec<_>>();
+    if assistant_messages.is_empty() {
+        return Err("prompt_gc sidecar returned no assistant summary payload".to_string());
+    }
+    if assistant_messages.len() != 1 {
+        return Err(format!(
+            "prompt_gc sidecar requires exactly one assistant summary payload, got {}",
+            assistant_messages.len()
+        ));
+    }
+    let assistant_payload = raw_assistant_output_text_from_item(assistant_messages[0])
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| "prompt_gc sidecar returned no assistant summary payload".to_string())?;
+    parse_prompt_gc_summary_response_text(&assistant_payload).map(|response| response.summaries)
+}
+
+fn parse_prompt_gc_summary_response_text(raw: &str) -> Result<PromptGcSummaryResponse, String> {
+    let response: PromptGcSummaryResponse = serde_json::from_str(raw)
+        .map_err(|error| format!("failed to parse prompt_gc summary JSON: {error}"))?;
+    if response.summaries.is_empty() {
+        return Err("prompt_gc summary response requires a non-empty summaries list".to_string());
+    }
+    Ok(response)
+}
+
+fn prompt_gc_summary_input_message(
     checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
-) -> Vec<ResponseItem> {
-    vec![ResponseItem::Message {
+    chunk_manifest: &[PromptGcChunkManifestEntry],
+) -> Result<String, String> {
+    let manifest_text = serde_json::to_string_pretty(chunk_manifest)
+        .map_err(|error| format!("failed to serialize prompt_gc chunk_manifest: {error}"))?;
+    Ok(format!(
+        "mode=prompt_gc_summary\ncheckpoint_id={}\ncheckpoint_seq={}\n\nReturn JSON only. Do not emit prose, markdown, or code fences.\n\nRequirements:\n- Return exactly one summary object per chunk_manifest entry.\n- Use only chunk_id values from chunk_manifest.\n- Keep chunk_id values unique.\n- Preserve semantic meaning while reducing prompt bloat.\n- `tool_context` and `reasoning_context` may be empty individually, but not both for the same chunk.\n\nchunk_manifest:\n{manifest_text}",
+        checkpoint.checkpoint_id, checkpoint.checkpoint_seq,
+    ))
+}
+
+fn prompt_gc_summary_input(
+    _turn_context: &TurnContext,
+    checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
+    chunk_manifest: &[PromptGcChunkManifestEntry],
+) -> Result<Vec<ResponseItem>, String> {
+    let text = prompt_gc_summary_input_message(checkpoint, chunk_manifest)?;
+    Ok(vec![ResponseItem::Message {
         id: None,
         role: "user".to_string(),
-        content: vec![codex_protocol::models::ContentItem::InputText {
-            text: format!(
-                "mode=prompt_gc\npolicy_id={}\ncheckpoint_id={}",
-                turn_context.config.manage_context_policy.quality_rubric_id,
-                checkpoint.checkpoint_id
-            ),
-        }],
+        content: vec![codex_protocol::models::ContentItem::InputText { text }],
         end_turn: None,
         phase: None,
-    }]
-}
-
-fn parse_prompt_gc_apply_outcome(
-    items: &[ResponseItem],
-    checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
-) -> Option<PromptGcApplyOutcome> {
-    for item in items.iter().rev() {
-        let output_text = match item {
-            ResponseItem::FunctionCallOutput { output, .. }
-            | ResponseItem::CustomToolCallOutput { output, .. } => match output.text_content() {
-                Some(text) => text,
-                None => continue,
-            },
-            _ => continue,
-        };
-        // Merge-safety anchor: hidden prompt_gc recovery may scan mixed tool outputs after a
-        // stream failure. Skip unrelated or malformed payloads instead of aborting the scan
-        // before a valid terminal prompt_gc apply output is reached.
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(output_text) else {
-            continue;
-        };
-        if value.get("mode").and_then(serde_json::Value::as_str) != Some("apply") {
-            continue;
-        }
-        let applied_unit_keys = value
-            .get("applied_unit_keys")
-            .and_then(serde_json::Value::as_array)
-            .map(|keys| {
-                keys.iter()
-                    .filter_map(serde_json::Value::as_u64)
-                    .collect::<Vec<u64>>()
-            })
-            .unwrap_or_default();
-        return Some(PromptGcApplyOutcome {
-            checkpoint_id: checkpoint.checkpoint_id.clone(),
-            checkpoint_seq: checkpoint.checkpoint_seq,
-            applied_unit_keys,
-        });
-    }
-    None
-}
-
-fn parse_prompt_gc_error(items: &[ResponseItem]) -> Option<String> {
-    for item in items.iter().rev() {
-        let output_text = match item {
-            ResponseItem::FunctionCallOutput { output, .. }
-            | ResponseItem::CustomToolCallOutput { output, .. } => match output.text_content() {
-                Some(text) => text,
-                None => continue,
-            },
-            _ => continue,
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(output_text) else {
-            continue;
-        };
-        if value.get("mode").and_then(serde_json::Value::as_str) != Some("error") {
-            continue;
-        }
-        let message = value
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("prompt_gc failed");
-        if let Some(stop_reason) = value.get("stop_reason").and_then(serde_json::Value::as_str) {
-            return Some(format!("{stop_reason}: {message}"));
-        }
-        return Some(message.to_string());
-    }
-    None
-}
-
-fn prompt_gc_retrieve_was_empty(items: &[ResponseItem]) -> bool {
-    for item in items.iter().rev() {
-        let output_text = match item {
-            ResponseItem::FunctionCallOutput { output, .. }
-            | ResponseItem::CustomToolCallOutput { output, .. } => match output.text_content() {
-                Some(text) => text,
-                None => continue,
-            },
-            _ => continue,
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(output_text) else {
-            continue;
-        };
-        if value.get("mode").and_then(serde_json::Value::as_str) != Some("retrieve") {
-            continue;
-        }
-        return value
-            .get("chunk_manifest")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(Vec::is_empty);
-    }
-    false
-}
-
-fn prompt_gc_terminal_output_present(items: &[ResponseItem]) -> bool {
-    items.iter().rev().any(|item| {
-        let output_text = match item {
-            ResponseItem::FunctionCallOutput { output, .. }
-            | ResponseItem::CustomToolCallOutput { output, .. } => match output.text_content() {
-                Some(text) => text,
-                None => return false,
-            },
-            _ => return false,
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(output_text) else {
-            return false;
-        };
-        value
-            .get("mode")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|mode| matches!(mode, "retrieve" | "apply" | "error"))
-    })
+    }])
 }
 
 fn prompt_tools_for_request(
@@ -8243,19 +8297,7 @@ async fn try_run_sampling_request(
             result.recorded_response_items = recorded_response_items;
             Ok(result)
         }
-        Err(err) => {
-            if execution_mode == SamplingExecutionMode::Hidden
-                && prompt_gc_terminal_output_present(&recorded_response_items)
-            {
-                return Ok(SamplingRequestResult {
-                    needs_follow_up,
-                    last_agent_message,
-                    non_tool_response_items,
-                    recorded_response_items,
-                });
-            }
-            Err(err)
-        }
+        Err(err) => Err(err),
     }
 }
 

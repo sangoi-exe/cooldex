@@ -496,7 +496,6 @@ mod resume_agent {
 pub(crate) mod wait {
     use super::*;
     use crate::agent::status::is_final;
-    use futures::FutureExt;
     use futures::StreamExt;
     use futures::stream::FuturesUnordered;
     use std::collections::HashMap;
@@ -776,7 +775,7 @@ pub(crate) mod wait {
         deadline: Option<Instant>,
     ) -> Result<bool, FunctionCallError>
     where
-        F: std::future::Future<Output = Option<(ThreadId, AgentStatus)>> + Unpin,
+        F: std::future::Future<Output = Option<(ThreadId, AgentStatus)>>,
     {
         if let Some(deadline) = deadline {
             loop {

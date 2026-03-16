@@ -334,6 +334,13 @@ impl PromptGcSidecar {
         None
     }
 
+    pub(crate) fn recover_noted_apply_outcome(&mut self) -> Option<PromptGcApplyOutcome> {
+        let checkpoint_id = self.active_checkpoint.as_ref()?.checkpoint_id.clone();
+        let outcome = self.take_noted_apply_outcome(&checkpoint_id)?;
+        self.complete_cycle(outcome.clone());
+        Some(outcome)
+    }
+
     fn observe_phase_checkpoint(&mut self, phase: MessagePhase, assistant_item_id: Option<String>) {
         let checkpoint_seq = self.next_checkpoint_seq;
         self.next_checkpoint_seq += 1;

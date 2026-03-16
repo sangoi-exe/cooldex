@@ -14,6 +14,7 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use serde::Deserialize;
@@ -167,11 +168,19 @@ fn build_recall_payload(
         .iter()
         .filter(|item| matches!(item, RolloutItem::Compacted(_)))
         .count();
-    let Some(latest_compacted_index) = rollout_items
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, item)| matches!(item, RolloutItem::Compacted(_)).then_some(index))
+    let Some(latest_compacted_index) =
+        rollout_items
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, item)| match item {
+                RolloutItem::Compacted(compacted)
+                    if !is_prompt_gc_observational_marker(compacted) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
     else {
         // Merge-safety anchor: "no_compaction_marker" drives the fail-loud
         // recall-first recovery path after auto-compaction warnings.
@@ -335,7 +344,10 @@ fn previous_recall_boundary_before(
                 index,
                 kind: RecallBoundaryKind::ContextCompactedEvent,
             }),
-            RolloutItem::Compacted(compacted) if compacted.replacement_history.is_some() => {
+            RolloutItem::Compacted(compacted)
+                if compacted.replacement_history.is_some()
+                    && !is_prompt_gc_compaction_marker(compacted) =>
+            {
                 Some(RecallBoundary {
                     index,
                     kind: RecallBoundaryKind::ReplacementHistoryCompacted,
@@ -344,6 +356,15 @@ fn previous_recall_boundary_before(
             _ => None,
         })
         .next_back()
+}
+
+fn is_prompt_gc_compaction_marker(compacted: &CompactedItem) -> bool {
+    compacted.prompt_gc.is_some()
+        || compacted.message == crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER
+}
+
+fn is_prompt_gc_observational_marker(compacted: &CompactedItem) -> bool {
+    is_prompt_gc_compaction_marker(compacted) && compacted.replacement_history.is_none()
 }
 
 fn recall_item_from_response_item(
@@ -525,6 +546,9 @@ mod tests {
     use codex_protocol::models::ReasoningItemReasoningSummary::SummaryText;
     use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::ContextCompactedEvent;
+    use codex_protocol::protocol::PromptGcCompactionMetadata;
+    use codex_protocol::protocol::PromptGcExecutionPhase;
+    use codex_protocol::protocol::PromptGcOutcomeKind;
     use codex_protocol::protocol::UserMessageEvent;
     use pretty_assertions::assert_eq;
     use serde_json::Value;
@@ -596,6 +620,38 @@ mod tests {
         })
     }
 
+    fn prompt_gc_observational_marker(kind: PromptGcOutcomeKind) -> RolloutItem {
+        RolloutItem::Compacted(CompactedItem {
+            message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
+            replacement_history: None,
+            prompt_gc: Some(PromptGcCompactionMetadata {
+                checkpoint_id: "turn-1:prompt_gc:0".to_string(),
+                checkpoint_seq: 0,
+                kind,
+                phase: Some(PromptGcExecutionPhase::Request),
+                stop_reason: Some("request_failed".to_string()),
+                error_message: Some("request failed".to_string()),
+                applied_unit_count: None,
+            }),
+        })
+    }
+
+    fn prompt_gc_replacement_history_marker(replacement_history: Vec<ResponseItem>) -> RolloutItem {
+        RolloutItem::Compacted(CompactedItem {
+            message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
+            replacement_history: Some(replacement_history),
+            prompt_gc: Some(PromptGcCompactionMetadata {
+                checkpoint_id: "turn-1:prompt_gc:1".to_string(),
+                checkpoint_seq: 1,
+                kind: PromptGcOutcomeKind::ApplySucceeded,
+                phase: Some(PromptGcExecutionPhase::Persist),
+                stop_reason: Some("target_reached".to_string()),
+                error_message: None,
+                applied_unit_count: Some(1),
+            }),
+        })
+    }
+
     fn user_message_event(text: &str) -> RolloutItem {
         RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
             message: text.to_string(),
@@ -619,6 +675,20 @@ mod tests {
             .and_then(Value::as_str)
             .expect("stop_reason")
             .to_string()
+    }
+
+    fn compact_recall_items(payload: &Value) -> Vec<String> {
+        payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("recall items array")
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .expect("compact recall item string")
+                    .to_string()
+            })
+            .collect()
     }
 
     #[test]
@@ -957,6 +1027,63 @@ mod tests {
         assert_eq!(
             payload.pointer("/boundary/last_boundary_kind"),
             Some(&json!("replacement_history_compacted"))
+        );
+    }
+
+    #[test]
+    fn recall_ignores_prompt_gc_observational_markers_as_upper_boundary() {
+        let rollout_items = vec![
+            assistant_message("before real compaction", None),
+            compacted_marker(),
+            assistant_message("after real compaction", None),
+            prompt_gc_observational_marker(PromptGcOutcomeKind::Failed),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, false)
+            .expect("build compact recall payload");
+
+        assert_eq!(
+            compact_recall_items(&payload),
+            vec!["1: [am] before real compaction".to_string()]
+        );
+    }
+
+    #[test]
+    fn recall_ignores_prompt_gc_replacement_history_as_lower_boundary() {
+        let rollout_items = vec![
+            replacement_history_compacted_marker_with_history(vec![ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "real base".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }]),
+            assistant_message("after real boundary", None),
+            prompt_gc_replacement_history_marker(vec![ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "prompt gc base".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }]),
+            assistant_message("after prompt gc boundary", None),
+            compacted_marker(),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, false)
+            .expect("build compact recall payload");
+
+        assert_eq!(
+            compact_recall_items(&payload),
+            vec![
+                "1: [am] real base".to_string(),
+                "2: [am] after real boundary".to_string(),
+                "3: [am] after prompt gc boundary".to_string(),
+            ]
         );
     }
 

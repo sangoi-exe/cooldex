@@ -1,3 +1,4 @@
+<!-- Merge-safety anchor: recall maintenance guidance must stay aligned with prompt_gc-aware upper/lower boundary rules so future syncs do not reintroduce stale compaction semantics. -->
 # Recall Maintenance Guide
 
 This document describes the current `recall` contract and the required maintenance checks when `recall` behavior changes.
@@ -7,11 +8,13 @@ This document describes the current `recall` contract and the required maintenan
 - `recall` accepts only an empty object payload: `{}`.
 - Any unknown argument fails loud with `stop_reason = "invalid_contract"`.
 - The rollout source is always the current session rollout recorder.
-- The upper boundary is the latest `RolloutItem::Compacted`.
+- The upper boundary is the latest non-observational compaction marker:
+  - a legacy `RolloutItem::Compacted` without prompt-gc observational metadata, or
+  - a prompt-gc `RolloutItem::Compacted` only when it carries `replacement_history: Some(...)`.
 - For standard compactions, the matching `EventMsg::ContextCompacted(_)` is a legacy event emitted after the `ContextCompaction` item completes, so the current compaction's own legacy event is not part of the pre-`Compacted` scan.
 - The lower boundary is the most recent earlier marker before that upper boundary where the marker is either:
   - `EventMsg::ContextCompacted(_)` from a previous compaction, or
-  - `RolloutItem::Compacted` with `replacement_history: Some(...)`.
+  - `RolloutItem::Compacted` with `replacement_history: Some(...)` that is not any prompt-gc marker.
 - If that lower boundary is `replacement_history_compacted`, recall hydrates the sanitized `replacement_history` stored on that marker as the base of the returned reasoning/assistant window, then appends newer matching rollout items after the marker.
 - Otherwise, returned rollout scan starts immediately after the lower boundary marker; when no lower boundary exists, scan starts at index `0`.
 - Returned items include only assistant messages and reasoning text.

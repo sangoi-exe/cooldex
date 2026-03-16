@@ -4047,11 +4047,15 @@ impl ChatWidget {
                 self.submit_user_message(INIT_PROMPT.to_string().into());
             }
             SlashCommand::Compact => {
-                self.clear_token_usage();
+                // Merge-safety anchor: hidden prompt_gc slash flows must only
+                // clear prompt_gc-private usage so visible `% left` state does
+                // not jump when the current footer data came from normal token
+                // accounting.
+                self.clear_prompt_gc_private_context_usage_info();
                 self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
             }
             SlashCommand::Sanitize => {
-                self.clear_token_usage();
+                self.clear_prompt_gc_private_context_usage_info();
                 self.app_event_tx.send(AppEvent::CodexOp(Op::Sanitize));
             }
             SlashCommand::Review => {
@@ -9179,10 +9183,6 @@ impl ChatWidget {
     #[cfg(test)]
     pub(crate) fn hide_status_indicator_for_test(&mut self) {
         self.bottom_pane.hide_status_indicator();
-    }
-
-    pub(crate) fn clear_token_usage(&mut self) {
-        self.token_info = None;
     }
 
     fn as_renderable(&self) -> RenderableItem<'_> {

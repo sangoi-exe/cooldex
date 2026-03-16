@@ -1798,12 +1798,17 @@ impl App {
     }
 
     fn reset_thread_event_state(&mut self) {
+        // Merge-safety anchor: fresh-session resets must clear the primary
+        // prompt-GC completion flags or hidden token usage can leak into the
+        // next session's visible token handling.
         self.abort_all_thread_event_listeners();
         self.thread_event_channels.clear();
         self.agent_picker_threads.clear();
         self.active_thread_id = None;
         self.active_thread_rx = None;
         self.primary_thread_id = None;
+        self.primary_prompt_gc_completion_pending = false;
+        self.primary_prompt_gc_visible_token_count_seen = false;
         self.pending_primary_events.clear();
         self.chat_widget.set_pending_thread_approvals(Vec::new());
     }
@@ -4799,6 +4804,18 @@ mod tests {
             .await
             .expect("timed out waiting for listener task abort")
             .expect("listener task drop notification should succeed");
+    }
+
+    #[tokio::test]
+    async fn reset_thread_event_state_clears_prompt_gc_primary_flags() {
+        let mut app = make_test_app().await;
+        app.primary_prompt_gc_completion_pending = true;
+        app.primary_prompt_gc_visible_token_count_seen = true;
+
+        app.reset_thread_event_state();
+
+        assert!(!app.primary_prompt_gc_completion_pending);
+        assert!(!app.primary_prompt_gc_visible_token_count_seen);
     }
 
     #[tokio::test]

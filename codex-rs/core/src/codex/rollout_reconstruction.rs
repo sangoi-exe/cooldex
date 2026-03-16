@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
 // the resume/fork hydration metadata derived from the same replay.
@@ -32,6 +33,8 @@ struct ActiveReplaySegment<'a> {
     previous_turn_settings: Option<PreviousTurnSettings>,
     reference_context_item: TurnReferenceContextItem,
     base_replacement_history: Option<&'a [ResponseItem]>,
+    rollout_suffix_start_index: Option<usize>,
+    compaction_indices: Vec<usize>,
 }
 
 fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&str>) -> bool {
@@ -47,6 +50,8 @@ fn is_prompt_gc_compaction_marker(compacted: &CompactedItem) -> bool {
 fn finalize_active_segment<'a>(
     active_segment: ActiveReplaySegment<'a>,
     base_replacement_history: &mut Option<&'a [ResponseItem]>,
+    rollout_suffix_start_index: &mut usize,
+    discarded_compaction_indices: &mut HashSet<usize>,
     previous_turn_settings: &mut Option<PreviousTurnSettings>,
     reference_context_item: &mut TurnReferenceContextItem,
     pending_rollback_turns: &mut usize,
@@ -58,6 +63,7 @@ fn finalize_active_segment<'a>(
         if active_segment.counts_as_user_turn {
             *pending_rollback_turns -= 1;
         }
+        discarded_compaction_indices.extend(active_segment.compaction_indices);
         return;
     }
 
@@ -67,6 +73,10 @@ fn finalize_active_segment<'a>(
         && let Some(segment_base_replacement_history) = active_segment.base_replacement_history
     {
         *base_replacement_history = Some(segment_base_replacement_history);
+        if let Some(segment_rollout_suffix_start_index) = active_segment.rollout_suffix_start_index
+        {
+            *rollout_suffix_start_index = segment_rollout_suffix_start_index;
+        }
     }
 
     // `previous_turn_settings` come from the newest surviving user turn that established them.
@@ -106,7 +116,8 @@ impl Session {
         let mut pending_rollback_turns = 0usize;
         // Borrowed suffix of rollout items newer than the newest surviving replacement-history
         // checkpoint. If no such checkpoint exists, this remains the full rollout.
-        let mut rollout_suffix = rollout_items;
+        let mut rollout_suffix_start_index = 0usize;
+        let mut discarded_compaction_indices = HashSet::new();
         // Reverse replay accumulates rollout items into the newest in-progress turn segment until
         // we hit its matching `TurnStarted`, at which point the segment can be finalized.
         let mut active_segment: Option<ActiveReplaySegment<'_>> = None;
@@ -121,6 +132,7 @@ impl Session {
                     }
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    active_segment.compaction_indices.push(index);
                     // Looking backward, compaction clears any older baseline unless a newer
                     // `TurnContextItem` in this same segment has already re-established it.
                     if matches!(
@@ -144,7 +156,7 @@ impl Session {
                         // crash-truncated prompt_gc pair would rewrite history
                         // without the resume metadata that anchors it.
                         active_segment.base_replacement_history = Some(replacement_history);
-                        rollout_suffix = &rollout_items[index + 1..];
+                        active_segment.rollout_suffix_start_index = Some(index.saturating_add(1));
                     }
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
@@ -216,6 +228,8 @@ impl Session {
                         finalize_active_segment(
                             active_segment,
                             &mut base_replacement_history,
+                            &mut rollout_suffix_start_index,
+                            &mut discarded_compaction_indices,
                             &mut previous_turn_settings,
                             &mut reference_context_item,
                             &mut pending_rollback_turns,
@@ -242,6 +256,8 @@ impl Session {
             finalize_active_segment(
                 active_segment,
                 &mut base_replacement_history,
+                &mut rollout_suffix_start_index,
+                &mut discarded_compaction_indices,
                 &mut previous_turn_settings,
                 &mut reference_context_item,
                 &mut pending_rollback_turns,
@@ -256,7 +272,11 @@ impl Session {
         // Materialize exact history semantics from the replay-derived suffix. The eventual lazy
         // design should keep this same replay shape, but drive it from a resumable reverse source
         // instead of an eagerly loaded `&[RolloutItem]`.
-        for item in rollout_suffix {
+        for (index, item) in rollout_items
+            .iter()
+            .enumerate()
+            .skip(rollout_suffix_start_index)
+        {
             match item {
                 RolloutItem::ResponseItem(response_item) => {
                     history.record_items(
@@ -265,6 +285,9 @@ impl Session {
                     );
                 }
                 RolloutItem::Compacted(compacted) => {
+                    if discarded_compaction_indices.contains(&index) {
+                        continue;
+                    }
                     if is_prompt_gc_compaction_marker(compacted) {
                         continue;
                     }

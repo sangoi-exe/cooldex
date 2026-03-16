@@ -12,6 +12,7 @@ During any sync/merge with `main` and/or `upstream`, these rules are mandatory:
 6. Remove from the workspace all CI/CD content under `.github` (workflows, actions, and any other pipeline artifacts).
 
 <!-- Merge-safety anchor: AGENTS.md is the canonical source for the workspace-local customization inventory and merge-policy invariants; future sync work must update this section and keep scratchpads as redirects only. -->
+
 ## Workspace-local Customization Inventory (Source of Truth)
 
 This section is the canonical cluster-level inventory of durable workspace-local divergence that must survive future syncs/merges with `upstream/main`. Re-derive it from the live diff against `upstream/main` whenever a cluster is added, removed, or materially re-scoped. Scratchpads may point here, but they must not duplicate the inventory body. This is a policy/inventory source of truth, not a claim that every legacy marker has already been normalized everywhere. The listed files are representative high-signal entrypoints, not an exhaustive manifest of every touched file in a cluster.
@@ -27,16 +28,11 @@ This section is the canonical cluster-level inventory of durable workspace-local
 
 ## Workspace Test Safety
 
-Whenever test execution is explicitly authorized in this workspace, run `cargo clean` immediately before the test command and immediately after it finishes.
-
-- Do not run tests that trigger compilation in this workspace. Leave compile-triggering validation to the user unless they explicitly re-authorize it in the current session.
 - Do not delegate test execution to sub-agents in this workspace.
 
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:
-
-## General Rules
 
 - Crate names are prefixed with `codex-`. For example, the `core` folder's crate is named `codex-core`
 - When using format! and you can inline variables into {}, always do that.
@@ -47,6 +43,11 @@ In the codex-rs folder where the rust code lives:
 - Always collapse if statements per https://rust-lang.github.io/rust-clippy/master/index.html#collapsible_if
 - Always inline format! args when possible per https://rust-lang.github.io/rust-clippy/master/index.html#uninlined_format_args
 - Use method references over closures when possible per https://rust-lang.github.io/rust-clippy/master/index.html#redundant_closure_for_method_calls
+- Avoid bool or ambiguous `Option` parameters that force callers to write hard-to-read code such as `foo(false)` or `bar(None)`. Prefer enums, named methods, newtypes, or other idiomatic Rust API shapes when they keep the callsite self-documenting.
+- When you cannot make that API change and still need a small positional-literal callsite in Rust, follow the `argument_comment_lint` convention:
+  - Use an exact `/*param_name*/` comment before opaque literal arguments such as `None`, booleans, and numeric literals when passing them by position.
+  - Do not add these comments for string or char literals unless the comment adds real clarity; those literals are intentionally exempt from the lint.
+  - If you add one of these comments, the parameter name must exactly match the callee signature.
 - When possible, make `match` statements exhaustive and avoid wildcard arms.
 - When writing tests, prefer comparing the equality of entire objects over fields one by one.
 - When making a change that adds or changes an API, ensure that the documentation in the `docs/` folder is up to date if applicable.
@@ -72,15 +73,12 @@ In the codex-rs folder where the rust code lives:
   - When extracting code from a large module, move the related tests and module/type docs toward
     the new implementation so the invariants stay close to the code that owns them.
 
-## Validation Workflow
+Run `just fmt` (in `codex-rs` directory) automatically after you have finished making Rust code changes; do not ask for approval to run it. Additionally, run the tests:
 
-Run `just fmt` (in `codex-rs` directory) automatically after you have finished making Rust code changes; do not ask for approval to run it. Do not run `cargo build` as a validation step.
+1. Run the test for the specific project that was changed. For example, if changes were made in `codex-rs/tui`, run `cargo test -p codex-tui`.
+2. Once those pass, if any changes were made in common, core, or protocol, run the complete test suite with `cargo test` (or `just test` if `cargo-nextest` is installed). Avoid `--all-features` for routine local runs because it expands the build matrix and can significantly increase `target/` disk usage; use it only when you specifically need full feature coverage. project-specific or individual tests can be run without asking the user, but do ask the user before running the complete test suite.
 
-Never run tests whose failure signal is redundant with build/compilation failures (including anything that would only surface the same errors as `cargo build`).
-Run tests only when they provide additional, non-build signal (for example behavioral/runtime/integration/snapshot validation).
-Prefer leaving test execution to the user unless explicitly requested; when requested, keep tests targeted and avoid full-suite runs unless explicitly asked.
-
-Before finalizing a large change to `codex-rs`, run `just fix -p <project>` (in `codex-rs` directory) to fix any linter issues in the code. Prefer scoping with `-p` to avoid slow workspace‑wide Clippy builds; only run `just fix` without `-p` if you changed shared crates. Do not run `cargo build` after `fix`/`fmt`; only run tests when they add non-build signal.
+Before finalizing a large change to `codex-rs`, run `just fix -p <project>` (in `codex-rs` directory) to fix any linter issues in the code. Prefer scoping with `-p` to avoid slow workspace‑wide Clippy builds; only run `just fix` without `-p` if you changed shared crates. Do not re-run tests after running `fix` or `fmt`.
 
 ## TUI style conventions
 
@@ -127,12 +125,8 @@ is easy to review and future diffs stay visual.
 
 When UI or text output changes intentionally, update the snapshots as follows:
 
-<!-- Merge-safety anchor: snapshot-test instructions in this workspace stay gated by explicit re-authorization plus cargo-clean guardrails; do not revert to unconditional compile-triggering test runs. -->
-- In this workspace, only run the snapshot test command after explicit re-authorization per `## Workspace Test Safety`; otherwise leave the compile-triggering step to the user.
-- When that authorization exists, apply the workspace `cargo clean` guardrail around the test command:
-  - `cargo clean`
+- Run tests to generate any updated snapshots:
   - `cargo test -p codex-tui`
-  - `cargo clean`
 - Check what’s pending:
   - `cargo insta pending-snapshots -p codex-tui`
 - Review changes by reading the generated `*.snap.new` files directly in the repo, or preview a specific file:
@@ -226,7 +220,6 @@ These guidelines apply to app-server protocol work in `codex-rs`, especially:
 - Regenerate schema fixtures when API shapes change:
   `just write-app-server-schema`
   (and `just write-app-server-schema --experimental` when experimental API fixtures are affected).
-<!-- Merge-safety anchor: app-server protocol validation in this workspace is conditional on explicit re-authorization; do not restore unconditional compile-triggering test commands here. -->
-- In this workspace, only run `cargo test -p codex-app-server-protocol` after explicit re-authorization per `## Workspace Test Safety`, and only when that behavioral/schema signal adds more than build-time validation.
+- Validate with `cargo test -p codex-app-server-protocol`.
 - Avoid boilerplate tests that only assert experimental field markers for individual
   request fields in `common.rs`; rely on schema generation/tests and behavioral coverage instead.

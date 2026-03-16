@@ -3,6 +3,8 @@
 //! These tests treat the widget as the adapter between `codex_protocol::protocol::EventMsg` inputs and
 //! the TUI output. Many assertions are snapshot-based so that layout regressions and status/header
 //! changes show up as stable, reviewable diffs.
+// Merge-safety anchor: prompt-GC TUI tests here must keep the private-token
+// clear/reset behavior aligned with app-level prompt-GC event handling.
 
 use super::*;
 use crate::app_event::AppEvent;
@@ -1858,6 +1860,30 @@ async fn turn_started_without_window_clears_prompt_gc_private_usage() {
             collaboration_mode_kind: ModeKind::Default,
         }),
     });
+
+    assert_eq!(chat.bottom_pane.context_window_percent(), None);
+    assert_eq!(chat.bottom_pane.context_window_used_tokens(), None);
+    assert_eq!(chat.token_usage(), TokenUsage::default());
+}
+
+#[tokio::test]
+async fn clear_prompt_gc_private_context_usage_info_clears_private_usage() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.replay_prompt_gc_context_usage_info(TokenUsageInfo {
+        total_token_usage: TokenUsage {
+            total_tokens: 950_000,
+            ..TokenUsage::default()
+        },
+        last_token_usage: TokenUsage {
+            total_tokens: 12_400,
+            ..TokenUsage::default()
+        },
+        model_context_window: Some(13_000),
+    });
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(60));
+
+    chat.clear_prompt_gc_private_context_usage_info();
 
     assert_eq!(chat.bottom_pane.context_window_percent(), None);
     assert_eq!(chat.bottom_pane.context_window_used_tokens(), None);
@@ -6521,9 +6547,58 @@ async fn slash_clean_submits_background_terminal_cleanup() {
 async fn slash_sanitize_submits_sanitize_op() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
+    chat.handle_codex_event(Event {
+        id: "token-usage".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(TokenUsageInfo {
+                total_token_usage: TokenUsage {
+                    total_tokens: 70_000,
+                    ..TokenUsage::default()
+                },
+                last_token_usage: TokenUsage {
+                    total_tokens: 12_600,
+                    ..TokenUsage::default()
+                },
+                model_context_window: Some(13_000),
+            }),
+            rate_limits: None,
+        }),
+    });
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(40));
+
     chat.dispatch_command(SlashCommand::Sanitize);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Sanitize)));
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(40));
+}
+
+#[tokio::test]
+async fn slash_compact_submits_compact_op_and_preserves_visible_usage() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "token-usage".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(TokenUsageInfo {
+                total_token_usage: TokenUsage {
+                    total_tokens: 70_000,
+                    ..TokenUsage::default()
+                },
+                last_token_usage: TokenUsage {
+                    total_tokens: 12_600,
+                    ..TokenUsage::default()
+                },
+                model_context_window: Some(13_000),
+            }),
+            rate_limits: None,
+        }),
+    });
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(40));
+
+    chat.dispatch_command(SlashCommand::Compact);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::CodexOp(Op::Compact)));
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(40));
 }
 
 #[tokio::test]

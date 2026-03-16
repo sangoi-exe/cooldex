@@ -1,8 +1,11 @@
 use super::*;
 
+// Merge-safety anchor: rollout reconstruction tests must preserve prompt_gc
+// marker semantics and rollback hydration invariants for resume/fork recovery.
 use crate::protocol::CompactedItem;
 use crate::protocol::InitialHistory;
 use crate::protocol::PromptGcCompactionMetadata;
+use crate::protocol::PromptGcExecutionPhase;
 use crate::protocol::PromptGcOutcomeKind;
 use crate::protocol::ResumedHistory;
 use codex_protocol::ThreadId;
@@ -569,6 +572,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
             },
         )),
         RolloutItem::TurnContext(previous_context_item.clone()),
+        RolloutItem::ResponseItem(assistant_message("seed assistant")),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: previous_turn_id,
@@ -620,6 +624,15 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
             .expect("serialize seeded reference context item"),
         serde_json::to_value(Some(previous_context_item))
             .expect("serialize expected reference context item")
+    );
+    assert!(
+        session
+            .clone_history()
+            .await
+            .raw_items()
+            .iter()
+            .any(|item| item == &assistant_message("seed assistant")),
+        "rollback must not drop surviving pre-rollback history after an incomplete compaction"
     );
 }
 
@@ -1359,6 +1372,9 @@ async fn reconstruct_history_ignores_prompt_gc_observational_markers() {
                 checkpoint_id: "turn-1:prompt_gc:0".to_string(),
                 checkpoint_seq: 0,
                 kind: PromptGcOutcomeKind::Started,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: None,
+                error_message: None,
                 applied_unit_count: None,
             }),
         }),
@@ -1369,6 +1385,9 @@ async fn reconstruct_history_ignores_prompt_gc_observational_markers() {
                 checkpoint_id: "turn-1:prompt_gc:0".to_string(),
                 checkpoint_seq: 0,
                 kind: PromptGcOutcomeKind::Failed,
+                phase: Some(PromptGcExecutionPhase::Request),
+                stop_reason: Some("request_failed".to_string()),
+                error_message: Some("request failed".to_string()),
                 applied_unit_count: None,
             }),
         }),
@@ -1430,6 +1449,117 @@ async fn record_initial_history_resumed_uses_prompt_gc_compaction_with_matching_
         serde_json::to_value(session.reference_context_item().await)
             .expect("serialize seeded reference context item"),
         serde_json::to_value(Some(current_context_item))
+            .expect("serialize expected reference context item")
+    );
+}
+
+#[tokio::test]
+async fn record_initial_history_resumed_rollback_discards_prompt_gc_compaction_from_rolled_back_turn()
+ {
+    let (session, turn_context) = make_session_and_context().await;
+    let previous_context_item = turn_context.to_turn_context_item();
+    let previous_turn_id = previous_context_item
+        .turn_id
+        .clone()
+        .expect("turn context should have turn_id");
+    let rolled_back_turn_id = "rolled-back-prompt-gc-turn".to_string();
+    let rolled_back_context_item = TurnContextItem {
+        turn_id: Some(rolled_back_turn_id.clone()),
+        trace_id: turn_context.trace_id.clone(),
+        cwd: turn_context.cwd.clone(),
+        current_date: turn_context.current_date.clone(),
+        timezone: turn_context.timezone.clone(),
+        approval_policy: turn_context.approval_policy.value(),
+        sandbox_policy: turn_context.sandbox_policy.get().clone(),
+        network: None,
+        model: turn_context.model_info.slug.clone(),
+        personality: turn_context.personality,
+        collaboration_mode: Some(turn_context.collaboration_mode.clone()),
+        realtime_active: Some(turn_context.realtime_active),
+        effort: turn_context.reasoning_effort,
+        summary: turn_context.reasoning_summary,
+        user_instructions: None,
+        developer_instructions: None,
+        final_output_json_schema: None,
+        truncation_policy: Some(turn_context.truncation_policy.into()),
+    };
+    let replacement_history = vec![assistant_message("prompt-gc summary")];
+
+    let rollout_items = vec![
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: previous_turn_id.clone(),
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                message: "seed".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+            },
+        )),
+        RolloutItem::TurnContext(previous_context_item.clone()),
+        RolloutItem::ResponseItem(assistant_message("seed assistant")),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(
+            codex_protocol::protocol::TurnCompleteEvent {
+                turn_id: previous_turn_id,
+                last_agent_message: None,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: rolled_back_turn_id,
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                message: "rolled back".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+            },
+        )),
+        RolloutItem::Compacted(CompactedItem {
+            message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
+            replacement_history: Some(replacement_history.clone()),
+            prompt_gc: None,
+        }),
+        RolloutItem::TurnContext(rolled_back_context_item),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )),
+    ];
+
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            history: rollout_items,
+            rollout_path: PathBuf::from("/tmp/resume.jsonl"),
+        }))
+        .await;
+
+    let history = session.clone_history().await;
+    assert!(
+        history
+            .raw_items()
+            .iter()
+            .any(|item| item == &assistant_message("seed assistant"))
+    );
+    assert!(
+        !history
+            .raw_items()
+            .iter()
+            .any(|item| item == &assistant_message("prompt-gc summary"))
+    );
+    assert_eq!(
+        serde_json::to_value(session.reference_context_item().await)
+            .expect("serialize seeded reference context item"),
+        serde_json::to_value(Some(previous_context_item))
             .expect("serialize expected reference context item")
     );
 }

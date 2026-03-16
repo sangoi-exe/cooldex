@@ -69,6 +69,10 @@ pub fn build_turns_from_rollout_items(items: &[RolloutItem]) -> Vec<Turn> {
     builder.finish()
 }
 
+fn is_prompt_gc_compaction_marker(compacted: &CompactedItem) -> bool {
+    compacted.prompt_gc.is_some() || compacted.message == "[internal] prompt_gc"
+}
+
 pub struct ThreadHistoryBuilder {
     turns: Vec<Turn>,
     current_turn: Option<PendingTurn>,
@@ -907,7 +911,13 @@ impl ThreadHistoryBuilder {
     /// This keeps compaction-only legacy turns from being dropped by
     /// `finish_current_turn` when they have no renderable items and were not
     /// explicitly opened.
-    fn handle_compacted(&mut self, _payload: &CompactedItem) {
+    fn handle_compacted(&mut self, payload: &CompactedItem) {
+        // Merge-safety anchor: hidden prompt_gc compaction markers must stay on
+        // the private replay seam so app-server thread history does not mint
+        // empty turns or synthetic ids from internal maintenance markers.
+        if is_prompt_gc_compaction_marker(payload) {
+            return;
+        }
         self.ensure_turn().saw_compaction = true;
     }
 
@@ -1168,6 +1178,9 @@ mod tests {
     use codex_protocol::protocol::McpInvocation;
     use codex_protocol::protocol::McpToolCallEndEvent;
     use codex_protocol::protocol::PatchApplyBeginEvent;
+    use codex_protocol::protocol::PromptGcCompactionMetadata;
+    use codex_protocol::protocol::PromptGcExecutionPhase;
+    use codex_protocol::protocol::PromptGcOutcomeKind;
     use codex_protocol::protocol::ThreadRolledBackEvent;
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
@@ -2321,6 +2334,38 @@ mod tests {
                 items: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn ignores_prompt_gc_compaction_only_turn() {
+        let items = vec![RolloutItem::Compacted(CompactedItem {
+            message: "[internal] prompt_gc".into(),
+            replacement_history: None,
+            prompt_gc: Some(PromptGcCompactionMetadata {
+                checkpoint_id: "turn-compact:prompt_gc:0".into(),
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Failed,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: Some("invalid_contract".into()),
+                error_message: Some("bad override".into()),
+                applied_unit_count: None,
+            }),
+        })];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert!(turns.is_empty());
+    }
+
+    #[test]
+    fn ignores_legacy_prompt_gc_compaction_marker_without_metadata() {
+        let items = vec![RolloutItem::Compacted(CompactedItem {
+            message: "[internal] prompt_gc".into(),
+            replacement_history: None,
+            prompt_gc: None,
+        })];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert!(turns.is_empty());
     }
 
     #[test]

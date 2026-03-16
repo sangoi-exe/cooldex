@@ -2,6 +2,7 @@ use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::prompt_gc_sidecar::MAX_RAW_BYTES_PER_RETRIEVE;
 use crate::prompt_gc_sidecar::MAX_UNITS_PER_RETRIEVE;
+use crate::prompt_gc_sidecar::PromptGcApplyOutcome;
 use crate::prompt_gc_sidecar::PromptGcCapturedUnit;
 use crate::prompt_gc_sidecar::PromptGcCheckpoint;
 use crate::prompt_gc_sidecar::PromptGcUnitKind;
@@ -10,291 +11,62 @@ use crate::protocol::REASONING_CONTEXT_CLOSE_TAG;
 use crate::protocol::REASONING_CONTEXT_OPEN_TAG;
 use crate::protocol::TOOL_CONTEXT_CLOSE_TAG;
 use crate::protocol::TOOL_CONTEXT_OPEN_TAG;
-use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
-use crate::tools::context::ToolPayload;
-use crate::tools::registry::ToolHandler;
-use crate::tools::registry::ToolKind;
-use async_trait::async_trait;
-use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseItem;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
-use sha1::Digest;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-pub(crate) struct PromptGcHandler;
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PromptGcToolArgs {
-    mode: String,
-    #[serde(default)]
-    policy_id: Option<String>,
-    #[serde(default)]
-    checkpoint_id: Option<String>,
-    #[serde(default)]
-    plan_id: Option<String>,
-    #[serde(default)]
-    state_hash: Option<String>,
-    #[serde(default)]
-    chunk_summaries: Option<Vec<PromptGcChunkSummaryInput>>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PromptGcChunkSummaryInput {
-    chunk_id: String,
-    tool_context: String,
-    reasoning_context: String,
+pub(crate) struct PromptGcChunkSummary {
+    pub(crate) chunk_id: String,
+    pub(crate) tool_context: String,
+    pub(crate) reasoning_context: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct PromptGcChunkManifestEntry {
-    chunk_id: String,
-    unit_key: u64,
-    kind: String,
-    approx_bytes: usize,
-    payload_text: String,
-    call_name: Option<String>,
+pub(crate) struct PromptGcChunkManifestEntry {
+    pub(crate) chunk_id: String,
+    pub(crate) unit_key: u64,
+    pub(crate) kind: String,
+    pub(crate) approx_bytes: usize,
+    pub(crate) payload_text: String,
+    pub(crate) call_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-struct PromptGcResolvedChunk {
-    manifest: PromptGcChunkManifestEntry,
-    exclusion_indices: Vec<usize>,
+pub(crate) struct PromptGcResolvedChunk {
+    pub(crate) manifest: PromptGcChunkManifestEntry,
+    pub(crate) exclusion_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
-struct PromptGcRetrievePlan {
-    plan_id: String,
-    state_hash: String,
-    chunk_manifest: Vec<PromptGcResolvedChunk>,
+pub(crate) struct PromptGcRuntimePlan {
+    pub(crate) chunk_manifest: Vec<PromptGcResolvedChunk>,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum StopReason {
-    TargetReached,
     InvalidContract,
     InvalidSummarySchema,
     StateHashMismatch,
-    PlanIdInvalid,
 }
 
 impl StopReason {
     fn as_str(self) -> &'static str {
         match self {
-            Self::TargetReached => "target_reached",
             Self::InvalidContract => "invalid_contract",
             Self::InvalidSummarySchema => "invalid_summary_schema",
             Self::StateHashMismatch => "state_hash_mismatch",
-            Self::PlanIdInvalid => "plan_id_invalid",
         }
     }
-}
-
-#[async_trait]
-impl ToolHandler for PromptGcHandler {
-    fn kind(&self) -> ToolKind {
-        ToolKind::Function
-    }
-
-    async fn handle(
-        &self,
-        invocation: ToolInvocation,
-    ) -> Result<ToolOutput, crate::function_tool::FunctionCallError> {
-        let ToolInvocation {
-            session,
-            payload,
-            turn,
-            ..
-        } = invocation;
-
-        let ToolPayload::Function { arguments } = payload else {
-            return Err(contract_error(
-                StopReason::InvalidContract,
-                "prompt_gc handler received unsupported payload",
-            ));
-        };
-
-        let args: PromptGcToolArgs = serde_json::from_str(&arguments).map_err(|error| {
-            contract_error(
-                StopReason::InvalidContract,
-                format!("failed to parse function arguments: {error}"),
-            )
-        })?;
-
-        let result = handle_prompt_gc(session.as_ref(), turn.as_ref(), &args).await?;
-        Ok(ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(
-                serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string()),
-            ),
-            success: Some(true),
-        })
-    }
-}
-
-async fn handle_prompt_gc(
-    session: &Session,
-    turn: &TurnContext,
-    args: &PromptGcToolArgs,
-) -> Result<serde_json::Value, crate::function_tool::FunctionCallError> {
-    match args.mode.as_str() {
-        "retrieve" => handle_retrieve(session, turn, args).await,
-        "apply" => handle_apply(session, turn, args).await,
-        other => Err(contract_error(
-            StopReason::InvalidContract,
-            format!("unsupported prompt_gc mode: {other}"),
-        )),
-    }
-}
-
-async fn handle_retrieve(
-    session: &Session,
-    turn: &TurnContext,
-    args: &PromptGcToolArgs,
-) -> Result<serde_json::Value, crate::function_tool::FunctionCallError> {
-    if args.plan_id.is_some() || args.state_hash.is_some() || args.chunk_summaries.is_some() {
-        return Err(contract_error(
-            StopReason::InvalidContract,
-            "prompt_gc.retrieve accepts only mode, policy_id, and checkpoint_id",
-        ));
-    }
-
-    validate_policy_id(
-        required_non_empty_str("policy_id", args.policy_id.as_ref())?,
-        turn,
-    )?;
-    let checkpoint_id = required_non_empty_str("checkpoint_id", args.checkpoint_id.as_ref())?;
-    let plan = build_retrieve_plan(session, turn, checkpoint_id).await?;
-    Ok(json!({
-        "mode": "retrieve",
-        "policy_id": turn.config.manage_context_policy.quality_rubric_id,
-        "checkpoint_id": checkpoint_id,
-        "plan_id": plan.plan_id,
-        "state_hash": plan.state_hash,
-        "chunk_manifest": plan.chunk_manifest.iter().map(|chunk| &chunk.manifest).collect::<Vec<_>>(),
-        "progress_report": {
-            "selected_chunks": plan.chunk_manifest.len(),
-            "max_units_per_apply": MAX_UNITS_PER_RETRIEVE,
-            "max_raw_bytes_per_retrieve": MAX_RAW_BYTES_PER_RETRIEVE,
-        }
-    }))
-}
-
-async fn handle_apply(
-    session: &Session,
-    turn: &TurnContext,
-    args: &PromptGcToolArgs,
-) -> Result<serde_json::Value, crate::function_tool::FunctionCallError> {
-    validate_policy_id(
-        required_non_empty_str("policy_id", args.policy_id.as_ref())?,
-        turn,
-    )?;
-    let checkpoint_id = required_non_empty_str("checkpoint_id", args.checkpoint_id.as_ref())?;
-    let plan_id = required_non_empty_str("plan_id", args.plan_id.as_ref())?;
-    let state_hash = required_non_empty_str("state_hash", args.state_hash.as_ref())?;
-    let chunk_summaries = args.chunk_summaries.as_ref().ok_or_else(|| {
-        contract_error(
-            StopReason::InvalidContract,
-            "prompt_gc.apply requires chunk_summaries",
-        )
-    })?;
-    if chunk_summaries.is_empty() {
-        return Err(contract_error(
-            StopReason::InvalidContract,
-            "prompt_gc.apply requires a non-empty chunk_summaries list",
-        ));
-    }
-
-    let plan = build_retrieve_plan(session, turn, checkpoint_id).await?;
-    validate_chunk_summaries(chunk_summaries, &plan.chunk_manifest)?;
-    if plan.plan_id != plan_id {
-        return Err(contract_error(
-            StopReason::PlanIdInvalid,
-            format!(
-                "plan_id mismatch (expected '{}', got '{plan_id}')",
-                plan.plan_id
-            ),
-        ));
-    }
-    if plan.state_hash != state_hash {
-        return Err(contract_error(
-            StopReason::StateHashMismatch,
-            format!(
-                "state_hash mismatch (expected '{}', got '{state_hash}')",
-                plan.state_hash
-            ),
-        ));
-    }
-
-    let selected_chunks = select_chunks(&plan, chunk_summaries)?;
-    let notes = build_notes(chunk_summaries)?;
-    let mut exclusion_indices = selected_chunks
-        .iter()
-        .flat_map(|chunk| chunk.exclusion_indices.iter().copied())
-        .collect::<Vec<_>>();
-    exclusion_indices.sort_unstable();
-    exclusion_indices.dedup();
-    let applied_unit_keys = selected_chunks
-        .iter()
-        .map(|chunk| chunk.manifest.unit_key)
-        .collect::<Vec<_>>();
-    let checkpoint = prompt_gc_checkpoint_for_id(session, turn, checkpoint_id).await?;
-    let applied_unit_count = u64::try_from(applied_unit_keys.len()).unwrap_or(u64::MAX);
-
-    let replacement_history = {
-        let mut state = session.state.lock().await;
-        let checkpoint = state.manage_context_checkpoint();
-        state.set_context_inclusion(&exclusion_indices, false);
-        state.add_context_notes(notes);
-        let replacement_history = state.prompt_snapshot_lenient();
-        state.restore_manage_context_checkpoint(checkpoint.clone());
-        replacement_history
-    };
-
-    session
-        .persist_prompt_gc_replacement_history(
-            turn,
-            &checkpoint,
-            applied_unit_count,
-            replacement_history,
-        )
-        .await
-        .map_err(|error| {
-            contract_error(
-                StopReason::InvalidContract,
-                format!("prompt_gc apply failed to persist replacement history: {error}"),
-            )
-        })?;
-
-    if let Some(sidecar) = session.prompt_gc_sidecar_for_sub_id(&turn.sub_id).await {
-        // Merge-safety anchor: hidden prompt_gc apply can succeed even if the model stream ends
-        // before response.completed. Cache the committed apply outcome in the sidecar so the
-        // runner can recover the cycle without relying on a streamed terminal tool output.
-        sidecar
-            .lock()
-            .await
-            .note_apply_outcome(checkpoint_id, applied_unit_keys.clone());
-    }
-
-    Ok(json!({
-        "mode": "apply",
-        "checkpoint_id": checkpoint_id,
-        "applied_unit_keys": applied_unit_keys,
-        "stop_reason": StopReason::TargetReached.as_str(),
-        "progress_report": {
-            "applied_chunks": selected_chunks.len(),
-            "applied_notes": chunk_summaries.len(),
-        }
-    }))
 }
 
 fn select_chunks(
-    plan: &PromptGcRetrievePlan,
-    chunk_summaries: &[PromptGcChunkSummaryInput],
+    plan: &PromptGcRuntimePlan,
+    chunk_summaries: &[PromptGcChunkSummary],
 ) -> Result<Vec<PromptGcResolvedChunk>, crate::function_tool::FunctionCallError> {
     let by_chunk_id = plan
         .chunk_manifest
@@ -316,12 +88,13 @@ fn select_chunks(
 }
 
 fn validate_chunk_summaries(
-    chunk_summaries: &[PromptGcChunkSummaryInput],
+    chunk_summaries: &[PromptGcChunkSummary],
     chunk_manifest: &[PromptGcResolvedChunk],
 ) -> Result<(), crate::function_tool::FunctionCallError> {
-    // Merge-safety anchor: prompt_gc.apply must stay fail-loud on duplicate
-    // chunk_id payloads just like manage_context.apply. Silent duplicates can
-    // inject conflicting contextual notes for the same hidden chunk.
+    // Merge-safety anchor: prompt_gc summary validation must stay fail-loud on
+    // duplicate chunk_id payloads just like manage_context.apply. Silent
+    // duplicates can inject conflicting contextual notes for the same hidden
+    // chunk.
     let manifest_ids: HashSet<&str> = chunk_manifest
         .iter()
         .map(|entry| entry.manifest.chunk_id.as_str())
@@ -333,7 +106,7 @@ fn validate_chunk_summaries(
         if chunk_id.is_empty() {
             return Err(contract_error(
                 StopReason::InvalidSummarySchema,
-                "prompt_gc.apply chunk_summaries[].chunk_id must be non-empty",
+                "prompt_gc chunk_summaries[].chunk_id must be non-empty",
             ));
         }
         if chunk.tool_context.trim().is_empty() && chunk.reasoning_context.trim().is_empty() {
@@ -351,16 +124,37 @@ fn validate_chunk_summaries(
         if !seen_chunk_ids.insert(chunk_id) {
             return Err(contract_error(
                 StopReason::InvalidSummarySchema,
-                format!("chunk_id '{chunk_id}' appears more than once in apply payload"),
+                format!("chunk_id '{chunk_id}' appears more than once in summary payload"),
             ));
         }
+    }
+
+    let missing_chunk_ids = chunk_manifest
+        .iter()
+        .map(|entry| entry.manifest.chunk_id.as_str())
+        .filter(|chunk_id| !seen_chunk_ids.contains(chunk_id))
+        .collect::<Vec<_>>();
+    if !missing_chunk_ids.is_empty() || chunk_summaries.len() != chunk_manifest.len() {
+        let missing_chunk_ids = if missing_chunk_ids.is_empty() {
+            "<none>".to_string()
+        } else {
+            missing_chunk_ids.join(", ")
+        };
+        return Err(contract_error(
+            StopReason::InvalidSummarySchema,
+            format!(
+                "prompt_gc requires summaries for every chunk_manifest entry; expected {}, got {}, missing chunk_id(s): {missing_chunk_ids}",
+                chunk_manifest.len(),
+                chunk_summaries.len(),
+            ),
+        ));
     }
 
     Ok(())
 }
 
 fn build_notes(
-    chunk_summaries: &[PromptGcChunkSummaryInput],
+    chunk_summaries: &[PromptGcChunkSummary],
 ) -> Result<Vec<String>, crate::function_tool::FunctionCallError> {
     let mut notes = Vec::new();
     for summary in chunk_summaries {
@@ -387,12 +181,40 @@ fn build_notes(
     Ok(notes)
 }
 
-async fn build_retrieve_plan(
+fn order_chunk_summaries(
+    chunk_manifest: &[PromptGcResolvedChunk],
+    chunk_summaries: &[PromptGcChunkSummary],
+) -> Result<Vec<PromptGcChunkSummary>, crate::function_tool::FunctionCallError> {
+    let by_chunk_id = chunk_summaries
+        .iter()
+        .cloned()
+        .map(|summary| (summary.chunk_id.clone(), summary))
+        .collect::<HashMap<_, _>>();
+    chunk_manifest
+        .iter()
+        .map(|chunk| {
+            by_chunk_id
+                .get(&chunk.manifest.chunk_id)
+                .cloned()
+                .ok_or_else(|| {
+                    contract_error(
+                        StopReason::InvalidSummarySchema,
+                        format!(
+                            "prompt_gc missing canonicalized summary for chunk_id '{}'",
+                            chunk.manifest.chunk_id
+                        ),
+                    )
+                })
+        })
+        .collect()
+}
+
+pub(crate) async fn build_runtime_plan(
     session: &Session,
     turn: &TurnContext,
     checkpoint_id: &str,
-) -> Result<PromptGcRetrievePlan, crate::function_tool::FunctionCallError> {
-    let checkpoint = prompt_gc_checkpoint_for_id(session, turn, checkpoint_id).await?;
+) -> Result<PromptGcRuntimePlan, crate::function_tool::FunctionCallError> {
+    prompt_gc_checkpoint_for_id(session, turn, checkpoint_id).await?;
     let sidecar = session
         .prompt_gc_sidecar_for_sub_id(&turn.sub_id)
         .await
@@ -441,16 +263,71 @@ async fn build_retrieve_plan(
             exclusion_indices,
         });
     }
-    let state_hash = state_hash_for(&checkpoint, &chunk_manifest);
-    let plan_id = plan_id_for(
-        turn.config.manage_context_policy.quality_rubric_id.as_str(),
-        &state_hash,
-        &chunk_manifest,
-    );
-    Ok(PromptGcRetrievePlan {
-        plan_id,
-        state_hash,
-        chunk_manifest,
+    Ok(PromptGcRuntimePlan { chunk_manifest })
+}
+
+pub(crate) async fn apply_runtime_plan(
+    session: &Session,
+    turn: &TurnContext,
+    checkpoint: &PromptGcCheckpoint,
+    plan: &PromptGcRuntimePlan,
+    chunk_summaries: &[PromptGcChunkSummary],
+) -> Result<PromptGcApplyOutcome, crate::function_tool::FunctionCallError> {
+    validate_chunk_summaries(chunk_summaries, &plan.chunk_manifest)?;
+    let ordered_chunk_summaries = order_chunk_summaries(&plan.chunk_manifest, chunk_summaries)?;
+    let selected_chunks = select_chunks(plan, &ordered_chunk_summaries)?;
+    let notes = build_notes(&ordered_chunk_summaries)?;
+    let mut exclusion_indices = selected_chunks
+        .iter()
+        .flat_map(|chunk| chunk.exclusion_indices.iter().copied())
+        .collect::<Vec<_>>();
+    exclusion_indices.sort_unstable();
+    exclusion_indices.dedup();
+    let applied_unit_keys = selected_chunks
+        .iter()
+        .map(|chunk| chunk.manifest.unit_key)
+        .collect::<Vec<_>>();
+    let applied_unit_count = u64::try_from(applied_unit_keys.len()).unwrap_or(u64::MAX);
+
+    let replacement_history = {
+        let mut state = session.state.lock().await;
+        let manage_context_checkpoint = state.manage_context_checkpoint();
+        state.set_context_inclusion(&exclusion_indices, false);
+        state.add_context_notes(notes);
+        let replacement_history = state.prompt_snapshot_lenient();
+        state.restore_manage_context_checkpoint(manage_context_checkpoint.clone());
+        replacement_history
+    };
+
+    session
+        .persist_prompt_gc_replacement_history(
+            turn,
+            checkpoint,
+            applied_unit_count,
+            replacement_history,
+        )
+        .await
+        .map_err(|error| {
+            contract_error(
+                StopReason::InvalidContract,
+                format!("prompt_gc apply failed to persist replacement history: {error}"),
+            )
+        })?;
+
+    if let Some(sidecar) = session.prompt_gc_sidecar_for_sub_id(&turn.sub_id).await {
+        // Merge-safety anchor: committed prompt_gc rewrites must keep the
+        // applied unit set recoverable until the cycle is finalized, or a
+        // post-persist interruption can leave the sidecar and rollout out of sync.
+        sidecar
+            .lock()
+            .await
+            .note_apply_outcome(&checkpoint.checkpoint_id, applied_unit_keys.clone());
+    }
+
+    Ok(PromptGcApplyOutcome {
+        checkpoint_id: checkpoint.checkpoint_id.clone(),
+        checkpoint_seq: checkpoint.checkpoint_seq,
+        applied_unit_keys,
     })
 }
 
@@ -586,68 +463,6 @@ fn resolve_function_output_index(
         })
 }
 
-fn state_hash_for(
-    checkpoint: &PromptGcCheckpoint,
-    chunk_manifest: &[PromptGcResolvedChunk],
-) -> String {
-    let mut hasher = sha1::Sha1::new();
-    hasher.update(checkpoint.checkpoint_id.as_bytes());
-    hasher.update(checkpoint.checkpoint_seq.to_string().as_bytes());
-    hasher.update(checkpoint.eligible_unit_count.to_string().as_bytes());
-    for chunk in chunk_manifest {
-        hasher.update(chunk.manifest.chunk_id.as_bytes());
-        hasher.update(chunk.manifest.unit_key.to_string().as_bytes());
-        hasher.update(chunk.manifest.kind.as_bytes());
-        hasher.update(chunk.manifest.payload_text.as_bytes());
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-fn plan_id_for(
-    policy_id: &str,
-    state_hash: &str,
-    chunk_manifest: &[PromptGcResolvedChunk],
-) -> String {
-    let mut hasher = sha1::Sha1::new();
-    hasher.update(policy_id.as_bytes());
-    hasher.update(state_hash.as_bytes());
-    for chunk in chunk_manifest {
-        hasher.update(chunk.manifest.chunk_id.as_bytes());
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-fn required_non_empty_str<'a>(
-    field_name: &str,
-    value: Option<&'a String>,
-) -> Result<&'a str, crate::function_tool::FunctionCallError> {
-    let value = value
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            contract_error(
-                StopReason::InvalidContract,
-                format!("missing or empty '{field_name}'"),
-            )
-        })?;
-    Ok(value)
-}
-
-fn validate_policy_id(
-    policy_id: &str,
-    turn: &TurnContext,
-) -> Result<(), crate::function_tool::FunctionCallError> {
-    let expected = turn.config.manage_context_policy.quality_rubric_id.trim();
-    if policy_id != expected {
-        return Err(contract_error(
-            StopReason::InvalidContract,
-            format!("policy_id mismatch (expected '{expected}', got '{policy_id}')"),
-        ));
-    }
-    Ok(())
-}
-
 fn contract_error(
     stop_reason: StopReason,
     message: impl Into<String>,
@@ -721,22 +536,6 @@ mod tests {
         }
     }
 
-    fn apply_args(
-        turn: &TurnContext,
-        checkpoint_id: &str,
-        plan: &PromptGcRetrievePlan,
-        chunk_summaries: Vec<PromptGcChunkSummaryInput>,
-    ) -> PromptGcToolArgs {
-        PromptGcToolArgs {
-            mode: "apply".to_string(),
-            policy_id: Some(turn.config.manage_context_policy.quality_rubric_id.clone()),
-            checkpoint_id: Some(checkpoint_id.to_string()),
-            plan_id: Some(plan.plan_id.clone()),
-            state_hash: Some(plan.state_hash.clone()),
-            chunk_summaries: Some(chunk_summaries),
-        }
-    }
-
     async fn activate_pending_checkpoint(
         sidecar: &Arc<tokio::sync::Mutex<crate::prompt_gc_sidecar::PromptGcSidecar>>,
     ) -> PromptGcCheckpoint {
@@ -767,33 +566,26 @@ mod tests {
             .await;
 
         let checkpoint_id = activate_pending_checkpoint(&sidecar).await.checkpoint_id;
-        let plan = build_retrieve_plan(&session, turn_context.as_ref(), &checkpoint_id)
+        let plan = build_runtime_plan(&session, turn_context.as_ref(), &checkpoint_id)
             .await
             .expect("retrieve plan");
         let chunk_id = plan.chunk_manifest[0].manifest.chunk_id.clone();
 
-        let error = handle_apply(
-            &session,
-            turn_context.as_ref(),
-            &apply_args(
-                turn_context.as_ref(),
-                &checkpoint_id,
-                &plan,
-                vec![
-                    PromptGcChunkSummaryInput {
-                        chunk_id: chunk_id.clone(),
-                        tool_context: "tool".to_string(),
-                        reasoning_context: "reasoning".to_string(),
-                    },
-                    PromptGcChunkSummaryInput {
-                        chunk_id,
-                        tool_context: "tool".to_string(),
-                        reasoning_context: "reasoning".to_string(),
-                    },
-                ],
-            ),
+        let error = validate_chunk_summaries(
+            &[
+                PromptGcChunkSummary {
+                    chunk_id: chunk_id.clone(),
+                    tool_context: "tool".to_string(),
+                    reasoning_context: "reasoning".to_string(),
+                },
+                PromptGcChunkSummary {
+                    chunk_id,
+                    tool_context: "tool".to_string(),
+                    reasoning_context: "reasoning".to_string(),
+                },
+            ],
+            &plan.chunk_manifest,
         )
-        .await
         .expect_err("duplicate chunk ids must fail");
 
         let crate::function_tool::FunctionCallError::RespondToModel(message) = error else {
@@ -801,6 +593,57 @@ mod tests {
         };
         assert!(message.contains("invalid_summary_schema"));
         assert!(message.contains("appears more than once"));
+    }
+
+    #[tokio::test]
+    async fn prompt_gc_apply_rejects_incomplete_chunk_summaries() {
+        let (session, turn_context) = make_session_and_context().await;
+        let turn_context = Arc::new(turn_context);
+        let sidecar = install_prompt_gc_active_turn(&session, Arc::clone(&turn_context)).await;
+
+        let items = vec![
+            ResponseItem::Reasoning {
+                id: "reasoning-1".to_string(),
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: None,
+            },
+            ResponseItem::Reasoning {
+                id: "reasoning-2".to_string(),
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: None,
+            },
+            commentary_phase_message("phase-1"),
+        ];
+        session
+            .record_conversation_items(turn_context.as_ref(), &items)
+            .await;
+
+        let checkpoint_id = activate_pending_checkpoint(&sidecar).await.checkpoint_id;
+        let plan = build_runtime_plan(&session, turn_context.as_ref(), &checkpoint_id)
+            .await
+            .expect("retrieve plan");
+        assert_eq!(plan.chunk_manifest.len(), 2);
+        let present_chunk_id = plan.chunk_manifest[0].manifest.chunk_id.clone();
+        let missing_chunk_id = plan.chunk_manifest[1].manifest.chunk_id.clone();
+
+        let error = validate_chunk_summaries(
+            &[PromptGcChunkSummary {
+                chunk_id: present_chunk_id,
+                tool_context: "tool".to_string(),
+                reasoning_context: "reasoning".to_string(),
+            }],
+            &plan.chunk_manifest,
+        )
+        .expect_err("missing chunk ids must fail");
+
+        let crate::function_tool::FunctionCallError::RespondToModel(message) = error else {
+            panic!("expected model-visible contract error");
+        };
+        assert!(message.contains("invalid_summary_schema"));
+        assert!(message.contains("prompt_gc requires summaries for every chunk_manifest entry"));
+        assert!(message.contains(&missing_chunk_id));
     }
 
     #[tokio::test]
@@ -847,7 +690,7 @@ mod tests {
             .await;
 
         let checkpoint_id = activate_pending_checkpoint(&sidecar).await.checkpoint_id;
-        let plan = build_retrieve_plan(&session, turn_context.as_ref(), &checkpoint_id)
+        let plan = build_runtime_plan(&session, turn_context.as_ref(), &checkpoint_id)
             .await
             .expect("retrieve plan");
 
@@ -869,67 +712,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_gc_partial_apply_allows_later_checkpoint_to_compact_leftovers() {
+    async fn prompt_gc_runtime_limits_leave_later_checkpoint_eligible_units() {
         let (session, turn_context) = make_session_and_context().await;
         let turn_context = Arc::new(turn_context);
         let sidecar = install_prompt_gc_active_turn(&session, Arc::clone(&turn_context)).await;
 
-        let initial_items = vec![
-            ResponseItem::Reasoning {
-                id: "reasoning-1".to_string(),
+        let mut initial_items = (0..(MAX_UNITS_PER_RETRIEVE + 1))
+            .map(|index| ResponseItem::Reasoning {
+                id: format!("reasoning-{index}"),
                 summary: Vec::new(),
                 content: None,
                 encrypted_content: None,
-            },
-            ResponseItem::Reasoning {
-                id: "reasoning-2".to_string(),
-                summary: Vec::new(),
-                content: None,
-                encrypted_content: None,
-            },
-            commentary_phase_message("phase-1"),
-        ];
+            })
+            .collect::<Vec<_>>();
+        initial_items.push(commentary_phase_message("phase-1"));
         session
             .record_conversation_items(turn_context.as_ref(), &initial_items)
             .await;
 
         let first_checkpoint_id = activate_pending_checkpoint(&sidecar).await.checkpoint_id;
-        let first_plan = build_retrieve_plan(&session, turn_context.as_ref(), &first_checkpoint_id)
+        let first_plan = build_runtime_plan(&session, turn_context.as_ref(), &first_checkpoint_id)
             .await
             .expect("first retrieve plan");
-        assert_eq!(first_plan.chunk_manifest.len(), 2);
-
-        let first_chunk = first_plan.chunk_manifest[0].manifest.chunk_id.clone();
-        let apply_value = handle_apply(
+        assert_eq!(first_plan.chunk_manifest.len(), MAX_UNITS_PER_RETRIEVE);
+        let first_checkpoint =
+            prompt_gc_checkpoint_for_id(&session, turn_context.as_ref(), &first_checkpoint_id)
+                .await
+                .expect("checkpoint");
+        let outcome = apply_runtime_plan(
             &session,
             turn_context.as_ref(),
-            &apply_args(
-                turn_context.as_ref(),
-                &first_checkpoint_id,
-                &first_plan,
-                vec![PromptGcChunkSummaryInput {
-                    chunk_id: first_chunk,
-                    tool_context: "tool".to_string(),
-                    reasoning_context: "reasoning".to_string(),
-                }],
-            ),
+            &first_checkpoint,
+            &first_plan,
+            &first_plan
+                .chunk_manifest
+                .iter()
+                .map(|chunk| PromptGcChunkSummary {
+                    chunk_id: chunk.manifest.chunk_id.clone(),
+                    tool_context: format!("tool {}", chunk.manifest.chunk_id),
+                    reasoning_context: format!("reasoning {}", chunk.manifest.chunk_id),
+                })
+                .collect::<Vec<_>>(),
         )
         .await
         .expect("apply");
-        let applied_unit_keys = apply_value
-            .get("applied_unit_keys")
-            .and_then(serde_json::Value::as_array)
-            .expect("applied unit keys")
-            .iter()
-            .filter_map(serde_json::Value::as_u64)
-            .collect::<Vec<_>>();
         sidecar
             .lock()
             .await
             .complete_cycle(crate::prompt_gc_sidecar::PromptGcApplyOutcome {
                 checkpoint_id: first_checkpoint_id.clone(),
                 checkpoint_seq: 0,
-                applied_unit_keys,
+                applied_unit_keys: outcome.applied_unit_keys,
             });
 
         session
@@ -940,7 +773,7 @@ mod tests {
             .await;
         let second_checkpoint_id = activate_pending_checkpoint(&sidecar).await.checkpoint_id;
         let second_plan =
-            build_retrieve_plan(&session, turn_context.as_ref(), &second_checkpoint_id)
+            build_runtime_plan(&session, turn_context.as_ref(), &second_checkpoint_id)
                 .await
                 .expect("second retrieve plan");
 
@@ -973,7 +806,7 @@ mod tests {
             .await;
 
         let checkpoint_id = activate_pending_checkpoint(&sidecar).await.checkpoint_id;
-        let plan = build_retrieve_plan(&session, turn_context.as_ref(), &checkpoint_id)
+        let plan = build_runtime_plan(&session, turn_context.as_ref(), &checkpoint_id)
             .await
             .expect("retrieve plan should resolve stored truncated output");
 
@@ -1007,26 +840,28 @@ mod tests {
             .await;
 
         let checkpoint_id = activate_pending_checkpoint(&sidecar).await.checkpoint_id;
-        let plan = build_retrieve_plan(&session, turn_context.as_ref(), &checkpoint_id)
+        let plan = build_runtime_plan(&session, turn_context.as_ref(), &checkpoint_id)
             .await
             .expect("retrieve plan");
+        let checkpoint =
+            prompt_gc_checkpoint_for_id(&session, turn_context.as_ref(), &checkpoint_id)
+                .await
+                .expect("checkpoint");
 
-        handle_apply(
+        apply_runtime_plan(
             &session,
             turn_context.as_ref(),
-            &apply_args(
-                turn_context.as_ref(),
-                &checkpoint_id,
-                &plan,
-                plan.chunk_manifest
-                    .iter()
-                    .map(|chunk| PromptGcChunkSummaryInput {
-                        chunk_id: chunk.manifest.chunk_id.clone(),
-                        tool_context: "same summary".to_string(),
-                        reasoning_context: "same summary".to_string(),
-                    })
-                    .collect(),
-            ),
+            &checkpoint,
+            &plan,
+            &plan
+                .chunk_manifest
+                .iter()
+                .map(|chunk| PromptGcChunkSummary {
+                    chunk_id: chunk.manifest.chunk_id.clone(),
+                    tool_context: "same summary".to_string(),
+                    reasoning_context: "same summary".to_string(),
+                })
+                .collect::<Vec<_>>(),
         )
         .await
         .expect("apply");
@@ -1056,5 +891,81 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("chunk_id=prompt_gc_chunk_1"))
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_gc_apply_keeps_manifest_order_when_summaries_are_reordered() {
+        let (session, turn_context) = make_session_and_context().await;
+        let turn_context = Arc::new(turn_context);
+        let sidecar = install_prompt_gc_active_turn(&session, Arc::clone(&turn_context)).await;
+
+        let items = vec![
+            ResponseItem::Reasoning {
+                id: "reasoning-1".to_string(),
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: None,
+            },
+            ResponseItem::Reasoning {
+                id: "reasoning-2".to_string(),
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: None,
+            },
+            commentary_phase_message("phase-1"),
+        ];
+        session
+            .record_conversation_items(turn_context.as_ref(), &items)
+            .await;
+
+        let checkpoint_id = activate_pending_checkpoint(&sidecar).await.checkpoint_id;
+        let plan = build_runtime_plan(&session, turn_context.as_ref(), &checkpoint_id)
+            .await
+            .expect("retrieve plan");
+        let checkpoint =
+            prompt_gc_checkpoint_for_id(&session, turn_context.as_ref(), &checkpoint_id)
+                .await
+                .expect("checkpoint");
+
+        let reversed_summaries = plan
+            .chunk_manifest
+            .iter()
+            .rev()
+            .map(|chunk| PromptGcChunkSummary {
+                chunk_id: chunk.manifest.chunk_id.clone(),
+                tool_context: format!("tool {}", chunk.manifest.chunk_id),
+                reasoning_context: format!("reasoning {}", chunk.manifest.chunk_id),
+            })
+            .collect::<Vec<_>>();
+
+        apply_runtime_plan(
+            &session,
+            turn_context.as_ref(),
+            &checkpoint,
+            &plan,
+            &reversed_summaries,
+        )
+        .await
+        .expect("apply");
+
+        let prompt = session.state.lock().await.prompt_snapshot_lenient();
+        let tool_notes = prompt
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::Message { role, content, .. } if role == "user" => {
+                    let ContentItem::InputText { text } = &content[0] else {
+                        return None;
+                    };
+                    text.contains(TOOL_CONTEXT_OPEN_TAG).then_some(text.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(tool_notes.len(), 2);
+        assert!(tool_notes[0].contains("chunk_id=prompt_gc_chunk_0"));
+        assert!(tool_notes[0].contains("tool prompt_gc_chunk_0"));
+        assert!(tool_notes[1].contains("chunk_id=prompt_gc_chunk_1"));
+        assert!(tool_notes[1].contains("tool prompt_gc_chunk_1"));
     }
 }
