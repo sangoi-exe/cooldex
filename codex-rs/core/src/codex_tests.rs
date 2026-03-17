@@ -369,6 +369,275 @@ async fn prompt_gc_sidecar_no_eligible_chunks_complete_without_visible_accountin
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_gc_sidecar_skips_under_selectable_token_threshold_without_rollout_markers() {
+    let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.model_info.context_window = Some(100_000);
+    turn_context_mut.model_info.effective_context_window_percent = 100;
+    {
+        let mut state = session.state.lock().await;
+        state.set_token_info(Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 90_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 90_000,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(100_000),
+        }));
+    }
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let reasoning = prompt_gc_under_threshold_reasoning("reasoning-1");
+    let phase_message = prompt_gc_phase_message("phase-1");
+    let observed_items = session
+        .record_into_history(&[reasoning, phase_message], &turn_context)
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, None);
+    assert_eq!(status.last_error, None);
+    assert_eq!(status.blocked_reason, None);
+    assert!(sidecar.lock().await.checkpoint(&checkpoint_id).is_none());
+    session.flush_rollout().await;
+    assert_eq!(prompt_gc_rollout_markers(&rollout_path).await, Vec::new());
+
+    let tool_calls = {
+        let active = session.active_turn.lock().await;
+        let active_turn = active.as_ref().expect("active turn");
+        active_turn.turn_state.lock().await.tool_calls
+    };
+    assert_eq!(
+        tool_calls, 0,
+        "skipped prompt_gc should not increment visible tool accounting"
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_gc_sidecar_large_tool_output_activates_below_global_context_pressure() {
+    let server = MockServer::start().await;
+    let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(StaticSseResponder {
+            calls: AtomicUsize::new(0),
+            response_body: sse(&[
+                response_created("resp-1"),
+                assistant_message_event(
+                    "msg-1",
+                    "{\"summaries\":[{\"chunk_id\":\"prompt_gc_chunk_0\",\"tool_context\":\"tool\",\"reasoning_context\":\"reasoning\"}]}",
+                ),
+                response_completed_with_usage("resp-1", 17),
+            ]),
+            headers: Vec::new(),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.model_info.context_window = Some(100_000);
+    turn_context_mut.model_info.effective_context_window_percent = 100;
+    {
+        let mut state = session.state.lock().await;
+        state.set_token_info(Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 12_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_000,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(100_000),
+        }));
+    }
+
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let items = vec![
+        ResponseItem::FunctionCall {
+            id: None,
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: "{\"cmd\":\"pwd\"}".to_string(),
+        },
+        ResponseItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload::from_text("x".repeat(900)),
+        },
+        ResponseItem::Message {
+            id: Some("phase-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "checkpoint".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(codex_protocol::models::MessagePhase::Commentary),
+        },
+    ];
+    let observed_items = session.record_into_history(&items, &turn_context).await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
+    assert_eq!(status.last_error, None);
+    assert_eq!(status.blocked_reason, None);
+    session.flush_rollout().await;
+    let markers = prompt_gc_rollout_markers(&rollout_path).await;
+    assert!(!markers.is_empty());
+    assert_eq!(markers[0].kind, PromptGcOutcomeKind::Started);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_gc_state_hash_mismatch_blocks_remaining_turn() {
+    let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.model_info.context_window = Some(100_000);
+    turn_context_mut.model_info.effective_context_window_percent = 100;
+    {
+        let mut state = session.state.lock().await;
+        state.set_token_info(Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 90_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 90_000,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(100_000),
+        }));
+    }
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let tool_call = ResponseItem::FunctionCall {
+        id: None,
+        call_id: "call-1".to_string(),
+        name: "shell".to_string(),
+        arguments: "{\"cmd\":\"pwd\"}".to_string(),
+    };
+    let tool_output = ResponseItem::FunctionCallOutput {
+        call_id: "call-1".to_string(),
+        output: FunctionCallOutputPayload::from_text("x".repeat(900)),
+    };
+    let phase_one = ResponseItem::Message {
+        id: Some("phase-1".to_string()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "checkpoint".to_string(),
+        }],
+        end_turn: None,
+        phase: Some(codex_protocol::models::MessagePhase::Commentary),
+    };
+    let observed_items = session
+        .record_into_history(&[tool_call, tool_output, phase_one.clone()], &turn_context)
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    session
+        .replace_history(
+            vec![phase_one.clone()],
+            Some(turn_context.to_turn_context_item()),
+        )
+        .await;
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, None);
+    assert!(status.blocked_reason.is_some(), "{status:?}");
+    session.flush_rollout().await;
+    let first_markers = prompt_gc_rollout_markers(&rollout_path).await;
+    assert_eq!(first_markers.len(), 2);
+    assert_eq!(first_markers[0].kind, PromptGcOutcomeKind::Started);
+    assert_eq!(first_markers[1].kind, PromptGcOutcomeKind::Failed);
+    assert_eq!(
+        first_markers[1].phase,
+        Some(PromptGcExecutionPhase::Prepare)
+    );
+    assert_eq!(
+        first_markers[1].stop_reason.as_deref(),
+        Some("state_hash_mismatch")
+    );
+    assert!(
+        first_markers[1]
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("state_hash_mismatch"))
+    );
+
+    let phase_two = ResponseItem::Message {
+        id: Some("phase-2".to_string()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "later checkpoint".to_string(),
+        }],
+        end_turn: None,
+        phase: Some(codex_protocol::models::MessagePhase::Commentary),
+    };
+    let later_items = session
+        .record_into_history(std::slice::from_ref(&phase_two), &turn_context)
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&later_items);
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    session.flush_rollout().await;
+    assert_eq!(
+        prompt_gc_rollout_markers(&rollout_path).await,
+        first_markers
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prompt_gc_sidecar_skips_after_tool_use_hooks() {
     let server = MockServer::start().await;
     let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
@@ -741,21 +1010,8 @@ async fn prompt_gc_sidecar_invalid_summary_payload_is_terminal_after_request() {
     configure_session_model_client_for_server(&mut session, &turn_context, &server);
 
     let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
-    let reasoning = ResponseItem::Reasoning {
-        id: "reasoning-1".to_string(),
-        summary: Vec::new(),
-        content: None,
-        encrypted_content: None,
-    };
-    let phase_message = ResponseItem::Message {
-        id: Some("phase-1".to_string()),
-        role: "assistant".to_string(),
-        content: vec![ContentItem::OutputText {
-            text: "checkpoint".to_string(),
-        }],
-        end_turn: None,
-        phase: Some(codex_protocol::models::MessagePhase::Commentary),
-    };
+    let reasoning = prompt_gc_eligible_reasoning("reasoning-1");
+    let phase_message = prompt_gc_phase_message("phase-1");
     let observed_items = session
         .record_into_history(&[reasoning, phase_message], &turn_context)
         .await;
@@ -908,27 +1164,9 @@ async fn prompt_gc_sidecar_incomplete_summary_payload_fails_apply_validation() {
     let observed_items = session
         .record_into_history(
             &[
-                ResponseItem::Reasoning {
-                    id: "reasoning-1".to_string(),
-                    summary: Vec::new(),
-                    content: None,
-                    encrypted_content: None,
-                },
-                ResponseItem::Reasoning {
-                    id: "reasoning-2".to_string(),
-                    summary: Vec::new(),
-                    content: None,
-                    encrypted_content: None,
-                },
-                ResponseItem::Message {
-                    id: Some("phase-1".to_string()),
-                    role: "assistant".to_string(),
-                    content: vec![ContentItem::OutputText {
-                        text: "checkpoint".to_string(),
-                    }],
-                    end_turn: None,
-                    phase: Some(codex_protocol::models::MessagePhase::Commentary),
-                },
+                prompt_gc_eligible_reasoning("reasoning-1"),
+                prompt_gc_eligible_reasoning("reasoning-2"),
+                prompt_gc_phase_message("phase-1"),
             ],
             &turn_context,
         )
@@ -1048,21 +1286,8 @@ async fn prompt_gc_hidden_usage_limit_auto_switches_and_retries() {
     let observed_items = session
         .record_into_history(
             &[
-                ResponseItem::Reasoning {
-                    id: "reasoning-1".to_string(),
-                    summary: Vec::new(),
-                    content: None,
-                    encrypted_content: None,
-                },
-                ResponseItem::Message {
-                    id: Some("phase-1".to_string()),
-                    role: "assistant".to_string(),
-                    content: vec![ContentItem::OutputText {
-                        text: "checkpoint".to_string(),
-                    }],
-                    end_turn: None,
-                    phase: Some(codex_protocol::models::MessagePhase::Commentary),
-                },
+                prompt_gc_eligible_reasoning("reasoning-1"),
+                prompt_gc_phase_message("phase-1"),
             ],
             &turn_context,
         )
@@ -1136,21 +1361,8 @@ async fn prompt_gc_hidden_usage_limit_blocks_remaining_turn_after_unrecoverable_
     configure_session_model_client_for_server(&mut session, &turn_context, &server);
 
     let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
-    let reasoning = ResponseItem::Reasoning {
-        id: "reasoning-1".to_string(),
-        summary: Vec::new(),
-        content: None,
-        encrypted_content: None,
-    };
-    let phase_message = ResponseItem::Message {
-        id: Some("phase-1".to_string()),
-        role: "assistant".to_string(),
-        content: vec![ContentItem::OutputText {
-            text: "checkpoint".to_string(),
-        }],
-        end_turn: None,
-        phase: Some(codex_protocol::models::MessagePhase::Commentary),
-    };
+    let reasoning = prompt_gc_eligible_reasoning("reasoning-1");
+    let phase_message = prompt_gc_phase_message("phase-1");
     let observed_items = session
         .record_into_history(&[reasoning, phase_message], &turn_context)
         .await;
@@ -1248,21 +1460,8 @@ async fn prompt_gc_hidden_request_error_does_not_apply() {
     let observed_items = session
         .record_into_history(
             &[
-                ResponseItem::Reasoning {
-                    id: "reasoning-1".to_string(),
-                    summary: Vec::new(),
-                    content: None,
-                    encrypted_content: None,
-                },
-                ResponseItem::Message {
-                    id: Some("phase-1".to_string()),
-                    role: "assistant".to_string(),
-                    content: vec![ContentItem::OutputText {
-                        text: "checkpoint".to_string(),
-                    }],
-                    end_turn: None,
-                    phase: Some(codex_protocol::models::MessagePhase::Commentary),
-                },
+                prompt_gc_eligible_reasoning("reasoning-1"),
+                prompt_gc_phase_message("phase-1"),
             ],
             &turn_context,
         )
@@ -1339,21 +1538,8 @@ async fn prompt_gc_hidden_context_window_does_not_emit_token_count() {
 async fn prompt_gc_sidecar_recovers_noted_apply_outcome_after_stream_failure() {
     let (session, turn_context, rx) = make_session_and_context_with_rx().await;
     let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
-    let reasoning = ResponseItem::Reasoning {
-        id: String::new(),
-        summary: Vec::new(),
-        content: None,
-        encrypted_content: None,
-    };
-    let phase_message = ResponseItem::Message {
-        id: Some("phase-1".to_string()),
-        role: "assistant".to_string(),
-        content: vec![ContentItem::OutputText {
-            text: "checkpoint".to_string(),
-        }],
-        end_turn: None,
-        phase: Some(codex_protocol::models::MessagePhase::Commentary),
-    };
+    let reasoning = prompt_gc_eligible_reasoning("reasoning-1");
+    let phase_message = prompt_gc_phase_message("phase-1");
     let observed_items = session
         .record_into_history(&[reasoning, phase_message], &turn_context)
         .await;
@@ -1755,6 +1941,36 @@ fn configure_session_model_client_for_server(
             .enabled(Feature::RuntimeMetrics),
         None,
     );
+}
+
+fn prompt_gc_under_threshold_reasoning(id: &str) -> ResponseItem {
+    ResponseItem::Reasoning {
+        id: id.to_string(),
+        summary: Vec::new(),
+        content: None,
+        encrypted_content: None,
+    }
+}
+
+fn prompt_gc_eligible_reasoning(id: &str) -> ResponseItem {
+    ResponseItem::Reasoning {
+        id: id.to_string(),
+        summary: Vec::new(),
+        content: None,
+        encrypted_content: Some("x".repeat(2_000)),
+    }
+}
+
+fn prompt_gc_phase_message(id: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: Some(id.to_string()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "checkpoint".to_string(),
+        }],
+        end_turn: None,
+        phase: Some(codex_protocol::models::MessagePhase::Commentary),
+    }
 }
 
 #[test]

@@ -7,6 +7,7 @@ use codex_core::config::Config;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TokenUsageInfo;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
@@ -60,6 +61,15 @@ fn initial_prompt_gc_bootstrap_event(
     }
 }
 
+// Merge-safety anchor: prompt-GC-private idle bootstrap must follow the same lead-session
+// eligibility rule as the runtime so child threads do not look prompt-GC-capable from token usage.
+fn allow_idle_prompt_gc_bootstrap(
+    session_source: &SessionSource,
+    seed_prompt_gc_context_usage_if_idle: bool,
+) -> bool {
+    seed_prompt_gc_context_usage_if_idle && !matches!(session_source, SessionSource::SubAgent(_))
+}
+
 // Merge-safety anchor: prompt-GC completion usage refresh must stay on the private TUI runtime
 // path so hidden prompt-GC can refresh context-left without surfacing a protocol TokenCount.
 async fn emit_prompt_gc_context_usage_update(
@@ -80,7 +90,13 @@ pub(crate) async fn forward_thread_runtime(
     let prompt_gc_state_rx = thread.subscribe_prompt_gc_activity();
     let mut prompt_gc_edge_rx = thread.subscribe_prompt_gc_activity_edges();
     let prompt_gc_active = *prompt_gc_state_rx.borrow();
-    let initial_token_usage_info = if !prompt_gc_active && seed_prompt_gc_context_usage_if_idle {
+    let idle_prompt_gc_bootstrap_allowed = if seed_prompt_gc_context_usage_if_idle {
+        let session_source = thread.config_snapshot().await.session_source;
+        allow_idle_prompt_gc_bootstrap(&session_source, seed_prompt_gc_context_usage_if_idle)
+    } else {
+        false
+    };
+    let initial_token_usage_info = if !prompt_gc_active && idle_prompt_gc_bootstrap_allowed {
         thread.token_usage_info().await
     } else {
         None
@@ -88,7 +104,7 @@ pub(crate) async fn forward_thread_runtime(
     if let Some(initial_event) = initial_prompt_gc_bootstrap_event(
         thread_id,
         prompt_gc_active,
-        seed_prompt_gc_context_usage_if_idle,
+        idle_prompt_gc_bootstrap_allowed,
         initial_token_usage_info,
     ) {
         app_event_tx.send(initial_event);
@@ -326,5 +342,20 @@ mod tests {
             }
             other => panic!("expected primary prompt-GC usage refresh, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn idle_prompt_gc_bootstrap_is_disabled_for_subagent_sessions() {
+        let session_source = SessionSource::SubAgent(
+            codex_protocol::protocol::SubAgentSource::Other("bug-hunter".to_string()),
+        );
+
+        assert!(!allow_idle_prompt_gc_bootstrap(&session_source, true));
+    }
+
+    #[test]
+    fn idle_prompt_gc_bootstrap_stays_enabled_for_lead_sessions() {
+        assert!(allow_idle_prompt_gc_bootstrap(&SessionSource::Cli, true));
+        assert!(!allow_idle_prompt_gc_bootstrap(&SessionSource::Cli, false));
     }
 }

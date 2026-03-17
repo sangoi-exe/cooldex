@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use crate::context_manager::estimate_response_item_model_visible_bytes;
+use crate::truncate::approx_tokens_from_byte_count_i64;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::MessagePhase;
@@ -59,6 +61,7 @@ pub(crate) struct PromptGcCapturedUnit {
     pub(crate) kind: PromptGcUnitKind,
     pub(crate) payload_text: String,
     pub(crate) approx_bytes: usize,
+    pub(crate) approx_model_visible_tokens: i64,
     pub(crate) resolver: PromptGcUnitResolver,
 }
 
@@ -67,6 +70,13 @@ pub(crate) struct PromptGcPendingCall {
     fingerprint: String,
     payload_text: String,
     call_name: String,
+    approx_model_visible_tokens: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PromptGcCheckpointEligibility {
+    pub(crate) uncompacted_unit_count: usize,
+    pub(crate) total_approx_tokens: i64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -129,6 +139,7 @@ impl PromptGcSidecar {
                     fingerprint: response_item_fingerprint(item),
                     payload_text,
                     call_name: name.clone(),
+                    approx_model_visible_tokens: estimate_response_item_model_visible_tokens(item),
                 };
                 self.pending_function_calls
                     .entry(call_id.clone())
@@ -150,6 +161,7 @@ impl PromptGcSidecar {
                     fingerprint: response_item_fingerprint(item),
                     payload_text,
                     call_name: name.clone(),
+                    approx_model_visible_tokens: estimate_response_item_model_visible_tokens(item),
                 };
                 self.pending_custom_calls
                     .entry(call_id.clone())
@@ -177,6 +189,7 @@ impl PromptGcSidecar {
                     fingerprint: response_item_fingerprint(item),
                     payload_text,
                     call_name: "local_shell".to_string(),
+                    approx_model_visible_tokens: estimate_response_item_model_visible_tokens(item),
                 };
                 self.pending_function_calls
                     .entry(call_id.clone())
@@ -253,23 +266,35 @@ impl PromptGcSidecar {
         max_raw_bytes: usize,
     ) -> Option<Vec<PromptGcCapturedUnit>> {
         let checkpoint = self.checkpoint(checkpoint_id)?;
-        let mut selected = Vec::new();
-        let mut selected_bytes = 0usize;
-        for unit in self.units.iter().take(checkpoint.eligible_unit_count) {
-            if self.compacted_unit_keys.contains(&unit.unit_key) {
-                continue;
-            }
-            let projected_bytes = selected_bytes.saturating_add(unit.approx_bytes);
-            if !selected.is_empty() && projected_bytes > max_raw_bytes {
-                break;
-            }
-            selected.push(unit.clone());
-            selected_bytes = projected_bytes;
-            if selected.len() >= max_units || selected_bytes >= max_raw_bytes {
-                break;
-            }
+        Some(
+            self.collect_selectable_unit_refs(&checkpoint, max_units, max_raw_bytes)
+                .into_iter()
+                .cloned()
+                .collect(),
+        )
+    }
+
+    pub(crate) fn checkpoint_eligibility(
+        &self,
+        checkpoint_id: &str,
+    ) -> Option<PromptGcCheckpointEligibility> {
+        let checkpoint = self.checkpoint(checkpoint_id)?;
+        let uncompacted_units = self
+            .units
+            .iter()
+            .take(checkpoint.eligible_unit_count)
+            .filter(|unit| !self.compacted_unit_keys.contains(&unit.unit_key));
+        let mut uncompacted_unit_count = 0usize;
+        let mut total_approx_tokens = 0i64;
+        for unit in uncompacted_units {
+            uncompacted_unit_count = uncompacted_unit_count.saturating_add(1);
+            total_approx_tokens =
+                total_approx_tokens.saturating_add(unit.approx_model_visible_tokens);
         }
-        Some(selected)
+        Some(PromptGcCheckpointEligibility {
+            uncompacted_unit_count,
+            total_approx_tokens,
+        })
     }
 
     pub(crate) fn complete_cycle(&mut self, outcome: PromptGcApplyOutcome) {
@@ -299,6 +324,26 @@ impl PromptGcSidecar {
     pub(crate) fn clear_pending_calls_for_rewrite(&mut self) {
         self.pending_function_calls.clear();
         self.pending_custom_calls.clear();
+    }
+
+    // Merge-safety anchor: runtime heuristics may decline a checkpoint without poisoning the
+    // sidecar state; skip paths must only clear the active cycle and preserve prior status.
+    pub(crate) fn skip_cycle(&mut self, checkpoint_id: &str) {
+        self.running = false;
+        if self
+            .pending_apply_outcome
+            .as_ref()
+            .is_some_and(|pending| pending.checkpoint_id == checkpoint_id)
+        {
+            self.pending_apply_outcome = None;
+        }
+        if self
+            .active_checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)
+        {
+            self.active_checkpoint = None;
+        }
     }
 
     pub(crate) fn fail_cycle(&mut self, checkpoint_id: &str, error: impl Into<String>) {
@@ -402,6 +447,7 @@ impl PromptGcSidecar {
             chunk_id,
             kind: PromptGcUnitKind::Reasoning,
             approx_bytes: payload_text.len(),
+            approx_model_visible_tokens: estimate_response_item_model_visible_tokens(item),
             payload_text,
             resolver: PromptGcUnitResolver::Reasoning {
                 fingerprint: response_item_fingerprint(item),
@@ -433,6 +479,9 @@ impl PromptGcSidecar {
             chunk_id,
             kind: PromptGcUnitKind::ToolPair,
             approx_bytes: payload_text.len(),
+            approx_model_visible_tokens: pending
+                .approx_model_visible_tokens
+                .saturating_add(estimate_response_item_model_visible_tokens(output_item)),
             payload_text,
             resolver: PromptGcUnitResolver::ToolPair {
                 call_id: call_id.to_string(),
@@ -457,12 +506,38 @@ impl PromptGcSidecar {
             chunk_id,
             kind: PromptGcUnitKind::ToolResult,
             approx_bytes: payload_text.len(),
+            approx_model_visible_tokens: estimate_response_item_model_visible_tokens(item),
             payload_text,
             resolver: PromptGcUnitResolver::ToolResult {
                 fingerprint: response_item_fingerprint(item),
                 call_name: call_name.to_string(),
             },
         });
+    }
+
+    fn collect_selectable_unit_refs<'a>(
+        &'a self,
+        checkpoint: &PromptGcCheckpoint,
+        max_units: usize,
+        max_raw_bytes: usize,
+    ) -> Vec<&'a PromptGcCapturedUnit> {
+        let mut selected = Vec::new();
+        let mut selected_bytes = 0usize;
+        for unit in self.units.iter().take(checkpoint.eligible_unit_count) {
+            if self.compacted_unit_keys.contains(&unit.unit_key) {
+                continue;
+            }
+            let projected_bytes = selected_bytes.saturating_add(unit.approx_bytes);
+            if !selected.is_empty() && projected_bytes > max_raw_bytes {
+                break;
+            }
+            selected.push(unit);
+            selected_bytes = projected_bytes;
+            if selected.len() >= max_units || selected_bytes >= max_raw_bytes {
+                break;
+            }
+        }
+        selected
     }
 }
 
@@ -481,6 +556,10 @@ fn function_call_output_text(output: &FunctionCallOutputPayload) -> String {
         .map(ToOwned::to_owned)
         .or_else(|| serde_json::to_string_pretty(output).ok())
         .unwrap_or_default()
+}
+
+fn estimate_response_item_model_visible_tokens(item: &ResponseItem) -> i64 {
+    approx_tokens_from_byte_count_i64(estimate_response_item_model_visible_bytes(item))
 }
 
 fn local_shell_action_text(action: &LocalShellAction) -> String {
@@ -641,6 +720,107 @@ mod tests {
         assert!(units[0].payload_text.contains("local_shell"));
         assert!(units[1].payload_text.contains("web_search"));
         assert!(units[2].payload_text.contains("image_generation"));
+    }
+
+    #[test]
+    fn checkpoint_eligibility_counts_large_tool_output_as_token_heavy() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let call = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: "{\"cmd\":\"pwd\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(0, &call);
+
+        let output = ResponseItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("x".repeat(900)),
+                success: Some(true),
+            },
+        };
+        sidecar.observe_recorded_item(1, &output);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(2, &phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let eligibility = sidecar
+            .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
+            .expect("eligibility");
+
+        assert_eq!(eligibility.uncompacted_unit_count, 1);
+        assert!(eligibility.total_approx_tokens >= 200);
+    }
+
+    #[test]
+    fn checkpoint_eligibility_ignores_compacted_units_but_keeps_leftovers() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let first = ResponseItem::Reasoning {
+            id: "reasoning-1".to_string(),
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: Some("x".repeat(2_000)),
+        };
+        let second = ResponseItem::Reasoning {
+            id: "reasoning-2".to_string(),
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: Some("y".repeat(2_000)),
+        };
+        let phase_one = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase one".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+
+        sidecar.observe_recorded_item(0, &first);
+        sidecar.observe_recorded_item(1, &second);
+        sidecar.observe_recorded_item(2, &phase_one);
+
+        let checkpoint_one = sidecar.take_pending_checkpoint().expect("checkpoint one");
+        let first_unit_key = sidecar.units[0].unit_key;
+        sidecar.complete_cycle(PromptGcApplyOutcome {
+            checkpoint_id: checkpoint_one.checkpoint_id,
+            checkpoint_seq: checkpoint_one.checkpoint_seq,
+            applied_unit_keys: vec![first_unit_key],
+        });
+
+        let phase_two = ResponseItem::Message {
+            id: Some("msg-2".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase two".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(3, &phase_two);
+
+        let checkpoint_two = sidecar.take_pending_checkpoint().expect("checkpoint two");
+        let eligibility = sidecar
+            .checkpoint_eligibility(checkpoint_two.checkpoint_id.as_str())
+            .expect("eligibility");
+
+        assert_eq!(eligibility.uncompacted_unit_count, 1);
+        assert!(eligibility.total_approx_tokens >= 200);
     }
 
     #[test]
@@ -862,5 +1042,33 @@ mod tests {
 
         assert_eq!(sidecar.status.last_applied_checkpoint_seq, None);
         assert_eq!(sidecar.status.last_error.as_deref(), Some("request failed"));
+    }
+
+    #[test]
+    fn skip_cycle_clears_runtime_state_without_poisoning_status() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(0, &phase_message);
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        sidecar.status.last_error = Some("older failure".to_string());
+        sidecar.status.last_applied_checkpoint_seq = Some(7);
+
+        sidecar.skip_cycle(&checkpoint.checkpoint_id);
+
+        assert!(!sidecar.running);
+        assert!(sidecar.active_checkpoint.is_none());
+        assert_eq!(sidecar.status.last_error.as_deref(), Some("older failure"));
+        assert_eq!(sidecar.status.last_applied_checkpoint_seq, Some(7));
+        assert_eq!(sidecar.status.blocked_reason, None);
     }
 }

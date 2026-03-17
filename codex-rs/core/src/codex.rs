@@ -3400,7 +3400,7 @@ impl Session {
     }
 
     async fn send_raw_response_items(&self, turn_context: &TurnContext, items: &[ResponseItem]) {
-        // Merge anchor: TUI `/debug` caches the latest `RawResponseItem` event, so this stream
+        // Merge-safety anchor: TUI `/debug` caches the latest `RawResponseItem` event, so this stream
         // must keep emitting every response item in order.
         for item in items {
             self.send_event(
@@ -4110,6 +4110,11 @@ async fn persist_prompt_gc_rollout_items(
     Ok(())
 }
 
+// Merge-safety anchor: prompt_gc runtime activation must stay tied to the eligible hidden payload
+// volume itself, so large tool outputs compact promptly even when the overall context window is
+// still mostly empty.
+const PROMPT_GC_MIN_SELECTABLE_APPROX_TOKENS: i64 = 200;
+
 fn prompt_gc_compaction_metadata(
     checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
     kind: PromptGcOutcomeKind,
@@ -4127,6 +4132,15 @@ fn prompt_gc_compaction_metadata(
         error_message,
         applied_unit_count,
     }
+}
+
+fn structured_function_call_error_payload(
+    error: &crate::function_tool::FunctionCallError,
+) -> Option<Value> {
+    let crate::function_tool::FunctionCallError::RespondToModel(raw) = error else {
+        return None;
+    };
+    serde_json::from_str(raw).ok()
 }
 
 async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiver<Submission>) {
@@ -6163,6 +6177,22 @@ async fn run_prompt_gc_sidecar_if_needed(
     let Some(checkpoint) = checkpoint else {
         return;
     };
+    let checkpoint_eligibility = sidecar
+        .lock()
+        .await
+        .checkpoint_eligibility(&checkpoint.checkpoint_id);
+    if matches!(checkpoint_eligibility, Some(eligibility) if eligibility.uncompacted_unit_count > 0 && eligibility.total_approx_tokens < PROMPT_GC_MIN_SELECTABLE_APPROX_TOKENS)
+    {
+        debug!(
+            turn_id = %turn_context.sub_id,
+            checkpoint_id = %checkpoint.checkpoint_id,
+            checkpoint_eligibility = ?checkpoint_eligibility,
+            threshold_tokens = PROMPT_GC_MIN_SELECTABLE_APPROX_TOKENS,
+            "skipping prompt_gc checkpoint until eligible token volume is higher"
+        );
+        sidecar.lock().await.skip_cycle(&checkpoint.checkpoint_id);
+        return;
+    }
     sess.persist_prompt_gc_rollout_marker(
         &checkpoint,
         PromptGcOutcomeKind::Started,
@@ -6197,22 +6227,37 @@ async fn run_prompt_gc_sidecar_if_needed(
     {
         Ok(plan) => plan,
         Err(error) => {
+            let error_message = error.to_string();
+            let error_payload = structured_function_call_error_payload(&error);
+            let stop_reason = error_payload
+                .as_ref()
+                .and_then(|payload| payload.get("stop_reason"))
+                .and_then(Value::as_str);
+            let marker_stop_reason = Some(stop_reason.unwrap_or("plan_build_failed").to_string());
+            let status_error = error_payload
+                .as_ref()
+                .and_then(|payload| payload.get("message"))
+                .and_then(Value::as_str)
+                .map(std::string::ToString::to_string)
+                .unwrap_or_else(|| error_message.clone());
             warn!(
                 turn_id = %turn_context.sub_id,
                 checkpoint_id = %checkpoint.checkpoint_id,
                 error = %error,
                 "prompt_gc sidecar failed to build the runtime plan"
             );
-            sidecar
-                .lock()
-                .await
-                .fail_cycle(&checkpoint.checkpoint_id, error.to_string());
+            let mut sidecar = sidecar.lock().await;
+            if matches!(stop_reason, Some("state_hash_mismatch")) {
+                sidecar.block_remaining_turn(&checkpoint.checkpoint_id, status_error);
+            } else {
+                sidecar.fail_cycle(&checkpoint.checkpoint_id, error_message.clone());
+            }
             sess.persist_prompt_gc_rollout_marker(
                 &checkpoint,
                 PromptGcOutcomeKind::Failed,
                 Some(PromptGcExecutionPhase::Prepare),
-                Some("plan_build_failed".to_string()),
-                Some(error.to_string()),
+                marker_stop_reason,
+                Some(error_message),
                 None,
             )
             .await;
