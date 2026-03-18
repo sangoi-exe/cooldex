@@ -18,6 +18,7 @@ use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
 use crate::protocol::RolloutItem;
 use crate::protocol::TurnStartedEvent;
+use crate::response_item_utils::local_shell_call_output_id;
 use crate::state::TaskKind;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::handlers::ManageContextHandler;
@@ -317,9 +318,19 @@ async fn materialize_sanitize_history_if_changed(
             let guard = sess.services.rollout.lock().await;
             guard.clone()
         };
-        if let Some(recorder) = recorder
-            && let Err(error) = recorder.record_items(&[compacted_item]).await
-        {
+        let Some(recorder) = recorder else {
+            if ctx.config.ephemeral {
+                sess.recompute_token_usage(ctx).await;
+                return Ok(outcome);
+            }
+            let mut state = sess.state.lock().await;
+            state.restore_manage_context_checkpoint(checkpoint);
+            return Err(CodexErr::Fatal(
+                "failed to persist compacted replacement_history: rollout recorder unavailable"
+                    .to_string(),
+            ));
+        };
+        if let Err(error) = recorder.record_items(&[compacted_item]).await {
             let mut state = sess.state.lock().await;
             state.restore_manage_context_checkpoint(checkpoint);
             return Err(CodexErr::Fatal(format!(
@@ -654,13 +665,12 @@ impl ManageContextCallOwnership {
                         .non_manage_function_like_call_ids
                         .insert(call_id.clone());
                 }
-                ResponseItem::LocalShellCall {
-                    call_id: Some(call_id),
-                    ..
-                } => {
-                    call_ownership
-                        .non_manage_function_like_call_ids
-                        .insert(call_id.clone());
+                ResponseItem::LocalShellCall { id, call_id, .. } => {
+                    if let Some(call_id) = local_shell_call_output_id(id, call_id) {
+                        call_ownership
+                            .non_manage_function_like_call_ids
+                            .insert(call_id);
+                    }
                 }
                 ResponseItem::CustomToolCall { call_id, .. } => {
                     call_ownership
@@ -988,6 +998,21 @@ mod tests {
         ResponseItem::LocalShellCall {
             id: None,
             call_id: Some(call_id.to_string()),
+            status: LocalShellStatus::Completed,
+            action: LocalShellAction::Exec(LocalShellExecAction {
+                command: vec!["echo".to_string(), "ok".to_string()],
+                timeout_ms: None,
+                working_directory: None,
+                env: None,
+                user: None,
+            }),
+        }
+    }
+
+    fn legacy_local_shell_call(id: &str) -> ResponseItem {
+        ResponseItem::LocalShellCall {
+            id: Some(id.to_string()),
+            call_id: None,
             status: LocalShellStatus::Completed,
             action: LocalShellAction::Exec(LocalShellExecAction {
                 command: vec!["echo".to_string(), "ok".to_string()],
@@ -1800,6 +1825,26 @@ mod tests {
     }
 
     #[test]
+    fn manage_context_follow_up_events_since_ignores_legacy_local_shell_collision_output() {
+        let before = vec![manage_context_call("call-1")];
+        let after = vec![
+            manage_context_call("shared"),
+            legacy_local_shell_call("shared"),
+            function_call_output(
+                "shared",
+                &json!({
+                    "mode": "apply",
+                    "stop_reason": "target_reached"
+                })
+                .to_string(),
+            ),
+        ];
+
+        let events = manage_context_follow_up_events_since(&before, &after);
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn manage_context_follow_up_events_since_ignores_non_manage_outputs_with_mode_shape() {
         let before = vec![
             manage_context_call("call-1"),
@@ -2369,6 +2414,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sanitize_replacement_history_if_changed_keeps_colliding_local_shell_output_for_in_flight_manage_context_call()
+     {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = crate::state::SessionState::new(session_configuration);
+        let baseline = [input_text_message("user", "baseline")];
+        state.record_items(
+            baseline.iter(),
+            crate::truncate::TruncationPolicy::Tokens(4_096),
+        );
+        let baseline_snapshot = state.history_snapshot_lenient();
+
+        let extra_items = [
+            manage_context_call("shared"),
+            local_shell_call("shared"),
+            function_call_output("shared", "ok"),
+        ];
+        state.record_items(
+            extra_items.iter(),
+            crate::truncate::TruncationPolicy::Tokens(4_096),
+        );
+        state.set_context_inclusion(&[0], false);
+
+        let materialized =
+            sanitize_replacement_history_if_changed(&mut state, &baseline_snapshot, &[])
+                .expect("must materialize with collision-preserving cleanup");
+
+        assert!(materialized.history_cleanup_required);
+        assert!(materialized.semantic_context_changed);
+        assert!(materialized.replacement_history.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name == "manage_context" && call_id == "shared"
+            )
+        }));
+        assert!(materialized.replacement_history.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::LocalShellCall { call_id, .. }
+                    if call_id.as_deref() == Some("shared")
+            )
+        }));
+        assert!(materialized.replacement_history.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "shared"
+            )
+        }));
+        assert_eq!(
+            state.history_snapshot_lenient(),
+            materialized.replacement_history
+        );
+    }
+
+    #[tokio::test]
     async fn sanitize_rollout_persist_failure_rolls_back_state() {
         let (session, turn) = crate::codex::make_session_and_context().await;
 
@@ -2445,5 +2545,87 @@ mod tests {
         assert_eq!(after_overlay, before_overlay);
         assert_eq!(after_context_items, before_context_items);
         assert_eq!(after_rids, before_rids);
+    }
+
+    #[tokio::test]
+    async fn sanitize_without_rollout_recorder_rolls_back_state_for_persistent_sessions() {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+
+        let history_before_sanitize = {
+            let mut state = session.state.lock().await;
+            let items = [
+                input_text_message("user", "first"),
+                input_text_message("assistant", "second"),
+            ];
+            state.record_items(items.iter(), turn.truncation_policy);
+            let baseline = state.history_snapshot_lenient();
+            state.set_context_inclusion(&[1], false);
+            let first_rid = state.history_rids_snapshot_lenient()[0];
+            state.upsert_context_replacements(vec![(first_rid, "first replaced".to_string())]);
+            state.add_context_notes(vec!["Decision: keep strict pruning.".to_string()]);
+            baseline
+        };
+
+        let (before_history, before_overlay, before_context_items, before_rids) = {
+            let state = session.state.lock().await;
+            (
+                state.history_snapshot_lenient(),
+                state.context_overlay_snapshot(),
+                state.build_context_items_event(),
+                state.history_rids_snapshot_lenient(),
+            )
+        };
+
+        let error =
+            materialize_sanitize_history_if_changed(&session, &turn, &history_before_sanitize, &[])
+                .await
+                .expect_err("materialization should fail without rollout recorder");
+        assert!(
+            error.to_string().contains("rollout recorder unavailable"),
+            "unexpected error: {error}"
+        );
+
+        let (after_history, after_overlay, after_context_items, after_rids) = {
+            let state = session.state.lock().await;
+            (
+                state.history_snapshot_lenient(),
+                state.context_overlay_snapshot(),
+                state.build_context_items_event(),
+                state.history_rids_snapshot_lenient(),
+            )
+        };
+        assert_eq!(after_history, before_history);
+        assert_eq!(after_overlay, before_overlay);
+        assert_eq!(after_context_items, before_context_items);
+        assert_eq!(after_rids, before_rids);
+    }
+
+    #[tokio::test]
+    async fn sanitize_without_rollout_recorder_succeeds_for_ephemeral_sessions() {
+        let (session, mut turn) = crate::codex::make_session_and_context().await;
+        let mut config = (*turn.config).clone();
+        config.ephemeral = true;
+        turn.config = Arc::new(config);
+
+        let history_before_sanitize = {
+            let mut state = session.state.lock().await;
+            let items = [
+                input_text_message("user", "first"),
+                input_text_message("assistant", "second"),
+            ];
+            state.record_items(items.iter(), turn.truncation_policy);
+            let baseline = state.history_snapshot_lenient();
+            state.set_context_inclusion(&[1], false);
+            let first_rid = state.history_rids_snapshot_lenient()[0];
+            state.upsert_context_replacements(vec![(first_rid, "first replaced".to_string())]);
+            state.add_context_notes(vec!["Decision: keep strict pruning.".to_string()]);
+            baseline
+        };
+
+        let outcome =
+            materialize_sanitize_history_if_changed(&session, &turn, &history_before_sanitize, &[])
+                .await
+                .expect("materialization should succeed for ephemeral sessions");
+        assert!(outcome.history_cleanup_required);
     }
 }

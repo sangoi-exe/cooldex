@@ -22,6 +22,8 @@ use crate::protocol::RateLimitSnapshot;
 use crate::protocol::TOOL_CONTEXT_OPEN_TAG;
 use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
+use crate::response_item_utils::is_unified_exec_output_frame;
+use crate::response_item_utils::is_unified_exec_token_qty_marker_line;
 use crate::rid::rid_to_string;
 use crate::state::ContextItemSummary;
 use crate::state::ContextItemsEvent;
@@ -629,6 +631,7 @@ fn preview_for_item(item: &ResponseItem) -> String {
 
 fn tool_output_preview_line(text: &str) -> &str {
     let trimmed = text.trim();
+    let unified_exec_framed = is_unified_exec_output_frame(trimmed);
     let mut fallback = None;
     for line in trimmed.lines() {
         let candidate = line.trim();
@@ -636,7 +639,7 @@ fn tool_output_preview_line(text: &str) -> &str {
             continue;
         }
         fallback.get_or_insert(candidate);
-        if is_tool_output_boilerplate_line(candidate) {
+        if is_tool_output_boilerplate_line(candidate, unified_exec_framed) {
             continue;
         }
         return candidate;
@@ -645,14 +648,14 @@ fn tool_output_preview_line(text: &str) -> &str {
     fallback.unwrap_or("")
 }
 
-fn is_tool_output_boilerplate_line(line: &str) -> bool {
+fn is_tool_output_boilerplate_line(line: &str, unified_exec_framed: bool) -> bool {
     line == "Output:"
         || line.starts_with("Chunk ID:")
         || line.starts_with("call_id:")
         || line.starts_with("Context left:")
         || line.starts_with("Exit code:")
         || line.starts_with("Wall time:")
-        || line.starts_with("Original token count:")
+        || (unified_exec_framed && is_unified_exec_token_qty_marker_line(line))
         || line.starts_with("Total output lines:")
         || line.starts_with("Process exited with code")
         || line.starts_with("Process running with session ID")
@@ -1061,8 +1064,20 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_preview_skips_original_token_count() {
-        let text = "Original token count: 123\nOutput:\nreal output line\n";
+    fn tool_output_preview_keeps_bare_token_qty_text() {
+        let text = "Token qty: 123\nOutput:\nreal output line\n";
+        assert_eq!(tool_output_preview_line(text), "Token qty: 123");
+    }
+
+    #[test]
+    fn tool_output_preview_skips_token_qty_inside_unified_exec_frame() {
+        let text = "Wall time: 0.1 seconds\nToken qty: 123\nOutput:\nreal output line\n";
+        assert_eq!(tool_output_preview_line(text), "real output line");
+    }
+
+    #[test]
+    fn tool_output_preview_skips_legacy_original_token_count_inside_unified_exec_frame() {
+        let text = "Wall time: 0.1 seconds\nOriginal token count: 123\nOutput:\nreal output line\n";
         assert_eq!(tool_output_preview_line(text), "real output line");
     }
 

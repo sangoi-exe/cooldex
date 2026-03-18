@@ -71,6 +71,7 @@ pub(crate) struct ToolsConfig {
     pub artifact_tools: bool,
     pub request_user_input: bool,
     pub default_mode_request_user_input: bool,
+    pub manage_context: bool,
     pub experimental_supported_tools: Vec<String>,
     pub agent_jobs_tools: bool,
     pub agent_jobs_worker_tools: bool,
@@ -99,6 +100,7 @@ impl ToolsConfig {
         let include_request_user_input = !matches!(session_source, SessionSource::SubAgent(_));
         let include_default_mode_request_user_input =
             include_request_user_input && features.enabled(Feature::DefaultModeRequestUserInput);
+        let include_manage_context = !matches!(session_source, SessionSource::SubAgent(_));
         let include_search_tool = features.enabled(Feature::Apps);
         let include_artifact_tools =
             features.enabled(Feature::Artifact) && codex_artifacts::can_manage_artifact_runtime();
@@ -172,6 +174,7 @@ impl ToolsConfig {
             artifact_tools: include_artifact_tools,
             request_user_input: include_request_user_input,
             default_mode_request_user_input: include_default_mode_request_user_input,
+            manage_context: include_manage_context,
             experimental_supported_tools: model_info.experimental_supported_tools.clone(),
             agent_jobs_tools: include_agent_jobs,
             agent_jobs_worker_tools,
@@ -464,7 +467,7 @@ fn create_exec_command_tool(allow_login_shell: bool, request_permission_enabled:
     properties.extend(create_approval_parameters(request_permission_enabled));
 
     ToolSpec::Function(ResponsesApiTool {
-        name: "exec_command".to_string(),
+        name: crate::tools::handlers::unified_exec::UNIFIED_EXEC_FUNCTION_TOOL_NAME.to_string(),
         description:
             "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
                 .to_string(),
@@ -1953,6 +1956,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::TestSyncHandler;
     use crate::tools::handlers::UnifiedExecHandler;
     use crate::tools::handlers::ViewImageHandler;
+    use crate::tools::handlers::unified_exec::UNIFIED_EXEC_FUNCTION_TOOL_NAME;
     use std::sync::Arc;
 
     let mut builder = ToolRegistryBuilder::new();
@@ -1993,7 +1997,10 @@ pub(crate) fn build_specs(
                 true,
             );
             builder.push_spec(create_write_stdin_tool());
-            builder.register_handler("exec_command", unified_exec_handler.clone());
+            builder.register_handler(
+                UNIFIED_EXEC_FUNCTION_TOOL_NAME,
+                unified_exec_handler.clone(),
+            );
             builder.register_handler("write_stdin", unified_exec_handler);
         }
         ConfigShellToolType::Disabled => {
@@ -2140,8 +2147,10 @@ pub(crate) fn build_specs(
 
     builder.push_spec_with_parallel_support(create_view_image_tool(), true);
     builder.register_handler("view_image", view_image_handler);
-    builder.push_spec(create_manage_context_tool());
-    builder.register_handler("manage_context", manage_context_handler);
+    if config.manage_context {
+        builder.push_spec(create_manage_context_tool());
+        builder.register_handler("manage_context", manage_context_handler);
+    }
     builder.push_spec(create_recall_tool());
     builder.register_handler("recall", recall_handler);
 
@@ -2596,9 +2605,11 @@ mod tests {
                 "close_agent",
                 "spawn_agents_on_csv",
                 "report_agent_job_result",
+                "recall",
             ],
         );
         assert_lacks_tool_name(&tools, "request_user_input");
+        assert_lacks_tool_name(&tools, "manage_context");
     }
 
     #[test]

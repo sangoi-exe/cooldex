@@ -2427,29 +2427,29 @@ mod tests {
         let receiver_thread_id = ThreadId::try_from("00000000-0000-0000-0000-000000000011")
             .expect("valid receiver thread id");
         let wait_begin = CollabWaitingBeginEvent {
-            sender_thread_id: sender_thread_id.clone(),
-            receiver_thread_ids: vec![receiver_thread_id.clone()],
+            sender_thread_id,
+            receiver_thread_ids: vec![receiver_thread_id],
             receiver_agents: Vec::new(),
             call_id: "wait-1".into(),
             wait_state: CoreCollabWaitState {
-                return_when: CoreCollabWaitReturnWhen::AllFinal,
-                disable_timeout: true,
+                return_when: CoreCollabWaitReturnWhen::AnyFinal,
+                disable_timeout: false,
                 timed_out: None,
             },
         };
         let wait_end = CollabWaitingEndEvent {
-            sender_thread_id: sender_thread_id.clone(),
+            sender_thread_id,
             call_id: "wait-1".into(),
             agent_statuses: Vec::new(),
             statuses: [(
-                receiver_thread_id.clone(),
+                receiver_thread_id,
                 AgentStatus::Completed(Some("done".into())),
             )]
             .into_iter()
             .collect(),
             wait_state: CoreCollabWaitState {
-                return_when: CoreCollabWaitReturnWhen::AllFinal,
-                disable_timeout: true,
+                return_when: CoreCollabWaitReturnWhen::AnyFinal,
+                disable_timeout: false,
                 timed_out: Some(true),
             },
         };
@@ -2477,8 +2477,8 @@ mod tests {
                 prompt: None,
                 agents_states: HashMap::new(),
                 wait_state: Some(crate::protocol::v2::CollabWaitState {
-                    return_when: crate::protocol::v2::CollabWaitReturnWhen::AllFinal,
-                    disable_timeout: true,
+                    return_when: crate::protocol::v2::CollabWaitReturnWhen::AnyFinal,
+                    disable_timeout: false,
                     timed_out: None,
                 }),
             }
@@ -2508,9 +2508,83 @@ mod tests {
                 .into_iter()
                 .collect(),
                 wait_state: Some(crate::protocol::v2::CollabWaitState {
+                    return_when: crate::protocol::v2::CollabWaitReturnWhen::AnyFinal,
+                    disable_timeout: false,
+                    timed_out: Some(true),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn reconstructs_collab_wait_items_with_all_final_wait_state() {
+        let sender_thread_id = ThreadId::try_from("00000000-0000-0000-0000-000000000020")
+            .expect("valid sender thread id");
+        let receiver_thread_id = ThreadId::try_from("00000000-0000-0000-0000-000000000021")
+            .expect("valid receiver thread id");
+        let wait_begin = CollabWaitingBeginEvent {
+            sender_thread_id,
+            receiver_thread_ids: vec![receiver_thread_id],
+            receiver_agents: Vec::new(),
+            call_id: "wait-all-final".into(),
+            wait_state: CoreCollabWaitState {
+                return_when: CoreCollabWaitReturnWhen::AllFinal,
+                disable_timeout: true,
+                timed_out: Some(false),
+            },
+        };
+        let wait_end = CollabWaitingEndEvent {
+            sender_thread_id,
+            call_id: "wait-all-final".into(),
+            agent_statuses: Vec::new(),
+            statuses: [(
+                receiver_thread_id,
+                AgentStatus::Completed(Some("done".into())),
+            )]
+            .into_iter()
+            .collect(),
+            wait_state: CoreCollabWaitState {
+                return_when: CoreCollabWaitReturnWhen::AllFinal,
+                disable_timeout: true,
+                timed_out: Some(false),
+            },
+        };
+
+        let mut builder = ThreadHistoryBuilder::new();
+        builder.handle_event(&EventMsg::UserMessage(UserMessageEvent {
+            message: "wait all".into(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+        }));
+        builder.handle_event(&EventMsg::CollabWaitingBegin(wait_begin));
+        builder.handle_event(&EventMsg::CollabWaitingEnd(wait_end));
+
+        let turns = builder.finish();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items[1],
+            ThreadItem::CollabAgentToolCall {
+                id: "wait-all-final".into(),
+                tool: CollabAgentTool::Wait,
+                status: CollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![receiver_thread_id.to_string()],
+                prompt: None,
+                agents_states: [(
+                    receiver_thread_id.to_string(),
+                    CollabAgentState {
+                        status: crate::protocol::v2::CollabAgentStatus::Completed,
+                        message: Some("done".into()),
+                        last_activity: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                wait_state: Some(crate::protocol::v2::CollabWaitState {
                     return_when: crate::protocol::v2::CollabWaitReturnWhen::AllFinal,
                     disable_timeout: true,
-                    timed_out: Some(true),
+                    timed_out: Some(false),
                 }),
             }
         );

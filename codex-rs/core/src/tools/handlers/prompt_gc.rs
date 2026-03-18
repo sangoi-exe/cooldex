@@ -11,6 +11,8 @@ use crate::protocol::REASONING_CONTEXT_CLOSE_TAG;
 use crate::protocol::REASONING_CONTEXT_OPEN_TAG;
 use crate::protocol::TOOL_CONTEXT_CLOSE_TAG;
 use crate::protocol::TOOL_CONTEXT_OPEN_TAG;
+use crate::truncate::TruncationPolicy;
+use crate::truncate::truncate_text;
 use codex_protocol::models::ResponseItem;
 use serde::Deserialize;
 use serde::Serialize;
@@ -85,6 +87,20 @@ fn select_chunks(
         selected.push(chunk.clone());
     }
     Ok(selected)
+}
+
+fn manifest_payload_text(unit: &PromptGcCapturedUnit) -> String {
+    if unit.approx_bytes <= MAX_RAW_BYTES_PER_RETRIEVE {
+        return unit.payload_text.clone();
+    }
+
+    // Merge-safety anchor: prompt_gc retrieve must keep oversize first units eligible without
+    // feeding the hidden model the full raw payload; preserve canonical approx_bytes for
+    // accounting and selection, but bound the manifest preview bytes.
+    truncate_text(
+        &unit.payload_text,
+        TruncationPolicy::Bytes(MAX_RAW_BYTES_PER_RETRIEVE),
+    )
 }
 
 fn validate_chunk_summaries(
@@ -253,7 +269,7 @@ pub(crate) async fn build_runtime_plan(
                     PromptGcUnitKind::ToolResult => "tool_result".to_string(),
                 },
                 approx_bytes: unit.approx_bytes,
-                payload_text: unit.payload_text.clone(),
+                payload_text: manifest_payload_text(&unit),
                 call_name: match &unit.resolver {
                     PromptGcUnitResolver::Reasoning { .. } => None,
                     PromptGcUnitResolver::ToolPair { call_name, .. } => Some(call_name.clone()),
@@ -862,6 +878,31 @@ mod tests {
                 ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "legacy-shell"
             )
         }));
+    }
+
+    #[test]
+    fn manifest_payload_text_truncates_oversize_units_for_manifest_preview() {
+        let payload_text = "x".repeat(MAX_RAW_BYTES_PER_RETRIEVE + 10_000);
+        let unit = PromptGcCapturedUnit {
+            unit_key: 1,
+            chunk_id: "chunk-1".to_string(),
+            kind: PromptGcUnitKind::ToolPair,
+            approx_bytes: payload_text.len(),
+            function_call_output_token_qty: Some(10_000),
+            payload_text,
+            resolver: PromptGcUnitResolver::ToolPair {
+                call_id: "call-1".to_string(),
+                call_fingerprint: "call-fingerprint".to_string(),
+                output_fingerprint: "output-fingerprint".to_string(),
+                call_name: "shell".to_string(),
+            },
+        };
+
+        let preview = manifest_payload_text(&unit);
+
+        assert!(preview.contains("chars truncated"));
+        assert!(preview.len() < unit.approx_bytes);
+        assert!(preview.len() <= MAX_RAW_BYTES_PER_RETRIEVE + 64);
     }
 
     #[tokio::test]

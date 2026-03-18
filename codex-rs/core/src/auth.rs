@@ -115,8 +115,8 @@ const REFRESH_TOKEN_INVALIDATED_MESSAGE: &str = "Your access token could not be 
 const REFRESH_TOKEN_UNKNOWN_MESSAGE: &str =
     "Your access token could not be refreshed. Please log out and sign in again.";
 const REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE: &str = "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.";
-pub const NON_PLUS_ACCOUNT_REMOVED_MESSAGE: &str = "Your ChatGPT account is not Plus or Pro and was removed from saved accounts. Please sign in again with a Plus or Pro account.";
-pub const EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE: &str = "Only Plus and Pro ChatGPT accounts are supported for external auth. Please sign in again with a Plus or Pro account.";
+pub const UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE: &str = "Your ChatGPT account uses an unsupported plan and was removed from saved accounts. Please sign in again with a supported ChatGPT plan.";
+pub const EXTERNAL_SUPPORTED_CHATGPT_PLAN_REQUIRED_MESSAGE: &str = "This ChatGPT plan is not supported for external auth. Please sign in again with a supported ChatGPT plan.";
 pub const EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE: &str =
     "External ChatGPT auth requires a valid ChatGPT access token JWT.";
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -132,10 +132,12 @@ pub enum RefreshTokenError {
 
 #[derive(Debug, Error)]
 pub enum ExternalAuthLoginError {
-    #[error("{EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE}")]
+    #[error("{EXTERNAL_SUPPORTED_CHATGPT_PLAN_REQUIRED_MESSAGE}")]
     UnsupportedPlan,
     #[error("{EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE}")]
     InvalidAccessToken,
+    #[error("{0}")]
+    MetadataMismatch(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -455,13 +457,15 @@ pub fn login_with_chatgpt_auth_tokens(
     access_token: &str,
     chatgpt_account_id: &str,
     chatgpt_plan_type: Option<&str>,
+    required_workspace_id: Option<&str>,
 ) -> Result<(), ExternalAuthLoginError> {
-    // Merge-safety anchor: external ChatGPT token auth must enforce the same Plus/Pro-only
+    // Merge-safety anchor: external ChatGPT token auth must enforce the same supported-plan
     // admission policy as the saved-account store before ephemeral auth can become active.
     let auth_dot_json = AuthDotJson::from_external_access_token(
         access_token,
         chatgpt_account_id,
         chatgpt_plan_type,
+        required_workspace_id,
     )
     .map_err(|error| {
         if error
@@ -470,12 +474,14 @@ pub fn login_with_chatgpt_auth_tokens(
             .is_some()
         {
             ExternalAuthLoginError::InvalidAccessToken
+        } else if error.kind() == std::io::ErrorKind::InvalidData {
+            ExternalAuthLoginError::MetadataMismatch(error.to_string())
         } else {
             ExternalAuthLoginError::Io(error)
         }
     })?;
     let mut store = AuthStore::from_legacy(auth_dot_json);
-    if !enforce_plus_or_pro_saved_accounts(&mut store).is_empty() {
+    if !enforce_supported_chatgpt_auth_accounts(&mut store).is_empty() {
         return Err(ExternalAuthLoginError::UnsupportedPlan);
     }
     save_auth(codex_home, &store, AuthCredentialsStoreMode::Ephemeral)?;
@@ -680,16 +686,16 @@ fn load_auth(
         };
 
     if let Some(mut store) = ephemeral_storage.load()? {
-        let removed_account_ids = enforce_plus_or_pro_saved_accounts(&mut store);
+        let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
         if !removed_account_ids.is_empty() {
             tracing::info!(
                 removed_account_ids = ?removed_account_ids,
-                "removed non-Plus/Pro accounts while loading external auth store"
+                "removed accounts with unsupported ChatGPT plans while loading external auth store"
             );
             if let Err(error) = save_auth(codex_home, &store, AuthCredentialsStoreMode::Ephemeral) {
                 tracing::warn!(
                     error = %error,
-                    "failed to persist plus/pro auth account policy while loading external auth store"
+                    "failed to persist supported ChatGPT plan policy while loading external auth store"
                 );
             }
         }
@@ -769,11 +775,11 @@ async fn update_tokens(
         tokens.refresh_token = refresh_token;
     }
     account.last_refresh = Some(Utc::now());
-    let removed_account_ids = enforce_plus_or_pro_saved_accounts(&mut store);
+    let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
     if !removed_account_ids.is_empty() {
         tracing::info!(
             removed_account_ids = ?removed_account_ids,
-            "removed non-Plus/Pro accounts from auth store"
+            "removed accounts with unsupported ChatGPT plans from auth store"
         );
     }
     store.validate()?;
@@ -903,26 +909,79 @@ fn refresh_token_endpoint() -> String {
         .unwrap_or_else(|_| REFRESH_TOKEN_URL.to_string())
 }
 
+fn external_auth_metadata_error(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
+fn external_auth_plan_label(plan: &InternalPlanType) -> String {
+    match plan {
+        InternalPlanType::Known(plan) => format!("{plan:?}"),
+        InternalPlanType::Unknown(raw) => raw.clone(),
+    }
+}
+
+fn validate_external_access_token_claims(
+    access_token: &str,
+    provided_account_id: &str,
+    provided_plan_type: Option<&str>,
+    required_workspace_id: Option<&str>,
+) -> std::io::Result<crate::token_data::IdTokenInfo> {
+    let token_info = parse_chatgpt_jwt_claims(access_token).map_err(std::io::Error::other)?;
+    let actual_account_id = token_info.chatgpt_account_id.as_deref().ok_or_else(|| {
+        external_auth_metadata_error(
+            "External auth access token is missing chatgpt_account_id claim.",
+        )
+    })?;
+    if actual_account_id != provided_account_id {
+        return Err(external_auth_metadata_error(format!(
+            "External auth access token workspace claim {actual_account_id:?} does not match provided workspace {provided_account_id:?}."
+        )));
+    }
+    if let Some(required_workspace_id) = required_workspace_id
+        && actual_account_id != required_workspace_id
+    {
+        return Err(external_auth_metadata_error(format!(
+            "External auth access token workspace claim {actual_account_id:?} does not match required workspace {required_workspace_id:?}."
+        )));
+    }
+    if let Some(provided_plan_type) = provided_plan_type {
+        let actual_plan_type = token_info.chatgpt_plan_type.as_ref().ok_or_else(|| {
+            external_auth_metadata_error(
+                "External auth access token is missing chatgpt_plan_type claim, so provided plan metadata cannot be verified.",
+            )
+        })?;
+        let provided_plan_type = InternalPlanType::from_raw_value(provided_plan_type);
+        if actual_plan_type != &provided_plan_type {
+            return Err(external_auth_metadata_error(format!(
+                "External auth access token plan claim {:?} does not match provided plan {:?}.",
+                external_auth_plan_label(actual_plan_type),
+                external_auth_plan_label(&provided_plan_type),
+            )));
+        }
+    }
+    Ok(token_info)
+}
+
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
 impl AuthDotJson {
-    fn from_external_tokens(external: &ExternalAuthTokens) -> std::io::Result<Self> {
-        let mut token_info =
-            parse_chatgpt_jwt_claims(&external.access_token).map_err(std::io::Error::other)?;
-        token_info.chatgpt_account_id = Some(external.chatgpt_account_id.clone());
-        token_info.chatgpt_plan_type = external
-            .chatgpt_plan_type
-            .as_deref()
-            .map(InternalPlanType::from_raw_value)
-            .or(token_info.chatgpt_plan_type)
-            .or(Some(InternalPlanType::Unknown("unknown".to_string())));
+    fn from_external_tokens(
+        external: &ExternalAuthTokens,
+        required_workspace_id: Option<&str>,
+    ) -> std::io::Result<Self> {
+        let token_info = validate_external_access_token_claims(
+            &external.access_token,
+            external.chatgpt_account_id.as_str(),
+            external.chatgpt_plan_type.as_deref(),
+            required_workspace_id,
+        )?;
         let tokens = TokenData {
+            account_id: token_info.chatgpt_account_id.clone(),
             id_token: token_info,
             access_token: external.access_token.clone(),
             refresh_token: String::new(),
-            account_id: Some(external.chatgpt_account_id.clone()),
         };
 
         Ok(Self {
@@ -937,13 +996,14 @@ impl AuthDotJson {
         access_token: &str,
         chatgpt_account_id: &str,
         chatgpt_plan_type: Option<&str>,
+        required_workspace_id: Option<&str>,
     ) -> std::io::Result<Self> {
         let external = ExternalAuthTokens {
             access_token: access_token.to_string(),
             chatgpt_account_id: chatgpt_account_id.to_string(),
             chatgpt_plan_type: chatgpt_plan_type.map(str::to_string),
         };
-        Self::from_external_tokens(&external)
+        Self::from_external_tokens(&external, required_workspace_id)
     }
 
     fn resolved_mode(&self) -> ApiAuthMode {
@@ -1151,16 +1211,16 @@ impl AuthManager {
     ) -> Self {
         let storage = create_auth_storage(codex_home.clone(), auth_credentials_store_mode);
         let mut store = storage.load().ok().flatten().unwrap_or_default();
-        let removed_account_ids = enforce_plus_or_pro_saved_accounts(&mut store);
+        let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
         if !removed_account_ids.is_empty() {
             tracing::info!(
                 removed_account_ids = ?removed_account_ids,
-                "removed non-Plus/Pro accounts during auth manager initialization"
+                "removed accounts with unsupported ChatGPT plans during auth manager initialization"
             );
             if let Err(error) = save_auth(&codex_home, &store, auth_credentials_store_mode) {
                 tracing::warn!(
                     error = %error,
-                    "failed to persist plus/pro auth account policy during initialization"
+                    "failed to persist supported ChatGPT plan policy during initialization"
                 );
             }
         }
@@ -1289,8 +1349,7 @@ impl AuthManager {
         make_active: bool,
     ) -> std::io::Result<String> {
         let account_id = tokens
-            .account_id
-            .clone()
+            .preferred_store_account_id()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.update_store(|store| {
             let now = Utc::now();
@@ -1747,18 +1806,18 @@ impl AuthManager {
                 return ReloadOutcome::Skipped;
             }
         };
-        let removed_account_ids = enforce_plus_or_pro_saved_accounts(&mut store);
+        let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
         if !removed_account_ids.is_empty() {
             tracing::info!(
                 removed_account_ids = ?removed_account_ids,
-                "removed non-Plus/Pro accounts during guarded auth reload"
+                "removed accounts with unsupported ChatGPT plans during guarded auth reload"
             );
             if let Err(error) =
                 save_auth(&self.codex_home, &store, self.auth_credentials_store_mode)
             {
                 tracing::warn!(
                     error = %error,
-                    "failed to persist plus/pro auth account policy during guarded reload"
+                    "failed to persist supported ChatGPT plan policy during guarded reload"
                 );
                 return ReloadOutcome::Skipped;
             }
@@ -1778,7 +1837,7 @@ impl AuthManager {
             {
                 tracing::info!(
                     expected_account_id,
-                    "Reloading auth after expected account was removed by plus/pro policy"
+                    "Reloading auth after expected account was removed by supported-plan policy"
                 );
                 self.set_cached(store);
                 return ReloadOutcome::ReloadedChanged;
@@ -1928,18 +1987,18 @@ impl AuthManager {
     fn load_store_from_storage(&self) -> AuthStore {
         match self.storage.load() {
             Ok(Some(mut store)) => {
-                let removed_account_ids = enforce_plus_or_pro_saved_accounts(&mut store);
+                let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
                 if !removed_account_ids.is_empty() {
                     tracing::info!(
                         removed_account_ids = ?removed_account_ids,
-                        "removed non-Plus/Pro accounts while loading auth store"
+                        "removed accounts with unsupported ChatGPT plans while loading auth store"
                     );
                     if let Err(error) =
                         save_auth(&self.codex_home, &store, self.auth_credentials_store_mode)
                     {
                         tracing::warn!(
                             error = %error,
-                            "failed to persist plus/pro auth account policy while loading store"
+                            "failed to persist supported ChatGPT plan policy while loading store"
                         );
                     }
                 }
@@ -2024,20 +2083,20 @@ impl AuthManager {
                 }
             }
         };
-        let removed_before_mutation = enforce_plus_or_pro_saved_accounts(&mut store);
+        let removed_before_mutation = enforce_supported_chatgpt_auth_accounts(&mut store);
         if !removed_before_mutation.is_empty() {
             tracing::info!(
                 removed_account_ids = ?removed_before_mutation,
-                "removed non-Plus/Pro accounts before auth store mutation"
+                "removed accounts with unsupported ChatGPT plans before auth store mutation"
             );
         }
 
         let out = mutator(&mut store)?;
-        let removed_after_mutation = enforce_plus_or_pro_saved_accounts(&mut store);
+        let removed_after_mutation = enforce_supported_chatgpt_auth_accounts(&mut store);
         if !removed_after_mutation.is_empty() {
             tracing::info!(
                 removed_account_ids = ?removed_after_mutation,
-                "removed non-Plus/Pro accounts after auth store mutation"
+                "removed accounts with unsupported ChatGPT plans after auth store mutation"
             );
         }
         store.validate()?;
@@ -2274,24 +2333,28 @@ impl AuthManager {
         };
 
         let refreshed = refresher.refresh(context).await?;
-        if let Some(expected_workspace_id) = forced_chatgpt_workspace_id.as_deref()
-            && refreshed.chatgpt_account_id != expected_workspace_id
-        {
-            return Err(RefreshTokenError::Transient(std::io::Error::other(
-                format!(
-                    "external auth refresh returned workspace {:?}, expected {expected_workspace_id:?}",
-                    refreshed.chatgpt_account_id,
-                ),
-            )));
-        }
         let auth_dot_json =
-            AuthDotJson::from_external_tokens(&refreshed).map_err(RefreshTokenError::Transient)?;
+            AuthDotJson::from_external_tokens(&refreshed, forced_chatgpt_workspace_id.as_deref())
+                .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::InvalidData {
+                    RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                        RefreshTokenFailedReason::Other,
+                        error.to_string(),
+                    ))
+                } else {
+                    RefreshTokenError::Transient(error)
+                }
+            })?;
+        let refreshed_store_account_id = auth_dot_json
+            .tokens
+            .as_ref()
+            .and_then(TokenData::preferred_store_account_id);
         let mut store = AuthStore::from_legacy(auth_dot_json);
-        let removed_account_ids = enforce_plus_or_pro_saved_accounts(&mut store);
+        let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
         if !removed_account_ids.is_empty() {
             tracing::info!(
                 removed_account_ids = ?removed_account_ids,
-                "removed non-Plus/Pro accounts after external auth refresh"
+                "removed accounts with unsupported ChatGPT plans after external auth refresh"
             );
         }
         save_auth(
@@ -2301,13 +2364,17 @@ impl AuthManager {
         )
         .map_err(RefreshTokenError::Transient)?;
         self.reload();
-        if removed_account_ids
-            .iter()
-            .any(|id| id == &refreshed.chatgpt_account_id)
+        if refreshed_store_account_id
+            .as_ref()
+            .is_some_and(|store_account_id| {
+                removed_account_ids
+                    .iter()
+                    .any(|removed_account_id| removed_account_id == store_account_id)
+            })
         {
             return Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                 RefreshTokenFailedReason::Other,
-                EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE.to_string(),
+                EXTERNAL_SUPPORTED_CHATGPT_PLAN_REQUIRED_MESSAGE.to_string(),
             )));
         }
         Ok(())
@@ -2343,7 +2410,7 @@ impl AuthManager {
             self.reload();
             return Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                 RefreshTokenFailedReason::Other,
-                NON_PLUS_ACCOUNT_REMOVED_MESSAGE.to_string(),
+                UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE.to_string(),
             )));
         }
 
@@ -2433,14 +2500,14 @@ fn store_from_auth_for_testing(auth: &CodexAuth) -> AuthStore {
     }
 }
 
-fn is_plus_or_pro_account(account: &StoredAccount) -> bool {
-    account.tokens.id_token.is_plus_or_pro_saved_account()
+fn is_supported_chatgpt_auth_account(account: &StoredAccount) -> bool {
+    account.tokens.id_token.is_supported_chatgpt_auth_plan()
 }
 
-fn enforce_plus_or_pro_saved_accounts(store: &mut AuthStore) -> Vec<String> {
+fn enforce_supported_chatgpt_auth_accounts(store: &mut AuthStore) -> Vec<String> {
     let mut removed_account_ids = Vec::new();
     store.accounts.retain(|account| {
-        let keep_account = is_plus_or_pro_account(account);
+        let keep_account = is_supported_chatgpt_auth_account(account);
         if !keep_account {
             removed_account_ids.push(account.id.clone());
         }
@@ -2727,8 +2794,6 @@ mod tests {
             "email_verified": true,
             "https://api.openai.com/auth": {
                 "chatgpt_plan_type": "pro",
-                "chatgpt_user_id": "user-12345",
-                "user_id": "user-12345",
                 "chatgpt_account_id": chatgpt_account_id,
             }
         });
@@ -2745,6 +2810,44 @@ mod tests {
             },
             access_token: format!("access-{chatgpt_account_id}"),
             refresh_token: format!("refresh-{chatgpt_account_id}"),
+            account_id: Some(chatgpt_account_id.to_string()),
+        }
+    }
+
+    fn token_data_for_chatgpt_user_account(
+        chatgpt_user_id: &str,
+        chatgpt_account_id: &str,
+    ) -> TokenData {
+        #[derive(Serialize)]
+        struct Header {
+            alg: &'static str,
+            typ: &'static str,
+        }
+        let header = Header {
+            alg: "none",
+            typ: "JWT",
+        };
+        let payload = serde_json::json!({
+            "email": format!("{chatgpt_user_id}@example.com"),
+            "email_verified": true,
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": "team",
+                "chatgpt_user_id": chatgpt_user_id,
+                "user_id": chatgpt_user_id,
+                "chatgpt_account_id": chatgpt_account_id,
+            }
+        });
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let header_b64 = b64(&serde_json::to_vec(&header).expect("serialize header"));
+        let payload_b64 = b64(&serde_json::to_vec(&payload).expect("serialize payload"));
+        let signature_b64 = b64(b"sig");
+        let fake_jwt = format!("{header_b64}.{payload_b64}.{signature_b64}");
+
+        TokenData {
+            id_token: parse_chatgpt_jwt_claims(fake_jwt.as_str())
+                .expect("chatgpt user token should parse"),
+            access_token: format!("access-{chatgpt_user_id}-{chatgpt_account_id}"),
+            refresh_token: format!("refresh-{chatgpt_user_id}-{chatgpt_account_id}"),
             account_id: Some(chatgpt_account_id.to_string()),
         }
     }
@@ -4087,10 +4190,14 @@ mod tests {
             codex_home.path().to_path_buf(),
             AuthCredentialsStoreMode::File,
         );
+        let store_account_id = parse_chatgpt_jwt_claims(&fake_jwt)
+            .expect("test jwt should parse")
+            .preferred_store_account_id()
+            .unwrap_or_else(|| "test-account".to_string());
         let updated = super::update_tokens(
             codex_home.path(),
             &storage,
-            "test-account",
+            store_account_id.as_str(),
             None,
             Some("new-access-token".to_string()),
             Some("new-refresh-token".to_string()),
@@ -4141,10 +4248,14 @@ mod tests {
             codex_home.path().to_path_buf(),
             AuthCredentialsStoreMode::File,
         );
+        let store_account_id = parse_chatgpt_jwt_claims(&free_jwt)
+            .expect("test jwt should parse")
+            .preferred_store_account_id()
+            .unwrap_or_else(|| "test-account".to_string());
         let updated = super::update_tokens(
             codex_home.path(),
             &storage,
-            "test-account",
+            store_account_id.as_str(),
             Some(free_jwt),
             None,
             None,
@@ -4349,7 +4460,7 @@ mod tests {
 
     #[test]
     #[serial(codex_api_key)]
-    fn auth_manager_new_removes_non_plus_accounts_from_store() {
+    fn auth_manager_new_removes_unsupported_accounts_from_store() {
         let codex_home = tempdir().unwrap();
         write_auth_file(
             AuthFileParams {
@@ -4377,6 +4488,110 @@ mod tests {
     }
 
     #[test]
+    #[serial(codex_api_key)]
+    fn auth_manager_new_keeps_business_accounts_in_store() {
+        let codex_home = tempdir().unwrap();
+        write_auth_file(
+            AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: Some("business".to_string()),
+                chatgpt_account_id: Some("org_workspace".to_string()),
+            },
+            codex_home.path(),
+        )
+        .expect("failed to write auth file");
+
+        let manager = AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::File,
+        );
+        assert_eq!(manager.list_accounts().len(), 1);
+
+        let auth = manager.auth_cached().expect("auth should remain cached");
+        assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Business));
+        assert_eq!(
+            auth.get_token_data()
+                .expect("token data should exist")
+                .id_token
+                .chatgpt_account_id
+                .as_deref(),
+            Some("org_workspace")
+        );
+    }
+
+    #[test]
+    fn login_with_chatgpt_auth_tokens_accepts_team_plan() {
+        let codex_home = tempdir().unwrap();
+        let access_token =
+            make_test_chatgpt_jwt(Some("team".to_string()), Some("org_workspace".to_string()))
+                .expect("build external access token");
+
+        super::login_with_chatgpt_auth_tokens(
+            codex_home.path(),
+            &access_token,
+            "org_workspace",
+            Some("team"),
+            None,
+        )
+        .expect("team external auth should be accepted");
+
+        let store = super::load_auth_store(codex_home.path(), AuthCredentialsStoreMode::Ephemeral)
+            .expect("load external auth store")
+            .expect("external auth store should exist");
+        assert_eq!(store.accounts.len(), 1);
+        assert_eq!(
+            store.active_account_id.as_deref(),
+            Some("chatgpt-user:user-12345:workspace:org_workspace")
+        );
+        assert_eq!(
+            store.accounts[0]
+                .tokens
+                .id_token
+                .get_chatgpt_plan_type()
+                .as_deref(),
+            Some("Team")
+        );
+    }
+
+    #[test]
+    fn upsert_account_preserves_distinct_chatgpt_users_on_same_workspace() {
+        let codex_home = tempdir().unwrap();
+        let manager = AuthManager::new(
+            codex_home.path().to_path_buf(),
+            false,
+            AuthCredentialsStoreMode::Ephemeral,
+        );
+
+        let first_id = manager
+            .upsert_account(
+                token_data_for_chatgpt_user_account("user-1", "org-workspace"),
+                Some("team-user-1".to_string()),
+                false,
+            )
+            .expect("first user should persist");
+        let second_id = manager
+            .upsert_account(
+                token_data_for_chatgpt_user_account("user-2", "org-workspace"),
+                Some("team-user-2".to_string()),
+                true,
+            )
+            .expect("second user should persist");
+
+        assert_eq!(first_id, "chatgpt-user:user-1:workspace:org-workspace");
+        assert_eq!(second_id, "chatgpt-user:user-2:workspace:org-workspace");
+
+        let accounts = manager.list_accounts();
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts.iter().any(|account| {
+            account.id == "chatgpt-user:user-1:workspace:org-workspace" && !account.is_active
+        }));
+        assert!(accounts.iter().any(|account| {
+            account.id == "chatgpt-user:user-2:workspace:org-workspace" && account.is_active
+        }));
+    }
+
+    #[test]
     fn login_with_chatgpt_auth_tokens_rejects_free_plan() {
         let codex_home = tempdir().unwrap();
         let access_token =
@@ -4388,6 +4603,7 @@ mod tests {
             &access_token,
             "org_workspace",
             Some("free"),
+            None,
         )
         .expect_err("free external auth should be rejected");
         assert!(matches!(
@@ -4396,7 +4612,7 @@ mod tests {
         ));
         assert_eq!(
             err.to_string(),
-            super::EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE
+            super::EXTERNAL_SUPPORTED_CHATGPT_PLAN_REQUIRED_MESSAGE
         );
         assert_eq!(
             super::load_auth_store(codex_home.path(), AuthCredentialsStoreMode::Ephemeral)
@@ -4415,6 +4631,7 @@ mod tests {
             codex_home.path(),
             &access_token,
             "org_workspace",
+            None,
             None,
         )
         .expect_err("external auth without a supported plan should be rejected");
@@ -4441,12 +4658,18 @@ mod tests {
             &access_token,
             "org_workspace",
             Some("mystery-tier"),
+            None,
         )
         .expect_err("external auth with an unknown caller-supplied plan should be rejected");
         assert!(matches!(
             err,
-            super::ExternalAuthLoginError::UnsupportedPlan
+            super::ExternalAuthLoginError::MetadataMismatch(_)
         ));
+        assert!(
+            err.to_string()
+                .contains("does not match provided plan \"mystery-tier\""),
+            "unexpected error: {err}"
+        );
         assert_eq!(
             super::load_auth_store(codex_home.path(), AuthCredentialsStoreMode::Ephemeral)
                 .expect("load external auth store"),
@@ -4467,6 +4690,7 @@ mod tests {
             codex_home.path(),
             &access_token,
             "org_workspace",
+            None,
             None,
         )
         .expect_err("external auth with an unknown JWT-derived plan should be rejected");
@@ -4490,6 +4714,7 @@ mod tests {
             "not-a-jwt",
             "org_workspace",
             Some("pro"),
+            None,
         )
         .expect_err("malformed external auth should be rejected");
         assert!(matches!(
@@ -4508,15 +4733,71 @@ mod tests {
     }
 
     #[test]
+    fn login_with_chatgpt_auth_tokens_rejects_workspace_claim_mismatch() {
+        let codex_home = tempdir().unwrap();
+        let access_token =
+            make_test_chatgpt_jwt(Some("pro".to_string()), Some("org-token".to_string()))
+                .expect("jwt");
+
+        let err = super::login_with_chatgpt_auth_tokens(
+            codex_home.path(),
+            &access_token,
+            "org-request",
+            Some("pro"),
+            None,
+        )
+        .expect_err("workspace mismatch should be rejected");
+        assert!(matches!(
+            err,
+            super::ExternalAuthLoginError::MetadataMismatch(_)
+        ));
+        assert!(
+            err.to_string()
+                .contains("does not match provided workspace \"org-request\""),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn login_with_chatgpt_auth_tokens_rejects_required_workspace_claim_mismatch() {
+        let codex_home = tempdir().unwrap();
+        let access_token =
+            make_test_chatgpt_jwt(Some("pro".to_string()), Some("org-token".to_string()))
+                .expect("jwt");
+
+        let err = super::login_with_chatgpt_auth_tokens(
+            codex_home.path(),
+            &access_token,
+            "org-token",
+            Some("pro"),
+            Some("org-required"),
+        )
+        .expect_err("required workspace mismatch should be rejected");
+        assert!(matches!(
+            err,
+            super::ExternalAuthLoginError::MetadataMismatch(_)
+        ));
+        assert!(
+            err.to_string()
+                .contains("does not match required workspace \"org-required\""),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     #[serial(codex_api_key)]
     fn load_auth_purges_unsupported_external_chatgpt_tokens_without_fallback() {
         let codex_home = tempdir().unwrap();
         let access_token =
             make_test_chatgpt_jwt(Some("free".to_string()), Some("org_workspace".to_string()))
                 .expect("jwt");
-        let auth_dot_json =
-            AuthDotJson::from_external_access_token(&access_token, "org_workspace", Some("free"))
-                .expect("external auth dot json");
+        let auth_dot_json = AuthDotJson::from_external_access_token(
+            &access_token,
+            "org_workspace",
+            Some("free"),
+            None,
+        )
+        .expect("external auth dot json");
         let store = AuthStore::from_legacy(auth_dot_json);
         super::save_auth(
             codex_home.path(),
@@ -4559,6 +4840,7 @@ mod tests {
             &access_token,
             "external_workspace",
             Some("free"),
+            None,
         )
         .expect("external auth dot json");
         let store = AuthStore::from_legacy(auth_dot_json);
@@ -4685,8 +4967,7 @@ mod tests {
             account_id: params.chatgpt_account_id.clone(),
         };
         let stored_id = tokens
-            .account_id
-            .clone()
+            .preferred_store_account_id()
             .unwrap_or_else(|| "test-account".to_string());
         let store = AuthStore {
             openai_api_key: params.openai_api_key,

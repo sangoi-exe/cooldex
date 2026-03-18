@@ -30,6 +30,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub struct UnifiedExecHandler;
+pub(crate) const UNIFIED_EXEC_FUNCTION_TOOL_NAME: &str = "exec_command";
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ExecCommandArgs {
@@ -327,7 +328,9 @@ fn format_response(response: &UnifiedExecResponse) -> String {
     }
 
     if let Some(original_token_count) = response.original_token_count {
-        sections.push(format!("Original token count: {original_token_count}"));
+        // Merge-safety anchor: prompt_gc and session-history boilerplate stripping both parse
+        // this serialized marker, so producer/consumers/tests must keep it aligned.
+        sections.push(format!("Token qty: {original_token_count}"));
     }
 
     sections.push("Output:".to_string());

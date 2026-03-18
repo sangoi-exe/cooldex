@@ -28,10 +28,10 @@ fmt:
     cargo fmt -- --config imports_granularity=Item 2>/dev/null
 
 fix *args:
-    cargo clippy --fix --tests --allow-dirty "$@"
+    ../scripts/cargo-guard.sh cargo clippy --fix --tests --allow-dirty "$@"
 
 clippy:
-    cargo clippy --tests "$@"
+    ../scripts/cargo-guard.sh cargo clippy --tests "$@"
 
 install:
     rustup show active-toolchain
@@ -44,7 +44,7 @@ install:
 # Prefer this for routine local runs; use explicit `cargo test --all-features`
 # only when you specifically need full feature coverage.
 test:
-    cargo nextest run --no-fail-fast
+    ../scripts/cargo-guard.sh cargo nextest run --no-fail-fast
 
 # Build and run Codex from source using Bazel.
 # Note we have to use the combination of `[no-cd]` and `--run_under="cd $PWD &&"`

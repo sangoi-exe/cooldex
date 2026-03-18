@@ -53,7 +53,7 @@ struct ParsedUnifiedExecOutput {
     wall_time_seconds: f64,
     process_id: Option<String>,
     exit_code: Option<i32>,
-    original_token_count: Option<usize>,
+    token_qty: Option<usize>,
     output: String,
 }
 
@@ -67,7 +67,7 @@ fn parse_unified_exec_output(raw: &str) -> Result<ParsedUnifiedExecOutput> {
             r#"Wall time: (?P<wall_time>-?\d+(?:\.\d+)?) seconds\n"#,
             r#"(?:Process exited with code (?P<exit_code>-?\d+)\n)?"#,
             r#"(?:Process running with session ID (?P<process_id>-?\d+)\n)?"#,
-            r#"(?:Original token count: (?P<original_token_count>\d+)\n)?"#,
+            r#"(?:Token qty: (?P<token_qty>\d+)\n)?"#,
             r#"Output:\n?(?P<output>.*)$"#,
         ))
         .expect("valid unified exec output regex")
@@ -103,13 +103,13 @@ fn parse_unified_exec_output(raw: &str) -> Result<ParsedUnifiedExecOutput> {
         .name("process_id")
         .map(|value| value.as_str().to_string());
 
-    let original_token_count = captures
-        .name("original_token_count")
+    let token_qty = captures
+        .name("token_qty")
         .map(|value| {
             value
                 .as_str()
                 .parse::<usize>()
-                .context("failed to parse original token count from unified exec output")
+                .context("failed to parse token qty from unified exec output")
         })
         .transpose()?;
 
@@ -124,7 +124,7 @@ fn parse_unified_exec_output(raw: &str) -> Result<ParsedUnifiedExecOutput> {
         wall_time_seconds,
         process_id,
         exit_code,
-        original_token_count,
+        token_qty,
         output,
     })
 }
@@ -1356,9 +1356,7 @@ async fn exec_command_reports_chunk_and_exit_metadata() -> Result<()> {
         "expected truncation notice in output: {output_text:?}"
     );
 
-    let original_tokens = metadata
-        .original_token_count
-        .expect("missing original_token_count") as usize;
+    let original_tokens = metadata.token_qty.expect("missing token_qty") as usize;
     assert!(
         original_tokens > 6,
         "original token count should exceed max_output_tokens"
@@ -2571,8 +2569,8 @@ PY
     assert_regex_match(truncated_pattern, &output_text);
 
     let original_tokens = large_output
-        .original_token_count
-        .expect("missing original_token_count for large output summary");
+        .token_qty
+        .expect("missing token_qty for large output summary");
     assert!(original_tokens > 0);
 
     Ok(())

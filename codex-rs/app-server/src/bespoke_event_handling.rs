@@ -2681,14 +2681,14 @@ mod tests {
             call_id: "wait-call-2".to_string(),
             agent_statuses: Vec::new(),
             statuses: [(
-                receiver_thread_id.clone(),
+                receiver_thread_id,
                 codex_protocol::protocol::AgentStatus::Completed(Some("done".to_string())),
             )]
             .into_iter()
             .collect(),
             wait_state: CoreCollabWaitState {
-                return_when: CoreCollabWaitReturnWhen::AllFinal,
-                disable_timeout: true,
+                return_when: CoreCollabWaitReturnWhen::AnyFinal,
+                disable_timeout: false,
                 timed_out: Some(true),
             },
         };
@@ -2710,8 +2710,8 @@ mod tests {
             .into_iter()
             .collect(),
             wait_state: Some(codex_app_server_protocol::CollabWaitState {
-                return_when: codex_app_server_protocol::CollabWaitReturnWhen::AllFinal,
-                disable_timeout: true,
+                return_when: codex_app_server_protocol::CollabWaitReturnWhen::AnyFinal,
+                disable_timeout: false,
                 timed_out: Some(true),
             }),
         };

@@ -60,6 +60,9 @@ use codex_hooks::Hooks;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::LocalShellAction;
+use codex_protocol::models::LocalShellExecAction;
+use codex_protocol::models::LocalShellStatus;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
@@ -368,8 +371,44 @@ async fn prompt_gc_sidecar_no_eligible_chunks_complete_without_visible_accountin
     assert_eq!(latest_rate_limits, None);
 }
 
+fn prompt_gc_unified_exec_output(token_qty: usize, body: &str) -> String {
+    format!("Wall time: 0.0000 seconds\nToken qty: {token_qty}\nOutput:\n{body}")
+}
+
+#[test]
+fn prompt_gc_plan_build_failure_details_falls_back_to_plan_build_failed_for_unstructured_errors() {
+    let details = prompt_gc_plan_build_failure_details(&FunctionCallError::Fatal(
+        "plain failure".to_string(),
+    ));
+
+    assert_eq!(details.marker_stop_reason, "plan_build_failed");
+    assert_eq!(details.error_message, "Fatal error: plain failure");
+    assert_eq!(details.status_error, "Fatal error: plain failure");
+    assert!(!details.blocks_remaining_turn);
+}
+
+#[test]
+fn prompt_gc_plan_build_failure_details_preserves_structured_state_hash_mismatch() {
+    let error = FunctionCallError::RespondToModel(
+        json!({
+            "mode": "error",
+            "stop_reason": "state_hash_mismatch",
+            "message": "tool call drifted before apply",
+        })
+        .to_string(),
+    );
+
+    let details = prompt_gc_plan_build_failure_details(&error);
+
+    assert_eq!(details.marker_stop_reason, "state_hash_mismatch");
+    assert_eq!(details.error_message, error.to_string());
+    assert_eq!(details.status_error, "tool call drifted before apply");
+    assert!(details.blocks_remaining_turn);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prompt_gc_sidecar_skips_under_selectable_token_threshold_without_rollout_markers() {
+async fn prompt_gc_sidecar_skips_when_function_call_output_lacks_token_qty_without_rollout_markers()
+{
     let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
     let rollout_path = attach_rollout_recorder(&session).await;
     let turn_context_mut =
@@ -392,10 +431,19 @@ async fn prompt_gc_sidecar_skips_under_selectable_token_threshold_without_rollou
     }
 
     let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
-    let reasoning = prompt_gc_under_threshold_reasoning("reasoning-1");
+    let tool_call = ResponseItem::FunctionCall {
+        id: None,
+        call_id: "call-1".to_string(),
+        name: "exec_command".to_string(),
+        arguments: "{\"cmd\":\"pwd\"}".to_string(),
+    };
+    let tool_output = ResponseItem::FunctionCallOutput {
+        call_id: "call-1".to_string(),
+        output: FunctionCallOutputPayload::from_text("x".repeat(900)),
+    };
     let phase_message = prompt_gc_phase_message("phase-1");
     let observed_items = session
-        .record_into_history(&[reasoning, phase_message], &turn_context)
+        .record_into_history(&[tool_call, tool_output, phase_message], &turn_context)
         .await;
     sidecar.lock().await.observe_recorded_batch(&observed_items);
     let parent_client_session = session.services.model_client.new_session();
@@ -431,7 +479,8 @@ async fn prompt_gc_sidecar_skips_under_selectable_token_threshold_without_rollou
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prompt_gc_sidecar_large_tool_output_activates_below_global_context_pressure() {
+async fn prompt_gc_sidecar_function_call_output_token_qty_over_200_triggers_below_global_context_pressure()
+ {
     let server = MockServer::start().await;
     let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
     let rollout_path = attach_rollout_recorder(&session).await;
@@ -478,12 +527,12 @@ async fn prompt_gc_sidecar_large_tool_output_activates_below_global_context_pres
         ResponseItem::FunctionCall {
             id: None,
             call_id: "call-1".to_string(),
-            name: "shell".to_string(),
+            name: "exec_command".to_string(),
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         },
         ResponseItem::FunctionCallOutput {
             call_id: "call-1".to_string(),
-            output: FunctionCallOutputPayload::from_text("x".repeat(900)),
+            output: FunctionCallOutputPayload::from_text(prompt_gc_unified_exec_output(2798, "ok")),
         },
         ResponseItem::Message {
             id: Some("phase-1".to_string()),
@@ -520,6 +569,206 @@ async fn prompt_gc_sidecar_large_tool_output_activates_below_global_context_pres
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_gc_sidecar_function_call_output_token_qty_over_200_triggers_for_non_exec_function_call()
+ {
+    let server = MockServer::start().await;
+    let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(StaticSseResponder {
+            calls: AtomicUsize::new(0),
+            response_body: sse(&[
+                response_created("resp-1"),
+                assistant_message_event(
+                    "msg-1",
+                    "{\"summaries\":[{\"chunk_id\":\"prompt_gc_chunk_0\",\"tool_context\":\"tool\",\"reasoning_context\":\"reasoning\"}]}",
+                ),
+                response_completed_with_usage("resp-1", 17),
+            ]),
+            headers: Vec::new(),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.model_info.context_window = Some(100_000);
+    turn_context_mut.model_info.effective_context_window_percent = 100;
+    {
+        let mut state = session.state.lock().await;
+        state.set_token_info(Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 12_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_000,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(100_000),
+        }));
+    }
+
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let items = vec![
+        ResponseItem::FunctionCall {
+            id: None,
+            call_id: "call-1".to_string(),
+            name: "other_tool".to_string(),
+            arguments: "{\"cmd\":\"pwd\"}".to_string(),
+        },
+        ResponseItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload::from_text(prompt_gc_unified_exec_output(2798, "ok")),
+        },
+        ResponseItem::Message {
+            id: Some("phase-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "checkpoint".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(codex_protocol::models::MessagePhase::Commentary),
+        },
+    ];
+    let observed_items = session.record_into_history(&items, &turn_context).await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
+    assert_eq!(status.last_error, None);
+    assert_eq!(status.blocked_reason, None);
+    session.flush_rollout().await;
+    let markers = prompt_gc_rollout_markers(&rollout_path).await;
+    assert!(!markers.is_empty());
+    assert_eq!(markers[0].kind, PromptGcOutcomeKind::Started);
+
+    let tool_calls = {
+        let active = session.active_turn.lock().await;
+        let active_turn = active.as_ref().expect("active turn");
+        active_turn.turn_state.lock().await.tool_calls
+    };
+    assert_eq!(tool_calls, 0);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_gc_sidecar_ignores_ambiguous_exec_command_local_shell_collision_without_rollout_markers()
+ {
+    let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.model_info.context_window = Some(100_000);
+    turn_context_mut.model_info.effective_context_window_percent = 100;
+    {
+        let mut state = session.state.lock().await;
+        state.set_token_info(Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 12_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_000,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(100_000),
+        }));
+    }
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let items = vec![
+        ResponseItem::FunctionCall {
+            id: None,
+            call_id: "shared".to_string(),
+            name: "exec_command".to_string(),
+            arguments: "{\"cmd\":\"pwd\"}".to_string(),
+        },
+        ResponseItem::LocalShellCall {
+            id: None,
+            call_id: Some("shared".to_string()),
+            status: LocalShellStatus::Completed,
+            action: LocalShellAction::Exec(LocalShellExecAction {
+                command: vec!["pwd".to_string()],
+                working_directory: None,
+                timeout_ms: None,
+                env: None,
+                user: None,
+            }),
+        },
+        ResponseItem::FunctionCallOutput {
+            call_id: "shared".to_string(),
+            output: FunctionCallOutputPayload::from_text(prompt_gc_unified_exec_output(2798, "ok")),
+        },
+        prompt_gc_phase_message("phase-1"),
+    ];
+    let observed_items = session.record_into_history(&items, &turn_context).await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
+    assert_eq!(status.last_error, None);
+    assert_eq!(status.blocked_reason, None);
+    assert!(sidecar.lock().await.checkpoint(&checkpoint_id).is_none());
+    session.flush_rollout().await;
+    assert_eq!(
+        prompt_gc_rollout_markers(&rollout_path).await,
+        vec![
+            PromptGcCompactionMetadata {
+                checkpoint_id: checkpoint_id.clone(),
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Started,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: None,
+                error_message: None,
+                applied_unit_count: None,
+            },
+            PromptGcCompactionMetadata {
+                checkpoint_id,
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::NoEligibleChunks,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: Some("no_eligible_chunks".to_string()),
+                error_message: None,
+                applied_unit_count: Some(0),
+            },
+        ]
+    );
+
+    let tool_calls = {
+        let active = session.active_turn.lock().await;
+        let active_turn = active.as_ref().expect("active turn");
+        active_turn.turn_state.lock().await.tool_calls
+    };
+    assert_eq!(tool_calls, 0);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prompt_gc_state_hash_mismatch_blocks_remaining_turn() {
     let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
     let rollout_path = attach_rollout_recorder(&session).await;
@@ -546,12 +795,12 @@ async fn prompt_gc_state_hash_mismatch_blocks_remaining_turn() {
     let tool_call = ResponseItem::FunctionCall {
         id: None,
         call_id: "call-1".to_string(),
-        name: "shell".to_string(),
+        name: "exec_command".to_string(),
         arguments: "{\"cmd\":\"pwd\"}".to_string(),
     };
     let tool_output = ResponseItem::FunctionCallOutput {
         call_id: "call-1".to_string(),
-        output: FunctionCallOutputPayload::from_text("x".repeat(900)),
+        output: FunctionCallOutputPayload::from_text(prompt_gc_unified_exec_output(2798, "ok")),
     };
     let phase_one = ResponseItem::Message {
         id: Some("phase-1".to_string()),
@@ -1010,11 +1259,11 @@ async fn prompt_gc_sidecar_invalid_summary_payload_is_terminal_after_request() {
     configure_session_model_client_for_server(&mut session, &turn_context, &server);
 
     let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
-    let reasoning = prompt_gc_eligible_reasoning("reasoning-1");
-    let phase_message = prompt_gc_phase_message("phase-1");
-    let observed_items = session
-        .record_into_history(&[reasoning, phase_message], &turn_context)
-        .await;
+    let mut items = Vec::from(prompt_gc_triggering_exec_command_items(
+        "call-1", 2_798, "ok",
+    ));
+    items.push(prompt_gc_phase_message("phase-1"));
+    let observed_items = session.record_into_history(&items, &turn_context).await;
     sidecar.lock().await.observe_recorded_batch(&observed_items);
     let parent_client_session = session.services.model_client.new_session();
 
@@ -1161,16 +1410,15 @@ async fn prompt_gc_sidecar_incomplete_summary_payload_fails_apply_validation() {
     configure_session_model_client_for_server(&mut session, &turn_context, &server);
 
     let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
-    let observed_items = session
-        .record_into_history(
-            &[
-                prompt_gc_eligible_reasoning("reasoning-1"),
-                prompt_gc_eligible_reasoning("reasoning-2"),
-                prompt_gc_phase_message("phase-1"),
-            ],
-            &turn_context,
-        )
-        .await;
+    let mut items = Vec::new();
+    items.extend(prompt_gc_triggering_exec_command_items(
+        "call-1", 2_798, "first",
+    ));
+    items.extend(prompt_gc_triggering_exec_command_items(
+        "call-2", 2_799, "second",
+    ));
+    items.push(prompt_gc_phase_message("phase-1"));
+    let observed_items = session.record_into_history(&items, &turn_context).await;
     sidecar.lock().await.observe_recorded_batch(&observed_items);
     let parent_client_session = session.services.model_client.new_session();
 
@@ -1283,15 +1531,11 @@ async fn prompt_gc_hidden_usage_limit_auto_switches_and_retries() {
     configure_session_model_client_for_server(&mut session, &turn_context, &server);
 
     let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
-    let observed_items = session
-        .record_into_history(
-            &[
-                prompt_gc_eligible_reasoning("reasoning-1"),
-                prompt_gc_phase_message("phase-1"),
-            ],
-            &turn_context,
-        )
-        .await;
+    let mut items = Vec::from(prompt_gc_triggering_exec_command_items(
+        "call-1", 2_798, "ok",
+    ));
+    items.push(prompt_gc_phase_message("phase-1"));
+    let observed_items = session.record_into_history(&items, &turn_context).await;
     sidecar.lock().await.observe_recorded_batch(&observed_items);
     let parent_client_session = session.services.model_client.new_session();
 
@@ -1361,11 +1605,11 @@ async fn prompt_gc_hidden_usage_limit_blocks_remaining_turn_after_unrecoverable_
     configure_session_model_client_for_server(&mut session, &turn_context, &server);
 
     let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
-    let reasoning = prompt_gc_eligible_reasoning("reasoning-1");
-    let phase_message = prompt_gc_phase_message("phase-1");
-    let observed_items = session
-        .record_into_history(&[reasoning, phase_message], &turn_context)
-        .await;
+    let mut items = Vec::from(prompt_gc_triggering_exec_command_items(
+        "call-1", 2_798, "ok",
+    ));
+    items.push(prompt_gc_phase_message("phase-1"));
+    let observed_items = session.record_into_history(&items, &turn_context).await;
     sidecar.lock().await.observe_recorded_batch(&observed_items);
     let parent_client_session = session.services.model_client.new_session();
 
@@ -1457,15 +1701,11 @@ async fn prompt_gc_hidden_request_error_does_not_apply() {
     configure_session_model_client_for_server(&mut session, &turn_context, &server);
 
     let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
-    let observed_items = session
-        .record_into_history(
-            &[
-                prompt_gc_eligible_reasoning("reasoning-1"),
-                prompt_gc_phase_message("phase-1"),
-            ],
-            &turn_context,
-        )
-        .await;
+    let mut items = Vec::from(prompt_gc_triggering_exec_command_items(
+        "call-1", 2_798, "ok",
+    ));
+    items.push(prompt_gc_phase_message("phase-1"));
+    let observed_items = session.record_into_history(&items, &turn_context).await;
     sidecar.lock().await.observe_recorded_batch(&observed_items);
     let parent_client_session = session.services.model_client.new_session();
 
@@ -1538,7 +1778,7 @@ async fn prompt_gc_hidden_context_window_does_not_emit_token_count() {
 async fn prompt_gc_sidecar_recovers_noted_apply_outcome_after_stream_failure() {
     let (session, turn_context, rx) = make_session_and_context_with_rx().await;
     let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
-    let reasoning = prompt_gc_eligible_reasoning("reasoning-1");
+    let reasoning = prompt_gc_large_reasoning_unit("reasoning-1");
     let phase_message = prompt_gc_phase_message("phase-1");
     let observed_items = session
         .record_into_history(&[reasoning, phase_message], &turn_context)
@@ -1943,22 +2183,34 @@ fn configure_session_model_client_for_server(
     );
 }
 
-fn prompt_gc_under_threshold_reasoning(id: &str) -> ResponseItem {
-    ResponseItem::Reasoning {
-        id: id.to_string(),
-        summary: Vec::new(),
-        content: None,
-        encrypted_content: None,
-    }
-}
-
-fn prompt_gc_eligible_reasoning(id: &str) -> ResponseItem {
+fn prompt_gc_large_reasoning_unit(id: &str) -> ResponseItem {
     ResponseItem::Reasoning {
         id: id.to_string(),
         summary: Vec::new(),
         content: None,
         encrypted_content: Some("x".repeat(2_000)),
     }
+}
+
+fn prompt_gc_triggering_exec_command_items(
+    call_id: &str,
+    token_qty: usize,
+    body: &str,
+) -> [ResponseItem; 2] {
+    [
+        ResponseItem::FunctionCall {
+            id: None,
+            call_id: call_id.to_string(),
+            name: "exec_command".to_string(),
+            arguments: format!("{{\"cmd\":\"printf {body:?}\"}}"),
+        },
+        ResponseItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload::from_text(prompt_gc_unified_exec_output(
+                token_qty, body,
+            )),
+        },
+    ]
 }
 
 fn prompt_gc_phase_message(id: &str) -> ResponseItem {

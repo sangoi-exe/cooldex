@@ -1185,12 +1185,15 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallE
 }
 
 fn strip_child_prompt_inheritance(config: &mut Config) {
-    // Workspace customization: child agents must not inherit the lead prompt stack.
-    // `subagent_instructions_file` provides the child-only base instructions instead, while
-    // AGENTS/project-doc and lead developer instructions stay isolated. Re-run this after any
-    // role/profile reload that reconstructs `Config` from persisted layers.
+    // Merge-safety anchor: child agents must not inherit the lead prompt stack or lead-only
+    // post-compact ritual. `subagent_instructions_file` provides the child-only base instructions,
+    // and child auto-compact recovery stays recall-only so local overlays cannot reintroduce
+    // manage_context into sub-agent threads. Re-run this after any role/profile reload that
+    // reconstructs `Config` from persisted layers.
     config.developer_instructions = None;
     config.user_instructions = None;
+    config.pos_compact_instructions =
+        Some(crate::codex::SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY.to_string());
     config.project_doc_max_bytes = 0;
     let _ = config.features.disable(Feature::ChildAgentsMd);
 }
@@ -2669,7 +2672,8 @@ mod tests {
             "wait",
             function_payload(json!({
                 "ids": [missing_id.to_string(), existing_id.to_string()],
-                "return_when": "all_final"
+                "return_when": "all_final",
+                "disable_timeout": true
             })),
         );
         let output = MultiAgentHandler
@@ -3321,6 +3325,8 @@ mod tests {
         expected.model_reasoning_summary = Some(turn.reasoning_summary);
         expected.developer_instructions = None;
         expected.user_instructions = None;
+        expected.pos_compact_instructions =
+            Some(crate::codex::SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY.to_string());
         expected.project_doc_max_bytes = 0;
         let _ = expected.features.disable(Feature::ChildAgentsMd);
         expected.compact_prompt = turn.compact_prompt.clone();
@@ -3355,6 +3361,22 @@ mod tests {
         let config = build_agent_spawn_config(&turn).expect("spawn config");
 
         assert_eq!(config.user_instructions, None);
+    }
+
+    #[tokio::test]
+    async fn build_agent_spawn_config_clears_pos_compact_instructions() {
+        let (_session, mut turn) = make_session_and_context().await;
+        let mut base_config = (*turn.config).clone();
+        base_config.pos_compact_instructions =
+            Some("Finally, use manage_context on the recall output.".to_string());
+        turn.config = Arc::new(base_config);
+
+        let config = build_agent_spawn_config(&turn).expect("spawn config");
+
+        assert_eq!(
+            config.pos_compact_instructions,
+            Some(crate::codex::SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY.to_string())
+        );
     }
 
     #[tokio::test]
@@ -3512,6 +3534,8 @@ mod tests {
         expected.model_reasoning_summary = Some(turn.reasoning_summary);
         expected.developer_instructions = None;
         expected.user_instructions = None;
+        expected.pos_compact_instructions =
+            Some(crate::codex::SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY.to_string());
         expected.project_doc_max_bytes = 0;
         let _ = expected.features.disable(Feature::ChildAgentsMd);
         expected.compact_prompt = turn.compact_prompt.clone();

@@ -302,11 +302,13 @@ impl AuthModeWidget {
         self.request_frame.schedule_frame();
     }
 
+    // Merge-safety anchor: onboarding ChatGPT auth copy must stay aligned with the
+    // supported-plan admission policy and forced-login gating.
     fn render_pick_mode(&self, area: Rect, buf: &mut Buffer) {
         let mut lines: Vec<Line> = vec![
             Line::from(vec![
                 "  ".into(),
-                "Sign in with ChatGPT to use Codex as part of your paid plan".into(),
+                "Sign in with ChatGPT to use Codex with a supported ChatGPT plan".into(),
             ]),
             Line::from(vec![
                 "  ".into(),
@@ -347,7 +349,7 @@ impl AuthModeWidget {
         let chatgpt_description = if !self.is_chatgpt_login_allowed() {
             "ChatGPT login is disabled"
         } else {
-            "Usage included with Plus and Pro plans"
+            "Usage included with Plus, Pro, Team, Business, Enterprise, and Edu plans"
         };
         let device_code_description = "Sign in from another device with a one-time code";
 
@@ -905,6 +907,19 @@ mod tests {
             SignInState::PickMode
         ));
         assert_eq!(widget.login_status, LoginStatus::NotAuthenticated);
+    }
+
+    #[test]
+    fn pick_mode_snapshot_lists_team_plan() {
+        use crate::test_backend::VT100Backend;
+
+        let (widget, _tmp) = widget_forced_chatgpt();
+        let mut terminal = ratatui::Terminal::new(VT100Backend::new(72, 12)).expect("terminal");
+        terminal
+            .draw(|frame| widget.render_ref(frame.area(), frame.buffer_mut()))
+            .expect("draw");
+
+        insta::assert_snapshot!(terminal.backend());
     }
 
     /// Collects all buffer cell symbols that contain the OSC 8 open sequence

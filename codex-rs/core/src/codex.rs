@@ -36,6 +36,7 @@ use crate::models_manager::manager::ModelsManager;
 use crate::parse_command::parse_command;
 use crate::parse_turn_item;
 use crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER;
+use crate::prompt_gc_sidecar::PROMPT_GC_MIN_FUNCTION_CALL_OUTPUT_TOKEN_QTY;
 use crate::prompt_gc_sidecar::PromptGcApplyOutcome;
 use crate::prompt_gc_sidecar::PromptGcObservedItem;
 use crate::realtime_conversation::RealtimeConversationManager;
@@ -357,6 +358,9 @@ pub struct CodexSpawnOk {
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const AUTO_COMPACT_RECON_WARNING_BODY: &str = "STOP. Codex CLI has just performed an auto-compact. BEFORE any other action: call recall. Then recon unstaged changes and update_plan status. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
+// Merge-safety anchor: sub-agents must get a recall-only post-compact warning so child threads do
+// not inherit lead-only recon/manage_context rituals from workspace-local overlays.
+pub(crate) const SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY: &str = "STOP. Codex CLI has just performed an auto-compact. BEFORE any other action: call recall. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
@@ -4110,11 +4114,6 @@ async fn persist_prompt_gc_rollout_items(
     Ok(())
 }
 
-// Merge-safety anchor: prompt_gc runtime activation must stay tied to the eligible hidden payload
-// volume itself, so large tool outputs compact promptly even when the overall context window is
-// still mostly empty.
-const PROMPT_GC_MIN_SELECTABLE_APPROX_TOKENS: i64 = 200;
-
 fn prompt_gc_compaction_metadata(
     checkpoint: &crate::prompt_gc_sidecar::PromptGcCheckpoint,
     kind: PromptGcOutcomeKind,
@@ -4141,6 +4140,37 @@ fn structured_function_call_error_payload(
         return None;
     };
     serde_json::from_str(raw).ok()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PromptGcPlanBuildFailureDetails {
+    error_message: String,
+    marker_stop_reason: String,
+    status_error: String,
+    blocks_remaining_turn: bool,
+}
+
+fn prompt_gc_plan_build_failure_details(
+    error: &crate::function_tool::FunctionCallError,
+) -> PromptGcPlanBuildFailureDetails {
+    let error_message = error.to_string();
+    let error_payload = structured_function_call_error_payload(error);
+    let stop_reason = error_payload
+        .as_ref()
+        .and_then(|payload| payload.get("stop_reason"))
+        .and_then(Value::as_str);
+    let status_error = error_payload
+        .as_ref()
+        .and_then(|payload| payload.get("message"))
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string)
+        .unwrap_or_else(|| error_message.clone());
+    PromptGcPlanBuildFailureDetails {
+        error_message,
+        marker_stop_reason: stop_reason.unwrap_or("plan_build_failed").to_string(),
+        status_error,
+        blocks_remaining_turn: matches!(stop_reason, Some("state_hash_mismatch")),
+    }
 }
 
 async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiver<Submission>) {
@@ -6181,14 +6211,18 @@ async fn run_prompt_gc_sidecar_if_needed(
         .lock()
         .await
         .checkpoint_eligibility(&checkpoint.checkpoint_id);
-    if matches!(checkpoint_eligibility, Some(eligibility) if eligibility.uncompacted_unit_count > 0 && eligibility.total_approx_tokens < PROMPT_GC_MIN_SELECTABLE_APPROX_TOKENS)
-    {
+    if matches!(
+        checkpoint_eligibility,
+        Some(eligibility)
+            if eligibility.uncompacted_unit_count > 0
+                && eligibility.triggering_function_call_output_count == 0
+    ) {
         debug!(
             turn_id = %turn_context.sub_id,
             checkpoint_id = %checkpoint.checkpoint_id,
             checkpoint_eligibility = ?checkpoint_eligibility,
-            threshold_tokens = PROMPT_GC_MIN_SELECTABLE_APPROX_TOKENS,
-            "skipping prompt_gc checkpoint until eligible token volume is higher"
+            threshold_tokens = PROMPT_GC_MIN_FUNCTION_CALL_OUTPUT_TOKEN_QTY,
+            "skipping prompt_gc checkpoint until a function_call_output reports Token qty above threshold"
         );
         sidecar.lock().await.skip_cycle(&checkpoint.checkpoint_id);
         return;
@@ -6227,19 +6261,7 @@ async fn run_prompt_gc_sidecar_if_needed(
     {
         Ok(plan) => plan,
         Err(error) => {
-            let error_message = error.to_string();
-            let error_payload = structured_function_call_error_payload(&error);
-            let stop_reason = error_payload
-                .as_ref()
-                .and_then(|payload| payload.get("stop_reason"))
-                .and_then(Value::as_str);
-            let marker_stop_reason = Some(stop_reason.unwrap_or("plan_build_failed").to_string());
-            let status_error = error_payload
-                .as_ref()
-                .and_then(|payload| payload.get("message"))
-                .and_then(Value::as_str)
-                .map(std::string::ToString::to_string)
-                .unwrap_or_else(|| error_message.clone());
+            let failure = prompt_gc_plan_build_failure_details(&error);
             warn!(
                 turn_id = %turn_context.sub_id,
                 checkpoint_id = %checkpoint.checkpoint_id,
@@ -6247,17 +6269,17 @@ async fn run_prompt_gc_sidecar_if_needed(
                 "prompt_gc sidecar failed to build the runtime plan"
             );
             let mut sidecar = sidecar.lock().await;
-            if matches!(stop_reason, Some("state_hash_mismatch")) {
-                sidecar.block_remaining_turn(&checkpoint.checkpoint_id, status_error);
+            if failure.blocks_remaining_turn {
+                sidecar.block_remaining_turn(&checkpoint.checkpoint_id, failure.status_error);
             } else {
-                sidecar.fail_cycle(&checkpoint.checkpoint_id, error_message.clone());
+                sidecar.fail_cycle(&checkpoint.checkpoint_id, failure.error_message.clone());
             }
             sess.persist_prompt_gc_rollout_marker(
                 &checkpoint,
                 PromptGcOutcomeKind::Failed,
                 Some(PromptGcExecutionPhase::Prepare),
-                marker_stop_reason,
-                Some(error_message),
+                Some(failure.marker_stop_reason),
+                Some(failure.error_message),
                 None,
             )
             .await;

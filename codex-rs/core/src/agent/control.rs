@@ -23,6 +23,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
@@ -104,6 +105,7 @@ fn export_forked_subagent_rollout_item(item: RolloutItem) -> Option<RolloutItem>
         RolloutItem::TurnContext(turn_context) => Some(RolloutItem::TurnContext(
             export_forked_subagent_turn_context(turn_context),
         )),
+        RolloutItem::EventMsg(EventMsg::UserMessage(_)) => None,
         RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => Some(item),
     }
 }
@@ -1301,6 +1303,40 @@ mod tests {
             replacement_history,
             USER_SHELL_COMMAND_OPEN_TAG
         ));
+    }
+
+    #[test]
+    fn build_forked_subagent_export_excludes_parent_user_events() {
+        let exported = build_forked_subagent_export(
+            vec![
+                RolloutItem::EventMsg(EventMsg::UserMessage(
+                    codex_protocol::protocol::UserMessageEvent {
+                        message: "parent asks something".to_string(),
+                        images: None,
+                        local_images: Vec::new(),
+                        text_elements: Vec::new(),
+                    },
+                )),
+                RolloutItem::EventMsg(EventMsg::TokenCount(
+                    codex_protocol::protocol::TokenCountEvent {
+                        info: None,
+                        rate_limits: None,
+                    },
+                )),
+            ],
+            "spawn-call-1",
+        );
+
+        assert!(
+            !exported
+                .iter()
+                .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::UserMessage(_))))
+        );
+        assert!(
+            exported
+                .iter()
+                .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TokenCount(_))))
+        );
     }
 
     #[tokio::test]

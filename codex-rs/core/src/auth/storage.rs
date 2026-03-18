@@ -185,8 +185,7 @@ impl AuthStore {
 
         if let Some(tokens) = legacy.tokens {
             let id = tokens
-                .account_id
-                .clone()
+                .preferred_store_account_id()
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
             store.accounts.push(StoredAccount {
                 id: id.clone(),
@@ -199,6 +198,26 @@ impl AuthStore {
         }
 
         store
+    }
+
+    pub fn normalize_account_ids(&mut self) {
+        let mut id_rewrites = HashMap::new();
+        for account in &mut self.accounts {
+            let Some(normalized_id) = account
+                .tokens
+                .migrated_store_account_id(account.id.as_str())
+            else {
+                continue;
+            };
+            id_rewrites.insert(account.id.clone(), normalized_id.clone());
+            account.id = normalized_id;
+        }
+
+        if let Some(active_account_id) = self.active_account_id.as_mut()
+            && let Some(rewritten_active_id) = id_rewrites.get(active_account_id)
+        {
+            *active_account_id = rewritten_active_id.clone();
+        }
     }
 }
 
@@ -501,7 +520,8 @@ pub(super) fn create_auth_storage(
 
 fn parse_auth_store(contents: &str) -> std::io::Result<AuthStore> {
     match serde_json::from_str::<AuthStore>(contents) {
-        Ok(store) => {
+        Ok(mut store) => {
+            store.normalize_account_ids();
             store.validate()?;
             Ok(store)
         }
@@ -533,6 +553,7 @@ fn create_auth_storage_with_keyring_store(
 mod tests {
     use super::*;
     use anyhow::Context;
+    use base64::Engine;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -600,6 +621,60 @@ mod tests {
         assert_eq!(loaded.active_account_id.as_deref(), Some("acct"));
         assert_eq!(loaded.accounts.len(), 1);
         assert_eq!(loaded.accounts[0].tokens.access_token, "access");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_auth_store_rekeys_workspace_backed_chatgpt_store_ids() -> anyhow::Result<()> {
+        let id_token_raw = {
+            let header = serde_json::json!({"alg":"none","typ":"JWT"});
+            let payload = serde_json::json!({
+                "email": "user@example.com",
+                "https://api.openai.com/auth": {
+                    "chatgpt_user_id": "user-123",
+                    "user_id": "user-123",
+                    "chatgpt_account_id": "org-workspace",
+                    "chatgpt_plan_type": "team"
+                }
+            });
+            let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+            format!(
+                "{}.{}.{}",
+                b64(&serde_json::to_vec(&header)?),
+                b64(&serde_json::to_vec(&payload)?),
+                b64(b"sig"),
+            )
+        };
+        let store = AuthStore {
+            active_account_id: Some("org-workspace".to_string()),
+            accounts: vec![StoredAccount {
+                id: "org-workspace".to_string(),
+                label: None,
+                tokens: TokenData {
+                    id_token: crate::token_data::parse_chatgpt_jwt_claims(&id_token_raw)?,
+                    access_token: "access".to_string(),
+                    refresh_token: "refresh".to_string(),
+                    account_id: Some("org-workspace".to_string()),
+                },
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            }],
+            ..AuthStore::default()
+        };
+
+        let loaded = parse_auth_store(&serde_json::to_string(&store)?)?;
+        assert_eq!(
+            loaded.active_account_id.as_deref(),
+            Some("chatgpt-user:user-123:workspace:org-workspace")
+        );
+        assert_eq!(
+            loaded.accounts[0].id,
+            "chatgpt-user:user-123:workspace:org-workspace"
+        );
+        assert_eq!(
+            loaded.accounts[0].tokens.account_id.as_deref(),
+            Some("org-workspace")
+        );
         Ok(())
     }
 

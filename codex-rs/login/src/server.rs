@@ -29,8 +29,8 @@ use base64::Engine;
 use chrono::Utc;
 use codex_core::AuthManager;
 use codex_core::auth::AuthCredentialsStoreMode;
-use codex_core::auth::NON_PLUS_ACCOUNT_REMOVED_MESSAGE;
 use codex_core::auth::StoredAccount;
+use codex_core::auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
 use codex_core::auth::update_auth_store;
 use codex_core::default_client::originator;
 use codex_core::token_data::TokenData;
@@ -753,6 +753,9 @@ pub(crate) async fn exchange_code_for_tokens(
 }
 
 /// Persists exchanged credentials using the configured local auth store.
+///
+/// Merge-safety anchor: browser/device ChatGPT login persistence must enforce the
+/// same supported-plan admission policy as core auth-store mutation and external auth.
 pub(crate) async fn persist_tokens_async(
     codex_home: &Path,
     api_key: Option<String>,
@@ -776,16 +779,15 @@ pub(crate) async fn persist_tokens_async(
         {
             tokens.account_id = Some(acc.to_string());
         }
-        let account_id = tokens
-            .account_id
-            .clone()
+        let account_id_for_store = tokens
+            .preferred_store_account_id()
             .unwrap_or_else(|| format!("account-{}", Utc::now().timestamp_millis()));
-        let account_id_for_store = account_id.clone();
+        let stored_account_id = account_id_for_store.clone();
         let now = Utc::now();
-        if !tokens.id_token.is_plus_or_pro_saved_account() {
+        if !tokens.id_token.is_supported_chatgpt_auth_plan() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                NON_PLUS_ACCOUNT_REMOVED_MESSAGE,
+                UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE,
             ));
         }
 
@@ -817,16 +819,14 @@ pub(crate) async fn persist_tokens_async(
         })?;
 
         let auth_manager = AuthManager::new(codex_home.clone(), false, auth_credentials_store_mode);
-        let Some(auth) = auth_manager.auth_cached() else {
+        let accounts = auth_manager.list_accounts();
+        if !accounts
+            .iter()
+            .any(|account| account.id == stored_account_id && account.is_active)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                NON_PLUS_ACCOUNT_REMOVED_MESSAGE,
-            ));
-        };
-        if auth.get_account_id().as_deref() != Some(account_id.as_str()) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                NON_PLUS_ACCOUNT_REMOVED_MESSAGE,
+                UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE,
             ));
         }
         Ok(())
@@ -1147,14 +1147,20 @@ mod tests {
     use super::sanitize_url_for_logging;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use codex_core::auth::NON_PLUS_ACCOUNT_REMOVED_MESSAGE;
+    use codex_core::auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
     use codex_core::auth::load_auth_store;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
-    fn id_token(email: &str, account_id: &str, plan_type: Option<&str>) -> String {
+    fn store_account_id(user_id: &str, account_id: &str) -> String {
+        format!("chatgpt-user:{user_id}:workspace:{account_id}")
+    }
+
+    fn id_token(email: &str, user_id: &str, account_id: &str, plan_type: Option<&str>) -> String {
         let header = serde_json::json!({"alg":"HS256","typ":"JWT"});
         let mut auth_payload = serde_json::json!({
+            "chatgpt_user_id": user_id,
+            "user_id": user_id,
             "chatgpt_account_id": account_id,
         });
         if let Some(plan_type) = plan_type {
@@ -1181,7 +1187,7 @@ mod tests {
         persist_tokens_async(
             codex_home,
             None,
-            id_token("work@example.com", "acc-work", Some("pro")),
+            id_token("work@example.com", "user-work", "acc-work", Some("pro")),
             "access-work".to_string(),
             "refresh-work".to_string(),
             mode,
@@ -1192,7 +1198,12 @@ mod tests {
         persist_tokens_async(
             codex_home,
             None,
-            id_token("personal@example.com", "acc-personal", Some("pro")),
+            id_token(
+                "personal@example.com",
+                "user-personal",
+                "acc-personal",
+                Some("pro"),
+            ),
             "access-personal".to_string(),
             "refresh-personal".to_string(),
             mode,
@@ -1205,18 +1216,21 @@ mod tests {
             .expect("auth store should exist");
 
         assert_eq!(store.accounts.len(), 2);
-        assert_eq!(store.active_account_id.as_deref(), Some("acc-personal"));
-        assert!(
-            store
-                .accounts
-                .iter()
-                .any(|account| account.id == "acc-work")
+        assert_eq!(
+            store.active_account_id.as_deref(),
+            Some("chatgpt-user:user-personal:workspace:acc-personal")
         );
         assert!(
             store
                 .accounts
                 .iter()
-                .any(|account| account.id == "acc-personal")
+                .any(|account| account.id == store_account_id("user-work", "acc-work"))
+        );
+        assert!(
+            store
+                .accounts
+                .iter()
+                .any(|account| { account.id == store_account_id("user-personal", "acc-personal") })
         );
     }
 
@@ -1229,7 +1243,7 @@ mod tests {
         persist_tokens_async(
             codex_home,
             Some("sk-test".to_string()),
-            id_token("work@example.com", "acc-work", Some("pro")),
+            id_token("work@example.com", "user-work", "acc-work", Some("pro")),
             "access-work".to_string(),
             "refresh-work".to_string(),
             mode,
@@ -1240,7 +1254,12 @@ mod tests {
         persist_tokens_async(
             codex_home,
             None,
-            id_token("personal@example.com", "acc-personal", Some("pro")),
+            id_token(
+                "personal@example.com",
+                "user-personal",
+                "acc-personal",
+                Some("pro"),
+            ),
             "access-personal".to_string(),
             "refresh-personal".to_string(),
             mode,
@@ -1254,11 +1273,54 @@ mod tests {
 
         assert_eq!(store.openai_api_key, None);
         assert_eq!(store.accounts.len(), 2);
-        assert_eq!(store.active_account_id.as_deref(), Some("acc-personal"));
+        assert_eq!(
+            store.active_account_id.as_deref(),
+            Some("chatgpt-user:user-personal:workspace:acc-personal")
+        );
     }
 
     #[tokio::test]
-    async fn persist_tokens_async_rejects_non_plus_or_pro_plan() {
+    async fn persist_tokens_async_accepts_business_plan() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path();
+        let mode = AuthCredentialsStoreMode::File;
+
+        persist_tokens_async(
+            codex_home,
+            None,
+            id_token(
+                "workspace@example.com",
+                "user-business",
+                "acc-business",
+                Some("business"),
+            ),
+            "access-business".to_string(),
+            "refresh-business".to_string(),
+            mode,
+        )
+        .await
+        .expect("business plan should be accepted");
+
+        let store = load_auth_store(codex_home, mode)
+            .expect("load auth store")
+            .expect("auth store should exist");
+        assert_eq!(store.accounts.len(), 1);
+        assert_eq!(
+            store.active_account_id.as_deref(),
+            Some("chatgpt-user:user-business:workspace:acc-business")
+        );
+        assert_eq!(
+            store.accounts[0]
+                .tokens
+                .id_token
+                .get_chatgpt_plan_type()
+                .as_deref(),
+            Some("Business")
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_tokens_async_rejects_unsupported_plan() {
         let dir = tempdir().expect("tempdir");
         let codex_home = dir.path();
         let mode = AuthCredentialsStoreMode::File;
@@ -1266,7 +1328,7 @@ mod tests {
         let error = persist_tokens_async(
             codex_home,
             None,
-            id_token("free@example.com", "acc-free", Some("free")),
+            id_token("free@example.com", "user-free", "acc-free", Some("free")),
             "access-free".to_string(),
             "refresh-free".to_string(),
             mode,
@@ -1275,7 +1337,7 @@ mod tests {
         .expect_err("free plan should be rejected");
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert_eq!(error.to_string(), NON_PLUS_ACCOUNT_REMOVED_MESSAGE);
+        assert_eq!(error.to_string(), UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE);
     }
 
     #[tokio::test]
@@ -1287,7 +1349,12 @@ mod tests {
         let error = persist_tokens_async(
             codex_home,
             None,
-            id_token("missing-plan@example.com", "acc-missing-plan", None),
+            id_token(
+                "missing-plan@example.com",
+                "user-missing-plan",
+                "acc-missing-plan",
+                None,
+            ),
             "access-missing-plan".to_string(),
             "refresh-missing-plan".to_string(),
             mode,
@@ -1296,7 +1363,69 @@ mod tests {
         .expect_err("missing plan should be rejected");
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert_eq!(error.to_string(), NON_PLUS_ACCOUNT_REMOVED_MESSAGE);
+        assert_eq!(error.to_string(), UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn persist_tokens_async_keeps_distinct_users_from_same_workspace() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path();
+        let mode = AuthCredentialsStoreMode::File;
+
+        persist_tokens_async(
+            codex_home,
+            None,
+            id_token("first@example.com", "user-first", "org-team", Some("team")),
+            "access-first".to_string(),
+            "refresh-first".to_string(),
+            mode,
+        )
+        .await
+        .expect("persist first team user");
+
+        persist_tokens_async(
+            codex_home,
+            None,
+            id_token(
+                "second@example.com",
+                "user-second",
+                "org-team",
+                Some("team"),
+            ),
+            "access-second".to_string(),
+            "refresh-second".to_string(),
+            mode,
+        )
+        .await
+        .expect("persist second team user");
+
+        let store = load_auth_store(codex_home, mode)
+            .expect("load auth store")
+            .expect("auth store should exist");
+
+        assert_eq!(store.accounts.len(), 2);
+        assert_eq!(
+            store.active_account_id.as_deref(),
+            Some("chatgpt-user:user-second:workspace:org-team")
+        );
+        assert!(
+            store
+                .accounts
+                .iter()
+                .any(|account| account.id == store_account_id("user-first", "org-team"))
+        );
+        assert!(
+            store
+                .accounts
+                .iter()
+                .any(|account| account.id == store_account_id("user-second", "org-team"))
+        );
+        assert!(
+            store
+                .accounts
+                .iter()
+                .all(|account| account.tokens.account_id.as_deref() == Some("org-team"))
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ use crate::protocol::REASONING_CONTEXT_CLOSE_TAG;
 use crate::protocol::REASONING_CONTEXT_OPEN_TAG;
 use crate::protocol::TOOL_CONTEXT_CLOSE_TAG;
 use crate::protocol::TOOL_CONTEXT_OPEN_TAG;
+use crate::response_item_utils::local_shell_call_output_id;
 use crate::rid::parse_rid;
 use crate::state::ContextItemsEvent;
 use crate::state::ContextOverlay;
@@ -405,9 +406,26 @@ async fn handle_apply(
         )
     };
 
-    if let Some(replacement_history) = replacement_history
-        && let Some(recorder) = recorder
-    {
+    if let Some(replacement_history) = replacement_history {
+        let Some(recorder) = recorder else {
+            if turn.config.ephemeral {
+                return Ok(ManageContextResult {
+                    json: json!({
+                        "mode": "apply",
+                        "applied_events": applied_events,
+                        "new_state_hash": new_state_hash,
+                        "progress_report": progress_report,
+                        "stop_reason": stop_reason.as_str(),
+                    }),
+                });
+            }
+            let mut state = session.state.lock().await;
+            state.restore_manage_context_checkpoint(checkpoint);
+            return Err(contract_error(
+                StopReason::RolloutPersistError,
+                "failed to persist compacted replacement_history: rollout recorder unavailable",
+            ));
+        };
         let compacted_item = RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(replacement_history),
@@ -616,11 +634,11 @@ fn collect_top_offenders(
             .map(|replacement| replacement.len() as u64)
             .unwrap_or(raw_bytes);
 
-        let call_id = item.and_then(call_id_for_item).map(ToString::to_string);
+        let call_id = item.and_then(call_id_for_item);
         let tool_name = call_id
             .as_deref()
             .and_then(|call_id| tool_name_by_call_id.get(call_id))
-            .map(|name| (*name).to_string());
+            .cloned();
 
         top_offenders.push(TopOffender {
             index: summary.index,
@@ -661,34 +679,33 @@ fn materialize_prompt_snapshot_after_apply(
 }
 
 fn in_flight_manage_context_call_ids(items: &[ResponseItem]) -> (HashSet<String>, HashSet<String>) {
-    let mut manage_context_function_call_ids: HashSet<String> = HashSet::new();
-    let mut manage_context_custom_call_ids: HashSet<String> = HashSet::new();
+    let call_ownership = ManageContextCallOwnership::from_items(items);
     let mut function_output_ids: HashSet<String> = HashSet::new();
     let mut custom_output_ids: HashSet<String> = HashSet::new();
 
     for item in items {
         match item {
-            ResponseItem::FunctionCall { name, call_id, .. } if name == "manage_context" => {
-                manage_context_function_call_ids.insert(call_id.clone());
-            }
-            ResponseItem::CustomToolCall { name, call_id, .. } if name == "manage_context" => {
-                manage_context_custom_call_ids.insert(call_id.clone());
-            }
-            ResponseItem::FunctionCallOutput { call_id, .. } => {
+            ResponseItem::FunctionCallOutput { call_id, .. }
+                if call_ownership.is_manage_context_output(item) =>
+            {
                 function_output_ids.insert(call_id.clone());
             }
-            ResponseItem::CustomToolCallOutput { call_id, .. } => {
+            ResponseItem::CustomToolCallOutput { call_id, .. }
+                if call_ownership.is_manage_context_output(item) =>
+            {
                 custom_output_ids.insert(call_id.clone());
             }
             _ => {}
         }
     }
 
-    let in_flight_function_call_ids: HashSet<String> = manage_context_function_call_ids
+    let in_flight_function_call_ids: HashSet<String> = call_ownership
+        .manage_context_function_call_ids
         .into_iter()
         .filter(|call_id| !function_output_ids.contains(call_id))
         .collect();
-    let in_flight_custom_call_ids: HashSet<String> = manage_context_custom_call_ids
+    let in_flight_custom_call_ids: HashSet<String> = call_ownership
+        .manage_context_custom_call_ids
         .into_iter()
         .filter(|call_id| !custom_output_ids.contains(call_id))
         .collect();
@@ -701,6 +718,7 @@ fn strip_completed_manage_context_pairs(
     in_flight_function_call_ids: &HashSet<String>,
     in_flight_custom_call_ids: &HashSet<String>,
 ) {
+    let call_ownership = ManageContextCallOwnership::from_items(items);
     let mut manage_context_function_call_ids: HashSet<String> = HashSet::new();
     let mut manage_context_custom_call_ids: HashSet<String> = HashSet::new();
     let mut function_output_ids: HashSet<String> = HashSet::new();
@@ -719,11 +737,10 @@ fn strip_completed_manage_context_pairs(
             ResponseItem::FunctionCall { call_id, .. } => {
                 non_manage_function_like_call_ids.insert(call_id.clone());
             }
-            ResponseItem::LocalShellCall {
-                call_id: Some(call_id),
-                ..
-            } => {
-                non_manage_function_like_call_ids.insert(call_id.clone());
+            ResponseItem::LocalShellCall { id, call_id, .. } => {
+                if let Some(call_id) = local_shell_call_output_id(id, call_id) {
+                    non_manage_function_like_call_ids.insert(call_id);
+                }
             }
             ResponseItem::CustomToolCall { call_id, .. } => {
                 non_manage_custom_call_ids.insert(call_id.clone());
@@ -768,14 +785,14 @@ fn strip_completed_manage_context_pairs(
         }
         ResponseItem::FunctionCallOutput { call_id, .. } => {
             if in_flight_function_call_ids.contains(call_id) {
-                return false;
+                return !call_ownership.is_manage_context_output(item);
             }
             !completed_function_call_ids.contains(call_id)
                 || non_manage_function_like_call_ids.contains(call_id)
         }
         ResponseItem::CustomToolCallOutput { call_id, .. } => {
             if in_flight_custom_call_ids.contains(call_id) {
-                return false;
+                return !call_ownership.is_manage_context_output(item);
             }
             !completed_custom_call_ids.contains(call_id)
                 || non_manage_custom_call_ids.contains(call_id)
@@ -812,13 +829,12 @@ impl ManageContextCallOwnership {
                         .non_manage_function_like_call_ids
                         .insert(call_id.clone());
                 }
-                ResponseItem::LocalShellCall {
-                    call_id: Some(call_id),
-                    ..
-                } => {
-                    call_ownership
-                        .non_manage_function_like_call_ids
-                        .insert(call_id.clone());
+                ResponseItem::LocalShellCall { id, call_id, .. } => {
+                    if let Some(call_id) = local_shell_call_output_id(id, call_id) {
+                        call_ownership
+                            .non_manage_function_like_call_ids
+                            .insert(call_id);
+                    }
                 }
                 ResponseItem::CustomToolCall { call_id, .. } => {
                     call_ownership
@@ -836,6 +852,15 @@ impl ManageContextCallOwnership {
             ResponseItem::FunctionCall { name, .. } | ResponseItem::CustomToolCall { name, .. } => {
                 name == "manage_context"
             }
+            ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. } => {
+                self.is_manage_context_output(item)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_manage_context_output(&self, item: &ResponseItem) -> bool {
+        match item {
             ResponseItem::FunctionCallOutput { call_id, .. } => {
                 self.manage_context_function_call_ids.contains(call_id)
                     && !self.non_manage_function_like_call_ids.contains(call_id)
@@ -849,19 +874,18 @@ impl ManageContextCallOwnership {
     }
 }
 
-fn tool_name_by_call_id(items: &[ResponseItem]) -> HashMap<&str, &str> {
-    let mut out: HashMap<&str, &str> = HashMap::new();
+fn tool_name_by_call_id(items: &[ResponseItem]) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
     for item in items {
         match item {
             ResponseItem::FunctionCall { call_id, name, .. }
             | ResponseItem::CustomToolCall { call_id, name, .. } => {
-                out.insert(call_id.as_str(), name.as_str());
+                out.insert(call_id.clone(), name.clone());
             }
-            ResponseItem::LocalShellCall {
-                call_id: Some(call_id),
-                ..
-            } => {
-                out.insert(call_id.as_str(), "local_shell");
+            ResponseItem::LocalShellCall { id, call_id, .. } => {
+                if let Some(call_id) = local_shell_call_output_id(id, call_id) {
+                    out.insert(call_id, "local_shell".to_string());
+                }
             }
             _ => {}
         }
@@ -869,16 +893,13 @@ fn tool_name_by_call_id(items: &[ResponseItem]) -> HashMap<&str, &str> {
     out
 }
 
-fn call_id_for_item(item: &ResponseItem) -> Option<&str> {
+fn call_id_for_item(item: &ResponseItem) -> Option<String> {
     match item {
         ResponseItem::FunctionCall { call_id, .. }
         | ResponseItem::FunctionCallOutput { call_id, .. }
         | ResponseItem::CustomToolCall { call_id, .. }
-        | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
-        ResponseItem::LocalShellCall {
-            call_id: Some(call_id),
-            ..
-        } => Some(call_id.as_str()),
+        | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.clone()),
+        ResponseItem::LocalShellCall { id, call_id, .. } => local_shell_call_output_id(id, call_id),
         _ => None,
     }
 }
@@ -1080,6 +1101,21 @@ mod tests {
         }
     }
 
+    fn legacy_local_shell_call(id: &str) -> ResponseItem {
+        ResponseItem::LocalShellCall {
+            id: Some(id.to_string()),
+            call_id: None,
+            status: LocalShellStatus::Completed,
+            action: LocalShellAction::Exec(LocalShellExecAction {
+                command: vec!["echo".to_string(), "test".to_string()],
+                timeout_ms: None,
+                working_directory: None,
+                env: None,
+                user: None,
+            }),
+        }
+    }
+
     fn manage_context_call(call_id: &str) -> ResponseItem {
         ResponseItem::FunctionCall {
             id: None,
@@ -1139,6 +1175,26 @@ mod tests {
             .and_then(Value::as_str)
             .expect("stop_reason")
             .to_string()
+    }
+
+    async fn attach_rollout_recorder(session: &crate::codex::Session, turn: &TurnContext) {
+        let recorder = crate::rollout::RolloutRecorder::new(
+            turn.config.as_ref(),
+            crate::rollout::RolloutRecorderParams::new(
+                session.conversation_id,
+                None,
+                turn.session_source.clone(),
+                codex_protocol::models::BaseInstructions::default(),
+                Vec::new(),
+                crate::rollout::policy::EventPersistenceMode::Limited,
+            ),
+            None,
+            None,
+        )
+        .await
+        .expect("create rollout recorder");
+        let mut guard = session.services.rollout.lock().await;
+        *guard = Some(recorder);
     }
 
     fn response_created(id: &str) -> Value {
@@ -1670,6 +1726,22 @@ mod tests {
     }
 
     #[test]
+    fn manage_context_call_ownership_keeps_local_shell_output_on_legacy_id_collision() {
+        let output = tool_output("shared", "ok");
+        let items = vec![
+            user_message("u1"),
+            manage_context_call("shared"),
+            manage_context_output("shared", "{\"mode\":\"retrieve\"}"),
+            legacy_local_shell_call("shared"),
+            output.clone(),
+        ];
+
+        let call_ownership = ManageContextCallOwnership::from_items(&items);
+
+        assert!(!call_ownership.is_manage_context_item(&output));
+    }
+
+    #[test]
     fn strip_completed_manage_context_pairs_drops_function_output_when_only_custom_call_collides() {
         let mut items = vec![
             user_message("u1"),
@@ -1815,6 +1887,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn in_flight_manage_context_call_ids_ignores_function_output_on_call_id_collision() {
+        let items = vec![
+            manage_context_call("shared"),
+            tool_call("shared"),
+            tool_output("shared", "ok"),
+        ];
+
+        let (in_flight_function_ids, in_flight_custom_ids) =
+            in_flight_manage_context_call_ids(&items);
+
+        assert_eq!(
+            in_flight_function_ids,
+            HashSet::from(["shared".to_string()])
+        );
+        assert!(in_flight_custom_ids.is_empty());
+    }
+
+    #[test]
+    fn in_flight_manage_context_call_ids_ignores_local_shell_output_on_call_id_collision() {
+        let items = vec![
+            manage_context_call("shared"),
+            local_shell_call("shared"),
+            tool_output("shared", "ok"),
+        ];
+
+        let (in_flight_function_ids, in_flight_custom_ids) =
+            in_flight_manage_context_call_ids(&items);
+
+        assert_eq!(
+            in_flight_function_ids,
+            HashSet::from(["shared".to_string()])
+        );
+        assert!(in_flight_custom_ids.is_empty());
+    }
+
+    #[test]
+    fn in_flight_manage_context_call_ids_ignores_legacy_local_shell_output_on_id_collision() {
+        let items = vec![
+            manage_context_call("shared"),
+            legacy_local_shell_call("shared"),
+            tool_output("shared", "ok"),
+        ];
+
+        let (in_flight_function_ids, in_flight_custom_ids) =
+            in_flight_manage_context_call_ids(&items);
+
+        assert_eq!(
+            in_flight_function_ids,
+            HashSet::from(["shared".to_string()])
+        );
+        assert!(in_flight_custom_ids.is_empty());
+    }
+
+    #[test]
+    fn strip_completed_manage_context_pairs_keeps_colliding_output_for_in_flight_call() {
+        let mut items = vec![
+            user_message("u1"),
+            manage_context_call("shared"),
+            tool_call("shared"),
+            tool_output("shared", "ok"),
+        ];
+
+        strip_completed_manage_context_pairs(
+            &mut items,
+            &HashSet::from(["shared".to_string()]),
+            &HashSet::new(),
+        );
+
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name == "manage_context" && call_id == "shared"
+            )
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCall { name, call_id, .. }
+                    if name == "exec_command" && call_id == "shared"
+            )
+        }));
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "shared"
+            )
+        }));
+    }
+
     #[tokio::test]
     async fn materialize_prompt_snapshot_after_apply_keeps_in_flight_manage_context_call() {
         let (session, turn) = crate::codex::make_session_and_context().await;
@@ -1865,6 +2028,7 @@ mod tests {
     #[tokio::test]
     async fn manage_context_apply_accepts_append_only_post_user_changes() {
         let (session, turn) = crate::codex::make_session_and_context().await;
+        attach_rollout_recorder(&session, &turn).await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
 
         {
@@ -2096,6 +2260,7 @@ mod tests {
     #[tokio::test]
     async fn manage_context_apply_generates_one_context_pair_per_chunk() {
         let (session, turn) = crate::codex::make_session_and_context().await;
+        attach_rollout_recorder(&session, &turn).await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
 
         {
@@ -2362,6 +2527,7 @@ mod tests {
             turn.config.features.enabled(Feature::RuntimeMetrics),
             None,
         );
+        attach_rollout_recorder(&session, &turn).await;
 
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
         {
@@ -2710,6 +2876,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manage_context_apply_without_rollout_recorder_rolls_back_state_for_persistent_sessions()
+     {
+        let (session, turn) = crate::codex::make_session_and_context().await;
+        let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
+
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &user_message("u1"),
+                    &tool_call("call_tool_1"),
+                    &tool_output("call_tool_1", "tool output payload"),
+                    &user_message("u2"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let (baseline_history, baseline_overlay, baseline_context_items, baseline_rids) = {
+            let state = session.state.lock().await;
+            (
+                state.history_snapshot_lenient(),
+                state.context_overlay_snapshot(),
+                state.build_context_items_event(),
+                state.history_rids_snapshot_lenient(),
+            )
+        };
+
+        let retrieve_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": policy_id,
+        }))
+        .expect("parse retrieve args");
+        let retrieve = handle_manage_context(&session, &turn, &retrieve_args)
+            .await
+            .expect("retrieve");
+
+        let plan_id = retrieve
+            .json
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .expect("plan_id")
+            .to_string();
+        let state_hash = retrieve
+            .json
+            .get("state_hash")
+            .and_then(Value::as_str)
+            .expect("state_hash")
+            .to_string();
+        let chunk_id = retrieve
+            .json
+            .get("chunk_manifest")
+            .and_then(Value::as_array)
+            .and_then(|manifest| manifest.first())
+            .and_then(|entry| entry.get("chunk_id"))
+            .and_then(Value::as_str)
+            .expect("chunk_id")
+            .to_string();
+
+        let apply_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "apply",
+            "policy_id": turn.config.manage_context_policy.quality_rubric_id,
+            "plan_id": plan_id,
+            "state_hash": state_hash,
+            "chunk_summaries": [{
+                "chunk_id": chunk_id,
+                "reasoning_context": "Preserve the core action.",
+                "tool_context": "Keep the canonical tool result.",
+            }],
+        }))
+        .expect("parse apply args");
+
+        let error = handle_manage_context(&session, &turn, &apply_args)
+            .await
+            .expect_err("apply should fail without rollout recorder");
+        let FunctionCallError::RespondToModel(payload) = error else {
+            panic!("expected model-facing contract error");
+        };
+        let payload: Value = serde_json::from_str(&payload).expect("valid error payload");
+        assert_eq!(
+            payload.get("stop_reason").and_then(Value::as_str),
+            Some(StopReason::RolloutPersistError.as_str())
+        );
+        assert!(
+            payload
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("rollout recorder unavailable")),
+            "unexpected payload: {payload:?}"
+        );
+
+        let (after_history, after_overlay, after_context_items, after_rids) = {
+            let state = session.state.lock().await;
+            (
+                state.history_snapshot_lenient(),
+                state.context_overlay_snapshot(),
+                state.build_context_items_event(),
+                state.history_rids_snapshot_lenient(),
+            )
+        };
+
+        assert_eq!(after_history, baseline_history);
+        assert_eq!(after_overlay, baseline_overlay);
+        assert_eq!(after_context_items, baseline_context_items);
+        assert_eq!(after_rids, baseline_rids);
+    }
+
+    #[tokio::test]
+    async fn manage_context_apply_without_rollout_recorder_succeeds_for_ephemeral_sessions() {
+        let (session, mut turn) = crate::codex::make_session_and_context().await;
+        let mut config = (*turn.config).clone();
+        config.ephemeral = true;
+        turn.config = Arc::new(config);
+        let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
+
+        {
+            let mut state = session.state.lock().await;
+            state.record_items(
+                [
+                    &user_message("u1"),
+                    &tool_call("call_tool_1"),
+                    &tool_output("call_tool_1", "tool output payload"),
+                    &user_message("u2"),
+                ],
+                turn.truncation_policy,
+            );
+        }
+
+        let retrieve_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "retrieve",
+            "policy_id": policy_id,
+        }))
+        .expect("parse retrieve args");
+        let retrieve = handle_manage_context(&session, &turn, &retrieve_args)
+            .await
+            .expect("retrieve");
+
+        let plan_id = retrieve
+            .json
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .expect("plan_id")
+            .to_string();
+        let state_hash = retrieve
+            .json
+            .get("state_hash")
+            .and_then(Value::as_str)
+            .expect("state_hash")
+            .to_string();
+        let chunk_id = retrieve
+            .json
+            .get("chunk_manifest")
+            .and_then(Value::as_array)
+            .and_then(|manifest| manifest.first())
+            .and_then(|entry| entry.get("chunk_id"))
+            .and_then(Value::as_str)
+            .expect("chunk_id")
+            .to_string();
+
+        let apply_args: ManageContextToolArgs = serde_json::from_value(json!({
+            "mode": "apply",
+            "policy_id": turn.config.manage_context_policy.quality_rubric_id,
+            "plan_id": plan_id,
+            "state_hash": state_hash,
+            "chunk_summaries": [{
+                "chunk_id": chunk_id,
+                "reasoning_context": "Preserve the core action.",
+                "tool_context": "Keep the canonical tool result.",
+            }],
+        }))
+        .expect("parse apply args");
+
+        let result = handle_manage_context(&session, &turn, &apply_args)
+            .await
+            .expect("apply should succeed for ephemeral sessions");
+        assert!(matches!(
+            result.json.get("stop_reason").and_then(Value::as_str),
+            Some(reason)
+                if reason == StopReason::TargetReached.as_str()
+                    || reason == StopReason::FixedPointReached.as_str()
+        ));
+    }
+
+    #[tokio::test]
     async fn manage_context_apply_rejects_invalid_chunk_id() {
         let (session, turn) = crate::codex::make_session_and_context().await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
@@ -2851,6 +3201,7 @@ mod tests {
             manage_context_call("shared"),
             tool_call("shared"),
             tool_output("shared", "ok"),
+            user_message("u2"),
         ];
         let ev_with_output = ContextItemsEvent {
             items: vec![
@@ -2882,6 +3233,13 @@ mod tests {
                     included: true,
                     id: Some("r3".to_string()),
                 },
+                crate::state::ContextItemSummary {
+                    index: 4,
+                    category: PruneCategory::UserMessage,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r4".to_string()),
+                },
             ],
         };
         let with_output_hash =
@@ -2891,6 +3249,7 @@ mod tests {
             user_message("u1"),
             manage_context_call("shared"),
             tool_call("shared"),
+            user_message("u2"),
         ];
         let ev_without_output = ContextItemsEvent {
             items: vec![
@@ -2914,6 +3273,13 @@ mod tests {
                     preview: String::new(),
                     included: true,
                     id: Some("r2".to_string()),
+                },
+                crate::state::ContextItemSummary {
+                    index: 3,
+                    category: PruneCategory::UserMessage,
+                    preview: String::new(),
+                    included: true,
+                    id: Some("r3".to_string()),
                 },
             ],
         };

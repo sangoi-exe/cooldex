@@ -5,17 +5,12 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
 use std::collections::HashSet;
 
+use crate::response_item_utils::local_shell_call_output_id;
 use crate::util::error_or_panic;
 use tracing::info;
 
 const IMAGE_CONTENT_OMITTED_PLACEHOLDER: &str =
     "image content omitted because you do not support image input";
-
-// Merge-safety anchor: legacy LocalShellCall items may carry only `id`; normalization must
-// preserve their paired FunctionCallOutput instead of dropping hidden prompt_gc rewrite context.
-fn local_shell_call_output_id(id: &Option<String>, call_id: &Option<String>) -> Option<String> {
-    call_id.clone().or_else(|| id.clone())
-}
 
 pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
     // Collect synthetic outputs to insert immediately after their calls.

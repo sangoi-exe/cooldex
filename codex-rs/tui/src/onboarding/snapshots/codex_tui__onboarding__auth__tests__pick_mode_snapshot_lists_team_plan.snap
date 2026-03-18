@@ -1,0 +1,16 @@
+---
+source: tui/src/onboarding/auth.rs
+expression: terminal.backend()
+---
+  Sign in with ChatGPT to use Codex with a supported ChatGPT plan
+  or connect an API key for usage-based billing
+
+> 1. Sign in with ChatGPT
+     Usage included with Plus, Pro, Team, Business, Enterprise, and Edu
+plans
+
+  2. Sign in with Device Code
+     Sign in from another device with a one-time code
+
+  API key login is disabled by this workspace. Sign in with ChatGPT to
+continue.

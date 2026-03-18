@@ -20,6 +20,24 @@ pub struct TokenData {
     pub account_id: Option<String>,
 }
 
+impl TokenData {
+    pub fn preferred_store_account_id(&self) -> Option<String> {
+        self.id_token
+            .preferred_store_account_id()
+            .or_else(|| self.account_id.clone())
+    }
+
+    pub fn migrated_store_account_id(&self, current_store_account_id: &str) -> Option<String> {
+        let preferred_store_account_id = self.id_token.preferred_store_account_id()?;
+        if self.account_id.as_deref() == Some(current_store_account_id)
+            && preferred_store_account_id != current_store_account_id
+        {
+            return Some(preferred_store_account_id);
+        }
+        None
+    }
+}
+
 /// Flat subset of useful claims in id_token from auth.json.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct IdTokenInfo {
@@ -43,10 +61,19 @@ impl IdTokenInfo {
         })
     }
 
-    pub fn is_plus_or_pro_saved_account(&self) -> bool {
+    // Merge-safety anchor: ChatGPT auth admission must stay aligned across saved-account
+    // filtering, browser/device login persistence, and external-token login.
+    pub fn is_supported_chatgpt_auth_plan(&self) -> bool {
         matches!(
             self.chatgpt_plan_type,
-            Some(PlanType::Known(KnownPlan::Plus | KnownPlan::Pro))
+            Some(PlanType::Known(
+                KnownPlan::Plus
+                    | KnownPlan::Pro
+                    | KnownPlan::Team
+                    | KnownPlan::Business
+                    | KnownPlan::Enterprise
+                    | KnownPlan::Edu
+            ))
         )
     }
 
@@ -57,6 +84,16 @@ impl IdTokenInfo {
                 KnownPlan::Team | KnownPlan::Business | KnownPlan::Enterprise | KnownPlan::Edu
             ))
         )
+    }
+
+    pub fn preferred_store_account_id(&self) -> Option<String> {
+        let user_id = self.chatgpt_user_id.as_deref()?;
+        Some(match self.chatgpt_account_id.as_deref() {
+            Some(chatgpt_account_id) => {
+                format!("chatgpt-user:{user_id}:workspace:{chatgpt_account_id}")
+            }
+            None => format!("chatgpt-user:{user_id}"),
+        })
     }
 }
 
@@ -291,5 +328,79 @@ mod tests {
             ..IdTokenInfo::default()
         };
         assert_eq!(personal.is_workspace_account(), false);
+    }
+
+    #[test]
+    fn supported_chatgpt_auth_plan_matches_current_supported_plans() {
+        let supported_plans = [
+            KnownPlan::Plus,
+            KnownPlan::Pro,
+            KnownPlan::Team,
+            KnownPlan::Business,
+            KnownPlan::Enterprise,
+            KnownPlan::Edu,
+        ];
+
+        for plan in supported_plans {
+            let info = IdTokenInfo {
+                chatgpt_plan_type: Some(PlanType::Known(plan)),
+                ..IdTokenInfo::default()
+            };
+            assert_eq!(info.is_supported_chatgpt_auth_plan(), true);
+        }
+
+        let unsupported_plans = [KnownPlan::Free, KnownPlan::Go];
+        for plan in unsupported_plans {
+            let info = IdTokenInfo {
+                chatgpt_plan_type: Some(PlanType::Known(plan)),
+                ..IdTokenInfo::default()
+            };
+            assert_eq!(info.is_supported_chatgpt_auth_plan(), false);
+        }
+
+        let unknown = IdTokenInfo {
+            chatgpt_plan_type: Some(PlanType::Unknown("mystery-tier".to_string())),
+            ..IdTokenInfo::default()
+        };
+        assert_eq!(unknown.is_supported_chatgpt_auth_plan(), false);
+
+        assert_eq!(
+            IdTokenInfo::default().is_supported_chatgpt_auth_plan(),
+            false
+        );
+    }
+
+    #[test]
+    fn preferred_store_account_id_uses_user_and_workspace() {
+        let info = IdTokenInfo {
+            chatgpt_user_id: Some("user-123".to_string()),
+            chatgpt_account_id: Some("org-456".to_string()),
+            ..IdTokenInfo::default()
+        };
+
+        assert_eq!(
+            info.preferred_store_account_id().as_deref(),
+            Some("chatgpt-user:user-123:workspace:org-456")
+        );
+    }
+
+    #[test]
+    fn migrated_store_account_id_only_rekeys_legacy_workspace_backed_ids() {
+        let token_data = TokenData {
+            id_token: IdTokenInfo {
+                chatgpt_user_id: Some("user-123".to_string()),
+                chatgpt_account_id: Some("org-456".to_string()),
+                ..IdTokenInfo::default()
+            },
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            account_id: Some("org-456".to_string()),
+        };
+
+        assert_eq!(
+            token_data.migrated_store_account_id("org-456").as_deref(),
+            Some("chatgpt-user:user-123:workspace:org-456")
+        );
+        assert_eq!(token_data.migrated_store_account_id("custom-id"), None);
     }
 }

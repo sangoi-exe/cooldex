@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use crate::context_manager::estimate_response_item_model_visible_bytes;
-use crate::truncate::approx_tokens_from_byte_count_i64;
+use crate::response_item_utils::function_call_output_token_qty;
+use crate::response_item_utils::local_shell_call_output_id;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::MessagePhase;
@@ -12,6 +12,7 @@ pub(crate) const PROMPT_GC_TOOL_NAME: &str = "prompt_gc";
 pub(crate) const PROMPT_GC_COMPACTION_MARKER: &str = "[internal] prompt_gc";
 pub(crate) const MAX_UNITS_PER_RETRIEVE: usize = 16;
 pub(crate) const MAX_RAW_BYTES_PER_RETRIEVE: usize = 24_000;
+pub(crate) const PROMPT_GC_MIN_FUNCTION_CALL_OUTPUT_TOKEN_QTY: usize = 200;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PromptGcObservedItem {
@@ -61,7 +62,7 @@ pub(crate) struct PromptGcCapturedUnit {
     pub(crate) kind: PromptGcUnitKind,
     pub(crate) payload_text: String,
     pub(crate) approx_bytes: usize,
-    pub(crate) approx_model_visible_tokens: i64,
+    pub(crate) function_call_output_token_qty: Option<usize>,
     pub(crate) resolver: PromptGcUnitResolver,
 }
 
@@ -70,13 +71,13 @@ pub(crate) struct PromptGcPendingCall {
     fingerprint: String,
     payload_text: String,
     call_name: String,
-    approx_model_visible_tokens: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PromptGcCheckpointEligibility {
     pub(crate) uncompacted_unit_count: usize,
-    pub(crate) total_approx_tokens: i64,
+    pub(crate) triggering_function_call_output_count: usize,
+    pub(crate) max_token_qty: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -139,7 +140,6 @@ impl PromptGcSidecar {
                     fingerprint: response_item_fingerprint(item),
                     payload_text,
                     call_name: name.clone(),
-                    approx_model_visible_tokens: estimate_response_item_model_visible_tokens(item),
                 };
                 self.pending_function_calls
                     .entry(call_id.clone())
@@ -161,7 +161,6 @@ impl PromptGcSidecar {
                     fingerprint: response_item_fingerprint(item),
                     payload_text,
                     call_name: name.clone(),
-                    approx_model_visible_tokens: estimate_response_item_model_visible_tokens(item),
                 };
                 self.pending_custom_calls
                     .entry(call_id.clone())
@@ -174,7 +173,7 @@ impl PromptGcSidecar {
                 action,
                 ..
             } => {
-                let Some(call_id) = call_id.as_ref().or(id.as_ref()) else {
+                let Some(call_id) = local_shell_call_output_id(id, call_id) else {
                     return;
                 };
                 // Merge-safety anchor: local shell records as a call item plus
@@ -189,16 +188,27 @@ impl PromptGcSidecar {
                     fingerprint: response_item_fingerprint(item),
                     payload_text,
                     call_name: "local_shell".to_string(),
-                    approx_model_visible_tokens: estimate_response_item_model_visible_tokens(item),
                 };
                 self.pending_function_calls
-                    .entry(call_id.clone())
+                    .entry(call_id)
                     .or_default()
                     .push(pending);
             }
             ResponseItem::FunctionCallOutput { call_id, output } => {
-                if let Some(pending) = pop_pending_call(&mut self.pending_function_calls, call_id) {
-                    self.push_tool_pair_unit(call_id, output, item, pending);
+                if proven_pending_function_call_name(&self.pending_function_calls, call_id)
+                    .is_some()
+                {
+                    if let Some(pending) =
+                        pop_pending_call(&mut self.pending_function_calls, call_id)
+                    {
+                        self.push_tool_pair_unit(call_id, output, item, pending);
+                    }
+                } else {
+                    // Merge-safety anchor: if multiple function-like producers share the same
+                    // logical call_id, PromptGcSidecar cannot prove which call owns this output.
+                    // Drop the entire pending queue for that call_id so later same-turn reuse
+                    // cannot be mispaired against stale ambiguous ownership.
+                    discard_pending_calls(&mut self.pending_function_calls, call_id);
                 }
             }
             ResponseItem::CustomToolCallOutput { call_id, output } => {
@@ -285,15 +295,22 @@ impl PromptGcSidecar {
             .take(checkpoint.eligible_unit_count)
             .filter(|unit| !self.compacted_unit_keys.contains(&unit.unit_key));
         let mut uncompacted_unit_count = 0usize;
-        let mut total_approx_tokens = 0i64;
+        let mut triggering_function_call_output_count = 0usize;
+        let mut max_token_qty = 0usize;
         for unit in uncompacted_units {
             uncompacted_unit_count = uncompacted_unit_count.saturating_add(1);
-            total_approx_tokens =
-                total_approx_tokens.saturating_add(unit.approx_model_visible_tokens);
+            if let Some(token_qty) = unit.function_call_output_token_qty
+                && token_qty > PROMPT_GC_MIN_FUNCTION_CALL_OUTPUT_TOKEN_QTY
+            {
+                triggering_function_call_output_count =
+                    triggering_function_call_output_count.saturating_add(1);
+                max_token_qty = max_token_qty.max(token_qty);
+            }
         }
         Some(PromptGcCheckpointEligibility {
             uncompacted_unit_count,
-            total_approx_tokens,
+            triggering_function_call_output_count,
+            max_token_qty,
         })
     }
 
@@ -447,7 +464,7 @@ impl PromptGcSidecar {
             chunk_id,
             kind: PromptGcUnitKind::Reasoning,
             approx_bytes: payload_text.len(),
-            approx_model_visible_tokens: estimate_response_item_model_visible_tokens(item),
+            function_call_output_token_qty: None,
             payload_text,
             resolver: PromptGcUnitResolver::Reasoning {
                 fingerprint: response_item_fingerprint(item),
@@ -479,9 +496,10 @@ impl PromptGcSidecar {
             chunk_id,
             kind: PromptGcUnitKind::ToolPair,
             approx_bytes: payload_text.len(),
-            approx_model_visible_tokens: pending
-                .approx_model_visible_tokens
-                .saturating_add(estimate_response_item_model_visible_tokens(output_item)),
+            function_call_output_token_qty: match output_item {
+                ResponseItem::FunctionCallOutput { .. } => function_call_output_token_qty(output),
+                _ => None,
+            },
             payload_text,
             resolver: PromptGcUnitResolver::ToolPair {
                 call_id: call_id.to_string(),
@@ -506,7 +524,7 @@ impl PromptGcSidecar {
             chunk_id,
             kind: PromptGcUnitKind::ToolResult,
             approx_bytes: payload_text.len(),
-            approx_model_visible_tokens: estimate_response_item_model_visible_tokens(item),
+            function_call_output_token_qty: None,
             payload_text,
             resolver: PromptGcUnitResolver::ToolResult {
                 fingerprint: response_item_fingerprint(item),
@@ -528,6 +546,9 @@ impl PromptGcSidecar {
                 continue;
             }
             let projected_bytes = selected_bytes.saturating_add(unit.approx_bytes);
+            // Merge-safety anchor: if the first uncompacted unit alone exceeds the raw-byte cap,
+            // keep it as a singleton selection instead of starving later checkpoints forever
+            // behind one oversize transcript.
             if !selected.is_empty() && projected_bytes > max_raw_bytes {
                 break;
             }
@@ -558,10 +579,6 @@ fn function_call_output_text(output: &FunctionCallOutputPayload) -> String {
         .unwrap_or_default()
 }
 
-fn estimate_response_item_model_visible_tokens(item: &ResponseItem) -> i64 {
-    approx_tokens_from_byte_count_i64(estimate_response_item_model_visible_bytes(item))
-}
-
 fn local_shell_action_text(action: &LocalShellAction) -> String {
     serde_json::to_string_pretty(action)
         .unwrap_or_else(|error| format!("failed_to_serialize: {error}"))
@@ -577,6 +594,25 @@ fn pop_pending_call(
         pending_calls.remove(call_id);
     }
     pending
+}
+
+fn discard_pending_calls(
+    pending_calls: &mut HashMap<String, Vec<PromptGcPendingCall>>,
+    call_id: &str,
+) {
+    pending_calls.remove(call_id);
+}
+
+fn proven_pending_function_call_name<'a>(
+    pending_calls: &'a HashMap<String, Vec<PromptGcPendingCall>>,
+    call_id: &str,
+) -> Option<&'a str> {
+    let calls = pending_calls.get(call_id)?;
+    let first_call_name = calls.first()?.call_name.as_str();
+    calls
+        .iter()
+        .all(|pending| pending.call_name == first_call_name)
+        .then_some(first_call_name)
 }
 
 #[cfg(test)]
@@ -605,7 +641,7 @@ mod tests {
         let call = ResponseItem::FunctionCall {
             id: None,
             call_id: "call-1".to_string(),
-            name: "shell".to_string(),
+            name: "exec_command".to_string(),
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
         sidecar.observe_recorded_item(1, &call);
@@ -723,14 +759,14 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_eligibility_counts_large_tool_output_as_token_heavy() {
+    fn checkpoint_eligibility_function_call_output_token_qty_over_200_triggers() {
         let mut sidecar = PromptGcSidecar::default();
         sidecar.bind_turn("turn-1");
 
         let call = ResponseItem::FunctionCall {
             id: None,
             call_id: "call-1".to_string(),
-            name: "shell".to_string(),
+            name: "exec_command".to_string(),
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
         sidecar.observe_recorded_item(0, &call);
@@ -738,7 +774,9 @@ mod tests {
         let output = ResponseItem::FunctionCallOutput {
             call_id: "call-1".to_string(),
             output: FunctionCallOutputPayload {
-                body: FunctionCallOutputBody::Text("x".repeat(900)),
+                body: FunctionCallOutputBody::Text(
+                    "Wall time: 0.1000 seconds\nToken qty: 201\nOutput:\nhello".to_string(),
+                ),
                 success: Some(true),
             },
         };
@@ -761,7 +799,465 @@ mod tests {
             .expect("eligibility");
 
         assert_eq!(eligibility.uncompacted_unit_count, 1);
-        assert!(eligibility.total_approx_tokens >= 200);
+        assert_eq!(eligibility.triggering_function_call_output_count, 1);
+        assert_eq!(eligibility.max_token_qty, 201);
+    }
+
+    #[test]
+    fn checkpoint_eligibility_function_call_output_token_qty_at_200_stays_non_triggering() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let call = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "call-1".to_string(),
+            name: "exec_command".to_string(),
+            arguments: "{\"cmd\":\"pwd\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(0, &call);
+
+        let output = ResponseItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text(
+                    "Wall time: 0.1000 seconds\nToken qty: 200\nOutput:\nhello".to_string(),
+                ),
+                success: Some(true),
+            },
+        };
+        sidecar.observe_recorded_item(1, &output);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(2, &phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let eligibility = sidecar
+            .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
+            .expect("eligibility");
+
+        assert_eq!(eligibility.uncompacted_unit_count, 1);
+        assert_eq!(eligibility.triggering_function_call_output_count, 0);
+        assert_eq!(eligibility.max_token_qty, 0);
+    }
+
+    #[test]
+    fn checkpoint_eligibility_ignores_custom_tool_output_token_qty_marker() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let call = ResponseItem::CustomToolCall {
+            id: None,
+            call_id: "call-1".to_string(),
+            name: "exec_command".to_string(),
+            input: "{\"cmd\":\"pwd\"}".to_string(),
+            status: None,
+        };
+        sidecar.observe_recorded_item(0, &call);
+
+        let output = ResponseItem::CustomToolCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload::from_text(
+                "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nhello".to_string(),
+            ),
+        };
+        sidecar.observe_recorded_item(1, &output);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(2, &phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let eligibility = sidecar
+            .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
+            .expect("eligibility");
+
+        assert_eq!(eligibility.uncompacted_unit_count, 1);
+        assert_eq!(eligibility.triggering_function_call_output_count, 0);
+        assert_eq!(eligibility.max_token_qty, 0);
+    }
+
+    #[test]
+    fn selectable_units_skip_ambiguous_collision_when_same_checkpoint_has_valid_trigger() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let valid_call = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "call-1".to_string(),
+            name: "exec_command".to_string(),
+            arguments: "{\"cmd\":\"pwd\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(0, &valid_call);
+
+        let valid_output = ResponseItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload::from_text(
+                "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nvalid".to_string(),
+            ),
+        };
+        sidecar.observe_recorded_item(1, &valid_output);
+
+        let ambiguous_exec_command = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "shared".to_string(),
+            name: "exec_command".to_string(),
+            arguments: "{\"cmd\":\"pwd\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(2, &ambiguous_exec_command);
+
+        let ambiguous_local_shell = ResponseItem::LocalShellCall {
+            id: None,
+            call_id: Some("shared".to_string()),
+            status: LocalShellStatus::Completed,
+            action: LocalShellAction::Exec(LocalShellExecAction {
+                command: vec!["pwd".to_string()],
+                working_directory: None,
+                timeout_ms: None,
+                env: None,
+                user: None,
+            }),
+        };
+        sidecar.observe_recorded_item(3, &ambiguous_local_shell);
+
+        let ambiguous_output = ResponseItem::FunctionCallOutput {
+            call_id: "shared".to_string(),
+            output: FunctionCallOutputPayload::from_text(
+                "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nambiguous".to_string(),
+            ),
+        };
+        sidecar.observe_recorded_item(4, &ambiguous_output);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(5, &phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let eligibility = sidecar
+            .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
+            .expect("eligibility");
+        let units = sidecar
+            .selectable_units(
+                checkpoint.checkpoint_id.as_str(),
+                MAX_UNITS_PER_RETRIEVE,
+                MAX_RAW_BYTES_PER_RETRIEVE,
+            )
+            .expect("units");
+
+        assert_eq!(eligibility.uncompacted_unit_count, 1);
+        assert_eq!(eligibility.triggering_function_call_output_count, 1);
+        assert_eq!(eligibility.max_token_qty, 900);
+        assert_eq!(units.len(), 1);
+        assert!(units[0].payload_text.contains("call-1"));
+        assert!(!units[0].payload_text.contains("call_id: shared"));
+    }
+
+    #[test]
+    fn ambiguous_collision_clears_pending_queue_before_same_turn_call_id_reuse() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let ambiguous_exec_command = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "shared".to_string(),
+            name: "exec_command".to_string(),
+            arguments: "{\"cmd\":\"printf old\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(0, &ambiguous_exec_command);
+
+        let ambiguous_local_shell = ResponseItem::LocalShellCall {
+            id: None,
+            call_id: Some("shared".to_string()),
+            status: LocalShellStatus::Completed,
+            action: LocalShellAction::Exec(LocalShellExecAction {
+                command: vec!["pwd".to_string()],
+                working_directory: None,
+                timeout_ms: None,
+                env: None,
+                user: None,
+            }),
+        };
+        sidecar.observe_recorded_item(1, &ambiguous_local_shell);
+
+        let ambiguous_output = ResponseItem::FunctionCallOutput {
+            call_id: "shared".to_string(),
+            output: FunctionCallOutputPayload::from_text(
+                "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nambiguous".to_string(),
+            ),
+        };
+        sidecar.observe_recorded_item(2, &ambiguous_output);
+
+        let later_exec_command = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "shared".to_string(),
+            name: "exec_command".to_string(),
+            arguments: "{\"cmd\":\"printf later\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(3, &later_exec_command);
+
+        let later_output = ResponseItem::FunctionCallOutput {
+            call_id: "shared".to_string(),
+            output: FunctionCallOutputPayload::from_text(
+                "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nlater".to_string(),
+            ),
+        };
+        sidecar.observe_recorded_item(4, &later_output);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(5, &phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let eligibility = sidecar
+            .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
+            .expect("eligibility");
+        let units = sidecar
+            .selectable_units(
+                checkpoint.checkpoint_id.as_str(),
+                MAX_UNITS_PER_RETRIEVE,
+                MAX_RAW_BYTES_PER_RETRIEVE,
+            )
+            .expect("units");
+
+        assert_eq!(eligibility.uncompacted_unit_count, 1);
+        assert_eq!(eligibility.triggering_function_call_output_count, 1);
+        assert_eq!(eligibility.max_token_qty, 900);
+        assert_eq!(units.len(), 1);
+        assert!(units[0].payload_text.contains("printf later"));
+        assert!(!units[0].payload_text.contains("printf old"));
+        assert!(!units[0].payload_text.contains("local_shell"));
+    }
+
+    #[test]
+    fn checkpoint_eligibility_triggers_non_exec_function_output_token_qty_marker() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let call = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "call-1".to_string(),
+            name: "other_tool".to_string(),
+            arguments: "{\"cmd\":\"pwd\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(0, &call);
+
+        let output = ResponseItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload::from_text(
+                "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nhello".to_string(),
+            ),
+        };
+        sidecar.observe_recorded_item(1, &output);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(2, &phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let eligibility = sidecar
+            .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
+            .expect("eligibility");
+
+        assert_eq!(eligibility.uncompacted_unit_count, 1);
+        assert_eq!(eligibility.triggering_function_call_output_count, 1);
+        assert_eq!(eligibility.max_token_qty, 900);
+    }
+
+    #[test]
+    fn checkpoint_eligibility_ignores_ambiguous_exec_command_local_shell_collision() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let exec_command = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "shared".to_string(),
+            name: "exec_command".to_string(),
+            arguments: "{\"cmd\":\"pwd\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(0, &exec_command);
+
+        let local_shell = ResponseItem::LocalShellCall {
+            id: None,
+            call_id: Some("shared".to_string()),
+            status: LocalShellStatus::Completed,
+            action: LocalShellAction::Exec(LocalShellExecAction {
+                command: vec!["pwd".to_string()],
+                working_directory: None,
+                timeout_ms: None,
+                env: None,
+                user: None,
+            }),
+        };
+        sidecar.observe_recorded_item(1, &local_shell);
+
+        let output = ResponseItem::FunctionCallOutput {
+            call_id: "shared".to_string(),
+            output: FunctionCallOutputPayload::from_text(
+                "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nhello".to_string(),
+            ),
+        };
+        sidecar.observe_recorded_item(2, &output);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(3, &phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let eligibility = sidecar
+            .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
+            .expect("eligibility");
+
+        assert_eq!(eligibility.uncompacted_unit_count, 0);
+        assert_eq!(eligibility.triggering_function_call_output_count, 0);
+        assert_eq!(eligibility.max_token_qty, 0);
+    }
+
+    #[test]
+    fn checkpoint_eligibility_ignores_ambiguous_exec_command_function_collision() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let other_tool = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "shared".to_string(),
+            name: "other_tool".to_string(),
+            arguments: "{\"cmd\":\"echo hi\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(0, &other_tool);
+
+        let exec_command = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "shared".to_string(),
+            name: "exec_command".to_string(),
+            arguments: "{\"cmd\":\"pwd\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(1, &exec_command);
+
+        let output = ResponseItem::FunctionCallOutput {
+            call_id: "shared".to_string(),
+            output: FunctionCallOutputPayload::from_text(
+                "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nhello".to_string(),
+            ),
+        };
+        sidecar.observe_recorded_item(2, &output);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(3, &phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let eligibility = sidecar
+            .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
+            .expect("eligibility");
+
+        assert_eq!(eligibility.uncompacted_unit_count, 0);
+        assert_eq!(eligibility.triggering_function_call_output_count, 0);
+        assert_eq!(eligibility.max_token_qty, 0);
+    }
+
+    #[test]
+    fn selectable_units_keep_oversize_first_unit_as_singleton_selection() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let call = ResponseItem::FunctionCall {
+            id: None,
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: "{\"cmd\":\"cat huge.log\"}".to_string(),
+        };
+        sidecar.observe_recorded_item(0, &call);
+
+        let output = ResponseItem::FunctionCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("x".repeat(MAX_RAW_BYTES_PER_RETRIEVE + 10_000)),
+                success: Some(true),
+            },
+        };
+        sidecar.observe_recorded_item(1, &output);
+
+        let later_reasoning = ResponseItem::Reasoning {
+            id: "reasoning-1".to_string(),
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: Some("y".repeat(2_000)),
+        };
+        sidecar.observe_recorded_item(2, &later_reasoning);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(3, &phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let units = sidecar
+            .selectable_units(
+                checkpoint.checkpoint_id.as_str(),
+                MAX_UNITS_PER_RETRIEVE,
+                MAX_RAW_BYTES_PER_RETRIEVE,
+            )
+            .expect("units");
+
+        assert_eq!(checkpoint.eligible_unit_count, 2);
+        assert_eq!(units.len(), 1);
+        assert!(matches!(units[0].kind, PromptGcUnitKind::ToolPair));
+        assert!(units[0].approx_bytes > MAX_RAW_BYTES_PER_RETRIEVE);
     }
 
     #[test]
@@ -820,7 +1316,8 @@ mod tests {
             .expect("eligibility");
 
         assert_eq!(eligibility.uncompacted_unit_count, 1);
-        assert!(eligibility.total_approx_tokens >= 200);
+        assert_eq!(eligibility.triggering_function_call_output_count, 0);
+        assert_eq!(eligibility.max_token_qty, 0);
     }
 
     #[test]

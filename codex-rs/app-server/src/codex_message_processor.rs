@@ -185,7 +185,7 @@ use codex_core::ThreadSortKey as CoreThreadSortKey;
 use codex_core::auth::AuthMode as CoreAuthMode;
 use codex_core::auth::CLIENT_ID;
 use codex_core::auth::EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE;
-use codex_core::auth::EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE;
+use codex_core::auth::EXTERNAL_SUPPORTED_CHATGPT_PLAN_REQUIRED_MESSAGE;
 use codex_core::auth::ExternalAuthLoginError;
 use codex_core::auth::login_with_api_key;
 use codex_core::auth::login_with_chatgpt_auth_tokens;
@@ -1200,31 +1200,20 @@ impl CodexMessageProcessor {
             }
         }
 
-        if let Some(expected_workspace) = self.config.forced_chatgpt_workspace_id.as_deref()
-            && chatgpt_account_id != expected_workspace
-        {
-            let error = JSONRPCErrorError {
-                code: INVALID_REQUEST_ERROR_CODE,
-                message: format!(
-                    "External auth must use workspace {expected_workspace}, but received {chatgpt_account_id:?}."
-                ),
-                data: None,
-            };
-            self.outgoing.send_error(request_id, error).await;
-            return;
-        }
-
+        // Merge-safety anchor: app-server external ChatGPT token login must reuse the core
+        // supported-plan admission policy and error wording.
         match login_with_chatgpt_auth_tokens(
             &self.config.codex_home,
             &access_token,
             &chatgpt_account_id,
             chatgpt_plan_type.as_deref(),
+            self.config.forced_chatgpt_workspace_id.as_deref(),
         ) {
             Ok(()) => {}
             Err(ExternalAuthLoginError::UnsupportedPlan) => {
                 let error = JSONRPCErrorError {
                     code: INVALID_REQUEST_ERROR_CODE,
-                    message: EXTERNAL_PLUS_OR_PRO_REQUIRED_MESSAGE.to_string(),
+                    message: EXTERNAL_SUPPORTED_CHATGPT_PLAN_REQUIRED_MESSAGE.to_string(),
                     data: None,
                 };
                 self.outgoing.send_error(request_id, error).await;
@@ -1234,6 +1223,15 @@ impl CodexMessageProcessor {
                 let error = JSONRPCErrorError {
                     code: INVALID_REQUEST_ERROR_CODE,
                     message: EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE.to_string(),
+                    data: None,
+                };
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+            Err(ExternalAuthLoginError::MetadataMismatch(message)) => {
+                let error = JSONRPCErrorError {
+                    code: INVALID_REQUEST_ERROR_CODE,
+                    message,
                     data: None,
                 };
                 self.outgoing.send_error(request_id, error).await;

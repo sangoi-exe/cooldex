@@ -8,13 +8,15 @@ use std::time::Duration;
 use anyhow::Result;
 use base64::Engine;
 use codex_core::auth::AuthCredentialsStoreMode;
-use codex_core::auth::NON_PLUS_ACCOUNT_REMOVED_MESSAGE;
+use codex_core::auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
 use codex_login::ServerOptions;
 use codex_login::run_login_server;
 use core_test_support::skip_if_no_network;
 use tempfile::tempdir;
 
 // See spawn.rs for details
+// Merge-safety anchor: browser-login auth-admission tests must stay aligned with
+// the supported ChatGPT plan policy and callback error messaging.
 
 fn start_mock_issuer(
     chatgpt_account_id: &str,
@@ -88,7 +90,7 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let chatgpt_account_id = "12345678-0000-0000-0000-000000000000";
-    let (issuer_addr, issuer_handle) = start_mock_issuer(chatgpt_account_id, "pro");
+    let (issuer_addr, issuer_handle) = start_mock_issuer(chatgpt_account_id, "business");
     let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
 
     let tmp = tempdir()?;
@@ -162,7 +164,7 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
 }
 
 #[tokio::test]
-async fn end_to_end_login_flow_rejects_non_plus_or_pro_account() -> Result<()> {
+async fn end_to_end_login_flow_rejects_unsupported_account() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let chatgpt_account_id = "12345678-0000-0000-0000-000000000000";
@@ -194,7 +196,7 @@ async fn end_to_end_login_flow_rejects_non_plus_or_pro_account() -> Result<()> {
     assert!(resp.status().is_success());
     let body = resp.text().await?;
     assert!(
-        body.contains("Your ChatGPT account is not Plus or Pro"),
+        body.contains("uses an unsupported plan"),
         "error body should explain the unsupported plan"
     );
     assert!(
@@ -206,7 +208,7 @@ async fn end_to_end_login_flow_rejects_non_plus_or_pro_account() -> Result<()> {
         .block_until_done()
         .await
         .expect_err("free-plan login should fail loudly");
-    assert_eq!(err.to_string(), NON_PLUS_ACCOUNT_REMOVED_MESSAGE);
+    assert_eq!(err.to_string(), UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE);
 
     let auth_path = codex_home.join("auth.json");
     assert!(
