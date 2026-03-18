@@ -26,11 +26,22 @@ This section is the canonical cluster-level inventory of durable workspace-local
 - `mcp-standalone` bridge/runtime customization: session cwd/config-path resolution, operator metadata plumbing, bridge defaults, and local runtime/auth expectations are workspace-local behavior. Representative files: `mcp-standalone/src/app.js`, `mcp-standalone/src/bridge/runtime.js`, `mcp-standalone/src/app-server/client.js`, `mcp-standalone/src/config.js`, `mcp-standalone/src/logger.js`, `mcp-standalone/README.md`.
 - workspace sync policy and local instruction overlays: keep `.github/**` removed from this workspace, preserve the AGENTS-centric sync policy, and keep local config/instruction overlays aligned when those rules change. Representative files: `AGENTS.md`, `/home/lucas/.codex/config.toml`, diff against `upstream/main` for `.github/**`.
 
+## `.sangoi` Repo Boundary
+
+- The workspace `.sangoi/` checkout is its own Git repository and is intentionally ignored by the main workspace repo (`/.sangoi/` in `.gitignore`), so root `git status`/`git diff` do not capture `.sangoi` changes.
+- When a task changes `.sangoi/**`, review and commit those changes from the `.sangoi` repo itself.
+- Apply the same commit-discipline rule inside `.sangoi`: when a clean split is possible, keep code/config/script changes separate from docs/instructions/logs/reports changes instead of mixing them into one commit.
+
 ## Workspace Test Safety
 
-- Do not delegate test execution to sub-agents in this workspace.
-- Do `cargo clean` before and after every test trial.
-- Because each Cargo test trial in this workspace requires `cargo clean` before and after, batch clearly same-class mechanical fallout before starting another Cargo validation run; rerun only when the batch is ready, fresh Cargo diagnostics are needed, or final targeted/fan-in validation is reached.
+- Do not delegate Cargo validation to sub-agents in this workspace. That includes `cargo check`, `cargo test --no-run`, and `cargo test`.
+- Run every Cargo validation rung through `./scripts/cargo-guard.sh` from the workspace root; do not run raw `cargo check`, `cargo test --no-run`, or `cargo test` directly in this workspace.
+- Cargo validation precedence is strict: exhaust the lighter/faster checks first, escalate only when they are green, and do not skip ahead to a heavier step when a lighter one can still answer the same question.
+- Batch clearly same-class mechanical fallout before escalating to a heavier validation rung; rerun only when the batch is ready or fresh diagnostics are needed.
+- `./scripts/cargo-guard.sh` owns target-dir resolution for the exact Cargo command, enforces the binary 10 GiB free-space floor, and runs `cargo clean` only when the target-dir filesystem is below that floor or a guarded run fails/interrupted.
+- Lightweight compile-first default: start with the relevant fast checks, preferring `./scripts/cargo-guard.sh cargo check -p <project> --tests` as the default proxy for import/type/borrow/macro/test-fixture compile failures.
+- Only after the relevant lightweight checks are green, run `./scripts/cargo-guard.sh cargo test -p <project> --no-run` for test-target build/link coverage.
+- Only after `./scripts/cargo-guard.sh cargo test -p <project> --no-run` is green, run real `./scripts/cargo-guard.sh cargo test -p <project>` for runtime/behavior validation when behavior actually needs to be proven.
 
 # Rust/codex-rs
 
@@ -75,12 +86,17 @@ In the codex-rs folder where the rust code lives:
   - When extracting code from a large module, move the related tests and module/type docs toward
     the new implementation so the invariants stay close to the code that owns them.
 
-Run `just fmt` (in `codex-rs` directory) automatically after you have finished making Rust code changes; do not ask for approval to run it. Additionally, run the tests:
+Run `just fmt` (in `codex-rs` directory) automatically after you have finished making Rust code changes; do not ask for approval to run it.
 
-1. Run the test for the specific project that was changed. For example, if changes were made in `codex-rs/tui`, run `cargo test -p codex-tui`.
-2. Once those pass, if any changes were made in common, core, or protocol, run the complete test suite with `cargo test` (or `just test` if `cargo-nextest` is installed). Avoid `--all-features` for routine local runs because it expands the build matrix and can significantly increase `target/` disk usage; use it only when you specifically need full feature coverage. project-specific or individual tests can be run without asking the user, but do ask the user before running the complete test suite.
+For Rust validation in `codex-rs`, use this light-first ladder:
 
-Before finalizing a large change to `codex-rs`, run `just fix -p <project>` (in `codex-rs` directory) to fix any linter issues in the code. Prefer scoping with `-p` to avoid slow workspace‑wide Clippy builds; only run `just fix` without `-p` if you changed shared crates. Do not re-run tests after running `fix` or `fmt`.
+0. Before each rung below, invoke it via `./scripts/cargo-guard.sh cargo ...`; the wrapper resolves the target-dir, checks the 10 GiB floor, and runs `cargo clean` only when the guardrail requires it.
+1. Run the relevant quick/light Cargo checks first, with `./scripts/cargo-guard.sh cargo check -p <project> --tests` as the default starting point.
+2. Only if those are green, run `./scripts/cargo-guard.sh cargo test -p <project> --no-run`.
+3. Only if `--no-run` is green, run `./scripts/cargo-guard.sh cargo test -p <project>` when runtime/behavior validation is actually needed.
+4. Ask the user before running a complete suite such as workspace-wide `cargo test` / `just test`.
+
+Before finalizing a large change to `codex-rs`, run `just fix -p <project>` (from the workspace root or inside `codex-rs`; the recipe routes through `./scripts/cargo-guard.sh`) to fix any linter issues in the code. Prefer scoping with `-p` to avoid slow workspace‑wide Clippy builds; only run `just fix` without `-p` if you changed shared crates. Do not re-run tests after running `fix` or `fmt`.
 
 ## TUI style conventions
 
@@ -127,8 +143,8 @@ is easy to review and future diffs stay visual.
 
 When UI or text output changes intentionally, update the snapshots as follows:
 
-- Run tests to generate any updated snapshots:
-  - `cargo test -p codex-tui`
+- Follow the light-first validation ladder for `codex-tui`; only after the lighter checks are green, run the real runtime step that generates or updates snapshots:
+  - `./scripts/cargo-guard.sh cargo test -p codex-tui`
 - Check what’s pending:
   - `cargo insta pending-snapshots -p codex-tui`
 - Review changes by reading the generated `*.snap.new` files directly in the repo, or preview a specific file:
@@ -222,6 +238,6 @@ These guidelines apply to app-server protocol work in `codex-rs`, especially:
 - Regenerate schema fixtures when API shapes change:
   `just write-app-server-schema`
   (and `just write-app-server-schema --experimental` when experimental API fixtures are affected).
-- Validate with `cargo test -p codex-app-server-protocol`.
+- Validate `codex-app-server-protocol` with the light-first ladder; run the real `./scripts/cargo-guard.sh cargo test -p codex-app-server-protocol` step only after the lighter checks are green and runtime behavior still needs to be proven.
 - Avoid boilerplate tests that only assert experimental field markers for individual
   request fields in `common.rs`; rely on schema generation/tests and behavioral coverage instead.

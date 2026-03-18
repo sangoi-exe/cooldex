@@ -1114,10 +1114,10 @@ The JSON-RPC auth/account surface exposes request/response methods plus server-i
 
 Codex supports these authentication modes. The current mode is surfaced in `account/updated` (`authMode`: `apikey`, `chatgpt`, `chatgptAuthTokens`, or `null`), which also includes the current ChatGPT `planType` when available.
 
-<!-- Merge-safety anchor: external ChatGPT token auth must stay aligned with the Plus/Pro-only admission policy so app-server login and hidden auth consumers do not diverge. -->
+<!-- Merge-safety anchor: external ChatGPT token auth must stay aligned with the supported-plan admission policy so app-server login and hidden auth consumers do not diverge. -->
 - **API key (`apiKey`)**: Caller supplies an OpenAI API key via `account/login/start` with `type: "apiKey"`. The API key is saved and used for API requests.
 - **ChatGPT managed (`chatgpt`)** (recommended): Codex owns the ChatGPT OAuth flow and refresh tokens. Start via `account/login/start` with `type: "chatgpt"`; Codex persists tokens to disk and refreshes them automatically.
-- **ChatGPT external tokens (`chatgptAuthTokens`)**: Caller provides ChatGPT tokens via `account/login/start` with `type: "chatgptAuthTokens"`. Tokens are kept in memory and the external host app is responsible for refresh. Only **Plus** and **Pro** plans are accepted; missing, unsupported, or malformed tokens fail the login request.
+- **ChatGPT external tokens (`chatgptAuthTokens`)**: Caller provides ChatGPT tokens via `account/login/start` with `type: "chatgptAuthTokens"`. Tokens are kept in memory and the external host app is responsible for refresh. Supported plans are `plus`, `pro`, `team`, `business`, `enterprise`, and `edu`. Missing, unsupported, or malformed tokens fail the login request.
 
 ### API Overview
 

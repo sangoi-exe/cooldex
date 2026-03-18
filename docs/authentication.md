@@ -25,8 +25,8 @@ When `keyring` or `auto` is used, the credentials are stored as a single seriali
 When using ChatGPT authentication, `auth.json` (or the keyring entry) stores a **versioned** auth store that can contain multiple ChatGPT accounts.
 
 - Each ChatGPT login **upserts** the account and makes it **active**.
-- Only **Plus** and **Pro** ChatGPT accounts remain in the saved multi-account store; unsupported plans fail the login instead of being stored and purged later.
-- External ChatGPT token login (`chatgptAuthTokens`) follows the same Plus/Pro-only rule; missing or unsupported plans fail before ephemeral auth can become active.
+- Supported ChatGPT plans for saved-account auth are **Plus**, **Pro**, **Team**, **Business**, **Enterprise**, and **Edu**; unsupported plans fail the login, and stale unsupported accounts are purged on load or refresh if they are already present.
+- External ChatGPT token login (`chatgptAuthTokens`) follows the same supported-plan policy; missing or unsupported plans fail before ephemeral auth can become active.
 - `codex logout` deletes the stored credentials (removes the `auth.json` file and the keyring entry, if present).
 - In the TUIs, use `/accounts` to switch the active account and add additional accounts. When multiple accounts are stored, `/logout` lets you choose between logging out all accounts or removing a single account (then exits).
 - Keep this aligned with `AuthManager::list_accounts()` and TUI account popups: `/accounts` renders only the summary fields exposed there.

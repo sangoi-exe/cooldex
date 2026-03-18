@@ -12,4 +12,4 @@ This feature must be used wisely. For simple or straightforward tasks, you don't
 * Do not delegate test execution or compile-triggering validation in this workspace. Keep sub-agents focused on bounded implementation, review, or reconnaissance scopes.
 * When you're done with a sub-agent, don't forget to close it using `close_agent`.
 * Be careful on the `timeout_ms` parameter you choose for `wait`. It should be wisely scaled.
-* Sub-agents have access to the same set of tools as you do so you must tell them if they are allowed to spawn sub-agents themselves or not.
+* Sub-agents do not necessarily have the same tool set as the lead. In particular, they keep `recall` but do not receive `manage_context`, so tell them if they are allowed to spawn sub-agents themselves or not.
