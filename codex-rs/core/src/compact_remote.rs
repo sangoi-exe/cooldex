@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::Prompt;
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::codex::built_tools;
 use crate::codex::maybe_auto_switch_account_on_usage_limit;
 use crate::compact::CompactionInitialContextPlacement;
 use crate::compact::inject_initial_context_into_compacted_history;
@@ -19,6 +21,7 @@ use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::info;
 
@@ -101,10 +104,20 @@ async fn run_remote_compact_task_inner_impl(
         .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
         .cloned()
         .collect();
+    let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
+    let tool_router = built_tools(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        &prompt_input,
+        &HashSet::new(),
+        /*skills_outcome*/ None,
+        &CancellationToken::new(),
+    )
+    .await?;
     let prompt = Prompt {
-        input: history.for_prompt(&turn_context.model_info.input_modalities),
-        tools: vec![],
-        parallel_tool_calls: false,
+        input: prompt_input,
+        tools: tool_router.model_visible_specs(),
+        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
         personality: turn_context.personality,
         output_schema: None,
@@ -125,6 +138,8 @@ async fn run_remote_compact_task_inner_impl(
             .compact_conversation_history(
                 &prompt,
                 &turn_context.model_info,
+                turn_context.reasoning_effort,
+                turn_context.reasoning_summary,
                 &turn_context.session_telemetry,
             )
             .await
@@ -286,6 +301,8 @@ fn should_keep_compacted_history_item(item: &ResponseItem) -> bool {
         | ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::CustomToolCall { .. }
         | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::ToolSearchOutput { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::GhostSnapshot { .. }
@@ -569,7 +586,7 @@ mod tests {
             "fixture auth manager should select acc-2 as the auto-switch target"
         );
 
-        let mut provider = crate::built_in_model_providers()["openai"].clone();
+        let mut provider = crate::built_in_model_providers(None)["openai"].clone();
         provider.base_url = Some(format!("{}/v1", server.uri()));
 
         let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
@@ -580,7 +597,6 @@ mod tests {
             provider,
             turn_context.session_source.clone(),
             turn_context.config.model_verbosity,
-            crate::ws_version_from_features(turn_context.config.as_ref()),
             turn_context
                 .config
                 .features

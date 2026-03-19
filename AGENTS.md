@@ -7,9 +7,11 @@ During any sync/merge with `main` and/or `upstream`, these rules are mandatory:
 1. These sync/merge instructions are specific to this workspace and must ALWAYS remain in `AGENTS.md` during future synchronizations.
 2. Always resolve conflicts **MANUALLY** every time. Using `ours/theirs` automation is forbidden (including `-X ours`, `-X theirs`, `git checkout --ours`, `git checkout --theirs`, and equivalents).
 3. In every conflict, find the best way to preserve the custom functionality we added while also reconciling significant upstream improvements.
-4. `Merge-safety anchor:` markers are MANDATORY, not optional, on every touched workspace-local divergence file and every touched seam whose behavior, docs, tests, schema, serialization, cache, or operator surface must stay aligned with those customizations. Use the file's native comment syntax (`//`, `///`, `#`, `<!-- -->`, etc.); the required marker text is `Merge-safety anchor:`, not literal `//` everywhere. If a file cannot carry inline comments, add the nearest durable technical note that names the invariant being preserved. Missing merge-safety markers in touched customized or customization-adjacent seams are STOP-SHIP.
-5. Existing `Merge anchor:` comments are legacy debt. Whenever you touch one of those files for customization-preserving work, normalize it to `Merge-safety anchor:` in the same change.
-6. Remove from the workspace all CI/CD content under `.github` (workflows, actions, and any other pipeline artifacts).
+4. When upstream and workspace-local code contain almost the same logic, compare both carefully and prefer the structurally cleaner upstream shape when it still supports the required local behavior; port only the necessary local contract deltas instead of blindly restoring the older local copy.
+5. When a workspace-local customization keeps colliding with high-churn native files, prefer extracting that customization into a new local module and importing it from the native seam when that reduces future merge friction without adding compatibility shims, alias layers, or ownership confusion.
+6. `Merge-safety anchor:` markers are MANDATORY, not optional, on every touched workspace-local divergence file and every touched seam whose behavior, docs, tests, schema, serialization, cache, or operator surface must stay aligned with those customizations. Use the file's native comment syntax (`//`, `///`, `#`, `<!-- -->`, etc.); the required marker text is `Merge-safety anchor:`, not literal `//` everywhere. If a file cannot carry inline comments, add the nearest durable technical note that names the invariant being preserved. Missing merge-safety markers in touched customized or customization-adjacent seams are STOP-SHIP.
+7. Existing `Merge anchor:` comments are legacy debt. Whenever you touch one of those files for customization-preserving work, normalize it to `Merge-safety anchor:` in the same change.
+8. Remove from the workspace all CI/CD content under `.github` (workflows, actions, and any other pipeline artifacts).
 
 <!-- Merge-safety anchor: AGENTS.md is the canonical source for the workspace-local customization inventory and merge-policy invariants; future sync work must update this section and keep scratchpads as redirects only. -->
 
@@ -103,6 +105,8 @@ Before finalizing a large change to `codex-rs`, run `just fix -p <project>` (fro
 See `codex-rs/tui/styles.md`.
 
 ## TUI code conventions
+
+- When a change lands in `codex-rs/tui` and `codex-rs/tui_app_server` has a parallel implementation of the same behavior, reflect the change in `codex-rs/tui_app_server` too unless there is a documented reason not to.
 
 - Use concise styling helpers from ratatui’s Stylize trait.
   - Basic spans: use "text".into()

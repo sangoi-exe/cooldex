@@ -916,6 +916,7 @@ mod tests {
                 id: None,
                 call_id: "call-1".to_string(),
                 name: "shell".to_string(),
+                namespace: None,
                 arguments: "{\"cmd\":\"pwd\"}".to_string(),
             },
             ResponseItem::FunctionCallOutput {

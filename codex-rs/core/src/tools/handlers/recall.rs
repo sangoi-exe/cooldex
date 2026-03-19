@@ -2,14 +2,13 @@ use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
 use crate::rollout::RolloutRecorder;
+use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use async_trait::async_trait;
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
@@ -79,11 +78,13 @@ struct RecallItem {
 
 #[async_trait]
 impl ToolHandler for RecallHandler {
+    type Output = FunctionToolOutput;
+
     fn kind(&self) -> ToolKind {
         ToolKind::Function
     }
 
-    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
+    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -106,12 +107,10 @@ impl ToolHandler for RecallHandler {
         })?;
 
         let response = handle_recall(session.as_ref(), turn.as_ref(), &args).await?;
-        Ok(ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(
-                serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string()),
-            ),
-            success: Some(true),
-        })
+        Ok(FunctionToolOutput::from_text(
+            serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string()),
+            Some(true),
+        ))
     }
 }
 

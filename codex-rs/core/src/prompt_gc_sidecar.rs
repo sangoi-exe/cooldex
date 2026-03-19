@@ -211,7 +211,9 @@ impl PromptGcSidecar {
                     discard_pending_calls(&mut self.pending_function_calls, call_id);
                 }
             }
-            ResponseItem::CustomToolCallOutput { call_id, output } => {
+            ResponseItem::CustomToolCallOutput {
+                call_id, output, ..
+            } => {
                 if let Some(pending) = pop_pending_call(&mut self.pending_custom_calls, call_id) {
                     self.push_tool_pair_unit(call_id, output, item, pending);
                 }
@@ -642,6 +644,7 @@ mod tests {
             id: None,
             call_id: "call-1".to_string(),
             name: "exec_command".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
         sidecar.observe_recorded_item(1, &call);
@@ -767,6 +770,7 @@ mod tests {
             id: None,
             call_id: "call-1".to_string(),
             name: "exec_command".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
         sidecar.observe_recorded_item(0, &call);
@@ -812,6 +816,7 @@ mod tests {
             id: None,
             call_id: "call-1".to_string(),
             name: "exec_command".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
         sidecar.observe_recorded_item(0, &call);
@@ -864,6 +869,7 @@ mod tests {
 
         let output = ResponseItem::CustomToolCallOutput {
             call_id: "call-1".to_string(),
+            name: None,
             output: FunctionCallOutputPayload::from_text(
                 "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nhello".to_string(),
             ),
@@ -900,6 +906,7 @@ mod tests {
             id: None,
             call_id: "call-1".to_string(),
             name: "exec_command".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
         sidecar.observe_recorded_item(0, &valid_call);
@@ -916,6 +923,7 @@ mod tests {
             id: None,
             call_id: "shared".to_string(),
             name: "exec_command".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
         sidecar.observe_recorded_item(2, &ambiguous_exec_command);
@@ -982,6 +990,7 @@ mod tests {
             id: None,
             call_id: "shared".to_string(),
             name: "exec_command".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"printf old\"}".to_string(),
         };
         sidecar.observe_recorded_item(0, &ambiguous_exec_command);
@@ -1012,6 +1021,7 @@ mod tests {
             id: None,
             call_id: "shared".to_string(),
             name: "exec_command".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"printf later\"}".to_string(),
         };
         sidecar.observe_recorded_item(3, &later_exec_command);
@@ -1065,6 +1075,7 @@ mod tests {
             id: None,
             call_id: "call-1".to_string(),
             name: "other_tool".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
         sidecar.observe_recorded_item(0, &call);
@@ -1107,6 +1118,7 @@ mod tests {
             id: None,
             call_id: "shared".to_string(),
             name: "exec_command".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
         sidecar.observe_recorded_item(0, &exec_command);
@@ -1163,6 +1175,7 @@ mod tests {
             id: None,
             call_id: "shared".to_string(),
             name: "other_tool".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"echo hi\"}".to_string(),
         };
         sidecar.observe_recorded_item(0, &other_tool);
@@ -1171,6 +1184,7 @@ mod tests {
             id: None,
             call_id: "shared".to_string(),
             name: "exec_command".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
         sidecar.observe_recorded_item(1, &exec_command);
@@ -1213,6 +1227,7 @@ mod tests {
             id: None,
             call_id: "call-1".to_string(),
             name: "shell".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"cat huge.log\"}".to_string(),
         };
         sidecar.observe_recorded_item(0, &call);
@@ -1383,6 +1398,7 @@ mod tests {
             id: None,
             call_id: "call-1".to_string(),
             name: "shell".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"old\"}".to_string(),
         };
         sidecar.observe_recorded_item(0, &old_call);
@@ -1392,6 +1408,7 @@ mod tests {
             id: None,
             call_id: "call-1".to_string(),
             name: "shell".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"new\"}".to_string(),
         };
         sidecar.observe_recorded_item(1, &new_call);
@@ -1475,6 +1492,7 @@ mod tests {
             id: None,
             call_id: "call-1".to_string(),
             name: "shell".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
         sidecar.observe_recorded_item(0, &call);
@@ -1507,6 +1525,7 @@ mod tests {
             id: None,
             call_id: "call-2".to_string(),
             name: "shell".to_string(),
+            namespace: None,
             arguments: "{\"cmd\":\"later\"}".to_string(),
         };
         sidecar.observe_recorded_item(3, &later_call);

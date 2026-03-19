@@ -1,3 +1,6 @@
+// Merge-safety anchor: parallel tool execution must preserve workspace-local tool-output
+// routing and blocked/disallowed response contracts across mixed function/custom/MCP tools.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -10,15 +13,19 @@ use tracing::Instrument;
 use tracing::instrument;
 use tracing::trace_span;
 
+use crate::client_common::tools::ToolSpec;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::error::CodexErr;
 use crate::function_tool::FunctionCallError;
+use crate::tools::context::AbortedToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
-use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolPayload;
+use crate::tools::registry::AnyToolResult;
 use crate::tools::router::ToolCall;
+use crate::tools::router::ToolCallSource;
 use crate::tools::router::ToolRouter;
+use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
@@ -54,6 +61,10 @@ impl ToolCallRuntime {
         }
     }
 
+    pub(crate) fn find_spec(&self, tool_name: &str) -> Option<ToolSpec> {
+        self.router.find_spec(tool_name)
+    }
+
     #[instrument(level = "trace", skip_all)]
     pub(crate) async fn handle_tool_call(
         self,
@@ -65,18 +76,26 @@ impl ToolCallRuntime {
         {
             return Ok(Self::disallowed_response(&call));
         }
+        let source = self.source;
+        self.handle_tool_call_with_source(call, source, cancellation_token)
+            .await
+            .map(AnyToolResult::into_response)
+    }
 
-        // Merge-safety anchor: this router decision is the single gate between
-        // shared read-lane execution and serialized write-lane execution.
+    #[instrument(level = "trace", skip_all)]
+    pub(crate) fn handle_tool_call_with_source(
+        self,
+        call: ToolCall,
+        source: ToolCallSource,
+        cancellation_token: CancellationToken,
+    ) -> impl std::future::Future<Output = Result<AnyToolResult, CodexErr>> {
         let supports_parallel = self.router.tool_supports_parallel(&call.tool_name);
-
         let router = Arc::clone(&self.router);
         let session = Arc::clone(&self.session);
         let turn = Arc::clone(&self.turn_context);
         let tracker = Arc::clone(&self.tracker);
         let lock = Arc::clone(&self.parallel_execution);
         let started = Instant::now();
-        let source = self.source;
 
         let dispatch_span = trace_span!(
             "dispatch_tool_call",
@@ -86,7 +105,7 @@ impl ToolCallRuntime {
             aborted = false,
         );
 
-        let handle: AbortOnDropHandle<Result<ResponseInputItem, FunctionCallError>> =
+        let handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
             AbortOnDropHandle::new(tokio::spawn(async move {
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
@@ -102,7 +121,7 @@ impl ToolCallRuntime {
                         };
 
                         router
-                            .dispatch_tool_call(
+                            .dispatch_tool_call_with_code_mode_result(
                                 session,
                                 turn,
                                 tracker,
@@ -115,38 +134,27 @@ impl ToolCallRuntime {
                 }
             }));
 
-        match handle.await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(FunctionCallError::Fatal(message))) => Err(CodexErr::Fatal(message)),
-            Ok(Err(other)) => Err(CodexErr::Fatal(other.to_string())),
-            Err(err) => Err(CodexErr::Fatal(format!(
-                "tool task failed to receive: {err:?}"
-            ))),
+        async move {
+            match handle.await {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(FunctionCallError::Fatal(message))) => Err(CodexErr::Fatal(message)),
+                Ok(Err(other)) => Err(CodexErr::Fatal(other.to_string())),
+                Err(err) => Err(CodexErr::Fatal(format!(
+                    "tool task failed to receive: {err:?}"
+                ))),
+            }
         }
     }
 }
 
 impl ToolCallRuntime {
-    fn aborted_response(call: &ToolCall, secs: f32) -> ResponseInputItem {
-        match &call.payload {
-            ToolPayload::Custom { .. } => ResponseInputItem::CustomToolCallOutput {
-                call_id: call.call_id.clone(),
-                output: FunctionCallOutputPayload {
-                    body: FunctionCallOutputBody::Text(Self::abort_message(call, secs)),
-                    ..Default::default()
-                },
-            },
-            ToolPayload::Mcp { .. } => ResponseInputItem::McpToolCallOutput {
-                call_id: call.call_id.clone(),
-                result: Err(Self::abort_message(call, secs)),
-            },
-            _ => ResponseInputItem::FunctionCallOutput {
-                call_id: call.call_id.clone(),
-                output: FunctionCallOutputPayload {
-                    body: FunctionCallOutputBody::Text(Self::abort_message(call, secs)),
-                    ..Default::default()
-                },
-            },
+    fn aborted_response(call: &ToolCall, secs: f32) -> AnyToolResult {
+        AnyToolResult {
+            call_id: call.call_id.clone(),
+            payload: call.payload.clone(),
+            result: Box::new(AbortedToolOutput {
+                message: Self::abort_message(call, secs),
+            }),
         }
     }
 
@@ -167,6 +175,7 @@ impl ToolCallRuntime {
         match &call.payload {
             ToolPayload::Custom { .. } => ResponseInputItem::CustomToolCallOutput {
                 call_id: call.call_id.clone(),
+                name: Some(call.tool_name.clone()),
                 output: FunctionCallOutputPayload {
                     body: FunctionCallOutputBody::Text(message),
                     success: Some(false),
@@ -174,7 +183,7 @@ impl ToolCallRuntime {
             },
             ToolPayload::Mcp { .. } => ResponseInputItem::McpToolCallOutput {
                 call_id: call.call_id.clone(),
-                result: Err(message),
+                output: CallToolResult::from_error_text(message),
             },
             _ => ResponseInputItem::FunctionCallOutput {
                 call_id: call.call_id.clone(),
@@ -196,6 +205,7 @@ mod tests {
     fn disallowed_response_sets_failed_success_for_function_and_custom_outputs() {
         let function_call = ToolCall {
             tool_name: "blocked_tool".to_string(),
+            tool_namespace: None,
             call_id: "function-call".to_string(),
             payload: ToolPayload::Function {
                 arguments: "{}".to_string(),
@@ -203,6 +213,7 @@ mod tests {
         };
         let custom_call = ToolCall {
             tool_name: "blocked_tool".to_string(),
+            tool_namespace: None,
             call_id: "custom-call".to_string(),
             payload: ToolPayload::Custom {
                 input: "{}".to_string(),
@@ -221,8 +232,13 @@ mod tests {
         }
 
         match ToolCallRuntime::disallowed_response(&custom_call) {
-            ResponseInputItem::CustomToolCallOutput { call_id, output } => {
+            ResponseInputItem::CustomToolCallOutput {
+                call_id,
+                name,
+                output,
+            } => {
                 assert_eq!(call_id, "custom-call");
+                assert_eq!(name.as_deref(), Some("blocked_tool"));
                 assert_eq!(output.text_content(), Some(expected_message));
                 assert_eq!(output.success, Some(false));
             }

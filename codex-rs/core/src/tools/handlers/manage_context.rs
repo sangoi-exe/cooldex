@@ -10,13 +10,12 @@ use crate::rid::parse_rid;
 use crate::state::ContextItemsEvent;
 use crate::state::ContextOverlay;
 use crate::state::PruneCategory;
+use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use async_trait::async_trait;
-use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::RolloutItem;
@@ -128,11 +127,13 @@ struct ManageContextResult {
 
 #[async_trait]
 impl ToolHandler for ManageContextHandler {
+    type Output = FunctionToolOutput;
+
     fn kind(&self) -> ToolKind {
         ToolKind::Function
     }
 
-    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
+    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
         let ToolInvocation {
             session,
             payload,
@@ -156,12 +157,10 @@ impl ToolHandler for ManageContextHandler {
 
         let result = handle_manage_context(session.as_ref(), turn.as_ref(), &args).await?;
 
-        Ok(ToolOutput::Function {
-            body: FunctionCallOutputBody::Text(
-                serde_json::to_string(&result.json).unwrap_or_else(|_| "{}".to_string()),
-            ),
-            success: Some(true),
-        })
+        Ok(FunctionToolOutput::from_text(
+            serde_json::to_string(&result.json).unwrap_or_else(|_| "{}".to_string()),
+            Some(true),
+        ))
     }
 }
 
@@ -1033,6 +1032,7 @@ mod tests {
     use crate::protocol::EventMsg;
     use crate::tasks::RegularTask;
     use codex_protocol::models::ContentItem;
+    use codex_protocol::models::FunctionCallOutputBody;
     use codex_protocol::models::LocalShellAction;
     use codex_protocol::models::LocalShellExecAction;
     use codex_protocol::models::LocalShellStatus;
@@ -1081,6 +1081,7 @@ mod tests {
         ResponseItem::FunctionCall {
             id: None,
             name: "exec_command".to_string(),
+            namespace: None,
             arguments: r#"{"cmd":"echo test"}"#.to_string(),
             call_id: call_id.to_string(),
         }
@@ -1120,6 +1121,7 @@ mod tests {
         ResponseItem::FunctionCall {
             id: None,
             name: "manage_context".to_string(),
+            namespace: None,
             arguments: "{}".to_string(),
             call_id: call_id.to_string(),
         }
@@ -1158,6 +1160,7 @@ mod tests {
     fn custom_tool_output(call_id: &str, output: &str) -> ResponseItem {
         ResponseItem::CustomToolCallOutput {
             call_id: call_id.to_string(),
+            name: None,
             output: codex_protocol::models::FunctionCallOutputPayload::from_text(
                 output.to_string(),
             ),
@@ -2509,7 +2512,7 @@ mod tests {
             .await;
 
         let (mut session, turn, rx) = crate::codex::make_session_and_context_with_rx().await;
-        let mut provider = crate::built_in_model_providers()["openai"].clone();
+        let mut provider = crate::built_in_model_providers(None)["openai"].clone();
         provider.base_url = Some(format!("{}/v1", server.uri()));
 
         let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
@@ -2520,7 +2523,6 @@ mod tests {
             provider,
             turn.session_source.clone(),
             turn.config.model_verbosity,
-            crate::ws_version_from_features(turn.config.as_ref()),
             turn.config
                 .features
                 .enabled(Feature::EnableRequestCompression),
@@ -3140,6 +3142,7 @@ mod tests {
             ResponseItem::FunctionCall {
                 id: None,
                 name: "manage_context".to_string(),
+                namespace: None,
                 arguments: "{}".to_string(),
                 call_id: call_id.to_string(),
             },

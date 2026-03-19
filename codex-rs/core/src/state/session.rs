@@ -1,5 +1,6 @@
 //! Session-wide mutable state.
 
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -25,6 +26,8 @@ use crate::protocol::TokenUsageInfo;
 use crate::response_item_utils::is_unified_exec_output_frame;
 use crate::response_item_utils::is_unified_exec_token_qty_marker_line;
 use crate::rid::rid_to_string;
+use crate::sandboxing::merge_permission_profiles;
+use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::state::ContextItemSummary;
 use crate::state::ContextItemsEvent;
 use crate::state::ContextOverlay;
@@ -55,8 +58,12 @@ pub(crate) struct SessionState {
     previous_turn_settings: Option<PreviousTurnSettings>,
     /// Startup regular task pre-created during session initialization.
     pub(crate) startup_regular_task: Option<JoinHandle<CodexResult<RegularTask>>>,
+    /// Startup prewarmed session prepared during session initialization.
+    pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
     pub(crate) active_mcp_tool_selection: Option<Vec<String>>,
     pub(crate) active_connector_selection: HashSet<String>,
+    pub(crate) pending_session_start_source: Option<codex_hooks::SessionStartSource>,
+    granted_permissions: Option<PermissionProfile>,
 }
 
 #[derive(Clone)]
@@ -84,8 +91,11 @@ impl SessionState {
             mcp_dependency_prompted: HashSet::new(),
             previous_turn_settings: None,
             startup_regular_task: None,
+            startup_prewarm: None,
             active_mcp_tool_selection: None,
             active_connector_selection: HashSet::new(),
+            pending_session_start_source: None,
+            granted_permissions: None,
         }
     }
 
@@ -452,6 +462,17 @@ impl SessionState {
         self.startup_regular_task.take()
     }
 
+    pub(crate) fn set_session_startup_prewarm(
+        &mut self,
+        startup_prewarm: SessionStartupPrewarmHandle,
+    ) {
+        self.startup_prewarm = Some(startup_prewarm);
+    }
+
+    pub(crate) fn take_session_startup_prewarm(&mut self) -> Option<SessionStartupPrewarmHandle> {
+        self.startup_prewarm.take()
+    }
+
     pub(crate) fn merge_mcp_tool_selection(&mut self, tool_names: Vec<String>) -> Vec<String> {
         if tool_names.is_empty() {
             return self.active_mcp_tool_selection.clone().unwrap_or_default();
@@ -518,6 +539,28 @@ impl SessionState {
         self.active_connector_selection.clear();
     }
 
+    pub(crate) fn set_pending_session_start_source(
+        &mut self,
+        value: Option<codex_hooks::SessionStartSource>,
+    ) {
+        self.pending_session_start_source = value;
+    }
+
+    pub(crate) fn take_pending_session_start_source(
+        &mut self,
+    ) -> Option<codex_hooks::SessionStartSource> {
+        self.pending_session_start_source.take()
+    }
+
+    pub(crate) fn record_granted_permissions(&mut self, permissions: PermissionProfile) {
+        self.granted_permissions =
+            merge_permission_profiles(self.granted_permissions.as_ref(), Some(&permissions));
+    }
+
+    pub(crate) fn granted_permissions(&self) -> Option<PermissionProfile> {
+        self.granted_permissions.clone()
+    }
+
     fn assert_history_alignment(&self) {
         let history_len = self.history.raw_items().len();
         let rid_len = self.history_rids.len();
@@ -566,12 +609,13 @@ fn prune_category_for_item(item: &ResponseItem) -> PruneCategory {
         ResponseItem::Reasoning { .. } => PruneCategory::Reasoning,
         ResponseItem::FunctionCall { .. }
         | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
         | ResponseItem::LocalShellCall { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. } => PruneCategory::ToolCall,
-        ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. } => {
-            PruneCategory::ToolOutput
-        }
+        ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::ToolSearchOutput { .. } => PruneCategory::ToolOutput,
         ResponseItem::GhostSnapshot { .. }
         | ResponseItem::Other
         | ResponseItem::Compaction { .. } => PruneCategory::ToolCall,
@@ -588,6 +632,7 @@ fn preview_for_item(item: &ResponseItem) -> String {
         }
         ResponseItem::FunctionCall { name, .. } => format!("tool call: {name}"),
         ResponseItem::CustomToolCall { name, .. } => format!("tool call: {name}"),
+        ResponseItem::ToolSearchCall { .. } => "tool call: tool_search".to_string(),
         ResponseItem::LocalShellCall { .. } => "tool call: local_shell".to_string(),
         ResponseItem::WebSearchCall { .. } => "tool call: web_search".to_string(),
         ResponseItem::ImageGenerationCall { .. } => "tool call: image_generation".to_string(),
@@ -598,6 +643,9 @@ fn preview_for_item(item: &ResponseItem) -> String {
         ResponseItem::CustomToolCallOutput { output, .. } => {
             let text = output.body.to_text().unwrap_or_default();
             tool_output_preview_line(&text).to_string()
+        }
+        ResponseItem::ToolSearchOutput { tools, .. } => {
+            format!("tool output: {} result(s)", tools.len())
         }
         ResponseItem::Reasoning { summary, .. } => summary
             .first()
@@ -707,15 +755,18 @@ fn apply_replacement(item: &ResponseItem, replacement: &str) -> Option<ResponseI
                 },
             })
         }
-        ResponseItem::CustomToolCallOutput { call_id, output } => {
-            Some(ResponseItem::CustomToolCallOutput {
-                call_id: call_id.clone(),
-                output: FunctionCallOutputPayload {
-                    body: FunctionCallOutputBody::Text(trimmed.to_string()),
-                    success: output.success,
-                },
-            })
-        }
+        ResponseItem::CustomToolCallOutput {
+            call_id,
+            name,
+            output,
+        } => Some(ResponseItem::CustomToolCallOutput {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text(trimmed.to_string()),
+                success: output.success,
+            },
+        }),
         ResponseItem::Reasoning { .. } => Some(ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -1118,6 +1169,7 @@ mod tests {
     fn apply_replacement_for_custom_tool_output_preserves_success() {
         let item = ResponseItem::CustomToolCallOutput {
             call_id: "call-1".to_string(),
+            name: Some("custom_tool".to_string()),
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text("old".to_string()),
                 success: Some(false),
@@ -1130,6 +1182,7 @@ mod tests {
             replaced,
             ResponseItem::CustomToolCallOutput {
                 call_id: "call-1".to_string(),
+                name: Some("custom_tool".to_string()),
                 output: FunctionCallOutputPayload {
                     body: FunctionCallOutputBody::Text("replacement text".to_string()),
                     success: Some(false),

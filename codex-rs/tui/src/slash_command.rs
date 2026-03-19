@@ -51,12 +51,14 @@ pub enum SlashCommand {
     Feedback,
     Rollout,
     Ps,
-    Clean,
+    #[strum(to_string = "stop", serialize = "clean")]
+    Stop,
     Clear,
     Personality,
     Realtime,
     Settings,
     TestApproval,
+    #[strum(serialize = "subagents")]
     MultiAgents,
     // Debugging commands.
     #[strum(serialize = "debug-m-drop")]
@@ -91,7 +93,7 @@ impl SlashCommand {
             SlashCommand::Statusline => "configure which items appear in the status line",
             SlashCommand::Theme => "choose a syntax highlighting theme",
             SlashCommand::Ps => "list background terminals",
-            SlashCommand::Clean => "stop all background terminals",
+            SlashCommand::Stop => "stop all background terminals",
             SlashCommand::MemoryDrop => "DO NOT USE",
             SlashCommand::MemoryUpdate => "DO NOT USE",
             SlashCommand::Model => "choose what model and reasoning effort to use",
@@ -137,7 +139,7 @@ impl SlashCommand {
     }
 
     /// Whether this command can be run while a task is in progress.
-    /// Merge anchor: `/accounts` and `/logout` stay blocked during active turns
+    /// Merge-safety anchor: `/accounts` and `/logout` stay blocked during active turns
     /// because account mutations are coordinated through app-level auth flows.
     pub fn available_during_task(self) -> bool {
         match self {
@@ -174,7 +176,7 @@ impl SlashCommand {
             | SlashCommand::Status
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
-            | SlashCommand::Clean
+            | SlashCommand::Stop
             | SlashCommand::Mcp
             | SlashCommand::Apps
             | SlashCommand::Feedback
@@ -209,16 +211,28 @@ pub fn built_in_slash_commands() -> Vec<(&'static str, SlashCommand)> {
 
 #[cfg(test)]
 mod tests {
-    use super::SlashCommand;
     use pretty_assertions::assert_eq;
+    use std::str::FromStr;
+
+    use super::SlashCommand;
 
     #[test]
     fn task_availability_preserves_existing_commands() {
         assert_eq!(SlashCommand::DebugConfig.available_during_task(), true);
         assert_eq!(SlashCommand::Debug.available_during_task(), true);
-        assert_eq!(SlashCommand::Clean.available_during_task(), true);
+        assert_eq!(SlashCommand::Stop.available_during_task(), true);
         assert_eq!(SlashCommand::Sanitize.available_during_task(), false);
         assert_eq!(SlashCommand::Accounts.available_during_task(), false);
         assert_eq!(SlashCommand::Logout.available_during_task(), false);
+    }
+
+    #[test]
+    fn stop_command_is_canonical_name() {
+        assert_eq!(SlashCommand::Stop.command(), "stop");
+    }
+
+    #[test]
+    fn clean_alias_parses_to_stop_command() {
+        assert_eq!(SlashCommand::from_str("clean"), Ok(SlashCommand::Stop));
     }
 }

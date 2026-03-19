@@ -961,6 +961,7 @@ mod tests {
         ResponseItem::FunctionCall {
             id: None,
             name: "manage_context".to_string(),
+            namespace: None,
             arguments: "{}".to_string(),
             call_id: call_id.to_string(),
         }
@@ -980,6 +981,7 @@ mod tests {
         ResponseItem::FunctionCall {
             id: None,
             name: "manage_context".to_string(),
+            namespace: None,
             arguments: arguments.to_string(),
             call_id: call_id.to_string(),
         }
@@ -989,6 +991,7 @@ mod tests {
         ResponseItem::FunctionCall {
             id: None,
             name: "other_tool".to_string(),
+            namespace: None,
             arguments: "{}".to_string(),
             call_id: call_id.to_string(),
         }
@@ -1037,6 +1040,7 @@ mod tests {
     fn custom_manage_context_output(call_id: &str, content: &str) -> ResponseItem {
         ResponseItem::CustomToolCallOutput {
             call_id: call_id.to_string(),
+            name: Some("manage_context".to_string()),
             output: codex_protocol::models::FunctionCallOutputPayload {
                 body: codex_protocol::models::FunctionCallOutputBody::Text(content.to_string()),
                 success: Some(true),

@@ -1,3 +1,6 @@
+// Merge-safety anchor: history projection/truncation must preserve workspace-local
+// prompt-gc, compact, and model-visible tool-output semantics during syncs.
+
 use crate::codex::TurnContext;
 use crate::context_manager::normalize;
 use crate::event_mapping::is_contextual_user_message_content;
@@ -57,7 +60,9 @@ impl ContextManager {
     pub(crate) fn new() -> Self {
         Self {
             items: Vec::new(),
-            token_info: TokenUsageInfo::new_or_append(&None, &None, None),
+            token_info: TokenUsageInfo::new_or_append(
+                &None, &None, /*model_context_window*/ None,
+            ),
             reference_context_item: None,
         }
     }
@@ -349,9 +354,6 @@ impl ContextManager {
         // all outputs must have a corresponding function/tool call
         normalize::remove_orphan_outputs(&mut self.items);
 
-        //rewrite image_gen_calls to messages to support stateless input
-        normalize::rewrite_image_generation_calls_for_stateless_input(&mut self.items);
-
         // strip images when model does not support them
         normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
     }
@@ -368,19 +370,21 @@ impl ContextManager {
                     ),
                 }
             }
-            ResponseItem::CustomToolCallOutput { call_id, output } => {
-                ResponseItem::CustomToolCallOutput {
-                    call_id: call_id.clone(),
-                    output: truncate_function_output_payload(
-                        output,
-                        policy_with_serialization_budget,
-                    ),
-                }
-            }
+            ResponseItem::CustomToolCallOutput {
+                call_id,
+                name,
+                output,
+            } => ResponseItem::CustomToolCallOutput {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                output: truncate_function_output_payload(output, policy_with_serialization_budget),
+            },
             ResponseItem::Message { .. }
             | ResponseItem::Reasoning { .. }
             | ResponseItem::LocalShellCall { .. }
             | ResponseItem::FunctionCall { .. }
+            | ResponseItem::ToolSearchCall { .. }
+            | ResponseItem::ToolSearchOutput { .. }
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::CustomToolCall { .. }
@@ -416,12 +420,15 @@ fn project_model_visible_item(item: ResponseItem) -> ResponseItem {
             call_id,
             output: project_model_visible_tool_output_payload(&output),
         },
-        ResponseItem::CustomToolCallOutput { call_id, output } => {
-            ResponseItem::CustomToolCallOutput {
-                call_id,
-                output: project_model_visible_tool_output_payload(&output),
-            }
-        }
+        ResponseItem::CustomToolCallOutput {
+            call_id,
+            name,
+            output,
+        } => ResponseItem::CustomToolCallOutput {
+            call_id,
+            name,
+            output: project_model_visible_tool_output_payload(&output),
+        },
         other => other,
     }
 }
@@ -443,6 +450,8 @@ fn is_api_message(message: &ResponseItem) -> bool {
         ResponseItem::Message { role, .. } => role.as_str() != "system",
         ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::FunctionCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::ToolSearchOutput { .. }
         | ResponseItem::CustomToolCall { .. }
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::LocalShellCall { .. }
@@ -503,9 +512,14 @@ pub(crate) fn estimate_response_item_model_visible_bytes(item: &ResponseItem) ->
             };
             estimate_serialized_item_model_visible_bytes(&projected)
         }
-        ResponseItem::CustomToolCallOutput { call_id, output } => {
+        ResponseItem::CustomToolCallOutput {
+            call_id,
+            name,
+            output,
+        } => {
             let projected = ResponseItem::CustomToolCallOutput {
                 call_id: call_id.clone(),
+                name: name.clone(),
                 output: project_model_visible_tool_output_payload(output),
             };
             estimate_serialized_item_model_visible_bytes(&projected)
@@ -651,12 +665,14 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
         ResponseItem::Message { role, .. } => role == "assistant",
         ResponseItem::Reasoning { .. }
         | ResponseItem::FunctionCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::CustomToolCall { .. }
         | ResponseItem::LocalShellCall { .. }
         | ResponseItem::Compaction { .. } => true,
         ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::ToolSearchOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::GhostSnapshot { .. }
         | ResponseItem::Other => false,
@@ -666,7 +682,9 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
 pub(crate) fn is_codex_generated_item(item: &ResponseItem) -> bool {
     matches!(
         item,
-        ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
+        ResponseItem::FunctionCallOutput { .. }
+            | ResponseItem::ToolSearchOutput { .. }
+            | ResponseItem::CustomToolCallOutput { .. }
     ) || matches!(item, ResponseItem::Message { role, .. } if role == "developer")
 }
 

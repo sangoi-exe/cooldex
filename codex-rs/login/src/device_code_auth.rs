@@ -8,7 +8,11 @@ use std::time::Instant;
 
 use crate::pkce::PkceCodes;
 use crate::server::ServerOptions;
+use codex_client::build_reqwest_client_with_custom_ca;
 use std::io;
+
+// Merge-safety anchor: device-code polling and verification URL handling are customized for the
+// local auth/login contract and must stay reconciled during upstream auth changes.
 
 const ANSI_BLUE: &str = "\x1b[94m";
 const ANSI_GRAY: &str = "\x1b[90m";
@@ -261,7 +265,7 @@ fn print_device_code_prompt(verification_url: &str, code: &str, expires_in_secs:
 }
 
 pub async fn request_device_code(opts: &ServerOptions) -> std::io::Result<DeviceCode> {
-    let client = reqwest::Client::new();
+    let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
     let base_url = opts.issuer.trim_end_matches('/');
     let api_base_url = format!("{base_url}/api/accounts");
     let uc = request_user_code(&client, &api_base_url, &opts.client_id).await?;
@@ -281,7 +285,7 @@ pub async fn complete_device_code_login(
     opts: ServerOptions,
     device_code: DeviceCode,
 ) -> std::io::Result<()> {
-    let client = reqwest::Client::new();
+    let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
     let base_url = opts.issuer.trim_end_matches('/');
     let api_base_url = format!("{base_url}/api/accounts");
 
@@ -320,7 +324,7 @@ pub async fn complete_device_code_login(
 
     crate::server::persist_tokens_async(
         &opts.codex_home,
-        None,
+        /*api_key*/ None,
         tokens.id_token,
         tokens.access_token,
         tokens.refresh_token,
@@ -329,7 +333,6 @@ pub async fn complete_device_code_login(
     .await
 }
 
-/// Full device code login flow.
 pub async fn run_device_code_login(opts: ServerOptions) -> std::io::Result<()> {
     let device_code = request_device_code(&opts).await?;
     print_device_code_prompt(
