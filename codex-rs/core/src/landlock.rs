@@ -36,6 +36,8 @@ where
     let file_system_sandbox_policy =
         FileSystemSandboxPolicy::from_legacy_sandbox_policy(sandbox_policy, sandbox_policy_cwd);
     let network_sandbox_policy = NetworkSandboxPolicy::from(sandbox_policy);
+    // Merge-safety anchor: the local workspace keeps legacy Landlock reaching
+    // the Linux sandbox helper invocation for shell/exec flows.
     let args = create_linux_sandbox_command_args_for_policies(
         command,
         command_cwd.as_path(),
@@ -112,6 +114,9 @@ pub fn create_linux_sandbox_command_args_for_policies(
         "--network-sandbox-policy".to_string(),
         network_policy_json,
     ];
+    // Merge-safety anchor: preserve explicit `--use-legacy-landlock` emission
+    // while the local workspace depends on the legacy path instead of
+    // unconditional bubblewrap.
     if use_legacy_landlock {
         linux_cmd.push("--use-legacy-landlock".to_string());
     }

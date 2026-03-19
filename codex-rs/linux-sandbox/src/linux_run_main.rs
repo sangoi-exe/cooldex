@@ -55,6 +55,8 @@ pub struct LandlockCommand {
     /// Opt-in: use the legacy Landlock Linux sandbox fallback.
     ///
     /// When not set, the helper uses the default bubblewrap pipeline.
+    // Merge-safety anchor: preserve the explicit legacy Landlock helper flag
+    // while the local workspace still relies on `use_legacy_landlock`.
     #[arg(long = "use-legacy-landlock", hide = true, default_value_t = false)]
     pub use_legacy_landlock: bool,
 
@@ -126,6 +128,9 @@ pub fn run_main() -> ! {
         network_sandbox_policy,
     )
     .unwrap_or_else(|err| panic!("{err}"));
+    // Merge-safety anchor: preserve the legacy Landlock compatibility guards
+    // so the override fails loud only on unsupported policy combinations,
+    // rather than disappearing during future bubblewrap-only merges.
     ensure_legacy_landlock_mode_supports_policy(
         use_legacy_landlock,
         &file_system_sandbox_policy,
@@ -172,6 +177,9 @@ pub fn run_main() -> ! {
         exec_or_panic(command);
     }
 
+    // Merge-safety anchor: preserve the legacy Landlock branch split so
+    // `use_legacy_landlock=true` still reaches the legacy fallback instead of
+    // always forcing bubblewrap.
     if !use_legacy_landlock {
         // Outer stage: bubblewrap first, then re-enter this binary in the
         // sandboxed environment to apply seccomp. This path never falls back
@@ -205,6 +213,9 @@ pub fn run_main() -> ! {
         );
     }
 
+    // Merge-safety anchor: preserve the legacy Landlock fallback/honor seam so
+    // `use_legacy_landlock=true` still executes the legacy enforcement path
+    // instead of drifting back into the bubblewrap-first flow.
     // Legacy path: Landlock enforcement only, when bwrap sandboxing is not enabled.
     if let Err(e) = apply_sandbox_policy_to_current_thread(
         &sandbox_policy,

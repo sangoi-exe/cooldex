@@ -95,6 +95,9 @@ pub(crate) struct SandboxTransformRequest<'a> {
     #[cfg(target_os = "macos")]
     pub macos_seatbelt_profile_extensions: Option<&'a MacOsSeatbeltProfileExtensions>,
     pub codex_linux_sandbox_exe: Option<&'a PathBuf>,
+    // Merge-safety anchor: preserve the legacy Landlock carry field in the
+    // shared sandbox transform request while the local workspace still routes
+    // Linux flows away from bubblewrap via `use_legacy_landlock`.
     pub use_legacy_landlock: bool,
     pub windows_sandbox_level: WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
@@ -581,6 +584,9 @@ impl SandboxManager {
         &self,
         request: SandboxTransformRequest<'_>,
     ) -> Result<ExecRequest, SandboxTransformError> {
+        // Merge-safety anchor: preserve the legacy Landlock carry seam through
+        // request destructuring so future merges do not drop the override
+        // before the LinuxSeccomp transform arm forwards it downstream.
         let SandboxTransformRequest {
             mut spec,
             policy,
@@ -666,6 +672,9 @@ impl SandboxManager {
             }
             #[cfg(not(target_os = "macos"))]
             SandboxType::MacosSeatbelt => return Err(SandboxTransformError::SeatbeltUnavailable),
+            // Merge-safety anchor: the local workspace keeps legacy Landlock
+            // flowing into the LinuxSeccomp transform so helper argv emission
+            // can preserve the non-bubblewrap path when explicitly requested.
             SandboxType::LinuxSeccomp => {
                 let exe = codex_linux_sandbox_exe
                     .ok_or(SandboxTransformError::MissingLinuxSandboxExecutable)?;

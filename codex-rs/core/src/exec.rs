@@ -258,6 +258,9 @@ pub fn build_exec_request(
         justification,
     };
 
+    // Merge-safety anchor: the local workspace keeps legacy Landlock
+    // propagating through exec request construction so Linux sandbox transforms
+    // can opt out of bubblewrap for writable Git metadata workflows.
     let manager = SandboxManager::new();
     let exec_req = manager
         .transform(crate::sandboxing::SandboxTransformRequest {

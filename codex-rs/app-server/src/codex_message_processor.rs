@@ -1750,6 +1750,9 @@ impl CodexMessageProcessor {
         let outgoing = self.outgoing.clone();
         let request_for_task = request.clone();
         let started_network_proxy_for_task = started_network_proxy;
+        // Merge-safety anchor: the local workspace keeps legacy Landlock
+        // reachable for app-server exec flows; preserve this flag read and
+        // propagation until bubblewrap has a safe writable-gitdir alternative.
         let use_legacy_landlock = self.config.features.use_legacy_landlock();
         let size = match size.map(crate::command_exec::terminal_size_from_protocol) {
             Some(Ok(size)) => Some(size),
