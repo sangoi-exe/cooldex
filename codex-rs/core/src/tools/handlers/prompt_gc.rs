@@ -526,7 +526,7 @@ mod tests {
         active_turn.add_task(RunningTask {
             done: Arc::new(Notify::new()),
             kind: TaskKind::Regular,
-            task: Arc::new(RegularTask::default()) as Arc<dyn SessionTask>,
+            task: Arc::new(RegularTask) as Arc<dyn SessionTask>,
             cancellation_token: CancellationToken::new(),
             handle: Arc::new(AbortOnDropHandle::new(tokio::spawn(async {}))),
             turn_context: Arc::clone(&turn_context),

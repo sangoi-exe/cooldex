@@ -58,7 +58,7 @@ pub enum SlashCommand {
     Realtime,
     Settings,
     TestApproval,
-    #[strum(serialize = "subagents")]
+    #[strum(to_string = "subagents", serialize = "multi-agents")]
     MultiAgents,
     // Debugging commands.
     #[strum(serialize = "debug-m-drop")]

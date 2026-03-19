@@ -13,7 +13,6 @@ use codex_app_server::INPUT_TOO_LARGE_ERROR_CODE;
 use codex_app_server::INVALID_PARAMS_ERROR_CODE;
 use codex_app_server_protocol::ByteRange;
 use codex_app_server_protocol::ClientInfo;
-use codex_app_server_protocol::CollabAgentState;
 use codex_app_server_protocol::CollabAgentStatus;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
@@ -1778,6 +1777,7 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
             status: CollabAgentToolCallStatus::InProgress,
             sender_thread_id: thread.id.clone(),
             receiver_thread_ids: Vec::new(),
+            receiver_agents: Vec::new(),
             prompt: Some(CHILD_PROMPT.to_string()),
             model: Some(REQUESTED_MODEL.to_string()),
             reasoning_effort: Some(REQUESTED_REASONING_EFFORT),
@@ -1807,6 +1807,7 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
         status,
         sender_thread_id,
         receiver_thread_ids,
+        receiver_agents,
         prompt,
         model,
         reasoning_effort,
@@ -1825,21 +1826,17 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
     assert_eq!(status, CollabAgentToolCallStatus::Completed);
     assert_eq!(sender_thread_id, thread.id);
     assert_eq!(receiver_thread_ids, vec![receiver_thread_id.clone()]);
+    assert_eq!(receiver_agents.len(), 1);
+    assert_eq!(receiver_agents[0].thread_id, receiver_thread_ids[0]);
     assert_eq!(prompt, Some(CHILD_PROMPT.to_string()));
     assert_eq!(model, Some(REQUESTED_MODEL.to_string()));
     assert_eq!(reasoning_effort, Some(REQUESTED_REASONING_EFFORT));
     assert_eq!(wait_state, None);
-    assert_eq!(
-        agents_states,
-        HashMap::from([(
-            receiver_thread_id,
-            CollabAgentState {
-                status: CollabAgentStatus::PendingInit,
-                message: None,
-                last_activity: None,
-            },
-        )])
-    );
+    let state = agents_states
+        .get(&receiver_thread_id)
+        .expect("spawn completion should include child state");
+    assert_eq!(state.status, CollabAgentStatus::PendingInit);
+    assert_eq!(state.message, None);
 
     let turn_completed = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
@@ -1992,6 +1989,7 @@ config_file = "./custom-role.toml"
         status,
         sender_thread_id,
         receiver_thread_ids,
+        receiver_agents,
         prompt,
         model,
         reasoning_effort,
@@ -2010,21 +2008,17 @@ config_file = "./custom-role.toml"
     assert_eq!(status, CollabAgentToolCallStatus::Completed);
     assert_eq!(sender_thread_id, thread.id);
     assert_eq!(receiver_thread_ids, vec![receiver_thread_id.clone()]);
+    assert_eq!(receiver_agents.len(), 1);
+    assert_eq!(receiver_agents[0].thread_id, receiver_thread_ids[0]);
     assert_eq!(prompt, Some(CHILD_PROMPT.to_string()));
     assert_eq!(model, Some(ROLE_MODEL.to_string()));
     assert_eq!(reasoning_effort, Some(ROLE_REASONING_EFFORT));
     assert_eq!(wait_state, None);
-    assert_eq!(
-        agents_states,
-        HashMap::from([(
-            receiver_thread_id,
-            CollabAgentState {
-                status: CollabAgentStatus::PendingInit,
-                message: None,
-                last_activity: None,
-            },
-        )])
-    );
+    let state = agents_states
+        .get(&receiver_thread_id)
+        .expect("spawn completion should include child state");
+    assert_eq!(state.status, CollabAgentStatus::PendingInit);
+    assert_eq!(state.message, None);
 
     let turn_completed = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {

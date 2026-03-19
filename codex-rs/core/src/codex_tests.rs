@@ -427,7 +427,7 @@ fn assistant_message_stream_parsers_seed_plan_parser_across_added_and_delta_boun
 
 #[test]
 fn prompt_gc_capability_is_explicitly_opt_in() {
-    assert!(RegularTask::default().supports_prompt_gc());
+    assert!(RegularTask.supports_prompt_gc());
     assert!(!crate::tasks::UserShellCommandTask::new("echo hi".to_string()).supports_prompt_gc());
     assert!(!crate::tasks::UndoTask::new().supports_prompt_gc());
     assert!(

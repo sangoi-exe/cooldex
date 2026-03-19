@@ -214,15 +214,221 @@ fn unauthorized_recovery_reports_mode_and_step_names() {
     assert_eq!(external.step_name(), "external_refresh");
 }
 
+#[test]
+#[serial(codex_api_key)]
+fn reload_if_account_id_matches_prefers_chatgpt_when_store_also_has_api_key() {
+    let codex_home = tempdir().unwrap();
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: Some("sk-test".to_string()),
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some("org_workspace".to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let outcome = manager.reload_if_account_id_matches(Some("org_workspace"));
+    assert!(
+        matches!(
+            outcome,
+            ReloadOutcome::ReloadedChanged | ReloadOutcome::ReloadedNoChange
+        ),
+        "reload should not be skipped when account ids match"
+    );
+    let auth = manager.auth_cached().expect("auth should be cached");
+    assert_eq!(auth.internal_auth_mode(), AuthMode::Chatgpt);
+}
+
+#[test]
+#[serial(codex_api_key)]
+fn auth_manager_new_keeps_business_accounts_in_store() {
+    let codex_home = tempdir().unwrap();
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("business".to_string()),
+            chatgpt_account_id: Some("org_workspace".to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    assert_eq!(manager.list_accounts().len(), 1);
+
+    let auth = manager.auth_cached().expect("auth should remain cached");
+    assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Business));
+    assert_eq!(
+        auth.get_token_data()
+            .expect("token data should exist")
+            .id_token
+            .chatgpt_account_id
+            .as_deref(),
+        Some("org_workspace")
+    );
+}
+
+#[test]
+fn login_with_chatgpt_auth_tokens_rejects_required_workspace_claim_mismatch() {
+    let codex_home = tempdir().unwrap();
+    let access_token =
+        make_test_chatgpt_jwt(Some("pro".to_string()), Some("org-token".to_string())).expect("jwt");
+
+    let err = super::login_with_chatgpt_auth_tokens(
+        codex_home.path(),
+        &access_token,
+        "org-token",
+        Some("pro"),
+        Some("org-required"),
+    )
+    .expect_err("required workspace mismatch should be rejected");
+    assert!(matches!(
+        err,
+        super::ExternalAuthLoginError::MetadataMismatch(_)
+    ));
+    assert!(
+        err.to_string()
+            .contains("does not match required workspace \"org-required\""),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+#[serial(codex_api_key)]
+fn load_auth_purges_unsupported_external_chatgpt_tokens_without_fallback() {
+    let codex_home = tempdir().unwrap();
+    let access_token =
+        make_test_chatgpt_jwt(Some("free".to_string()), Some("org_workspace".to_string()))
+            .expect("jwt");
+    let auth_dot_json =
+        AuthDotJson::from_external_access_token(&access_token, "org_workspace", Some("free"), None)
+            .expect("external auth dot json");
+    let store = AuthStore::from_legacy(auth_dot_json);
+    super::save_auth(
+        codex_home.path(),
+        &store,
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("save stale external auth");
+
+    let auth = super::load_auth(codex_home.path(), false, AuthCredentialsStoreMode::File)
+        .expect("load auth");
+    assert_eq!(auth, None);
+
+    let store = super::load_auth_store(codex_home.path(), AuthCredentialsStoreMode::Ephemeral)
+        .expect("load external auth store")
+        .expect("sanitized external auth store should remain present");
+    assert_eq!(store.accounts, Vec::new());
+    assert_eq!(store.active_account_id, None);
+}
+
+#[test]
+#[serial(codex_api_key)]
+fn load_auth_falls_back_to_persisted_chatgpt_auth_when_external_tokens_are_unsupported() {
+    let codex_home = tempdir().unwrap();
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some("persisted_workspace".to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("write persisted pro auth");
+
+    let access_token = make_test_chatgpt_jwt(
+        Some("free".to_string()),
+        Some("external_workspace".to_string()),
+    )
+    .expect("jwt");
+    let auth_dot_json = AuthDotJson::from_external_access_token(
+        &access_token,
+        "external_workspace",
+        Some("free"),
+        None,
+    )
+    .expect("external auth dot json");
+    let store = AuthStore::from_legacy(auth_dot_json);
+    super::save_auth(
+        codex_home.path(),
+        &store,
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("save stale external auth");
+
+    let auth = super::load_auth(codex_home.path(), false, AuthCredentialsStoreMode::File)
+        .expect("load auth")
+        .expect("persisted auth should remain available");
+    assert_eq!(auth.internal_auth_mode(), AuthMode::Chatgpt);
+    assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Pro));
+    assert_eq!(
+        auth.get_token_data()
+            .expect("token data should exist")
+            .id_token
+            .chatgpt_account_id
+            .as_deref(),
+        Some("persisted_workspace")
+    );
+
+    let store = super::load_auth_store(codex_home.path(), AuthCredentialsStoreMode::Ephemeral)
+        .expect("load external auth store")
+        .expect("sanitized external auth store should remain present");
+    assert_eq!(store.accounts, Vec::new());
+    assert_eq!(store.active_account_id, None);
+}
+
+#[test]
+fn usage_limit_auto_switch_removes_only_free_and_unknown_plans() {
+    assert!(super::usage_limit_auto_switch_removes_plan_type(Some(
+        &AccountPlanType::Free
+    )));
+    assert!(super::usage_limit_auto_switch_removes_plan_type(Some(
+        &AccountPlanType::Unknown
+    )));
+    assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+        &AccountPlanType::Go
+    )));
+    assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+        &AccountPlanType::Plus
+    )));
+    assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+        &AccountPlanType::Pro
+    )));
+    assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+        &AccountPlanType::Team
+    )));
+    assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+        &AccountPlanType::Business
+    )));
+    assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+        &AccountPlanType::Enterprise
+    )));
+    assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+        &AccountPlanType::Edu
+    )));
+    assert!(!super::usage_limit_auto_switch_removes_plan_type(None));
+}
+
 struct AuthFileParams {
     openai_api_key: Option<String>,
     chatgpt_plan_type: Option<String>,
     chatgpt_account_id: Option<String>,
 }
 
-fn write_auth_file(params: AuthFileParams, codex_home: &Path) -> std::io::Result<String> {
-    let auth_file = get_auth_file(codex_home);
-    // Create a minimal valid JWT for the id_token field.
+fn make_test_chatgpt_jwt(
+    chatgpt_plan_type: Option<String>,
+    chatgpt_account_id: Option<String>,
+) -> std::io::Result<String> {
     #[derive(Serialize)]
     struct Header {
         alg: &'static str,
@@ -237,13 +443,12 @@ fn write_auth_file(params: AuthFileParams, codex_home: &Path) -> std::io::Result
         "user_id": "user-12345",
     });
 
-    if let Some(chatgpt_plan_type) = params.chatgpt_plan_type {
-        auth_payload["chatgpt_plan_type"] = serde_json::Value::String(chatgpt_plan_type);
+    if let Some(chatgpt_plan_type) = chatgpt_plan_type.as_ref() {
+        auth_payload["chatgpt_plan_type"] = serde_json::Value::String(chatgpt_plan_type.clone());
     }
 
-    if let Some(chatgpt_account_id) = params.chatgpt_account_id {
-        let org_value = serde_json::Value::String(chatgpt_account_id);
-        auth_payload["chatgpt_account_id"] = org_value;
+    if let Some(chatgpt_account_id) = chatgpt_account_id.as_ref() {
+        auth_payload["chatgpt_account_id"] = serde_json::Value::String(chatgpt_account_id.clone());
     }
 
     let payload = serde_json::json!({
@@ -255,14 +460,23 @@ fn write_auth_file(params: AuthFileParams, codex_home: &Path) -> std::io::Result
     let header_b64 = b64(&serde_json::to_vec(&header)?);
     let payload_b64 = b64(&serde_json::to_vec(&payload)?);
     let signature_b64 = b64(b"sig");
-    let fake_jwt = format!("{header_b64}.{payload_b64}.{signature_b64}");
+    Ok(format!("{header_b64}.{payload_b64}.{signature_b64}"))
+}
+
+fn write_auth_file(params: AuthFileParams, codex_home: &Path) -> std::io::Result<String> {
+    let auth_file = get_auth_file(codex_home);
+    let fake_jwt = make_test_chatgpt_jwt(
+        params.chatgpt_plan_type.clone(),
+        params.chatgpt_account_id.clone(),
+    )?;
 
     let auth_json_data = json!({
         "OPENAI_API_KEY": params.openai_api_key,
         "tokens": {
             "id_token": fake_jwt,
             "access_token": "test-access-token",
-            "refresh_token": "test-refresh-token"
+            "refresh_token": "test-refresh-token",
+            "account_id": params.chatgpt_account_id,
         },
         "last_refresh": Utc::now(),
     });

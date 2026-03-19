@@ -139,6 +139,40 @@ impl CommandPopup {
     /// paired with optional highlight indices. Preserves the original
     /// presentation order for built-ins and prompts.
     fn filtered(&self) -> Vec<(CommandItem, Option<Vec<usize>>)> {
+        enum MatchBucket {
+            Exact,
+            Prefix,
+        }
+
+        fn match_bucket(
+            filter_lower: &str,
+            filter_chars: usize,
+            display: &str,
+            name: Option<&str>,
+            name_offset: usize,
+        ) -> Option<(MatchBucket, Option<Vec<usize>>)> {
+            let indices_for = |offset| Some((offset..offset + filter_chars).collect());
+            let display_lower = display.to_lowercase();
+            let name_lower = name.map(str::to_lowercase);
+            let display_exact = display_lower == filter_lower;
+            let name_exact = name_lower.as_deref() == Some(filter_lower);
+            if display_exact || name_exact {
+                let offset = if display_exact { 0 } else { name_offset };
+                return Some((MatchBucket::Exact, indices_for(offset)));
+            }
+
+            let display_prefix = display_lower.starts_with(filter_lower);
+            let name_prefix = name_lower
+                .as_ref()
+                .is_some_and(|candidate| candidate.starts_with(filter_lower));
+            if display_prefix || name_prefix {
+                let offset = if display_prefix { 0 } else { name_offset };
+                return Some((MatchBucket::Prefix, indices_for(offset)));
+            }
+
+            None
+        }
+
         let filter = self.command_filter.trim();
         let mut out: Vec<(CommandItem, Option<Vec<usize>>)> = Vec::new();
         if filter.is_empty() {
@@ -161,43 +195,54 @@ impl CommandPopup {
         let mut exact: Vec<(CommandItem, Option<Vec<usize>>)> = Vec::new();
         let mut prefix: Vec<(CommandItem, Option<Vec<usize>>)> = Vec::new();
         let prompt_prefix_len = PROMPTS_CMD_PREFIX.chars().count() + 1;
-        let indices_for = |offset| Some((offset..offset + filter_chars).collect());
-
-        let mut push_match =
-            |item: CommandItem, display: &str, name: Option<&str>, name_offset: usize| {
-                let display_lower = display.to_lowercase();
-                let name_lower = name.map(str::to_lowercase);
-                let display_exact = display_lower == filter_lower;
-                let name_exact = name_lower.as_deref() == Some(filter_lower.as_str());
-                if display_exact || name_exact {
-                    let offset = if display_exact { 0 } else { name_offset };
-                    exact.push((item, indices_for(offset)));
-                    return;
-                }
-                let display_prefix = display_lower.starts_with(&filter_lower);
-                let name_prefix = name_lower
-                    .as_ref()
-                    .is_some_and(|name| name.starts_with(&filter_lower));
-                if display_prefix || name_prefix {
-                    let offset = if display_prefix { 0 } else { name_offset };
-                    prefix.push((item, indices_for(offset)));
-                }
-            };
 
         for (_, cmd) in self.builtins.iter() {
-            push_match(CommandItem::Builtin(*cmd), cmd.command(), None, 0);
+            let item = CommandItem::Builtin(*cmd);
+            let display = cmd.command();
+            let aliases = slash_commands::builtin_search_aliases(*cmd);
+            if let Some((bucket, indices)) =
+                match_bucket(&filter_lower, filter_chars, display, None, 0)
+            {
+                match bucket {
+                    MatchBucket::Exact => exact.push((item, indices)),
+                    MatchBucket::Prefix => prefix.push((item, indices)),
+                }
+                continue;
+            }
+
+            for alias in aliases {
+                let alias_lower = alias.to_lowercase();
+                if alias_lower == filter_lower {
+                    exact.push((item, None));
+                    break;
+                }
+                if alias_lower.starts_with(&filter_lower) {
+                    prefix.push((item, None));
+                    break;
+                }
+            }
         }
         // Support both search styles:
         // - Typing "name" should surface "/prompts:name" results.
         // - Typing "prompts:name" should also work.
         for (idx, p) in self.prompts.iter().enumerate() {
             let display = format!("{PROMPTS_CMD_PREFIX}:{}", p.name);
-            push_match(
-                CommandItem::UserPrompt(idx),
+            if let Some((bucket, indices)) = match_bucket(
+                &filter_lower,
+                filter_chars,
                 &display,
                 Some(&p.name),
                 prompt_prefix_len,
-            );
+            ) {
+                match bucket {
+                    MatchBucket::Exact => {
+                        exact.push((CommandItem::UserPrompt(idx), indices));
+                    }
+                    MatchBucket::Prefix => {
+                        prefix.push((CommandItem::UserPrompt(idx), indices));
+                    }
+                }
+            }
         }
 
         out.extend(exact);
@@ -354,7 +399,7 @@ mod tests {
                 CommandItem::UserPrompt(_) => None,
             })
             .collect();
-        assert_eq!(cmds, vec!["model", "mention", "mcp"]);
+        assert_eq!(cmds, vec!["model", "mention", "mcp", "subagents"]);
     }
 
     #[test]

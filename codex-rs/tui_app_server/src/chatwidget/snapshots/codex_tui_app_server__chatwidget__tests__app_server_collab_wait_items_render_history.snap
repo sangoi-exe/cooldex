@@ -1,12 +1,14 @@
 ---
 source: tui_app_server/src/chatwidget/tests.rs
+assertion_line: 4436
 expression: combined
 ---
-• Waiting for 2 agents
-  └ 019cff70-2599-75e2-af72-b958ce5dc1cc
-    019cff70-2599-75e2-af72-b96db334332d
+• Waiting for any of 2 agents
+  └ Scout [explorer]
+    Builder [implementer]
+    Wait mode: any final status
 
 
-• Finished waiting
-  └ 019cff70-2599-75e2-af72-b958ce5dc1cc: Completed - Done
-    019cff70-2599-75e2-af72-b96db334332d: Running
+• Wait condition met (any final)
+  └ Scout [explorer]: Completed - Done
+    Builder [implementer]: Running

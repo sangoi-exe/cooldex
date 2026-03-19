@@ -38,6 +38,13 @@ pub(crate) fn builtins_for_input(flags: BuiltinCommandFlags) -> Vec<(&'static st
         .collect()
 }
 
+pub(crate) fn builtin_search_aliases(command: SlashCommand) -> &'static [&'static str] {
+    match command {
+        SlashCommand::MultiAgents => &["multi-agents"],
+        _ => &[],
+    }
+}
+
 /// Find a single built-in command by exact name, after applying the gating rules.
 pub(crate) fn find_builtin_command(name: &str, flags: BuiltinCommandFlags) -> Option<SlashCommand> {
     let cmd = SlashCommand::from_str(name).ok()?;
@@ -51,7 +58,12 @@ pub(crate) fn find_builtin_command(name: &str, flags: BuiltinCommandFlags) -> Op
 pub(crate) fn has_builtin_prefix(name: &str, flags: BuiltinCommandFlags) -> bool {
     builtins_for_input(flags)
         .into_iter()
-        .any(|(command_name, _)| fuzzy_match(command_name, name).is_some())
+        .any(|(command_name, command)| {
+            fuzzy_match(command_name, name).is_some()
+                || builtin_search_aliases(command)
+                    .iter()
+                    .any(|alias| fuzzy_match(alias, name).is_some())
+        })
 }
 
 #[cfg(test)]
@@ -98,6 +110,18 @@ mod tests {
         assert_eq!(
             find_builtin_command("clean", all_enabled_flags()),
             Some(SlashCommand::Stop)
+        );
+    }
+
+    #[test]
+    fn multi_agents_alias_resolves_for_dispatch() {
+        assert_eq!(
+            find_builtin_command("multi-agents", all_enabled_flags()),
+            Some(SlashCommand::MultiAgents)
+        );
+        assert_eq!(
+            find_builtin_command("subagents", all_enabled_flags()),
+            Some(SlashCommand::MultiAgents)
         );
     }
 

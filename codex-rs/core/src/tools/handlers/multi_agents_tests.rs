@@ -1082,7 +1082,7 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         .expect("approval policy set");
 
     let config = build_agent_spawn_config(&turn).expect("spawn config");
-    let mut expected = base_config.clone();
+    let mut expected = base_config;
     expected.base_instructions = Some("base".to_string());
     expected.model = Some(turn.model_info.slug.clone());
     expected.model_provider = turn.provider.clone();
@@ -1119,7 +1119,7 @@ async fn build_agent_spawn_config_clears_user_instructions() {
     let mut base_config = (*turn.config).clone();
     base_config.user_instructions = Some("base-user".to_string());
     turn.user_instructions = Some("resolved-user".to_string());
-    turn.config = Arc::new(base_config.clone());
+    turn.config = Arc::new(base_config);
 
     let config = build_agent_spawn_config(&turn).expect("spawn config");
 

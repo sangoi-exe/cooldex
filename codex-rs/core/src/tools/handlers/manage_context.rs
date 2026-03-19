@@ -2617,7 +2617,7 @@ mod tests {
                     text: "follow up after apply".to_string(),
                     text_elements: Vec::new(),
                 }],
-                RegularTask::default(),
+                RegularTask,
             )
             .await;
         wait_for_turn_complete(&rx).await;

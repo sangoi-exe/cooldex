@@ -53,6 +53,7 @@ use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::CollabAgentActivity as CoreCollabAgentActivity;
 use codex_protocol::protocol::CollabAgentActivityKind as CoreCollabAgentActivityKind;
+use codex_protocol::protocol::CollabAgentRef as CoreCollabAgentRef;
 use codex_protocol::protocol::CollabAgentStatusEntry as CoreCollabAgentStatusEntry;
 use codex_protocol::protocol::CollabWaitReturnWhen as CoreCollabWaitReturnWhen;
 use codex_protocol::protocol::CollabWaitState as CoreCollabWaitState;
@@ -4227,6 +4228,9 @@ pub enum ThreadItem {
         /// Thread ID of the receiving agent, when applicable. In case of spawn operation,
         /// this corresponds to the newly spawned agent.
         receiver_thread_ids: Vec<String>,
+        /// Optional nickname/role metadata for the receiving agents when available on the
+        /// originating core event.
+        receiver_agents: Vec<CollabAgentRef>,
         /// Prompt text sent as part of the collab tool call, when available.
         prompt: Option<String>,
         /// Model requested for the spawned agent, when applicable.
@@ -4612,6 +4616,45 @@ impl From<CoreCollabAgentActivityKind> for CollabAgentActivityKind {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+pub struct CollabAgentRef {
+    pub thread_id: String,
+    pub agent_nickname: Option<String>,
+    pub agent_role: Option<String>,
+}
+
+impl From<CoreCollabAgentRef> for CollabAgentRef {
+    fn from(value: CoreCollabAgentRef) -> Self {
+        Self {
+            thread_id: value.thread_id.to_string(),
+            agent_nickname: value.agent_nickname,
+            agent_role: value.agent_role,
+        }
+    }
+}
+
+impl From<&CoreCollabAgentRef> for CollabAgentRef {
+    fn from(value: &CoreCollabAgentRef) -> Self {
+        Self {
+            thread_id: value.thread_id.to_string(),
+            agent_nickname: value.agent_nickname.clone(),
+            agent_role: value.agent_role.clone(),
+        }
+    }
+}
+
+impl From<&CoreCollabAgentStatusEntry> for CollabAgentRef {
+    fn from(value: &CoreCollabAgentStatusEntry) -> Self {
+        Self {
+            thread_id: value.thread_id.to_string(),
+            agent_nickname: value.agent_nickname.clone(),
+            agent_role: value.agent_role.clone(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub struct CollabAgentActivity {
     pub kind: CollabAgentActivityKind,
     pub summary: String,
@@ -4634,6 +4677,8 @@ impl From<CoreCollabAgentActivity> for CollabAgentActivity {
 pub struct CollabAgentState {
     pub status: CollabAgentStatus,
     pub message: Option<String>,
+    pub agent_nickname: Option<String>,
+    pub agent_role: Option<String>,
     pub last_activity: Option<CollabAgentActivity>,
 }
 
@@ -4643,36 +4688,50 @@ impl From<CoreAgentStatus> for CollabAgentState {
             CoreAgentStatus::PendingInit => Self {
                 status: CollabAgentStatus::PendingInit,
                 message: None,
+                agent_nickname: None,
+                agent_role: None,
                 last_activity: None,
             },
             CoreAgentStatus::Running => Self {
                 status: CollabAgentStatus::Running,
                 message: None,
+                agent_nickname: None,
+                agent_role: None,
                 last_activity: None,
             },
             CoreAgentStatus::Interrupted => Self {
                 status: CollabAgentStatus::Interrupted,
                 message: None,
+                agent_nickname: None,
+                agent_role: None,
                 last_activity: None,
             },
             CoreAgentStatus::Completed(message) => Self {
                 status: CollabAgentStatus::Completed,
                 message,
+                agent_nickname: None,
+                agent_role: None,
                 last_activity: None,
             },
             CoreAgentStatus::Errored(message) => Self {
                 status: CollabAgentStatus::Errored,
                 message: Some(message),
+                agent_nickname: None,
+                agent_role: None,
                 last_activity: None,
             },
             CoreAgentStatus::Shutdown => Self {
                 status: CollabAgentStatus::Shutdown,
                 message: None,
+                agent_nickname: None,
+                agent_role: None,
                 last_activity: None,
             },
             CoreAgentStatus::NotFound => Self {
                 status: CollabAgentStatus::NotFound,
                 message: None,
+                agent_nickname: None,
+                agent_role: None,
                 last_activity: None,
             },
         }
@@ -4682,6 +4741,8 @@ impl From<CoreAgentStatus> for CollabAgentState {
 impl From<&CoreCollabAgentStatusEntry> for CollabAgentState {
     fn from(value: &CoreCollabAgentStatusEntry) -> Self {
         let mut state = Self::from(value.status.clone());
+        state.agent_nickname = value.agent_nickname.clone();
+        state.agent_role = value.agent_role.clone();
         state.last_activity = value.last_activity.clone().map(CollabAgentActivity::from);
         state
     }
@@ -5999,6 +6060,8 @@ mod tests {
             CollabAgentState {
                 status: CollabAgentStatus::Interrupted,
                 message: None,
+                agent_nickname: None,
+                agent_role: None,
                 last_activity: None,
             }
         );

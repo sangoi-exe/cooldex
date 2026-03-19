@@ -19,6 +19,7 @@ use crate::model_catalog::ModelCatalog;
 use crate::test_backend::VT100Backend;
 use crate::tui::FrameRequester;
 use assert_matches::assert_matches;
+use codex_app_server_protocol::CollabAgentRef as AppServerCollabAgentRef;
 use codex_app_server_protocol::CollabAgentState as AppServerCollabAgentState;
 use codex_app_server_protocol::CollabAgentStatus as AppServerCollabAgentStatus;
 use codex_app_server_protocol::CollabAgentTool as AppServerCollabAgentTool;
@@ -4341,6 +4342,18 @@ async fn live_app_server_collab_wait_items_render_history() {
                     receiver_thread_id.to_string(),
                     other_receiver_thread_id.to_string(),
                 ],
+                receiver_agents: vec![
+                    AppServerCollabAgentRef {
+                        thread_id: receiver_thread_id.to_string(),
+                        agent_nickname: Some("Scout".to_string()),
+                        agent_role: Some("explorer".to_string()),
+                    },
+                    AppServerCollabAgentRef {
+                        thread_id: other_receiver_thread_id.to_string(),
+                        agent_nickname: Some("Builder".to_string()),
+                        agent_role: Some("implementer".to_string()),
+                    },
+                ],
                 prompt: None,
                 model: None,
                 reasoning_effort: None,
@@ -4368,6 +4381,18 @@ async fn live_app_server_collab_wait_items_render_history() {
                     receiver_thread_id.to_string(),
                     other_receiver_thread_id.to_string(),
                 ],
+                receiver_agents: vec![
+                    AppServerCollabAgentRef {
+                        thread_id: receiver_thread_id.to_string(),
+                        agent_nickname: Some("Scout".to_string()),
+                        agent_role: Some("explorer".to_string()),
+                    },
+                    AppServerCollabAgentRef {
+                        thread_id: other_receiver_thread_id.to_string(),
+                        agent_nickname: Some("Builder".to_string()),
+                        agent_role: Some("implementer".to_string()),
+                    },
+                ],
                 prompt: None,
                 model: None,
                 reasoning_effort: None,
@@ -4377,6 +4402,8 @@ async fn live_app_server_collab_wait_items_render_history() {
                         AppServerCollabAgentState {
                             status: AppServerCollabAgentStatus::Completed,
                             message: Some("Done".to_string()),
+                            agent_nickname: Some("Scout".to_string()),
+                            agent_role: Some("explorer".to_string()),
                             last_activity: None,
                         },
                     ),
@@ -4385,6 +4412,8 @@ async fn live_app_server_collab_wait_items_render_history() {
                         AppServerCollabAgentState {
                             status: AppServerCollabAgentStatus::Running,
                             message: None,
+                            agent_nickname: Some("Builder".to_string()),
+                            agent_role: Some("implementer".to_string()),
                             last_activity: None,
                         },
                     ),
@@ -4425,6 +4454,7 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
                 status: AppServerCollabAgentToolCallStatus::InProgress,
                 sender_thread_id: sender_thread_id.to_string(),
                 receiver_thread_ids: Vec::new(),
+                receiver_agents: Vec::new(),
                 prompt: Some("Explore the repo".to_string()),
                 model: Some("gpt-5".to_string()),
                 reasoning_effort: Some(ReasoningEffortConfig::High),
@@ -4445,6 +4475,11 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
                 status: AppServerCollabAgentToolCallStatus::Completed,
                 sender_thread_id: sender_thread_id.to_string(),
                 receiver_thread_ids: vec![spawned_thread_id.to_string()],
+                receiver_agents: vec![AppServerCollabAgentRef {
+                    thread_id: spawned_thread_id.to_string(),
+                    agent_nickname: Some("Robie".to_string()),
+                    agent_role: Some("explorer".to_string()),
+                }],
                 prompt: Some("Explore the repo".to_string()),
                 model: Some("gpt-5".to_string()),
                 reasoning_effort: Some(ReasoningEffortConfig::High),
@@ -4453,6 +4488,8 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
                     AppServerCollabAgentState {
                         status: AppServerCollabAgentStatus::PendingInit,
                         message: None,
+                        agent_nickname: Some("Robie".to_string()),
+                        agent_role: Some("explorer".to_string()),
                         last_activity: None,
                     },
                 )]),
@@ -4467,9 +4504,63 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
         .map(|lines| lines_to_single_string(&lines))
         .collect::<Vec<_>>()
         .join("\n");
+    assert!(
+        combined.contains("Spawned Robie [explorer] (gpt-5 high)"),
+        "expected spawn line to include agent metadata and requested model, got {combined:?}"
+    );
     assert_snapshot!(
         "app_server_collab_spawn_completed_renders_requested_model_and_effort",
         combined
+    );
+}
+
+#[tokio::test]
+async fn replayed_app_server_collab_resume_completed_preserves_agent_metadata() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let sender_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b90000000003").expect("valid thread id");
+    let receiver_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b9a3ec0e6f0c").expect("valid thread id");
+
+    chat.replay_thread_item(
+        AppServerThreadItem::CollabAgentToolCall {
+            id: "resume-1".to_string(),
+            tool: AppServerCollabAgentTool::ResumeAgent,
+            status: AppServerCollabAgentToolCallStatus::Completed,
+            sender_thread_id: sender_thread_id.to_string(),
+            receiver_thread_ids: vec![receiver_thread_id.to_string()],
+            receiver_agents: vec![AppServerCollabAgentRef {
+                thread_id: receiver_thread_id.to_string(),
+                agent_nickname: Some("Robie".to_string()),
+                agent_role: Some("explorer".to_string()),
+            }],
+            prompt: None,
+            model: None,
+            reasoning_effort: None,
+            agents_states: HashMap::from([(
+                receiver_thread_id.to_string(),
+                AppServerCollabAgentState {
+                    status: AppServerCollabAgentStatus::Completed,
+                    message: None,
+                    agent_nickname: Some("Robie".to_string()),
+                    agent_role: Some("explorer".to_string()),
+                    last_activity: None,
+                },
+            )]),
+            wait_state: None,
+        },
+        "turn-1".to_string(),
+        ReplayKind::ThreadSnapshot,
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("Resumed Robie [explorer]"),
+        "expected replayed resume line to preserve agent metadata, got {rendered:?}"
     );
 }
 

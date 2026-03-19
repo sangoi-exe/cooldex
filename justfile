@@ -28,10 +28,12 @@ fmt:
     cargo fmt -- --config imports_granularity=Item 2>/dev/null
 
 fix *args:
-    ../scripts/cargo-guard.sh cargo clippy --fix --tests --allow-dirty "$@"
+    # Merge-safety anchor: workspace Cargo guard recipes must keep routing through the
+    # shared wrapper even when the script is non-executable in the current checkout.
+    bash ../scripts/cargo-guard.sh cargo clippy --fix --tests --allow-dirty "$@"
 
 clippy:
-    ../scripts/cargo-guard.sh cargo clippy --tests "$@"
+    bash ../scripts/cargo-guard.sh cargo clippy --tests "$@"
 
 install:
     rustup show active-toolchain
@@ -44,7 +46,7 @@ install:
 # Prefer this for routine local runs; use explicit `cargo test --all-features`
 # only when you specifically need full feature coverage.
 test:
-    ../scripts/cargo-guard.sh cargo nextest run --no-fail-fast
+    bash ../scripts/cargo-guard.sh cargo nextest run --no-fail-fast
 
 # Build and run Codex from source using Bazel.
 # Note we have to use the combination of `[no-cd]` and `--run_under="cd $PWD &&"`
