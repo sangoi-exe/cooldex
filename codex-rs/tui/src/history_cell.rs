@@ -1743,7 +1743,7 @@ fn decode_mcp_image(block: &serde_json::Value) -> Option<DynamicImage> {
 
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn new_warning_event(message: String) -> PrefixedWrappedHistoryCell {
-    PrefixedWrappedHistoryCell::new(message.yellow(), "⚠ ".yellow(), "  ")
+    PrefixedWrappedHistoryCell::new(message.red(), "⚠  ".red(), "  ")
 }
 
 #[derive(Debug)]

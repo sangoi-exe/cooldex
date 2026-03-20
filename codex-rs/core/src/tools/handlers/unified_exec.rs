@@ -358,37 +358,6 @@ pub(crate) fn get_command(
     }
 }
 
-fn format_response(response: &ExecCommandToolOutput) -> String {
-    let mut sections = Vec::new();
-
-    if !response.chunk_id.is_empty() {
-        sections.push(format!("Chunk ID: {}", response.chunk_id));
-    }
-
-    let wall_time_seconds = response.wall_time.as_secs_f64();
-    sections.push(format!("Wall time: {wall_time_seconds:.4} seconds"));
-
-    if let Some(exit_code) = response.exit_code {
-        sections.push(format!("Process exited with code {exit_code}"));
-    }
-
-    if let Some(process_id) = &response.process_id {
-        // Training still uses "session ID".
-        sections.push(format!("Process running with session ID {process_id}"));
-    }
-
-    if let Some(original_token_count) = response.original_token_count {
-        // Merge-safety anchor: prompt_gc and session-history boilerplate stripping both parse
-        // this serialized marker, so producer/consumers/tests must keep it aligned.
-        sections.push(format!("Token qty: {original_token_count}"));
-    }
-
-    sections.push("Output:".to_string());
-    sections.push(response.truncated_output());
-
-    sections.join("\n")
-}
-
 #[cfg(test)]
 #[path = "unified_exec_tests.rs"]
 mod tests;

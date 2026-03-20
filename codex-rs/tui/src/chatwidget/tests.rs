@@ -2248,7 +2248,6 @@ async fn make_chatwidget_manual(
         last_copyable_output: None,
         last_debug_raw_response_item: None,
         running_commands: HashMap::new(),
-        pending_collab_spawn_requests: HashMap::new(),
         suppressed_exec_calls: HashSet::new(),
         skills_all: Vec::new(),
         skills_initial_state: None,
@@ -2513,7 +2512,7 @@ fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {
 }
 
 #[tokio::test]
-async fn collab_spawn_end_shows_requested_model_and_effort() {
+async fn collab_spawn_end_shows_effective_profile_model_and_effort() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
     let sender_thread_id = ThreadId::new();
     let spawned_thread_id = ThreadId::new();
@@ -2524,8 +2523,9 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
             call_id: "call-spawn".to_string(),
             sender_thread_id,
             prompt: "Explore the repo".to_string(),
-            model: "gpt-5".to_string(),
-            reasoning_effort: ReasoningEffortConfig::High,
+            profile: Some("subxhigh".to_string()),
+            model: "gpt-5.2".to_string(),
+            reasoning_effort: Some(ReasoningEffortConfig::Medium),
         }),
     });
     chat.handle_codex_event(Event {
@@ -2537,8 +2537,9 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
             new_agent_nickname: Some("Robie".to_string()),
             new_agent_role: Some("explorer".to_string()),
             prompt: "Explore the repo".to_string(),
+            profile: Some("subxhigh".to_string()),
             model: "gpt-5".to_string(),
-            reasoning_effort: ReasoningEffortConfig::High,
+            reasoning_effort: Some(ReasoningEffortConfig::High),
             status: AgentStatus::PendingInit,
         }),
     });
@@ -2551,8 +2552,12 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
         .join("\n");
 
     assert!(
-        rendered.contains("Spawned Robie [explorer] (gpt-5 high)"),
-        "expected spawn line to include agent metadata and requested model, got {rendered:?}"
+        rendered.contains("Spawned Robie [explorer] (profile=subxhigh, gpt-5 high)"),
+        "expected spawn line to include agent metadata and effective spawn config, got {rendered:?}"
+    );
+    assert_snapshot!(
+        "collab_spawn_end_shows_effective_profile_model_and_effort",
+        rendered
     );
 }
 
@@ -2619,6 +2624,30 @@ async fn test_rate_limit_warnings_monthly() {
             "Heads up, you have less than 25% of your monthly limit left. Run /status for a breakdown.",
         ),],
         "expected one warning per limit for the highest crossed threshold"
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_warning_history_inserts_visible_gap_after_icon() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: Some("Codex".to_string()),
+        plan_type: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 95.0,
+            window_minutes: Some(299),
+            resets_at: None,
+        }),
+        secondary: None,
+        credits: None,
+    }));
+
+    let inserted = drain_insert_history(&mut rx);
+    assert_eq!(
+        lines_to_single_string(&inserted[0]),
+        "⚠  Heads up, you have less than 5% of your 5h limit left. Run /status for a\n  breakdown.\n",
     );
 }
 

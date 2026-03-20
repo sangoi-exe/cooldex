@@ -545,8 +545,43 @@
       ],
       "type": "string"
     },
+    "CollabAgentRef": {
+      "properties": {
+        "agentNickname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
     "CollabAgentState": {
       "properties": {
+        "agentNickname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "lastActivity": {
           "anyOf": [
             {
@@ -611,6 +646,9 @@
     },
     "CollabWaitState": {
       "properties": {
+        "conditionEnabled": {
+          "type": "boolean"
+        },
         "disableTimeout": {
           "type": "boolean"
         },
@@ -626,6 +664,7 @@
         }
       },
       "required": [
+        "conditionEnabled",
         "disableTimeout",
         "returnWhen",
         "timedOut"
@@ -2645,7 +2684,14 @@
               "type": "string"
             },
             "model": {
-              "description": "Model requested for the spawned agent, when applicable.",
+              "description": "Effective model used by the spawned agent, when applicable.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "profile": {
+              "description": "Optional config profile selected for the spawned agent, when applicable.",
               "type": [
                 "string",
                 "null"
@@ -2667,7 +2713,14 @@
                   "type": "null"
                 }
               ],
-              "description": "Reasoning effort requested for the spawned agent, when applicable."
+              "description": "Effective reasoning effort used by the spawned agent, when applicable."
+            },
+            "receiverAgents": {
+              "description": "Optional nickname/role metadata for the receiving agents when available on the originating core event.",
+              "items": {
+                "$ref": "#/definitions/CollabAgentRef"
+              },
+              "type": "array"
             },
             "receiverThreadIds": {
               "description": "Thread ID of the receiving agent, when applicable. In case of spawn operation, this corresponds to the newly spawned agent.",
@@ -2718,6 +2771,7 @@
           "required": [
             "agentsStates",
             "id",
+            "receiverAgents",
             "receiverThreadIds",
             "senderThreadId",
             "status",

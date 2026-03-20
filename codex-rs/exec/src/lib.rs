@@ -1905,6 +1905,7 @@ mod tests {
                 name: Some("thread".to_string()),
                 turns: vec![],
             },
+            config_path: PathBuf::from("/tmp/config.toml"),
             model: "gpt-5.4".to_string(),
             model_provider: "openai".to_string(),
             service_tier: None,

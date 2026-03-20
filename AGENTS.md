@@ -42,10 +42,12 @@ This section is the canonical cluster-level inventory of durable workspace-local
 - Run every Cargo validation rung through `./scripts/cargo-guard.sh` from the workspace root; do not run raw `cargo check`, `cargo test --no-run`, or `cargo test` directly in this workspace.
 - Cargo validation precedence is strict: exhaust the lighter/faster checks first, escalate only when they are green, and do not skip ahead to a heavier step when a lighter one can still answer the same question.
 - Batch clearly same-class mechanical fallout before escalating to a heavier validation rung; rerun only when the batch is ready or fresh diagnostics are needed.
-- `./scripts/cargo-guard.sh` owns target-dir resolution for the exact Cargo command, enforces the binary 10 GiB free-space floor, and runs `cargo clean` only when the target-dir filesystem is below that floor or a guarded run fails/interrupted.
-- Lightweight compile-first default: start with the relevant fast checks, preferring `./scripts/cargo-guard.sh cargo check -p <project> --tests` as the default proxy for import/type/borrow/macro/test-fixture compile failures.
+- `./scripts/cargo-guard.sh` asks Cargo itself for the effective `target_directory`/`build_directory` under the exact wrapper context, enforces the binary 5 GiB free-space floor, and runs `cargo clean` only when the lowest-free-space filesystem across those directories is below that floor before or after a guarded build-like command; failure/interruption alone must not trigger cleanup.
+- Lightweight compile-first default: start with the relevant fast checks, preferring `./scripts/cargo-guard.sh cargo check -p <project>` first and escalating to `--tests` only when test targets, fixtures, macros, or integration surfaces are in play.
 - Only after the relevant lightweight checks are green, run `./scripts/cargo-guard.sh cargo test -p <project> --no-run` for test-target build/link coverage.
 - Only after `./scripts/cargo-guard.sh cargo test -p <project> --no-run` is green, run real `./scripts/cargo-guard.sh cargo test -p <project>` for runtime/behavior validation when behavior actually needs to be proven.
+- Successful exit alone is not green: compiler warnings in the selected target set are blockers even when `cargo check` / `cargo test --no-run` exit `0`.
+- Target selection must match the shipped surface. If you are validating an installable binary or other top-level deliverable, include that final target (for example `./scripts/cargo-guard.sh cargo check -p codex-cli --bin codex`) instead of validating only a narrower dependency crate. When plain rustc warnings in transitive local crates must also be blocking for that shipped surface, use `just check-strict ...` on the same exact target instead of assuming `just clippy-strict ...` alone proves the full binary path.
 
 # Rust/codex-rs
 
@@ -94,11 +96,13 @@ Run `just fmt` (in `codex-rs` directory) automatically after you have finished m
 
 For Rust validation in `codex-rs`, use this light-first ladder:
 
-0. Before each rung below, invoke it via `./scripts/cargo-guard.sh cargo ...`; the wrapper resolves the target-dir, checks the 10 GiB floor, and runs `cargo clean` only when the guardrail requires it.
-1. Run the relevant quick/light Cargo checks first, with `./scripts/cargo-guard.sh cargo check -p <project> --tests` as the default starting point.
-2. Only if those are green, run `./scripts/cargo-guard.sh cargo test -p <project> --no-run`.
-3. Only if `--no-run` is green, run `./scripts/cargo-guard.sh cargo test -p <project>` when runtime/behavior validation is actually needed.
-4. Ask the user before running a complete suite such as workspace-wide `cargo test` / `just test`.
+0. Before each rung below, invoke it via `./scripts/cargo-guard.sh cargo ...`; the wrapper asks Cargo for the effective `target_directory`/`build_directory`, checks the 5 GiB floor across those directories, and runs `cargo clean` only when low free space violates that guardrail.
+1. Run the relevant quick/light Cargo checks first, with `./scripts/cargo-guard.sh cargo check -p <project>` as the default starting point.
+2. Escalate to `./scripts/cargo-guard.sh cargo check -p <project> --tests` only when test targets, fixtures, macros, or integration surfaces are part of the touched scope.
+3. Only if the relevant `cargo check` rung(s) are green, run `./scripts/cargo-guard.sh cargo test -p <project> --no-run`.
+4. Only if `--no-run` is green, run `./scripts/cargo-guard.sh cargo test -p <project>` when runtime/behavior validation is actually needed.
+5. Ask the user before running a complete suite such as workspace-wide `cargo test` / `just test`.
+6. When warnings must be blocking for the selected target set, run `just clippy-strict ...` after the compile ladder. Add `--tests` only when test targets are intentionally in scope. If the deliverable is a shipped binary or another top-level target whose local dependencies must also be warning-clean under plain rustc, also run `just check-strict ...` on that same exact surface (for example `just check-strict -p codex-cli --bin codex`).
 
 Before finalizing a large change to `codex-rs`, run `just fix -p <project>` (from the workspace root or inside `codex-rs`; the recipe routes through `./scripts/cargo-guard.sh`) to fix any linter issues in the code. Prefer scoping with `-p` to avoid slow workspace‑wide Clippy builds; only run `just fix` without `-p` if you changed shared crates. Do not re-run tests after running `fix` or `fmt`.
 

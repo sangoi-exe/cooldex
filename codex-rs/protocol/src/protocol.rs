@@ -3301,8 +3301,12 @@ pub struct CollabAgentSpawnBeginEvent {
     /// Initial prompt sent to the agent. Can be empty to prevent CoT leaking at the
     /// beginning.
     pub prompt: String,
+    /// Optional config profile selected for the spawned agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     pub model: String,
-    pub reasoning_effort: ReasoningEffortConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffortConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -3373,10 +3377,19 @@ pub struct CollabAgentSpawnEndEvent {
     /// Initial prompt sent to the agent. Can be empty to prevent CoT leaking at the
     /// beginning.
     pub prompt: String,
-    /// Effective model used by the spawned agent after inheritance and role overrides.
+    // Merge-safety anchor: collab spawn payloads must carry effective child profile/model/
+    // reasoning metadata together so live events, rollout replay, app-server history, and both
+    // TUIs render the same authoritative spawn label.
+    /// Optional config profile selected for the spawned agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Effective model used by the spawned agent after inheritance, profile selection, and role
+    /// overrides.
     pub model: String,
-    /// Effective reasoning effort used by the spawned agent after inheritance and role overrides.
-    pub reasoning_effort: ReasoningEffortConfig,
+    /// Effective reasoning effort used by the spawned agent after inheritance, profile
+    /// selection, and role overrides, when the child snapshot/config resolves one explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffortConfig>,
     /// Last known status of the new agent reported to the sender agent.
     pub status: AgentStatus,
 }
@@ -3424,7 +3437,7 @@ pub enum CollabWaitReturnWhen {
     AllFinal,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema, TS)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase")]
 pub struct CollabWaitState {
@@ -3434,8 +3447,46 @@ pub struct CollabWaitState {
     pub return_when: CollabWaitReturnWhen,
     #[serde(default)]
     pub disable_timeout: bool,
+    #[serde(default)]
+    pub condition_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timed_out: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollabWaitStateSerde {
+    #[serde(default)]
+    return_when: CollabWaitReturnWhen,
+    #[serde(default)]
+    disable_timeout: bool,
+    #[serde(default)]
+    condition_enabled: Option<bool>,
+    #[serde(default)]
+    timed_out: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for CollabWaitState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = CollabWaitStateSerde::deserialize(deserializer)?;
+        let condition_enabled =
+            raw.condition_enabled.unwrap_or(raw.disable_timeout) && raw.timed_out != Some(true);
+        Ok(Self {
+            return_when: raw.return_when,
+            disable_timeout: raw.disable_timeout,
+            condition_enabled,
+            timed_out: raw.timed_out,
+        })
+    }
+}
+
+impl CollabWaitState {
+    pub fn uses_explicit_condition(&self) -> bool {
+        self.condition_enabled && self.disable_timeout && self.timed_out != Some(true)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -3613,6 +3664,65 @@ mod tests {
             SessionSource::from_startup_arg("atlas").unwrap(),
             SessionSource::Custom("atlas".to_string())
         );
+    }
+
+    #[test]
+    fn collab_wait_state_missing_condition_flag_infers_timed_mode_from_timeout_setting() {
+        let timed_wait: CollabWaitState = serde_json::from_value(json!({
+            "returnWhen": "any_final",
+            "disableTimeout": false,
+            "timedOut": true
+        }))
+        .expect("timed wait should deserialize");
+        assert_eq!(
+            timed_wait,
+            CollabWaitState {
+                return_when: CollabWaitReturnWhen::AnyFinal,
+                disable_timeout: false,
+                condition_enabled: false,
+                timed_out: Some(true),
+            }
+        );
+        assert!(!timed_wait.uses_explicit_condition());
+
+        let explicit_wait: CollabWaitState = serde_json::from_value(json!({
+            "returnWhen": "all_final",
+            "disableTimeout": true,
+            "timedOut": false
+        }))
+        .expect("explicit wait should deserialize");
+        assert_eq!(
+            explicit_wait,
+            CollabWaitState {
+                return_when: CollabWaitReturnWhen::AllFinal,
+                disable_timeout: true,
+                condition_enabled: true,
+                timed_out: Some(false),
+            }
+        );
+        assert!(explicit_wait.uses_explicit_condition());
+    }
+
+    #[test]
+    fn collab_wait_state_timed_out_disables_impossible_explicit_condition() {
+        let invalid_wait: CollabWaitState = serde_json::from_value(json!({
+            "returnWhen": "any_final",
+            "disableTimeout": true,
+            "conditionEnabled": true,
+            "timedOut": true
+        }))
+        .expect("invalid mixed wait state should deserialize");
+
+        assert_eq!(
+            invalid_wait,
+            CollabWaitState {
+                return_when: CollabWaitReturnWhen::AnyFinal,
+                disable_timeout: true,
+                condition_enabled: false,
+                timed_out: Some(true),
+            }
+        );
+        assert!(!invalid_wait.uses_explicit_condition());
     }
 
     #[test]

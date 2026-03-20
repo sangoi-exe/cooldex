@@ -713,7 +713,6 @@ pub(crate) struct ChatWidget {
     // unavailable or stale data.
     last_debug_raw_response_item: Option<Result<String, String>>,
     running_commands: HashMap<String, RunningCommand>,
-    pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
     suppressed_exec_calls: HashSet<String>,
     skills_all: Vec<ProtocolSkillMetadata>,
     skills_initial_state: Option<HashMap<PathBuf, bool>>,
@@ -3802,7 +3801,6 @@ impl ChatWidget {
             last_copyable_output: None,
             last_debug_raw_response_item: None,
             running_commands: HashMap::new(),
-            pending_collab_spawn_requests: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
             unified_exec_wait_streak: None,
@@ -3995,7 +3993,6 @@ impl ChatWidget {
             last_copyable_output: None,
             last_debug_raw_response_item: None,
             running_commands: HashMap::new(),
-            pending_collab_spawn_requests: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
             unified_exec_wait_streak: None,
@@ -4180,7 +4177,6 @@ impl ChatWidget {
             last_copyable_output: None,
             last_debug_raw_response_item: None,
             running_commands: HashMap::new(),
-            pending_collab_spawn_requests: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
             unified_exec_wait_streak: None,
@@ -5649,24 +5645,10 @@ impl ChatWidget {
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
-            EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
-                call_id,
-                model,
-                reasoning_effort,
-                ..
-            }) => {
-                self.pending_collab_spawn_requests.insert(
-                    call_id,
-                    multi_agents::SpawnRequestSummary {
-                        model,
-                        reasoning_effort,
-                    },
-                );
-            }
-            EventMsg::CollabAgentSpawnEnd(ev) => {
-                let spawn_request = self.pending_collab_spawn_requests.remove(&ev.call_id);
-                self.on_collab_event(multi_agents::spawn_end(ev, spawn_request.as_ref()));
-            }
+            EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent { .. }) => {}
+            // Merge-safety anchor: the widget must render spawn rows from the effective end-event
+            // payload; do not restore begin-event request caching here.
+            EventMsg::CollabAgentSpawnEnd(ev) => self.on_collab_event(multi_agents::spawn_end(ev)),
             EventMsg::CollabAgentInteractionBegin(_) => {}
             EventMsg::CollabAgentInteractionEnd(ev) => {
                 self.on_collab_event(multi_agents::interaction_end(ev))

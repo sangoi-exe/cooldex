@@ -27,7 +27,6 @@ use crate::pkce::PkceCodes;
 use crate::pkce::generate_pkce;
 use base64::Engine;
 use chrono::Utc;
-use codex_app_server_protocol::AuthMode;
 use codex_client::build_reqwest_client_with_custom_ca;
 use codex_core::AuthManager;
 use codex_core::auth::AuthCredentialsStoreMode;

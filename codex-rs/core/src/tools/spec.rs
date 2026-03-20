@@ -1090,7 +1090,7 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
             "profile".to_string(),
             JsonSchema::String {
                 description: Some(
-                    "Optional config profile for the spawned agent. If omitted, existing spawn profile behavior is preserved."
+                    "Optional config profile for the spawned agent. Use this only when the child should load alternate profile-backed settings; otherwise it inherits the lead agent's current settings."
                         .to_string(),
                 ),
             },
@@ -1104,39 +1104,24 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
                 ),
             },
         ),
-        (
-            "model".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Optional model override for the new agent. Replaces the inherited model."
-                        .to_string(),
-                ),
-            },
-        ),
-        (
-            "reasoning_effort".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort."
-                        .to_string(),
-                ),
-            },
-        ),
     ]);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agent".to_string(),
+        // Merge-safety anchor: spawn-agent model/reasoning selection must stay `lead inherited`
+        // unless a profile is explicitly chosen; do not reintroduce direct tool-arg overrides.
         description: format!(
             r#"
         Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work.
         Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.
         Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself.
-        Spawn a sub-agent for a well-scoped task. Returns the agent id (and user-facing nickname when available) to use to communicate with this agent. This spawn_agent tool provides you access to smaller but more efficient sub-agents. A mini model can solve many tasks faster than the main model. You should follow the rules and guidelines below to use this tool.
+        Spawn a sub-agent for a well-scoped task. Returns the agent id (and user-facing nickname when available) to use to communicate with this agent.
+        Child model/reasoning selection follows the live lead settings by default. Set `profile` only when the child should load alternate model/reasoning config from that profile. The model catalog below is informational only; `spawn_agent` does not accept direct `model` or `reasoning_effort` arguments.
 
 {available_models_description}
 ### When to delegate vs. do the subtask yourself
 - First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers on the critical path, and which tasks are sidecar tasks that are needed but can run in parallel without blocking the next local step. As part of that plan, explicitly decide what immediate task you should do locally right now. Do this planning step before delegating to agents so you do not hand off the immediate blocking task to a submodel and then waste time waiting on it.
-- Use the smaller subagent when a subtask is easy enough for it to handle and can run in parallel with your local work. Prefer delegating concrete, bounded sidecar tasks that materially advance the main task without blocking your immediate next local step.
+- Use a subagent when a subtask is easy enough for delegation and can run in parallel with your local work. Prefer delegating concrete, bounded sidecar tasks that materially advance the main task without blocking your immediate next local step.
 - Do not delegate urgent blocking work when your immediate next step depends on that result. If the very next action is blocked on that task, the main rollout should usually do it locally to keep the critical path moving.
 - Keep work local when the subtask is too difficult to delegate well and when it is tightly coupled, urgent, or likely to block your immediate next step.
 
@@ -1178,10 +1163,11 @@ fn spawn_agent_models_description(models: &[ModelPreset]) -> String {
     let visible_models: Vec<&ModelPreset> =
         models.iter().filter(|model| model.show_in_picker).collect();
     if visible_models.is_empty() {
-        return "No picker-visible models are currently loaded.".to_string();
+        return "### Informational model catalog\n- No picker-visible models are currently loaded."
+            .to_string();
     }
 
-    visible_models
+    let models = visible_models
         .into_iter()
         .map(|model| {
             let efforts = model
@@ -1200,7 +1186,10 @@ fn spawn_agent_models_description(models: &[ModelPreset]) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    format!(
+        "### Informational model catalog\n- The entries below are informational only. Use `profile` when you need alternate child settings; otherwise the child inherits the lead's live model and reasoning.\n{models}"
+    )
 }
 
 fn create_spawn_agents_on_csv_tool() -> ToolSpec {
@@ -1407,17 +1396,14 @@ fn create_wait_agent_tool() -> ToolSpec {
         "ids".to_string(),
         JsonSchema::Array {
             items: Box::new(JsonSchema::String { description: None }),
-            description: Some(
-                "Agent ids to wait on. Pass multiple ids to wait for any requested final status by default, or set `return_when` to `all_final` to wait for every requested final status. Duplicate ids are rejected."
-                    .to_string(),
-            ),
+            description: Some("Agent ids to wait on. Duplicate ids are rejected.".to_string()),
         },
     );
     properties.insert(
         "timeout_ms".to_string(),
         JsonSchema::Number {
             description: Some(format!(
-                "Optional timeout in milliseconds. Defaults to {DEFAULT_WAIT_TIMEOUT_MS}, min {MIN_WAIT_TIMEOUT_MS}, max {MAX_WAIT_TIMEOUT_MS}. Prefer longer waits (minutes) to avoid busy polling."
+                "Optional timeout in milliseconds for the timed convenience mode used when `return_when` is omitted. Defaults to {DEFAULT_WAIT_TIMEOUT_MS}, min {MIN_WAIT_TIMEOUT_MS}, max {MAX_WAIT_TIMEOUT_MS}. Prefer longer waits (minutes) to avoid busy polling."
             )),
         },
     );
@@ -1425,7 +1411,7 @@ fn create_wait_agent_tool() -> ToolSpec {
         "disable_timeout".to_string(),
         JsonSchema::Boolean {
             description: Some(
-                "When true, wait without a timeout cap until the requested wait condition is satisfied. Cannot be combined with `timeout_ms`."
+                "When true, wait without a timeout cap until the requested `return_when` condition is satisfied. Requires `return_when` and cannot be combined with `timeout_ms`."
                     .to_string(),
             ),
         },
@@ -1434,7 +1420,7 @@ fn create_wait_agent_tool() -> ToolSpec {
         "return_when".to_string(),
         JsonSchema::String {
             description: Some(
-                "Optional wait condition. Accepted values: `any_final` (default) or `all_final`."
+                "Optional wait condition. Accepted values: `any_final` or `all_final`. When set, `disable_timeout=true` is required."
                     .to_string(),
             ),
         },
@@ -1445,7 +1431,7 @@ fn create_wait_agent_tool() -> ToolSpec {
         // Merge-safety anchor: keep wait-tool docs aligned with the emitted wait metadata so
         // timeout returns and all_final waits do not regress into stale “first finish wins”
         // guidance.
-        description: "Wait for agents to reach the requested final-status condition. By default, `wait` returns when any requested agent reaches a final status; set `return_when` to `all_final` to wait for every requested agent. Returns current state for every requested agent, including running agents on timeout, with recent lastActivity metadata when available. When the wait returns, a notification message will be received containing the same updated agent states."
+        description: "Wait for agents in one of two modes. Timed convenience mode: omit `return_when` and `wait` will return when a requested agent reaches a final status or the timeout elapses. Condition mode: set `return_when` to `any_final` or `all_final` and also set `disable_timeout=true`; `any_final` waits for the next requested agent that is not already final to reach a final status unless every requested agent is already terminal, and `all_final` waits for every requested agent to be terminal. Returns current state for every requested agent, including running agents on timeout, with recent lastActivity metadata when available. When the wait returns, a notification message will be received containing the same updated agent states."
             .to_string(),
         strict: false,
         defer_loading: None,

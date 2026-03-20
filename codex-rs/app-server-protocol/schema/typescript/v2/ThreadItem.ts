@@ -4,6 +4,7 @@
 import type { MessagePhase } from "../MessagePhase";
 import type { ReasoningEffort } from "../ReasoningEffort";
 import type { JsonValue } from "../serde_json/JsonValue";
+import type { CollabAgentRef } from "./CollabAgentRef";
 import type { CollabAgentState } from "./CollabAgentState";
 import type { CollabAgentTool } from "./CollabAgentTool";
 import type { CollabAgentToolCallStatus } from "./CollabAgentToolCallStatus";
@@ -82,15 +83,24 @@ senderThreadId: string,
  */
 receiverThreadIds: Array<string>,
 /**
+ * Optional nickname/role metadata for the receiving agents when available on the
+ * originating core event.
+ */
+receiverAgents: Array<CollabAgentRef>,
+/**
  * Prompt text sent as part of the collab tool call, when available.
  */
 prompt: string | null,
 /**
- * Model requested for the spawned agent, when applicable.
+ * Optional config profile selected for the spawned agent, when applicable.
+ */
+profile: string | null,
+/**
+ * Effective model used by the spawned agent, when applicable.
  */
 model: string | null,
 /**
- * Reasoning effort requested for the spawned agent, when applicable.
+ * Effective reasoning effort used by the spawned agent, when applicable.
  */
 reasoningEffort: ReasoningEffort | null,
 /**

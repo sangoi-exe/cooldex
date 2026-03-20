@@ -960,6 +960,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::CollabAgentSpawnBegin(begin_event) => {
+            // Merge-safety anchor: app-server spawn notifications must preserve effective child
+            // profile/model/reasoning metadata so live notifications match replayed history.
             let item = ThreadItem::CollabAgentToolCall {
                 id: begin_event.call_id,
                 tool: CollabAgentTool::SpawnAgent,
@@ -968,8 +970,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids: Vec::new(),
                 receiver_agents: Vec::new(),
                 prompt: Some(begin_event.prompt),
+                profile: begin_event.profile,
                 model: Some(begin_event.model),
-                reasoning_effort: Some(begin_event.reasoning_effort),
+                reasoning_effort: begin_event.reasoning_effort,
                 agents_states: HashMap::new(),
                 wait_state: None,
             };
@@ -1023,8 +1026,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                     })
                     .collect(),
                 prompt: Some(end_event.prompt),
+                profile: end_event.profile,
                 model: Some(end_event.model),
-                reasoning_effort: Some(end_event.reasoning_effort),
+                reasoning_effort: end_event.reasoning_effort,
                 agents_states,
                 wait_state: None,
             };
@@ -1047,6 +1051,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids,
                 receiver_agents: Vec::new(),
                 prompt: Some(begin_event.prompt),
+                profile: None,
                 model: None,
                 reasoning_effort: None,
                 agents_states: HashMap::new(),
@@ -1085,6 +1090,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     end_event.receiver_agent_role.clone(),
                 )],
                 prompt: Some(end_event.prompt),
+                profile: None,
                 model: None,
                 reasoning_effort: None,
                 agents_states: [(receiver_id, received_status)].into_iter().collect(),
@@ -1130,6 +1136,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 receiver_thread_ids: vec![begin_event.receiver_thread_id.to_string()],
                 receiver_agents: Vec::new(),
                 prompt: None,
+                profile: None,
                 model: None,
                 reasoning_effort: None,
                 agents_states: HashMap::new(),
@@ -1182,6 +1189,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     end_event.receiver_agent_role.clone(),
                 )],
                 prompt: None,
+                profile: None,
                 model: None,
                 reasoning_effort: None,
                 agents_states,
@@ -2642,6 +2650,7 @@ fn collab_resume_begin_item(
             begin_event.receiver_agent_role,
         )],
         prompt: None,
+        profile: None,
         model: None,
         reasoning_effort: None,
         agents_states: HashMap::new(),
@@ -2678,6 +2687,7 @@ fn collab_resume_end_item(end_event: codex_protocol::protocol::CollabResumeEndEv
             end_event.receiver_agent_role,
         )],
         prompt: None,
+        profile: None,
         model: None,
         reasoning_effort: None,
         agents_states,
@@ -2705,6 +2715,7 @@ fn collab_wait_begin_item(
             .map(V2CollabAgentRef::from)
             .collect(),
         prompt: None,
+        profile: None,
         model: None,
         reasoning_effort: None,
         agents_states: HashMap::new(),
@@ -2769,6 +2780,7 @@ fn collab_wait_end_item(end_event: codex_protocol::protocol::CollabWaitingEndEve
             .map(V2CollabAgentRef::from)
             .collect(),
         prompt: None,
+        profile: None,
         model: None,
         reasoning_effort: None,
         agents_states,
@@ -3226,6 +3238,7 @@ mod tests {
                 agent_role: Some("reviewer".to_string()),
             }],
             prompt: None,
+            profile: None,
             model: None,
             reasoning_effort: None,
             agents_states: HashMap::new(),
@@ -3259,6 +3272,7 @@ mod tests {
                 agent_role: Some("maintainer".to_string()),
             }],
             prompt: None,
+            profile: None,
             model: None,
             reasoning_effort: None,
             agents_states: [(
@@ -3291,6 +3305,7 @@ mod tests {
             wait_state: CoreCollabWaitState {
                 return_when: CoreCollabWaitReturnWhen::AllFinal,
                 disable_timeout: true,
+                condition_enabled: true,
                 timed_out: None,
             },
         };
@@ -3312,12 +3327,14 @@ mod tests {
                 .map(V2CollabAgentRef::from)
                 .collect(),
             prompt: None,
+            profile: None,
             model: None,
             reasoning_effort: None,
             agents_states: HashMap::new(),
             wait_state: Some(codex_app_server_protocol::CollabWaitState {
                 return_when: codex_app_server_protocol::CollabWaitReturnWhen::AllFinal,
                 disable_timeout: true,
+                condition_enabled: true,
                 timed_out: None,
             }),
         };
@@ -3346,6 +3363,7 @@ mod tests {
             wait_state: CoreCollabWaitState {
                 return_when: CoreCollabWaitReturnWhen::AnyFinal,
                 disable_timeout: false,
+                condition_enabled: false,
                 timed_out: Some(true),
             },
         };
@@ -3363,6 +3381,7 @@ mod tests {
                 agent_role: Some("observer".to_string()),
             }],
             prompt: None,
+            profile: None,
             model: None,
             reasoning_effort: None,
             agents_states: [(
@@ -3378,6 +3397,7 @@ mod tests {
             wait_state: Some(codex_app_server_protocol::CollabWaitState {
                 return_when: codex_app_server_protocol::CollabWaitReturnWhen::AnyFinal,
                 disable_timeout: false,
+                condition_enabled: false,
                 timed_out: Some(true),
             }),
         };

@@ -35,6 +35,7 @@ export type { ChatgptAuthTokensRefreshResponse } from "./ChatgptAuthTokensRefres
 export type { CodexErrorInfo } from "./CodexErrorInfo";
 export type { CollabAgentActivity } from "./CollabAgentActivity";
 export type { CollabAgentActivityKind } from "./CollabAgentActivityKind";
+export type { CollabAgentRef } from "./CollabAgentRef";
 export type { CollabAgentState } from "./CollabAgentState";
 export type { CollabAgentStatus } from "./CollabAgentStatus";
 export type { CollabAgentTool } from "./CollabAgentTool";

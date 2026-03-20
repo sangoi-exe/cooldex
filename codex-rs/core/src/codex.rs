@@ -587,6 +587,7 @@ impl Codex {
         let session_configuration = SessionConfiguration {
             provider: config.model_provider.clone(),
             collaboration_mode,
+            collaboration_mode_reasoning_effort_explicit: false,
             model_reasoning_summary: config.model_reasoning_summary,
             service_tier: config.service_tier,
             developer_instructions: config.developer_instructions.clone(),
@@ -1053,6 +1054,7 @@ pub(crate) struct SessionConfiguration {
     provider: ModelProviderInfo,
 
     collaboration_mode: CollaborationMode,
+    collaboration_mode_reasoning_effort_explicit: bool,
     model_reasoning_summary: Option<ReasoningSummaryConfig>,
     service_tier: Option<ServiceTier>,
 
@@ -1113,7 +1115,18 @@ impl SessionConfiguration {
         &self.codex_home
     }
 
+    fn effective_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
+        if self.collaboration_mode_reasoning_effort_explicit {
+            self.collaboration_mode.reasoning_effort()
+        } else {
+            self.collaboration_mode
+                .reasoning_effort()
+                .or(self.original_config_do_not_use.model_reasoning_effort)
+        }
+    }
+
     fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
+        let reasoning_effort = self.effective_reasoning_effort();
         ThreadConfigSnapshot {
             model: self.collaboration_mode.model().to_string(),
             model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
@@ -1124,7 +1137,7 @@ impl SessionConfiguration {
             cwd: self.cwd.clone(),
             config_path: self.config_path.clone(),
             ephemeral: self.original_config_do_not_use.ephemeral,
-            reasoning_effort: self.collaboration_mode.reasoning_effort(),
+            reasoning_effort,
             personality: self.personality,
             session_source: self.session_source.clone(),
         }
@@ -1139,6 +1152,8 @@ impl SessionConfiguration {
             );
         if let Some(collaboration_mode) = updates.collaboration_mode.clone() {
             next_configuration.collaboration_mode = collaboration_mode;
+            next_configuration.collaboration_mode_reasoning_effort_explicit =
+                updates.collaboration_mode_explicit;
         }
         if let Some(summary) = updates.reasoning_summary {
             next_configuration.model_reasoning_summary = Some(summary);
@@ -1194,6 +1209,7 @@ pub(crate) struct SessionSettingsUpdate {
     pub(crate) sandbox_policy: Option<SandboxPolicy>,
     pub(crate) windows_sandbox_level: Option<WindowsSandboxLevel>,
     pub(crate) collaboration_mode: Option<CollaborationMode>,
+    pub(crate) collaboration_mode_explicit: bool,
     pub(crate) reasoning_summary: Option<ReasoningSummaryConfig>,
     pub(crate) service_tier: Option<Option<ServiceTier>>,
     pub(crate) final_output_json_schema: Option<Option<Value>>,
@@ -1285,8 +1301,11 @@ impl Session {
         let config = session_configuration.original_config_do_not_use.clone();
         let mut per_turn_config = (*config).clone();
         per_turn_config.cwd = session_configuration.cwd.clone();
-        per_turn_config.model_reasoning_effort =
-            session_configuration.collaboration_mode.reasoning_effort();
+        // Merge-safety anchor: keep the session's persisted model reasoning as the fallback when
+        // Default-mode collaboration state omits an explicit effort, so child threads and normal
+        // turns inherit the lead's actual configured reasoning unless a turn/session override
+        // replaced it.
+        per_turn_config.model_reasoning_effort = session_configuration.effective_reasoning_effort();
         per_turn_config.model_reasoning_summary = session_configuration.model_reasoning_summary;
         per_turn_config.service_tier = session_configuration.service_tier;
         per_turn_config.personality = session_configuration.personality;
@@ -1365,7 +1384,7 @@ impl Session {
         js_repl: Arc<JsReplHandle>,
         skills_outcome: Arc<SkillLoadOutcome>,
     ) -> TurnContext {
-        let reasoning_effort = session_configuration.collaboration_mode.reasoning_effort();
+        let reasoning_effort = session_configuration.effective_reasoning_effort();
         let reasoning_summary = session_configuration
             .model_reasoning_summary
             .unwrap_or(model_info.default_reasoning_summary);
@@ -1696,7 +1715,7 @@ impl Session {
 
         session_telemetry.conversation_starts(
             config.model_provider.name.as_str(),
-            session_configuration.collaboration_mode.reasoning_effort(),
+            session_configuration.effective_reasoning_effort(),
             config
                 .model_reasoning_summary
                 .unwrap_or(ReasoningSummaryConfig::Auto),
@@ -1939,7 +1958,7 @@ impl Session {
                 approvals_reviewer: session_configuration.approvals_reviewer,
                 sandbox_policy: session_configuration.sandbox_policy.get().clone(),
                 cwd: session_configuration.cwd.clone(),
-                reasoning_effort: session_configuration.collaboration_mode.reasoning_effort(),
+                reasoning_effort: session_configuration.effective_reasoning_effort(),
                 history_log_id,
                 history_entry_count,
                 initial_messages,
@@ -2685,27 +2704,6 @@ impl Session {
     fn set_prompt_gc_activity(&self, active: bool) {
         self.prompt_gc_active.send_replace(active);
         let _ = self.prompt_gc_activity_edges.send(active);
-    }
-
-    /// Persist the event to the rollout file, flush it, and only then deliver it to clients.
-    ///
-    /// Most events can be delivered immediately after queueing the rollout write, but some
-    /// clients (e.g. app-server thread/rollback) re-read the rollout file synchronously on
-    /// receipt of the event and depend on the marker already being visible on disk.
-    pub(crate) async fn send_event_raw_flushed(&self, event: Event) {
-        // Record the last known agent status.
-        if let Some(status) = agent_status_from_event(&event.msg) {
-            self.agent_status.send_replace(status);
-        }
-        if let Some(activity) = agent_last_activity_from_event(&event.msg) {
-            self.agent_last_activity.send_replace(Some(activity));
-        }
-        self.persist_rollout_items(&[RolloutItem::EventMsg(event.msg.clone())])
-            .await;
-        self.flush_rollout().await;
-        if let Err(e) = self.tx_event.send(event).await {
-            debug!("dropping event because channel is closed: {e}");
-        }
     }
 
     async fn deliver_event_raw(&self, event: Event) {
@@ -4557,14 +4555,13 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                     collaboration_mode,
                     personality,
                 } => {
-                    let collaboration_mode = if let Some(collab_mode) = collaboration_mode {
-                        collab_mode
-                    } else {
+                    let (collaboration_mode, collaboration_mode_explicit) = {
                         let state = sess.state.lock().await;
-                        state.session_configuration.collaboration_mode.with_updates(
+                        handlers::resolve_collaboration_mode_update(
+                            &state.session_configuration,
                             model.clone(),
                             effort,
-                            /*developer_instructions*/ None,
+                            collaboration_mode,
                         )
                     };
                     handlers::override_turn_context(
@@ -4577,6 +4574,7 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                             sandbox_policy,
                             windows_sandbox_level,
                             collaboration_mode: Some(collaboration_mode),
+                            collaboration_mode_explicit,
                             reasoning_summary: summary,
                             service_tier,
                             personality,
@@ -4752,6 +4750,7 @@ fn submission_dispatch_span(sub: &Submission) -> tracing::Span {
 /// Operation handlers
 mod handlers {
     use crate::codex::Session;
+    use crate::codex::SessionConfiguration;
     use crate::codex::SessionSettingsUpdate;
     use crate::codex::SteerInputError;
 
@@ -4791,8 +4790,6 @@ mod handlers {
 
     use crate::context_manager::is_user_turn_boundary;
     use codex_protocol::config_types::CollaborationMode;
-    use codex_protocol::config_types::ModeKind;
-    use codex_protocol::config_types::Settings;
     use codex_protocol::dynamic_tools::DynamicToolResponse;
     use codex_protocol::mcp::RequestId as ProtocolRequestId;
     use codex_protocol::user_input::UserInput;
@@ -4803,6 +4800,27 @@ mod handlers {
     use std::sync::Arc;
     use tracing::info;
     use tracing::warn;
+
+    use crate::codex::ReasoningEffortConfig;
+
+    pub(super) fn resolve_collaboration_mode_update(
+        session_configuration: &SessionConfiguration,
+        model: Option<String>,
+        effort: Option<Option<ReasoningEffortConfig>>,
+        collaboration_mode: Option<CollaborationMode>,
+    ) -> (CollaborationMode, bool) {
+        match collaboration_mode {
+            Some(collaboration_mode) => (collaboration_mode, true),
+            None => {
+                let collaboration_mode = session_configuration
+                    .collaboration_mode
+                    .with_updates(model, effort, /*developer_instructions*/ None);
+                let collaboration_mode_explicit = effort.is_some()
+                    || session_configuration.collaboration_mode_reasoning_effort_explicit;
+                (collaboration_mode, collaboration_mode_explicit)
+            }
+        }
+    }
 
     pub async fn interrupt(sess: &Arc<Session>) {
         sess.interrupt_task().await;
@@ -4844,16 +4862,15 @@ mod handlers {
                 collaboration_mode,
                 personality,
             } => {
-                let collaboration_mode = collaboration_mode.or_else(|| {
-                    Some(CollaborationMode {
-                        mode: ModeKind::Default,
-                        settings: Settings {
-                            model: model.clone(),
-                            reasoning_effort: effort,
-                            developer_instructions: None,
-                        },
-                    })
-                });
+                let (collaboration_mode, collaboration_mode_explicit) = {
+                    let state = sess.state.lock().await;
+                    resolve_collaboration_mode_update(
+                        &state.session_configuration,
+                        Some(model.clone()),
+                        effort.map(Some),
+                        collaboration_mode,
+                    )
+                };
                 (
                     items,
                     SessionSettingsUpdate {
@@ -4862,7 +4879,8 @@ mod handlers {
                         approvals_reviewer: None,
                         sandbox_policy: Some(sandbox_policy),
                         windows_sandbox_level: None,
-                        collaboration_mode,
+                        collaboration_mode: Some(collaboration_mode),
+                        collaboration_mode_explicit,
                         reasoning_summary: summary,
                         service_tier,
                         final_output_json_schema: Some(final_output_json_schema),
@@ -5364,6 +5382,8 @@ mod handlers {
             .collect::<Vec<_>>();
         sess.persist_rollout_items(&[RolloutItem::EventMsg(rollback_msg.clone())])
             .await;
+        // Flush and rebuild the in-memory rollout view before notifying clients because rollback
+        // consumers re-read the rollout file synchronously on receipt of the event.
         sess.flush_rollout().await;
         sess.apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
             .await;
@@ -7821,16 +7841,26 @@ async fn emit_turn_item_in_plan_mode(
 }
 
 /// Handle a completed assistant response item in plan mode, returning true if handled.
+struct PlanModeAssistantItemDoneCtx<'a> {
+    previously_active_item: Option<&'a TurnItem>,
+    last_agent_message: &'a mut Option<String>,
+    recorded_response_items: &'a mut Vec<ResponseItem>,
+    execution_mode: SamplingExecutionMode,
+}
+
 async fn handle_assistant_item_done_in_plan_mode(
     sess: &Session,
     turn_context: &TurnContext,
     item: &ResponseItem,
     state: &mut PlanModeStreamState,
-    previously_active_item: Option<&TurnItem>,
-    last_agent_message: &mut Option<String>,
-    recorded_response_items: &mut Vec<ResponseItem>,
-    execution_mode: SamplingExecutionMode,
+    ctx: PlanModeAssistantItemDoneCtx<'_>,
 ) -> bool {
+    let PlanModeAssistantItemDoneCtx {
+        previously_active_item,
+        last_agent_message,
+        recorded_response_items,
+        execution_mode,
+    } = ctx;
     if let ResponseItem::Message { role, .. } = item
         && role == "assistant"
     {
@@ -8496,10 +8526,12 @@ async fn try_run_sampling_request(
                         &turn_context,
                         &item,
                         state,
-                        previously_active_item.as_ref(),
-                        &mut last_agent_message,
-                        &mut recorded_response_items,
-                        execution_mode,
+                        PlanModeAssistantItemDoneCtx {
+                            previously_active_item: previously_active_item.as_ref(),
+                            last_agent_message: &mut last_agent_message,
+                            recorded_response_items: &mut recorded_response_items,
+                            execution_mode,
+                        },
                     )
                     .await
                 {

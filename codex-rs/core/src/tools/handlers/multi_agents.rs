@@ -16,7 +16,6 @@ use crate::config::deserialize_config_toml_with_base;
 use crate::error::CodexErr;
 use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
-use crate::models_manager::manager::RefreshStrategy;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -28,8 +27,6 @@ use async_trait::async_trait;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::ResponseInputItem;
-use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::CollabAgentInteractionBeginEvent;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
 use codex_protocol::protocol::CollabAgentRef;
@@ -278,10 +275,12 @@ fn build_agent_resume_config(
 }
 
 fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
-    let base_config = turn.config.clone();
-    let mut config = (*base_config).clone();
+    let mut config = turn.config.as_ref().clone();
     config.model = Some(turn.model_info.slug.clone());
     config.model_provider = turn.provider.clone();
+    // Merge-safety anchor: child spawn config must trust the already-materialized turn context for
+    // effective reasoning effort so inherited-vs-explicit ownership stays in `SessionConfiguration`
+    // instead of being re-decided here.
     config.model_reasoning_effort = turn.reasoning_effort;
     config.model_reasoning_summary = Some(turn.reasoning_summary);
     strip_child_prompt_inheritance(&mut config);
@@ -320,6 +319,22 @@ async fn finalize_spawn_agent_prompt_config(
         .clone()
         .unwrap_or_else(|| turn.model_info.slug.clone());
     let model_info = models_manager.get_model_info(model.as_str(), config).await;
+    if !model_info.used_fallback_model_metadata
+        && let Some(reasoning_effort) = config.model_reasoning_effort
+        && !model_info
+            .supported_reasoning_levels
+            .iter()
+            .any(|preset| preset.effort == reasoning_effort)
+    {
+        let normalized_reasoning_effort = model_info.default_reasoning_level;
+        tracing::warn!(
+            model = model.as_str(),
+            ?reasoning_effort,
+            ?normalized_reasoning_effort,
+            "spawn_agent reasoning effort unsupported by final child model; normalizing to model default"
+        );
+        config.model_reasoning_effort = normalized_reasoning_effort;
+    }
     config.base_instructions = Some(
         config
             .subagent_base_instructions
@@ -336,6 +351,8 @@ fn apply_spawn_agent_profile_override(
         return Ok(());
     };
 
+    // Merge-safety anchor: profile reload is the only spawn-time path that may replace inherited
+    // child model/reasoning settings now that direct spawn-agent overrides are gone.
     let merged_toml = config.config_layer_stack.effective_config();
     let merged_config = deserialize_config_toml_with_base(merged_toml, &config.codex_home)
         .map_err(|err| {
@@ -517,107 +534,16 @@ fn current_statuses(
 
 fn collab_wait_state(
     return_when: codex_protocol::protocol::CollabWaitReturnWhen,
+    condition_enabled: bool,
     disable_timeout: bool,
     timed_out: Option<bool>,
 ) -> codex_protocol::protocol::CollabWaitState {
     codex_protocol::protocol::CollabWaitState {
         return_when,
         disable_timeout,
+        condition_enabled,
         timed_out,
     }
-}
-
-async fn apply_requested_spawn_agent_model_overrides(
-    session: &Session,
-    turn: &TurnContext,
-    config: &mut Config,
-    requested_model: Option<&str>,
-    requested_reasoning_effort: Option<ReasoningEffort>,
-) -> Result<(), FunctionCallError> {
-    if requested_model.is_none() && requested_reasoning_effort.is_none() {
-        return Ok(());
-    }
-
-    if let Some(requested_model) = requested_model {
-        let available_models = session
-            .services
-            .models_manager
-            .list_models(RefreshStrategy::Offline)
-            .await;
-        let selected_model_name = find_spawn_agent_model_name(&available_models, requested_model)?;
-        let selected_model_info = session
-            .services
-            .models_manager
-            .get_model_info(&selected_model_name, config)
-            .await;
-
-        config.model = Some(selected_model_name.clone());
-        if let Some(reasoning_effort) = requested_reasoning_effort {
-            validate_spawn_agent_reasoning_effort(
-                &selected_model_name,
-                &selected_model_info.supported_reasoning_levels,
-                reasoning_effort,
-            )?;
-            config.model_reasoning_effort = Some(reasoning_effort);
-        } else {
-            config.model_reasoning_effort = selected_model_info.default_reasoning_level;
-        }
-
-        return Ok(());
-    }
-
-    if let Some(reasoning_effort) = requested_reasoning_effort {
-        validate_spawn_agent_reasoning_effort(
-            &turn.model_info.slug,
-            &turn.model_info.supported_reasoning_levels,
-            reasoning_effort,
-        )?;
-        config.model_reasoning_effort = Some(reasoning_effort);
-    }
-
-    Ok(())
-}
-
-fn find_spawn_agent_model_name(
-    available_models: &[codex_protocol::openai_models::ModelPreset],
-    requested_model: &str,
-) -> Result<String, FunctionCallError> {
-    available_models
-        .iter()
-        .find(|model| model.model == requested_model)
-        .map(|model| model.model.clone())
-        .ok_or_else(|| {
-            let available = available_models
-                .iter()
-                .map(|model| model.model.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            FunctionCallError::RespondToModel(format!(
-                "Unknown model `{requested_model}` for spawn_agent. Available models: {available}"
-            ))
-        })
-}
-
-fn validate_spawn_agent_reasoning_effort(
-    model: &str,
-    supported_reasoning_levels: &[ReasoningEffortPreset],
-    requested_reasoning_effort: ReasoningEffort,
-) -> Result<(), FunctionCallError> {
-    if supported_reasoning_levels
-        .iter()
-        .any(|preset| preset.effort == requested_reasoning_effort)
-    {
-        return Ok(());
-    }
-
-    let supported = supported_reasoning_levels
-        .iter()
-        .map(|preset| preset.effort.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(FunctionCallError::RespondToModel(format!(
-        "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
-    )))
 }
 
 #[cfg(test)]

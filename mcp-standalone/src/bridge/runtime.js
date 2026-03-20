@@ -147,12 +147,26 @@ function createQueryValidationError(message, details = null) {
   return createBridgeRuntimeError(400, "BAD_REQUEST", message, details);
 }
 
+function readBridgeFailureCause(error) {
+  if (typeof error?.details?.rpcError?.message === "string" && error.details.rpcError.message.trim().length > 0) {
+    return error.details.rpcError.message.trim();
+  }
+  if (typeof error?.message === "string" && error.message.trim().length > 0) {
+    return error.message.trim();
+  }
+  if (typeof error?.details?.message === "string" && error.details.message.trim().length > 0) {
+    return error.details.message.trim();
+  }
+  return null;
+}
+
 function mapAppServerError(method, error) {
   if (error?.code === "APP_SERVER_RPC_ERROR") {
+    const cause = readBridgeFailureCause(error);
     return createBridgeRuntimeError(
       502,
       "APP_SERVER_RPC_ERROR",
-      `app-server ${method} returned a JSON-RPC error.`,
+      cause ? `app-server ${method} returned a JSON-RPC error: ${cause}` : `app-server ${method} returned a JSON-RPC error.`,
       error.details ?? null,
     );
   }
@@ -183,7 +197,10 @@ function mapAppServerError(method, error) {
   return createBridgeRuntimeError(
     502,
     "APP_SERVER_REQUEST_FAILED",
-    `app-server ${method} request failed.`,
+    (() => {
+      const cause = readBridgeFailureCause(error);
+      return cause ? `app-server ${method} request failed: ${cause}` : `app-server ${method} request failed.`;
+    })(),
     {
       code: error?.code ?? null,
       message: error instanceof Error ? error.message : String(error),

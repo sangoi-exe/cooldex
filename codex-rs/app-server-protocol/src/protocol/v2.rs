@@ -4233,9 +4233,14 @@ pub enum ThreadItem {
         receiver_agents: Vec<CollabAgentRef>,
         /// Prompt text sent as part of the collab tool call, when available.
         prompt: Option<String>,
-        /// Model requested for the spawned agent, when applicable.
+        /// Optional config profile selected for the spawned agent, when applicable.
+        profile: Option<String>,
+        // Merge-safety anchor: collab spawn history items must preserve effective child
+        // profile/model/reasoning together so app-server live items and replayed items stay in
+        // lockstep with the core rollout/operator surfaces.
+        /// Effective model used by the spawned agent, when applicable.
         model: Option<String>,
-        /// Reasoning effort requested for the spawned agent, when applicable.
+        /// Effective reasoning effort used by the spawned agent, when applicable.
         reasoning_effort: Option<ReasoningEffort>,
         /// Last known status of the target agents, when available.
         agents_states: HashMap<String, CollabAgentState>,
@@ -4539,22 +4544,83 @@ pub enum CollabAgentToolCallStatus {
     Failed,
 }
 
-v2_enum_from_core! {
-    pub enum CollabWaitReturnWhen from CoreCollabWaitReturnWhen {
-        AnyFinal,
-        AllFinal
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum CollabWaitReturnWhen {
+    #[default]
+    AnyFinal,
+    AllFinal,
+}
+
+impl CollabWaitReturnWhen {
+    pub fn to_core(self) -> CoreCollabWaitReturnWhen {
+        match self {
+            Self::AnyFinal => CoreCollabWaitReturnWhen::AnyFinal,
+            Self::AllFinal => CoreCollabWaitReturnWhen::AllFinal,
+        }
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+impl From<CoreCollabWaitReturnWhen> for CollabWaitReturnWhen {
+    fn from(value: CoreCollabWaitReturnWhen) -> Self {
+        match value {
+            CoreCollabWaitReturnWhen::AnyFinal => Self::AnyFinal,
+            CoreCollabWaitReturnWhen::AllFinal => Self::AllFinal,
+        }
+    }
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct CollabWaitState {
+    #[serde(default)]
     pub return_when: CollabWaitReturnWhen,
+    #[serde(default)]
     pub disable_timeout: bool,
+    #[serde(default)]
+    pub condition_enabled: bool,
     /// Null until the wait call finishes.
+    #[serde(default)]
     #[schemars(required, schema_with = "required_nullable_bool_schema")]
     pub timed_out: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollabWaitStateSerde {
+    #[serde(default)]
+    return_when: CollabWaitReturnWhen,
+    #[serde(default)]
+    disable_timeout: bool,
+    #[serde(default)]
+    condition_enabled: Option<bool>,
+    #[serde(default)]
+    timed_out: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for CollabWaitState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = CollabWaitStateSerde::deserialize(deserializer)?;
+        let condition_enabled =
+            raw.condition_enabled.unwrap_or(raw.disable_timeout) && raw.timed_out != Some(true);
+        Ok(Self {
+            return_when: raw.return_when,
+            disable_timeout: raw.disable_timeout,
+            condition_enabled,
+            timed_out: raw.timed_out,
+        })
+    }
+}
+
+impl CollabWaitState {
+    pub fn uses_explicit_condition(&self) -> bool {
+        self.condition_enabled && self.disable_timeout && self.timed_out != Some(true)
+    }
 }
 
 impl From<CoreCollabWaitState> for CollabWaitState {
@@ -4562,6 +4628,7 @@ impl From<CoreCollabWaitState> for CollabWaitState {
         Self {
             return_when: value.return_when.into(),
             disable_timeout: value.disable_timeout,
+            condition_enabled: value.uses_explicit_condition(),
             timed_out: value.timed_out,
         }
     }
@@ -8026,5 +8093,94 @@ mod tests {
         let serialized_without_override =
             serde_json::to_value(&without_override).expect("params should serialize");
         assert_eq!(serialized_without_override.get("serviceTier"), None);
+    }
+
+    #[test]
+    fn collab_wait_state_missing_condition_enabled_infers_from_disable_timeout() {
+        let wait_state: CollabWaitState = serde_json::from_value(json!({
+            "returnWhen": "allFinal",
+            "disableTimeout": true,
+            "timedOut": null,
+        }))
+        .expect("wait state should deserialize");
+
+        assert_eq!(
+            wait_state,
+            CollabWaitState {
+                return_when: CollabWaitReturnWhen::AllFinal,
+                disable_timeout: true,
+                condition_enabled: true,
+                timed_out: None,
+            }
+        );
+        assert!(wait_state.uses_explicit_condition());
+    }
+
+    #[test]
+    fn item_completed_notification_deserializes_legacy_wait_state_without_condition_enabled() {
+        let notification: ItemCompletedNotification = serde_json::from_value(json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "type": "collabAgentToolCall",
+                "id": "wait-1",
+                "tool": "wait",
+                "status": "completed",
+                "senderThreadId": "sender-1",
+                "receiverThreadIds": ["receiver-1"],
+                "receiverAgents": [],
+                "prompt": null,
+                "profile": null,
+                "model": null,
+                "reasoningEffort": null,
+                "agentsStates": {},
+                "waitState": {
+                    "returnWhen": "anyFinal",
+                    "disableTimeout": false,
+                    "timedOut": true
+                }
+            }
+        }))
+        .expect("legacy notification should deserialize");
+
+        let ThreadItem::CollabAgentToolCall { wait_state, .. } = notification.item else {
+            panic!("expected collab agent tool call");
+        };
+        assert_eq!(
+            wait_state,
+            Some(CollabWaitState {
+                return_when: CollabWaitReturnWhen::AnyFinal,
+                disable_timeout: false,
+                condition_enabled: false,
+                timed_out: Some(true),
+            })
+        );
+        assert!(
+            !wait_state
+                .expect("wait state should be present")
+                .uses_explicit_condition()
+        );
+    }
+
+    #[test]
+    fn collab_wait_state_timed_out_disables_impossible_explicit_condition() {
+        let wait_state: CollabWaitState = serde_json::from_value(json!({
+            "returnWhen": "anyFinal",
+            "disableTimeout": true,
+            "conditionEnabled": true,
+            "timedOut": true,
+        }))
+        .expect("invalid mixed wait state should deserialize");
+
+        assert_eq!(
+            wait_state,
+            CollabWaitState {
+                return_when: CollabWaitReturnWhen::AnyFinal,
+                disable_timeout: true,
+                condition_enabled: false,
+                timed_out: Some(true),
+            }
+        );
+        assert!(!wait_state.uses_explicit_condition());
     }
 }

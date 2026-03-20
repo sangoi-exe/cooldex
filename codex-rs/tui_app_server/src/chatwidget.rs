@@ -737,7 +737,6 @@ pub(crate) struct ChatWidget {
     // Latest completed user-visible Codex output that `/copy` should place on the clipboard.
     last_copyable_output: Option<String>,
     running_commands: HashMap<String, RunningCommand>,
-    pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
     suppressed_exec_calls: HashSet<String>,
     skills_all: Vec<ProtocolSkillMetadata>,
     skills_initial_state: Option<HashMap<PathBuf, bool>>,
@@ -1375,8 +1374,38 @@ fn app_server_collab_wait_state_to_core(wait_state: &AppServerCollabWaitState) -
             AppServerCollabWaitReturnWhen::AllFinal => CollabWaitReturnWhen::AllFinal,
         },
         disable_timeout: wait_state.disable_timeout,
+        condition_enabled: wait_state.uses_explicit_condition(),
         timed_out: wait_state.timed_out,
     }
+}
+
+// Merge-safety anchor: wait tool items coming from app-server must not synthesize explicit
+// any_final/all_final semantics when wait metadata is missing; fall back to generic timed
+// rendering only and warn so the protocol violation stays visible in logs.
+fn missing_app_server_collab_wait_state_for_render() -> CollabWaitState {
+    tracing::warn!(
+        "wait tool item arrived without wait_state; falling back to generic timed wait rendering"
+    );
+    CollabWaitState {
+        return_when: CollabWaitReturnWhen::AnyFinal,
+        disable_timeout: false,
+        condition_enabled: false,
+        timed_out: None,
+    }
+}
+
+fn invalid_completed_app_server_spawn_status(missing_fields: &[&str]) -> AgentStatus {
+    let missing_fields = missing_fields.join(", ");
+    tracing::warn!(
+        "completed spawn tool item missing required fields: {missing_fields}; surfacing protocol violation"
+    );
+    AgentStatus::Errored(format!(
+        "protocol violation: completed spawn item missing {missing_fields}"
+    ))
+}
+
+fn protocol_violation_placeholder(field_name: &str) -> String {
+    format!("<protocol violation: missing {field_name}>")
 }
 
 fn app_server_collab_receiver_identity(
@@ -3389,6 +3418,7 @@ impl ChatWidget {
             receiver_thread_ids,
             receiver_agents,
             prompt,
+            profile,
             model,
             reasoning_effort,
             agents_states,
@@ -3406,56 +3436,91 @@ impl ChatWidget {
 
         match tool {
             CollabAgentTool::SpawnAgent => {
-                if let (Some(model), Some(reasoning_effort)) = (model.clone(), reasoning_effort) {
-                    self.pending_collab_spawn_requests.insert(
-                        id.clone(),
-                        multi_agents::SpawnRequestSummary {
-                            model,
-                            reasoning_effort,
-                        },
-                    );
-                }
-
-                if !matches!(status, CollabAgentToolCallStatus::InProgress) {
-                    let spawn_request =
-                        self.pending_collab_spawn_requests.remove(&id).or_else(|| {
-                            model
-                                .zip(reasoning_effort)
-                                .map(|(model, reasoning_effort)| {
-                                    multi_agents::SpawnRequestSummary {
-                                        model,
-                                        reasoning_effort,
-                                    }
-                                })
-                        });
-                    let (new_agent_nickname, new_agent_role) = first_receiver
-                        .as_ref()
-                        .map(|thread_id| {
-                            app_server_collab_receiver_identity(
-                                &thread_id.to_string(),
-                                &receiver_agents,
-                                &agents_states,
-                            )
-                        })
-                        .unwrap_or_default();
+                if matches!(status, CollabAgentToolCallStatus::Completed) {
+                    let mut missing_fields = Vec::new();
+                    if first_receiver.is_none() {
+                        missing_fields.push("receiverThreadIds[0]");
+                    }
+                    if prompt
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|prompt| !prompt.is_empty())
+                        .is_none()
+                    {
+                        missing_fields.push("prompt");
+                    }
+                    if model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|model| !model.is_empty())
+                        .is_none()
+                    {
+                        missing_fields.push("model");
+                    }
                     let receiver_status = first_receiver
                         .as_ref()
                         .and_then(|thread_id| agents_states.get(&thread_id.to_string()))
-                        .map(app_server_collab_state_to_core)
-                        .unwrap_or_else(|| AgentStatus::Errored("Agent spawn failed".into()));
+                        .map(app_server_collab_state_to_core);
+                    if receiver_status.is_none() {
+                        missing_fields.push("agentsStates[receiver]");
+                    }
+                    let (new_thread_id, new_agent_nickname, new_agent_role, receiver_status) =
+                        if missing_fields.is_empty() {
+                            let (new_agent_nickname, new_agent_role) = first_receiver
+                                .as_ref()
+                                .map(|thread_id| {
+                                    app_server_collab_receiver_identity(
+                                        &thread_id.to_string(),
+                                        &receiver_agents,
+                                        &agents_states,
+                                    )
+                                })
+                                .unwrap_or_default();
+                            (first_receiver, new_agent_nickname, new_agent_role, {
+                                let Some(receiver_status) = receiver_status else {
+                                    unreachable!(
+                                        "receiver status should exist when no fields are missing"
+                                    );
+                                };
+                                receiver_status
+                            })
+                        } else {
+                            (
+                                None,
+                                None,
+                                None,
+                                invalid_completed_app_server_spawn_status(&missing_fields),
+                            )
+                        };
                     self.on_collab_event(multi_agents::spawn_end(
                         codex_protocol::protocol::CollabAgentSpawnEndEvent {
                             call_id: id,
                             sender_thread_id,
-                            new_thread_id: first_receiver,
+                            new_thread_id,
                             new_agent_nickname,
                             new_agent_role,
-                            prompt: prompt.unwrap_or_default(),
-                            model: String::new(),
-                            reasoning_effort: ReasoningEffortConfig::Medium,
+                            prompt: prompt
+                                .unwrap_or_else(|| protocol_violation_placeholder("prompt")),
+                            profile,
+                            model: model.unwrap_or_else(|| protocol_violation_placeholder("model")),
+                            reasoning_effort,
                             status: receiver_status,
                         },
-                        spawn_request.as_ref(),
+                    ));
+                } else if matches!(status, CollabAgentToolCallStatus::Failed) {
+                    self.on_collab_event(multi_agents::spawn_end(
+                        codex_protocol::protocol::CollabAgentSpawnEndEvent {
+                            call_id: id,
+                            sender_thread_id,
+                            new_thread_id: None,
+                            new_agent_nickname: None,
+                            new_agent_role: None,
+                            prompt: prompt.unwrap_or_default(),
+                            profile,
+                            model: model.unwrap_or_default(),
+                            reasoning_effort,
+                            status: AgentStatus::Errored("Agent spawn failed".to_string()),
+                        },
                     ));
                 }
             }
@@ -3530,7 +3595,7 @@ impl ChatWidget {
                 let wait_state = wait_state
                     .as_ref()
                     .map(app_server_collab_wait_state_to_core)
-                    .unwrap_or_default();
+                    .unwrap_or_else(missing_app_server_collab_wait_state_for_render);
                 if matches!(status, CollabAgentToolCallStatus::InProgress) {
                     self.on_collab_event(multi_agents::waiting_begin(
                         codex_protocol::protocol::CollabWaitingBeginEvent {
@@ -4316,7 +4381,6 @@ impl ChatWidget {
             plan_stream_controller: None,
             last_copyable_output: None,
             running_commands: HashMap::new(),
-            pending_collab_spawn_requests: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
             unified_exec_wait_streak: None,
@@ -5865,6 +5929,7 @@ impl ChatWidget {
                 receiver_thread_ids,
                 receiver_agents,
                 prompt,
+                profile,
                 model,
                 reasoning_effort,
                 agents_states,
@@ -5877,6 +5942,7 @@ impl ChatWidget {
                 receiver_thread_ids,
                 receiver_agents,
                 prompt,
+                profile,
                 model,
                 reasoning_effort,
                 agents_states,
@@ -6323,6 +6389,7 @@ impl ChatWidget {
                 receiver_thread_ids,
                 receiver_agents,
                 prompt,
+                profile,
                 model,
                 reasoning_effort,
                 agents_states,
@@ -6335,6 +6402,7 @@ impl ChatWidget {
                 receiver_thread_ids,
                 receiver_agents,
                 prompt,
+                profile,
                 model,
                 reasoning_effort,
                 agents_states,
@@ -6620,24 +6688,10 @@ impl ChatWidget {
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
-            EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
-                call_id,
-                model,
-                reasoning_effort,
-                ..
-            }) => {
-                self.pending_collab_spawn_requests.insert(
-                    call_id,
-                    multi_agents::SpawnRequestSummary {
-                        model,
-                        reasoning_effort,
-                    },
-                );
-            }
-            EventMsg::CollabAgentSpawnEnd(ev) => {
-                let spawn_request = self.pending_collab_spawn_requests.remove(&ev.call_id);
-                self.on_collab_event(multi_agents::spawn_end(ev, spawn_request.as_ref()));
-            }
+            EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent { .. }) => {}
+            // Merge-safety anchor: the TUI app-server widget must render spawn rows from the
+            // effective end-event payload; do not restore begin-event request caching here.
+            EventMsg::CollabAgentSpawnEnd(ev) => self.on_collab_event(multi_agents::spawn_end(ev)),
             EventMsg::CollabAgentInteractionBegin(_) => {}
             EventMsg::CollabAgentInteractionEnd(ev) => {
                 self.on_collab_event(multi_agents::interaction_end(ev))

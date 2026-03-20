@@ -15,6 +15,12 @@ use tokio::time::timeout_at;
 
 pub(crate) struct Handler;
 
+struct StatusSubscription {
+    thread_id: ThreadId,
+    status_rx: Receiver<AgentStatus>,
+    was_final_at_start: bool,
+}
+
 #[async_trait]
 impl ToolHandler for Handler {
     type Output = WaitResult;
@@ -47,6 +53,18 @@ impl ToolHandler for Handler {
                 "disable_timeout cannot be combined with timeout_ms".to_owned(),
             ));
         }
+        let condition_enabled = args.return_when.is_some();
+        if condition_enabled && !args.disable_timeout {
+            return Err(FunctionCallError::RespondToModel(
+                "return_when requires disable_timeout=true".to_owned(),
+            ));
+        }
+        if !condition_enabled && args.disable_timeout {
+            return Err(FunctionCallError::RespondToModel(
+                "disable_timeout requires return_when".to_owned(),
+            ));
+        }
+        let return_when = args.return_when.unwrap_or_default();
 
         let receiver_thread_ids = args
             .ids
@@ -97,22 +115,32 @@ impl ToolHandler for Handler {
                     receiver_thread_ids: receiver_thread_ids.clone(),
                     receiver_agents: receiver_agents.clone(),
                     call_id: call_id.clone(),
-                    wait_state: collab_wait_state(args.return_when, args.disable_timeout, None),
+                    wait_state: collab_wait_state(
+                        return_when,
+                        condition_enabled,
+                        args.disable_timeout,
+                        None,
+                    ),
                 }
                 .into(),
             )
             .await;
 
-        let mut status_rxs = Vec::with_capacity(receiver_thread_ids.len());
+        let mut status_subscriptions = Vec::with_capacity(receiver_thread_ids.len());
         let mut final_status_count = 0;
         for id in &receiver_thread_ids {
             match session.services.agent_control.subscribe_status(*id).await {
                 Ok(rx) => {
                     let status = rx.borrow().clone();
-                    if is_final(&status) {
+                    let was_final_at_start = is_final(&status);
+                    if was_final_at_start {
                         final_status_count += 1;
                     }
-                    status_rxs.push((*id, rx));
+                    status_subscriptions.push(StatusSubscription {
+                        thread_id: *id,
+                        status_rx: rx,
+                        was_final_at_start,
+                    });
                 }
                 Err(CodexErr::ThreadNotFound(_)) => {
                     final_status_count += 1;
@@ -133,7 +161,8 @@ impl ToolHandler for Handler {
                                 ),
                                 statuses,
                                 wait_state: collab_wait_state(
-                                    args.return_when,
+                                    return_when,
+                                    condition_enabled,
                                     args.disable_timeout,
                                     None,
                                 ),
@@ -147,15 +176,16 @@ impl ToolHandler for Handler {
         }
 
         let mut condition_met = wait_condition_already_met(
-            args.return_when,
+            condition_enabled,
+            return_when,
             final_status_count,
             receiver_thread_ids.len(),
         );
         if !condition_met {
             condition_met = wait_for_condition(
                 session.clone(),
-                status_rxs,
-                args.return_when,
+                status_subscriptions,
+                return_when,
                 timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms as u64)),
             )
             .await?;
@@ -178,7 +208,8 @@ impl ToolHandler for Handler {
                     agent_statuses,
                     statuses: statuses_map,
                     wait_state: collab_wait_state(
-                        args.return_when,
+                        return_when,
+                        condition_enabled,
                         args.disable_timeout,
                         Some(result.timed_out),
                     ),
@@ -196,8 +227,7 @@ struct WaitArgs {
     ids: Vec<String>,
     #[serde(default)]
     disable_timeout: bool,
-    #[serde(default)]
-    return_when: CollabWaitReturnWhen,
+    return_when: Option<CollabWaitReturnWhen>,
     timeout_ms: Option<i64>,
 }
 
@@ -248,37 +278,58 @@ async fn wait_for_final_status(
 }
 
 fn wait_condition_already_met(
+    condition_enabled: bool,
     return_when: CollabWaitReturnWhen,
     final_status_count: usize,
     total_status_count: usize,
 ) -> bool {
+    if !condition_enabled {
+        return final_status_count > 0;
+    }
     match return_when {
-        CollabWaitReturnWhen::AnyFinal => final_status_count > 0,
+        CollabWaitReturnWhen::AnyFinal => final_status_count == total_status_count,
         CollabWaitReturnWhen::AllFinal => final_status_count == total_status_count,
     }
 }
 
 async fn wait_for_condition(
     session: Arc<Session>,
-    status_rxs: Vec<(ThreadId, Receiver<AgentStatus>)>,
+    status_subscriptions: Vec<StatusSubscription>,
     return_when: CollabWaitReturnWhen,
     deadline: Option<Instant>,
 ) -> Result<bool, FunctionCallError> {
     match return_when {
-        CollabWaitReturnWhen::AnyFinal => wait_for_any_final(session, status_rxs, deadline).await,
-        CollabWaitReturnWhen::AllFinal => wait_for_all_final(session, status_rxs, deadline).await,
+        CollabWaitReturnWhen::AnyFinal => {
+            wait_for_any_final(session, status_subscriptions, deadline).await
+        }
+        CollabWaitReturnWhen::AllFinal => {
+            wait_for_all_final(session, status_subscriptions, deadline).await
+        }
     }
 }
 
 async fn wait_for_any_final(
     session: Arc<Session>,
-    status_rxs: Vec<(ThreadId, Receiver<AgentStatus>)>,
+    status_subscriptions: Vec<StatusSubscription>,
     deadline: Option<Instant>,
 ) -> Result<bool, FunctionCallError> {
     let mut futures = FuturesUnordered::new();
-    for (id, rx) in status_rxs {
+    for subscription in status_subscriptions {
+        if subscription.was_final_at_start {
+            continue;
+        }
+        if is_final(&subscription.status_rx.borrow().clone()) {
+            return Ok(true);
+        }
         let session = session.clone();
-        futures.push(wait_for_final_status(session, id, rx));
+        futures.push(wait_for_final_status(
+            session,
+            subscription.thread_id,
+            subscription.status_rx,
+        ));
+    }
+    if futures.is_empty() {
+        return Ok(true);
     }
     wait_for_any_final_from_futures(&mut futures, deadline).await
 }
@@ -320,16 +371,20 @@ where
 
 async fn wait_for_all_final(
     session: Arc<Session>,
-    status_rxs: Vec<(ThreadId, Receiver<AgentStatus>)>,
+    status_subscriptions: Vec<StatusSubscription>,
     deadline: Option<Instant>,
 ) -> Result<bool, FunctionCallError> {
     let mut futures = FuturesUnordered::new();
-    for (id, rx) in status_rxs {
-        if is_final(&rx.borrow().clone()) {
+    for subscription in status_subscriptions {
+        if subscription.was_final_at_start || is_final(&subscription.status_rx.borrow().clone()) {
             continue;
         }
         let session = session.clone();
-        futures.push(wait_for_final_status(session, id, rx));
+        futures.push(wait_for_final_status(
+            session,
+            subscription.thread_id,
+            subscription.status_rx,
+        ));
     }
 
     let mut remaining = futures.len();
@@ -370,5 +425,60 @@ async fn wait_for_all_final(
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codex::make_session_and_context;
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn wait_for_any_final_returns_success_when_filtered_set_is_empty() {
+        let (session, _) = make_session_and_context().await;
+        let (_status_tx, status_rx) = watch::channel(AgentStatus::Shutdown);
+
+        let result = wait_for_any_final(
+            Arc::new(session),
+            vec![StatusSubscription {
+                thread_id: ThreadId::new(),
+                status_rx,
+                was_final_at_start: true,
+            }],
+            None,
+        )
+        .await
+        .expect("empty filtered any_final set should succeed");
+
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn wait_for_any_final_returns_success_when_receiver_became_final_after_start() {
+        let (session, _) = make_session_and_context().await;
+        let (_finished_tx, finished_rx) = watch::channel(AgentStatus::Shutdown);
+        let (_running_tx, running_rx) = watch::channel(AgentStatus::Running);
+
+        let result = wait_for_any_final(
+            Arc::new(session),
+            vec![
+                StatusSubscription {
+                    thread_id: ThreadId::new(),
+                    status_rx: finished_rx,
+                    was_final_at_start: false,
+                },
+                StatusSubscription {
+                    thread_id: ThreadId::new(),
+                    status_rx: running_rx,
+                    was_final_at_start: false,
+                },
+            ],
+            None,
+        )
+        .await
+        .expect("a receiver that became final after wait start should satisfy any_final");
+
+        assert!(result);
     }
 }

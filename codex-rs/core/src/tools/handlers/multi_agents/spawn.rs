@@ -50,32 +50,11 @@ impl ToolHandler for Handler {
                 "Agent depth limit reached. Solve the task yourself.".to_string(),
             ));
         }
-        session
-            .send_event(
-                &turn,
-                CollabAgentSpawnBeginEvent {
-                    call_id: call_id.clone(),
-                    sender_thread_id: session.conversation_id,
-                    prompt: prompt.clone(),
-                    model: args.model.clone().unwrap_or_default(),
-                    reasoning_effort: args.reasoning_effort.unwrap_or_default(),
-                }
-                .into(),
-            )
-            .await;
         let mut config = build_agent_spawn_config(turn.as_ref())?;
-        apply_requested_spawn_agent_model_overrides(
-            &session,
-            turn.as_ref(),
-            &mut config,
-            args.model.as_deref(),
-            args.reasoning_effort,
-        )
-        .await?;
+        apply_spawn_agent_profile_override(&mut config, profile_name)?;
         apply_role_to_config(&mut config, role_name)
             .await
             .map_err(FunctionCallError::RespondToModel)?;
-        apply_spawn_agent_profile_override(&mut config, profile_name)?;
         apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
         finalize_spawn_agent_prompt_config(
             &mut config,
@@ -84,6 +63,29 @@ impl ToolHandler for Handler {
         )
         .await;
         apply_spawn_agent_overrides(&mut config, child_depth);
+        // Merge-safety anchor: spawn-agent children inherit the lead model/reasoning unless a
+        // profile replaces them, and role-locked settings still win after profile selection;
+        // begin/end events must report the effective child profile/model/reasoning together.
+        let configured_model = config
+            .model
+            .clone()
+            .unwrap_or_else(|| turn.model_info.slug.clone());
+        let configured_reasoning_effort = config.model_reasoning_effort;
+        let configured_profile = config.active_profile.clone();
+        session
+            .send_event(
+                &turn,
+                CollabAgentSpawnBeginEvent {
+                    call_id: call_id.clone(),
+                    sender_thread_id: session.conversation_id,
+                    prompt: prompt.clone(),
+                    profile: configured_profile.clone(),
+                    model: configured_model.clone(),
+                    reasoning_effort: configured_reasoning_effort,
+                }
+                .into(),
+            )
+            .await;
 
         let result = session
             .services
@@ -102,44 +104,41 @@ impl ToolHandler for Handler {
             )
             .await
             .map_err(collab_spawn_error);
-        let (new_thread_id, status) = match &result {
-            Ok(thread_id) => (
-                Some(*thread_id),
-                session.services.agent_control.get_status(*thread_id).await,
-            ),
-            Err(_) => (None, AgentStatus::NotFound),
-        };
-        let agent_snapshot = match new_thread_id {
-            Some(thread_id) => {
-                session
+        let (new_thread_id, status, agent_snapshot) = match result.as_ref() {
+            Ok(thread_id) => {
+                let Some(agent_snapshot) = session
                     .services
                     .agent_control
-                    .get_agent_config_snapshot(thread_id)
+                    .get_agent_config_snapshot(*thread_id)
                     .await
+                else {
+                    return Err(FunctionCallError::Fatal(format!(
+                        "spawned agent {thread_id} missing config snapshot after successful spawn"
+                    )));
+                };
+                (
+                    Some(*thread_id),
+                    session.services.agent_control.get_status(*thread_id).await,
+                    Some(agent_snapshot),
+                )
             }
-            None => None,
+            Err(_) => (None, AgentStatus::NotFound, None),
         };
-        let (new_agent_nickname, new_agent_role) = match (&agent_snapshot, new_thread_id) {
-            (Some(snapshot), _) => (
+        let (new_agent_nickname, new_agent_role) = match &agent_snapshot {
+            Some(snapshot) => (
                 snapshot.session_source.get_nickname(),
                 snapshot.session_source.get_agent_role(),
             ),
-            (None, Some(thread_id)) => session
-                .services
-                .agent_control
-                .get_agent_nickname_and_role(thread_id)
-                .await
-                .unwrap_or((None, None)),
-            (None, None) => (None, None),
+            None => (None, None),
         };
         let effective_model = agent_snapshot
             .as_ref()
             .map(|snapshot| snapshot.model.clone())
-            .unwrap_or_else(|| args.model.clone().unwrap_or_default());
+            .unwrap_or_else(|| configured_model.clone());
         let effective_reasoning_effort = agent_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.reasoning_effort)
-            .unwrap_or(args.reasoning_effort.unwrap_or_default());
+            .or(configured_reasoning_effort);
         let nickname = new_agent_nickname.clone();
         session
             .send_event(
@@ -151,6 +150,7 @@ impl ToolHandler for Handler {
                     new_agent_nickname,
                     new_agent_role,
                     prompt,
+                    profile: configured_profile,
                     model: effective_model,
                     reasoning_effort: effective_reasoning_effort,
                     status,
@@ -174,13 +174,12 @@ impl ToolHandler for Handler {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SpawnAgentArgs {
     message: Option<String>,
     items: Option<Vec<UserInput>>,
     agent_type: Option<String>,
     profile: Option<String>,
-    model: Option<String>,
-    reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     fork_context: bool,
 }

@@ -32,11 +32,11 @@ const TURN_2_NO_WAIT_PROMPT: &str = "follow up without wait";
 const CHILD_PROMPT: &str = "child: do work";
 const INHERITED_MODEL: &str = "gpt-5.2-codex";
 const INHERITED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::XHigh;
-const REQUESTED_MODEL: &str = "gpt-5.1";
-const REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 const ROLE_MODEL: &str = "gpt-5.1-codex-max";
 const ROLE_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 
+// Merge-safety anchor: collab spawn notification tests here must keep child model/reasoning
+// metadata aligned with lead inheritance, profile overrides, role overrides, and schema removal.
 fn body_contains(req: &wiremock::Request, text: &str) -> bool {
     let is_zstd = req
         .headers
@@ -407,33 +407,47 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawn_agent_requested_model_and_reasoning_override_inherited_settings_without_role()
--> Result<()> {
+async fn spawn_agent_inherits_lead_model_and_reasoning_without_profile() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let child_snapshot = spawn_child_and_capture_snapshot(
-        &server,
-        json!({
-            "message": CHILD_PROMPT,
-            "model": REQUESTED_MODEL,
-            "reasoning_effort": REQUESTED_REASONING_EFFORT,
-        }),
-        |builder| builder,
-    )
-    .await?;
+    let child_snapshot =
+        spawn_child_and_capture_snapshot(&server, json!({ "message": CHILD_PROMPT }), |builder| {
+            builder
+        })
+        .await?;
 
-    assert_eq!(child_snapshot.model, REQUESTED_MODEL);
+    assert_eq!(child_snapshot.model, INHERITED_MODEL);
     assert_eq!(
         child_snapshot.reasoning_effort,
-        Some(REQUESTED_REASONING_EFFORT)
+        Some(INHERITED_REASONING_EFFORT)
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> Result<()> {
+async fn spawn_agent_keeps_reasoning_effort_absent_when_lead_has_none() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let child_snapshot =
+        spawn_child_and_capture_snapshot(&server, json!({ "message": CHILD_PROMPT }), |builder| {
+            builder.with_config(|config| {
+                config.model = Some(INHERITED_MODEL.to_string());
+                config.model_reasoning_effort = None;
+            })
+        })
+        .await?;
+
+    assert_eq!(child_snapshot.model, INHERITED_MODEL);
+    assert_eq!(child_snapshot.reasoning_effort, None);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_agent_role_overrides_inherited_model_and_reasoning_settings() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -442,8 +456,6 @@ async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> 
         json!({
             "message": CHILD_PROMPT,
             "agent_type": "custom",
-            "model": REQUESTED_MODEL,
-            "reasoning_effort": REQUESTED_REASONING_EFFORT,
         }),
         |builder| {
             builder.with_config(|config| {
@@ -524,6 +536,49 @@ async fn spawn_agent_tool_description_mentions_role_locked_settings() -> Result<
     assert_eq!(
         custom_role_description,
         "custom: {\nCustom role\n- This role's model is set to `gpt-5.1-codex-max` and its reasoning effort is set to `high`. These settings cannot be changed.\n}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_agent_tool_schema_omits_direct_model_and_reasoning_fields() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let resp_mock = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, TURN_1_PROMPT),
+        sse(vec![
+            ev_response_created("resp-turn1-1"),
+            ev_assistant_message("msg-turn1-1", "done"),
+            ev_completed("resp-turn1-1"),
+        ]),
+    )
+    .await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::Collab)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn(TURN_1_PROMPT).await?;
+
+    let request = resp_mock.single_request();
+    assert_eq!(
+        tool_parameter_description(&request, "spawn_agent", "model"),
+        None
+    );
+    assert_eq!(
+        tool_parameter_description(&request, "spawn_agent", "reasoning_effort"),
+        None
+    );
+    assert!(
+        tool_parameter_description(&request, "spawn_agent", "profile").is_some(),
+        "spawn_agent profile parameter should remain available"
     );
 
     Ok(())

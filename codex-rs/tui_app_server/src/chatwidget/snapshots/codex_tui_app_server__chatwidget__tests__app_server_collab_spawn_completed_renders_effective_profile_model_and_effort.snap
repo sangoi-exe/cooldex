@@ -1,7 +1,7 @@
 ---
 source: tui_app_server/src/chatwidget/tests.rs
-assertion_line: 4511
+assertion_line: 4519
 expression: combined
 ---
-• Spawned Robie [explorer] (gpt-5 high)
+• Spawned Robie [explorer] (profile=subxhigh, gpt-5 high)
   └ Explore the repo

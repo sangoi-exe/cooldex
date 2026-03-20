@@ -652,6 +652,5 @@ impl AgentControl {
     }
 }
 #[cfg(test)]
-#[cfg(test)]
 #[path = "control_tests.rs"]
 mod tests;

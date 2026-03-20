@@ -102,7 +102,7 @@ async fn wait_for_model_available(manager: &Arc<ModelsManager>, slug: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() -> Result<()> {
+async fn spawn_agent_description_lists_visible_models_as_informational_catalog() -> Result<()> {
     let server = start_mock_server().await;
     mount_models_once(
         &server,
@@ -169,6 +169,22 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
         "expected visible model summary in spawn_agent description: {description:?}"
     );
     assert!(
+        description.contains("### Informational model catalog"),
+        "expected informational heading in spawn_agent description: {description:?}"
+    );
+    assert!(
+        description.contains(
+            "The model catalog below is informational only; `spawn_agent` does not accept direct `model` or `reasoning_effort` arguments."
+        ),
+        "expected non-selectable model catalog wording in spawn_agent description: {description:?}"
+    );
+    assert!(
+        description.contains(
+            "Use `profile` when you need alternate child settings; otherwise the child inherits the lead's live model and reasoning."
+        ),
+        "expected profile-only selection wording in spawn_agent description: {description:?}"
+    );
+    assert!(
         description.contains("Default reasoning effort: medium."),
         "expected default reasoning effort in spawn_agent description: {description:?}"
     );
@@ -197,6 +213,10 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
             "Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself."
         ),
         "expected agent-role clarification in spawn_agent description: {description:?}"
+    );
+    assert!(
+        !description.contains("A mini model can solve many tasks faster than the main model."),
+        "spawn_agent description should no longer imply direct model downshifts: {description:?}"
     );
 
     Ok(())

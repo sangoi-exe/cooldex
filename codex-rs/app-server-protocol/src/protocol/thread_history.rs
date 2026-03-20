@@ -562,6 +562,9 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::protocol::CollabAgentSpawnBeginEvent,
     ) {
+        // Merge-safety anchor: collab spawn replay must preserve effective child
+        // profile/model/reasoning metadata so app-server snapshots render the same spawn label as
+        // live core events.
         let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
             tool: CollabAgentTool::SpawnAgent,
@@ -570,8 +573,9 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: Vec::new(),
             receiver_agents: Vec::new(),
             prompt: Some(payload.prompt.clone()),
+            profile: payload.profile.clone(),
             model: Some(payload.model.clone()),
-            reasoning_effort: Some(payload.reasoning_effort),
+            reasoning_effort: payload.reasoning_effort,
             agents_states: HashMap::new(),
             wait_state: None,
         };
@@ -621,8 +625,9 @@ impl ThreadHistoryBuilder {
                 })
                 .collect(),
             prompt: Some(payload.prompt.clone()),
+            profile: payload.profile.clone(),
             model: Some(payload.model.clone()),
-            reasoning_effort: Some(payload.reasoning_effort),
+            reasoning_effort: payload.reasoning_effort,
             agents_states,
             wait_state: None,
         });
@@ -640,6 +645,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
             receiver_agents: Vec::new(),
             prompt: Some(payload.prompt.clone()),
+            profile: None,
             model: None,
             reasoning_effort: None,
             agents_states: HashMap::new(),
@@ -674,6 +680,7 @@ impl ThreadHistoryBuilder {
                 payload.receiver_agent_role.clone(),
             )],
             prompt: Some(payload.prompt.clone()),
+            profile: None,
             model: None,
             reasoning_effort: None,
             agents_states: [(receiver_id, received_status)].into_iter().collect(),
@@ -701,6 +708,7 @@ impl ThreadHistoryBuilder {
                 .map(CollabAgentRef::from)
                 .collect(),
             prompt: None,
+            profile: None,
             model: None,
             reasoning_effort: None,
             agents_states: HashMap::new(),
@@ -763,6 +771,7 @@ impl ThreadHistoryBuilder {
                 .map(CollabAgentRef::from)
                 .collect(),
             prompt: None,
+            profile: None,
             model: None,
             reasoning_effort: None,
             agents_states,
@@ -782,6 +791,7 @@ impl ThreadHistoryBuilder {
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
             receiver_agents: Vec::new(),
             prompt: None,
+            profile: None,
             model: None,
             reasoning_effort: None,
             agents_states: HashMap::new(),
@@ -818,6 +828,7 @@ impl ThreadHistoryBuilder {
                 payload.receiver_agent_role.clone(),
             )],
             prompt: None,
+            profile: None,
             model: None,
             reasoning_effort: None,
             agents_states,
@@ -841,6 +852,7 @@ impl ThreadHistoryBuilder {
                 payload.receiver_agent_role.clone(),
             )],
             prompt: None,
+            profile: None,
             model: None,
             reasoning_effort: None,
             agents_states: HashMap::new(),
@@ -880,6 +892,7 @@ impl ThreadHistoryBuilder {
                 payload.receiver_agent_role.clone(),
             )],
             prompt: None,
+            profile: None,
             model: None,
             reasoning_effort: None,
             agents_states,
@@ -2545,6 +2558,7 @@ mod tests {
                     agent_role: None,
                 }],
                 prompt: None,
+                profile: None,
                 model: None,
                 reasoning_effort: None,
                 agents_states: [(
@@ -2582,6 +2596,7 @@ mod tests {
             wait_state: CoreCollabWaitState {
                 return_when: CoreCollabWaitReturnWhen::AnyFinal,
                 disable_timeout: false,
+                condition_enabled: false,
                 timed_out: None,
             },
         };
@@ -2604,6 +2619,7 @@ mod tests {
             wait_state: CoreCollabWaitState {
                 return_when: CoreCollabWaitReturnWhen::AnyFinal,
                 disable_timeout: false,
+                condition_enabled: false,
                 timed_out: Some(true),
             },
         };
@@ -2634,12 +2650,14 @@ mod tests {
                     agent_role: Some("observer".into()),
                 }],
                 prompt: None,
+                profile: None,
                 model: None,
                 reasoning_effort: None,
                 agents_states: HashMap::new(),
                 wait_state: Some(crate::protocol::v2::CollabWaitState {
                     return_when: crate::protocol::v2::CollabWaitReturnWhen::AnyFinal,
                     disable_timeout: false,
+                    condition_enabled: false,
                     timed_out: None,
                 }),
             }
@@ -2663,6 +2681,7 @@ mod tests {
                     agent_role: Some("observer".into()),
                 }],
                 prompt: None,
+                profile: None,
                 model: None,
                 reasoning_effort: None,
                 agents_states: [(
@@ -2680,6 +2699,7 @@ mod tests {
                 wait_state: Some(crate::protocol::v2::CollabWaitState {
                     return_when: crate::protocol::v2::CollabWaitReturnWhen::AnyFinal,
                     disable_timeout: false,
+                    condition_enabled: false,
                     timed_out: Some(true),
                 }),
             }
@@ -2700,6 +2720,7 @@ mod tests {
             wait_state: CoreCollabWaitState {
                 return_when: CoreCollabWaitReturnWhen::AllFinal,
                 disable_timeout: true,
+                condition_enabled: true,
                 timed_out: Some(false),
             },
         };
@@ -2716,6 +2737,7 @@ mod tests {
             wait_state: CoreCollabWaitState {
                 return_when: CoreCollabWaitReturnWhen::AllFinal,
                 disable_timeout: true,
+                condition_enabled: true,
                 timed_out: Some(false),
             },
         };
@@ -2742,6 +2764,7 @@ mod tests {
                 receiver_thread_ids: vec![receiver_thread_id.to_string()],
                 receiver_agents: Vec::new(),
                 prompt: None,
+                profile: None,
                 model: None,
                 reasoning_effort: None,
                 agents_states: [(
@@ -2759,6 +2782,7 @@ mod tests {
                 wait_state: Some(crate::protocol::v2::CollabWaitState {
                     return_when: crate::protocol::v2::CollabWaitReturnWhen::AllFinal,
                     disable_timeout: true,
+                    condition_enabled: true,
                     timed_out: Some(false),
                 }),
             }
@@ -2785,8 +2809,9 @@ mod tests {
                 new_agent_nickname: Some("Scout".into()),
                 new_agent_role: Some("explorer".into()),
                 prompt: "inspect the repo".into(),
+                profile: Some("subxhigh".into()),
                 model: "gpt-5.4-mini".into(),
-                reasoning_effort: codex_protocol::openai_models::ReasoningEffort::Medium,
+                reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::Medium),
                 status: AgentStatus::Running,
             }),
         ];
@@ -2812,6 +2837,7 @@ mod tests {
                     agent_role: Some("explorer".into()),
                 }],
                 prompt: Some("inspect the repo".into()),
+                profile: Some("subxhigh".into()),
                 model: Some("gpt-5.4-mini".into()),
                 reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::Medium),
                 agents_states: [(
@@ -2889,6 +2915,7 @@ mod tests {
                     agent_role: None,
                 }],
                 prompt: Some("new task".into()),
+                profile: None,
                 model: None,
                 reasoning_effort: None,
                 agents_states: [(

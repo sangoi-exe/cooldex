@@ -4,4 +4,4 @@
 import type { CollabAgentActivity } from "./CollabAgentActivity";
 import type { CollabAgentStatus } from "./CollabAgentStatus";
 
-export type CollabAgentState = { status: CollabAgentStatus, message: string | null, lastActivity: CollabAgentActivity | null, };
+export type CollabAgentState = { status: CollabAgentStatus, message: string | null, agentNickname: string | null, agentRole: string | null, lastActivity: CollabAgentActivity | null, };

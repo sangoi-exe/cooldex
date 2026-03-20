@@ -551,8 +551,9 @@ fn collab_spawn_begin_and_end_emit_item_events() {
             call_id: "call-10".to_string(),
             sender_thread_id,
             prompt: prompt.clone(),
+            profile: Some("subxhigh".to_string()),
             model: "gpt-5".to_string(),
-            reasoning_effort: ReasoningEffortConfig::default(),
+            reasoning_effort: Some(ReasoningEffortConfig::default()),
         }),
     );
     let begin_events = ep.collect_thread_events(&begin);
@@ -583,8 +584,9 @@ fn collab_spawn_begin_and_end_emit_item_events() {
             new_agent_nickname: None,
             new_agent_role: None,
             prompt: prompt.clone(),
+            profile: Some("subxhigh".to_string()),
             model: "gpt-5".to_string(),
-            reasoning_effort: ReasoningEffortConfig::default(),
+            reasoning_effort: Some(ReasoningEffortConfig::default()),
             status: AgentStatus::Running,
         }),
     );
@@ -641,6 +643,7 @@ fn collab_wait_end_without_begin_synthesizes_failed_item() {
             wait_state: CollabWaitState {
                 return_when: CollabWaitReturnWhen::AnyFinal,
                 disable_timeout: false,
+                condition_enabled: false,
                 timed_out: Some(false),
             },
         }),
@@ -678,6 +681,7 @@ fn collab_wait_end_without_begin_synthesizes_failed_item() {
                     wait_state: Some(CollabWaitState {
                         return_when: CollabWaitReturnWhen::AnyFinal,
                         disable_timeout: false,
+                        condition_enabled: false,
                         timed_out: Some(false),
                     }),
                 }),

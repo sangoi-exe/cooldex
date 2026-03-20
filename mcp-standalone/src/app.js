@@ -26,8 +26,12 @@ function sendBridgeError(req, res, status, code, message, details = null) {
 }
 
 function requireBridgeAuth(config) {
+  const configuredBridgeBearerToken =
+    typeof config.bridgeBearerToken === "string" && config.bridgeBearerToken.trim().length > 0
+      ? config.bridgeBearerToken.trim()
+      : null;
   return (req, res, next) => {
-    if (!config.bridgeBearerToken) {
+    if (configuredBridgeBearerToken === null) {
       sendBridgeError(req, res, 503, "NOT_CONFIGURED", "Bridge bearer auth is not configured yet.");
       return;
     }
@@ -39,7 +43,7 @@ function requireBridgeAuth(config) {
     }
 
     const token = authorization.slice("Bearer ".length).trim();
-    if (token !== config.bridgeBearerToken) {
+    if (token !== configuredBridgeBearerToken) {
       sendBridgeError(req, res, 403, "FORBIDDEN", "Bridge bearer token was rejected.");
       return;
     }
@@ -78,7 +82,8 @@ export function createApp({ config, logger, bridgeRuntime }) {
       ok: true,
       service: "codex-netsuite-bridge",
       bridgeBasePath: config.bridgeBasePath,
-      authConfigured: Boolean(config.bridgeBearerToken),
+      authConfigured:
+        typeof config.bridgeBearerToken === "string" && config.bridgeBearerToken.trim().length > 0,
       defaultSessionCwd: config.defaultSessionCwd,
       defaultSessionConfigPath: config.defaultSessionConfigPath,
       bridgeStateDbPath: config.bridgeStateDbPath,
@@ -89,7 +94,7 @@ export function createApp({ config, logger, bridgeRuntime }) {
   const router = express.Router();
   router.use(requireBridgeAuth(config));
 
-  // Merge anchor: these route bindings define the published bridge contract in
+  // Merge-safety anchor: these route bindings define the published bridge contract in
   // `mcp-standalone/README.md`; keep paths and runtime method wiring aligned.
   router.get("/sessions", asyncRoute(async (req, res) => {
     const response = await bridgeRuntime.listSessions(req.query ?? {});

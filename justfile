@@ -32,8 +32,19 @@ fix *args:
     # shared wrapper even when the script is non-executable in the current checkout.
     bash ../scripts/cargo-guard.sh cargo clippy --fix --tests --allow-dirty "$@"
 
-clippy:
+clippy *args:
     bash ../scripts/cargo-guard.sh cargo clippy --tests "$@"
+
+clippy-strict *args:
+    # Merge-safety anchor: warning-blocking lint runs must stay routed through the shared
+    # Cargo guard and must fail on clippy plus in-crate rustc warnings for the selected target set.
+    bash ../scripts/cargo-guard.sh cargo clippy "$@" -- -D warnings
+
+check-strict *args:
+    # Merge-safety anchor: shipped-surface warning gates must also catch plain rustc warnings from
+    # transitive local crates, so this exact-target check runs under `RUSTFLAGS=-D warnings`.
+    RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-D warnings" \
+        bash ../scripts/cargo-guard.sh cargo check "$@"
 
 install:
     rustup show active-toolchain

@@ -279,7 +279,7 @@ impl Renderable for StatusIndicatorWidget {
         }
         if let Some(badge) = &self.inline_badge {
             spans.push(" · ".dim());
-            spans.push(badge.clone().yellow().bold());
+            spans.push(badge.clone().cyan().bold());
         }
         if let Some(message) = &self.inline_message {
             // Keep optional context after elapsed/interrupt text so that core

@@ -1902,7 +1902,6 @@ async fn make_chatwidget_manual(
         pending_guardian_review_status: PendingGuardianReviewStatus::default(),
         last_copyable_output: None,
         running_commands: HashMap::new(),
-        pending_collab_spawn_requests: HashMap::new(),
         suppressed_exec_calls: HashSet::new(),
         skills_all: Vec::new(),
         skills_initial_state: None,
@@ -2086,8 +2085,10 @@ fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {
     s
 }
 
+// Merge-safety anchor: app-server spawn render tests here must prefer effective end-event
+// model/reasoning over begin/request values.
 #[tokio::test]
-async fn collab_spawn_end_shows_requested_model_and_effort() {
+async fn collab_spawn_end_shows_effective_model_and_effort() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
     let sender_thread_id = ThreadId::new();
     let spawned_thread_id = ThreadId::new();
@@ -2098,8 +2099,9 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
             call_id: "call-spawn".to_string(),
             sender_thread_id,
             prompt: "Explore the repo".to_string(),
-            model: "gpt-5".to_string(),
-            reasoning_effort: ReasoningEffortConfig::High,
+            profile: Some("subxhigh".to_string()),
+            model: "gpt-5.2".to_string(),
+            reasoning_effort: Some(ReasoningEffortConfig::Medium),
         }),
     });
     chat.handle_codex_event(Event {
@@ -2111,8 +2113,9 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
             new_agent_nickname: Some("Robie".to_string()),
             new_agent_role: Some("explorer".to_string()),
             prompt: "Explore the repo".to_string(),
+            profile: Some("subxhigh".to_string()),
             model: "gpt-5".to_string(),
-            reasoning_effort: ReasoningEffortConfig::High,
+            reasoning_effort: Some(ReasoningEffortConfig::High),
             status: AgentStatus::PendingInit,
         }),
     });
@@ -2125,8 +2128,8 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
         .join("\n");
 
     assert!(
-        rendered.contains("Spawned Robie [explorer] (gpt-5 high)"),
-        "expected spawn line to include agent metadata and requested model, got {rendered:?}"
+        rendered.contains("Spawned Robie [explorer] (profile=subxhigh, gpt-5 high)"),
+        "expected spawn line to include agent metadata and effective spawn config, got {rendered:?}"
     );
 }
 
@@ -2193,6 +2196,30 @@ async fn test_rate_limit_warnings_monthly() {
             "Heads up, you have less than 25% of your monthly limit left. Run /status for a breakdown.",
         ),],
         "expected one warning per limit for the highest crossed threshold"
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_warning_history_inserts_visible_gap_after_icon() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: Some("Codex".to_string()),
+        plan_type: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 95.0,
+            window_minutes: Some(299),
+            resets_at: None,
+        }),
+        secondary: None,
+        credits: None,
+    }));
+
+    let inserted = drain_insert_history(&mut rx);
+    assert_eq!(
+        lines_to_single_string(&inserted[0]),
+        "⚠  Heads up, you have less than 5% of your 5h limit left. Run /status for a\n  breakdown.\n",
     );
 }
 
@@ -4355,12 +4382,14 @@ async fn live_app_server_collab_wait_items_render_history() {
                     },
                 ],
                 prompt: None,
+                profile: Some("subxhigh".to_string()),
                 model: None,
                 reasoning_effort: None,
                 agents_states: HashMap::new(),
                 wait_state: Some(AppServerCollabWaitState {
                     return_when: AppServerCollabWaitReturnWhen::AnyFinal,
                     disable_timeout: false,
+                    condition_enabled: false,
                     timed_out: None,
                 }),
             },
@@ -4394,6 +4423,7 @@ async fn live_app_server_collab_wait_items_render_history() {
                     },
                 ],
                 prompt: None,
+                profile: Some("subxhigh".to_string()),
                 model: None,
                 reasoning_effort: None,
                 agents_states: HashMap::from([
@@ -4421,6 +4451,7 @@ async fn live_app_server_collab_wait_items_render_history() {
                 wait_state: Some(AppServerCollabWaitState {
                     return_when: AppServerCollabWaitReturnWhen::AnyFinal,
                     disable_timeout: false,
+                    condition_enabled: false,
                     timed_out: Some(false),
                 }),
             },
@@ -4437,7 +4468,175 @@ async fn live_app_server_collab_wait_items_render_history() {
 }
 
 #[tokio::test]
-async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effort() {
+async fn live_app_server_collab_wait_missing_wait_state_renders_generic_history() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let sender_thread_id =
+        ThreadId::from_string("019d0b00-0000-7000-a000-b90000000001").expect("valid thread id");
+    let receiver_thread_id =
+        ThreadId::from_string("019d0b00-0000-7000-a000-b90000000002").expect("valid thread id");
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::CollabAgentToolCall {
+                id: "wait-missing".to_string(),
+                tool: AppServerCollabAgentTool::Wait,
+                status: AppServerCollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![receiver_thread_id.to_string()],
+                receiver_agents: vec![AppServerCollabAgentRef {
+                    thread_id: receiver_thread_id.to_string(),
+                    agent_nickname: Some("Scout".to_string()),
+                    agent_role: Some("explorer".to_string()),
+                }],
+                prompt: None,
+                profile: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: HashMap::from([(
+                    receiver_thread_id.to_string(),
+                    AppServerCollabAgentState {
+                        status: AppServerCollabAgentStatus::Completed,
+                        message: Some("Done".to_string()),
+                        agent_nickname: Some("Scout".to_string()),
+                        agent_role: Some("explorer".to_string()),
+                        last_activity: None,
+                    },
+                )]),
+                wait_state: None,
+            },
+        }),
+        None,
+    );
+
+    let combined = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_snapshot!(
+        "app_server_collab_wait_missing_wait_state_renders_generic_history",
+        combined
+    );
+}
+
+#[tokio::test]
+async fn live_app_server_collab_wait_legacy_condition_flag_renders_generic_history() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let sender_thread_id =
+        ThreadId::from_string("019d0b00-0000-7000-a000-b90000000011").expect("valid thread id");
+    let receiver_thread_id =
+        ThreadId::from_string("019d0b00-0000-7000-a000-b90000000012").expect("valid thread id");
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::CollabAgentToolCall {
+                id: "wait-legacy".to_string(),
+                tool: AppServerCollabAgentTool::Wait,
+                status: AppServerCollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![receiver_thread_id.to_string()],
+                receiver_agents: vec![AppServerCollabAgentRef {
+                    thread_id: receiver_thread_id.to_string(),
+                    agent_nickname: Some("Scout".to_string()),
+                    agent_role: Some("explorer".to_string()),
+                }],
+                prompt: None,
+                profile: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: HashMap::from([(
+                    receiver_thread_id.to_string(),
+                    AppServerCollabAgentState {
+                        status: AppServerCollabAgentStatus::Running,
+                        message: None,
+                        agent_nickname: Some("Scout".to_string()),
+                        agent_role: Some("explorer".to_string()),
+                        last_activity: None,
+                    },
+                )]),
+                wait_state: Some(AppServerCollabWaitState {
+                    return_when: AppServerCollabWaitReturnWhen::AnyFinal,
+                    disable_timeout: false,
+                    condition_enabled: true,
+                    timed_out: Some(true),
+                }),
+            },
+        }),
+        None,
+    );
+
+    let combined = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(combined.contains("Wait timed out"));
+    assert!(!combined.contains("Wait timed out (any final)"));
+}
+
+#[tokio::test]
+async fn live_app_server_collab_wait_timed_out_with_disabled_timeout_renders_generic_history() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let sender_thread_id =
+        ThreadId::from_string("019d0b00-0000-7000-a000-b90000000021").expect("valid thread id");
+    let receiver_thread_id =
+        ThreadId::from_string("019d0b00-0000-7000-a000-b90000000022").expect("valid thread id");
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::CollabAgentToolCall {
+                id: "wait-invalid-timeout".to_string(),
+                tool: AppServerCollabAgentTool::Wait,
+                status: AppServerCollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![receiver_thread_id.to_string()],
+                receiver_agents: vec![AppServerCollabAgentRef {
+                    thread_id: receiver_thread_id.to_string(),
+                    agent_nickname: Some("Scout".to_string()),
+                    agent_role: Some("explorer".to_string()),
+                }],
+                prompt: None,
+                profile: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: HashMap::from([(
+                    receiver_thread_id.to_string(),
+                    AppServerCollabAgentState {
+                        status: AppServerCollabAgentStatus::Running,
+                        message: None,
+                        agent_nickname: Some("Scout".to_string()),
+                        agent_role: Some("explorer".to_string()),
+                        last_activity: None,
+                    },
+                )]),
+                wait_state: Some(AppServerCollabWaitState {
+                    return_when: AppServerCollabWaitReturnWhen::AnyFinal,
+                    disable_timeout: true,
+                    condition_enabled: true,
+                    timed_out: Some(true),
+                }),
+            },
+        }),
+        None,
+    );
+
+    let combined = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(combined.contains("Wait timed out"));
+    assert!(!combined.contains("Wait timed out (any final)"));
+}
+
+#[tokio::test]
+async fn live_app_server_collab_spawn_completed_renders_effective_profile_model_and_effort() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     let sender_thread_id =
         ThreadId::from_string("019cff70-2599-75e2-af72-b90000000002").expect("valid thread id");
@@ -4456,8 +4655,9 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
                 receiver_thread_ids: Vec::new(),
                 receiver_agents: Vec::new(),
                 prompt: Some("Explore the repo".to_string()),
-                model: Some("gpt-5".to_string()),
-                reasoning_effort: Some(ReasoningEffortConfig::High),
+                profile: Some("subxhigh".to_string()),
+                model: Some("gpt-5.2".to_string()),
+                reasoning_effort: Some(ReasoningEffortConfig::Medium),
                 agents_states: HashMap::new(),
                 wait_state: None,
             },
@@ -4481,6 +4681,7 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
                     agent_role: Some("explorer".to_string()),
                 }],
                 prompt: Some("Explore the repo".to_string()),
+                profile: Some("subxhigh".to_string()),
                 model: Some("gpt-5".to_string()),
                 reasoning_effort: Some(ReasoningEffortConfig::High),
                 agents_states: HashMap::from([(
@@ -4505,11 +4706,100 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        combined.contains("Spawned Robie [explorer] (gpt-5 high)"),
-        "expected spawn line to include agent metadata and requested model, got {combined:?}"
+        combined.contains("Spawned Robie [explorer] (profile=subxhigh, gpt-5 high)"),
+        "expected spawn line to include agent metadata and effective spawn config, got {combined:?}"
     );
     assert_snapshot!(
-        "app_server_collab_spawn_completed_renders_requested_model_and_effort",
+        "app_server_collab_spawn_completed_renders_effective_profile_model_and_effort",
+        combined
+    );
+}
+
+#[tokio::test]
+async fn live_app_server_collab_spawn_completed_missing_metadata_surfaces_protocol_violation() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let sender_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b90000000004").expect("valid thread id");
+    let spawned_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b91781b41a8f").expect("valid thread id");
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::CollabAgentToolCall {
+                id: "spawn-2".to_string(),
+                tool: AppServerCollabAgentTool::SpawnAgent,
+                status: AppServerCollabAgentToolCallStatus::Completed,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: vec![spawned_thread_id.to_string()],
+                receiver_agents: vec![AppServerCollabAgentRef {
+                    thread_id: spawned_thread_id.to_string(),
+                    agent_nickname: Some("Robie".to_string()),
+                    agent_role: Some("explorer".to_string()),
+                }],
+                prompt: Some("Explore the repo".to_string()),
+                profile: Some("subxhigh".to_string()),
+                model: None,
+                reasoning_effort: Some(ReasoningEffortConfig::High),
+                agents_states: HashMap::new(),
+                wait_state: None,
+            },
+        }),
+        None,
+    );
+
+    let combined = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(combined.contains(
+        "protocol violation: completed spawn item missing model, agentsStates[receiver]"
+    ));
+    assert_snapshot!(
+        "app_server_collab_spawn_completed_missing_metadata_surfaces_protocol_violation",
+        combined
+    );
+}
+
+#[tokio::test]
+async fn live_app_server_collab_spawn_failed_without_receiver_stays_generic_failure() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let sender_thread_id =
+        ThreadId::from_string("019cff70-2599-75e2-af72-b90000000005").expect("valid thread id");
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::CollabAgentToolCall {
+                id: "spawn-3".to_string(),
+                tool: AppServerCollabAgentTool::SpawnAgent,
+                status: AppServerCollabAgentToolCallStatus::Failed,
+                sender_thread_id: sender_thread_id.to_string(),
+                receiver_thread_ids: Vec::new(),
+                receiver_agents: Vec::new(),
+                prompt: Some("Explore the repo".to_string()),
+                profile: Some("subxhigh".to_string()),
+                model: Some("gpt-5".to_string()),
+                reasoning_effort: Some(ReasoningEffortConfig::High),
+                agents_states: HashMap::new(),
+                wait_state: None,
+            },
+        }),
+        None,
+    );
+
+    let combined = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(combined.contains("Agent spawn failed"));
+    assert!(!combined.contains("protocol violation"));
+    assert_snapshot!(
+        "app_server_collab_spawn_failed_without_receiver_stays_generic_failure",
         combined
     );
 }
@@ -4535,6 +4825,7 @@ async fn replayed_app_server_collab_resume_completed_preserves_agent_metadata() 
                 agent_role: Some("explorer".to_string()),
             }],
             prompt: None,
+            profile: None,
             model: None,
             reasoning_effort: None,
             agents_states: HashMap::from([(
@@ -4750,7 +5041,7 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
 
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1);
-    assert_eq!(lines_to_single_string(&cells[0]), "⚠ server overloaded\n");
+    assert_eq!(lines_to_single_string(&cells[0]), "⚠  server overloaded\n");
     assert!(!chat.bottom_pane.is_task_running());
 }
 

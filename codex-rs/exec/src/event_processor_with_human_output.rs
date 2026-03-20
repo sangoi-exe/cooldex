@@ -2,6 +2,7 @@ use codex_core::config::Config;
 use codex_core::web_search::web_search_detail;
 use codex_protocol::items::TurnItem;
 use codex_protocol::num_format::format_with_separators;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AgentReasoningRawContentEvent;
 use codex_protocol::protocol::AgentStatus;
@@ -13,6 +14,7 @@ use codex_protocol::protocol::CollabAgentSpawnEndEvent;
 use codex_protocol::protocol::CollabCloseBeginEvent;
 use codex_protocol::protocol::CollabCloseEndEvent;
 use codex_protocol::protocol::CollabWaitReturnWhen;
+use codex_protocol::protocol::CollabWaitState;
 use codex_protocol::protocol::CollabWaitingBeginEvent;
 use codex_protocol::protocol::CollabWaitingEndEvent;
 use codex_protocol::protocol::DeprecationNoticeEvent;
@@ -700,14 +702,23 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 call_id,
                 sender_thread_id: _,
                 prompt,
+                profile,
+                model,
+                reasoning_effort,
                 ..
             }) => {
                 ts_msg!(
                     self,
                     "{} {}",
                     "collab".style(self.magenta),
-                    format_collab_invocation("spawn_agent", &call_id, Some(&prompt))
-                        .style(self.bold)
+                    format_collab_spawn_invocation(
+                        &call_id,
+                        Some(&prompt),
+                        profile.as_deref(),
+                        Some(model.as_str()),
+                        reasoning_effort,
+                    )
+                    .style(self.bold)
                 );
             }
             EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
@@ -715,15 +726,21 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 sender_thread_id: _,
                 new_thread_id,
                 prompt,
+                profile,
+                model,
+                reasoning_effort,
                 status,
                 ..
             }) => {
                 let success = new_thread_id.is_some() && !is_collab_status_failure(&status);
                 let title_style = if success { self.green } else { self.red };
-                let title = format!(
-                    "{} {}:",
-                    format_collab_invocation("spawn_agent", &call_id, Some(&prompt)),
-                    format_collab_status(&status)
+                let title = format_collab_spawn_end_title(
+                    &call_id,
+                    Some(&prompt),
+                    profile.as_deref(),
+                    Some(model.as_str()),
+                    reasoning_effort,
+                    &status,
                 );
                 ts_msg!(self, "{}", title.style(title_style));
                 if let Some(new_thread_id) = new_thread_id {
@@ -788,7 +805,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 );
                 eprintln!(
                     "  wait: {}",
-                    format_wait_mode(&wait_state.return_when).style(self.dimmed)
+                    format_wait_mode(&wait_state).style(self.dimmed)
                 );
                 if wait_state.disable_timeout {
                     eprintln!("  timeout: {}", "disabled".style(self.dimmed));
@@ -802,22 +819,22 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 ..
             }) => {
                 let timed_out = wait_state.timed_out == Some(true);
+                let wait_result_label = format_wait_result_label(&wait_state, timed_out);
                 if timed_out {
                     ts_msg!(
                         self,
                         "{} {}, {} agents reported:",
                         format_collab_invocation("wait", &call_id, None),
-                        format!("timed out ({})", format_wait_mode(&wait_state.return_when))
-                            .style(self.yellow),
+                        wait_result_label.style(self.yellow),
                         statuses.len()
                     );
                 } else {
                     let success = !statuses.values().any(is_collab_status_failure);
                     let title_style = if success { self.green } else { self.red };
                     let title = format!(
-                        "{} condition met ({}), {} agents reported:",
+                        "{} {}, {} agents reported:",
                         format_collab_invocation("wait", &call_id, None),
-                        format_wait_mode(&wait_state.return_when),
+                        wait_result_label,
                         statuses.len()
                     );
                     ts_msg!(self, "{}", title.style(title_style));
@@ -948,10 +965,28 @@ impl EventProcessor for EventProcessorWithHumanOutput {
 // Merge-safety anchor: human wait output must key off explicit wait metadata instead of inferring
 // timeout from empty status maps, or timeout returns become indistinguishable from any_final
 // completions once current agent states are included.
-fn format_wait_mode(return_when: &CollabWaitReturnWhen) -> &'static str {
-    match return_when {
+fn format_wait_mode(wait_state: &CollabWaitState) -> &'static str {
+    if !wait_state.uses_explicit_condition() {
+        return "timed status check";
+    }
+    match wait_state.return_when {
         CollabWaitReturnWhen::AnyFinal => "any final",
         CollabWaitReturnWhen::AllFinal => "all final",
+    }
+}
+
+fn format_wait_result_label(wait_state: &CollabWaitState, timed_out: bool) -> String {
+    if !wait_state.uses_explicit_condition() {
+        return if timed_out {
+            "timed out".to_owned()
+        } else {
+            "finished".to_owned()
+        };
+    }
+    if timed_out {
+        format!("timed out ({})", format_wait_mode(wait_state))
+    } else {
+        format!("condition met ({})", format_wait_mode(wait_state))
     }
 }
 
@@ -1279,6 +1314,59 @@ fn format_collab_invocation(tool: &str, call_id: &str, prompt: Option<&str>) -> 
     }
 }
 
+fn format_collab_spawn_invocation(
+    call_id: &str,
+    prompt: Option<&str>,
+    profile: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> String {
+    let mut formatted = format_collab_invocation("spawn_agent", call_id, prompt);
+    if let Some(metadata) = format_collab_spawn_metadata(profile, model, reasoning_effort) {
+        formatted.push_str(" [");
+        formatted.push_str(&metadata);
+        formatted.push(']');
+    }
+    formatted
+}
+
+fn format_collab_spawn_end_title(
+    call_id: &str,
+    prompt: Option<&str>,
+    profile: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
+    status: &AgentStatus,
+) -> String {
+    format!(
+        "{} {}:",
+        format_collab_spawn_invocation(call_id, prompt, profile, model, reasoning_effort),
+        format_collab_status(status)
+    )
+}
+
+fn format_collab_spawn_metadata(
+    profile: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(profile) = profile.map(str::trim).filter(|profile| !profile.is_empty()) {
+        parts.push(format!("profile={profile}"));
+    }
+    if let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) {
+        parts.push(format!("model={model}"));
+    }
+    if let Some(reasoning_effort) = reasoning_effort {
+        parts.push(format!("reasoning={reasoning_effort}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
 fn format_collab_status(status: &AgentStatus) -> String {
     match status {
         AgentStatus::PendingInit => "pending init".to_string(),
@@ -1363,9 +1451,16 @@ fn format_mcp_invocation(invocation: &McpInvocation) -> String {
 #[cfg(test)]
 mod tests {
     use super::AgentStatus;
+    use super::format_collab_spawn_end_title;
+    use super::format_collab_spawn_invocation;
     use super::format_collab_status;
+    use super::format_wait_mode;
+    use super::format_wait_result_label;
     use std::path::PathBuf;
 
+    use codex_protocol::openai_models::ReasoningEffort;
+    use codex_protocol::protocol::CollabWaitReturnWhen;
+    use codex_protocol::protocol::CollabWaitState;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::HookCompletedEvent;
     use codex_protocol::protocol::HookEventName;
@@ -1431,6 +1526,117 @@ mod tests {
         let formatted = format_collab_status(&status);
 
         assert_eq!(formatted, "completed: \"done\"");
+    }
+
+    #[test]
+    fn spawn_invocation_includes_inherited_model_without_missing_reasoning_placeholder() {
+        let formatted = format_collab_spawn_invocation(
+            "call-1",
+            Some("Investigate this"),
+            None,
+            Some("gpt-5.2"),
+            None,
+        );
+
+        assert_eq!(
+            formatted,
+            "spawn_agent(call-1, prompt=\"Investigate this\") [model=gpt-5.2]"
+        );
+    }
+
+    #[test]
+    fn spawn_invocation_includes_profile_model_and_reasoning() {
+        let formatted = format_collab_spawn_invocation(
+            "call-2",
+            Some("Review this"),
+            Some("subxhigh"),
+            Some("gpt-5.4"),
+            Some(ReasoningEffort::XHigh),
+        );
+
+        assert_eq!(
+            formatted,
+            "spawn_agent(call-2, prompt=\"Review this\") [profile=subxhigh, model=gpt-5.4, reasoning=xhigh]"
+        );
+    }
+
+    #[test]
+    fn spawn_end_title_uses_effective_end_metadata_when_it_differs_from_begin_config() {
+        let title = format_collab_spawn_end_title(
+            "call-3",
+            Some("Investigate regressions"),
+            Some("reviewer"),
+            Some("gpt-5.4"),
+            Some(ReasoningEffort::High),
+            &AgentStatus::Completed(None),
+        );
+
+        assert_eq!(
+            title,
+            "spawn_agent(call-3, prompt=\"Investigate regressions\") [profile=reviewer, model=gpt-5.4, reasoning=high] completed:"
+        );
+    }
+
+    #[test]
+    fn timed_wait_mode_is_generic_when_condition_disabled() {
+        let wait_state = CollabWaitState {
+            return_when: CollabWaitReturnWhen::AnyFinal,
+            disable_timeout: false,
+            condition_enabled: false,
+            timed_out: None,
+        };
+
+        assert_eq!(format_wait_mode(&wait_state), "timed status check");
+        assert_eq!(format_wait_result_label(&wait_state, false), "finished");
+        assert_eq!(format_wait_result_label(&wait_state, true), "timed out");
+    }
+
+    #[test]
+    fn explicit_wait_mode_keeps_condition_label() {
+        let wait_state = CollabWaitState {
+            return_when: CollabWaitReturnWhen::AllFinal,
+            disable_timeout: true,
+            condition_enabled: true,
+            timed_out: None,
+        };
+
+        assert_eq!(format_wait_mode(&wait_state), "all final");
+        assert_eq!(
+            format_wait_result_label(&wait_state, false),
+            "condition met (all final)"
+        );
+        assert_eq!(
+            format_wait_result_label(&wait_state, true),
+            "timed out (all final)"
+        );
+    }
+
+    #[test]
+    fn legacy_wait_without_disabled_timeout_stays_generic() {
+        let wait_state = CollabWaitState {
+            return_when: CollabWaitReturnWhen::AnyFinal,
+            disable_timeout: false,
+            condition_enabled: true,
+            timed_out: None,
+        };
+
+        assert_eq!(format_wait_mode(&wait_state), "timed status check");
+        assert_eq!(format_wait_result_label(&wait_state, false), "finished");
+        assert_eq!(format_wait_result_label(&wait_state, true), "timed out");
+    }
+
+    #[test]
+    fn timed_out_wait_with_disabled_timeout_stays_generic() {
+        let wait_state = CollabWaitState {
+            return_when: CollabWaitReturnWhen::AnyFinal,
+            disable_timeout: true,
+            condition_enabled: true,
+            timed_out: Some(true),
+        };
+
+        assert_eq!(format_wait_mode(&wait_state), "timed status check");
+        assert_eq!(format_wait_result_label(&wait_state, false), "finished");
+        assert_eq!(format_wait_result_label(&wait_state, true), "timed out");
     }
 
     #[test]

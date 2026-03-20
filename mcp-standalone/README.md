@@ -115,7 +115,7 @@ Runtime floor: Node 22+
 
 - `PORT` — HTTP port (default `8787`)
 - `BRIDGE_BASE_PATH` — API prefix (default `/api/codex/v1`)
-- `BRIDGE_BEARER_TOKEN` — required bearer token for protected bridge routes
+- `BRIDGE_BEARER_TOKEN` — required bearer token for protected bridge routes; when unset the bridge fails closed with `503 NOT_CONFIGURED` until a token is configured
 - `BRIDGE_DEBUG_TRANSCRIPT` — when truthy, prints a terminal-only transcript of inbound user text, agent output, reasoning deltas, and key lifecycle/tool activity (default `false`)
 - `BRIDGE_STATE_DB_PATH` — absolute SQLite file path for durable bridge state (default `~/.codex/codex-netsuite-bridge/bridge-state.sqlite`)
 - `BRIDGE_DEFAULT_SESSION_CWD` — default cwd used when `session_create.cwd` is omitted (default `/home/lucas/work/avmb-plus`)

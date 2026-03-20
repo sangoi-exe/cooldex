@@ -2132,23 +2132,6 @@ fn make_mcp_tool(
     }
 }
 
-fn function_call_rollout_item(name: &str, call_id: &str) -> RolloutItem {
-    RolloutItem::ResponseItem(ResponseItem::FunctionCall {
-        id: None,
-        name: name.to_string(),
-        namespace: None,
-        arguments: "{}".to_string(),
-        call_id: call_id.to_string(),
-    })
-}
-
-fn function_call_output_rollout_item(call_id: &str, output: &str) -> RolloutItem {
-    RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
-        call_id: call_id.to_string(),
-        output: FunctionCallOutputPayload::from_text(output.to_string()),
-    })
-}
-
 fn response_created(id: &str) -> Value {
     json!({
         "type": "response.created",
@@ -3630,6 +3613,7 @@ async fn set_rate_limits_retains_previous_credits() {
     let session_configuration = SessionConfiguration {
         provider: config.model_provider.clone(),
         collaboration_mode,
+        collaboration_mode_reasoning_effort_explicit: false,
         model_reasoning_summary: config.model_reasoning_summary,
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
@@ -3731,6 +3715,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
     let session_configuration = SessionConfiguration {
         provider: config.model_provider.clone(),
         collaboration_mode,
+        collaboration_mode_reasoning_effort_explicit: false,
         model_reasoning_summary: config.model_reasoning_summary,
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
@@ -4108,6 +4093,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
     SessionConfiguration {
         provider: config.model_provider.clone(),
         collaboration_mode,
+        collaboration_mode_reasoning_effort_explicit: false,
         model_reasoning_summary: config.model_reasoning_summary,
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
@@ -4187,6 +4173,293 @@ async fn session_configuration_apply_preserves_split_file_system_policy_on_cwd_o
     assert_eq!(
         updated.file_system_sandbox_policy,
         session_configuration.file_system_sandbox_policy
+    );
+}
+
+#[tokio::test]
+async fn spawn_agent_preserves_explicit_reasoning_effort_clear_in_session_config() {
+    let mut session_configuration = make_session_configuration_for_tests().await;
+    let mut config = (*session_configuration.original_config_do_not_use).clone();
+    config.model_reasoning_effort = Some(ReasoningEffortConfig::High);
+    session_configuration.original_config_do_not_use = Arc::new(config);
+
+    let cleared_mode = session_configuration.collaboration_mode.with_updates(
+        /*model*/ None,
+        Some(/*effort*/ None),
+        /*developer_instructions*/ None,
+    );
+    let updated = session_configuration
+        .apply(&SessionSettingsUpdate {
+            collaboration_mode: Some(cleared_mode),
+            collaboration_mode_explicit: true,
+            ..Default::default()
+        })
+        .expect("apply explicit reasoning clear");
+
+    assert_eq!(updated.thread_config_snapshot().reasoning_effort, None);
+    assert_eq!(
+        Session::build_per_turn_config(&updated).model_reasoning_effort,
+        None
+    );
+}
+
+#[tokio::test]
+async fn synthesized_user_turn_update_preserves_explicit_reasoning_effort_clear() {
+    let mut session_configuration = make_session_configuration_for_tests().await;
+    let mut config = (*session_configuration.original_config_do_not_use).clone();
+    config.model_reasoning_effort = Some(ReasoningEffortConfig::High);
+    session_configuration.original_config_do_not_use = Arc::new(config);
+
+    let cleared_mode = session_configuration.collaboration_mode.with_updates(
+        /*model*/ None,
+        Some(/*effort*/ None),
+        /*developer_instructions*/ None,
+    );
+    let cleared_configuration = session_configuration
+        .apply(&SessionSettingsUpdate {
+            collaboration_mode: Some(cleared_mode),
+            collaboration_mode_explicit: true,
+            ..Default::default()
+        })
+        .expect("apply explicit reasoning clear");
+
+    let (collaboration_mode, collaboration_mode_explicit) =
+        handlers::resolve_collaboration_mode_update(
+            &cleared_configuration,
+            Some(cleared_configuration.collaboration_mode.model().to_string()),
+            /*effort*/ None,
+            /*collaboration_mode*/ None,
+        );
+    let updated = cleared_configuration
+        .apply(&SessionSettingsUpdate {
+            collaboration_mode: Some(collaboration_mode),
+            collaboration_mode_explicit,
+            ..Default::default()
+        })
+        .expect("apply synthesized user-turn update");
+
+    assert_eq!(updated.thread_config_snapshot().reasoning_effort, None);
+    assert_eq!(
+        Session::build_per_turn_config(&updated).model_reasoning_effort,
+        None
+    );
+}
+
+async fn make_synthesized_user_turn_update_with_inherited_reasoning_effort(
+    inherited_reasoning_effort: ReasoningEffortConfig,
+) -> SessionConfiguration {
+    let mut session_configuration = make_session_configuration_for_tests().await;
+    let mut config = (*session_configuration.original_config_do_not_use).clone();
+    config.model_reasoning_effort = Some(inherited_reasoning_effort);
+    session_configuration.original_config_do_not_use = Arc::new(config);
+    session_configuration.collaboration_mode =
+        session_configuration.collaboration_mode.with_updates(
+            /*model*/ None,
+            Some(/*effort*/ None),
+            /*developer_instructions*/ None,
+        );
+    session_configuration.collaboration_mode_reasoning_effort_explicit = false;
+
+    let (collaboration_mode, collaboration_mode_explicit) =
+        handlers::resolve_collaboration_mode_update(
+            &session_configuration,
+            Some(session_configuration.collaboration_mode.model().to_string()),
+            /*effort*/ None,
+            /*collaboration_mode*/ None,
+        );
+    session_configuration
+        .apply(&SessionSettingsUpdate {
+            collaboration_mode: Some(collaboration_mode),
+            collaboration_mode_explicit,
+            ..Default::default()
+        })
+        .expect("apply synthesized user-turn update")
+}
+
+#[tokio::test]
+async fn synthesized_user_turn_update_preserves_inherited_reasoning_effort_in_turn_context() {
+    let updated = make_synthesized_user_turn_update_with_inherited_reasoning_effort(
+        ReasoningEffortConfig::High,
+    )
+    .await;
+    let config = Arc::clone(&updated.original_config_do_not_use);
+    let conversation_id = ThreadId::default();
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let models_manager = Arc::new(ModelsManager::new(
+        config.codex_home.clone(),
+        auth_manager.clone(),
+        None,
+        CollaborationModesConfig::default(),
+    ));
+    let per_turn_config = Session::build_per_turn_config(&updated);
+    let model_info = ModelsManager::construct_model_info_offline_for_tests(
+        updated.collaboration_mode.model(),
+        &per_turn_config,
+    );
+    let session_telemetry = session_telemetry(
+        conversation_id,
+        config.as_ref(),
+        &model_info,
+        updated.session_source.clone(),
+    );
+    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.clone()));
+    let skills_manager = Arc::new(SkillsManager::new(
+        config.codex_home.clone(),
+        Arc::clone(&plugins_manager),
+        true,
+    ));
+    let skills_outcome = Arc::new(skills_manager.skills_for_config(&per_turn_config));
+    let environment = Arc::new(codex_environment::Environment);
+    let js_repl = Arc::new(JsReplHandle::with_node_path(
+        config.js_repl_node_path.clone(),
+        config.js_repl_node_module_dirs.clone(),
+    ));
+    let user_shell = default_user_shell();
+
+    let turn_context = Session::make_turn_context(
+        Some(Arc::clone(&auth_manager)),
+        &session_telemetry,
+        updated.provider.clone(),
+        &updated,
+        &user_shell,
+        /*shell_zsh_path*/ None,
+        config.main_execve_wrapper_exe.as_ref(),
+        per_turn_config,
+        model_info,
+        &models_manager,
+        /*network*/ None,
+        environment,
+        "turn_id".to_string(),
+        js_repl,
+        skills_outcome,
+    );
+
+    assert_eq!(updated.collaboration_mode.reasoning_effort(), None);
+    assert_eq!(
+        updated.thread_config_snapshot().reasoning_effort,
+        Some(ReasoningEffortConfig::High)
+    );
+    assert_eq!(turn_context.collaboration_mode.reasoning_effort(), None);
+    assert_eq!(
+        turn_context.reasoning_effort,
+        Some(ReasoningEffortConfig::High)
+    );
+    assert_eq!(
+        turn_context.config.model_reasoning_effort,
+        Some(ReasoningEffortConfig::High)
+    );
+}
+
+#[tokio::test]
+async fn session_configured_event_preserves_inherited_reasoning_effort_after_synthesized_update() {
+    let session_configuration = make_synthesized_user_turn_update_with_inherited_reasoning_effort(
+        ReasoningEffortConfig::High,
+    )
+    .await;
+    let config = Arc::clone(&session_configuration.original_config_do_not_use);
+    let (tx_event, rx_event) = async_channel::unbounded();
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let models_manager = Arc::new(ModelsManager::new(
+        config.codex_home.clone(),
+        auth_manager.clone(),
+        None,
+        CollaborationModesConfig::default(),
+    ));
+    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.clone()));
+    let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
+    let skills_manager = Arc::new(SkillsManager::new(
+        config.codex_home.clone(),
+        Arc::clone(&plugins_manager),
+        true,
+    ));
+    let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
+    let (agent_last_activity_tx, _agent_last_activity_rx) =
+        watch::channel::<Option<codex_protocol::protocol::CollabAgentActivity>>(None);
+    let (prompt_gc_active_tx, _prompt_gc_active_rx) = watch::channel(false);
+    let (prompt_gc_activity_edges, _) = tokio::sync::broadcast::channel(16);
+
+    let session = Session::new(
+        session_configuration,
+        Arc::clone(&config),
+        auth_manager,
+        models_manager,
+        Arc::new(ExecPolicyManager::default()),
+        tx_event,
+        agent_status_tx,
+        agent_last_activity_tx,
+        prompt_gc_active_tx,
+        prompt_gc_activity_edges,
+        InitialHistory::New,
+        SessionSource::Exec,
+        skills_manager,
+        plugins_manager,
+        mcp_manager,
+        Arc::new(FileWatcher::noop()),
+        AgentControl::default(),
+    )
+    .await
+    .expect("session should start");
+
+    let event = rx_event.recv().await.expect("session configured event");
+    let EventMsg::SessionConfigured(session_configured) = event.msg else {
+        panic!("expected SessionConfiguredEvent");
+    };
+
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .thread_config_snapshot()
+            .reasoning_effort,
+        Some(ReasoningEffortConfig::High)
+    );
+    assert_eq!(
+        session_configured.reasoning_effort,
+        Some(ReasoningEffortConfig::High)
+    );
+}
+
+#[tokio::test]
+async fn synthesized_override_turn_context_update_preserves_explicit_reasoning_effort_clear() {
+    let mut session_configuration = make_session_configuration_for_tests().await;
+    let mut config = (*session_configuration.original_config_do_not_use).clone();
+    config.model_reasoning_effort = Some(ReasoningEffortConfig::High);
+    session_configuration.original_config_do_not_use = Arc::new(config);
+
+    let cleared_mode = session_configuration.collaboration_mode.with_updates(
+        /*model*/ None,
+        Some(/*effort*/ None),
+        /*developer_instructions*/ None,
+    );
+    let cleared_configuration = session_configuration
+        .apply(&SessionSettingsUpdate {
+            collaboration_mode: Some(cleared_mode),
+            collaboration_mode_explicit: true,
+            ..Default::default()
+        })
+        .expect("apply explicit reasoning clear");
+
+    let (collaboration_mode, collaboration_mode_explicit) =
+        handlers::resolve_collaboration_mode_update(
+            &cleared_configuration,
+            /*model*/ None,
+            /*effort*/ None,
+            /*collaboration_mode*/ None,
+        );
+    let updated = cleared_configuration
+        .apply(&SessionSettingsUpdate {
+            collaboration_mode: Some(collaboration_mode),
+            collaboration_mode_explicit,
+            ..Default::default()
+        })
+        .expect("apply synthesized override-turn-context update");
+
+    assert_eq!(updated.thread_config_snapshot().reasoning_effort, None);
+    assert_eq!(
+        Session::build_per_turn_config(&updated).model_reasoning_effort,
+        None
     );
 }
 
@@ -4342,6 +4615,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
     let session_configuration = SessionConfiguration {
         provider: config.model_provider.clone(),
         collaboration_mode,
+        collaboration_mode_reasoning_effort_explicit: false,
         model_reasoning_summary: config.model_reasoning_summary,
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
@@ -4449,6 +4723,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let session_configuration = SessionConfiguration {
         provider: config.model_provider.clone(),
         collaboration_mode,
+        collaboration_mode_reasoning_effort_explicit: false,
         model_reasoning_summary: config.model_reasoning_summary,
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
@@ -5302,6 +5577,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
     let session_configuration = SessionConfiguration {
         provider: config.model_provider.clone(),
         collaboration_mode,
+        collaboration_mode_reasoning_effort_explicit: false,
         model_reasoning_summary: config.model_reasoning_summary,
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),

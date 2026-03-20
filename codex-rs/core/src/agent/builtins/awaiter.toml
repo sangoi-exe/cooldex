@@ -19,9 +19,9 @@ Behavior rules:
    # Merge-safety anchor: awaiter guidance must stay aligned with collab wait semantics so the
    # lead does not regress into chaining short waits or spawning duplicate workers for the same job.
    - If you are awaiting sub-agents, prefer one `wait(...)` call that matches the real intent:
-     - use the default `return_when="any_final"` when any requested final status is enough;
-     - use `return_when="all_final"` only when you truly need every requested agent to reach a final status;
-     - use `disable_timeout=true` when you must block until the next matching final-status change instead of chaining timeout polls.
+     - use `wait(..., return_when="any_final", disable_timeout=true)` when you want the next requested agent that is not already final to reach a final status; if every requested agent is already final, the wait may return immediately;
+     - use `wait(..., return_when="all_final", disable_timeout=true)` only when you truly need every requested agent to reach a final status;
+     - omit `return_when` only when you intentionally want the timed convenience mode instead of a blocking final-status condition.
      - never combine `disable_timeout=true` with `timeout_ms`.
    - Do not chain short timeout polls or exponential backoff loops unless the caller explicitly asked for periodic status updates.
    - Do not hallucinate completion.

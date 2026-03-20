@@ -119,12 +119,13 @@ export function resolveBridgeStateDbPath(rawValue) {
 }
 
 export function loadConfig() {
+  const configuredBridgeBearerToken = process.env.BRIDGE_BEARER_TOKEN?.trim() || null;
   return {
     port: parsePositiveInteger(process.env.PORT, 8787),
     bridgeBasePath: process.env.BRIDGE_BASE_PATH?.trim() || "/api/codex/v1",
-    bridgeBearerToken: process.env.BRIDGE_BEARER_TOKEN?.trim() || null,
+    bridgeBearerToken: configuredBridgeBearerToken,
     bridgeDebugTranscript: parseBooleanEnv("BRIDGE_DEBUG_TRANSCRIPT", false),
-    // Merge anchor: these defaults are consumed by runtime `session_create`
+    // Merge-safety anchor: these defaults are consumed by runtime `session_create`
     // resolution and documented route semantics.
     defaultSessionCwd: resolveDirectoryPath(
       "BRIDGE_DEFAULT_SESSION_CWD",

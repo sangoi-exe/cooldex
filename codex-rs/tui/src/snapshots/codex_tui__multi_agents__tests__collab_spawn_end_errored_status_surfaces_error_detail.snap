@@ -1,0 +1,7 @@
+---
+source: tui/src/multi_agents.rs
+expression: "cell.display_lines(200).into_iter().map(|line|\nline.spans.into_iter().map(|span|\nspan.content.into_owned()).collect::<String>()).collect::<Vec<_>>().join(\"\\n\")"
+---
+• Spawned Robie [explorer] (profile=subxhigh, gpt-5 high)
+  └ Error - protocol violation: completed spawn item missing model
+    <protocol violation: missing model>

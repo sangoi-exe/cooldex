@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Merge-safety anchor: all workspace Cargo validation must go through this wrapper so the
-# target-dir resolution, free-space floor, and conditional cargo-clean policy stay deterministic.
+# Merge-safety anchor: all workspace Cargo validation must go through this wrapper so Cargo-derived
+# target/build resolution, the free-space floor, and the low-space-only cargo-clean policy stay deterministic.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 CODEX_RS_DIR="${REPO_ROOT}/codex-rs"
-MIN_FREE_GIB="${CARGO_GUARD_MIN_FREE_GIB:-10}"
+CALLER_CWD="$(pwd)"
+MIN_FREE_GIB="${CARGO_GUARD_MIN_FREE_GIB:-5}"
 
 log() {
     local level="$1"
@@ -16,54 +17,29 @@ log() {
 }
 
 usage() {
-    cat <<'EOF'
+    cat <<'EOF_HELP'
 Usage:
   ./scripts/cargo-guard.sh <cargo-subcommand> [args...]
   ./scripts/cargo-guard.sh cargo <cargo-subcommand> [args...]
 
-Runs Cargo from ./codex-rs with a deterministic free-space guardrail:
-  - resolves the effective target-dir for the exact command
-  - requires at least 10 GiB free before starting
-  - runs `cargo clean` only when space is below the floor
-  - reruns `cargo clean` after failed/interrupted runs, or after successful runs that still leave
-    the target filesystem below the floor
+Runs Cargo with a deterministic free-space guardrail for build-like commands:
+  - runs from ./codex-rs by default
+  - preserves the caller cwd when `--manifest-path` is supplied so Cargo resolves that manifest/config context truthfully
+  - derives the effective `target_directory` and `build_directory` from `cargo metadata`
+  - requires at least 5 GiB free before starting a guarded build-like command
+  - runs `cargo clean` only when the lowest free-space filesystem across the derived target/build dirs is below the floor
+  - never runs `cargo clean` solely because the guarded Cargo command failed or was interrupted
 
-Supported target-dir override inputs:
+Guarded build-like subcommands:
+  - bench, build, check, clippy, doc, fix, install, nextest, run, rustc, test
+
+Supported Cargo context inputs:
+  - `+toolchain`
+  - `--config <KEY=VALUE|PATH>` / `--config=<KEY=VALUE|PATH>`
+  - `--manifest-path <path>` / `--manifest-path=<path>`
+  - `--lockfile-path <path>` / `--lockfile-path=<path>`
   - `--target-dir <path>` / `--target-dir=<path>`
-  - inline `--config build.target-dir=...`
-  - `CARGO_BUILD_TARGET_DIR`
-  - `CARGO_TARGET_DIR`
-  - `codex-rs/.cargo/config.toml`
-  - `~/.cargo/config.toml`
-
-Deliberately unsupported:
-  - `--manifest-path`
-  - file-based `--config <path>`
-EOF
-}
-
-strip_outer_quotes() {
-    local value="$1"
-    if [[ "${value}" == \"*\" && "${value}" == *\" ]]; then
-        value="${value:1:${#value}-2}"
-    elif [[ "${value}" == \'*\' && "${value}" == *\' ]]; then
-        value="${value:1:${#value}-2}"
-    fi
-    printf '%s\n' "${value}"
-}
-
-is_unsupported_file_based_config_arg() {
-    local config_value="$1"
-    if [[ "${config_value}" == build.target-dir=* ]]; then
-        return 1
-    fi
-    if [[ -f "${config_value}" ]]; then
-        return 0
-    fi
-    if [[ "${config_value}" != /* && -f "${CODEX_RS_DIR}/${config_value}" ]]; then
-        return 0
-    fi
-    return 1
+EOF_HELP
 }
 
 resolve_path() {
@@ -74,31 +50,6 @@ resolve_path() {
     else
         realpath -m -- "${base_dir}/${raw_path}"
     fi
-}
-
-extract_build_target_dir_from_config() {
-    local config_path="$1"
-    awk '
-        BEGIN {
-            in_build = 0;
-            target = "";
-        }
-        /^\[build\][[:space:]]*$/ {
-            in_build = 1;
-            next;
-        }
-        /^\[/ {
-            in_build = 0;
-        }
-        in_build && match($0, /^[[:space:]]*target-dir[[:space:]]*=[[:space:]]*"([^"]+)"/, parts) {
-            target = parts[1];
-        }
-        END {
-            if (target != "") {
-                print target;
-            }
-        }
-    ' "${config_path}"
 }
 
 available_gib() {
@@ -113,72 +64,112 @@ available_gib() {
     printf '%s\n' "${available}"
 }
 
+metadata_field() {
+    local json="$1"
+    local field="$2"
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "${json}" | jq -r --arg field "${field}" '.[$field] // empty'
+        return
+    fi
+
+    printf '%s' "${json}" | tr -d '\n' | sed -nE "s/.*\"${field}\":\"([^\"]*)\".*/\1/p"
+}
+
+append_unique_path() {
+    local candidate="$1"
+    if [[ -z "${candidate}" ]]; then
+        return
+    fi
+    local existing
+    for existing in "${guard_paths[@]}"; do
+        if [[ "${existing}" == "${candidate}" ]]; then
+            return
+        fi
+    done
+    guard_paths+=("${candidate}")
+}
+
+measure_guard_paths() {
+    lowest_guard_gib=""
+    lowest_guard_path=""
+    local guard_path free_gib
+    for guard_path in "${guard_paths[@]}"; do
+        free_gib="$(available_gib "${guard_path}")"
+        log info "guard-path: ${guard_path} (${free_gib} GiB free)"
+        if [[ -z "${lowest_guard_gib}" ]] || (( free_gib < lowest_guard_gib )); then
+            lowest_guard_gib="${free_gib}"
+            lowest_guard_path="${guard_path}"
+        fi
+    done
+}
+
+is_guarded_subcommand() {
+    case "$1" in
+        bench|build|check|clippy|doc|fix|install|nextest|run|rustc|test)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 run_cargo_clean() {
     local reason="$1"
     log warning "running cargo clean (${reason})"
     (
-        cd -- "${CODEX_RS_DIR}"
-        cargo "${cargo_global_args[@]}" clean
+        cd -- "${cargo_workdir}"
+        cargo "${cargo_prefix_args[@]}" clean "${clean_context_args[@]}" "${clean_scope_args[@]}"
     )
 }
 
-resolve_target_dir() {
-    if [[ -n "${explicit_target_dir}" ]]; then
-        resolve_path "${explicit_target_dir}" "${CODEX_RS_DIR}"
-        return
+resolve_metadata_dirs() {
+    local metadata_json
+    local metadata_cmd=(cargo "${cargo_prefix_args[@]}" metadata --format-version=1 --no-deps --quiet "${metadata_context_args[@]}")
+
+    if [[ -n "${resolved_explicit_target_dir}" ]]; then
+        metadata_json="$(
+            cd -- "${cargo_workdir}"
+            env CARGO_TARGET_DIR="${resolved_explicit_target_dir}" "${metadata_cmd[@]}"
+        )"
+    else
+        metadata_json="$(
+            cd -- "${cargo_workdir}"
+            "${metadata_cmd[@]}"
+        )"
     fi
 
-    if [[ -n "${inline_config_target_dir}" ]]; then
-        resolve_path "${inline_config_target_dir}" "${CODEX_RS_DIR}"
-        return
-    fi
+    resolved_target_dir="$(metadata_field "${metadata_json}" target_directory)"
+    resolved_build_dir="$(metadata_field "${metadata_json}" build_directory)"
 
-    if [[ -n "${CARGO_BUILD_TARGET_DIR:-}" ]]; then
-        resolve_path "${CARGO_BUILD_TARGET_DIR}" "${CODEX_RS_DIR}"
-        return
+    if [[ -z "${resolved_target_dir}" ]]; then
+        log error "cargo metadata did not return target_directory"
+        exit 1
     fi
-
-    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-        resolve_path "${CARGO_TARGET_DIR}" "${CODEX_RS_DIR}"
-        return
+    if [[ -z "${resolved_build_dir}" ]]; then
+        resolved_build_dir="${resolved_target_dir}"
     fi
-
-    local repo_config_target=""
-    if [[ -f "${CODEX_RS_DIR}/.cargo/config.toml" ]]; then
-        repo_config_target="$(extract_build_target_dir_from_config "${CODEX_RS_DIR}/.cargo/config.toml")"
-        if [[ -n "${repo_config_target}" ]]; then
-            resolve_path "${repo_config_target}" "${CODEX_RS_DIR}/.cargo"
-            return
-        fi
-    fi
-
-    local user_config_target=""
-    if [[ -f "${HOME}/.cargo/config.toml" ]]; then
-        user_config_target="$(extract_build_target_dir_from_config "${HOME}/.cargo/config.toml")"
-        if [[ -n "${user_config_target}" ]]; then
-            resolve_path "${user_config_target}" "${HOME}/.cargo"
-            return
-        fi
-    fi
-
-    resolve_path "target" "${CODEX_RS_DIR}"
 }
 
 cleanup_on_exit() {
     local status=$?
     trap - EXIT
 
-    if (( cargo_started == 1 )) && [[ "${cargo_subcommand}" != "clean" ]]; then
-        if (( status != 0 )); then
-            run_cargo_clean "command exited with status ${status}"
-        else
-            local post_run_free_gib
-            post_run_free_gib="$(available_gib "${resolved_target_dir}")"
-            if (( post_run_free_gib < MIN_FREE_GIB )); then
-                run_cargo_clean "post-run free space ${post_run_free_gib} GiB below floor ${MIN_FREE_GIB} GiB"
-            else
-                log info "post-run free space ${post_run_free_gib} GiB >= floor ${MIN_FREE_GIB} GiB; skipping cargo clean"
+    if (( cargo_started == 1 )) && (( guard_enabled == 1 )); then
+        measure_guard_paths
+        if (( lowest_guard_gib < MIN_FREE_GIB )); then
+            run_cargo_clean "post-run free space ${lowest_guard_gib} GiB at ${lowest_guard_path} below floor ${MIN_FREE_GIB} GiB (command exited with status ${status})"
+            measure_guard_paths
+            if (( lowest_guard_gib < MIN_FREE_GIB )); then
+                log error "free space is still below the ${MIN_FREE_GIB} GiB floor after cargo clean (${lowest_guard_gib} GiB at ${lowest_guard_path})"
+                if (( status == 0 )); then
+                    status=1
+                fi
             fi
+        elif (( status != 0 )); then
+            log info "command exited with status ${status}, but lowest free space ${lowest_guard_gib} GiB at ${lowest_guard_path} is above the ${MIN_FREE_GIB} GiB floor; skipping cargo clean"
+        else
+            log info "post-run lowest free space ${lowest_guard_gib} GiB at ${lowest_guard_path} is above the ${MIN_FREE_GIB} GiB floor; skipping cargo clean"
         fi
     fi
 
@@ -210,37 +201,27 @@ if [[ ! -d "${CODEX_RS_DIR}" ]]; then
     exit 1
 fi
 
-explicit_target_dir=""
-inline_config_target_dir=""
-cargo_global_args=()
+if ! [[ "${MIN_FREE_GIB}" =~ ^[0-9]+$ ]] || (( MIN_FREE_GIB <= 0 )); then
+    log error "CARGO_GUARD_MIN_FREE_GIB must be a positive integer; got ${MIN_FREE_GIB}"
+    exit 2
+fi
+
+cargo_prefix_args=()
+metadata_context_args=()
+clean_context_args=()
+clean_scope_args=()
+cargo_chdir_values=()
+manifest_path_raw=""
+explicit_target_dir_raw=""
 cargo_subcommand=""
 
 index=0
 while (( index < ${#cargo_args[@]} )); do
     arg="${cargo_args[$index]}"
     case "${arg}" in
-        --target-dir=*)
-            explicit_target_dir="$(strip_outer_quotes "${arg#--target-dir=}")"
-            cargo_global_args+=("${arg}")
-            ;;
-        --target-dir)
-            (( index + 1 < ${#cargo_args[@]} )) || {
-                log error "--target-dir requires a value"
-                exit 2
-            }
-            ((index += 1))
-            explicit_target_dir="$(strip_outer_quotes "${cargo_args[$index]}")"
-            cargo_global_args+=("--target-dir" "${cargo_args[$index]}")
-            ;;
-        --config=*)
-            config_value="${arg#--config=}"
-            config_value="$(strip_outer_quotes "${config_value}")"
-            if [[ "${config_value}" == build.target-dir=* ]]; then
-                inline_config_target_dir="$(strip_outer_quotes "${config_value#build.target-dir=}")"
-                cargo_global_args+=("${arg}")
-            elif is_unsupported_file_based_config_arg "${config_value}"; then
-                log error "file-based --config overrides are unsupported; use inline build.target-dir=... or extend the wrapper"
-                exit 2
+        +*)
+            if [[ -z "${cargo_subcommand}" ]]; then
+                cargo_prefix_args+=("${arg}")
             fi
             ;;
         --config)
@@ -249,20 +230,117 @@ while (( index < ${#cargo_args[@]} )); do
                 exit 2
             }
             ((index += 1))
-            config_value="$(strip_outer_quotes "${cargo_args[$index]}")"
-            if [[ "${config_value}" == build.target-dir=* ]]; then
-                inline_config_target_dir="$(strip_outer_quotes "${config_value#build.target-dir=}")"
-                cargo_global_args+=("--config" "${cargo_args[$index]}")
-            elif is_unsupported_file_based_config_arg "${config_value}"; then
-                log error "file-based --config overrides are unsupported; use inline build.target-dir=... or extend the wrapper"
+            metadata_context_args+=("--config" "${cargo_args[$index]}")
+            clean_context_args+=("--config" "${cargo_args[$index]}")
+            ;;
+        --config=*)
+            metadata_context_args+=("${arg}")
+            clean_context_args+=("${arg}")
+            ;;
+        --manifest-path)
+            (( index + 1 < ${#cargo_args[@]} )) || {
+                log error "--manifest-path requires a value"
                 exit 2
+            }
+            ((index += 1))
+            manifest_path_raw="${cargo_args[$index]}"
+            ;;
+        --manifest-path=*)
+            manifest_path_raw="${arg#--manifest-path=}"
+            ;;
+        --lockfile-path)
+            (( index + 1 < ${#cargo_args[@]} )) || {
+                log error "--lockfile-path requires a value"
+                exit 2
+            }
+            ((index += 1))
+            metadata_context_args+=("--lockfile-path" "${cargo_args[$index]}")
+            clean_context_args+=("--lockfile-path" "${cargo_args[$index]}")
+            ;;
+        --lockfile-path=*)
+            metadata_context_args+=("${arg}")
+            clean_context_args+=("${arg}")
+            ;;
+        --locked|--offline|--frozen)
+            metadata_context_args+=("${arg}")
+            clean_context_args+=("${arg}")
+            ;;
+        -Z)
+            (( index + 1 < ${#cargo_args[@]} )) || {
+                log error "-Z requires a value"
+                exit 2
+            }
+            ((index += 1))
+            if [[ -z "${cargo_subcommand}" ]]; then
+                cargo_prefix_args+=("-Z" "${cargo_args[$index]}")
             fi
             ;;
-        --manifest-path|--manifest-path=*)
-            log error "--manifest-path is unsupported in this workspace wrapper; run from ./codex-rs via package selection flags instead"
-            exit 2
+        -Z=*)
+            if [[ -z "${cargo_subcommand}" ]]; then
+                cargo_prefix_args+=("${arg}")
+            fi
             ;;
-        -*)
+        -C)
+            (( index + 1 < ${#cargo_args[@]} )) || {
+                log error "-C requires a value"
+                exit 2
+            }
+            ((index += 1))
+            if [[ -z "${cargo_subcommand}" ]]; then
+                cargo_prefix_args+=("-C" "${cargo_args[$index]}")
+                cargo_chdir_values+=("${cargo_args[$index]}")
+            fi
+            ;;
+        -C=*)
+            if [[ -z "${cargo_subcommand}" ]]; then
+                cargo_prefix_args+=("${arg}")
+                cargo_chdir_values+=("${arg#-C=}")
+            fi
+            ;;
+        --target-dir)
+            (( index + 1 < ${#cargo_args[@]} )) || {
+                log error "--target-dir requires a value"
+                exit 2
+            }
+            ((index += 1))
+            explicit_target_dir_raw="${cargo_args[$index]}"
+            ;;
+        --target-dir=*)
+            explicit_target_dir_raw="${arg#--target-dir=}"
+            ;;
+        -p|--package|--target|--profile)
+            (( index + 1 < ${#cargo_args[@]} )) || {
+                log error "${arg} requires a value"
+                exit 2
+            }
+            ((index += 1))
+            clean_scope_args+=("${arg}" "${cargo_args[$index]}")
+            ;;
+        -p=*|--package=*|--target=*|--profile=*)
+            clean_scope_args+=("${arg}")
+            ;;
+        --workspace|--release|--doc)
+            clean_scope_args+=("${arg}")
+            ;;
+        --color)
+            (( index + 1 < ${#cargo_args[@]} )) || {
+                log error "--color requires a value"
+                exit 2
+            }
+            ((index += 1))
+            if [[ -z "${cargo_subcommand}" ]]; then
+                cargo_prefix_args+=("--color" "${cargo_args[$index]}")
+            fi
+            ;;
+        --color=*|-q|--quiet|-v|--verbose|-vv)
+            if [[ -z "${cargo_subcommand}" ]]; then
+                cargo_prefix_args+=("${arg}")
+            fi
+            ;;
+        -* )
+            if [[ -z "${cargo_subcommand}" ]]; then
+                cargo_prefix_args+=("${arg}")
+            fi
             ;;
         *)
             if [[ -z "${cargo_subcommand}" ]]; then
@@ -273,29 +351,81 @@ while (( index < ${#cargo_args[@]} )); do
     ((index += 1))
 done
 
+cargo_workdir="${CODEX_RS_DIR}"
+if [[ -n "${manifest_path_raw}" ]]; then
+    cargo_workdir="${CALLER_CWD}"
+fi
+
+cargo_path_base_dir="${cargo_workdir}"
+for chdir_value in "${cargo_chdir_values[@]}"; do
+    cargo_path_base_dir="$(resolve_path "${chdir_value}" "${cargo_path_base_dir}")"
+done
+
+if [[ -n "${manifest_path_raw}" ]]; then
+    resolved_manifest_path="$(resolve_path "${manifest_path_raw}" "${cargo_path_base_dir}")"
+    if [[ ! -f "${resolved_manifest_path}" ]]; then
+        log error "--manifest-path does not exist: ${resolved_manifest_path}"
+        exit 2
+    fi
+    case "${resolved_manifest_path}" in
+        "${CODEX_RS_DIR}"/*|"${CODEX_RS_DIR}")
+            ;;
+        *)
+            log error "--manifest-path must stay under ${CODEX_RS_DIR}; got ${resolved_manifest_path}"
+            exit 2
+            ;;
+    esac
+    metadata_context_args+=("--manifest-path" "${resolved_manifest_path}")
+    clean_context_args+=("--manifest-path" "${resolved_manifest_path}")
+fi
+
+resolved_explicit_target_dir=""
+if [[ -n "${explicit_target_dir_raw}" ]]; then
+    resolved_explicit_target_dir="$(resolve_path "${explicit_target_dir_raw}" "${cargo_path_base_dir}")"
+    clean_context_args+=("--target-dir" "${resolved_explicit_target_dir}")
+fi
+
 if [[ -z "${cargo_subcommand}" ]]; then
-    log error "missing cargo subcommand"
-    usage
-    exit 2
+    log info "no cargo subcommand detected; forwarding command without guard"
+    (
+        cd -- "${cargo_workdir}"
+        cargo "${cargo_args[@]}"
+    )
+    exit $?
 fi
 
-if ! [[ "${MIN_FREE_GIB}" =~ ^[0-9]+$ ]] || (( MIN_FREE_GIB <= 0 )); then
-    log error "CARGO_GUARD_MIN_FREE_GIB must be a positive integer; got ${MIN_FREE_GIB}"
-    exit 2
+guard_enabled=0
+if is_guarded_subcommand "${cargo_subcommand}"; then
+    guard_enabled=1
 fi
 
-resolved_target_dir="$(resolve_target_dir)"
-pre_run_free_gib="$(available_gib "${resolved_target_dir}")"
+if (( guard_enabled == 0 )); then
+    log info "subcommand ${cargo_subcommand} does not produce guarded build artifacts; forwarding without free-space guard"
+    (
+        cd -- "${cargo_workdir}"
+        cargo "${cargo_args[@]}"
+    )
+    exit $?
+fi
+
+resolve_metadata_dirs
+
+guard_paths=()
+append_unique_path "${resolved_target_dir}"
+append_unique_path "${resolved_build_dir}"
 
 log info "workspace: ${CODEX_RS_DIR}"
+log info "execution cwd: ${cargo_workdir}"
 log info "target-dir: ${resolved_target_dir}"
-log info "pre-run free space: ${pre_run_free_gib} GiB"
+log info "build-dir: ${resolved_build_dir}"
+measure_guard_paths
+log info "pre-run lowest free space: ${lowest_guard_gib} GiB at ${lowest_guard_path}"
 
-if (( pre_run_free_gib < MIN_FREE_GIB )) && [[ "${cargo_subcommand}" != "clean" ]]; then
-    run_cargo_clean "pre-run free space ${pre_run_free_gib} GiB below floor ${MIN_FREE_GIB} GiB"
-    pre_run_free_gib="$(available_gib "${resolved_target_dir}")"
-    log info "post-clean free space: ${pre_run_free_gib} GiB"
-    if (( pre_run_free_gib < MIN_FREE_GIB )); then
+if (( lowest_guard_gib < MIN_FREE_GIB )); then
+    run_cargo_clean "pre-run free space ${lowest_guard_gib} GiB at ${lowest_guard_path} below floor ${MIN_FREE_GIB} GiB"
+    measure_guard_paths
+    log info "post-clean lowest free space: ${lowest_guard_gib} GiB at ${lowest_guard_path}"
+    if (( lowest_guard_gib < MIN_FREE_GIB )); then
         log error "free space is still below the ${MIN_FREE_GIB} GiB floor after cargo clean"
         exit 1
     fi
@@ -305,6 +435,6 @@ cargo_started=1
 trap cleanup_on_exit EXIT
 
 (
-    cd -- "${CODEX_RS_DIR}"
+    cd -- "${cargo_workdir}"
     cargo "${cargo_args[@]}"
 )

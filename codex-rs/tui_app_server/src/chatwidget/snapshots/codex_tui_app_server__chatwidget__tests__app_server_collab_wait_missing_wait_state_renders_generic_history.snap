@@ -1,0 +1,7 @@
+---
+source: tui_app_server/src/chatwidget/tests.rs
+assertion_line: 4494
+expression: combined
+---
+• Finished waiting
+  └ Scout [explorer]: Completed - Done
