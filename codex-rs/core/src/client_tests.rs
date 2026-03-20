@@ -4,7 +4,14 @@ use super::PendingUnauthorizedRetry;
 use super::UnauthorizedRecoveryExecution;
 use super::X_CODEX_TURN_STATE_HEADER;
 use super::build_responses_headers;
+use crate::ResponseEvent;
+use crate::auth::AuthCredentialsStoreMode;
+use crate::auth::AuthStore;
+use crate::auth::StoredAccount;
+use crate::auth::save_auth;
 use crate::client_common::Prompt;
+use base64::Engine;
+use chrono::Utc;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
@@ -12,8 +19,15 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::start_websocket_server;
+use futures::StreamExt;
 use pretty_assertions::assert_eq;
+use serde::Serialize;
 use serde_json::json;
+use std::collections::HashSet;
+use tempfile::tempdir;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
@@ -89,6 +103,44 @@ fn test_session_telemetry() -> SessionTelemetry {
         "test-terminal".to_string(),
         SessionSource::Cli,
     )
+}
+
+fn test_chatgpt_token_data(chatgpt_account_id: &str) -> crate::token_data::TokenData {
+    #[derive(Serialize)]
+    struct Header {
+        alg: &'static str,
+        typ: &'static str,
+    }
+
+    let header = Header {
+        alg: "none",
+        typ: "JWT",
+    };
+    let payload = json!({
+        "email": "user@example.com",
+        "email_verified": true,
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_user_id": "user-12345",
+            "user_id": "user-12345",
+            "chatgpt_account_id": chatgpt_account_id,
+        }
+    });
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header_b64 = b64(&serde_json::to_vec(&header).expect("serialize header"));
+    let payload_b64 = b64(&serde_json::to_vec(&payload).expect("serialize payload"));
+    let signature_b64 = b64(b"sig");
+    let fake_jwt = format!("{header_b64}.{payload_b64}.{signature_b64}");
+
+    crate::token_data::TokenData {
+        id_token: crate::token_data::IdTokenInfo {
+            raw_jwt: fake_jwt,
+            ..crate::token_data::IdTokenInfo::default()
+        },
+        access_token: format!("access-{chatgpt_account_id}"),
+        refresh_token: format!("refresh-{chatgpt_account_id}"),
+        account_id: Some(chatgpt_account_id.to_string()),
+    }
 }
 
 #[test]
@@ -226,6 +278,290 @@ async fn prompt_gc_hidden_child_session_stream_fallback_keeps_visible_websockets
         .count();
     assert_eq!(websocket_attempts, 1);
     assert_eq!(http_attempts, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_websocket_reconnects_when_auth_account_changes_mid_session() {
+    let server = start_websocket_server(vec![
+        vec![
+            vec![ev_response_created("resp-1"), ev_completed("resp-1")],
+            vec![
+                ev_response_created("resp-unused-if-connection-is-reused"),
+                ev_completed("resp-unused-if-connection-is-reused"),
+            ],
+        ],
+        vec![vec![ev_response_created("resp-2"), ev_completed("resp-2")]],
+    ])
+    .await;
+
+    let auth_home = tempdir().expect("create auth tempdir");
+    let auth_store = AuthStore {
+        active_account_id: Some("acc-0".to_string()),
+        accounts: vec![
+            StoredAccount {
+                id: "acc-0".to_string(),
+                label: None,
+                tokens: test_chatgpt_token_data("acc-0"),
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+            StoredAccount {
+                id: "acc-1".to_string(),
+                label: None,
+                tokens: test_chatgpt_token_data("acc-1"),
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+        ],
+        ..AuthStore::default()
+    };
+    save_auth(
+        auth_home.path(),
+        &auth_store,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("persist auth store");
+    let auth_manager = crate::AuthManager::shared(
+        auth_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    let client = ModelClient::new(
+        Some(auth_manager.clone()),
+        ThreadId::new(),
+        test_provider(&format!("{}/v1", server.uri())),
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_nickname: None,
+            agent_role: None,
+        }),
+        None,
+        false,
+        false,
+        None,
+    );
+    let model_info = test_model_info();
+    let session_telemetry = test_session_telemetry();
+    let prompt = Prompt {
+        input: Vec::new(),
+        tools: Vec::new(),
+        parallel_tool_calls: false,
+        base_instructions: BaseInstructions {
+            text: "auth-sensitive websocket reuse".to_string(),
+        },
+        personality: None,
+        output_schema: None,
+    };
+    let mut session = client.new_session();
+
+    let mut first_stream = session
+        .stream(
+            &prompt,
+            &model_info,
+            &session_telemetry,
+            None,
+            ReasoningSummaryConfig::None,
+            None,
+            None,
+        )
+        .await
+        .expect("first websocket request should succeed");
+    while let Some(event) = first_stream.next().await {
+        if matches!(
+            event.expect("first stream event"),
+            ResponseEvent::Completed { .. }
+        ) {
+            break;
+        }
+    }
+
+    let accounts_before = auth_manager.list_accounts();
+    let failing_store_account_id = accounts_before
+        .iter()
+        .find(|account| account.is_active)
+        .map(|account| account.id.clone())
+        .expect("active account should be present");
+    let freshly_unsupported_store_account_ids = HashSet::new();
+    let switched_to = auth_manager
+        .switch_account_on_usage_limit(
+            None,
+            Some(failing_store_account_id.as_str()),
+            None,
+            None,
+            &freshly_unsupported_store_account_ids,
+            None,
+        )
+        .expect("account switch should succeed");
+    assert!(
+        switched_to.is_some(),
+        "account switch should select a fallback account"
+    );
+
+    let mut second_stream = session
+        .stream(
+            &prompt,
+            &model_info,
+            &session_telemetry,
+            None,
+            ReasoningSummaryConfig::None,
+            None,
+            None,
+        )
+        .await
+        .expect("second websocket request should reconnect with the new account");
+    while let Some(event) = second_stream.next().await {
+        if matches!(
+            event.expect("second stream event"),
+            ResponseEvent::Completed { .. }
+        ) {
+            break;
+        }
+    }
+
+    assert!(
+        server
+            .wait_for_handshakes(2, std::time::Duration::from_secs(2))
+            .await,
+        "expected a second websocket handshake after the account changed"
+    );
+    let handshakes = server.handshakes();
+    assert_eq!(handshakes.len(), 2);
+    assert_eq!(
+        handshakes[0].header("chatgpt-account-id").as_deref(),
+        Some("acc-0")
+    );
+    assert_eq!(
+        handshakes[1].header("chatgpt-account-id").as_deref(),
+        Some("acc-1")
+    );
+    assert_eq!(
+        handshakes[0].header("authorization").as_deref(),
+        Some("Bearer access-acc-0")
+    );
+    assert_eq!(
+        handshakes[1].header("authorization").as_deref(),
+        Some("Bearer access-acc-1")
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_preconnect_reconnects_when_auth_account_changes_mid_session() {
+    let server = start_websocket_server(vec![Vec::new(), Vec::new()]).await;
+
+    let auth_home = tempdir().expect("create auth tempdir");
+    let auth_store = AuthStore {
+        active_account_id: Some("acc-0".to_string()),
+        accounts: vec![
+            StoredAccount {
+                id: "acc-0".to_string(),
+                label: None,
+                tokens: test_chatgpt_token_data("acc-0"),
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+            StoredAccount {
+                id: "acc-1".to_string(),
+                label: None,
+                tokens: test_chatgpt_token_data("acc-1"),
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+        ],
+        ..AuthStore::default()
+    };
+    save_auth(
+        auth_home.path(),
+        &auth_store,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("persist auth store");
+    let auth_manager = crate::AuthManager::shared(
+        auth_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    let client = ModelClient::new(
+        Some(auth_manager.clone()),
+        ThreadId::new(),
+        test_provider(&format!("{}/v1", server.uri())),
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_nickname: None,
+            agent_role: None,
+        }),
+        None,
+        false,
+        false,
+        None,
+    );
+    let model_info = test_model_info();
+    let session_telemetry = test_session_telemetry();
+    let mut session = client.new_session();
+
+    session
+        .preconnect_websocket(&session_telemetry, &model_info)
+        .await
+        .expect("first websocket preconnect should succeed");
+
+    let accounts_before = auth_manager.list_accounts();
+    let failing_store_account_id = accounts_before
+        .iter()
+        .find(|account| account.is_active)
+        .map(|account| account.id.clone())
+        .expect("active account should be present");
+    let freshly_unsupported_store_account_ids = HashSet::new();
+    let switched_to = auth_manager
+        .switch_account_on_usage_limit(
+            None,
+            Some(failing_store_account_id.as_str()),
+            None,
+            None,
+            &freshly_unsupported_store_account_ids,
+            None,
+        )
+        .expect("account switch should succeed");
+    assert!(
+        switched_to.is_some(),
+        "account switch should select a fallback account"
+    );
+
+    session
+        .preconnect_websocket(&session_telemetry, &model_info)
+        .await
+        .expect("second websocket preconnect should reconnect with the new account");
+
+    assert!(
+        server
+            .wait_for_handshakes(2, std::time::Duration::from_secs(2))
+            .await,
+        "expected a second websocket handshake after the account changed"
+    );
+    let handshakes = server.handshakes();
+    assert_eq!(handshakes.len(), 2);
+    assert_eq!(
+        handshakes[0].header("chatgpt-account-id").as_deref(),
+        Some("acc-0")
+    );
+    assert_eq!(
+        handshakes[1].header("chatgpt-account-id").as_deref(),
+        Some("acc-1")
+    );
+    assert_eq!(
+        handshakes[0].header("authorization").as_deref(),
+        Some("Bearer access-acc-0")
+    );
+    assert_eq!(
+        handshakes[1].header("authorization").as_deref(),
+        Some("Bearer access-acc-1")
+    );
+
+    server.shutdown().await;
 }
 
 #[test]

@@ -220,6 +220,7 @@ struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
     last_request: Option<ResponsesApiRequest>,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
+    connected_api_auth: Option<CoreAuthProvider>,
     connection_reused: StdMutex<bool>,
 }
 
@@ -693,6 +694,7 @@ impl ModelClientSession {
         self.websocket_session.connection = None;
         self.websocket_session.last_request = None;
         self.websocket_session.last_response_rx = None;
+        self.websocket_session.connected_api_auth = None;
         self.websocket_session
             .set_connection_reused(/*connection_reused*/ false);
     }
@@ -878,15 +880,24 @@ impl ModelClientSession {
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
-        if self.websocket_session.connection.is_some() {
-            return Ok(());
-        }
-
         let client_setup = self.client.current_client_setup().await.map_err(|err| {
             ApiError::Stream(format!(
                 "failed to build websocket prewarm client setup: {err}"
             ))
         })?;
+        let needs_new = match self.websocket_session.connection.as_ref() {
+            Some(conn) => {
+                self.websocket_session.connected_api_auth.as_ref() != Some(&client_setup.api_auth)
+                    || conn.is_closed().await
+            }
+            None => true,
+        };
+        if !needs_new {
+            return Ok(());
+        }
+
+        self.reset_websocket_session();
+        let connected_api_auth = client_setup.api_auth.clone();
         let auth_context = AuthRequestTelemetryContext::new(
             client_setup.auth.as_ref().map(CodexAuth::auth_mode),
             &client_setup.api_auth,
@@ -905,6 +916,7 @@ impl ModelClientSession {
             )
             .await?;
         self.websocket_session.connection = Some(connection);
+        self.websocket_session.connected_api_auth = Some(connected_api_auth);
         self.websocket_session
             .set_connection_reused(/*connection_reused*/ false);
         Ok(())
@@ -935,14 +947,18 @@ impl ModelClientSession {
             auth_context,
             request_route_telemetry,
         } = params;
+        // Merge-safety anchor: websocket reuse must track the actual handshake auth material so
+        // usage-limit account auto-switches and auth refreshes never keep retrying on a
+        // connection authenticated for stale credentials.
+        let auth_changed = self.websocket_session.connected_api_auth.as_ref() != Some(&api_auth);
         let needs_new = match self.websocket_session.connection.as_ref() {
-            Some(conn) => conn.is_closed().await,
+            Some(conn) => auth_changed || conn.is_closed().await,
             None => true,
         };
 
         if needs_new {
-            self.websocket_session.last_request = None;
-            self.websocket_session.last_response_rx = None;
+            self.reset_websocket_session();
+            let connected_api_auth = api_auth.clone();
             let turn_state = options
                 .turn_state
                 .clone()
@@ -961,14 +977,10 @@ impl ModelClientSession {
                 .await
             {
                 Ok(new_conn) => new_conn,
-                Err(err) => {
-                    if matches!(err, ApiError::Transport(TransportError::Timeout)) {
-                        self.reset_websocket_session();
-                    }
-                    return Err(err);
-                }
+                Err(err) => return Err(err),
             };
             self.websocket_session.connection = Some(new_conn);
+            self.websocket_session.connected_api_auth = Some(connected_api_auth);
             self.websocket_session
                 .set_connection_reused(/*connection_reused*/ false);
         } else {

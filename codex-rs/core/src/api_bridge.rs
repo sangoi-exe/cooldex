@@ -209,7 +209,7 @@ struct UsageErrorBody {
     resets_at: Option<i64>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CoreAuthProvider {
     token: Option<String>,
     account_id: Option<String>,
