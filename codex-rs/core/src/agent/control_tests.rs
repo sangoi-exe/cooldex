@@ -28,6 +28,9 @@ use tokio::time::sleep;
 use tokio::time::timeout;
 use toml::Value as TomlValue;
 
+// Merge-safety anchor: forked-child export tests must preserve role/lead
+// developer_instructions while still stripping user-only prompt state.
+
 async fn test_config_with_cli_overrides(
     cli_overrides: Vec<(String, TomlValue)>,
 ) -> (TempDir, Config) {
@@ -460,6 +463,30 @@ async fn spawn_agent_can_fork_parent_thread_history() {
         .submit(Op::Shutdown {})
         .await
         .expect("parent shutdown should submit");
+}
+
+#[tokio::test]
+async fn export_forked_subagent_turn_context_preserves_developer_instructions() {
+    let harness = AgentControlHarness::new().await;
+    let (_thread_id, thread) = harness.start_thread().await;
+    let mut turn_context = thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .to_turn_context_item();
+    turn_context.user_instructions = Some("user-only".to_string());
+    turn_context.developer_instructions = Some("role-dev".to_string());
+
+    let exported = export_forked_subagent_turn_context(turn_context);
+
+    assert_eq!(exported.user_instructions, None);
+    assert_eq!(exported.developer_instructions.as_deref(), Some("role-dev"));
+
+    let _ = thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("thread shutdown should submit");
 }
 
 #[tokio::test]

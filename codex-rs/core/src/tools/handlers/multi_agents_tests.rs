@@ -3,6 +3,7 @@ use crate::AuthManager;
 use crate::CodexAuth;
 use crate::ThreadManager;
 use crate::agent::AgentRuntimeState;
+use crate::agent::role::apply_role_to_config;
 use crate::built_in_model_providers;
 use crate::codex::make_session_and_context;
 use crate::config::DEFAULT_AGENT_MAX_DEPTH;
@@ -487,6 +488,48 @@ async fn spawn_agent_role_remains_authoritative_when_profile_is_also_set() {
         .await;
     assert_eq!(snapshot.model, role_model);
     assert_eq!(snapshot.reasoning_effort, Some(role_reasoning_effort));
+}
+
+#[tokio::test]
+async fn spawn_agent_role_preserves_role_developer_instructions() {
+    let (session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let role_path = config.codex_home.join("role-dev.toml");
+    std::fs::write(
+        &role_path,
+        "developer_instructions = \"role-dev\"\nmodel_reasoning_effort = \"high\"\n",
+    )
+    .expect("write role config");
+    config.developer_instructions = Some("lead-dev".to_string());
+    config.agent_roles.insert(
+        "custom".to_string(),
+        crate::config::AgentRoleConfig {
+            description: Some("Custom role".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    turn.config = Arc::new(config);
+
+    let mut child_config = build_agent_spawn_config(&turn).expect("spawn config");
+    apply_role_to_config(&mut child_config, Some("custom"))
+        .await
+        .expect("custom role should apply");
+    apply_spawn_agent_runtime_overrides(&mut child_config, &turn)
+        .expect("runtime overrides should apply");
+    finalize_spawn_agent_prompt_config(
+        &mut child_config,
+        &turn,
+        session.services.models_manager.as_ref(),
+    )
+    .await;
+
+    assert_eq!(
+        child_config.developer_instructions.as_deref(),
+        Some("role-dev")
+    );
+    assert_eq!(child_config.user_instructions, None);
 }
 
 #[tokio::test]
@@ -1648,8 +1691,9 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     let (_session, mut turn) = make_session_and_context().await;
     let mut base_config = (*turn.config).clone();
     base_config.subagent_base_instructions = Some("base".to_string());
+    base_config.developer_instructions = Some("base-dev".to_string());
     turn.config = Arc::new(base_config.clone());
-    turn.developer_instructions = Some("dev".to_string());
+    turn.developer_instructions = Some("resolved-dev".to_string());
     turn.compact_prompt = Some("compact".to_string());
     turn.shell_environment_policy = ShellEnvironmentPolicy {
         use_profile: true,
@@ -1681,7 +1725,7 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     expected.model_provider = turn.provider.clone();
     expected.model_reasoning_effort = turn.reasoning_effort;
     expected.model_reasoning_summary = Some(turn.reasoning_summary);
-    expected.developer_instructions = None;
+    expected.developer_instructions = Some("base-dev".to_string());
     expected.user_instructions = None;
     expected.compact_prompt = turn.compact_prompt.clone();
     expected.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
@@ -1724,7 +1768,9 @@ async fn build_agent_resume_config_clears_base_instructions() {
     let (_session, mut turn) = make_session_and_context().await;
     let mut base_config = (*turn.config).clone();
     base_config.base_instructions = Some("caller-base".to_string());
+    base_config.developer_instructions = Some("resume-dev".to_string());
     turn.config = Arc::new(base_config);
+    turn.developer_instructions = Some("resolved-resume-dev".to_string());
     turn.approval_policy
         .set(AskForApproval::OnRequest)
         .expect("approval policy set");
@@ -1737,7 +1783,8 @@ async fn build_agent_resume_config_clears_base_instructions() {
     expected.model_provider = turn.provider.clone();
     expected.model_reasoning_effort = turn.reasoning_effort;
     expected.model_reasoning_summary = Some(turn.reasoning_summary);
-    expected.developer_instructions = turn.developer_instructions.clone();
+    expected.developer_instructions = Some("resume-dev".to_string());
+    expected.user_instructions = None;
     expected.compact_prompt = turn.compact_prompt.clone();
     expected.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
     expected.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
@@ -1752,5 +1799,9 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .sandbox_policy
         .set(turn.sandbox_policy.get().clone())
         .expect("sandbox policy set");
+    expected.pos_compact_instructions =
+        Some(crate::codex::SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY.to_string());
+    expected.project_doc_max_bytes = 0;
+    let _ = expected.features.disable(Feature::ChildAgentsMd);
     assert_eq!(config, expected);
 }

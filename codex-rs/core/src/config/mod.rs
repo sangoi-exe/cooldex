@@ -2706,9 +2706,11 @@ impl Config {
             .subagent_instructions_file
             .as_ref()
             .or(cfg.subagent_instructions_file.as_ref());
-        // Workspace customization seam: child-agent base instructions come from
-        // `subagent_instructions_file` so subagents can stay isolated from the
-        // lead prompt stack during spawn/resume flows in multi_agents.rs.
+        // Merge-safety anchor: child-agent base instructions come from
+        // `subagent_instructions_file`; spawn/resume flows in multi_agents.rs
+        // still strip inherited user/project-doc prompt state, but child
+        // `developer_instructions` may now remain active for role/local
+        // specialization.
         let subagent_base_instructions = Self::try_read_non_empty_file(
             subagent_instructions_path,
             "sub-agent instructions file",

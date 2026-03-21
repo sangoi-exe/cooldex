@@ -291,12 +291,10 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallE
 }
 
 fn strip_child_prompt_inheritance(config: &mut Config) {
-    // Merge-safety anchor: child agents must not inherit the lead prompt stack or lead-only
-    // post-compact ritual. `subagent_instructions_file` provides the child-only base instructions,
-    // and child auto-compact recovery stays recall-only so local overlays cannot reintroduce
-    // manage_context into sub-agent threads. Re-run this after any role/profile reload that
-    // reconstructs `Config` from persisted layers.
-    config.developer_instructions = None;
+    // Merge-safety anchor: child agents must still drop inherited user/project-doc prompt state
+    // and lead-only post-compact ritual, but child `developer_instructions` now stay available so
+    // role files and lead config can intentionally specialize spawned sub-agents. Re-run this
+    // after any role/profile reload that reconstructs `Config` from persisted layers.
     config.user_instructions = None;
     config.pos_compact_instructions =
         Some(crate::codex::SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY.to_string());
@@ -310,9 +308,10 @@ async fn finalize_spawn_agent_prompt_config(
     models_manager: &crate::models_manager::manager::ModelsManager,
 ) {
     // Merge-safety anchor: role/profile reloads rebuild `Config` from persisted layers, which can
-    // repopulate developer instructions, AGENTS/project-doc context, and feature flags. Normalize
-    // the child prompt after the final reload so sub-agents stay isolated from the lead prompt
-    // stack and derive base instructions from the child's final model/personality selection.
+    // repopulate user/project-doc context and feature flags. Normalize the child prompt after the
+    // final reload so sub-agents keep intended developer instructions while still dropping
+    // lead-only user/project-doc inheritance and deriving base instructions from the child's final
+    // model/personality selection.
     strip_child_prompt_inheritance(config);
     let model = config
         .model

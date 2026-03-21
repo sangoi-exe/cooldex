@@ -163,7 +163,6 @@ fn export_forked_subagent_response_item(item: ResponseItem) -> Option<ResponseIt
 
 fn export_forked_subagent_turn_context(mut turn_context: TurnContextItem) -> TurnContextItem {
     turn_context.user_instructions = None;
-    turn_context.developer_instructions = None;
     turn_context
 }
 
