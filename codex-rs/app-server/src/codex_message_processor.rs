@@ -7246,7 +7246,7 @@ impl CodexMessageProcessor {
                     ..Default::default()
                 },
                 Some(command_cwd.clone()),
-                None,
+                /*config_path*/ None,
                 &cloud_requirements,
                 &config.codex_home,
             )

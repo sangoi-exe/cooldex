@@ -197,7 +197,8 @@ impl McpProcess {
         &mut self,
         client_info: ClientInfo,
     ) -> anyhow::Result<JSONRPCMessage> {
-        self.initialize_with_capabilities(client_info, None).await
+        self.initialize_with_capabilities(client_info, /*capabilities*/ None)
+            .await
     }
 
     /// Performs the initialization handshake with the MCP server using experimental capabilities.

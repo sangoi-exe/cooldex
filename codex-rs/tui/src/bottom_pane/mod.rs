@@ -685,7 +685,11 @@ impl BottomPane {
         self.status_state = None;
         if let Some(status) = self.status.as_mut() {
             status.update_header("Working".to_string());
-            status.update_details(None, StatusDetailsCapitalization::CapitalizeFirst, 1);
+            status.update_details(
+                /*details*/ None,
+                StatusDetailsCapitalization::CapitalizeFirst,
+                /*max_lines*/ 1,
+            );
             self.request_redraw();
         }
     }

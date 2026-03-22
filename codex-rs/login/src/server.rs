@@ -359,7 +359,7 @@ async fn process_request(
                                 &err.to_string(),
                                 io::ErrorKind::PermissionDenied,
                                 Some("unsupported_plan"),
-                                None,
+                                /*error_description*/ None,
                             );
                         }
                         return login_error_response(
@@ -821,7 +821,11 @@ pub(crate) async fn persist_tokens_async(
             Ok(())
         })?;
 
-        let auth_manager = AuthManager::new(codex_home.clone(), false, auth_credentials_store_mode);
+        let auth_manager = AuthManager::new(
+            codex_home.clone(),
+            /*enable_codex_api_key_env*/ false,
+            auth_credentials_store_mode,
+        );
         let accounts = auth_manager.list_accounts();
         if !accounts
             .iter()

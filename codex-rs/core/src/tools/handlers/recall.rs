@@ -319,7 +319,11 @@ fn collect_replacement_history_items(replacement_history: &[ResponseItem]) -> Ve
     replacement_history
         .iter()
         .filter_map(|response_item| {
-            recall_item_from_response_item(response_item, "replacement_history", None)
+            recall_item_from_response_item(
+                response_item,
+                "replacement_history",
+                /*rollout_index*/ None,
+            )
         })
         .collect()
 }

@@ -1546,7 +1546,9 @@ impl App {
         }
 
         let now = Utc::now();
-        self.recompute_accounts_status_cache_expiry(now, true);
+        self.recompute_accounts_status_cache_expiry(
+            now, /*allow_fallback_timestamp_initialization*/ true,
+        );
         if !force && self.accounts_status_cache_is_active(now) {
             if self.open_accounts_popup_when_cache_ready {
                 self.open_accounts_popup_when_cache_ready = false;
@@ -1582,7 +1584,7 @@ impl App {
                     accounts_status_cache_fully_refreshed(
                         refresh_result.attempted_fetches,
                         refresh_result.successful_fetches,
-                        true,
+                        /*persistence_succeeded*/ true,
                     ),
                 )
             } else {
@@ -1592,7 +1594,7 @@ impl App {
                         accounts_status_cache_fully_refreshed(
                             refresh_result.attempted_fetches,
                             refresh_result.successful_fetches,
-                            true,
+                            /*persistence_succeeded*/ true,
                         ),
                     ),
                     Err(err) => {
@@ -1629,7 +1631,11 @@ impl App {
         if self.pending_forced_accounts_status_refresh {
             self.pending_forced_accounts_status_refresh = false;
             let show_loading_popup = self.open_accounts_popup_when_cache_ready;
-            self.maybe_start_accounts_status_refresh(true, false, show_loading_popup);
+            self.maybe_start_accounts_status_refresh(
+                /*force*/ true,
+                /*open_popup_when_ready*/ false,
+                show_loading_popup,
+            );
             return;
         }
         if self.open_accounts_popup_when_cache_ready {
@@ -2893,8 +2899,14 @@ impl App {
             open_accounts_popup_when_cache_ready: false,
         };
 
-        app.recompute_accounts_status_cache_expiry(Utc::now(), true);
-        app.maybe_start_accounts_status_refresh(true, false, false);
+        app.recompute_accounts_status_cache_expiry(
+            Utc::now(),
+            /*allow_fallback_timestamp_initialization*/ true,
+        );
+        app.maybe_start_accounts_status_refresh(
+            /*force*/ true, /*open_popup_when_ready*/ false,
+            /*show_loading_popup*/ false,
+        );
         Self::spawn_accounts_cache_poller(app.app_event_tx.clone());
 
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
@@ -3478,11 +3490,20 @@ impl App {
                         .add_error_message(format!("Failed to reload auth store: {err}"));
                     return Ok(AppRunControl::Continue);
                 }
-                self.recompute_accounts_status_cache_expiry(Utc::now(), true);
-                self.maybe_start_accounts_status_refresh(false, true, true);
+                self.recompute_accounts_status_cache_expiry(
+                    Utc::now(),
+                    /*allow_fallback_timestamp_initialization*/ true,
+                );
+                self.maybe_start_accounts_status_refresh(
+                    /*force*/ false, /*open_popup_when_ready*/ true,
+                    /*show_loading_popup*/ true,
+                );
             }
             AppEvent::PollAccountsStatusCache => {
-                self.maybe_start_accounts_status_refresh(false, false, false);
+                self.maybe_start_accounts_status_refresh(
+                    /*force*/ false, /*open_popup_when_ready*/ false,
+                    /*show_loading_popup*/ false,
+                );
             }
             AppEvent::AccountsStatusCacheFetched {
                 updated_accounts,
@@ -3509,10 +3530,15 @@ impl App {
                                 )
                             })
                             .unwrap_or_else(|| account_id.clone());
-                        self.recompute_accounts_status_cache_expiry(Utc::now(), true);
+                        self.recompute_accounts_status_cache_expiry(
+                            Utc::now(),
+                            /*allow_fallback_timestamp_initialization*/ true,
+                        );
                         self.chat_widget.on_active_account_changed();
-                        self.chat_widget
-                            .add_info_message(format!("Active account: {display}"), None);
+                        self.chat_widget.add_info_message(
+                            format!("Active account: {display}"),
+                            /*hint*/ None,
+                        );
                     }
                     Err(err) => {
                         self.chat_widget
@@ -3541,7 +3567,10 @@ impl App {
 
                 match self.auth_manager.remove_account(&account_id) {
                     Ok(true) => {
-                        self.recompute_accounts_status_cache_expiry(Utc::now(), true);
+                        self.recompute_accounts_status_cache_expiry(
+                            Utc::now(),
+                            /*allow_fallback_timestamp_initialization*/ true,
+                        );
                         if exit_after {
                             self.app_event_tx
                                 .send(AppEvent::Exit(ExitMode::ShutdownFirst));
@@ -3553,7 +3582,7 @@ impl App {
                                     format!(
                                         "Removed account: {removed_display}. You are now logged out."
                                     ),
-                                    None,
+                                    /*hint*/ None,
                                 );
                             } else if was_active {
                                 let active_display = accounts_after
@@ -3572,12 +3601,12 @@ impl App {
                                     format!(
                                         "Removed account: {removed_display}. Active account: {active_display}"
                                     ),
-                                    None,
+                                    /*hint*/ None,
                                 );
                             } else {
                                 self.chat_widget.add_info_message(
                                     format!("Removed account: {removed_display}"),
-                                    None,
+                                    /*hint*/ None,
                                 );
                             }
                         }
@@ -3595,7 +3624,10 @@ impl App {
             }
             AppEvent::LogoutAllAccounts => match self.auth_manager.logout() {
                 Ok(true) => {
-                    self.recompute_accounts_status_cache_expiry(Utc::now(), true);
+                    self.recompute_accounts_status_cache_expiry(
+                        Utc::now(),
+                        /*allow_fallback_timestamp_initialization*/ true,
+                    );
                     self.app_event_tx
                         .send(AppEvent::Exit(ExitMode::ShutdownFirst));
                 }
@@ -3683,20 +3715,32 @@ impl App {
                 ChatGptAddAccountOutcome::Success {
                     active_account_display,
                 } => {
-                    self.recompute_accounts_status_cache_expiry(Utc::now(), true);
-                    self.maybe_start_accounts_status_refresh(true, false, false);
+                    self.recompute_accounts_status_cache_expiry(
+                        Utc::now(),
+                        /*allow_fallback_timestamp_initialization*/ true,
+                    );
+                    self.maybe_start_accounts_status_refresh(
+                        /*force*/ true, /*open_popup_when_ready*/ false,
+                        /*show_loading_popup*/ false,
+                    );
                     self.chat_widget.on_active_account_changed();
                     if let Some(display) = active_account_display {
-                        self.chat_widget
-                            .add_info_message(format!("Active account: {display}"), None);
+                        self.chat_widget.add_info_message(
+                            format!("Active account: {display}"),
+                            /*hint*/ None,
+                        );
                     } else {
-                        self.chat_widget
-                            .add_info_message("Added ChatGPT account.".to_string(), None);
+                        self.chat_widget.add_info_message(
+                            "Added ChatGPT account.".to_string(),
+                            /*hint*/ None,
+                        );
                     }
                 }
                 ChatGptAddAccountOutcome::Cancelled => {
-                    self.chat_widget
-                        .add_info_message("ChatGPT login cancelled.".to_string(), None);
+                    self.chat_widget.add_info_message(
+                        "ChatGPT login cancelled.".to_string(),
+                        /*hint*/ None,
+                    );
                 }
                 ChatGptAddAccountOutcome::Failed { message } => {
                     self.chat_widget
@@ -4880,7 +4924,13 @@ impl App {
         let app_event_tx = self.app_event_tx.clone();
         self.thread_event_channels.insert(thread_id, channel);
         let listener_handle = tokio::spawn(async move {
-            forward_thread_runtime(thread, app_event_tx, Some(thread_id), true).await;
+            forward_thread_runtime(
+                thread,
+                app_event_tx,
+                Some(thread_id),
+                /*seed_prompt_gc_context_usage_if_idle*/ true,
+            )
+            .await;
         });
         self.thread_event_listener_tasks
             .insert(thread_id, listener_handle);

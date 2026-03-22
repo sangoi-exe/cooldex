@@ -1690,7 +1690,7 @@ impl ChatWidget {
                     "recall".to_string(),
                     recall_debug_markdown,
                     self.config.cwd.as_path(),
-                    false,
+                    /*transcript_only*/ false,
                 ));
                 self.request_redraw();
             }
@@ -1840,7 +1840,7 @@ impl ChatWidget {
         self.update_task_running_state();
         self.retry_status_header = None;
         self.pending_status_indicator_restore = false;
-        self.bottom_pane.set_prompt_gc_active(false);
+        self.bottom_pane.set_prompt_gc_active(/*active*/ false);
         self.bottom_pane
             .set_interrupt_hint_visible(/*visible*/ true);
         self.terminal_title_status_kind = TerminalTitleStatusKind::Working;
@@ -1891,7 +1891,7 @@ impl ChatWidget {
         }
         // Mark task stopped and request redraw now that all content is in history.
         self.pending_status_indicator_restore = false;
-        self.bottom_pane.set_prompt_gc_active(false);
+        self.bottom_pane.set_prompt_gc_active(/*active*/ false);
         self.agent_turn_running = false;
         self.turn_sleep_inhibitor
             .set_turn_running(/*turn_running*/ false);
@@ -2100,7 +2100,8 @@ impl ChatWidget {
             None => {
                 let Some(model_context_window) = model_context_window else {
                     self.prompt_gc_context_usage_unknown = false;
-                    self.bottom_pane.set_context_window(None, None);
+                    self.bottom_pane
+                        .set_context_window(/*percent*/ None, /*used_tokens*/ None);
                     self.token_info = None;
                     return;
                 };
@@ -2261,7 +2262,7 @@ impl ChatWidget {
         // Ensure any spinner is replaced by a red ✗ and flushed into history.
         self.finalize_active_cell_as_failed();
         // Reset running state and clear streaming buffers.
-        self.bottom_pane.set_prompt_gc_active(false);
+        self.bottom_pane.set_prompt_gc_active(/*active*/ false);
         self.agent_turn_running = false;
         self.turn_sleep_inhibitor
             .set_turn_running(/*turn_running*/ false);
@@ -3131,7 +3132,7 @@ impl ChatWidget {
     }
 
     fn on_shutdown_complete(&mut self) {
-        self.bottom_pane.set_prompt_gc_active(false);
+        self.bottom_pane.set_prompt_gc_active(/*active*/ false);
         self.request_immediate_exit();
     }
 
@@ -3162,12 +3163,13 @@ impl ChatWidget {
             } else if self.token_info.is_none() {
                 self.mark_prompt_gc_context_usage_unknown();
             }
-            self.bottom_pane.set_prompt_gc_active(true);
+            self.bottom_pane.set_prompt_gc_active(/*active*/ true);
             self.bottom_pane.ensure_status_indicator();
-            self.bottom_pane.set_interrupt_hint_visible(true);
+            self.bottom_pane
+                .set_interrupt_hint_visible(/*visible*/ true);
             return;
         }
-        self.bottom_pane.set_prompt_gc_active(false);
+        self.bottom_pane.set_prompt_gc_active(/*active*/ false);
         if self.commentary_stream_active() {
             self.bottom_pane.hide_status_indicator();
         }
@@ -4877,7 +4879,7 @@ impl ChatWidget {
                     self.add_info_message(
                         "`/debug` is unavailable before the first raw response output or right after a rollback."
                             .to_string(),
-                        None,
+                        /*hint*/ None,
                     );
                     return;
                 };
@@ -4888,7 +4890,7 @@ impl ChatWidget {
                             format!(
                                 "Latest raw API response item:\n\n```json\n{raw_response}\n```"
                             ),
-                            None,
+                            /*hint*/ None,
                         );
                     }
                     Err(err) => {

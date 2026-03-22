@@ -53,7 +53,7 @@ fn initial_prompt_gc_bootstrap_event(
     token_usage_info: Option<TokenUsageInfo>,
 ) -> Option<AppEvent> {
     if prompt_gc_active {
-        Some(prompt_gc_activity_event(thread_id, true))
+        Some(prompt_gc_activity_event(thread_id, /*active*/ true))
     } else if seed_prompt_gc_context_usage_if_idle {
         Some(prompt_gc_context_usage_event(thread_id, token_usage_info))
     } else {
@@ -161,7 +161,7 @@ pub(crate) async fn forward_thread_runtime(
     }
 
     if *prompt_gc_state_rx.borrow() {
-        app_event_tx.send(prompt_gc_activity_event(thread_id, false));
+        app_event_tx.send(prompt_gc_activity_event(thread_id, /*active*/ false));
         emit_prompt_gc_context_usage_update(thread.as_ref(), &app_event_tx, thread_id).await;
     }
 }
@@ -215,7 +215,13 @@ pub(crate) fn spawn_agent(
             }
         });
 
-        forward_thread_runtime(thread, app_event_tx_clone, None, true).await;
+        forward_thread_runtime(
+            thread,
+            app_event_tx_clone,
+            /*thread_id*/ None,
+            /*seed_prompt_gc_context_usage_if_idle*/ true,
+        )
+        .await;
     });
 
     codex_op_tx
@@ -252,7 +258,13 @@ pub(crate) fn spawn_agent_from_existing(
             }
         });
 
-        forward_thread_runtime(thread, app_event_tx_clone, None, true).await;
+        forward_thread_runtime(
+            thread,
+            app_event_tx_clone,
+            /*thread_id*/ None,
+            /*seed_prompt_gc_context_usage_if_idle*/ true,
+        )
+        .await;
     });
 
     codex_op_tx

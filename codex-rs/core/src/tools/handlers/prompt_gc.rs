@@ -308,7 +308,7 @@ pub(crate) async fn apply_runtime_plan(
     let replacement_history = {
         let mut state = session.state.lock().await;
         let manage_context_checkpoint = state.manage_context_checkpoint();
-        state.set_context_inclusion(&exclusion_indices, false);
+        state.set_context_inclusion(&exclusion_indices, /*included*/ false);
         state.add_context_notes(notes);
         let replacement_history = state.prompt_snapshot_lenient();
         state.restore_manage_context_checkpoint(manage_context_checkpoint);

@@ -1012,7 +1012,7 @@ async fn write_and_reconcile_items_atomically(
         state_builder,
         items,
         default_provider,
-        None,
+        /*new_thread_memory_mode*/ None,
     )
     .await;
     Ok(())

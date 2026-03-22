@@ -361,7 +361,7 @@ async fn handle_apply(
         indices_to_exclude.sort_unstable();
         indices_to_exclude.dedup();
         if !indices_to_exclude.is_empty() {
-            state.set_context_inclusion(&indices_to_exclude, false);
+            state.set_context_inclusion(&indices_to_exclude, /*included*/ false);
         }
         let replaced_chunks = replacement_updates.len();
         if !replacement_updates.is_empty() {

@@ -824,7 +824,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     ts_msg!(
                         self,
                         "{} {}, {} agents reported:",
-                        format_collab_invocation("wait", &call_id, None),
+                        format_collab_invocation("wait", &call_id, /*prompt*/ None),
                         wait_result_label.style(self.yellow),
                         statuses.len()
                     );
@@ -833,7 +833,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     let title_style = if success { self.green } else { self.red };
                     let title = format!(
                         "{} {}, {} agents reported:",
-                        format_collab_invocation("wait", &call_id, None),
+                        format_collab_invocation("wait", &call_id, /*prompt*/ None),
                         wait_result_label,
                         statuses.len()
                     );

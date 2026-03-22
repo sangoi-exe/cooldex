@@ -421,7 +421,7 @@ impl EventProcessorWithJsonOutput {
             ev.sender_thread_id.to_string(),
             Vec::new(),
             Some(ev.prompt.clone()),
-            None,
+            /*wait_state*/ None,
         )
     }
 
@@ -450,7 +450,7 @@ impl EventProcessorWithJsonOutput {
             Some(ev.prompt.clone()),
             agents_states,
             status,
-            None,
+            /*wait_state*/ None,
         )
     }
 
@@ -464,7 +464,7 @@ impl EventProcessorWithJsonOutput {
             ev.sender_thread_id.to_string(),
             vec![ev.receiver_thread_id.to_string()],
             Some(ev.prompt.clone()),
-            None,
+            /*wait_state*/ None,
         )
     }
 
@@ -487,7 +487,7 @@ impl EventProcessorWithJsonOutput {
             Some(ev.prompt.clone()),
             [(receiver_id, agent_state)].into_iter().collect(),
             status,
-            None,
+            /*wait_state*/ None,
         )
     }
 
@@ -503,7 +503,7 @@ impl EventProcessorWithJsonOutput {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
-            None,
+            /*prompt*/ None,
             Some(ev.wait_state.clone()),
         )
     }
@@ -548,8 +548,8 @@ impl EventProcessorWithJsonOutput {
             CollabTool::CloseAgent,
             ev.sender_thread_id.to_string(),
             vec![ev.receiver_thread_id.to_string()],
-            None,
-            None,
+            /*prompt*/ None,
+            /*wait_state*/ None,
         )
     }
 
@@ -569,7 +569,7 @@ impl EventProcessorWithJsonOutput {
             /*prompt*/ None,
             [(receiver_id, agent_state)].into_iter().collect(),
             status,
-            None,
+            /*wait_state*/ None,
         )
     }
 

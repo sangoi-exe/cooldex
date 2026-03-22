@@ -201,9 +201,13 @@ impl CommandPopup {
             let item = CommandItem::Builtin(*cmd);
             let display = cmd.command();
             let aliases = slash_commands::builtin_search_aliases(*cmd);
-            if let Some((bucket, indices)) =
-                match_bucket(&filter_lower, filter_chars, display, None, 0)
-            {
+            if let Some((bucket, indices)) = match_bucket(
+                &filter_lower,
+                filter_chars,
+                display,
+                /*name*/ None,
+                /*name_offset*/ 0,
+            ) {
                 match bucket {
                     MatchBucket::Exact => exact.push((item, indices)),
                     MatchBucket::Prefix => prefix.push((item, indices)),

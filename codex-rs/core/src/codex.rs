@@ -3582,7 +3582,7 @@ impl Session {
                 PromptGcOutcomeKind::ApplySucceeded,
                 Some(PromptGcExecutionPhase::Persist),
                 Some("target_reached".to_string()),
-                None,
+                /*error_message*/ None,
                 Some(applied_unit_count),
             )),
         })];
@@ -3919,13 +3919,19 @@ impl Session {
     }
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
-        self.recompute_token_usage_with_visibility(turn_context, true)
-            .await;
+        self.recompute_token_usage_with_visibility(
+            turn_context,
+            /*emit_token_count_event*/ true,
+        )
+        .await;
     }
 
     pub(crate) async fn recompute_token_usage_silently(&self, turn_context: &TurnContext) {
-        self.recompute_token_usage_with_visibility(turn_context, false)
-            .await;
+        self.recompute_token_usage_with_visibility(
+            turn_context,
+            /*emit_token_count_event*/ false,
+        )
+        .await;
     }
 
     async fn recompute_token_usage_with_visibility(
@@ -3972,8 +3978,12 @@ impl Session {
         turn_context: &TurnContext,
         new_rate_limits: RateLimitSnapshot,
     ) {
-        self.update_rate_limits_with_visibility(turn_context, new_rate_limits, true)
-            .await;
+        self.update_rate_limits_with_visibility(
+            turn_context,
+            new_rate_limits,
+            /*emit_token_count_event*/ true,
+        )
+        .await;
     }
 
     async fn update_rate_limits_with_visibility(
@@ -6064,7 +6074,7 @@ pub(crate) async fn run_turn(
             sampling_request_input,
             &explicitly_enabled_connectors,
             skills_outcome,
-            None,
+            /*allowed_tool_names*/ None,
             &mut server_model_warning_emitted_for_turn,
             cancellation_token.child_token(),
         )
@@ -6625,9 +6635,9 @@ async fn run_prompt_gc_sidecar_if_needed(
         &checkpoint,
         PromptGcOutcomeKind::Started,
         Some(PromptGcExecutionPhase::Prepare),
-        None,
-        None,
-        None,
+        /*stop_reason*/ None,
+        /*error_message*/ None,
+        /*applied_unit_count*/ None,
     )
     .await;
     struct PromptGcActivityGuard<'a> {
@@ -6635,13 +6645,13 @@ async fn run_prompt_gc_sidecar_if_needed(
     }
     impl<'a> PromptGcActivityGuard<'a> {
         fn new(session: &'a Session) -> Self {
-            session.set_prompt_gc_activity(true);
+            session.set_prompt_gc_activity(/*active*/ true);
             Self { session }
         }
     }
     impl<'a> Drop for PromptGcActivityGuard<'a> {
         fn drop(&mut self) {
-            self.session.set_prompt_gc_activity(false);
+            self.session.set_prompt_gc_activity(/*active*/ false);
         }
     }
     let _prompt_gc_activity_guard = PromptGcActivityGuard::new(sess.as_ref());
@@ -6674,7 +6684,7 @@ async fn run_prompt_gc_sidecar_if_needed(
                 Some(PromptGcExecutionPhase::Prepare),
                 Some(failure.marker_stop_reason),
                 Some(failure.error_message),
-                None,
+                /*applied_unit_count*/ None,
             )
             .await;
             return;
@@ -6693,7 +6703,7 @@ async fn run_prompt_gc_sidecar_if_needed(
             PromptGcOutcomeKind::NoEligibleChunks,
             Some(PromptGcExecutionPhase::Prepare),
             Some("no_eligible_chunks".to_string()),
-            None,
+            /*error_message*/ None,
             Some(0),
         )
         .await;
@@ -6724,7 +6734,7 @@ async fn run_prompt_gc_sidecar_if_needed(
                 Some(PromptGcExecutionPhase::Prepare),
                 Some("summary_input_build_failed".to_string()),
                 Some(error),
-                None,
+                /*applied_unit_count*/ None,
             )
             .await;
             return;
@@ -6753,10 +6763,10 @@ async fn run_prompt_gc_sidecar_if_needed(
         Arc::clone(turn_context),
         turn_diff_tracker,
         &mut client_session,
-        None,
+        /*turn_metadata_header*/ None,
         router,
         prompt,
-        None,
+        /*allowed_tool_names*/ None,
         &mut server_model_warning_emitted,
         cancellation_token.child_token(),
         SamplingExecutionMode::Hidden,
@@ -6783,7 +6793,7 @@ async fn run_prompt_gc_sidecar_if_needed(
                 Some(PromptGcExecutionPhase::Request),
                 Some("usage_limit_reached".to_string()),
                 Some(error.to_string()),
-                None,
+                /*applied_unit_count*/ None,
             )
             .await;
             return;
@@ -6805,7 +6815,7 @@ async fn run_prompt_gc_sidecar_if_needed(
                 Some(PromptGcExecutionPhase::Request),
                 Some("request_failed".to_string()),
                 Some(error.to_string()),
-                None,
+                /*applied_unit_count*/ None,
             )
             .await;
             return;
@@ -6823,7 +6833,7 @@ async fn run_prompt_gc_sidecar_if_needed(
             Some(PromptGcExecutionPhase::Request),
             Some("unexpected_follow_up".to_string()),
             Some("prompt_gc sidecar requested an unexpected follow-up".to_string()),
-            None,
+            /*applied_unit_count*/ None,
         )
         .await;
         return;
@@ -6848,7 +6858,7 @@ async fn run_prompt_gc_sidecar_if_needed(
                 Some(PromptGcExecutionPhase::Summarize),
                 Some("invalid_summary_payload".to_string()),
                 Some(error),
-                None,
+                /*applied_unit_count*/ None,
             )
             .await;
             return;
@@ -6882,7 +6892,7 @@ async fn run_prompt_gc_sidecar_if_needed(
                 Some(PromptGcExecutionPhase::Apply),
                 Some("apply_failed".to_string()),
                 Some(error.to_string()),
-                None,
+                /*applied_unit_count*/ None,
             )
             .await;
         }

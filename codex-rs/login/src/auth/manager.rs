@@ -2615,13 +2615,13 @@ fn exhausted_until_from_snapshot(
     if rate_limit_window_blocked(snapshot.secondary.as_ref(), now) {
         return Some(
             rate_limit_window_reset_at(snapshot.secondary.as_ref())
-                .unwrap_or_else(|| exhausted_until(None, Some(snapshot), now)),
+                .unwrap_or_else(|| exhausted_until(/*resets_at*/ None, Some(snapshot), now)),
         );
     }
     if rate_limit_window_blocked(snapshot.primary.as_ref(), now) {
         return Some(
             rate_limit_window_reset_at(snapshot.primary.as_ref())
-                .unwrap_or_else(|| exhausted_until(None, Some(snapshot), now)),
+                .unwrap_or_else(|| exhausted_until(/*resets_at*/ None, Some(snapshot), now)),
         );
     }
     None

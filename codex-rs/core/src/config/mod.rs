@@ -723,7 +723,7 @@ impl ConfigBuilder {
                     return Err(crate::config_loader::io_error_from_config_error(
                         std::io::ErrorKind::InvalidData,
                         config_error,
-                        None,
+                        /*source*/ None,
                     ));
                 }
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));

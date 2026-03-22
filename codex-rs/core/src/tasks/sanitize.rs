@@ -202,7 +202,8 @@ impl SanitizeStagnationTracker {
             if let Some(raw_message) = error_signature.message.as_deref() {
                 let trimmed_message = raw_message.trim();
                 if !trimmed_message.is_empty() {
-                    let compact_message = summarize_status_message(trimmed_message, 220);
+                    let compact_message =
+                        summarize_status_message(trimmed_message, /*max_chars*/ 220);
                     message.push_str(" Last manage_context error: ");
                     message.push_str(&compact_message);
                     message.push('.');
@@ -347,8 +348,11 @@ async fn report_sanitize_materialization_error(
     ctx: &TurnContext,
     error: CodexErr,
 ) -> Option<String> {
-    sess.send_event(ctx, EventMsg::Error(error.to_error_event(None)))
-        .await;
+    sess.send_event(
+        ctx,
+        EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
+    )
+    .await;
     Some(format!(
         "{SANITIZE_ERROR_MESSAGE_PREFIX} {error}. Fix the error and retry /sanitize."
     ))
@@ -436,10 +440,10 @@ impl SessionTask for SanitizeTask {
                 Arc::clone(&ctx),
                 Arc::clone(&turn_diff_tracker),
                 &mut client_session,
-                None,
+                /*turn_metadata_header*/ None,
                 input,
                 &explicitly_enabled_connectors,
-                None,
+                /*skills_outcome*/ None,
                 Some(&allowed_tool_names),
                 &mut server_model_warning_emitted_for_turn,
                 cancellation_token.child_token(),
@@ -450,13 +454,19 @@ impl SessionTask for SanitizeTask {
                 Err(CodexErr::TurnAborted | CodexErr::Interrupted) => return None,
                 Err(error @ CodexErr::ContextWindowExceeded) => {
                     sess.set_total_tokens_full(ctx.as_ref()).await;
-                    sess.send_event(ctx.as_ref(), EventMsg::Error(error.to_error_event(None)))
-                        .await;
+                    sess.send_event(
+                        ctx.as_ref(),
+                        EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
+                    )
+                    .await;
                     return Some(SANITIZE_CONTEXT_WINDOW_EXCEEDED_MESSAGE.to_string());
                 }
                 Err(error) => {
-                    sess.send_event(ctx.as_ref(), EventMsg::Error(error.to_error_event(None)))
-                        .await;
+                    sess.send_event(
+                        ctx.as_ref(),
+                        EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
+                    )
+                    .await;
                     return Some(format!(
                         "{SANITIZE_ERROR_MESSAGE_PREFIX} {error}. Fix the error and retry /sanitize."
                     ));

@@ -613,7 +613,7 @@ fn wait_complete_lines(
 }
 
 fn status_summary_line(status: &AgentStatus) -> Line<'static> {
-    status_summary_spans(status, None).into()
+    status_summary_spans(status, /*last_activity*/ None).into()
 }
 
 #[allow(clippy::disallowed_methods)]

@@ -106,7 +106,7 @@ impl CodeModeService {
             Arc::clone(session),
             Arc::clone(turn),
             tracker,
-            None,
+            /*allowed_tool_names*/ None,
             ToolCallSource::CodeMode,
         );
         let host = Arc::new(CoreTurnHost { exec, tool_runtime });
