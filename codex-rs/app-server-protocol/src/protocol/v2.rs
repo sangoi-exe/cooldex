@@ -4236,8 +4236,9 @@ pub enum ThreadItem {
         /// Optional config profile selected for the spawned agent, when applicable.
         profile: Option<String>,
         // Merge-safety anchor: collab spawn history items must preserve effective child
-        // profile/model/reasoning together so app-server live items and replayed items stay in
-        // lockstep with the core rollout/operator surfaces.
+        // profile/model/reasoning together so app-server live items, replayed items, and the
+        // generated `ThreadItem` schema surfaces stay in lockstep with the core rollout/operator
+        // surfaces.
         /// Effective model used by the spawned agent, when applicable.
         model: Option<String>,
         /// Effective reasoning effort used by the spawned agent, when applicable.

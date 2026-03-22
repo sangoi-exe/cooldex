@@ -92,6 +92,9 @@ impl ToolRouter {
         }
     }
 
+    // Merge-safety anchor: alternate router construction and dispatch must preserve
+    // ToolCallSource threading so code-mode and collab lanes keep their source-aware registry
+    // behavior instead of silently falling back to the default function-tool path.
     pub fn from_builder(builder: ToolRegistryBuilder) -> Self {
         let (specs, registry) = builder.build();
         let model_visible_specs = specs

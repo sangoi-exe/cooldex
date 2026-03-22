@@ -1317,6 +1317,10 @@ pub struct ConfigToml {
 
     /// Optional path to a file containing model instructions for sub-agent
     /// threads spawned via the collab `spawn_agent` tool.
+    // Merge-safety anchor: commentless `core/config.schema.json` is generated from
+    // `ConfigToml`, so child-agent instruction fields like `subagent_instructions_file` must
+    // stay aligned here with spawn/resume config plumbing instead of drifting only in schema
+    // output.
     pub subagent_instructions_file: Option<AbsolutePathBuf>,
 
     /// Compact prompt used for history compaction.

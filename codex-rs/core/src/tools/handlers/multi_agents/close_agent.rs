@@ -68,6 +68,9 @@ impl ToolHandler for Handler {
                 return Err(collab_agent_error(agent_id, err));
             }
         };
+        // Merge-safety anchor: close_agent must fail loud when running-child preemption is not
+        // allowed, while still emitting the authoritative status in both the end event and the
+        // tool result payload.
         let result = match ensure_running_subagent_preemption_allowed(
             turn.config.as_ref(),
             "close",

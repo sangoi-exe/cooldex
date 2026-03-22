@@ -78,6 +78,9 @@ impl CodeModeService {
             session: Arc::clone(session),
             turn: Arc::clone(turn),
         };
+        // Merge-safety anchor: code-mode nested tool calls must keep their explicit
+        // `ToolCallSource::CodeMode` tagging so router/parallel handling preserves the
+        // source-aware policy/logging path instead of collapsing into the default tool flow.
         let tool_runtime = ToolCallRuntime::new(
             router,
             Arc::clone(session),
