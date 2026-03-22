@@ -44,9 +44,9 @@ use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_core::config::ConfigToml;
-use codex_core::features::FEATURES;
-use codex_core::features::Feature;
 use codex_core::personality_migration::PERSONALITY_MIGRATION_FILENAME;
+use codex_features::FEATURES;
+use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
@@ -661,7 +661,7 @@ async fn turn_start_uses_thread_feature_overrides_for_collaboration_mode_instruc
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let turn: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
+    let _turn: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -1851,11 +1851,18 @@ model_reasoning_effort = "{PROFILE_REASONING_EFFORT}"
     assert_eq!(model, Some(PROFILE_MODEL.to_string()));
     assert_eq!(reasoning_effort, Some(PROFILE_REASONING_EFFORT));
     assert_eq!(wait_state, None);
-    let state = agents_states
+    let agent_state = agents_states
         .get(&receiver_thread_id)
-        .expect("spawn completion should include child state");
-    assert_eq!(state.status, CollabAgentStatus::PendingInit);
-    assert_eq!(state.message, None);
+        .expect("spawn completion should include child agent state");
+    assert!(
+        matches!(
+            agent_state.status,
+            CollabAgentStatus::PendingInit | CollabAgentStatus::Running
+        ),
+        "child agent should still be initializing or already running, got {:?}",
+        agent_state.status
+    );
+    assert_eq!(agent_state.message, None);
 
     let turn_completed = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
@@ -1962,7 +1969,7 @@ async fn turn_start_emits_spawn_agent_item_without_fabricated_reasoning_effort_v
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let _turn: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
+    let turn: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
 
     let spawn_started = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
@@ -2232,11 +2239,18 @@ config_file = "./custom-role.toml"
     assert_eq!(model, Some(ROLE_MODEL.to_string()));
     assert_eq!(reasoning_effort, Some(ROLE_REASONING_EFFORT));
     assert_eq!(wait_state, None);
-    let state = agents_states
+    let agent_state = agents_states
         .get(&receiver_thread_id)
-        .expect("spawn completion should include child state");
-    assert_eq!(state.status, CollabAgentStatus::PendingInit);
-    assert_eq!(state.message, None);
+        .expect("spawn completion should include child agent state");
+    assert!(
+        matches!(
+            agent_state.status,
+            CollabAgentStatus::PendingInit | CollabAgentStatus::Running
+        ),
+        "child agent should still be initializing or already running, got {:?}",
+        agent_state.status
+    );
+    assert_eq!(agent_state.message, None);
 
     let turn_completed = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {

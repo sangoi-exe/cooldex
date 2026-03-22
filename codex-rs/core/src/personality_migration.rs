@@ -175,6 +175,7 @@ mod tests {
                 source: SessionSource::Cli,
                 agent_nickname: None,
                 agent_role: None,
+                agent_path: None,
                 model_provider: None,
                 base_instructions: None,
                 dynamic_tools: None,

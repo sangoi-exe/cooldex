@@ -49,6 +49,7 @@ pub(crate) fn builder_from_session_meta(
     builder.model_provider = session_meta.meta.model_provider.clone();
     builder.agent_nickname = session_meta.meta.agent_nickname.clone();
     builder.agent_role = session_meta.meta.agent_role.clone();
+    builder.agent_path = session_meta.meta.agent_path.clone();
     builder.cwd = session_meta.meta.cwd.clone();
     builder.cli_version = Some(session_meta.meta.cli_version.clone());
     builder.sandbox_policy = SandboxPolicy::new_read_only_policy();
@@ -481,6 +482,7 @@ mod tests {
             source: SessionSource::default(),
             agent_nickname: None,
             agent_role: None,
+            agent_path: None,
             model_provider: Some("openai".to_string()),
             base_instructions: None,
             dynamic_tools: None,
@@ -533,6 +535,7 @@ mod tests {
             source: SessionSource::default(),
             agent_nickname: None,
             agent_role: None,
+            agent_path: None,
             model_provider: Some("openai".to_string()),
             base_instructions: None,
             dynamic_tools: None,
@@ -806,6 +809,7 @@ mod tests {
             source: SessionSource::default(),
             agent_nickname: None,
             agent_role: None,
+            agent_path: None,
             model_provider: Some("test-provider".to_string()),
             base_instructions: None,
             dynamic_tools: None,

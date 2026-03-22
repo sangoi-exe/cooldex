@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use base64::Engine;
-use codex_core::auth::AuthCredentialsStoreMode;
-use codex_core::auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
 use codex_login::ServerOptions;
+use codex_login::auth::AuthCredentialsStoreMode;
+use codex_login::auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
 use codex_login::run_login_server;
 use core_test_support::skip_if_no_network;
 use tempfile::tempdir;

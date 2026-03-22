@@ -92,7 +92,7 @@ pub(crate) fn compose_account_display(
 
     match auth.auth_mode() {
         CoreAuthMode::ApiKey => Some(StatusAccountDisplay::ApiKey),
-        CoreAuthMode::Chatgpt => {
+        CoreAuthMode::Chatgpt | CoreAuthMode::ChatgptAuthTokens => {
             // Merge-safety anchor: the TUI account badge must prefer the active ChatGPT
             // account's label/email so `/accounts` state stays aligned with auth storage and the
             // currently selected account.

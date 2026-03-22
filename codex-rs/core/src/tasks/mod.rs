@@ -49,7 +49,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
 
-use crate::features::Feature;
+use codex_features::Feature;
 pub(crate) use compact::CompactTask;
 pub(crate) use ghost_snapshot::GhostSnapshotTask;
 pub(crate) use regular::RegularTask;

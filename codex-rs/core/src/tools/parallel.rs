@@ -71,15 +71,21 @@ impl ToolCallRuntime {
         call: ToolCall,
         cancellation_token: CancellationToken,
     ) -> Result<ResponseInputItem, CodexErr> {
+        let error_call = call.clone();
         if let Some(allowed_tool_names) = self.allowed_tool_names.as_ref()
             && !allowed_tool_names.contains(call.tool_name.as_str())
         {
             return Ok(Self::disallowed_response(&call));
         }
         let source = self.source;
-        self.handle_tool_call_with_source(call, source, cancellation_token)
+        match self
+            .handle_tool_call_with_source(call, source, cancellation_token)
             .await
-            .map(AnyToolResult::into_response)
+        {
+            Ok(response) => Ok(response.into_response()),
+            Err(FunctionCallError::Fatal(message)) => Err(CodexErr::Fatal(message)),
+            Err(other) => Ok(Self::failure_response(error_call, other)),
+        }
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -88,7 +94,7 @@ impl ToolCallRuntime {
         call: ToolCall,
         source: ToolCallSource,
         cancellation_token: CancellationToken,
-    ) -> impl std::future::Future<Output = Result<AnyToolResult, CodexErr>> {
+    ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
         let supports_parallel = self.router.tool_supports_parallel(&call.tool_name);
         let router = Arc::clone(&self.router);
         let session = Arc::clone(&self.session);
@@ -98,7 +104,7 @@ impl ToolCallRuntime {
         let started = Instant::now();
 
         let dispatch_span = trace_span!(
-            "dispatch_tool_call",
+            "dispatch_tool_call_with_code_mode_result",
             otel.name = call.tool_name.as_str(),
             tool_name = call.tool_name.as_str(),
             call_id = call.call_id.as_str(),
@@ -135,19 +141,41 @@ impl ToolCallRuntime {
             }));
 
         async move {
-            match handle.await {
-                Ok(Ok(response)) => Ok(response),
-                Ok(Err(FunctionCallError::Fatal(message))) => Err(CodexErr::Fatal(message)),
-                Ok(Err(other)) => Err(CodexErr::Fatal(other.to_string())),
-                Err(err) => Err(CodexErr::Fatal(format!(
-                    "tool task failed to receive: {err:?}"
-                ))),
-            }
+            handle.await.map_err(|err| {
+                FunctionCallError::Fatal(format!("tool task failed to receive: {err:?}"))
+            })?
         }
     }
 }
 
 impl ToolCallRuntime {
+    fn failure_response(call: ToolCall, err: FunctionCallError) -> ResponseInputItem {
+        let message = err.to_string();
+        match call.payload {
+            ToolPayload::ToolSearch { .. } => ResponseInputItem::ToolSearchOutput {
+                call_id: call.call_id,
+                status: "completed".to_string(),
+                execution: "client".to_string(),
+                tools: Vec::new(),
+            },
+            ToolPayload::Custom { .. } => ResponseInputItem::CustomToolCallOutput {
+                call_id: call.call_id,
+                name: None,
+                output: codex_protocol::models::FunctionCallOutputPayload {
+                    body: codex_protocol::models::FunctionCallOutputBody::Text(message),
+                    success: Some(false),
+                },
+            },
+            _ => ResponseInputItem::FunctionCallOutput {
+                call_id: call.call_id,
+                output: codex_protocol::models::FunctionCallOutputPayload {
+                    body: codex_protocol::models::FunctionCallOutputBody::Text(message),
+                    success: Some(false),
+                },
+            },
+        }
+    }
+
     fn aborted_response(call: &ToolCall, secs: f32) -> AnyToolResult {
         AnyToolResult {
             call_id: call.call_id.clone(),

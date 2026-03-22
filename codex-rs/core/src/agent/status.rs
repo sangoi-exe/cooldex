@@ -181,6 +181,18 @@ fn turn_item_activity(
             CollabAgentActivityKind::Task,
             format!("{prefix} plan: {}", preview_text(item.text.as_str())),
         ),
+        TurnItem::HookPrompt(item) => {
+            let text = item
+                .fragments
+                .iter()
+                .map(|fragment| fragment.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (
+                CollabAgentActivityKind::Task,
+                format!("{prefix} hook prompt: {}", preview_text(text.as_str())),
+            )
+        }
         TurnItem::Reasoning(item) => {
             let text = item
                 .summary_text

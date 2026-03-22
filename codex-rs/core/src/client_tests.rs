@@ -334,6 +334,7 @@ async fn subagent_websocket_reconnects_when_auth_account_changes_mid_session() {
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: ThreadId::new(),
             depth: 1,
+            agent_path: None,
             agent_nickname: None,
             agent_role: None,
         }),
@@ -492,6 +493,7 @@ async fn subagent_preconnect_reconnects_when_auth_account_changes_mid_session() 
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: ThreadId::new(),
             depth: 1,
+            agent_path: None,
             agent_nickname: None,
             agent_role: None,
         }),

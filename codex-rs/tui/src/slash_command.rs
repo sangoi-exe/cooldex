@@ -40,11 +40,13 @@ pub enum SlashCommand {
     Mention,
     Status,
     DebugConfig,
+    Title,
     Statusline,
     Theme,
     Mcp,
     Apps,
     Accounts,
+    Plugins,
     Logout,
     Quit,
     Exit,
@@ -90,6 +92,7 @@ impl SlashCommand {
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
+            SlashCommand::Title => "configure which items appear in the terminal title",
             SlashCommand::Statusline => "configure which items appear in the status line",
             SlashCommand::Theme => "choose a syntax highlighting theme",
             SlashCommand::Ps => "list background terminals",
@@ -114,6 +117,7 @@ impl SlashCommand {
             SlashCommand::Mcp => "list configured MCP tools",
             SlashCommand::Apps => "manage apps",
             SlashCommand::Accounts => "manage ChatGPT accounts",
+            SlashCommand::Plugins => "browse plugins",
             SlashCommand::Logout => "log out of Codex",
             SlashCommand::Rollout => "print the rollout file path",
             SlashCommand::TestApproval => "test approval request",
@@ -163,6 +167,7 @@ impl SlashCommand {
             | SlashCommand::Accounts
             | SlashCommand::Clear
             | SlashCommand::Logout
+            | SlashCommand::Title
             | SlashCommand::Statusline
             | SlashCommand::Theme
             | SlashCommand::MemoryDrop
@@ -179,6 +184,7 @@ impl SlashCommand {
             | SlashCommand::Stop
             | SlashCommand::Mcp
             | SlashCommand::Apps
+            | SlashCommand::Plugins
             | SlashCommand::Feedback
             | SlashCommand::Quit
             | SlashCommand::Exit => true,

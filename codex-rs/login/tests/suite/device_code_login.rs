@@ -3,10 +3,10 @@
 use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use codex_core::auth::AuthCredentialsStoreMode;
-use codex_core::auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
-use codex_core::auth::load_auth_store;
 use codex_login::ServerOptions;
+use codex_login::auth::AuthCredentialsStoreMode;
+use codex_login::auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
+use codex_login::auth::load_auth_store;
 use codex_login::request_device_code;
 use codex_login::run_device_code_login;
 use serde_json::json;

@@ -66,11 +66,7 @@ impl ToolHandler for Handler {
         }
         let return_when = args.return_when.unwrap_or_default();
 
-        let receiver_thread_ids = args
-            .ids
-            .iter()
-            .map(|id| agent_id(id))
-            .collect::<Result<Vec<_>, _>>()?;
+        let receiver_thread_ids = resolve_agent_targets(&session, &turn, args.ids).await?;
         let mut seen_receiver_thread_ids = HashSet::with_capacity(receiver_thread_ids.len());
         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
         for receiver_thread_id in &receiver_thread_ids {
@@ -79,16 +75,15 @@ impl ToolHandler for Handler {
                     "ids must not contain duplicates".to_owned(),
                 ));
             }
-            let (agent_nickname, agent_role) = session
+            let agent_metadata = session
                 .services
                 .agent_control
-                .get_agent_nickname_and_role(*receiver_thread_id)
-                .await
-                .unwrap_or((None, None));
+                .get_agent_metadata(*receiver_thread_id)
+                .unwrap_or_default();
             receiver_agents.push(CollabAgentRef {
                 thread_id: *receiver_thread_id,
-                agent_nickname,
-                agent_role,
+                agent_nickname: agent_metadata.agent_nickname,
+                agent_role: agent_metadata.agent_role,
             });
         }
 

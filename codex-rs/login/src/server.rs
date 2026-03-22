@@ -23,19 +23,19 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crate::AuthManager;
+use crate::auth::AuthCredentialsStoreMode;
+use crate::auth::StoredAccount;
+use crate::auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
+use crate::auth::update_auth_store;
+use crate::default_client::originator;
 use crate::pkce::PkceCodes;
 use crate::pkce::generate_pkce;
+use crate::token_data::TokenData;
+use crate::token_data::parse_chatgpt_jwt_claims;
 use base64::Engine;
 use chrono::Utc;
 use codex_client::build_reqwest_client_with_custom_ca;
-use codex_core::AuthManager;
-use codex_core::auth::AuthCredentialsStoreMode;
-use codex_core::auth::StoredAccount;
-use codex_core::auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
-use codex_core::auth::update_auth_store;
-use codex_core::default_client::originator;
-use codex_core::token_data::TokenData;
-use codex_core::token_data::parse_chatgpt_jwt_claims;
 use rand::RngCore;
 use serde_json::Value as JsonValue;
 use tiny_http::Header;
@@ -493,10 +493,7 @@ fn build_authorize_url(
         ("id_token_add_organizations".to_string(), "true".to_string()),
         ("codex_cli_simplified_flow".to_string(), "true".to_string()),
         ("state".to_string(), state.to_string()),
-        (
-            "originator".to_string(),
-            originator().value.as_str().to_string(),
-        ),
+        ("originator".to_string(), originator().value),
     ];
     if let Some(workspace_id) = forced_chatgpt_workspace_id {
         query.push(("allowed_workspace_id".to_string(), workspace_id.to_string()));
@@ -1150,10 +1147,10 @@ mod tests {
     use super::redact_sensitive_query_value;
     use super::redact_sensitive_url_parts;
     use super::sanitize_url_for_logging;
+    use crate::auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
+    use crate::auth::load_auth_store;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use codex_core::auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
-    use codex_core::auth::load_auth_store;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 

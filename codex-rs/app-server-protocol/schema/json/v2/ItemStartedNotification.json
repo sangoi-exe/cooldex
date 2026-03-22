@@ -287,6 +287,15 @@
         }
       ]
     },
+    "CommandExecutionSource": {
+      "enum": [
+        "agent",
+        "userShell",
+        "unifiedExecStartup",
+        "unifiedExecInteraction"
+      ],
+      "type": "string"
+    },
     "CommandExecutionStatus": {
       "enum": [
         "inProgress",
@@ -364,6 +373,21 @@
         "diff",
         "kind",
         "path"
+      ],
+      "type": "object"
+    },
+    "HookPromptFragment": {
+      "properties": {
+        "hookRunId": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "hookRunId",
+        "text"
       ],
       "type": "object"
     },
@@ -599,6 +623,33 @@
         },
         {
           "properties": {
+            "fragments": {
+              "items": {
+                "$ref": "#/definitions/HookPromptFragment"
+              },
+              "type": "array"
+            },
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "hookPrompt"
+              ],
+              "title": "HookPromptThreadItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "fragments",
+            "id",
+            "type"
+          ],
+          "title": "HookPromptThreadItem",
+          "type": "object"
+        },
+        {
+          "properties": {
             "id": {
               "type": "string"
             },
@@ -751,6 +802,14 @@
                 "string",
                 "null"
               ]
+            },
+            "source": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CommandExecutionSource"
+                }
+              ],
+              "default": "agent"
             },
             "status": {
               "$ref": "#/definitions/CommandExecutionStatus"
@@ -1099,6 +1158,12 @@
               "type": "string"
             },
             "revisedPrompt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "savedPath": {
               "type": [
                 "string",
                 "null"
