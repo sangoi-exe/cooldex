@@ -70,6 +70,7 @@ mod model_provider_info;
 pub mod path_utils;
 pub mod personality_migration;
 pub mod plugins;
+mod prompt_gc_rollout;
 mod prompt_gc_sidecar;
 mod sandbox_tags;
 pub mod sandboxing;

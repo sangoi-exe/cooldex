@@ -1613,6 +1613,96 @@ async fn prompt_gc_sidecar_incomplete_summary_payload_fails_apply_validation() {
 }
 
 #[tokio::test]
+async fn prompt_gc_sidecar_non_reducing_summary_fails_apply_validation() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let server = MockServer::start().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(StaticSseResponder {
+            calls: AtomicUsize::new(0),
+            response_body: sse(&[
+                response_created("resp-1"),
+                assistant_message_event(
+                    "msg-1",
+                    &format!(
+                        "{{\"summaries\":[{{\"chunk_id\":\"prompt_gc_chunk_0\",\"tool_context\":\"{}\",\"reasoning_context\":\"{}\"}}]}}",
+                        "tool context ".repeat(256),
+                        "reasoning context ".repeat(256),
+                    ),
+                ),
+                response_completed_with_usage("resp-1", 17),
+            ]),
+            headers: Vec::new(),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let mut items = Vec::from(prompt_gc_triggering_exec_command_items(
+        "call-1", 2_798, "ok",
+    ));
+    items.push(prompt_gc_phase_message("phase-1"));
+    let observed_items = session.record_into_history(&items, &turn_context).await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let history_before = {
+        let state = session.state.lock().await;
+        state.history_snapshot_lenient()
+    };
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, None);
+    let last_error = status.last_error.expect("apply validation error");
+    assert!(
+        last_error.contains("prompt_gc summary did not reduce projected prompt cost"),
+        "last_error={last_error}"
+    );
+    let history_after = {
+        let state = session.state.lock().await;
+        state.history_snapshot_lenient()
+    };
+    assert_eq!(history_after, history_before);
+    session.flush_rollout().await;
+    assert_eq!(
+        prompt_gc_rollout_markers(&rollout_path).await,
+        vec![
+            PromptGcCompactionMetadata {
+                checkpoint_id: checkpoint_id.clone(),
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Started,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: None,
+                error_message: None,
+                applied_unit_count: None,
+            },
+            PromptGcCompactionMetadata {
+                checkpoint_id,
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Failed,
+                phase: Some(PromptGcExecutionPhase::Apply),
+                stop_reason: Some("apply_failed".to_string()),
+                error_message: Some(last_error),
+                applied_unit_count: None,
+            },
+        ]
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn prompt_gc_hidden_usage_limit_auto_switches_and_retries() {
     let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
     let server = MockServer::start().await;
@@ -2294,6 +2384,7 @@ fn configure_session_model_client_for_server(
 ) {
     let mut provider = crate::built_in_model_providers(None)["openai"].clone();
     provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider.supports_websockets = false;
     let session_mut = Arc::get_mut(session).expect("session arc should be unique");
     let auth_manager = Arc::clone(&session_mut.services.auth_manager);
     session_mut.services.model_client = ModelClient::new(

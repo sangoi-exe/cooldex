@@ -1,6 +1,8 @@
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
+use crate::prompt_gc_rollout::compaction_replacement_history_is_hydratable;
+use crate::prompt_gc_rollout::is_prompt_gc_compaction_marker;
 use crate::rollout::RolloutRecorder;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -15,7 +17,11 @@ use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::REASONING_CONTEXT_CLOSE_TAG;
+use codex_protocol::protocol::REASONING_CONTEXT_OPEN_TAG;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::TOOL_CONTEXT_CLOSE_TAG;
+use codex_protocol::protocol::TOOL_CONTEXT_OPEN_TAG;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
@@ -226,6 +232,8 @@ fn build_recall_payload(
             "legend": {
                 "[r]": "reasoning",
                 "[am]": "assistant message",
+                "[tc]": "tool context note",
+                "[rc]": "reasoning context note",
             },
             "items": compact.items,
         }));
@@ -250,6 +258,7 @@ fn build_recall_payload(
         "filters": {
             "include_reasoning": true,
             "include_assistant_messages": true,
+            "include_context_notes": true,
             "exclude_tool_output": true,
         },
         "counts": {
@@ -352,8 +361,11 @@ fn previous_recall_boundary_before(
                 kind: RecallBoundaryKind::ContextCompactedEvent,
             }),
             RolloutItem::Compacted(compacted)
-                if compacted.replacement_history.is_some()
-                    && !is_prompt_gc_compaction_marker(compacted) =>
+                if compaction_replacement_history_is_hydratable(
+                    rollout_items,
+                    index,
+                    compacted,
+                ) =>
             {
                 Some(RecallBoundary {
                     index,
@@ -363,11 +375,6 @@ fn previous_recall_boundary_before(
             _ => None,
         })
         .next_back()
-}
-
-fn is_prompt_gc_compaction_marker(compacted: &CompactedItem) -> bool {
-    compacted.prompt_gc.is_some()
-        || compacted.message == crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER
 }
 
 fn is_prompt_gc_observational_marker(compacted: &CompactedItem) -> bool {
@@ -417,8 +424,57 @@ fn recall_item_from_response_item(
                     .map(|message_phase| phase_name(message_phase).to_string()),
             })
         }
+        ResponseItem::Message { role, content, .. }
+            if role == "user" && source == "replacement_history" =>
+        {
+            recall_item_from_context_note_message(content, source, rollout_index)
+        }
         _ => None,
     }
+}
+
+fn recall_item_from_context_note_message(
+    content_items: &[ContentItem],
+    source: &str,
+    rollout_index: Option<usize>,
+) -> Option<RecallItem> {
+    let [ContentItem::InputText { text }] = content_items else {
+        return None;
+    };
+    if let Some(note_text) =
+        extract_context_note_text(text, TOOL_CONTEXT_OPEN_TAG, TOOL_CONTEXT_CLOSE_TAG)
+    {
+        return Some(RecallItem {
+            kind: "tool_context_note".to_string(),
+            source: source.to_string(),
+            rollout_index,
+            text: note_text,
+            phase: None,
+        });
+    }
+    if let Some(note_text) = extract_context_note_text(
+        text,
+        REASONING_CONTEXT_OPEN_TAG,
+        REASONING_CONTEXT_CLOSE_TAG,
+    ) {
+        return Some(RecallItem {
+            kind: "reasoning_context_note".to_string(),
+            source: source.to_string(),
+            rollout_index,
+            text: note_text,
+            phase: None,
+        });
+    }
+    None
+}
+
+fn extract_context_note_text(text: &str, open_tag: &str, close_tag: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let note_body = trimmed
+        .strip_prefix(open_tag)?
+        .strip_suffix(close_tag)?
+        .trim();
+    (!note_body.is_empty()).then(|| note_body.to_string())
 }
 
 fn trim_items_to_bytes_limit(
@@ -477,6 +533,8 @@ fn compact_item_tag(kind: &str) -> &'static str {
     match kind {
         "reasoning" => "[r]",
         "assistant_message" => "[am]",
+        "tool_context_note" => "[tc]",
+        "reasoning_context_note" => "[rc]",
         _ => "[other]",
     }
 }
@@ -548,17 +606,22 @@ fn contract_error(reason: StopReason, message: impl Into<String>) -> FunctionCal
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
     use codex_protocol::models::BaseInstructions;
     use codex_protocol::models::FunctionCallOutputPayload;
     use codex_protocol::models::ReasoningItemReasoningSummary::SummaryText;
+    use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::ContextCompactedEvent;
     use codex_protocol::protocol::PromptGcCompactionMetadata;
     use codex_protocol::protocol::PromptGcExecutionPhase;
     use codex_protocol::protocol::PromptGcOutcomeKind;
+    use codex_protocol::protocol::SandboxPolicy;
+    use codex_protocol::protocol::TurnContextItem;
     use codex_protocol::protocol::UserMessageEvent;
     use pretty_assertions::assert_eq;
     use serde_json::Value;
+    use std::path::PathBuf;
     use tokio::io::AsyncWriteExt;
 
     const TEST_RECALL_KBYTES_LIMIT: usize = 256;
@@ -603,6 +666,34 @@ mod tests {
             call_id: call_id.to_string(),
             output: FunctionCallOutputPayload::from_text(output.to_string()),
         })
+    }
+
+    fn tool_context_note_message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: format!(
+                    "{TOOL_CONTEXT_OPEN_TAG}\nchunk_id=prompt_gc_chunk_0\n{text}\n{TOOL_CONTEXT_CLOSE_TAG}"
+                ),
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
+    fn reasoning_context_note_message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: format!(
+                    "{REASONING_CONTEXT_OPEN_TAG}\nchunk_id=prompt_gc_chunk_0\n{text}\n{REASONING_CONTEXT_CLOSE_TAG}"
+                ),
+            }],
+            end_turn: None,
+            phase: None,
+        }
     }
 
     fn compacted_marker() -> RolloutItem {
@@ -656,6 +747,29 @@ mod tests {
                 error_message: None,
                 applied_unit_count: Some(1),
             }),
+        })
+    }
+
+    fn prompt_gc_turn_context_item() -> RolloutItem {
+        RolloutItem::TurnContext(TurnContextItem {
+            turn_id: Some("turn-1".to_string()),
+            trace_id: None,
+            cwd: PathBuf::from("/tmp"),
+            current_date: None,
+            timezone: None,
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            network: None,
+            model: "gpt-5".to_string(),
+            personality: None,
+            collaboration_mode: None,
+            realtime_active: None,
+            effort: None,
+            summary: ReasoningSummaryConfig::Auto,
+            user_instructions: None,
+            developer_instructions: None,
+            final_output_json_schema: None,
+            truncation_policy: None,
         })
     }
 
@@ -1056,7 +1170,46 @@ mod tests {
     }
 
     #[test]
-    fn recall_ignores_prompt_gc_replacement_history_as_lower_boundary_until_notes_are_hydratable() {
+    fn recall_uses_prompt_gc_replacement_history_as_lower_boundary_when_notes_are_hydratable() {
+        let mut rollout_items = vec![
+            replacement_history_compacted_marker_with_history(vec![ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "real base".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }]),
+            assistant_message("after real boundary", None),
+        ];
+        rollout_items.extend([
+            prompt_gc_replacement_history_marker(vec![
+                tool_context_note_message("prompt gc tool base"),
+                reasoning_context_note_message("prompt gc reasoning base"),
+            ]),
+            prompt_gc_turn_context_item(),
+        ]);
+        rollout_items.extend([
+            assistant_message("after prompt gc boundary", None),
+            compacted_marker(),
+        ]);
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, false)
+            .expect("build compact recall payload");
+
+        assert_eq!(
+            compact_recall_items(&payload),
+            vec![
+                "1: [tc] chunk_id=prompt_gc_chunk_0\nprompt gc tool base".to_string(),
+                "2: [rc] chunk_id=prompt_gc_chunk_0\nprompt gc reasoning base".to_string(),
+                "3: [am] after prompt gc boundary".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recall_ignores_crash_truncated_prompt_gc_replacement_history_without_turn_context() {
         let rollout_items = vec![
             replacement_history_compacted_marker_with_history(vec![ResponseItem::Message {
                 id: None,
@@ -1068,16 +1221,11 @@ mod tests {
                 phase: None,
             }]),
             assistant_message("after real boundary", None),
-            prompt_gc_replacement_history_marker(vec![ResponseItem::Message {
-                id: None,
-                role: "assistant".to_string(),
-                content: vec![ContentItem::OutputText {
-                    text: "prompt gc base".to_string(),
-                }],
-                end_turn: None,
-                phase: None,
-            }]),
-            assistant_message("after prompt gc boundary", None),
+            prompt_gc_replacement_history_marker(vec![
+                tool_context_note_message("prompt gc tool base"),
+                reasoning_context_note_message("prompt gc reasoning base"),
+            ]),
+            assistant_message("after truncated prompt gc boundary", None),
             compacted_marker(),
         ];
 
@@ -1089,7 +1237,7 @@ mod tests {
             vec![
                 "1: [am] real base".to_string(),
                 "2: [am] after real boundary".to_string(),
-                "3: [am] after prompt gc boundary".to_string(),
+                "3: [am] after truncated prompt gc boundary".to_string(),
             ]
         );
     }
@@ -1187,6 +1335,41 @@ mod tests {
         assert!(payload.get("integrity").is_none());
         assert!(payload.get("boundary").is_none());
         assert!(payload.get("counts").is_none());
+    }
+
+    #[test]
+    fn recall_debug_mode_reports_hydrated_prompt_gc_note_items() {
+        let mut rollout_items = Vec::new();
+        rollout_items.extend([
+            prompt_gc_replacement_history_marker(vec![
+                tool_context_note_message("tool summary"),
+                reasoning_context_note_message("reasoning summary"),
+            ]),
+            prompt_gc_turn_context_item(),
+        ]);
+        rollout_items.extend([compacted_marker()]);
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, true)
+            .expect("build debug recall payload");
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+
+        assert_eq!(
+            payload.pointer("/boundary/last_boundary_kind"),
+            Some(&json!("replacement_history_compacted"))
+        );
+        assert_eq!(
+            payload.pointer("/filters/include_context_notes"),
+            Some(&json!(true))
+        );
+        assert_eq!(items[0].get("kind"), Some(&json!("tool_context_note")));
+        assert_eq!(items[0].get("source"), Some(&json!("replacement_history")));
+        assert_eq!(items[0].get("rollout_index"), Some(&Value::Null));
+        assert_eq!(items[1].get("kind"), Some(&json!("reasoning_context_note")));
+        assert_eq!(items[1].get("source"), Some(&json!("replacement_history")));
+        assert_eq!(items[1].get("rollout_index"), Some(&Value::Null));
     }
 
     #[test]

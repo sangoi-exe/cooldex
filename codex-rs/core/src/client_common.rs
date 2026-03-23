@@ -18,7 +18,10 @@ use tokio::sync::mpsc;
 pub const REVIEW_PROMPT: &str = include_str!("../review_prompt.md");
 /// Sanitize sub-agent system prompt. Edit `core/sanitize_prompt.md` to customize.
 pub const SANITIZE_PROMPT: &str = include_str!("../sanitize_prompt.md");
-/// Default PromptGcSidecar system prompt used when `config.toml` does not override it.
+// Merge-safety anchor: `PROMPT_GC_PROMPT` is the built-in prompt source for the
+// hidden summary-only PromptGcSidecar child-session flow. HEAD keeps prompt_gc
+// out of the model tool registry and exposes no `config.toml` override seam here.
+/// PromptGcSidecar hidden child-session summary prompt. Edit `core/prompt_gc_prompt.md` to customize.
 pub const PROMPT_GC_PROMPT: &str = include_str!("../prompt_gc_prompt.md");
 
 // Centralized templates for review-related user messages

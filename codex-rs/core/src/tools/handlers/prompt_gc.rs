@@ -1,5 +1,7 @@
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::context_manager::ContextManager;
+use crate::context_manager::estimate_response_item_model_visible_bytes;
 use crate::prompt_gc_sidecar::MAX_RAW_BYTES_PER_RETRIEVE;
 use crate::prompt_gc_sidecar::MAX_UNITS_PER_RETRIEVE;
 use crate::prompt_gc_sidecar::PromptGcApplyOutcome;
@@ -53,6 +55,7 @@ pub(crate) struct PromptGcRuntimePlan {
 enum StopReason {
     InvalidContract,
     InvalidSummarySchema,
+    NoPromptReduction,
     StateHashMismatch,
 }
 
@@ -61,9 +64,16 @@ impl StopReason {
         match self {
             Self::InvalidContract => "invalid_contract",
             Self::InvalidSummarySchema => "invalid_summary_schema",
+            Self::NoPromptReduction => "no_prompt_reduction",
             Self::StateHashMismatch => "state_hash_mismatch",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PromptProjectionCost {
+    model_visible_bytes: i64,
+    estimated_tokens: i64,
 }
 
 fn select_chunks(
@@ -197,6 +207,25 @@ fn build_notes(
     Ok(notes)
 }
 
+fn projected_prompt_cost(
+    prompt_items: &[ResponseItem],
+    turn: &TurnContext,
+) -> PromptProjectionCost {
+    let model_visible_bytes = prompt_items
+        .iter()
+        .map(estimate_response_item_model_visible_bytes)
+        .fold(0i64, i64::saturating_add);
+    let mut projected_history = ContextManager::new();
+    projected_history.replace(prompt_items.to_vec());
+    let estimated_tokens = projected_history
+        .estimate_token_count(turn)
+        .unwrap_or(i64::MAX);
+    PromptProjectionCost {
+        model_visible_bytes,
+        estimated_tokens,
+    }
+}
+
 fn order_chunk_summaries(
     chunk_manifest: &[PromptGcResolvedChunk],
     chunk_summaries: &[PromptGcChunkSummary],
@@ -305,15 +334,32 @@ pub(crate) async fn apply_runtime_plan(
         .collect::<Vec<_>>();
     let applied_unit_count = u64::try_from(applied_unit_keys.len()).unwrap_or(u64::MAX);
 
-    let replacement_history = {
+    let (replacement_history, before_cost, after_cost) = {
         let mut state = session.state.lock().await;
+        let current_prompt = state.prompt_snapshot_for_model(&turn.model_info.input_modalities);
+        let before_cost = projected_prompt_cost(&current_prompt, turn);
         let manage_context_checkpoint = state.manage_context_checkpoint();
         state.set_context_inclusion(&exclusion_indices, /*included*/ false);
         state.add_context_notes(notes);
         let replacement_history = state.prompt_snapshot_lenient();
+        let rewritten_prompt = state.prompt_snapshot_for_model(&turn.model_info.input_modalities);
+        let after_cost = projected_prompt_cost(&rewritten_prompt, turn);
         state.restore_manage_context_checkpoint(manage_context_checkpoint);
-        replacement_history
+        (replacement_history, before_cost, after_cost)
     };
+
+    if after_cost.model_visible_bytes >= before_cost.model_visible_bytes {
+        return Err(contract_error(
+            StopReason::NoPromptReduction,
+            format!(
+                "prompt_gc summary did not reduce projected prompt cost: before_model_visible_bytes={}, after_model_visible_bytes={}, before_estimated_tokens={}, after_estimated_tokens={}",
+                before_cost.model_visible_bytes,
+                after_cost.model_visible_bytes,
+                before_cost.estimated_tokens,
+                after_cost.estimated_tokens,
+            ),
+        ));
+    }
 
     session
         .persist_prompt_gc_replacement_history(
@@ -509,6 +555,7 @@ mod tests {
     use codex_protocol::models::LocalShellExecAction;
     use codex_protocol::models::LocalShellStatus;
     use codex_protocol::models::MessagePhase;
+    use codex_protocol::models::ReasoningItemContent;
     use codex_protocol::models::WebSearchAction;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
@@ -549,6 +596,17 @@ mod tests {
             }],
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
+        }
+    }
+
+    fn verbose_reasoning_item(id: &str) -> ResponseItem {
+        ResponseItem::Reasoning {
+            id: id.to_string(),
+            summary: Vec::new(),
+            content: Some(vec![ReasoningItemContent::ReasoningText {
+                text: format!("{id} {}", "detail ".repeat(64)),
+            }]),
+            encrypted_content: None,
         }
     }
 
@@ -734,12 +792,7 @@ mod tests {
         let sidecar = install_prompt_gc_active_turn(&session, Arc::clone(&turn_context)).await;
 
         let mut initial_items = (0..(MAX_UNITS_PER_RETRIEVE + 1))
-            .map(|index| ResponseItem::Reasoning {
-                id: format!("reasoning-{index}"),
-                summary: Vec::new(),
-                content: None,
-                encrypted_content: None,
-            })
+            .map(|index| verbose_reasoning_item(&format!("reasoning-{index}")))
             .collect::<Vec<_>>();
         initial_items.push(commentary_phase_message("phase-1"));
         session
@@ -765,8 +818,8 @@ mod tests {
                 .iter()
                 .map(|chunk| PromptGcChunkSummary {
                     chunk_id: chunk.manifest.chunk_id.clone(),
-                    tool_context: format!("tool {}", chunk.manifest.chunk_id),
-                    reasoning_context: format!("reasoning {}", chunk.manifest.chunk_id),
+                    tool_context: String::new(),
+                    reasoning_context: "r".to_string(),
                 })
                 .collect::<Vec<_>>(),
         )
@@ -805,12 +858,7 @@ mod tests {
         let sidecar = install_prompt_gc_active_turn(&session, Arc::clone(&turn_context)).await;
 
         let mut items = (0..MAX_UNITS_PER_RETRIEVE)
-            .map(|index| ResponseItem::Reasoning {
-                id: format!("reasoning-{index}"),
-                summary: Vec::new(),
-                content: None,
-                encrypted_content: None,
-            })
+            .map(|index| verbose_reasoning_item(&format!("reasoning-{index}")))
             .collect::<Vec<_>>();
         items.push(ResponseItem::LocalShellCall {
             id: Some("legacy-shell".to_string()),
@@ -854,7 +902,7 @@ mod tests {
                 .map(|chunk| PromptGcChunkSummary {
                     chunk_id: chunk.manifest.chunk_id.clone(),
                     tool_context: String::new(),
-                    reasoning_context: format!("reasoning {}", chunk.manifest.chunk_id),
+                    reasoning_context: "r".to_string(),
                 })
                 .collect::<Vec<_>>(),
         )
@@ -945,18 +993,8 @@ mod tests {
         let sidecar = install_prompt_gc_active_turn(&session, Arc::clone(&turn_context)).await;
 
         let items = vec![
-            ResponseItem::Reasoning {
-                id: "reasoning-1".to_string(),
-                summary: Vec::new(),
-                content: None,
-                encrypted_content: None,
-            },
-            ResponseItem::Reasoning {
-                id: "reasoning-2".to_string(),
-                summary: Vec::new(),
-                content: None,
-                encrypted_content: None,
-            },
+            verbose_reasoning_item("reasoning-1"),
+            verbose_reasoning_item("reasoning-2"),
             commentary_phase_message("phase-1"),
         ];
         session
@@ -982,8 +1020,8 @@ mod tests {
                 .iter()
                 .map(|chunk| PromptGcChunkSummary {
                     chunk_id: chunk.manifest.chunk_id.clone(),
-                    tool_context: "same summary".to_string(),
-                    reasoning_context: "same summary".to_string(),
+                    tool_context: "same".to_string(),
+                    reasoning_context: String::new(),
                 })
                 .collect::<Vec<_>>(),
         )
@@ -1024,18 +1062,8 @@ mod tests {
         let sidecar = install_prompt_gc_active_turn(&session, Arc::clone(&turn_context)).await;
 
         let items = vec![
-            ResponseItem::Reasoning {
-                id: "reasoning-1".to_string(),
-                summary: Vec::new(),
-                content: None,
-                encrypted_content: None,
-            },
-            ResponseItem::Reasoning {
-                id: "reasoning-2".to_string(),
-                summary: Vec::new(),
-                content: None,
-                encrypted_content: None,
-            },
+            verbose_reasoning_item("reasoning-1"),
+            verbose_reasoning_item("reasoning-2"),
             commentary_phase_message("phase-1"),
         ];
         session
@@ -1057,8 +1085,8 @@ mod tests {
             .rev()
             .map(|chunk| PromptGcChunkSummary {
                 chunk_id: chunk.manifest.chunk_id.clone(),
-                tool_context: format!("tool {}", chunk.manifest.chunk_id),
-                reasoning_context: format!("reasoning {}", chunk.manifest.chunk_id),
+                tool_context: "t".to_string(),
+                reasoning_context: String::new(),
             })
             .collect::<Vec<_>>();
 
@@ -1088,8 +1116,66 @@ mod tests {
 
         assert_eq!(tool_notes.len(), 2);
         assert!(tool_notes[0].contains("chunk_id=prompt_gc_chunk_0"));
-        assert!(tool_notes[0].contains("tool prompt_gc_chunk_0"));
+        assert!(tool_notes[0].contains("\nt\n"));
         assert!(tool_notes[1].contains("chunk_id=prompt_gc_chunk_1"));
-        assert!(tool_notes[1].contains("tool prompt_gc_chunk_1"));
+        assert!(tool_notes[1].contains("\nt\n"));
+    }
+
+    #[tokio::test]
+    async fn prompt_gc_apply_rejects_non_reducing_summaries() {
+        let (session, turn_context) = make_session_and_context().await;
+        let turn_context = Arc::new(turn_context);
+        let sidecar = install_prompt_gc_active_turn(&session, Arc::clone(&turn_context)).await;
+
+        let items = vec![
+            ResponseItem::Reasoning {
+                id: "reasoning-1".to_string(),
+                summary: vec![
+                    codex_protocol::models::ReasoningItemReasoningSummary::SummaryText {
+                        text: "tiny".to_string(),
+                    },
+                ],
+                content: None,
+                encrypted_content: None,
+            },
+            commentary_phase_message("phase-1"),
+        ];
+        session
+            .record_conversation_items(turn_context.as_ref(), &items)
+            .await;
+        let prompt_before = session.state.lock().await.prompt_snapshot_lenient();
+
+        let checkpoint_id = activate_pending_checkpoint(&sidecar).await.checkpoint_id;
+        let plan = build_runtime_plan(&session, turn_context.as_ref(), &checkpoint_id)
+            .await
+            .expect("retrieve plan");
+        let checkpoint =
+            prompt_gc_checkpoint_for_id(&session, turn_context.as_ref(), &checkpoint_id)
+                .await
+                .expect("checkpoint");
+
+        let error = apply_runtime_plan(
+            &session,
+            turn_context.as_ref(),
+            &checkpoint,
+            &plan,
+            &[PromptGcChunkSummary {
+                chunk_id: plan.chunk_manifest[0].manifest.chunk_id.clone(),
+                tool_context: "tool context ".repeat(64),
+                reasoning_context: "reasoning context ".repeat(64),
+            }],
+        )
+        .await
+        .expect_err("non-reducing prompt_gc summary must fail");
+
+        let crate::function_tool::FunctionCallError::RespondToModel(message) = error else {
+            panic!("expected model-visible contract error");
+        };
+        assert!(message.contains("no_prompt_reduction"));
+        assert!(message.contains("before_model_visible_bytes="));
+        assert_eq!(
+            session.state.lock().await.prompt_snapshot_lenient(),
+            prompt_before
+        );
     }
 }

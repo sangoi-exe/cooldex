@@ -1,4 +1,6 @@
 use super::*;
+use crate::prompt_gc_rollout::compaction_replacement_history_is_hydratable;
+use crate::prompt_gc_rollout::is_prompt_gc_compaction_marker;
 use std::collections::HashSet;
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
@@ -40,11 +42,6 @@ struct ActiveReplaySegment<'a> {
 fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&str>) -> bool {
     active_turn_id
         .is_none_or(|turn_id| item_turn_id.is_none_or(|item_turn_id| item_turn_id == turn_id))
-}
-
-fn is_prompt_gc_compaction_marker(compacted: &CompactedItem) -> bool {
-    compacted.prompt_gc.is_some()
-        || compacted.message == crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER
 }
 
 fn finalize_active_segment<'a>(
@@ -143,16 +140,16 @@ impl Session {
                     }
                     if active_segment.base_replacement_history.is_none()
                         && let Some(replacement_history) = &compacted.replacement_history
-                        && (!is_prompt_gc_compaction_marker(compacted)
-                            || matches!(
-                                active_segment.reference_context_item,
-                                TurnReferenceContextItem::Latest(_)
-                            ))
+                        && compaction_replacement_history_is_hydratable(
+                            rollout_items,
+                            index,
+                            compacted,
+                        )
                     {
                         // Merge-safety anchor: prompt_gc writes a Compacted item
                         // before its matching TurnContext. Reverse replay must
-                        // only accept that replacement_history after the segment
-                        // has observed the matching TurnContext; otherwise a
+                        // only accept that replacement_history after the
+                        // persisted TurnContext pair exists; otherwise a
                         // crash-truncated prompt_gc pair would rewrite history
                         // without the resume metadata that anchors it.
                         active_segment.base_replacement_history = Some(replacement_history);
