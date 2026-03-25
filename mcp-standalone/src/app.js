@@ -136,6 +136,14 @@ export function createApp({ config, logger, bridgeRuntime }) {
     });
   }));
 
+  router.post("/sessions/:sessionId/title", asyncRoute(async (req, res) => {
+    const response = await bridgeRuntime.renameSession(req.params.sessionId, req.body ?? {});
+    res.json({
+      requestId: readRequestId(req),
+      ...response,
+    });
+  }));
+
   app.use(config.bridgeBasePath, router);
 
   app.use((error, req, res, next) => {

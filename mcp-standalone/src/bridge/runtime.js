@@ -93,7 +93,7 @@ function truncatePersistedToolItem(item) {
 }
 
 function createPersistedPayload(message) {
-  // Merge anchor: truncation here must stay aligned with README transcript/persistence
+  // Merge-safety anchor: truncation here must stay aligned with README transcript/persistence
   // guarantees and with store-side payload readers.
   const payload = {
     method: message.method,
@@ -336,7 +336,7 @@ function createSnapshotResponse(store, session) {
 }
 
 function resolveSessionCwd(requestBody, defaultSessionCwd) {
-  // Merge anchor: `session_create.cwd` semantics are part of the bridge contract
+  // Merge-safety anchor: `session_create.cwd` semantics are part of the bridge contract
   // and must stay aligned with README + config default resolution.
   const rawCwd = requestBody?.cwd;
   if (rawCwd === undefined || rawCwd === null) {
@@ -378,7 +378,7 @@ function resolveSessionCwd(requestBody, defaultSessionCwd) {
 }
 
 function resolveSessionConfigPath(requestBody, defaultSessionConfigPath) {
-  // Merge anchor: `session_create.configPath` precedence (request -> env default -> null)
+  // Merge-safety anchor: `session_create.configPath` precedence (request -> env default -> null)
   // is contract behavior shared with docs and resume/start validation.
   const rawConfigPath = requestBody?.configPath;
   if (rawConfigPath === undefined || rawConfigPath === null) {
@@ -445,7 +445,7 @@ function resolveSessionConfigPath(requestBody, defaultSessionConfigPath) {
 }
 
 function normalizeOptionalSessionOperator(requestBody) {
-  // Merge anchor: operator normalization feeds persisted `session.operator` and
+  // Merge-safety anchor: operator normalization feeds persisted `session.operator` and
   // API `SessionSummary.operator`; keep nullability and key derivation stable.
   const rawOperator = requestBody?.operator;
   if (rawOperator === undefined || rawOperator === null) {
@@ -1269,7 +1269,7 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
       };
     },
     async createSession(requestBody) {
-      // Merge anchor: session_create resolves cwd/configPath/operator exactly once;
+      // Merge-safety anchor: session_create resolves cwd/configPath/operator exactly once;
       // persisted values here are the source of truth for later send/resume calls.
       const cwd = resolveSessionCwd(requestBody, config.defaultSessionCwd);
       const resolvedConfigPath = resolveSessionConfigPath(requestBody, config.defaultSessionConfigPath);
@@ -1345,7 +1345,7 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
         throw createBridgeRuntimeError(404, "SESSION_NOT_FOUND", `Unknown sessionId ${sessionId}.`);
       }
 
-      // Merge anchor: `message_send` intentionally reuses persisted session cwd/configPath
+      // Merge-safety anchor: `message_send` intentionally reuses persisted session cwd/configPath
       // and fails loud when they are missing or malformed.
       const text = typeof requestBody?.text === "string" ? requestBody.text.trim() : "";
       if (text.length === 0) {
@@ -1377,6 +1377,9 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
       }
 
       await ensureSessionThreadLoaded(session);
+      const messageId = randomUUID();
+      const acceptedAt = Date.now();
+      const nextCursor = session.cursor;
       let turnStartResponse;
       try {
         const params = {
@@ -1395,7 +1398,22 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
         throw mapAppServerError("turn/start", error);
       }
 
+      const turnId = typeof turnStartResponse?.turn?.id === "string" ? turnStartResponse.turn.id : null;
       writeTranscriptText("USER", createTranscriptScope({ threadId: session.threadId }), text);
+      appendThreadEvent(session.threadId, {
+        occurredAt: acceptedAt,
+        type: "user_message",
+        turnId,
+        payload: {
+          method: "bridge/user_message",
+          params: {
+            text,
+            messageId,
+          },
+          message: null,
+          code: null,
+        },
+      });
       store.updateSession(session, {
         lastMessagePreview: text,
         status: "running",
@@ -1404,9 +1422,31 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
       return {
         sessionId,
         accepted: true,
-        messageId: randomUUID(),
-        turnId: typeof turnStartResponse?.turn?.id === "string" ? turnStartResponse.turn.id : null,
-        nextCursor: session.cursor,
+        messageId,
+        turnId,
+        nextCursor,
+      };
+    },
+    renameSession(sessionId, requestBody) {
+      const session = store.getSessionById(sessionId);
+      if (!session) {
+        throw createBridgeRuntimeError(404, "SESSION_NOT_FOUND", `Unknown sessionId ${sessionId}.`);
+      }
+
+      const title = typeof requestBody?.title === "string" ? requestBody.title.trim() : "";
+      if (title.length === 0) {
+        throw createBridgeRuntimeError(400, "BAD_REQUEST", "session_rename requires a non-empty title field.");
+      }
+
+      if (session.title === title) {
+        return {
+          session: store.toSessionSummary(session),
+        };
+      }
+
+      const updatedSession = store.updateSession(session, { title });
+      return {
+        session: store.toSessionSummary(updatedSession),
       };
     },
   };

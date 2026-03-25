@@ -30,7 +30,7 @@ The current runtime slice now does these things:
 2. starts a real `codex app-server` child process over `stdio://`
 3. performs the required `initialize` then `initialized` handshake
 4. persists the bridge-owned session registry, event journal, and pending-approval projection in SQLite
-5. exposes live `session_create`, `message_send`, `session_list`, `session_open`, and `session_poll` routes
+5. exposes live `session_create`, `session_rename`, `message_send`, `session_list`, `session_open`, and `session_poll` routes
 6. keeps `session_open` and `session_poll` strictly bridge-owned and durable across bridge restarts
 7. auto-resolves unsupported interactive app-server server requests so turns do not hang forever
 8. returns `message_send` as accepted-only and does not wait for turn completion inline
@@ -84,6 +84,7 @@ The bridge still must not claim replay/backfill or mid-turn process resurrection
 - Empty `session_poll` results preserve the current cursor instead of resetting it to `null`.
 - `session_open` and `session_poll` do not rebuild from Codex-native replay in this slice.
 - `session_create` accepts optional `cwd`, optional `configPath`, and optional `operator`.
+- `session_rename` requires a non-empty `title` string and persists it on the existing bridge-owned session row.
 - When `session_create.cwd` is omitted or null, the bridge resolves the effective cwd to `/home/lucas/work/avmb-plus`.
 - `session_create` resolves `configPath` in this order: explicit `session_create.configPath` -> `BRIDGE_DEFAULT_SESSION_CONFIG_PATH` -> `null`.
 - `session_create.operator` must be an object or `null`; when present, `userId`, `userEmail`, and `displayName` must each be `string | null` when provided.
@@ -97,6 +98,9 @@ The bridge still must not claim replay/backfill or mid-turn process resurrection
 - `thread/start` receives resolved session `configPath` only when it is non-null, and the bridge fails loud if the response `configPath` mismatches the expected resolved value.
 - The first `message_send` after a bridge restart resumes the stored `threadId` with the stored `cwd`, and it reuses the stored `configPath` unless that session was created without an explicit config override.
 - `message_send` does not send `configPath` to `turn/start`; the config path is fixed at session creation time, and `message_send` fails loud if stored resolved session state is missing required fields.
+- A successful `message_send` appends a durable `user_message` event to the session journal with `payload.method = "bridge/user_message"`, `payload.params.text`, and `payload.params.messageId`.
+- `message_send.nextCursor` is the cursor that existed before that durable `user_message` append, so the next `session_poll` can observe the operator message and any later events in one pass.
+- `session_rename` returns the updated `session` summary and does not mutate transcript state.
 
 ## Unsupported interactive requests
 
