@@ -5,6 +5,7 @@ import { isAbsolute } from "node:path";
 import { createAppServerClient } from "../app-server/client.js";
 import { truncateLogText } from "../logger.js";
 import { createBridgeStore } from "./store.js";
+import { formatTranscriptLine } from "./transcript.js";
 
 const MAX_SESSION_LIST_LIMIT = 200;
 const MAX_SESSION_POLL_LIMIT = 500;
@@ -614,24 +615,27 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
   function createTranscriptScope({ threadId = null, turnId = null, itemId = null }) {
     const session = typeof threadId === "string" ? store.getSessionByThreadId(threadId) : null;
     return {
+      operatorUserId: typeof session?.operator?.userId === "string" ? session.operator.userId : null,
       sessionId: session ? shortId(session.sessionId) : "unmapped",
       turnId: typeof turnId === "string" ? shortId(turnId) : "-",
       itemId: typeof itemId === "string" ? shortId(itemId) : "-",
     };
   }
 
-  function writeTranscriptLine(channel, scope, text) {
+  // Merge-safety anchor: transcript prefix formatting must stay aligned with
+  // README/operator docs and transcript.js contract coverage.
+  function writeTranscriptLine(channel, scope, text, occurredAt = Date.now()) {
     if (!config.bridgeDebugTranscript) {
       return;
     }
     process.stderr.write(
-      `${channel.padEnd(7)} [s:${scope.sessionId} t:${scope.turnId} i:${scope.itemId}] ${text}\n`,
+      `${formatTranscriptLine({ channel, occurredAt, scope, text })}\n`,
     );
   }
 
-  function writeTranscriptText(channel, scope, text) {
+  function writeTranscriptText(channel, scope, text, occurredAt = Date.now()) {
     for (const line of extractTranscriptLines(text)) {
-      writeTranscriptLine(channel, scope, line);
+      writeTranscriptLine(channel, scope, line, occurredAt);
     }
   }
 
@@ -1399,7 +1403,7 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
       }
 
       const turnId = typeof turnStartResponse?.turn?.id === "string" ? turnStartResponse.turn.id : null;
-      writeTranscriptText("USER", createTranscriptScope({ threadId: session.threadId }), text);
+      writeTranscriptText("USER", createTranscriptScope({ threadId: session.threadId }), text, acceptedAt);
       appendThreadEvent(session.threadId, {
         occurredAt: acceptedAt,
         type: "user_message",

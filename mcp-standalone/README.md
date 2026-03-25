@@ -62,6 +62,7 @@ The bridge still must not claim replay/backfill or mid-turn process resurrection
 ### Live in Slice 2
 
 - `POST /api/codex/v1/sessions`
+- `POST /api/codex/v1/sessions/:sessionId/title`
 - `POST /api/codex/v1/sessions/:sessionId/messages`
 - `GET /api/codex/v1/sessions`
 - `GET /api/codex/v1/sessions/:sessionId`
@@ -133,7 +134,20 @@ The bridge validates `BRIDGE_DEFAULT_SESSION_CWD` and `BRIDGE_DEFAULT_SESSION_CO
 
 ## Terminal debug transcript
 
+<!-- Merge-safety anchor: terminal transcript prefix format must stay aligned with src/bridge/runtime.js and src/bridge/transcript.js. -->
+
 When `BRIDGE_DEBUG_TRANSCRIPT=true`, the bridge prints a human-readable operator transcript to `stderr` while it runs. This is terminal-only and does not change the bridge HTTP contract.
+
+Each transcript line keeps the padded channel prefix and then includes:
+
+- a fixed GMT-3 timestamp in `[HH:mm:ss|DD-MM-YYYY]` format
+- an operator tag in the form `[NS:<userId>]`
+- `[NS:-]` when the current session does not have a stored `operator.userId`
+- the existing bridge scope block `[s:<session> t:<turn> i:<item>]`
+
+Example:
+
+- `SESSION [11:30:01|25-03-2026] [NS:12345] [s:db3b040b t:- i:-] thread/started -> idle`
 
 The transcript currently includes:
 
