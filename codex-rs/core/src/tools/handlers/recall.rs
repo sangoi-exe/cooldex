@@ -1,7 +1,10 @@
+use std::collections::HashSet;
+
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
 use crate::prompt_gc_rollout::compaction_replacement_history_is_hydratable;
+use crate::prompt_gc_rollout::discarded_rollout_indices_for_rolled_back_turns;
 use crate::prompt_gc_rollout::is_prompt_gc_compaction_marker;
 use crate::rollout::RolloutRecorder;
 use crate::tools::context::FunctionToolOutput;
@@ -169,6 +172,7 @@ fn build_recall_payload(
     parse_errors: usize,
     recall_debug: bool,
 ) -> Result<serde_json::Value, FunctionCallError> {
+    let discarded_rollout_indices = discarded_rollout_indices_for_rolled_back_turns(rollout_items);
     let compacted_markers_seen = rollout_items
         .iter()
         .filter(|item| matches!(item, RolloutItem::Compacted(_)))
@@ -180,7 +184,8 @@ fn build_recall_payload(
             .rev()
             .find_map(|(index, item)| match item {
                 RolloutItem::Compacted(compacted)
-                    if !is_prompt_gc_observational_marker(compacted) =>
+                    if !discarded_rollout_indices.contains(&index)
+                        && !is_prompt_gc_observational_marker(compacted) =>
                 {
                     Some(index)
                 }
@@ -199,7 +204,11 @@ fn build_recall_payload(
         return Err(contract_error(StopReason::NoCompactionMarker, message));
     };
 
-    let last_boundary = previous_recall_boundary_before(rollout_items, latest_compacted_index);
+    let last_boundary = previous_recall_boundary_before(
+        rollout_items,
+        latest_compacted_index,
+        &discarded_rollout_indices,
+    );
     let start_index = last_boundary.map_or(0, |boundary| boundary.index.saturating_add(1));
 
     // Merge-safety anchor: replacement-history boundaries must hydrate stored
@@ -218,6 +227,7 @@ fn build_recall_payload(
         rollout_items,
         start_index,
         latest_compacted_index,
+        &discarded_rollout_indices,
     ));
     let matching_pre_compact_items = matching_items.len();
 
@@ -306,6 +316,7 @@ fn collect_pre_compact_items(
     rollout_items: &[RolloutItem],
     start_index: usize,
     latest_compacted_index: usize,
+    discarded_rollout_indices: &HashSet<usize>,
 ) -> Vec<RecallItem> {
     let mut output = Vec::new();
     for (index, rollout_item) in rollout_items
@@ -314,6 +325,9 @@ fn collect_pre_compact_items(
         .skip(start_index)
         .take(latest_compacted_index.saturating_sub(start_index))
     {
+        if discarded_rollout_indices.contains(&index) {
+            continue;
+        }
         let RolloutItem::ResponseItem(response_item) = rollout_item else {
             continue;
         };
@@ -350,11 +364,13 @@ fn replacement_history_for_boundary(
 fn previous_recall_boundary_before(
     rollout_items: &[RolloutItem],
     latest_compacted_index: usize,
+    discarded_rollout_indices: &HashSet<usize>,
 ) -> Option<RecallBoundary> {
     rollout_items
         .iter()
         .enumerate()
         .take(latest_compacted_index)
+        .filter(|(index, _)| !discarded_rollout_indices.contains(index))
         .filter_map(|(index, item)| match item {
             RolloutItem::EventMsg(EventMsg::ContextCompacted(_)) => Some(RecallBoundary {
                 index,
@@ -606,6 +622,7 @@ fn contract_error(reason: StopReason, message: impl Into<String>) -> FunctionCal
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
     use codex_protocol::models::BaseInstructions;
     use codex_protocol::models::FunctionCallOutputPayload;
@@ -617,7 +634,10 @@ mod tests {
     use codex_protocol::protocol::PromptGcExecutionPhase;
     use codex_protocol::protocol::PromptGcOutcomeKind;
     use codex_protocol::protocol::SandboxPolicy;
+    use codex_protocol::protocol::ThreadRolledBackEvent;
+    use codex_protocol::protocol::TurnCompleteEvent;
     use codex_protocol::protocol::TurnContextItem;
+    use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
     use pretty_assertions::assert_eq;
     use serde_json::Value;
@@ -751,8 +771,12 @@ mod tests {
     }
 
     fn prompt_gc_turn_context_item() -> RolloutItem {
+        turn_context_item("turn-1")
+    }
+
+    fn turn_context_item(turn_id: &str) -> RolloutItem {
         RolloutItem::TurnContext(TurnContextItem {
-            turn_id: Some("turn-1".to_string()),
+            turn_id: Some(turn_id.to_string()),
             trace_id: None,
             cwd: PathBuf::from("/tmp"),
             current_date: None,
@@ -771,6 +795,27 @@ mod tests {
             final_output_json_schema: None,
             truncation_policy: None,
         })
+    }
+
+    fn turn_started_event(turn_id: &str) -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: turn_id.to_string(),
+            model_context_window: Some(128_000),
+            collaboration_mode_kind: ModeKind::Default,
+        }))
+    }
+
+    fn turn_complete_event(turn_id: &str) -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: turn_id.to_string(),
+            last_agent_message: None,
+        }))
+    }
+
+    fn thread_rolled_back_event(num_turns: u32) -> RolloutItem {
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns,
+        }))
     }
 
     fn user_message_event(text: &str) -> RolloutItem {
@@ -1239,6 +1284,73 @@ mod tests {
                 "2: [am] after real boundary".to_string(),
                 "3: [am] after truncated prompt gc boundary".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn recall_ignores_rolled_back_prompt_gc_replacement_history_boundaries() {
+        let rollout_items = vec![
+            replacement_history_compacted_marker_with_history(vec![ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "surviving base".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }]),
+            assistant_message("after surviving boundary", None),
+            turn_started_event("turn-2"),
+            user_message_event("rolled back turn"),
+            prompt_gc_replacement_history_marker(vec![
+                tool_context_note_message("rolled back tool base"),
+                reasoning_context_note_message("rolled back reasoning base"),
+            ]),
+            turn_context_item("turn-2"),
+            assistant_message("rolled back assistant", None),
+            turn_complete_event("turn-2"),
+            thread_rolled_back_event(1),
+            turn_started_event("turn-3"),
+            user_message_event("surviving turn"),
+            assistant_message("after rollback", None),
+            turn_complete_event("turn-3"),
+            compacted_marker(),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, false)
+            .expect("build compact recall payload");
+
+        assert_eq!(
+            compact_recall_items(&payload),
+            vec![
+                "1: [am] surviving base".to_string(),
+                "2: [am] after surviving boundary".to_string(),
+                "3: [am] after rollback".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recall_excludes_rolled_back_response_items_before_latest_compaction() {
+        let rollout_items = vec![
+            turn_started_event("turn-1"),
+            user_message_event("rolled back turn"),
+            assistant_message("rolled back assistant", None),
+            turn_complete_event("turn-1"),
+            thread_rolled_back_event(1),
+            turn_started_event("turn-2"),
+            user_message_event("surviving turn"),
+            assistant_message("surviving assistant", None),
+            turn_complete_event("turn-2"),
+            compacted_marker(),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, false)
+            .expect("build compact recall payload");
+
+        assert_eq!(
+            compact_recall_items(&payload),
+            vec!["1: [am] surviving assistant".to_string()]
         );
     }
 

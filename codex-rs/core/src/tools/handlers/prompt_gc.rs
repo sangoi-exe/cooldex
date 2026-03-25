@@ -254,12 +254,33 @@ fn order_chunk_summaries(
         .collect()
 }
 
+fn selectable_units_for_runtime_plan(
+    sidecar: &crate::prompt_gc_sidecar::PromptGcSidecar,
+    checkpoint: &PromptGcCheckpoint,
+) -> Result<Vec<PromptGcCapturedUnit>, crate::function_tool::FunctionCallError> {
+    sidecar
+        .selectable_units(
+            &checkpoint.checkpoint_id,
+            MAX_UNITS_PER_RETRIEVE,
+            MAX_RAW_BYTES_PER_RETRIEVE,
+        )
+        .ok_or_else(|| {
+            contract_error(
+                StopReason::InvalidContract,
+                format!(
+                    "prompt_gc checkpoint '{}' lost active ownership before runtime plan build",
+                    checkpoint.checkpoint_id
+                ),
+            )
+        })
+}
+
 pub(crate) async fn build_runtime_plan(
     session: &Session,
     turn: &TurnContext,
     checkpoint_id: &str,
 ) -> Result<PromptGcRuntimePlan, crate::function_tool::FunctionCallError> {
-    prompt_gc_checkpoint_for_id(session, turn, checkpoint_id).await?;
+    let checkpoint = prompt_gc_checkpoint_for_id(session, turn, checkpoint_id).await?;
     let sidecar = session
         .prompt_gc_sidecar_for_sub_id(&turn.sub_id)
         .await
@@ -270,13 +291,7 @@ pub(crate) async fn build_runtime_plan(
             )
         })?;
     let sidecar = sidecar.lock().await;
-    let units = sidecar
-        .selectable_units(
-            checkpoint_id,
-            MAX_UNITS_PER_RETRIEVE,
-            MAX_RAW_BYTES_PER_RETRIEVE,
-        )
-        .unwrap_or_default();
+    let units = selectable_units_for_runtime_plan(&sidecar, &checkpoint)?;
     drop(sidecar);
 
     let current_history = {
@@ -1177,5 +1192,49 @@ mod tests {
             session.state.lock().await.prompt_snapshot_lenient(),
             prompt_before
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_gc_runtime_plan_fails_loud_when_validated_checkpoint_loses_active_ownership() {
+        let (session, turn_context) = make_session_and_context().await;
+        let turn_context = Arc::new(turn_context);
+        let sidecar = install_prompt_gc_active_turn(&session, Arc::clone(&turn_context)).await;
+
+        let items = vec![
+            ResponseItem::Reasoning {
+                id: "reasoning-1".to_string(),
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: None,
+            },
+            commentary_phase_message("phase-1"),
+        ];
+        session
+            .record_conversation_items(turn_context.as_ref(), &items)
+            .await;
+
+        let checkpoint = activate_pending_checkpoint(&sidecar).await;
+        let validated_checkpoint =
+            prompt_gc_checkpoint_for_id(&session, turn_context.as_ref(), &checkpoint.checkpoint_id)
+                .await
+                .expect("validated checkpoint");
+
+        let error = {
+            let mut sidecar = sidecar.lock().await;
+            sidecar.complete_cycle(PromptGcApplyOutcome {
+                checkpoint_id: validated_checkpoint.checkpoint_id.clone(),
+                checkpoint_seq: validated_checkpoint.checkpoint_seq,
+                applied_unit_keys: Vec::new(),
+            });
+            selectable_units_for_runtime_plan(&sidecar, &validated_checkpoint)
+                .expect_err("lost checkpoint ownership must fail loud")
+        };
+
+        let crate::function_tool::FunctionCallError::RespondToModel(message) = error else {
+            panic!("expected model-visible contract error");
+        };
+        assert!(message.contains("invalid_contract"));
+        assert!(message.contains(&validated_checkpoint.checkpoint_id));
+        assert!(message.contains("lost active ownership"));
     }
 }
