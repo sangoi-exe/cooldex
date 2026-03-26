@@ -2317,11 +2317,14 @@ fn create_manage_context_tool() -> ToolSpec {
 fn create_recall_tool() -> ToolSpec {
     let properties = BTreeMap::new();
 
+    // Merge-safety anchor: recall tool wording must stay aligned with the
+    // live recall runtime/docs contract, including the latest real
+    // non-observational compaction boundary and prompt-gc context-note output.
     ToolSpec::Function(ResponsesApiTool {
         name: "recall".to_string(),
         description:
-            "Recall recent reasoning and assistant messages from the current session rollout before the latest compaction marker (tool outputs excluded)."
-                .to_string(),
+                "Recall recent reasoning, assistant messages, and prompt-gc context notes from the current session rollout before the latest real non-observational compaction marker (tool outputs excluded)."
+                    .to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::Object {

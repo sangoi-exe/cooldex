@@ -40,6 +40,7 @@ enum StopReason {
     InvalidContract,
     Unavailable,
     NoCompactionMarker,
+    RolloutParseError,
     RolloutReadError,
 }
 
@@ -49,6 +50,7 @@ impl StopReason {
             Self::InvalidContract => "invalid_contract",
             Self::Unavailable => "unavailable",
             Self::NoCompactionMarker => "no_compaction_marker",
+            Self::RolloutParseError => "rollout_parse_error",
             Self::RolloutReadError => "rollout_read_error",
         }
     }
@@ -58,6 +60,7 @@ impl StopReason {
 enum RecallBoundaryKind {
     ContextCompactedEvent,
     ReplacementHistoryCompacted,
+    CompactedMarker,
 }
 
 impl RecallBoundaryKind {
@@ -65,6 +68,7 @@ impl RecallBoundaryKind {
         match self {
             Self::ContextCompactedEvent => "context_compacted_event",
             Self::ReplacementHistoryCompacted => "replacement_history_compacted",
+            Self::CompactedMarker => "compacted_marker",
         }
     }
 }
@@ -172,6 +176,13 @@ fn build_recall_payload(
     parse_errors: usize,
     recall_debug: bool,
 ) -> Result<serde_json::Value, FunctionCallError> {
+    if parse_errors > 0 {
+        return Err(contract_error(
+            StopReason::RolloutParseError,
+            rollout_parse_error_message(parse_errors),
+        ));
+    }
+
     let discarded_rollout_indices = discarded_rollout_indices_for_rolled_back_turns(rollout_items);
     let compacted_markers_seen = rollout_items
         .iter()
@@ -194,14 +205,10 @@ fn build_recall_payload(
     else {
         // Merge-safety anchor: "no_compaction_marker" drives the fail-loud
         // recall-first recovery path after auto-compaction warnings.
-        let message = if parse_errors == 0 {
-            "current session rollout has no compacted marker".to_string()
-        } else {
-            format!(
-                "current session rollout has no compacted marker (rollout parse errors: {parse_errors})"
-            )
-        };
-        return Err(contract_error(StopReason::NoCompactionMarker, message));
+        return Err(contract_error(
+            StopReason::NoCompactionMarker,
+            "current session rollout has no compacted marker",
+        ));
     };
 
     let last_boundary = previous_recall_boundary_before(
@@ -255,7 +262,7 @@ fn build_recall_payload(
         "mode": "recall_pre_compact",
         "source": "current_session_rollout",
         "integrity": {
-            "status": if parse_errors == 0 { "ok" } else { "degraded" },
+            "status": "ok",
             "rollout_parse_errors": parse_errors,
         },
         "boundary": {
@@ -388,9 +395,22 @@ fn previous_recall_boundary_before(
                     kind: RecallBoundaryKind::ReplacementHistoryCompacted,
                 })
             }
+            RolloutItem::Compacted(compacted)
+                if !is_prompt_gc_compaction_marker(compacted)
+                    && compacted.replacement_history.is_none() =>
+            {
+                Some(RecallBoundary {
+                    index,
+                    kind: RecallBoundaryKind::CompactedMarker,
+                })
+            }
             _ => None,
         })
         .next_back()
+}
+
+fn rollout_parse_error_message(parse_errors: usize) -> String {
+    format!("current session rollout is malformed (rollout parse errors: {parse_errors})")
 }
 
 fn is_prompt_gc_observational_marker(compacted: &CompactedItem) -> bool {
@@ -876,20 +896,20 @@ mod tests {
     }
 
     #[test]
-    fn recall_no_compaction_marker_error_reports_parse_errors_when_present() {
+    fn recall_parse_errors_take_precedence_over_no_compaction_marker() {
         let rollout_items = vec![assistant_message("before", None), reasoning("analysis")];
 
         let error = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 2, true)
-            .expect_err("must fail when no compaction marker is present");
+            .expect_err("must fail loud when rollout parsing is degraded");
         let payload = parse_error_payload(error);
 
         assert_eq!(
             payload.get("stop_reason").and_then(Value::as_str),
-            Some(StopReason::NoCompactionMarker.as_str())
+            Some(StopReason::RolloutParseError.as_str())
         );
         assert_eq!(
             payload.get("message").and_then(Value::as_str),
-            Some("current session rollout has no compacted marker (rollout parse errors: 2)")
+            Some("current session rollout is malformed (rollout parse errors: 2)")
         );
     }
 
@@ -1163,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn recall_ignores_non_replacement_history_compacted_markers_as_lower_boundaries() {
+    fn recall_prefers_newer_replacement_history_boundary_over_older_compacted_marker() {
         let rollout_items = vec![
             compacted_marker(),
             reasoning("reasoning after ignored compacted marker"),
@@ -1193,6 +1213,38 @@ mod tests {
         assert_eq!(
             payload.pointer("/boundary/last_boundary_kind"),
             Some(&json!("replacement_history_compacted"))
+        );
+    }
+
+    #[test]
+    fn recall_uses_standard_compacted_marker_as_lower_boundary() {
+        let rollout_items = vec![
+            assistant_message("too old", None),
+            compacted_marker(),
+            assistant_message("after compacted marker", None),
+            compacted_marker(),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, true)
+            .expect("build recall payload");
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].get("rollout_index").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(payload.pointer("/boundary/start_index"), Some(&json!(2)));
+        assert_eq!(
+            payload.pointer("/boundary/last_boundary_index"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            payload.pointer("/boundary/last_boundary_kind"),
+            Some(&json!("compacted_marker"))
         );
     }
 
@@ -1331,6 +1383,45 @@ mod tests {
     }
 
     #[test]
+    fn recall_ignores_rolled_back_context_compacted_boundaries() {
+        let rollout_items = vec![
+            replacement_history_compacted_marker_with_history(vec![ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "surviving base".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }]),
+            assistant_message("after surviving boundary", None),
+            turn_started_event("turn-2"),
+            user_message_event("rolled back turn"),
+            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent)),
+            assistant_message("rolled back assistant", None),
+            turn_complete_event("turn-2"),
+            thread_rolled_back_event(1),
+            turn_started_event("turn-3"),
+            user_message_event("surviving turn"),
+            assistant_message("after rollback", None),
+            turn_complete_event("turn-3"),
+            compacted_marker(),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, false)
+            .expect("build compact recall payload");
+
+        assert_eq!(
+            compact_recall_items(&payload),
+            vec![
+                "1: [am] surviving base".to_string(),
+                "2: [am] after surviving boundary".to_string(),
+                "3: [am] after rollback".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn recall_excludes_rolled_back_response_items_before_latest_compaction() {
         let rollout_items = vec![
             turn_started_event("turn-1"),
@@ -1394,22 +1485,23 @@ mod tests {
     }
 
     #[test]
-    fn recall_reports_degraded_integrity_when_rollout_has_parse_errors() {
+    fn recall_fails_loud_when_rollout_has_parse_errors() {
         let rollout_items = vec![
             assistant_message("assistant before compact", None),
             compacted_marker(),
         ];
 
-        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 1, true)
-            .expect("build recall payload");
+        let error = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 1, true)
+            .expect_err("malformed rollout must fail loud");
+        let payload = parse_error_payload(error);
 
         assert_eq!(
-            payload.pointer("/integrity/status"),
-            Some(&json!("degraded"))
+            payload.get("stop_reason").and_then(Value::as_str),
+            Some(StopReason::RolloutParseError.as_str())
         );
         assert_eq!(
-            payload.pointer("/integrity/rollout_parse_errors"),
-            Some(&json!(1))
+            payload.get("message").and_then(Value::as_str),
+            Some("current session rollout is malformed (rollout parse errors: 1)")
         );
     }
 
@@ -1421,7 +1513,7 @@ mod tests {
             compacted_marker(),
         ];
 
-        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 3, false)
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, false)
             .expect("build compact recall payload");
         let items = payload
             .get("items")
@@ -1542,7 +1634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recall_returns_degraded_integrity_when_rollout_contains_invalid_line() {
+    async fn recall_fails_loud_when_rollout_contains_invalid_line() {
         let (session, mut turn) = crate::codex::make_session_and_context().await;
         let mut config = (*turn.config).clone();
         config.recall_debug = Some(true);
@@ -1590,18 +1682,18 @@ mod tests {
         .expect("append malformed rollout line");
         file.flush().await.expect("flush malformed line");
 
-        let payload = handle_recall(&session, &turn, &RecallToolArgs {})
+        let error = handle_recall(&session, &turn, &RecallToolArgs {})
             .await
-            .expect("recall response");
+            .expect_err("malformed rollout must fail loud");
+        let payload = parse_error_payload(error);
 
         assert_eq!(
-            payload.pointer("/integrity/status"),
-            Some(&json!("degraded"))
+            payload.get("stop_reason").and_then(Value::as_str),
+            Some(StopReason::RolloutParseError.as_str())
         );
         assert_eq!(
-            payload.pointer("/integrity/rollout_parse_errors"),
-            Some(&json!(1))
+            payload.get("message").and_then(Value::as_str),
+            Some("current session rollout is malformed (rollout parse errors: 1)")
         );
-        assert_eq!(payload.pointer("/counts/returned_items"), Some(&json!(1)));
     }
 }
