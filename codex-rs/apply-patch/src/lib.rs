@@ -4,8 +4,12 @@ mod seek_sequence;
 mod standalone_executable;
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -274,6 +278,113 @@ pub struct AffectedPaths {
     pub deleted: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+enum ExistingFileSnapshot {
+    RegularFile {
+        contents: Vec<u8>,
+        permissions: std::fs::Permissions,
+    },
+    Symlink {
+        target: PathBuf,
+        target_contents: Vec<u8>,
+        target_permissions: std::fs::Permissions,
+    },
+    SymlinkPath {
+        target: PathBuf,
+    },
+}
+
+impl ExistingFileSnapshot {
+    fn current_contents(&self) -> &[u8] {
+        match self {
+            ExistingFileSnapshot::RegularFile { contents, .. } => contents,
+            ExistingFileSnapshot::Symlink {
+                target_contents, ..
+            } => target_contents,
+            ExistingFileSnapshot::SymlinkPath { .. } => {
+                unreachable!("SymlinkPath snapshots are only for delete/move-source rollback")
+            }
+        }
+    }
+
+    fn current_permissions(&self) -> &std::fs::Permissions {
+        match self {
+            ExistingFileSnapshot::RegularFile { permissions, .. } => permissions,
+            ExistingFileSnapshot::Symlink {
+                target_permissions, ..
+            } => target_permissions,
+            ExistingFileSnapshot::SymlinkPath { .. } => {
+                unreachable!("SymlinkPath snapshots are only for delete/move-source rollback")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum VirtualEntry {
+    Missing,
+    RegularFile { contents: String },
+    Symlink { target: PathBuf, contents: String },
+}
+
+impl VirtualEntry {
+    fn current_contents(&self) -> Option<&str> {
+        match self {
+            VirtualEntry::Missing => None,
+            VirtualEntry::RegularFile { contents } => Some(contents),
+            VirtualEntry::Symlink { contents, .. } => Some(contents),
+        }
+    }
+
+    fn with_updated_contents(&self, contents: String) -> Self {
+        match self {
+            VirtualEntry::Missing | VirtualEntry::RegularFile { .. } => {
+                VirtualEntry::RegularFile { contents }
+            }
+            VirtualEntry::Symlink { target, .. } => VirtualEntry::Symlink {
+                target: target.clone(),
+                contents,
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PreparedChange {
+    Add {
+        path: PathBuf,
+        contents: String,
+    },
+    Delete {
+        path: PathBuf,
+    },
+    Update {
+        path: PathBuf,
+        contents: String,
+    },
+    Move {
+        source_path: PathBuf,
+        dest_path: PathBuf,
+        contents: String,
+    },
+}
+
+#[derive(Debug)]
+enum RollbackChange {
+    RemoveFile {
+        path: PathBuf,
+        created_dirs: Vec<PathBuf>,
+    },
+    RestoreExistingPath {
+        path: PathBuf,
+        snapshot: ExistingFileSnapshot,
+    },
+    RestoreDeletedPath {
+        path: PathBuf,
+        snapshot: ExistingFileSnapshot,
+    },
+}
+
 /// Apply the hunks to the filesystem, returning which files were added, modified, or deleted.
 /// Returns an error if the patch could not be applied.
 fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
@@ -281,56 +392,28 @@ fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
         anyhow::bail!("No files were modified.");
     }
 
+    let prepared_changes = prepare_changes(hunks)?;
     let mut added: Vec<PathBuf> = Vec::new();
     let mut modified: Vec<PathBuf> = Vec::new();
     let mut deleted: Vec<PathBuf> = Vec::new();
-    for hunk in hunks {
-        match hunk {
-            Hunk::AddFile { path, contents } => {
-                if let Some(parent) = path.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    std::fs::create_dir_all(parent).with_context(|| {
-                        format!("Failed to create parent directories for {}", path.display())
-                    })?;
-                }
-                std::fs::write(path, contents)
-                    .with_context(|| format!("Failed to write file {}", path.display()))?;
-                added.push(path.clone());
-            }
-            Hunk::DeleteFile { path } => {
-                std::fs::remove_file(path)
-                    .with_context(|| format!("Failed to delete file {}", path.display()))?;
-                deleted.push(path.clone());
-            }
-            Hunk::UpdateFile {
-                path,
-                move_path,
-                chunks,
-            } => {
-                let AppliedPatch { new_contents, .. } =
-                    derive_new_contents_from_chunks(path, chunks)?;
-                if let Some(dest) = move_path {
-                    if let Some(parent) = dest.parent()
-                        && !parent.as_os_str().is_empty()
-                    {
-                        std::fs::create_dir_all(parent).with_context(|| {
-                            format!("Failed to create parent directories for {}", dest.display())
-                        })?;
-                    }
-                    std::fs::write(dest, new_contents)
-                        .with_context(|| format!("Failed to write file {}", dest.display()))?;
-                    std::fs::remove_file(path)
-                        .with_context(|| format!("Failed to remove original {}", path.display()))?;
-                    modified.push(dest.clone());
-                } else {
-                    std::fs::write(path, new_contents)
-                        .with_context(|| format!("Failed to write file {}", path.display()))?;
-                    modified.push(path.clone());
-                }
-            }
+    let mut rollbacks: Vec<RollbackChange> = Vec::new();
+
+    for prepared_change in prepared_changes {
+        if let Err(err) = commit_prepared_change(
+            prepared_change,
+            &mut added,
+            &mut modified,
+            &mut deleted,
+            &mut rollbacks,
+        ) {
+            let rollback_result = rollback_changes(rollbacks);
+            return match rollback_result {
+                Ok(()) => Err(err),
+                Err(rollback_err) => Err(err.context(format!("Rollback failed: {rollback_err}"))),
+            };
         }
     }
+
     Ok(AffectedPaths {
         added,
         modified,
@@ -338,9 +421,636 @@ fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
     })
 }
 
+fn prepare_changes(hunks: &[Hunk]) -> anyhow::Result<Vec<PreparedChange>> {
+    let mut prepared_changes = Vec::with_capacity(hunks.len());
+    let mut virtual_entries: HashMap<PathBuf, VirtualEntry> = HashMap::new();
+
+    for hunk in hunks {
+        match hunk {
+            Hunk::AddFile { path, contents } => {
+                let current_entry = current_virtual_entry(
+                    &mut virtual_entries,
+                    path,
+                    load_virtual_entry_for_write,
+                )?;
+                prepared_changes.push(PreparedChange::Add {
+                    path: path.clone(),
+                    contents: contents.clone(),
+                });
+                virtual_entries.insert(
+                    path.clone(),
+                    current_entry.with_updated_contents(contents.clone()),
+                );
+            }
+            Hunk::DeleteFile { path } => {
+                let current_entry = current_virtual_entry(
+                    &mut virtual_entries,
+                    path,
+                    load_virtual_entry_for_delete,
+                )?;
+                if matches!(current_entry, VirtualEntry::Missing) {
+                    anyhow::bail!("Failed to delete file {}", path.display());
+                }
+                prepared_changes.push(PreparedChange::Delete { path: path.clone() });
+                virtual_entries.insert(path.clone(), VirtualEntry::Missing);
+            }
+            Hunk::UpdateFile {
+                path,
+                move_path,
+                chunks,
+            } => {
+                let source_entry = current_virtual_entry(
+                    &mut virtual_entries,
+                    path,
+                    load_virtual_entry_for_update,
+                )?;
+                let Some(source_contents) = source_entry.current_contents() else {
+                    return Err(missing_update_error(path));
+                };
+                let AppliedPatch { new_contents, .. } =
+                    derive_new_contents_from_contents(path, source_contents, chunks)?;
+                if let Some(dest_path) = move_path {
+                    let dest_entry = current_virtual_entry(
+                        &mut virtual_entries,
+                        dest_path,
+                        load_virtual_entry_for_write,
+                    )?;
+                    prepared_changes.push(PreparedChange::Move {
+                        source_path: path.clone(),
+                        dest_path: dest_path.clone(),
+                        contents: new_contents.clone(),
+                    });
+                    virtual_entries.insert(path.clone(), VirtualEntry::Missing);
+                    virtual_entries.insert(
+                        dest_path.clone(),
+                        dest_entry.with_updated_contents(new_contents),
+                    );
+                } else {
+                    prepared_changes.push(PreparedChange::Update {
+                        path: path.clone(),
+                        contents: new_contents.clone(),
+                    });
+                    virtual_entries.insert(
+                        path.clone(),
+                        source_entry.with_updated_contents(new_contents),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(prepared_changes)
+}
+
+fn current_virtual_entry(
+    virtual_entries: &mut HashMap<PathBuf, VirtualEntry>,
+    path: &Path,
+    loader: fn(&Path) -> anyhow::Result<VirtualEntry>,
+) -> anyhow::Result<VirtualEntry> {
+    if let Some(entry) = virtual_entries.get(path) {
+        return Ok(entry.clone());
+    }
+
+    let entry = loader(path)?;
+    virtual_entries.insert(path.to_path_buf(), entry.clone());
+    Ok(entry)
+}
+
+fn load_virtual_entry_for_write(path: &Path) -> anyhow::Result<VirtualEntry> {
+    let failure_context = format!("Failed to write file {}", path.display());
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            OpenOptions::new()
+                .write(true)
+                .open(path)
+                .with_context(|| failure_context.clone())?;
+            if metadata.file_type().is_symlink() {
+                let target = std::fs::read_link(path).with_context(|| failure_context.clone())?;
+                Ok(VirtualEntry::Symlink {
+                    target,
+                    contents: String::new(),
+                })
+            } else if metadata.is_file() {
+                Ok(VirtualEntry::RegularFile {
+                    contents: String::new(),
+                })
+            } else {
+                anyhow::bail!(failure_context)
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(VirtualEntry::Missing),
+        Err(err) => Err(anyhow::Error::new(err).context(failure_context)),
+    }
+}
+
+fn load_virtual_entry_for_delete(path: &Path) -> anyhow::Result<VirtualEntry> {
+    let failure_context = format!("Failed to delete file {}", path.display());
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                let target = std::fs::read_link(path).with_context(|| failure_context.clone())?;
+                Ok(VirtualEntry::Symlink {
+                    target,
+                    contents: String::new(),
+                })
+            } else if metadata.is_file() {
+                Ok(VirtualEntry::RegularFile {
+                    contents: String::new(),
+                })
+            } else {
+                anyhow::bail!(failure_context)
+            }
+        }
+        Err(err) => Err(anyhow::Error::new(err).context(failure_context)),
+    }
+}
+
+fn load_virtual_entry_for_update(path: &Path) -> anyhow::Result<VirtualEntry> {
+    let failure_context = format!("Failed to read file to update {}", path.display());
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) => return Err(anyhow::anyhow!("{failure_context}: {err}")),
+    };
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) => return Err(anyhow::anyhow!("{failure_context}: {err}")),
+    };
+    if metadata.file_type().is_symlink() {
+        let target = match std::fs::read_link(path) {
+            Ok(target) => target,
+            Err(err) => return Err(anyhow::anyhow!("{failure_context}: {err}")),
+        };
+        Ok(VirtualEntry::Symlink { target, contents })
+    } else if metadata.is_file() {
+        Ok(VirtualEntry::RegularFile { contents })
+    } else {
+        anyhow::bail!(failure_context)
+    }
+}
+
+fn missing_update_error(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Failed to read file to update {}: No such file or directory (os error 2)",
+        path.display()
+    )
+}
+
+fn snapshot_deleted_path(
+    path: &Path,
+    failure_context: &str,
+) -> anyhow::Result<Option<ExistingFileSnapshot>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                let target =
+                    std::fs::read_link(path).with_context(|| failure_context.to_string())?;
+                Ok(Some(ExistingFileSnapshot::SymlinkPath { target }))
+            } else if metadata.is_file() {
+                reject_multiply_linked_regular_file(path, &metadata, failure_context)?;
+                let contents = std::fs::read(path).with_context(|| failure_context.to_string())?;
+                Ok(Some(ExistingFileSnapshot::RegularFile {
+                    contents,
+                    permissions: metadata.permissions(),
+                }))
+            } else {
+                anyhow::bail!(failure_context.to_string())
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(anyhow::Error::new(err).context(failure_context.to_string())),
+    }
+}
+
+fn reject_multiply_linked_regular_file(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    failure_context: &str,
+) -> anyhow::Result<()> {
+    if metadata.is_file() && hard_link_count(metadata) > 1 {
+        anyhow::bail!(
+            "{failure_context}: multiply-linked regular files are not supported for delete or move-source rollback ({})",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn hard_link_count(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+
+    metadata.nlink()
+}
+
+#[cfg(windows)]
+fn hard_link_count(_metadata: &std::fs::Metadata) -> u64 {
+    // Stable std does not expose a hard-link count on Windows for this toolchain.
+    1
+}
+
+#[cfg(not(any(unix, windows)))]
+fn hard_link_count(_metadata: &std::fs::Metadata) -> u64 {
+    1
+}
+
+fn snapshot_existing_path(
+    path: &Path,
+    failure_context: &str,
+    require_write_access: bool,
+) -> anyhow::Result<Option<ExistingFileSnapshot>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if require_write_access {
+                OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .with_context(|| failure_context.to_string())?;
+            }
+            if metadata.file_type().is_symlink() {
+                let target =
+                    std::fs::read_link(path).with_context(|| failure_context.to_string())?;
+                let target_contents =
+                    std::fs::read(path).with_context(|| failure_context.to_string())?;
+                let target_permissions = std::fs::metadata(path)
+                    .with_context(|| failure_context.to_string())?
+                    .permissions();
+                Ok(Some(ExistingFileSnapshot::Symlink {
+                    target,
+                    target_contents,
+                    target_permissions,
+                }))
+            } else if metadata.is_file() {
+                let contents = std::fs::read(path).with_context(|| failure_context.to_string())?;
+                Ok(Some(ExistingFileSnapshot::RegularFile {
+                    contents,
+                    permissions: metadata.permissions(),
+                }))
+            } else {
+                anyhow::bail!(failure_context.to_string())
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(anyhow::Error::new(err).context(failure_context.to_string())),
+    }
+}
+
+fn commit_prepared_change(
+    prepared_change: PreparedChange,
+    added: &mut Vec<PathBuf>,
+    modified: &mut Vec<PathBuf>,
+    deleted: &mut Vec<PathBuf>,
+    rollbacks: &mut Vec<RollbackChange>,
+) -> anyhow::Result<()> {
+    match prepared_change {
+        PreparedChange::Add { path, contents } => {
+            let rollback = commit_write_change(&path, &contents)?;
+            added.push(path);
+            rollbacks.push(rollback);
+        }
+        PreparedChange::Delete { path } => {
+            let rollback = commit_delete_change(&path)?;
+            deleted.push(path);
+            rollbacks.push(rollback);
+        }
+        PreparedChange::Update { path, contents } => {
+            let rollback = commit_write_change(&path, &contents)?;
+            modified.push(path);
+            rollbacks.push(rollback);
+        }
+        PreparedChange::Move {
+            source_path,
+            dest_path,
+            contents,
+        } => {
+            let source_failure_context =
+                format!("Failed to remove original {}", source_path.display());
+            let source_snapshot = snapshot_deleted_path(&source_path, &source_failure_context)?
+                .ok_or_else(|| {
+                    anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+                        .context(source_failure_context.clone())
+                })?;
+            let dest_rollback = commit_write_change(&dest_path, &contents)?;
+            if let Err(err) =
+                std::fs::remove_file(&source_path).with_context(|| source_failure_context.clone())
+            {
+                return match rollback_changes(vec![dest_rollback]) {
+                    Ok(()) => Err(err),
+                    Err(rollback_err) => {
+                        Err(err.context(format!("Rollback failed: {rollback_err}")))
+                    }
+                };
+            }
+            modified.push(dest_path);
+            rollbacks.push(dest_rollback);
+            rollbacks.push(RollbackChange::RestoreDeletedPath {
+                path: source_path,
+                snapshot: source_snapshot,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn commit_write_change(path: &Path, contents: &str) -> anyhow::Result<RollbackChange> {
+    let failure_context = format!("Failed to write file {}", path.display());
+    match snapshot_existing_path(path, &failure_context, /*require_write_access*/ true)? {
+        Some(snapshot) => {
+            write_existing_path_with_rollback(path, contents, &snapshot)
+                .with_context(|| failure_context.clone())?;
+            Ok(RollbackChange::RestoreExistingPath {
+                path: path.to_path_buf(),
+                snapshot,
+            })
+        }
+        None => {
+            let created_dirs = create_parent_dirs_if_needed(path)?;
+            if let Err(err) =
+                write_new_path_atomically(path, contents.as_bytes(), /*permissions*/ None)
+            {
+                let cleanup_result = remove_created_dirs_if_empty(&created_dirs);
+                return match cleanup_result {
+                    Ok(()) => Err(anyhow::Error::new(err).context(failure_context)),
+                    Err(cleanup_err) => Err(anyhow::Error::new(err)
+                        .context(format!("{failure_context}; cleanup failed: {cleanup_err}"))),
+                };
+            }
+            Ok(RollbackChange::RemoveFile {
+                path: path.to_path_buf(),
+                created_dirs,
+            })
+        }
+    }
+}
+
+fn commit_delete_change(path: &Path) -> anyhow::Result<RollbackChange> {
+    let failure_context = format!("Failed to delete file {}", path.display());
+    let snapshot = snapshot_deleted_path(path, &failure_context)?.ok_or_else(|| {
+        anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context(failure_context.clone())
+    })?;
+    std::fs::remove_file(path).with_context(|| failure_context.clone())?;
+    Ok(RollbackChange::RestoreDeletedPath {
+        path: path.to_path_buf(),
+        snapshot,
+    })
+}
+
+fn write_existing_path_with_rollback(
+    path: &Path,
+    contents: &str,
+    snapshot: &ExistingFileSnapshot,
+) -> anyhow::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("Failed to write file {}", path.display()))?;
+    file.set_len(0)
+        .with_context(|| format!("Failed to write file {}", path.display()))?;
+    let write_result = (|| -> std::io::Result<()> {
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    match write_result {
+        Ok(()) => Ok(()),
+        Err(err) => match restore_existing_path(path, snapshot) {
+            Ok(()) => Err(anyhow::Error::new(err)),
+            Err(rollback_err) => {
+                Err(anyhow::Error::new(err).context(format!("Rollback failed: {rollback_err}")))
+            }
+        },
+    }
+}
+
+fn restore_existing_path(path: &Path, snapshot: &ExistingFileSnapshot) -> anyhow::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("Failed to restore {}", path.display()))?;
+    file.set_len(0)
+        .with_context(|| format!("Failed to restore {}", path.display()))?;
+    file.write_all(snapshot.current_contents())
+        .with_context(|| format!("Failed to restore {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("Failed to restore {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("Failed to restore {}", path.display()))?;
+    drop(file);
+    std::fs::set_permissions(path, snapshot.current_permissions().clone())
+        .with_context(|| format!("Failed to restore {}", path.display()))?;
+    Ok(())
+}
+
+fn rollback_changes(rollbacks: Vec<RollbackChange>) -> anyhow::Result<()> {
+    for rollback in rollbacks.into_iter().rev() {
+        match rollback {
+            RollbackChange::RemoveFile { path, created_dirs } => {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(anyhow::Error::new(err).context(format!(
+                            "Failed to remove rollback file {}",
+                            path.display()
+                        )));
+                    }
+                }
+                remove_created_dirs_if_empty(&created_dirs)?;
+            }
+            RollbackChange::RestoreExistingPath { path, snapshot } => {
+                restore_existing_path(&path, &snapshot)?;
+            }
+            RollbackChange::RestoreDeletedPath { path, snapshot } => {
+                restore_deleted_path(&path, &snapshot)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn restore_deleted_path(path: &Path, snapshot: &ExistingFileSnapshot) -> anyhow::Result<()> {
+    let created_dirs = create_parent_dirs_if_needed(path)?;
+    let restore_result = match snapshot {
+        ExistingFileSnapshot::RegularFile {
+            contents,
+            permissions,
+        } => write_new_path_atomically(path, contents, Some(permissions)),
+        ExistingFileSnapshot::Symlink { target, .. }
+        | ExistingFileSnapshot::SymlinkPath { target } => create_symlink(target, path),
+    };
+    match restore_result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let cleanup_result = remove_created_dirs_if_empty(&created_dirs);
+            match cleanup_result {
+                Ok(()) => Err(anyhow::Error::new(err)
+                    .context(format!("Failed to restore {}", path.display()))),
+                Err(cleanup_err) => Err(anyhow::Error::new(err).context(format!(
+                    "Failed to restore {}: cleanup failed: {cleanup_err}",
+                    path.display()
+                ))),
+            }
+        }
+    }
+}
+
+fn create_parent_dirs_if_needed(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut missing_dirs: Vec<PathBuf> = Vec::new();
+    let mut current = parent;
+    while !current.as_os_str().is_empty() && !current.exists() {
+        missing_dirs.push(current.to_path_buf());
+        let Some(next) = current.parent().filter(|next| !next.as_os_str().is_empty()) else {
+            break;
+        };
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+
+    for dir in missing_dirs.iter().rev() {
+        std::fs::create_dir(dir).with_context(|| {
+            format!("Failed to create parent directories for {}", path.display())
+        })?;
+    }
+
+    Ok(missing_dirs)
+}
+
+fn remove_created_dirs_if_empty(created_dirs: &[PathBuf]) -> anyhow::Result<()> {
+    for dir in created_dirs {
+        match std::fs::remove_dir(dir) {
+            Ok(()) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "Failed to remove rollback directory {}",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_new_path_atomically(
+    path: &Path,
+    contents: &[u8],
+    permissions: Option<&std::fs::Permissions>,
+) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let (mut temp_file, temp_path) = create_atomic_temp_file(parent, path)?;
+    let write_result = (|| -> std::io::Result<()> {
+        temp_file.write_all(contents)?;
+        temp_file.flush()?;
+        temp_file.sync_all()?;
+        drop(temp_file);
+        std::fs::rename(&temp_path, path)?;
+        if let Some(permissions) = permissions {
+            std::fs::set_permissions(path, permissions.clone())?;
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, path: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, path)
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, path: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, path)
+}
+
+fn create_atomic_temp_file(
+    parent: &Path,
+    target_path: &Path,
+) -> std::io::Result<(std::fs::File, PathBuf)> {
+    let file_stem = target_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "apply-patch".to_string());
+    let process_id = std::process::id();
+    let timestamp_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    for attempt in 0..1024_u32 {
+        let temp_path = parent.join(format!(
+            ".{file_stem}.codex-apply-patch.{process_id}.{timestamp_nanos}.{attempt}.tmp"
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(temp_file) => return Ok((temp_file, temp_path)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("Failed to allocate temp file for {}", target_path.display()),
+    ))
+}
+
 struct AppliedPatch {
     original_contents: String,
     new_contents: String,
+}
+
+fn derive_new_contents_from_contents(
+    path: &Path,
+    original_contents: &str,
+    chunks: &[UpdateFileChunk],
+) -> std::result::Result<AppliedPatch, ApplyPatchError> {
+    let mut original_lines: Vec<String> = original_contents.split('\n').map(String::from).collect();
+
+    // Drop the trailing empty element that results from the final newline so
+    // that line counts match the behaviour of standard `diff`.
+    if original_lines.last().is_some_and(String::is_empty) {
+        original_lines.pop();
+    }
+
+    let replacements = compute_replacements(&original_lines, path, chunks)?;
+    let new_lines = apply_replacements(original_lines, &replacements);
+    let mut new_lines = new_lines;
+    if !new_lines.last().is_some_and(String::is_empty) {
+        new_lines.push(String::new());
+    }
+    let new_contents = new_lines.join("\n");
+    Ok(AppliedPatch {
+        original_contents: original_contents.to_string(),
+        new_contents,
+    })
 }
 
 /// Return *only* the new file contents (joined into a single `String`) after
@@ -359,25 +1069,7 @@ fn derive_new_contents_from_chunks(
         }
     };
 
-    let mut original_lines: Vec<String> = original_contents.split('\n').map(String::from).collect();
-
-    // Drop the trailing empty element that results from the final newline so
-    // that line counts match the behaviour of standard `diff`.
-    if original_lines.last().is_some_and(String::is_empty) {
-        original_lines.pop();
-    }
-
-    let replacements = compute_replacements(&original_lines, path, chunks)?;
-    let new_lines = apply_replacements(original_lines, &replacements);
-    let mut new_lines = new_lines;
-    if !new_lines.last().is_some_and(String::is_empty) {
-        new_lines.push(String::new());
-    }
-    let new_contents = new_lines.join("\n");
-    Ok(AppliedPatch {
-        original_contents,
-        new_contents,
-    })
+    derive_new_contents_from_contents(path, &original_contents, chunks)
 }
 
 /// Compute a list of replacements needed to transform `original_lines` into the
@@ -1056,13 +1748,21 @@ g
     fn test_apply_patch_fails_on_write_error() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("readonly.txt");
-        fs::write(&path, "before\n").unwrap();
-        let mut perms = fs::metadata(&path).unwrap().permissions();
-        perms.set_readonly(true);
-        fs::set_permissions(&path, perms).unwrap();
+        fs::write(
+            &path, "before
+",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).unwrap();
 
         let patch = wrap_patch(&format!(
-            "*** Update File: {}\n@@\n-before\n+after\n*** End Patch",
+            "*** Update File: {}
+@@
+-before
++after
+*** End Patch",
             path.display()
         ));
 
@@ -1070,5 +1770,657 @@ g
         let mut stderr = Vec::new();
         let result = apply_patch(&patch, &mut stdout, &mut stderr);
         assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "before
+"
+        );
+        assert_eq!(String::from_utf8(stdout).unwrap(), "");
+        let _ = String::from_utf8(stderr).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_patch_move_failure_rolls_back_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("source");
+        let dest_dir = dir.path().join("dest");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+
+        let source_path = source_dir.join("original.txt");
+        let dest_path = dest_dir.join("renamed.txt");
+        fs::write(
+            &source_path,
+            "before
+",
+        )
+        .unwrap();
+        fs::write(
+            &dest_path,
+            "existing
+",
+        )
+        .unwrap();
+
+        let original_mode = fs::metadata(&source_dir).unwrap().permissions().mode();
+        let mut readonly_dir_permissions = fs::metadata(&source_dir).unwrap().permissions();
+        readonly_dir_permissions.set_mode(0o555);
+        fs::set_permissions(&source_dir, readonly_dir_permissions).unwrap();
+
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}
+*** Move to: {}
+@@
+-before
++after
+*** End Patch",
+            source_path.display(),
+            dest_path.display()
+        ));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let result = apply_patch(&patch, &mut stdout, &mut stderr);
+
+        fs::set_permissions(&source_dir, fs::Permissions::from_mode(original_mode)).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&source_path).unwrap(),
+            "before
+"
+        );
+        assert_eq!(
+            fs::read_to_string(&dest_path).unwrap(),
+            "existing
+"
+        );
+        assert_eq!(String::from_utf8(stdout).unwrap(), "");
+        let _ = String::from_utf8(stderr).unwrap();
+    }
+
+    #[test]
+    fn test_apply_patch_add_then_update_same_path_succeeds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("step.txt");
+        let patch = wrap_patch(&format!(
+            "*** Add File: {}
++one
+*** Update File: {}
+@@
+-one
++two",
+            path.display(),
+            path.display()
+        ));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "two
+"
+        );
+        assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    }
+
+    #[test]
+    fn test_apply_patch_update_then_update_same_path_succeeds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("double-update.txt");
+        fs::write(
+            &path, "before
+",
+        )
+        .unwrap();
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}
+@@
+-before
++middle
+*** Update File: {}
+@@
+-middle
++after",
+            path.display(),
+            path.display()
+        ));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "after
+"
+        );
+        assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    }
+
+    #[test]
+    fn test_apply_patch_move_then_update_destination_succeeds() {
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("source.txt");
+        let dest_path = dir.path().join("dest.txt");
+        fs::write(
+            &source_path,
+            "before
+",
+        )
+        .unwrap();
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}
+*** Move to: {}
+@@
+-before
++middle
+*** Update File: {}
+@@
+-middle
++after",
+            source_path.display(),
+            dest_path.display(),
+            dest_path.display()
+        ));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+
+        assert!(!source_path.exists());
+        assert_eq!(
+            fs::read_to_string(&dest_path).unwrap(),
+            "after
+"
+        );
+        assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_patch_add_over_existing_symlink_keeps_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let target_path = dir.path().join("target.txt");
+        let link_path = dir.path().join("link.txt");
+        fs::write(
+            &target_path,
+            "before
+",
+        )
+        .unwrap();
+        symlink("target.txt", &link_path).unwrap();
+
+        let patch = wrap_patch(&format!(
+            "*** Add File: {}
++after",
+            link_path.display()
+        ));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(&target_path).unwrap(),
+            "after
+"
+        );
+        assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_patch_update_hardlink_preserves_linked_contents() {
+        let dir = tempdir().unwrap();
+        let original_path = dir.path().join("original.txt");
+        let linked_path = dir.path().join("linked.txt");
+        fs::write(
+            &original_path,
+            "before
+",
+        )
+        .unwrap();
+        fs::hard_link(&original_path, &linked_path).unwrap();
+
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}
+@@
+-before
++after",
+            linked_path.display()
+        ));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&original_path).unwrap(),
+            "after
+"
+        );
+        assert_eq!(
+            fs::read_to_string(&linked_path).unwrap(),
+            "after
+"
+        );
+        assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_patch_late_failure_removes_empty_dirs_created_by_prior_add() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("source");
+        let dest_dir = dir.path().join("dest");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+
+        let source_path = source_dir.join("original.txt");
+        let dest_path = dest_dir.join("renamed.txt");
+        let added_path = dir.path().join("nested/new.txt");
+        fs::write(
+            &source_path,
+            "before
+",
+        )
+        .unwrap();
+        fs::write(
+            &dest_path,
+            "existing
+",
+        )
+        .unwrap();
+
+        let original_mode = fs::metadata(&source_dir).unwrap().permissions().mode();
+        let mut readonly_dir_permissions = fs::metadata(&source_dir).unwrap().permissions();
+        readonly_dir_permissions.set_mode(0o555);
+        fs::set_permissions(&source_dir, readonly_dir_permissions).unwrap();
+
+        let patch = wrap_patch(&format!(
+            "*** Add File: {}
++created
+*** Update File: {}
+*** Move to: {}
+@@
+-before
++after",
+            added_path.display(),
+            source_path.display(),
+            dest_path.display()
+        ));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let result = apply_patch(&patch, &mut stdout, &mut stderr);
+
+        fs::set_permissions(&source_dir, fs::Permissions::from_mode(original_mode)).unwrap();
+
+        assert!(result.is_err());
+        assert!(!added_path.exists());
+        assert!(!dir.path().join("nested").exists());
+        assert_eq!(
+            fs::read_to_string(&source_path).unwrap(),
+            "before
+"
+        );
+        assert_eq!(
+            fs::read_to_string(&dest_path).unwrap(),
+            "existing
+"
+        );
+        assert_eq!(String::from_utf8(stdout).unwrap(), "");
+        let _ = String::from_utf8(stderr).unwrap();
+    }
+
+    #[test]
+    fn test_write_new_path_atomically_rename_failure_cleans_temp_file() {
+        let dir = tempdir().unwrap();
+        let existing_dir = dir.path().join("existing");
+        fs::create_dir(&existing_dir).unwrap();
+
+        let error = write_new_path_atomically(
+            &existing_dir,
+            b"hello
+",
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::IsADirectory
+        ));
+        let leftover_temp = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .find(|name| name.starts_with(".existing.codex-apply-patch."));
+        assert_eq!(leftover_temp, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_patch_move_with_hardlinked_source_fails_before_commit() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("source.txt");
+        let dest_path = dir.path().join("dest.txt");
+        fs::write(
+            &source_path,
+            "before
+",
+        )
+        .unwrap();
+        fs::hard_link(&source_path, &dest_path).unwrap();
+
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}
+*** Move to: {}
+@@
+-before
++after",
+            source_path.display(),
+            dest_path.display(),
+        ));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let result = apply_patch(&patch, &mut stdout, &mut stderr);
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&source_path).unwrap(),
+            "before
+"
+        );
+        assert_eq!(
+            fs::read_to_string(&dest_path).unwrap(),
+            "before
+"
+        );
+        let source_metadata = fs::metadata(&source_path).unwrap();
+        let dest_metadata = fs::metadata(&dest_path).unwrap();
+        assert_eq!(source_metadata.dev(), dest_metadata.dev());
+        assert_eq!(source_metadata.ino(), dest_metadata.ino());
+        assert_eq!(source_metadata.nlink(), 2);
+        assert_eq!(dest_metadata.nlink(), 2);
+        assert_eq!(String::from_utf8(stdout).unwrap(), "");
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("multiply-linked regular files are not supported")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_patch_delete_hardlinked_file_fails_before_commit() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("source.txt");
+        let peer_path = dir.path().join("peer.txt");
+        fs::write(
+            &source_path,
+            "before
+",
+        )
+        .unwrap();
+        fs::hard_link(&source_path, &peer_path).unwrap();
+
+        let patch = wrap_patch(&format!("*** Delete File: {}", source_path.display()));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let result = apply_patch(&patch, &mut stdout, &mut stderr);
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&source_path).unwrap(),
+            "before
+"
+        );
+        assert_eq!(
+            fs::read_to_string(&peer_path).unwrap(),
+            "before
+"
+        );
+        let source_metadata = fs::metadata(&source_path).unwrap();
+        let peer_metadata = fs::metadata(&peer_path).unwrap();
+        assert_eq!(source_metadata.dev(), peer_metadata.dev());
+        assert_eq!(source_metadata.ino(), peer_metadata.ino());
+        assert_eq!(source_metadata.nlink(), 2);
+        assert_eq!(peer_metadata.nlink(), 2);
+        assert_eq!(String::from_utf8(stdout).unwrap(), "");
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("multiply-linked regular files are not supported")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_patch_update_matches_std_write_permission_drop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let patch_path = dir.path().join("patched.txt");
+        let baseline_path = dir.path().join("baseline.txt");
+        fs::write(
+            &patch_path,
+            "before
+",
+        )
+        .unwrap();
+        fs::write(
+            &baseline_path,
+            "before
+",
+        )
+        .unwrap();
+
+        for current_path in [&patch_path, &baseline_path] {
+            let mut permissions = fs::metadata(current_path).unwrap().permissions();
+            permissions.set_mode(0o4755);
+            fs::set_permissions(current_path, permissions).unwrap();
+        }
+
+        fs::write(
+            &baseline_path,
+            b"after
+",
+        )
+        .unwrap();
+        let baseline_mode = fs::metadata(&baseline_path).unwrap().permissions().mode() & 0o7777;
+
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}
+@@
+-before
++after",
+            patch_path.display()
+        ));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+
+        let patched_mode = fs::metadata(&patch_path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(patched_mode, baseline_mode);
+        assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_patch_delete_dangling_symlink_succeeds() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dangling-link");
+        symlink("missing-target", &path).unwrap();
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let patch = wrap_patch(&format!("*** Delete File: {}", path.display()));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+
+        assert!(matches!(
+            fs::symlink_metadata(&path).map_err(|err| err.kind()),
+            Err(std::io::ErrorKind::NotFound)
+        ));
+        assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_patch_delete_rollback_restores_setuid_mode_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let delete_path = dir.path().join("setuid.txt");
+        let readonly_path = dir.path().join("readonly.txt");
+        fs::write(
+            &delete_path,
+            "before
+",
+        )
+        .unwrap();
+        fs::write(
+            &readonly_path,
+            "locked
+",
+        )
+        .unwrap();
+        let mut delete_permissions = fs::metadata(&delete_path).unwrap().permissions();
+        delete_permissions.set_mode(0o4755);
+        fs::set_permissions(&delete_path, delete_permissions).unwrap();
+        let original_mode = fs::metadata(&delete_path).unwrap().permissions().mode() & 0o7777;
+
+        let mut readonly_permissions = fs::metadata(&readonly_path).unwrap().permissions();
+        readonly_permissions.set_mode(0o444);
+        fs::set_permissions(&readonly_path, readonly_permissions).unwrap();
+
+        let patch = wrap_patch(&format!(
+            "*** Delete File: {}
+*** Update File: {}
+@@
+-locked
++changed",
+            delete_path.display(),
+            readonly_path.display()
+        ));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let result = apply_patch(&patch, &mut stdout, &mut stderr);
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(&delete_path).unwrap(),
+            "before
+"
+        );
+        let restored_mode = fs::metadata(&delete_path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(restored_mode, original_mode);
+        assert_eq!(String::from_utf8(stdout).unwrap(), "");
+        let _ = String::from_utf8(stderr).unwrap();
+    }
+
+    #[test]
+    fn test_apply_patch_delete_non_utf8_file_succeeds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bin.dat");
+        fs::write(&path, [0xff]).unwrap();
+        let patch = wrap_patch(&format!("*** Delete File: {}", path.display()));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+
+        assert!(!path.exists());
+        assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    }
+
+    #[test]
+    fn test_apply_patch_add_over_existing_non_utf8_file_succeeds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bin.dat");
+        fs::write(&path, [0xff]).unwrap();
+        let patch = wrap_patch(&format!(
+            "*** Add File: {}
++after",
+            path.display()
+        ));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"after
+"
+        );
+        assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    }
+
+    #[test]
+    fn test_apply_patch_move_over_existing_non_utf8_destination_succeeds() {
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("source.txt");
+        let dest_path = dir.path().join("dest.dat");
+        fs::write(
+            &source_path,
+            "before
+",
+        )
+        .unwrap();
+        fs::write(&dest_path, [0xff]).unwrap();
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}
+*** Move to: {}
+@@
+-before
++after",
+            source_path.display(),
+            dest_path.display()
+        ));
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+
+        assert!(!source_path.exists());
+        assert_eq!(
+            fs::read(&dest_path).unwrap(),
+            b"after
+"
+        );
+        assert_eq!(String::from_utf8(stderr).unwrap(), "");
     }
 }

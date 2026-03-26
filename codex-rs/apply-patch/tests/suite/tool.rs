@@ -240,18 +240,30 @@ fn test_apply_patch_cli_updates_file_appends_trailing_newline() -> anyhow::Resul
 }
 
 #[test]
-fn test_apply_patch_cli_failure_after_partial_success_leaves_changes() -> anyhow::Result<()> {
+fn test_apply_patch_cli_failure_before_commit_leaves_no_changes() -> anyhow::Result<()> {
     let tmp = tempdir()?;
     let new_file = tmp.path().join("created.txt");
 
     apply_patch_command(tmp.path())?
-        .arg("*** Begin Patch\n*** Add File: created.txt\n+hello\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch")
+        .arg(
+            "*** Begin Patch
+*** Add File: created.txt
++hello
+*** Update File: missing.txt
+@@
+-old
++new
+*** End Patch",
+        )
         .assert()
         .failure()
         .stdout("")
-        .stderr("Failed to read file to update missing.txt: No such file or directory (os error 2)\n");
+        .stderr(
+            "Failed to read file to update missing.txt: No such file or directory (os error 2)
+",
+        );
 
-    assert_eq!(fs::read_to_string(&new_file)?, "hello\n");
+    assert!(!new_file.exists());
 
     Ok(())
 }
