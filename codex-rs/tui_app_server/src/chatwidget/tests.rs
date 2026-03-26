@@ -1966,6 +1966,7 @@ async fn make_chatwidget_manual(
         external_editor_state: ExternalEditorState::Closed,
         realtime_conversation: RealtimeConversationUiState::default(),
         last_rendered_user_message_event: None,
+        restored_pending_input_state: None,
         last_non_retry_error: None,
     };
     widget.set_model(&resolved_model);
@@ -3940,6 +3941,7 @@ async fn idle_commit_ticks_do_not_restore_status_without_commentary_completion()
     drain_insert_history(&mut rx);
 
     assert_eq!(chat.bottom_pane.status_indicator_visible(), false);
+    assert!(chat.bottom_pane.status_widget().is_some());
     assert_eq!(chat.bottom_pane.is_task_running(), true);
 
     // A second idle tick should not toggle the row back on and cause jitter.
@@ -3990,6 +3992,7 @@ async fn plan_completion_restores_status_indicator_after_streaming_plan_output()
     drain_insert_history(&mut rx);
 
     assert_eq!(chat.bottom_pane.status_indicator_visible(), false);
+    assert!(chat.bottom_pane.status_widget().is_some());
     assert_eq!(chat.bottom_pane.is_task_running(), true);
 
     chat.on_plan_item_completed("- Step 1\n".to_string());
@@ -4079,6 +4082,8 @@ async fn steer_enter_queues_while_plan_stream_is_active() {
     chat.on_plan_delta("- Step 1".to_string());
     let _ = drain_insert_history(&mut rx);
 
+    assert!(chat.bottom_pane.status_indicator_visible());
+
     chat.bottom_pane
         .set_composer_text("queued submission".to_string(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -4092,6 +4097,17 @@ async fn steer_enter_queues_while_plan_stream_is_active() {
     assert!(chat.pending_steers.is_empty());
     assert_no_submit_op(&mut op_rx);
     assert!(drain_insert_history(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn assistant_delta_without_visible_output_keeps_status_indicator_visible() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.on_task_started();
+    chat.on_agent_message_delta("checkpoint".to_string());
+
+    assert!(chat.bottom_pane.status_indicator_visible());
+    assert!(chat.bottom_pane.status_widget().is_some());
 }
 
 #[tokio::test]
@@ -5523,6 +5539,363 @@ async fn manual_interrupt_restores_pending_steers_to_composer() {
             .iter()
             .all(|cell| !lines_to_single_string(cell).contains("queued while streaming"))
     );
+}
+
+#[tokio::test]
+async fn task_complete_restores_unacknowledged_pending_steers_to_composer() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_task_started();
+    chat.on_agent_message_delta(
+        "Final answer line
+"
+        .to_string(),
+    );
+
+    chat.bottom_pane.set_composer_text(
+        "queued while streaming".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(chat.pending_steers.len(), 1);
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "queued while streaming".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.on_task_complete(Some("Final answer line".to_string()), false);
+
+    assert!(!chat.bottom_pane.is_task_running());
+    assert!(chat.pending_steers.is_empty());
+    assert!(chat.queued_user_messages.is_empty());
+    assert_eq!(chat.bottom_pane.composer_text(), "queued while streaming");
+    assert_no_submit_op(&mut op_rx);
+
+    let inserted = drain_insert_history(&mut rx);
+    assert!(
+        inserted
+            .iter()
+            .all(|cell| !lines_to_single_string(cell).contains("queued while streaming"))
+    );
+}
+
+#[tokio::test]
+// Merge-safety anchor: pending-steer snapshot coverage must preserve the local-draft restore
+// contract: unacknowledged follow-ups come back to the composer, and late matching user-message
+// completions clear that restored draft without silently resubmitting it.
+async fn task_complete_restores_unacknowledged_pending_steers_to_composer_snapshot() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_task_started();
+    chat.on_agent_message_delta("Final answer line\n".to_string());
+
+    chat.bottom_pane.set_composer_text(
+        "queued while streaming".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "queued while streaming".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.on_task_complete(Some("Final answer line".to_string()), false);
+
+    assert_snapshot!(
+        "task_complete_restores_unacknowledged_pending_steers_to_composer_snapshot",
+        render_bottom_popup(&chat, 80)
+    );
+}
+
+#[tokio::test]
+async fn task_complete_restores_pending_pastes_to_composer() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_task_started();
+    chat.on_agent_message_delta("Final answer line\n".to_string());
+
+    chat.bottom_pane
+        .set_composer_text("sent while streaming".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(chat.pending_steers.len(), 1);
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "sent while streaming".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.bottom_pane
+        .set_composer_text("draft [PASTE_1]".to_string(), Vec::new(), Vec::new());
+    chat.bottom_pane.set_composer_pending_pastes(vec![(
+        "[PASTE_1]".to_string(),
+        "restored paste payload".to_string(),
+    )]);
+
+    chat.on_task_complete(Some("Final answer line".to_string()), false);
+
+    assert_eq!(
+        chat.bottom_pane.composer_text(),
+        "sent while streaming\ndraft [PASTE_1]"
+    );
+    assert_eq!(
+        chat.bottom_pane.composer_pending_pastes(),
+        vec![(
+            "[PASTE_1]".to_string(),
+            "restored paste payload".to_string()
+        )]
+    );
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn late_user_message_completion_clears_restored_pending_steer_draft_snapshot() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_task_started();
+    chat.on_agent_message_delta("Final answer line\n".to_string());
+
+    chat.bottom_pane.set_composer_text(
+        "queued while streaming".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "queued while streaming".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.on_task_complete(Some("Final answer line".to_string()), false);
+    drain_insert_history(&mut rx);
+
+    complete_user_message(&mut chat, "late-user-message", "queued while streaming");
+
+    assert_snapshot!(
+        "late_user_message_completion_clears_restored_pending_steer_draft_snapshot",
+        render_bottom_popup(&chat, 80)
+    );
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn late_user_message_completion_rebases_suffix_edits_after_restored_pending_steer_snapshot() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_task_started();
+    chat.on_agent_message_delta("Final answer line\n".to_string());
+
+    chat.bottom_pane.set_composer_text(
+        "queued while streaming".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "queued while streaming".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.on_task_complete(Some("Final answer line".to_string()), false);
+    drain_insert_history(&mut rx);
+
+    chat.bottom_pane.set_composer_text(
+        "queued while streaming\nedited follow-up".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+
+    complete_user_message(&mut chat, "late-user-message", "queued while streaming");
+
+    assert_snapshot!(
+        "late_user_message_completion_rebases_suffix_edits_after_restored_pending_steer_snapshot",
+        render_bottom_popup(&chat, 80)
+    );
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn late_user_message_completion_clears_restored_pending_steer_draft() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_task_started();
+    chat.on_agent_message_delta("Final answer line\n".to_string());
+
+    chat.bottom_pane.set_composer_text(
+        "queued while streaming".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(chat.pending_steers.len(), 1);
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "queued while streaming".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.on_task_complete(Some("Final answer line".to_string()), false);
+    drain_insert_history(&mut rx);
+
+    complete_user_message(&mut chat, "late-user-message", "queued while streaming");
+
+    assert_eq!(chat.bottom_pane.composer_text(), "");
+    assert!(chat.bottom_pane.composer_pending_pastes().is_empty());
+
+    let inserted = drain_insert_history(&mut rx);
+    assert!(
+        inserted
+            .iter()
+            .any(|cell| lines_to_single_string(cell).contains("queued while streaming"))
+    );
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn late_user_message_completion_rebases_suffix_edits_after_restored_pending_steer() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_task_started();
+    chat.on_agent_message_delta("Final answer line\n".to_string());
+
+    chat.bottom_pane.set_composer_text(
+        "queued while streaming".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(chat.pending_steers.len(), 1);
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "queued while streaming".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.on_task_complete(Some("Final answer line".to_string()), false);
+    drain_insert_history(&mut rx);
+
+    chat.bottom_pane.set_composer_text(
+        "queued while streaming\nedited follow-up".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+
+    complete_user_message(&mut chat, "late-user-message", "queued while streaming");
+
+    assert_eq!(chat.bottom_pane.composer_text(), "edited follow-up");
+    assert!(chat.bottom_pane.composer_pending_pastes().is_empty());
+
+    let inserted = drain_insert_history(&mut rx);
+    assert!(
+        inserted
+            .iter()
+            .any(|cell| lines_to_single_string(cell).contains("queued while streaming"))
+    );
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn thread_restore_keeps_pending_steer_identity_for_late_ack_cleanup() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.on_task_started();
+    chat.on_agent_message_delta("Final answer line\n".to_string());
+
+    chat.bottom_pane.set_composer_text(
+        "queued while streaming".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "queued while streaming".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected Op::UserTurn, got {other:?}"),
+    }
+
+    let input_state = chat
+        .capture_thread_input_state()
+        .expect("expected pending-steer thread state");
+    let (mut restored_chat, mut restored_rx, mut restored_op_rx) =
+        make_chatwidget_manual(None).await;
+    restored_chat.thread_id = Some(ThreadId::new());
+    restored_chat.restore_thread_input_state(Some(input_state));
+
+    assert_eq!(
+        restored_chat.pending_steer_texts(),
+        vec!["queued while streaming".to_string()]
+    );
+    assert!(restored_chat.queued_user_message_texts().is_empty());
+
+    restored_chat.on_task_complete(Some("Final answer line".to_string()), false);
+    drain_insert_history(&mut restored_rx);
+    complete_user_message(
+        &mut restored_chat,
+        "late-user-message",
+        "queued while streaming",
+    );
+
+    assert_eq!(restored_chat.bottom_pane.composer_text(), "");
+    assert!(
+        restored_chat
+            .bottom_pane
+            .composer_pending_pastes()
+            .is_empty()
+    );
+    assert_no_submit_op(&mut restored_op_rx);
 }
 
 #[tokio::test]
@@ -7305,6 +7678,7 @@ async fn undo_success_events_render_info_messages() {
         !chat.bottom_pane.status_indicator_visible(),
         "status indicator should be hidden after successful undo"
     );
+    assert!(chat.bottom_pane.status_widget().is_none());
 
     let completed = lines_to_single_string(&cells[0]);
     assert!(
@@ -7340,12 +7714,32 @@ async fn undo_failure_events_render_error_message() {
         !chat.bottom_pane.status_indicator_visible(),
         "status indicator should be hidden after failed undo"
     );
+    assert!(chat.bottom_pane.status_widget().is_none());
 
     let completed = lines_to_single_string(&cells[0]);
     assert!(
         completed.contains("Failed to restore workspace state."),
         "expected failure message, got {completed:?}"
     );
+}
+
+#[tokio::test]
+async fn task_completion_clears_hidden_status_widget() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.on_task_started();
+    chat.on_agent_message_delta("Final answer line\n".to_string());
+    chat.on_commit_tick();
+    drain_insert_history(&mut rx);
+
+    assert!(!chat.bottom_pane.status_indicator_visible());
+    assert!(chat.bottom_pane.status_widget().is_some());
+
+    chat.on_task_complete(None, false);
+
+    assert!(!chat.bottom_pane.is_task_running());
+    assert!(!chat.bottom_pane.status_indicator_visible());
+    assert!(chat.bottom_pane.status_widget().is_none());
 }
 
 #[tokio::test]
@@ -10791,6 +11185,155 @@ async fn mcp_startup_complete_does_not_clear_running_task() {
 }
 
 #[tokio::test]
+async fn task_complete_hands_status_owner_back_to_mcp_startup() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "task-1".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "mcp-1".into(),
+        msg: EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+            server: "alpha".into(),
+            status: McpStartupStatus::Starting,
+        }),
+    });
+    chat.set_status_header("Reviewing answer".to_string());
+
+    chat.on_task_complete(Some("Final answer line".to_string()), false);
+
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("mcp startup should keep the status widget allocated");
+    assert!(chat.bottom_pane.is_task_running());
+    assert!(chat.bottom_pane.status_indicator_visible());
+    assert_eq!(status.header(), "Booting MCP server: alpha");
+    assert_eq!(status.details(), None);
+}
+
+#[tokio::test]
+async fn task_complete_restores_hidden_status_indicator_for_mcp_startup() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "task-1".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "mcp-1".into(),
+        msg: EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+            server: "alpha".into(),
+            status: McpStartupStatus::Starting,
+        }),
+    });
+    chat.on_agent_message_delta("Final answer line\n".to_string());
+    chat.on_commit_tick();
+    drain_insert_history(&mut rx);
+    assert!(!chat.bottom_pane.status_indicator_visible());
+
+    chat.set_status_header("Reviewing answer".to_string());
+    chat.on_task_complete(Some("Final answer line".to_string()), false);
+
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("mcp startup should keep the status widget allocated");
+    assert!(chat.bottom_pane.is_task_running());
+    assert!(chat.bottom_pane.status_indicator_visible());
+    assert_eq!(status.header(), "Booting MCP server: alpha");
+    assert_eq!(status.details(), None);
+
+    chat.handle_codex_event(Event {
+        id: "mcp-2".into(),
+        msg: EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+            server: "beta".into(),
+            status: McpStartupStatus::Starting,
+        }),
+    });
+    assert!(chat.bottom_pane.status_indicator_visible());
+}
+
+#[tokio::test]
+async fn finalize_turn_hands_status_owner_back_to_mcp_startup() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "task-1".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "mcp-1".into(),
+        msg: EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+            server: "alpha".into(),
+            status: McpStartupStatus::Starting,
+        }),
+    });
+    chat.set_status_header("Running hook".to_string());
+
+    chat.finalize_turn();
+
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("mcp startup should keep the status widget allocated");
+    assert!(chat.bottom_pane.is_task_running());
+    assert!(chat.bottom_pane.status_indicator_visible());
+    assert_eq!(status.header(), "Booting MCP server: alpha");
+    assert_eq!(status.details(), None);
+}
+
+#[tokio::test]
+async fn finalize_turn_restores_hidden_status_indicator_for_mcp_startup() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "task-1".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "mcp-1".into(),
+        msg: EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+            server: "alpha".into(),
+            status: McpStartupStatus::Starting,
+        }),
+    });
+    chat.on_agent_message_delta("Final answer line\n".to_string());
+    chat.on_commit_tick();
+    drain_insert_history(&mut rx);
+    assert!(!chat.bottom_pane.status_indicator_visible());
+
+    chat.set_status_header("Running hook".to_string());
+    chat.finalize_turn();
+
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("mcp startup should keep the status widget allocated");
+    assert!(chat.bottom_pane.is_task_running());
+    assert!(chat.bottom_pane.status_indicator_visible());
+    assert_eq!(status.header(), "Booting MCP server: alpha");
+    assert_eq!(status.details(), None);
+}
+
+#[tokio::test]
 async fn background_event_updates_status_header() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
@@ -11520,6 +12063,7 @@ async fn thread_snapshot_replayed_stream_recovery_restores_previous_status_heade
         .bottom_pane
         .status_widget()
         .expect("status indicator should be visible");
+    assert!(chat.bottom_pane.status_indicator_visible());
     assert_eq!(status.header(), "Working");
     assert_eq!(status.details(), None);
     assert!(chat.retry_status_header.is_none());
@@ -11831,6 +12375,7 @@ async fn stream_recovery_restores_previous_status_header() {
         .bottom_pane
         .status_widget()
         .expect("status indicator should be visible");
+    assert!(chat.bottom_pane.status_indicator_visible());
     assert_eq!(status.header(), "Working");
     assert_eq!(status.details(), None);
     assert!(chat.retry_status_header.is_none());

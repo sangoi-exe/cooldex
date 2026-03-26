@@ -4,6 +4,8 @@
 //! context (for example, the prompt-GC badge and unified-exec background-process
 //! summary). Keeping these pieces on one line avoids vertical layout churn in
 //! the bottom pane.
+// Merge-safety anchor: TUI keeps the status row allocated across temporary hides so prompt-GC and
+// commentary streaming do not reset elapsed timing or collapse the bottom-pane layout mid-turn.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -52,6 +54,7 @@ pub(crate) struct StatusIndicatorWidget {
     /// Optional suffix rendered after the elapsed/interrupt segment.
     inline_message: Option<String>,
     show_interrupt_hint: bool,
+    visible: bool,
 
     elapsed_running: Duration,
     last_resume_at: Instant,
@@ -91,6 +94,7 @@ impl StatusIndicatorWidget {
             inline_badge: None,
             inline_message: None,
             show_interrupt_hint: true,
+            visible: true,
             elapsed_running: Duration::ZERO,
             last_resume_at: Instant::now(),
             is_paused: false,
@@ -159,6 +163,14 @@ impl StatusIndicatorWidget {
 
     pub(crate) fn set_interrupt_hint_visible(&mut self, visible: bool) {
         self.show_interrupt_hint = visible;
+    }
+
+    pub(crate) fn set_visible(&mut self, visible: bool) {
+        self.visible = visible;
+    }
+
+    pub(crate) fn is_visible(&self) -> bool {
+        self.visible
     }
 
     #[cfg(test)]
@@ -247,6 +259,14 @@ impl Renderable for StatusIndicatorWidget {
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
         if area.is_empty() {
+            return;
+        }
+
+        if !self.visible {
+            let blank_lines = (0..area.height)
+                .map(|_| Line::from(" ".repeat(usize::from(area.width))))
+                .collect::<Vec<_>>();
+            Paragraph::new(Text::from(blank_lines)).render_ref(area, buf);
             return;
         }
 
@@ -451,5 +471,48 @@ mod tests {
                 .is_some_and(|span| span.content.as_ref().contains('…')),
             "expected one-line details to be ellipsized, got {last:?}"
         );
+    }
+
+    #[test]
+    fn hidden_widget_preserves_height_but_renders_blank() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut widget =
+            StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy(), false);
+        widget.update_details(
+            Some("First detail line\nSecond detail line".to_string()),
+            StatusDetailsCapitalization::CapitalizeFirst,
+            STATUS_DETAILS_DEFAULT_MAX_LINES,
+        );
+
+        let width: u16 = 32;
+        let visible_height = widget.desired_height(width);
+        widget.set_visible(false);
+
+        assert_eq!(widget.desired_height(width), visible_height);
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, visible_height)).expect("terminal");
+        terminal
+            .draw(|frame| widget.render(frame.area(), frame.buffer_mut()))
+            .expect("draw");
+
+        let backend = terminal.backend();
+        for y in 0..visible_height {
+            let mut row = String::new();
+            for x in 0..width {
+                row.push(
+                    backend.buffer()[(x, y)]
+                        .symbol()
+                        .chars()
+                        .next()
+                        .unwrap_or(' '),
+                );
+            }
+            assert!(
+                row.chars().all(|character| character == ' '),
+                "expected hidden status row to render blank spaces, got {row:?}"
+            );
+        }
     }
 }

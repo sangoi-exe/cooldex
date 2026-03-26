@@ -6807,7 +6807,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_only_thread_keeps_restored_queue_visible() {
+    async fn replay_only_thread_keeps_restored_pending_steer_visible() {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
         let thread_id = ThreadId::new();
         let session_configured = Event {
@@ -6854,7 +6854,7 @@ mod tests {
         let input_state = app
             .chat_widget
             .capture_thread_input_state()
-            .expect("expected queued follow-up state");
+            .expect("expected pending-steer state");
 
         let (chat_widget, _app_event_tx, _rx, mut new_op_rx) =
             make_chatwidget_manual_with_sender().await;
@@ -6881,16 +6881,21 @@ mod tests {
 
         assert_eq!(
             app.chat_widget.queued_user_message_texts(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            app.chat_widget.pending_steer_texts(),
             vec!["queued follow-up".to_string()]
         );
         assert!(
             new_op_rx.try_recv().is_err(),
-            "replay-only threads should not auto-submit restored queue"
+            "replay-only threads should not auto-submit restored pending steers"
         );
     }
 
     #[tokio::test]
-    async fn replay_thread_snapshot_keeps_queue_when_running_state_only_comes_from_snapshot() {
+    async fn replay_thread_snapshot_keeps_pending_steer_when_running_state_only_comes_from_snapshot()
+     {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
         let thread_id = ThreadId::new();
         let session_configured = Event {
@@ -6937,7 +6942,7 @@ mod tests {
         let input_state = app
             .chat_widget
             .capture_thread_input_state()
-            .expect("expected queued follow-up state");
+            .expect("expected pending-steer state");
 
         let (chat_widget, _app_event_tx, _rx, mut new_op_rx) =
             make_chatwidget_manual_with_sender().await;
@@ -6958,16 +6963,20 @@ mod tests {
 
         assert_eq!(
             app.chat_widget.queued_user_message_texts(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            app.chat_widget.pending_steer_texts(),
             vec!["queued follow-up".to_string()]
         );
         assert!(
             new_op_rx.try_recv().is_err(),
-            "restored queue should stay queued when replay did not prove the turn finished"
+            "pending steer should stay pending when replay did not prove the turn finished"
         );
     }
 
     #[tokio::test]
-    async fn replay_thread_snapshot_does_not_submit_queue_before_replay_catches_up() {
+    async fn replay_thread_snapshot_restores_pending_steer_to_composer_after_replay_catches_up() {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
         let thread_id = ThreadId::new();
         let session_configured = Event {
@@ -7014,7 +7023,7 @@ mod tests {
         let input_state = app
             .chat_widget
             .capture_thread_input_state()
-            .expect("expected queued follow-up state");
+            .expect("expected pending-steer state");
 
         let (chat_widget, _app_event_tx, _rx, mut new_op_rx) =
             make_chatwidget_manual_with_sender().await;
@@ -7051,10 +7060,14 @@ mod tests {
 
         assert!(
             new_op_rx.try_recv().is_err(),
-            "queued follow-up should stay queued until the latest turn completes"
+            "pending steer should stay pending until the latest turn completes"
         );
         assert_eq!(
             app.chat_widget.queued_user_message_texts(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            app.chat_widget.pending_steer_texts(),
             vec!["queued follow-up".to_string()]
         );
 
@@ -7066,16 +7079,12 @@ mod tests {
             }),
         });
 
-        match next_user_turn_op(&mut new_op_rx) {
-            Op::UserTurn { items, .. } => assert_eq!(
-                items,
-                vec![UserInput::Text {
-                    text: "queued follow-up".to_string(),
-                    text_elements: Vec::new(),
-                }]
-            ),
-            other => panic!("expected queued follow-up submission, got {other:?}"),
-        }
+        assert_eq!(
+            app.chat_widget.composer_text_with_pending(),
+            "queued follow-up"
+        );
+        assert!(app.chat_widget.queued_user_message_texts().is_empty());
+        assert!(new_op_rx.try_recv().is_err());
     }
 
     #[tokio::test]

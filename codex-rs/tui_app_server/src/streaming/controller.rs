@@ -100,6 +100,12 @@ impl StreamController {
         self.state.oldest_queued_age(now)
     }
 
+    // Merge-safety anchor: commentary status-row hiding must key off committed visible output,
+    // not mere controller existence, so no-newline deltas keep the status row visible.
+    pub(crate) fn has_visible_output(&self) -> bool {
+        self.header_emitted
+    }
+
     fn emit(&mut self, lines: Vec<Line<'static>>) -> Option<Box<dyn HistoryCell>> {
         if lines.is_empty() {
             return None;
@@ -202,6 +208,12 @@ impl PlanStreamController {
     /// Returns the age of the oldest queued plan line.
     pub(crate) fn oldest_queued_age(&self, now: Instant) -> Option<Duration> {
         self.state.oldest_queued_age(now)
+    }
+
+    // Merge-safety anchor: plan-stream status-row hiding must key off committed visible output,
+    // not mere controller existence, so no-newline deltas keep the status row visible.
+    pub(crate) fn has_visible_output(&self) -> bool {
+        self.header_emitted
     }
 
     fn emit(

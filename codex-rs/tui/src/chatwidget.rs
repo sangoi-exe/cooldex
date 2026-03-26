@@ -892,6 +892,7 @@ pub(crate) struct ChatWidget {
     external_editor_state: ExternalEditorState,
     realtime_conversation: RealtimeConversationUiState,
     last_rendered_user_message_event: Option<RenderedUserMessageEvent>,
+    restored_pending_input_state: Option<RestoredPendingInputState>,
 }
 
 /// Snapshot of active-cell state that affects transcript overlay rendering.
@@ -951,12 +952,36 @@ impl ThreadComposerState {
             || !self.mention_bindings.is_empty()
             || !self.pending_pastes.is_empty()
     }
+
+    fn has_message_content(&self) -> bool {
+        !self.text.is_empty()
+            || !self.local_images.is_empty()
+            || !self.remote_image_urls.is_empty()
+            || !self.text_elements.is_empty()
+            || !self.mention_bindings.is_empty()
+    }
+
+    fn clone_as_user_message(&self) -> UserMessage {
+        UserMessage {
+            text: self.text.clone(),
+            local_images: self.local_images.clone(),
+            remote_image_urls: self.remote_image_urls.clone(),
+            text_elements: self.text_elements.clone(),
+            mention_bindings: self.mention_bindings.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PendingSteer {
+    user_message: UserMessage,
+    compare_key: PendingSteerCompareKey,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ThreadInputState {
     composer: Option<ThreadComposerState>,
-    pending_steers: VecDeque<UserMessage>,
+    pending_steers: VecDeque<PendingSteer>,
     queued_user_messages: VecDeque<UserMessage>,
     current_collaboration_mode: CollaborationMode,
     active_collaboration_mask: Option<CollaborationModeMask>,
@@ -989,9 +1014,49 @@ impl From<&str> for UserMessage {
     }
 }
 
-struct PendingSteer {
-    user_message: UserMessage,
-    compare_key: PendingSteerCompareKey,
+#[derive(Debug, Clone, PartialEq, Default)]
+struct RestoredPendingInputState {
+    pending_steers: VecDeque<PendingSteer>,
+    queued_user_messages: VecDeque<UserMessage>,
+    composer: Option<ThreadComposerState>,
+}
+
+impl RestoredPendingInputState {
+    fn has_pending_steers(&self) -> bool {
+        !self.pending_steers.is_empty()
+    }
+
+    fn restored_composer_state(&self) -> Option<ThreadComposerState> {
+        let mut messages: Vec<UserMessage> = self
+            .pending_steers
+            .iter()
+            .map(|pending| pending.user_message.clone())
+            .collect();
+        messages.extend(self.queued_user_messages.iter().cloned());
+        if let Some(composer) = &self.composer
+            && composer.has_message_content()
+        {
+            messages.push(composer.clone_as_user_message());
+        }
+
+        if messages.is_empty() {
+            return self.composer.clone();
+        }
+
+        let merged = merge_user_messages(messages);
+        Some(ThreadComposerState {
+            text: merged.text,
+            local_images: merged.local_images,
+            remote_image_urls: merged.remote_image_urls,
+            text_elements: merged.text_elements,
+            mention_bindings: merged.mention_bindings,
+            pending_pastes: self
+                .composer
+                .as_ref()
+                .map(|composer| composer.pending_pastes.clone())
+                .unwrap_or_default(),
+        })
+    }
 }
 
 pub(crate) fn create_initial_user_message(
@@ -1034,6 +1099,86 @@ fn append_text_with_rebased_elements(
         element.byte_range.end += offset;
         element
     }));
+}
+
+fn append_thread_composer_suffix(
+    target: &mut ThreadComposerState,
+    mut suffix: ThreadComposerState,
+) {
+    if target.text.is_empty()
+        && suffix.text.starts_with('\n')
+        && suffix
+            .text_elements
+            .iter()
+            .all(|element| element.byte_range.start > 0 && element.byte_range.end > 0)
+    {
+        suffix.text.remove(0);
+        for element in &mut suffix.text_elements {
+            element.byte_range.start -= 1;
+            element.byte_range.end -= 1;
+        }
+    }
+    append_text_with_rebased_elements(
+        &mut target.text,
+        &mut target.text_elements,
+        &suffix.text,
+        suffix.text_elements,
+    );
+    target.local_images.extend(suffix.local_images);
+    target.remote_image_urls.extend(suffix.remote_image_urls);
+    target.mention_bindings.extend(suffix.mention_bindings);
+    target.pending_pastes.extend(suffix.pending_pastes);
+}
+
+fn capture_thread_composer_suffix(
+    current: &ThreadComposerState,
+    prefix: &ThreadComposerState,
+) -> Option<ThreadComposerState> {
+    if !current.text.starts_with(&prefix.text)
+        || !current
+            .local_images
+            .as_slice()
+            .starts_with(prefix.local_images.as_slice())
+        || !current
+            .remote_image_urls
+            .as_slice()
+            .starts_with(prefix.remote_image_urls.as_slice())
+        || !current
+            .text_elements
+            .as_slice()
+            .starts_with(prefix.text_elements.as_slice())
+        || !current
+            .mention_bindings
+            .as_slice()
+            .starts_with(prefix.mention_bindings.as_slice())
+        || !current
+            .pending_pastes
+            .as_slice()
+            .starts_with(prefix.pending_pastes.as_slice())
+    {
+        return None;
+    }
+
+    let prefix_text_len = prefix.text.len();
+    let mut text_elements = current.text_elements[prefix.text_elements.len()..].to_vec();
+    if text_elements.iter().any(|element| {
+        element.byte_range.start < prefix_text_len || element.byte_range.end < prefix_text_len
+    }) {
+        return None;
+    }
+    for element in &mut text_elements {
+        element.byte_range.start -= prefix_text_len;
+        element.byte_range.end -= prefix_text_len;
+    }
+
+    Some(ThreadComposerState {
+        text: current.text[prefix_text_len..].to_string(),
+        local_images: current.local_images[prefix.local_images.len()..].to_vec(),
+        remote_image_urls: current.remote_image_urls[prefix.remote_image_urls.len()..].to_vec(),
+        text_elements,
+        mention_bindings: current.mention_bindings[prefix.mention_bindings.len()..].to_vec(),
+        pending_pastes: current.pending_pastes[prefix.pending_pastes.len()..].to_vec(),
+    })
 }
 
 // When merging multiple queued drafts (e.g., after interrupt), each draft starts numbering
@@ -1179,6 +1324,59 @@ impl ChatWidget {
         self.refresh_terminal_title();
     }
 
+    fn mcp_startup_status_header(&self) -> Option<String> {
+        let current = self.mcp_startup_status.as_ref()?;
+        if current.is_empty() {
+            return Some("Starting MCP servers".to_string());
+        }
+        let total = current.len();
+        let mut starting: Vec<_> = current
+            .iter()
+            .filter_map(|(name, state)| {
+                if matches!(state, McpStartupStatus::Starting) {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        starting.sort();
+        Some(if let Some(first) = starting.first() {
+            let completed = total.saturating_sub(starting.len());
+            let max_to_show = 3;
+            let mut to_show: Vec<String> = starting
+                .iter()
+                .take(max_to_show)
+                .map(ToString::to_string)
+                .collect();
+            if starting.len() > max_to_show {
+                to_show.push("…".to_string());
+            }
+            if total > 1 {
+                format!(
+                    "Starting MCP servers ({completed}/{total}): {}",
+                    to_show.join(", ")
+                )
+            } else {
+                format!("Booting MCP server: {first}")
+            }
+        } else if total > 1 {
+            format!("Finalizing MCP startup ({total}/{total})")
+        } else {
+            "Finalizing MCP startup".to_string()
+        })
+    }
+
+    // Merge-safety anchor: when agent-turn cleanup overlaps active MCP startup, the status row
+    // must hand ownership back to MCP startup immediately instead of keeping a stale turn-owned
+    // header alive under a still-running bottom pane.
+    fn restore_mcp_startup_status_header(&mut self) {
+        if let Some(header) = self.mcp_startup_status_header() {
+            self.bottom_pane.ensure_status_indicator();
+            self.set_status_header(header);
+        }
+    }
+
     fn restore_reasoning_status_header(&mut self) {
         if let Some(header) = extract_first_bold(&self.reasoning_buffer) {
             self.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
@@ -1211,6 +1409,22 @@ impl ChatWidget {
 
     fn commentary_stream_active(&self) -> bool {
         self.stream_controller.is_some() || self.plan_stream_controller.is_some()
+    }
+
+    fn commentary_stream_has_visible_output(&self) -> bool {
+        self.stream_controller
+            .as_ref()
+            .is_some_and(StreamController::has_visible_output)
+            || self
+                .plan_stream_controller
+                .as_ref()
+                .is_some_and(PlanStreamController::has_visible_output)
+    }
+
+    fn should_hide_status_indicator_for_commentary_stream(&self) -> bool {
+        self.commentary_stream_active()
+            && !self.bottom_pane.prompt_gc_active()
+            && self.commentary_stream_has_visible_output()
     }
 
     fn stream_controllers_idle(&self) -> bool {
@@ -1731,9 +1945,10 @@ impl ChatWidget {
             self.app_event_tx.send(AppEvent::StartCommitAnimation);
             self.run_catch_up_commit_tick();
         }
-        if self.commentary_stream_active() && !self.bottom_pane.prompt_gc_active() {
+        if self.should_hide_status_indicator_for_commentary_stream() {
             // Merge-safety anchor: prompt-GC restoration must preserve the hidden-status contract
-            // for live commentary streams even before a newline produces committed plan cells.
+            // only after commentary has emitted visible output, so live layout height stays stable
+            // without blanking the footer before the first streamed line lands.
             self.bottom_pane.hide_status_indicator();
         }
         self.request_redraw();
@@ -1897,6 +2112,7 @@ impl ChatWidget {
             .set_turn_running(/*turn_running*/ false);
         self.bottom_pane.clear_status_state();
         self.update_task_running_state();
+        self.restore_mcp_startup_status_header();
         self.function_call_names_by_id.clear();
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
@@ -1905,6 +2121,15 @@ impl ChatWidget {
         self.request_redraw();
 
         let had_pending_steers = !self.pending_steers.is_empty();
+        // Merge-safety anchor: if a turn completes before pending steers are acknowledged, the
+        // "after next tool call" path is dead; restore those follow-ups locally instead of
+        // leaving the UI stuck on zombie pending-input state.
+        if had_pending_steers
+            && !from_replay
+            && let Some(restored) = self.drain_pending_input_for_restore()
+        {
+            self.restore_pending_input_state(restored);
+        }
         self.refresh_pending_input_preview();
 
         if !from_replay && self.queued_user_messages.is_empty() && !had_pending_steers {
@@ -2267,6 +2492,7 @@ impl ChatWidget {
         self.turn_sleep_inhibitor
             .set_turn_running(/*turn_running*/ false);
         self.update_task_running_state();
+        self.restore_mcp_startup_status_header();
         self.function_call_names_by_id.clear();
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
@@ -2318,41 +2544,7 @@ impl ChatWidget {
         status.insert(ev.server, ev.status);
         self.mcp_startup_status = Some(status);
         self.update_task_running_state();
-        if let Some(current) = &self.mcp_startup_status {
-            let total = current.len();
-            let mut starting: Vec<_> = current
-                .iter()
-                .filter_map(|(name, state)| {
-                    if matches!(state, McpStartupStatus::Starting) {
-                        Some(name)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            starting.sort();
-            if let Some(first) = starting.first() {
-                let completed = total.saturating_sub(starting.len());
-                let max_to_show = 3;
-                let mut to_show: Vec<String> = starting
-                    .iter()
-                    .take(max_to_show)
-                    .map(ToString::to_string)
-                    .collect();
-                if starting.len() > max_to_show {
-                    to_show.push("…".to_string());
-                }
-                let header = if total > 1 {
-                    format!(
-                        "Starting MCP servers ({completed}/{total}): {}",
-                        to_show.join(", ")
-                    )
-                } else {
-                    format!("Booting MCP server: {first}")
-                };
-                self.set_status_header(header);
-            }
-        }
+        self.restore_mcp_startup_status_header();
         self.request_redraw();
     }
 
@@ -2415,51 +2607,85 @@ impl ChatWidget {
                 .collect();
             if !pending_steers.is_empty() {
                 self.submit_user_message(merge_user_messages(pending_steers));
-            } else if let Some(combined) = self.drain_pending_messages_for_restore() {
-                self.restore_user_message_to_composer(combined);
+            } else if let Some(restored) = self.drain_pending_input_for_restore() {
+                self.restore_pending_input_state(restored);
             }
-        } else if let Some(combined) = self.drain_pending_messages_for_restore() {
-            self.restore_user_message_to_composer(combined);
+        } else if let Some(restored) = self.drain_pending_input_for_restore() {
+            self.restore_pending_input_state(restored);
         }
         self.refresh_pending_input_preview();
 
         self.request_redraw();
     }
 
-    /// Merge pending steers, queued drafts, and the current composer state into a single message.
+    fn capture_composer_state(&self) -> Option<ThreadComposerState> {
+        let composer = ThreadComposerState {
+            text: self.bottom_pane.composer_text(),
+            text_elements: self.bottom_pane.composer_text_elements(),
+            local_images: self.bottom_pane.composer_local_images(),
+            remote_image_urls: self.bottom_pane.remote_image_urls(),
+            mention_bindings: self.bottom_pane.composer_mention_bindings(),
+            pending_pastes: self.bottom_pane.composer_pending_pastes(),
+        };
+        composer.has_content().then_some(composer)
+    }
+
+    fn restore_composer_state(&mut self, composer: Option<ThreadComposerState>) {
+        if let Some(composer) = composer {
+            let local_image_paths = composer
+                .local_images
+                .into_iter()
+                .map(|image| image.path)
+                .collect();
+            self.set_remote_image_urls(composer.remote_image_urls);
+            self.bottom_pane.set_composer_text_with_mention_bindings(
+                composer.text,
+                composer.text_elements,
+                local_image_paths,
+                composer.mention_bindings,
+            );
+            self.bottom_pane
+                .set_composer_pending_pastes(composer.pending_pastes);
+        } else {
+            self.set_remote_image_urls(Vec::new());
+            self.bottom_pane.set_composer_text_with_mention_bindings(
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
+            self.bottom_pane.set_composer_pending_pastes(Vec::new());
+        }
+    }
+
+    fn restore_pending_input_state(&mut self, restored: RestoredPendingInputState) {
+        let composer = restored.restored_composer_state();
+        self.restored_pending_input_state = restored.has_pending_steers().then_some(restored);
+        self.restore_composer_state(composer);
+    }
+
+    /// Merge pending steers, queued drafts, and the current composer state into a single restore
+    /// object without dropping composer-only payload such as pending pastes.
     ///
     /// Each pending message numbers attachments from `[Image #1]` relative to its own remote
     /// images. When we concatenate multiple messages after interrupt, we must renumber local-image
     /// placeholders in a stable order and rebase text element byte ranges so the restored composer
     /// state stays aligned with the merged attachment list. Returns `None` when there is nothing to
     /// restore.
-    fn drain_pending_messages_for_restore(&mut self) -> Option<UserMessage> {
-        if self.pending_steers.is_empty() && self.queued_user_messages.is_empty() {
+    fn drain_pending_input_for_restore(&mut self) -> Option<RestoredPendingInputState> {
+        let composer = self.capture_composer_state();
+        if self.pending_steers.is_empty()
+            && self.queued_user_messages.is_empty()
+            && composer.is_none()
+        {
             return None;
         }
 
-        let existing_message = UserMessage {
-            text: self.bottom_pane.composer_text(),
-            text_elements: self.bottom_pane.composer_text_elements(),
-            local_images: self.bottom_pane.composer_local_images(),
-            remote_image_urls: self.bottom_pane.remote_image_urls(),
-            mention_bindings: self.bottom_pane.composer_mention_bindings(),
-        };
-
-        let mut to_merge: Vec<UserMessage> = self
-            .pending_steers
-            .drain(..)
-            .map(|steer| steer.user_message)
-            .collect();
-        to_merge.extend(self.queued_user_messages.drain(..));
-        if !existing_message.text.is_empty()
-            || !existing_message.local_images.is_empty()
-            || !existing_message.remote_image_urls.is_empty()
-        {
-            to_merge.push(existing_message);
-        }
-
-        Some(merge_user_messages(to_merge))
+        Some(RestoredPendingInputState {
+            pending_steers: self.pending_steers.drain(..).collect(),
+            queued_user_messages: self.queued_user_messages.drain(..).collect(),
+            composer,
+        })
     }
 
     fn restore_user_message_to_composer(&mut self, user_message: UserMessage) {
@@ -2478,24 +2704,96 @@ impl ChatWidget {
             local_image_paths,
             mention_bindings,
         );
+        self.bottom_pane.set_composer_pending_pastes(Vec::new());
+    }
+
+    fn reconcile_restored_pending_input_completion(
+        &mut self,
+        compare_key: &PendingSteerCompareKey,
+    ) -> bool {
+        let Some(mut restored) = self.restored_pending_input_state.take() else {
+            return false;
+        };
+        if restored
+            .pending_steers
+            .front()
+            .is_none_or(|pending| &pending.compare_key != compare_key)
+        {
+            self.restored_pending_input_state = Some(restored);
+            return false;
+        }
+
+        let current_composer = self.capture_composer_state();
+        let restored_composer = restored.restored_composer_state();
+        if let (Some(current), Some(restored_snapshot)) =
+            (current_composer.as_ref(), restored_composer.as_ref())
+            && current != restored_snapshot
+        {
+            let Some(suffix) = capture_thread_composer_suffix(current, restored_snapshot) else {
+                tracing::warn!(
+                    "late pending-steer ack arrived after restored composer diverged in a non-rebasable way"
+                );
+                self.restored_pending_input_state = Some(restored);
+                return false;
+            };
+            if suffix.has_content() {
+                append_thread_composer_suffix(restored.composer.get_or_insert_default(), suffix);
+            }
+        }
+
+        restored.pending_steers.pop_front();
+        self.restore_composer_state(restored.restored_composer_state());
+        if restored.has_pending_steers() {
+            self.restored_pending_input_state = Some(restored);
+        }
+
+        true
+    }
+
+    fn handle_committed_user_message_event(
+        &mut self,
+        event: UserMessageEvent,
+        compare_key: PendingSteerCompareKey,
+    ) {
+        let rendered = Self::rendered_user_message_event_from_event(&event);
+        if self
+            .pending_steers
+            .front()
+            .is_some_and(|pending| pending.compare_key == compare_key)
+        {
+            if let Some(pending) = self.pending_steers.pop_front() {
+                self.refresh_pending_input_preview();
+                let pending_event = UserMessageEvent {
+                    message: pending.user_message.text,
+                    images: Some(pending.user_message.remote_image_urls),
+                    local_images: pending
+                        .user_message
+                        .local_images
+                        .into_iter()
+                        .map(|image| image.path)
+                        .collect(),
+                    text_elements: pending.user_message.text_elements,
+                };
+                self.on_user_message_event(pending_event);
+            } else if self.last_rendered_user_message_event.as_ref() != Some(&rendered) {
+                tracing::warn!(
+                    "pending steer matched compare key but queue was empty when rendering committed user message"
+                );
+                self.on_user_message_event(event);
+            }
+        } else if self.reconcile_restored_pending_input_completion(&compare_key) {
+            if self.last_rendered_user_message_event.as_ref() != Some(&rendered) {
+                self.on_user_message_event(event);
+            }
+        } else if self.last_rendered_user_message_event.as_ref() != Some(&rendered) {
+            self.on_user_message_event(event);
+        }
     }
 
     pub(crate) fn capture_thread_input_state(&self) -> Option<ThreadInputState> {
-        let composer = ThreadComposerState {
-            text: self.bottom_pane.composer_text(),
-            text_elements: self.bottom_pane.composer_text_elements(),
-            local_images: self.bottom_pane.composer_local_images(),
-            remote_image_urls: self.bottom_pane.remote_image_urls(),
-            mention_bindings: self.bottom_pane.composer_mention_bindings(),
-            pending_pastes: self.bottom_pane.composer_pending_pastes(),
-        };
         Some(ThreadInputState {
-            composer: composer.has_content().then_some(composer),
-            pending_steers: self
-                .pending_steers
-                .iter()
-                .map(|pending| pending.user_message.clone())
-                .collect(),
+            composer: self.capture_composer_state(),
+            pending_steers: self.pending_steers.clone(),
             queued_user_messages: self.queued_user_messages.clone(),
             current_collaboration_mode: self.current_collaboration_mode.clone(),
             active_collaboration_mask: self.active_collaboration_mask.clone(),
@@ -2504,52 +2802,20 @@ impl ChatWidget {
     }
 
     pub(crate) fn restore_thread_input_state(&mut self, input_state: Option<ThreadInputState>) {
+        self.restored_pending_input_state = None;
         if let Some(input_state) = input_state {
             self.current_collaboration_mode = input_state.current_collaboration_mode;
             self.active_collaboration_mask = input_state.active_collaboration_mask;
             self.agent_turn_running = input_state.agent_turn_running;
             self.update_collaboration_mode_indicator();
             self.refresh_model_display();
-            if let Some(composer) = input_state.composer {
-                let local_image_paths = composer
-                    .local_images
-                    .into_iter()
-                    .map(|img| img.path)
-                    .collect();
-                self.set_remote_image_urls(composer.remote_image_urls);
-                self.bottom_pane.set_composer_text_with_mention_bindings(
-                    composer.text,
-                    composer.text_elements,
-                    local_image_paths,
-                    composer.mention_bindings,
-                );
-                self.bottom_pane
-                    .set_composer_pending_pastes(composer.pending_pastes);
-            } else {
-                self.set_remote_image_urls(Vec::new());
-                self.bottom_pane.set_composer_text_with_mention_bindings(
-                    String::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                );
-                self.bottom_pane.set_composer_pending_pastes(Vec::new());
-            }
-            self.pending_steers.clear();
-            self.queued_user_messages = input_state.pending_steers;
-            self.queued_user_messages
-                .extend(input_state.queued_user_messages);
+            self.restore_composer_state(input_state.composer);
+            self.pending_steers = input_state.pending_steers;
+            self.queued_user_messages = input_state.queued_user_messages;
         } else {
             self.agent_turn_running = false;
             self.pending_steers.clear();
-            self.set_remote_image_urls(Vec::new());
-            self.bottom_pane.set_composer_text_with_mention_bindings(
-                String::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            );
-            self.bottom_pane.set_composer_pending_pastes(Vec::new());
+            self.restore_composer_state(/*composer*/ None);
             self.queued_user_messages.clear();
         }
         self.turn_sleep_inhibitor
@@ -3156,7 +3422,11 @@ impl ChatWidget {
         self.set_status_header(message);
     }
 
+    // Merge-safety anchor: prompt-gc UI state must never materialize a fake cancellable
+    // `Working` row when no real task is running; the status row and interrupt affordance stay
+    // owned by the actual task lifecycle, not by prompt-gc alone.
     pub(crate) fn set_prompt_gc_activity(&mut self, active: bool) {
+        let task_running = self.bottom_pane.is_task_running();
         if active {
             if self.token_info_is_prompt_gc_private {
                 self.clear_prompt_gc_private_context_usage_info();
@@ -3164,13 +3434,17 @@ impl ChatWidget {
                 self.mark_prompt_gc_context_usage_unknown();
             }
             self.bottom_pane.set_prompt_gc_active(/*active*/ true);
-            self.bottom_pane.ensure_status_indicator();
-            self.bottom_pane
-                .set_interrupt_hint_visible(/*visible*/ true);
+            if task_running || self.bottom_pane.status_indicator_visible() {
+                self.bottom_pane.ensure_status_indicator();
+                self.bottom_pane
+                    .set_interrupt_hint_visible(/*visible*/ task_running);
+            }
             return;
         }
         self.bottom_pane.set_prompt_gc_active(/*active*/ false);
-        if self.commentary_stream_active() {
+        self.bottom_pane
+            .set_interrupt_hint_visible(/*visible*/ task_running);
+        if task_running && self.should_hide_status_indicator_for_commentary_stream() {
             self.bottom_pane.hide_status_indicator();
         }
     }
@@ -3219,7 +3493,7 @@ impl ChatWidget {
 
     fn on_undo_completed(&mut self, event: UndoCompletedEvent) {
         let UndoCompletedEvent { success, message } = event;
-        self.bottom_pane.hide_status_indicator();
+        self.bottom_pane.clear_status_indicator();
         self.terminal_title_status_kind = TerminalTitleStatusKind::Working;
         self.refresh_terminal_title();
         let message = message.unwrap_or_else(|| {
@@ -3318,7 +3592,7 @@ impl ChatWidget {
             self.maybe_restore_status_indicator_after_stream_idle();
             self.app_event_tx.send(AppEvent::StopCommitAnimation);
         }
-        if self.commentary_stream_active() && !self.bottom_pane.prompt_gc_active() {
+        if self.should_hide_status_indicator_for_commentary_stream() {
             self.bottom_pane.hide_status_indicator();
         }
 
@@ -3351,7 +3625,7 @@ impl ChatWidget {
 
     fn handle_stream_finished(&mut self) {
         if self.task_complete_pending {
-            self.bottom_pane.hide_status_indicator();
+            self.bottom_pane.clear_status_indicator();
             self.task_complete_pending = false;
         }
         // A completed stream indicates non-exec content was just inserted.
@@ -3394,9 +3668,10 @@ impl ChatWidget {
             self.app_event_tx.send(AppEvent::StartCommitAnimation);
             self.run_catch_up_commit_tick();
         }
-        if self.commentary_stream_active() && !self.bottom_pane.prompt_gc_active() {
+        if self.should_hide_status_indicator_for_commentary_stream() {
             // Merge-safety anchor: prompt-GC restoration must preserve the hidden-status contract
-            // for live commentary streams even before a newline produces committed message cells.
+            // only after commentary has emitted visible output, so live layout height stays stable
+            // without blanking the footer before the first streamed line lands.
             self.bottom_pane.hide_status_indicator();
         }
         self.request_redraw();
@@ -3929,6 +4204,7 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
+            restored_pending_input_state: None,
         };
 
         widget.prefetch_rate_limits();
@@ -4135,6 +4411,7 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
+            restored_pending_input_state: None,
         };
 
         widget.prefetch_rate_limits();
@@ -4333,6 +4610,7 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
+            restored_pending_input_state: None,
         };
 
         widget.prefetch_rate_limits();
@@ -5226,6 +5504,7 @@ impl ChatWidget {
     }
 
     fn submit_user_message(&mut self, user_message: UserMessage) {
+        self.restored_pending_input_state = None;
         if !self.is_session_configured() {
             tracing::warn!("cannot submit user message before session is configured; queueing");
             self.queued_user_messages.push_front(user_message);
@@ -5810,37 +6089,8 @@ impl ChatWidget {
                     let EventMsg::UserMessage(event) = item.as_legacy_event() else {
                         unreachable!("user message item should convert to a legacy user message");
                     };
-                    let rendered = Self::rendered_user_message_event_from_event(&event);
                     let compare_key = Self::pending_steer_compare_key_from_item(item);
-                    if self
-                        .pending_steers
-                        .front()
-                        .is_some_and(|pending| pending.compare_key == compare_key)
-                    {
-                        if let Some(pending) = self.pending_steers.pop_front() {
-                            self.refresh_pending_input_preview();
-                            let pending_event = UserMessageEvent {
-                                message: pending.user_message.text,
-                                images: Some(pending.user_message.remote_image_urls),
-                                local_images: pending
-                                    .user_message
-                                    .local_images
-                                    .into_iter()
-                                    .map(|image| image.path)
-                                    .collect(),
-                                text_elements: pending.user_message.text_elements,
-                            };
-                            self.on_user_message_event(pending_event);
-                        } else if self.last_rendered_user_message_event.as_ref() != Some(&rendered)
-                        {
-                            tracing::warn!(
-                                "pending steer matched compare key but queue was empty when rendering committed user message"
-                            );
-                            self.on_user_message_event(event);
-                        }
-                    } else if self.last_rendered_user_message_event.as_ref() != Some(&rendered) {
-                        self.on_user_message_event(event);
-                    }
+                    self.handle_committed_user_message_event(event, compare_key);
                 }
                 if let codex_protocol::items::TurnItem::Plan(plan_item) = &item {
                     self.on_plan_item_completed(plan_item.text.clone());
@@ -8453,7 +8703,7 @@ impl ChatWidget {
     pub(crate) fn clear_windows_sandbox_setup_status(&mut self) {
         self.bottom_pane
             .set_composer_input_enabled(/*enabled*/ true, /*placeholder*/ None);
-        self.bottom_pane.hide_status_indicator();
+        self.bottom_pane.clear_status_indicator();
         self.request_redraw();
     }
 
@@ -9488,6 +9738,14 @@ impl ChatWidget {
         self.queued_user_messages
             .iter()
             .map(|message| message.text.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_steer_texts(&self) -> Vec<String> {
+        self.pending_steers
+            .iter()
+            .map(|pending| pending.user_message.text.clone())
             .collect()
     }
 

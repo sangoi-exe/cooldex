@@ -692,9 +692,10 @@ impl BottomPane {
         self.composer.quit_shortcut_hint_visible()
     }
 
-    #[cfg(test)]
     pub(crate) fn status_indicator_visible(&self) -> bool {
-        self.status.is_some()
+        self.status
+            .as_ref()
+            .is_some_and(StatusIndicatorWidget::is_visible)
     }
 
     #[cfg(test)]
@@ -739,26 +740,48 @@ impl BottomPane {
                 self.request_redraw();
             }
         } else {
-            // Hide the status indicator when a task completes, but keep other modal views.
-            self.hide_status_indicator();
+            // Drop the status indicator when a task completes so the next turn gets a fresh timer.
+            self.clear_status_indicator();
         }
     }
 
-    /// Hide the status indicator while leaving task-running state untouched.
+    // Merge-safety anchor: app-server TUI must keep one allocated status widget per running task;
+    // temporary commentary hides only flip visibility, while teardown paths clear the widget.
+    /// Visually hide the status indicator while leaving task-running state untouched.
     pub(crate) fn hide_status_indicator(&mut self) {
+        if let Some(status) = self.status.as_mut()
+            && status.is_visible()
+        {
+            status.set_visible(/*visible*/ false);
+            self.request_redraw();
+        }
+    }
+
+    /// Remove the status indicator widget entirely.
+    pub(crate) fn clear_status_indicator(&mut self) {
         if self.status.take().is_some() {
             self.request_redraw();
         }
     }
 
     pub(crate) fn ensure_status_indicator(&mut self) {
+        let mut needs_redraw = false;
         if self.status.is_none() {
             self.status = Some(StatusIndicatorWidget::new(
                 self.app_event_tx.clone(),
                 self.frame_requester.clone(),
                 self.animations_enabled,
             ));
-            self.sync_status_inline_message();
+            needs_redraw = true;
+        }
+        if let Some(status) = self.status.as_mut()
+            && !status.is_visible()
+        {
+            status.set_visible(/*visible*/ true);
+            needs_redraw = true;
+        }
+        self.sync_status_inline_message();
+        if needs_redraw {
             self.request_redraw();
         }
     }
@@ -1135,7 +1158,7 @@ impl BottomPane {
             }
             // Avoid double-surfacing the same summary and avoid adding an extra
             // row while the status line is already visible.
-            if self.status.is_none() && !self.unified_exec_footer.is_empty() {
+            if !self.status_indicator_visible() && !self.unified_exec_footer.is_empty() {
                 flex.push(
                     /*flex*/ 0,
                     RenderableItem::Borrowed(&self.unified_exec_footer),
@@ -1439,6 +1462,83 @@ mod tests {
 
         let bufs = snapshot_buffer(&buf);
         assert!(bufs.contains("• Working"), "expected Working header");
+    }
+
+    #[test]
+    fn hiding_status_indicator_keeps_widget_allocated() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = BottomPane::new(BottomPaneParams {
+            app_event_tx: tx,
+            frame_requester: FrameRequester::test_dummy(),
+            has_input_focus: true,
+            enhanced_keys_supported: false,
+            placeholder_text: "Ask Codex to do anything".to_string(),
+            disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
+        });
+
+        pane.set_task_running(true);
+        assert!(pane.status_widget().is_some());
+        assert!(pane.status_indicator_visible());
+
+        pane.hide_status_indicator();
+
+        assert!(pane.status_widget().is_some());
+        assert!(!pane.status_indicator_visible());
+    }
+
+    #[test]
+    fn hidden_status_still_shows_unified_exec_footer() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = BottomPane::new(BottomPaneParams {
+            app_event_tx: tx,
+            frame_requester: FrameRequester::test_dummy(),
+            has_input_focus: true,
+            enhanced_keys_supported: false,
+            placeholder_text: "Ask Codex to do anything".to_string(),
+            disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
+        });
+
+        pane.set_task_running(true);
+        pane.set_unified_exec_processes(vec!["sleep 5".to_string()]);
+        pane.hide_status_indicator();
+
+        let width = 120;
+        let area = Rect::new(0, 0, width, pane.desired_height(width));
+        let rendered = render_snapshot(&pane, area);
+        assert!(rendered.contains("background terminal running · /ps to view"));
+    }
+
+    #[test]
+    fn hidden_status_with_unified_exec_footer_snapshot() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut pane = BottomPane::new(BottomPaneParams {
+            app_event_tx: tx,
+            frame_requester: FrameRequester::test_dummy(),
+            has_input_focus: true,
+            enhanced_keys_supported: false,
+            placeholder_text: "Ask Codex to do anything".to_string(),
+            disable_paste_burst: false,
+            animations_enabled: true,
+            skills: Some(Vec::new()),
+        });
+
+        pane.set_task_running(true);
+        pane.set_unified_exec_processes(vec!["sleep 5".to_string()]);
+        pane.hide_status_indicator();
+
+        let width = 120;
+        let area = Rect::new(0, 0, width, pane.desired_height(width));
+        assert_snapshot!(
+            "hidden_status_with_unified_exec_footer_snapshot",
+            render_snapshot(&pane, area)
+        );
     }
 
     #[test]
