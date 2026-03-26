@@ -13,6 +13,8 @@ pub(crate) const PROMPT_GC_COMPACTION_MARKER: &str = "[internal] prompt_gc";
 pub(crate) const MAX_UNITS_PER_RETRIEVE: usize = 16;
 pub(crate) const MAX_RAW_BYTES_PER_RETRIEVE: usize = 24_000;
 pub(crate) const PROMPT_GC_MIN_FUNCTION_CALL_OUTPUT_TOKEN_QTY: usize = 200;
+pub(crate) const PROMPT_GC_MIN_FINAL_ANSWER_SELECTABLE_RAW_BYTES: usize =
+    MAX_RAW_BYTES_PER_RETRIEVE / MAX_UNITS_PER_RETRIEVE;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PromptGcObservedItem {
@@ -78,6 +80,8 @@ pub(crate) struct PromptGcCheckpointEligibility {
     pub(crate) uncompacted_unit_count: usize,
     pub(crate) triggering_function_call_output_count: usize,
     pub(crate) max_token_qty: usize,
+    pub(crate) selectable_unit_count: usize,
+    pub(crate) selectable_raw_bytes: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -290,7 +294,16 @@ impl PromptGcSidecar {
         &self,
         checkpoint_id: &str,
     ) -> Option<PromptGcCheckpointEligibility> {
+        // Merge-safety anchor: prompt_gc activation must derive from the same
+        // selectable burden that runtime plan build can actually feed into the
+        // hidden summarizer. Keep these eligibility metrics aligned with the
+        // final-answer fallback gate in `codex.rs`.
         let checkpoint = self.checkpoint(checkpoint_id)?;
+        let selectable_units = self.collect_selectable_unit_refs(
+            &checkpoint,
+            MAX_UNITS_PER_RETRIEVE,
+            MAX_RAW_BYTES_PER_RETRIEVE,
+        );
         let uncompacted_units = self
             .units
             .iter()
@@ -309,10 +322,16 @@ impl PromptGcSidecar {
                 max_token_qty = max_token_qty.max(token_qty);
             }
         }
+        let selectable_unit_count = selectable_units.len();
+        let selectable_raw_bytes = selectable_units
+            .iter()
+            .fold(0usize, |acc, unit| acc.saturating_add(unit.approx_bytes));
         Some(PromptGcCheckpointEligibility {
             uncompacted_unit_count,
             triggering_function_call_output_count,
             max_token_qty,
+            selectable_unit_count,
+            selectable_raw_bytes,
         })
     }
 
@@ -1333,6 +1352,8 @@ mod tests {
         assert_eq!(eligibility.uncompacted_unit_count, 1);
         assert_eq!(eligibility.triggering_function_call_output_count, 0);
         assert_eq!(eligibility.max_token_qty, 0);
+        assert_eq!(eligibility.selectable_unit_count, 1);
+        assert!(eligibility.selectable_raw_bytes >= 2_000);
     }
 
     #[test]

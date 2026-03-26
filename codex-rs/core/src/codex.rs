@@ -36,6 +36,7 @@ use crate::models_manager::manager::RefreshStrategy;
 use crate::parse_command::parse_command;
 use crate::parse_turn_item;
 use crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER;
+use crate::prompt_gc_sidecar::PROMPT_GC_MIN_FINAL_ANSWER_SELECTABLE_RAW_BYTES;
 use crate::prompt_gc_sidecar::PROMPT_GC_MIN_FUNCTION_CALL_OUTPUT_TOKEN_QTY;
 use crate::prompt_gc_sidecar::PromptGcApplyOutcome;
 use crate::prompt_gc_sidecar::PromptGcObservedItem;
@@ -341,6 +342,7 @@ use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DeveloperInstructions;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -6615,18 +6617,29 @@ async fn run_prompt_gc_sidecar_if_needed(
         .lock()
         .await
         .checkpoint_eligibility(&checkpoint.checkpoint_id);
+    // Merge-safety anchor: prompt_gc keeps the strict `FunctionCallOutput`
+    // fast path for non-final checkpoints, but final answers may fall back to
+    // selectable raw burden derived from the retrieve budget. Keep this
+    // predicate aligned with `PromptGcCheckpointEligibility` and the AGENTS
+    // inventory entry.
+    let final_answer_fallback_eligible = matches!(checkpoint_eligibility, Some(eligibility) if checkpoint.phase == MessagePhase::FinalAnswer
+        && eligibility.triggering_function_call_output_count == 0
+        && eligibility.selectable_raw_bytes >= PROMPT_GC_MIN_FINAL_ANSWER_SELECTABLE_RAW_BYTES);
     if matches!(
         checkpoint_eligibility,
         Some(eligibility)
-            if eligibility.uncompacted_unit_count > 0
+            if eligibility.selectable_unit_count > 0
                 && eligibility.triggering_function_call_output_count == 0
+                && !final_answer_fallback_eligible
     ) {
         debug!(
             turn_id = %turn_context.sub_id,
             checkpoint_id = %checkpoint.checkpoint_id,
+            phase = ?checkpoint.phase,
             checkpoint_eligibility = ?checkpoint_eligibility,
             threshold_tokens = PROMPT_GC_MIN_FUNCTION_CALL_OUTPUT_TOKEN_QTY,
-            "skipping prompt_gc checkpoint until a function_call_output reports Token qty above threshold"
+            threshold_selectable_raw_bytes = PROMPT_GC_MIN_FINAL_ANSWER_SELECTABLE_RAW_BYTES,
+            "skipping prompt_gc checkpoint until a function_call_output reports Token qty above threshold or a final answer reaches the selectable burden fallback"
         );
         sidecar.lock().await.skip_cycle(&checkpoint.checkpoint_id);
         return;

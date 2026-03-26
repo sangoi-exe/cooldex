@@ -623,6 +623,319 @@ async fn prompt_gc_sidecar_skips_when_function_call_output_lacks_token_qty_witho
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_gc_sidecar_final_answer_reasoning_burden_triggers_without_function_call_output() {
+    let server = MockServer::start().await;
+    let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(StaticSseResponder {
+            calls: AtomicUsize::new(0),
+            response_body: sse(&[
+                response_created("resp-1"),
+                assistant_message_event(
+                    "msg-1",
+                    "{\"summaries\":[{\"chunk_id\":\"prompt_gc_chunk_0\",\"tool_context\":\"tool\",\"reasoning_context\":\"reasoning\"}]}",
+                ),
+                response_completed_with_usage("resp-1", 17),
+            ]),
+            headers: Vec::new(),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.model_info.context_window = Some(100_000);
+    turn_context_mut.model_info.effective_context_window_percent = 100;
+    {
+        let mut state = session.state.lock().await;
+        state.set_token_info(Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 12_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_000,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(100_000),
+        }));
+    }
+
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let observed_items = session
+        .record_into_history(
+            &[
+                prompt_gc_large_reasoning_unit("reasoning-1"),
+                prompt_gc_final_phase_message("phase-1"),
+            ],
+            &turn_context,
+        )
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
+    assert_eq!(status.last_error, None);
+    assert_eq!(status.blocked_reason, None);
+    session.flush_rollout().await;
+    let markers = prompt_gc_rollout_markers(&rollout_path).await;
+    assert!(!markers.is_empty());
+    assert_eq!(markers[0].kind, PromptGcOutcomeKind::Started);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_gc_sidecar_final_answer_below_fallback_threshold_still_skips_without_rollout_markers()
+ {
+    let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.model_info.context_window = Some(100_000);
+    turn_context_mut.model_info.effective_context_window_percent = 100;
+    {
+        let mut state = session.state.lock().await;
+        state.set_token_info(Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 90_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 90_000,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(100_000),
+        }));
+    }
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let observed_items = session
+        .record_into_history(
+            &[
+                ResponseItem::Reasoning {
+                    id: "reasoning-1".to_string(),
+                    summary: Vec::new(),
+                    content: None,
+                    encrypted_content: Some("x".repeat(200)),
+                },
+                prompt_gc_final_phase_message("phase-1"),
+            ],
+            &turn_context,
+        )
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, None);
+    assert_eq!(status.last_error, None);
+    assert_eq!(status.blocked_reason, None);
+    assert!(sidecar.lock().await.checkpoint(&checkpoint_id).is_none());
+    session.flush_rollout().await;
+    assert_eq!(prompt_gc_rollout_markers(&rollout_path).await, Vec::new());
+
+    let tool_calls = {
+        let active = session.active_turn.lock().await;
+        let active_turn = active.as_ref().expect("active turn");
+        active_turn.turn_state.lock().await.tool_calls
+    };
+    assert_eq!(tool_calls, 0);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_gc_sidecar_final_answer_tool_result_burden_triggers_without_function_call_output() {
+    let server = MockServer::start().await;
+    let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(StaticSseResponder {
+            calls: AtomicUsize::new(0),
+            response_body: sse(&[
+                response_created("resp-1"),
+                assistant_message_event(
+                    "msg-1",
+                    "{\"summaries\":[{\"chunk_id\":\"prompt_gc_chunk_0\",\"tool_context\":\"tool\",\"reasoning_context\":\"reasoning\"}]}",
+                ),
+                response_completed_with_usage("resp-1", 17),
+            ]),
+            headers: Vec::new(),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.model_info.context_window = Some(100_000);
+    turn_context_mut.model_info.effective_context_window_percent = 100;
+    {
+        let mut state = session.state.lock().await;
+        state.set_token_info(Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 12_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_000,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(100_000),
+        }));
+    }
+
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let observed_items = session
+        .record_into_history(
+            &[
+                ResponseItem::ImageGenerationCall {
+                    id: "ig_1".to_string(),
+                    status: "completed".to_string(),
+                    revised_prompt: Some("cat".to_string()),
+                    result: "x".repeat(2_000),
+                },
+                prompt_gc_final_phase_message("phase-1"),
+            ],
+            &turn_context,
+        )
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
+    assert_eq!(status.last_error, None);
+    assert_eq!(status.blocked_reason, None);
+    session.flush_rollout().await;
+    let markers = prompt_gc_rollout_markers(&rollout_path).await;
+    assert!(!markers.is_empty());
+    assert_eq!(markers[0].kind, PromptGcOutcomeKind::Started);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_gc_sidecar_final_answer_custom_tool_burden_triggers_without_function_call_output() {
+    let server = MockServer::start().await;
+    let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(StaticSseResponder {
+            calls: AtomicUsize::new(0),
+            response_body: sse(&[
+                response_created("resp-1"),
+                assistant_message_event(
+                    "msg-1",
+                    "{\"summaries\":[{\"chunk_id\":\"prompt_gc_chunk_0\",\"tool_context\":\"tool\",\"reasoning_context\":\"reasoning\"}]}",
+                ),
+                response_completed_with_usage("resp-1", 17),
+            ]),
+            headers: Vec::new(),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.model_info.context_window = Some(100_000);
+    turn_context_mut.model_info.effective_context_window_percent = 100;
+    {
+        let mut state = session.state.lock().await;
+        state.set_token_info(Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 12_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_000,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(100_000),
+        }));
+    }
+
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
+    let sidecar = install_prompt_gc_active_turn(&session, &turn_context).await;
+    let observed_items = session
+        .record_into_history(
+            &[
+                ResponseItem::CustomToolCall {
+                    id: None,
+                    call_id: "call-1".to_string(),
+                    name: "custom_tool".to_string(),
+                    input: "x".repeat(500),
+                    status: None,
+                },
+                ResponseItem::CustomToolCallOutput {
+                    call_id: "call-1".to_string(),
+                    name: Some("custom_tool".to_string()),
+                    output: FunctionCallOutputPayload::from_text("y".repeat(1_500)),
+                },
+                prompt_gc_final_phase_message("phase-1"),
+            ],
+            &turn_context,
+        )
+        .await;
+    sidecar.lock().await.observe_recorded_batch(&observed_items);
+    let parent_client_session = session.services.model_client.new_session();
+
+    run_prompt_gc_sidecar_if_needed(
+        &session,
+        &turn_context,
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &parent_client_session,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let status = sidecar.lock().await.status.clone();
+    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
+    assert_eq!(status.last_error, None);
+    assert_eq!(status.blocked_reason, None);
+    session.flush_rollout().await;
+    let markers = prompt_gc_rollout_markers(&rollout_path).await;
+    assert!(!markers.is_empty());
+    assert_eq!(markers[0].kind, PromptGcOutcomeKind::Started);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prompt_gc_sidecar_function_call_output_token_qty_over_200_triggers_below_global_context_pressure()
  {
     let server = MockServer::start().await;
@@ -2437,6 +2750,17 @@ fn prompt_gc_triggering_exec_command_items(
 }
 
 fn prompt_gc_phase_message(id: &str) -> ResponseItem {
+    prompt_gc_phase_message_with_phase(id, codex_protocol::models::MessagePhase::Commentary)
+}
+
+fn prompt_gc_final_phase_message(id: &str) -> ResponseItem {
+    prompt_gc_phase_message_with_phase(id, codex_protocol::models::MessagePhase::FinalAnswer)
+}
+
+fn prompt_gc_phase_message_with_phase(
+    id: &str,
+    phase: codex_protocol::models::MessagePhase,
+) -> ResponseItem {
     ResponseItem::Message {
         id: Some(id.to_string()),
         role: "assistant".to_string(),
@@ -2444,7 +2768,7 @@ fn prompt_gc_phase_message(id: &str) -> ResponseItem {
             text: "checkpoint".to_string(),
         }],
         end_turn: None,
-        phase: Some(codex_protocol::models::MessagePhase::Commentary),
+        phase: Some(phase),
     }
 }
 #[test]
