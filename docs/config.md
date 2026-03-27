@@ -30,6 +30,24 @@ When Codex knows which client started the turn, the legacy notify JSON payload a
 
 The generated JSON Schema for `config.toml` lives at `codex-rs/core/config.schema.json`.
 
+<!-- Merge-safety anchor: resume-history docs must stay aligned with the
+rollout-backed plain/app-server TUI replay contract and the default
+since-last-compaction truncation boundary. -->
+## Resume transcript rendering
+
+`[tui].resume_history` controls how much persisted transcript the TUI replays
+when you resume a stored session.
+
+- `since-last-compaction` (default): replay only the suffix starting at the
+  last surviving visible `Context compacted` marker.
+- `full`: replay the full reconstructed persisted transcript.
+
+This setting applies to resume bootstraps in both the plain TUI and the
+app-server-backed TUI. In the plain TUI, once reconstructed turns are
+available they define the resume boundary even if the surviving suffix is not
+currently renderable; Codex falls back to the legacy `initial_messages` replay
+path only when reconstructed turns could not be loaded.
+
 ## SQLite State DB
 
 Codex stores the SQLite-backed state DB under `sqlite_home` (config key) or the
