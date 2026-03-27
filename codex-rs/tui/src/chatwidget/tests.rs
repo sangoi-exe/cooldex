@@ -5110,6 +5110,62 @@ async fn commentary_completion_restores_status_indicator_before_exec_begin() {
 }
 
 #[tokio::test]
+async fn queued_follow_up_after_hidden_status_uses_full_viewport_vt100_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.show_welcome_banner = false;
+
+    chat.on_task_started();
+    chat.on_agent_message_delta("Visible commentary line\n".to_string());
+    chat.on_commit_tick();
+
+    let history_cells = drain_insert_history(&mut rx);
+    assert!(
+        !history_cells.is_empty(),
+        "expected committed commentary history"
+    );
+    assert!(!chat.bottom_pane.status_indicator_visible());
+
+    chat.bottom_pane.set_composer_text(
+        "queued after visible output".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    let width: u16 = 80;
+    let vt_height: u16 = 12;
+    let ui_height = chat.desired_height(width).min(vt_height);
+    let viewport = Rect::new(
+        0,
+        vt_height.saturating_sub(ui_height.saturating_add(1)),
+        width,
+        ui_height,
+    );
+
+    let backend = VT100Backend::new(width, vt_height);
+    let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+    term.set_viewport_area(viewport);
+
+    for lines in history_cells {
+        crate::insert_history::insert_history_lines(&mut term, lines)
+            .expect("Failed to insert history lines in test");
+    }
+
+    term.draw(|f| {
+        chat.render(f.area(), f.buffer_mut());
+    })
+    .expect("draw hidden-status queued follow-up snapshot");
+
+    assert_snapshot!(
+        "queued_follow_up_after_hidden_status_uses_full_viewport_vt100_snapshot",
+        term.backend().vt100().screen().contents()
+    );
+}
+
+#[tokio::test]
 async fn plan_completion_restores_status_indicator_after_streaming_plan_output() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.set_feature_enabled(Feature::CollaborationModes, true);

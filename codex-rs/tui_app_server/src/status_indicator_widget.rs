@@ -4,7 +4,8 @@
 //! context (for example, the unified-exec background-process summary). Keeping
 //! these pieces on one line avoids vertical layout churn in the bottom pane.
 // Merge-safety anchor: TUI app-server keeps the status row allocated across temporary hides so
-// commentary streaming does not reset elapsed timing or collapse the bottom-pane layout mid-turn.
+// commentary streaming does not reset elapsed timing mid-turn; hidden rows must stay off-layout by
+// reporting zero height and rendering no filler.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -241,19 +242,14 @@ impl StatusIndicatorWidget {
 
 impl Renderable for StatusIndicatorWidget {
     fn desired_height(&self, width: u16) -> u16 {
+        if !self.visible {
+            return 0;
+        }
         1 + u16::try_from(self.wrapped_details_lines(width).len()).unwrap_or(0)
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        if area.is_empty() {
-            return;
-        }
-
-        if !self.visible {
-            let blank_lines = (0..area.height)
-                .map(|_| Line::from(" ".repeat(usize::from(area.width))))
-                .collect::<Vec<_>>();
-            Paragraph::new(Text::from(blank_lines)).render_ref(area, buf);
+        if area.is_empty() || !self.visible {
             return;
         }
 
@@ -457,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_widget_preserves_height_but_renders_blank() {
+    fn hidden_widget_has_zero_height_and_renders_nothing() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
         let mut widget =
@@ -472,30 +468,24 @@ mod tests {
         let visible_height = widget.desired_height(width);
         widget.set_visible(false);
 
-        assert_eq!(widget.desired_height(width), visible_height);
+        assert_eq!(widget.desired_height(width), 0);
 
-        let mut terminal =
-            Terminal::new(TestBackend::new(width, visible_height)).expect("terminal");
-        terminal
-            .draw(|frame| widget.render(frame.area(), frame.buffer_mut()))
-            .expect("draw");
+        let area = Rect::new(0, 0, width, visible_height);
+        let mut buf = Buffer::empty(area);
+        for y in 0..visible_height {
+            for x in 0..width {
+                buf[(x, y)].set_symbol("x");
+            }
+        }
 
-        let backend = terminal.backend();
+        widget.render(area, &mut buf);
+
         for y in 0..visible_height {
             let mut row = String::new();
             for x in 0..width {
-                row.push(
-                    backend.buffer()[(x, y)]
-                        .symbol()
-                        .chars()
-                        .next()
-                        .unwrap_or(' '),
-                );
+                row.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
             }
-            assert!(
-                row.chars().all(|character| character == ' '),
-                "expected hidden status row to render blank spaces, got {row:?}"
-            );
+            assert_eq!(row, "x".repeat(usize::from(width)));
         }
     }
 }

@@ -2736,6 +2736,8 @@ impl App {
         (active_thread_id != primary_thread_id).then_some((active_thread_id, primary_thread_id))
     }
 
+    // Merge-safety anchor: app-server replay must restore pending input state before replayed
+    // turns/events, then only resume restored follow-ups after the snapshot catch-up is complete.
     fn replay_thread_snapshot(
         &mut self,
         snapshot: ThreadEventSnapshot,
