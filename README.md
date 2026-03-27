@@ -1,8 +1,8 @@
 # Cooldex
 
-Cooldex is my upstream-aligned Codex fork with a thin layer of local addons.
+Cooldex is an upstream-aligned Codex fork with a deliberately small local surface: richer resume history, tighter context recovery, and the operator/runtime tooling I actually use.
 
-The upstream Codex repository currently accepts external code contributions by invitation only, so this fork is where I keep the changes I actually want to run while still rebasing regularly on the official tree. The goal is not to replace upstream Codex or drift into a separate product line; it is to keep the official base intact and layer local behavior on top as clearly-scoped mods/addons.
+The upstream Codex repository currently accepts external code contributions by invitation only, so this fork is where I keep the changes I actually use while still rebasing regularly on the official tree. The goal is to stay close to upstream and layer a bounded local surface on top, not to turn Codex into a separate product line.
 
 ## Install This Fork Locally
 
@@ -19,18 +19,28 @@ This assumes a working Rust toolchain, pins `CARGO_TARGET_DIR` so the build outp
 
 The npm install path in the upstream README targets published `@openai/codex` artifacts. A plain Git-URL install of this fork is not documented here because the checked-out `codex-cli/` package does not ship the staged `vendor/` binaries that its Node launcher expects at runtime. If this fork ever gets its own staged or published npm artifacts, that install path can be documented separately.
 
-## Local Addons
+## What Changes Here
 
-- `manage_context`: stricter retrieve/apply cleanup flow, `/sanitize` integration, and replacement-history handling wired to the live runtime docs.
-- `recall`: args-less recall, compact/debug behavior, tighter rollout coupling, and fail-loud malformed-rollout handling.
-- `prompt_gc` / `PromptGcSidecar`: automatic prompt compaction for regular lead turns with hidden sidecar execution and rollout-backed hydration.
-- Resume transcript rendering: reconstructed resume history from persisted rollout turns, with optional truncation starting at the last surviving visible `Context compacted` marker.
-- `/accounts`: multi-account ChatGPT auth management across core storage, TUI flows, and app-server surfaces.
-- Sub-agent/runtime orchestration: local spawn/profile plumbing, background-agent handling, parallel tool execution, and collaboration/thread APIs beyond upstream.
-- TUI debugging/operator surfaces: `/debug`, raw-response inspection, context-window visibility, and other operator-facing diagnostics.
-- `mcp-standalone`: local bridge defaults for session cwd/config resolution, operator metadata plumbing, and runtime/auth expectations.
-- Legacy Landlock override: preserve the local `use_legacy_landlock = true` path until upstream ships a safe writable-`gitdir` alternative.
-- Workspace sync policy: keep the fork aligned with upstream while preserving local merge-safety invariants and removing `.github/**` from this workspace.
+These are the local clusters that materially change how this fork behaves.
+
+### History and context recovery
+
+- Resume transcript rendering: replays stored sessions from rollout-backed reconstructed turns, keeps the original visible tool/review/file-change history, and defaults to the suffix after the last surviving visible `Context compacted` marker.
+- `recall`: pulls pre-compaction assistant and reasoning context from the live rollout with prompt-GC-aware boundaries, so post-compact recovery stays deterministic instead of guessing from partial transcript remnants.
+- `prompt_gc` / `PromptGcSidecar`: compacts heavy lead turns through a hidden sidecar flow and persists the replacement history needed to shrink context without breaking later replay or recall.
+- `manage_context`: keeps manual retrieve/apply context surgery plus `/sanitize`, so curated context cleanup can be materialized, rolled back, and reapplied instead of living as ad hoc prompt edits.
+
+### Operator tooling and runtime
+
+- `/accounts`: turns ChatGPT auth into a real multi-account TUI workflow, so you can store, switch, and retire accounts instead of treating login as a single-slot state.
+- Sub-agent/runtime orchestration: adds local spawn/profile/background-agent plumbing, collaboration threads, and parallel tool execution, so multi-agent runs behave like a first-class workflow instead of an improvised overlay.
+- TUI debugging/custom operator surfaces: keeps `/debug`, raw-response inspection, and context-window diagnostics wired to the live event/cache path, so operator debugging runs against real runtime evidence.
+- `mcp-standalone`: adds the standalone bridge/runtime layer for local integrations, with explicit session cwd/config resolution and operator metadata instead of hidden cwd/config inheritance.
+
+### Maintenance and workspace policy
+
+- Legacy Landlock override: keeps `use_legacy_landlock = true` wired through the local Linux sandbox path, so Git metadata writes still work until upstream has a safe writable-`gitdir` replacement.
+- Workspace sync policy and local instruction overlays: keep the fork rebased on upstream while preserving the merge-safety inventory, manual conflict policy, and `.github/**` removal that define this workspace.
 
 ---
 
