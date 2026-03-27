@@ -832,9 +832,9 @@ pub(crate) struct ChatWidget {
     quit_shortcut_key: Option<KeyBinding>,
     // Simple review mode flag; used to adjust layout and banners.
     is_review_mode: bool,
-    #[cfg(test)]
     // Snapshot of token usage to restore after review mode exits.
     pre_review_token_info: Option<Option<TokenUsageInfo>>,
+    pre_review_task_running: Option<bool>,
     // Whether the next streamed assistant content should be preceded by a final message separator.
     //
     // This is set whenever we insert a visible history cell that conceptually belongs to a turn.
@@ -2689,7 +2689,6 @@ impl ChatWidget {
         Some(info.total_token_usage.tokens_in_context_window())
     }
 
-    #[cfg(test)]
     fn restore_pre_review_token_info(&mut self) {
         if let Some(saved) = self.pre_review_token_info.take() {
             match saved {
@@ -2700,6 +2699,12 @@ impl ChatWidget {
                     self.token_info = None;
                 }
             }
+        }
+    }
+
+    fn restore_pre_review_task_running(&mut self) {
+        if let Some(saved) = self.pre_review_task_running.take() {
+            self.bottom_pane.set_task_running(saved);
         }
     }
 
@@ -4709,8 +4714,8 @@ impl ChatWidget {
             quit_shortcut_expires_at: None,
             quit_shortcut_key: None,
             is_review_mode: false,
-            #[cfg(test)]
             pre_review_token_info: None,
+            pre_review_task_running: None,
             needs_final_message_separator: false,
             had_work_activity: false,
             saw_plan_update_this_turn: false,
@@ -6017,36 +6022,38 @@ impl ChatWidget {
                 exit_code,
                 duration_ms,
             } => {
+                let parsed_cmd: Vec<ParsedCommand> = command_actions
+                    .into_iter()
+                    .map(codex_app_server_protocol::CommandAction::into_core)
+                    .collect();
+                let source = source.to_core();
+                let command = vec![command];
+                let begin_event = ExecCommandBeginEvent {
+                    call_id: id.clone(),
+                    process_id: process_id.clone(),
+                    turn_id: turn_id.clone(),
+                    command: command.clone(),
+                    cwd: cwd.clone(),
+                    parsed_cmd: parsed_cmd.clone(),
+                    source,
+                    interaction_input: None,
+                };
                 if matches!(
                     status,
                     codex_app_server_protocol::CommandExecutionStatus::InProgress
                 ) {
-                    self.on_exec_command_begin(ExecCommandBeginEvent {
-                        call_id: id,
-                        process_id,
-                        turn_id: turn_id.clone(),
-                        command: vec![command],
-                        cwd,
-                        parsed_cmd: command_actions
-                            .into_iter()
-                            .map(codex_app_server_protocol::CommandAction::into_core)
-                            .collect(),
-                        source: source.to_core(),
-                        interaction_input: None,
-                    });
+                    self.handle_exec_begin_now(begin_event);
                 } else {
                     let aggregated_output = aggregated_output.unwrap_or_default();
-                    self.on_exec_command_end(ExecCommandEndEvent {
+                    self.handle_exec_begin_now(begin_event);
+                    self.handle_exec_end_now(ExecCommandEndEvent {
                         call_id: id,
                         process_id,
                         turn_id: turn_id.clone(),
-                        command: vec![command],
+                        command,
                         cwd,
-                        parsed_cmd: command_actions
-                            .into_iter()
-                            .map(codex_app_server_protocol::CommandAction::into_core)
-                            .collect(),
-                        source: source.to_core(),
+                        parsed_cmd,
+                        source,
                         interaction_input: None,
                         stdout: String::new(),
                         stderr: String::new(),
@@ -6071,27 +6078,40 @@ impl ChatWidget {
                             }
                         },
                     });
+                    self.flush_active_cell();
                 }
             }
+            // Merge-safety anchor: resumed app-server replay must synthesize the same visible
+            // command/file-change/review terminal surfaces as the plain TUI, including completed
+            // unified-exec rows, declined patch failures, and the review-finish banner/token
+            // restoration path.
             ThreadItem::FileChange {
                 id,
                 changes,
                 status,
             } => {
+                let core_changes = app_server_patch_changes_to_core(changes);
+                self.on_patch_apply_begin(PatchApplyBeginEvent {
+                    call_id: id.clone(),
+                    turn_id: turn_id.clone(),
+                    auto_approved: false,
+                    changes: core_changes.clone(),
+                });
                 if !matches!(
                     status,
                     codex_app_server_protocol::PatchApplyStatus::InProgress
+                        | codex_app_server_protocol::PatchApplyStatus::Completed
                 ) {
                     self.on_patch_apply_end(codex_protocol::protocol::PatchApplyEndEvent {
                         call_id: id,
                         turn_id: turn_id.clone(),
                         stdout: String::new(),
                         stderr: String::new(),
-                        success: !matches!(
+                        success: matches!(
                             status,
-                            codex_app_server_protocol::PatchApplyStatus::Failed
+                            codex_app_server_protocol::PatchApplyStatus::Completed
                         ),
-                        changes: app_server_patch_changes_to_core(changes),
+                        changes: core_changes,
                         status: match status {
                             codex_app_server_protocol::PatchApplyStatus::Completed => {
                                 codex_protocol::protocol::PatchApplyStatus::Completed
@@ -6140,16 +6160,18 @@ impl ChatWidget {
                 });
             }
             ThreadItem::WebSearch { id, query, action } => {
-                self.on_web_search_begin(WebSearchBeginEvent {
-                    call_id: id.clone(),
-                });
-                self.on_web_search_end(WebSearchEndEvent {
-                    call_id: id,
-                    query,
-                    action: action
-                        .map(web_search_action_to_core)
-                        .unwrap_or(codex_protocol::models::WebSearchAction::Other),
-                });
+                if Self::web_search_renders_on_resume(&query, &action) {
+                    self.on_web_search_begin(WebSearchBeginEvent {
+                        call_id: id.clone(),
+                    });
+                    self.on_web_search_end(WebSearchEndEvent {
+                        call_id: id,
+                        query,
+                        action: action
+                            .map(web_search_action_to_core)
+                            .unwrap_or(codex_protocol::models::WebSearchAction::Other),
+                    });
+                }
             }
             ThreadItem::ImageView { id, path } => {
                 self.on_view_image_tool_call(ViewImageToolCallEvent {
@@ -6164,26 +6186,35 @@ impl ChatWidget {
                 result,
                 saved_path,
             } => {
-                self.on_image_generation_end(ImageGenerationEndEvent {
-                    call_id: id,
-                    result,
-                    revised_prompt,
-                    status,
-                    saved_path,
-                });
+                if Self::image_generation_renders_on_resume(
+                    &status,
+                    &revised_prompt,
+                    &result,
+                    &saved_path,
+                ) {
+                    self.on_image_generation_end(ImageGenerationEndEvent {
+                        call_id: id,
+                        result,
+                        revised_prompt,
+                        status,
+                        saved_path,
+                    });
+                }
             }
             ThreadItem::EnteredReviewMode { review, .. } => {
-                self.add_to_history(history_cell::new_review_status_line(format!(
-                    ">> Code review started: {review} <<"
-                )));
-                if !self.bottom_pane.is_task_running() {
-                    self.bottom_pane.set_task_running(/*running*/ true);
-                }
-                self.is_review_mode = true;
+                self.on_entered_review_mode(
+                    ReviewRequest {
+                        target: ReviewTarget::Custom {
+                            instructions: review.clone(),
+                        },
+                        user_facing_hint: Some(review),
+                    },
+                    /*from_replay*/ true,
+                );
             }
             ThreadItem::ExitedReviewMode { review, .. } => {
                 self.on_agent_message(review);
-                self.is_review_mode = false;
+                self.finish_review_mode();
             }
             ThreadItem::ContextCompaction { .. } => {
                 self.on_agent_message("Context compacted".to_owned());
@@ -6679,12 +6710,15 @@ impl ChatWidget {
                 agents_states,
                 wait_state,
             }),
-            ThreadItem::EnteredReviewMode { review, .. } => {
-                self.add_to_history(history_cell::new_review_status_line(format!(
-                    ">> Code review started: {review} <<"
-                )));
-                self.is_review_mode = true;
-            }
+            ThreadItem::EnteredReviewMode { review, .. } => self.on_entered_review_mode(
+                ReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: review.clone(),
+                    },
+                    user_facing_hint: Some(review),
+                },
+                /*from_replay*/ false,
+            ),
             _ => {}
         }
     }
@@ -6694,11 +6728,141 @@ impl ChatWidget {
         notification: ItemCompletedNotification,
         replay_kind: Option<ReplayKind>,
     ) {
-        self.handle_thread_item(
-            notification.item,
-            notification.turn_id,
-            replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
-        );
+        let ItemCompletedNotification { turn_id, item, .. } = notification;
+        let Some(replay_kind) = replay_kind else {
+            match item {
+                ThreadItem::CommandExecution {
+                    id,
+                    command,
+                    cwd,
+                    process_id,
+                    source,
+                    status,
+                    command_actions,
+                    aggregated_output,
+                    exit_code,
+                    duration_ms,
+                } => {
+                    if matches!(
+                        status,
+                        codex_app_server_protocol::CommandExecutionStatus::InProgress
+                    ) {
+                        return;
+                    }
+                    let aggregated_output = aggregated_output.unwrap_or_default();
+                    self.on_exec_command_end(ExecCommandEndEvent {
+                        call_id: id,
+                        process_id,
+                        turn_id,
+                        command: vec![command],
+                        cwd,
+                        parsed_cmd: command_actions
+                            .into_iter()
+                            .map(codex_app_server_protocol::CommandAction::into_core)
+                            .collect(),
+                        source: source.to_core(),
+                        interaction_input: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        aggregated_output: aggregated_output.clone(),
+                        exit_code: exit_code.unwrap_or_default(),
+                        duration: Duration::from_millis(
+                            duration_ms.unwrap_or_default().max(0) as u64
+                        ),
+                        formatted_output: aggregated_output,
+                        status: match status {
+                            codex_app_server_protocol::CommandExecutionStatus::Completed => {
+                                codex_protocol::protocol::ExecCommandStatus::Completed
+                            }
+                            codex_app_server_protocol::CommandExecutionStatus::Failed => {
+                                codex_protocol::protocol::ExecCommandStatus::Failed
+                            }
+                            codex_app_server_protocol::CommandExecutionStatus::Declined => {
+                                codex_protocol::protocol::ExecCommandStatus::Declined
+                            }
+                            codex_app_server_protocol::CommandExecutionStatus::InProgress => {
+                                unreachable!("live completed notifications must not be in progress")
+                            }
+                        },
+                    });
+                }
+                ThreadItem::FileChange {
+                    id,
+                    changes,
+                    status,
+                } => {
+                    if matches!(
+                        status,
+                        codex_app_server_protocol::PatchApplyStatus::Failed
+                            | codex_app_server_protocol::PatchApplyStatus::Declined
+                    ) {
+                        self.on_patch_apply_end(codex_protocol::protocol::PatchApplyEndEvent {
+                            call_id: id,
+                            turn_id,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            success: false,
+                            changes: app_server_patch_changes_to_core(changes),
+                            status: match status {
+                                codex_app_server_protocol::PatchApplyStatus::Failed => {
+                                    codex_protocol::protocol::PatchApplyStatus::Failed
+                                }
+                                codex_app_server_protocol::PatchApplyStatus::Declined => {
+                                    codex_protocol::protocol::PatchApplyStatus::Declined
+                                }
+                                codex_app_server_protocol::PatchApplyStatus::Completed
+                                | codex_app_server_protocol::PatchApplyStatus::InProgress => {
+                                    unreachable!(
+                                        "live failed patch completions must be failed or declined"
+                                    )
+                                }
+                            },
+                        });
+                    }
+                }
+                ThreadItem::WebSearch { id, query, action } => {
+                    if Self::web_search_renders_on_resume(&query, &action) {
+                        self.on_web_search_end(WebSearchEndEvent {
+                            call_id: id,
+                            query,
+                            action: action
+                                .map(web_search_action_to_core)
+                                .unwrap_or(codex_protocol::models::WebSearchAction::Other),
+                        });
+                    }
+                }
+                ThreadItem::ImageGeneration {
+                    id,
+                    status,
+                    revised_prompt,
+                    result,
+                    saved_path,
+                } => {
+                    if Self::image_generation_renders_on_resume(
+                        &status,
+                        &revised_prompt,
+                        &result,
+                        &saved_path,
+                    ) {
+                        self.on_image_generation_end(ImageGenerationEndEvent {
+                            call_id: id,
+                            result,
+                            revised_prompt,
+                            status,
+                            saved_path,
+                        });
+                    }
+                }
+                ThreadItem::EnteredReviewMode { .. } => {}
+                ThreadItem::ExitedReviewMode { review, .. } => {
+                    self.on_agent_message(review);
+                    self.finish_review_mode();
+                }
+                other => self.handle_thread_item(other, turn_id, ThreadItemRenderSource::Live),
+            }
+            return;
+        };
+        self.handle_thread_item(item, turn_id, ThreadItemRenderSource::Replay(replay_kind));
     }
 
     fn on_patch_apply_output_delta(&mut self, _item_id: String, _delta: String) {}
@@ -6910,7 +7074,10 @@ impl ChatWidget {
             EventMsg::ExecCommandOutputDelta(delta) => self.on_exec_command_output_delta(delta),
             EventMsg::PatchApplyBegin(ev) => self.on_patch_apply_begin(ev),
             EventMsg::PatchApplyEnd(ev) => self.on_patch_apply_end(ev),
+            #[cfg(test)]
             EventMsg::ExecCommandEnd(ev) => self.on_exec_command_end(ev),
+            #[cfg(not(test))]
+            EventMsg::ExecCommandEnd(ev) => self.handle_exec_end_now(ev),
             EventMsg::ViewImageToolCall(ev) => self.on_view_image_tool_call(ev),
             EventMsg::ImageGenerationBegin(ev) => self.on_image_generation_begin(ev),
             EventMsg::ImageGenerationEnd(ev) => self.on_image_generation_end(ev),
@@ -6957,7 +7124,18 @@ impl ChatWidget {
             EventMsg::EnteredReviewMode(review_request) => {
                 self.on_entered_review_mode(review_request, from_replay)
             }
+            #[cfg(test)]
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
+            #[cfg(not(test))]
+            EventMsg::ExitedReviewMode(review) => {
+                let review_message = review
+                    .review_output
+                    .map(|output| output.overall_explanation.trim().to_string())
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| "Reviewer failed to output a response.".to_string());
+                self.on_agent_message(review_message);
+                self.finish_review_mode();
+            }
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
             EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent { .. }) => {}
             // Merge-safety anchor: the TUI app-server widget must render spawn rows from the
@@ -7033,14 +7211,15 @@ impl ChatWidget {
         }
     }
 
-    #[cfg(test)]
     fn on_entered_review_mode(&mut self, review: ReviewRequest, from_replay: bool) {
         // Enter review mode and emit a concise banner
+        let was_task_running = self.bottom_pane.is_task_running();
         if self.pre_review_token_info.is_none() {
             self.pre_review_token_info = Some(self.token_info.clone());
+            self.pre_review_task_running = Some(was_task_running);
         }
         // Avoid toggling running state for replayed history events on resume.
-        if !from_replay && !self.bottom_pane.is_task_running() {
+        if !from_replay && !was_task_running {
             self.bottom_pane.set_task_running(/*running*/ true);
         }
         self.is_review_mode = true;
@@ -7084,13 +7263,33 @@ impl ChatWidget {
             // Final message is rendered as part of the AgentMessage.
         }
 
+        self.finish_review_mode();
+    }
+
+    fn finish_review_mode(&mut self) {
         self.is_review_mode = false;
         self.restore_pre_review_token_info();
-        // Append a finishing banner at the end of this turn.
+        self.restore_pre_review_task_running();
         self.add_to_history(history_cell::new_review_status_line(
             "<< Code review finished >>".to_string(),
         ));
         self.request_redraw();
+    }
+
+    fn web_search_renders_on_resume(
+        query: &str,
+        action: &Option<codex_app_server_protocol::WebSearchAction>,
+    ) -> bool {
+        action.is_some() || !query.is_empty()
+    }
+
+    fn image_generation_renders_on_resume(
+        status: &str,
+        revised_prompt: &Option<String>,
+        result: &str,
+        saved_path: &Option<String>,
+    ) -> bool {
+        !status.is_empty() || revised_prompt.is_some() || !result.is_empty() || saved_path.is_some()
     }
 
     fn on_user_message_event(&mut self, event: UserMessageEvent) {
@@ -7184,6 +7383,25 @@ impl ChatWidget {
             self.submit_user_message(user_message);
         }
         // Update the list to reflect the remaining queued messages (if any).
+        self.refresh_pending_input_preview();
+    }
+
+    pub(crate) fn maybe_send_restored_follow_up(&mut self) {
+        if self.suppress_queue_autosend || self.bottom_pane.is_task_running() {
+            return;
+        }
+        if self.queued_user_messages.front().is_some() {
+            self.maybe_send_next_queued_input();
+            return;
+        }
+        let pending_steers: Vec<UserMessage> = self
+            .pending_steers
+            .drain(..)
+            .map(|pending| pending.user_message)
+            .collect();
+        if !pending_steers.is_empty() {
+            self.submit_user_message(merge_user_messages(pending_steers));
+        }
         self.refresh_pending_input_preview();
     }
 

@@ -17,6 +17,7 @@ use crate::config::types::OtelConfig;
 use crate::config::types::OtelConfigToml;
 use crate::config::types::OtelExporterKind;
 use crate::config::types::PluginConfig;
+use crate::config::types::ResumeHistoryMode;
 use crate::config::types::SandboxWorkspaceWrite;
 use crate::config::types::ShellEnvironmentPolicy;
 use crate::config::types::ShellEnvironmentPolicyToml;
@@ -384,6 +385,9 @@ pub struct Config {
 
     /// Syntax highlighting theme override (kebab-case name).
     pub tui_theme: Option<String>,
+
+    /// Controls how much history the TUI renders when resuming stored sessions.
+    pub tui_resume_history: ResumeHistoryMode,
 
     /// The directory that should be treated as the current working directory
     /// for the session. All relative paths inside the business-logic layer are
@@ -3038,6 +3042,14 @@ impl Config {
             tui_status_line: cfg.tui.as_ref().and_then(|t| t.status_line.clone()),
             tui_terminal_title: cfg.tui.as_ref().and_then(|t| t.terminal_title.clone()),
             tui_theme: cfg.tui.as_ref().and_then(|t| t.theme.clone()),
+            // Merge-safety anchor: runtime projection of `[tui].resume_history`
+            // must stay aligned with the persisted config/schema/docs contract
+            // that defaults resume replay to the last surviving compaction.
+            tui_resume_history: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.resume_history)
+                .unwrap_or_default(),
             otel: {
                 let t: OtelConfigToml = cfg.otel.unwrap_or_default();
                 let log_user_prompt = t.log_user_prompt.unwrap_or(false);
@@ -3214,6 +3226,7 @@ mod tests;
 mod notifications_tests {
     use crate::config::types::NotificationMethod;
     use crate::config::types::Notifications;
+    use crate::config::types::ResumeHistoryMode;
     use assert_matches::assert_matches;
     use serde::Deserialize;
 
@@ -3223,6 +3236,8 @@ mod notifications_tests {
         notifications: Notifications,
         #[serde(default)]
         notification_method: NotificationMethod,
+        #[serde(default)]
+        resume_history: ResumeHistoryMode,
     }
 
     #[derive(Deserialize, Debug, PartialEq)]
@@ -3263,5 +3278,28 @@ mod notifications_tests {
         let parsed: RootTomlTest =
             toml::from_str(toml).expect("deserialize notification_method=\"bel\"");
         assert_eq!(parsed.tui.notification_method, NotificationMethod::Bel);
+    }
+
+    #[test]
+    fn test_tui_resume_history_mode() {
+        let toml = r#"
+            [tui]
+            resume_history = "full"
+        "#;
+        let parsed: RootTomlTest =
+            toml::from_str(toml).expect("deserialize resume_history=\"full\"");
+        assert_eq!(parsed.tui.resume_history, ResumeHistoryMode::Full);
+    }
+
+    #[test]
+    fn test_tui_resume_history_mode_defaults_to_since_last_compaction() {
+        let toml = r#"
+            [tui]
+        "#;
+        let parsed: RootTomlTest = toml::from_str(toml).expect("deserialize empty tui block");
+        assert_eq!(
+            parsed.tui.resume_history,
+            ResumeHistoryMode::SinceLastCompaction
+        );
     }
 }

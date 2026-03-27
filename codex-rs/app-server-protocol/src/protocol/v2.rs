@@ -4654,7 +4654,7 @@ impl From<CoreCollabWaitReturnWhen> for CollabWaitReturnWhen {
     }
 }
 
-#[derive(Serialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema, TS)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, Default, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct CollabWaitState {
@@ -4666,8 +4666,20 @@ pub struct CollabWaitState {
     pub condition_enabled: bool,
     /// Null until the wait call finishes.
     #[serde(default)]
-    #[schemars(required, schema_with = "required_nullable_bool_schema")]
     pub timed_out: Option<bool>,
+}
+
+#[derive(JsonSchema)]
+#[schemars(rename = "CollabWaitState")]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct CollabWaitStateSchema {
+    return_when: CollabWaitReturnWhen,
+    disable_timeout: bool,
+    condition_enabled: bool,
+    /// Null until the wait call finishes.
+    #[schemars(required, schema_with = "required_nullable_bool_schema")]
+    timed_out: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -4718,7 +4730,7 @@ impl From<CoreCollabWaitState> for CollabWaitState {
 }
 
 fn required_nullable_collab_wait_state_schema(schema_gen: &mut SchemaGenerator) -> Schema {
-    schema_gen.subschema_for::<Option<CollabWaitState>>()
+    schema_gen.subschema_for::<Option<CollabWaitStateSchema>>()
 }
 
 fn required_nullable_bool_schema(schema_gen: &mut SchemaGenerator) -> Schema {

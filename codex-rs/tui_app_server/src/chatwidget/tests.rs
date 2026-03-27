@@ -3,6 +3,9 @@
 //! These tests treat the widget as the adapter between `codex_protocol::protocol::EventMsg` inputs and
 //! the TUI output. Many assertions are snapshot-based so that layout regressions and status/header
 //! changes show up as stable, reviewable diffs.
+// Merge-safety anchor: resume-history replay tests here must stay aligned with
+// the app-server TUI replay contract for visible file-change and fallback
+// surfaces.
 
 use super::*;
 use crate::app_event::AppEvent;
@@ -1632,6 +1635,7 @@ async fn review_restores_context_window_indicator() {
         }),
     });
     assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert!(!chat.bottom_pane.is_task_running());
 
     chat.handle_codex_event(Event {
         id: "review-start".into(),
@@ -1642,6 +1646,7 @@ async fn review_restores_context_window_indicator() {
             user_facing_hint: Some("feature branch".to_string()),
         }),
     });
+    assert!(chat.bottom_pane.is_task_running());
 
     chat.handle_codex_event(Event {
         id: "token-review".into(),
@@ -1661,6 +1666,7 @@ async fn review_restores_context_window_indicator() {
     let _ = drain_insert_history(&mut rx);
 
     assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert!(!chat.bottom_pane.is_task_running());
     assert!(!chat.is_review_mode);
 }
 
@@ -1944,6 +1950,7 @@ async fn make_chatwidget_manual(
         quit_shortcut_key: None,
         is_review_mode: false,
         pre_review_token_info: None,
+        pre_review_task_running: None,
         needs_final_message_separator: false,
         had_work_activity: false,
         saw_plan_update_this_turn: false,
@@ -4315,6 +4322,255 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
 
     assert!(!chat.bottom_pane.is_task_running());
     assert!(chat.bottom_pane.status_widget().is_none());
+}
+
+#[tokio::test]
+async fn live_app_server_completed_unified_exec_uses_completion_path_without_replaying_begin() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_server_notification(
+        ServerNotification::TurnStarted(TurnStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: AppServerTurn {
+                id: "turn-1".to_string(),
+                items: Vec::new(),
+                status: AppServerTurnStatus::InProgress,
+                error: None,
+            },
+        }),
+        None,
+    );
+
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::CommandExecution {
+                id: "cmd-1".to_string(),
+                command: "cat README.md".to_string(),
+                cwd: PathBuf::from("/home/user/project"),
+                process_id: Some("proc-1".to_string()),
+                source: codex_app_server_protocol::CommandExecutionSource::UnifiedExecStartup,
+                status: codex_app_server_protocol::CommandExecutionStatus::InProgress,
+                command_actions: Vec::new(),
+                aggregated_output: None,
+                exit_code: None,
+                duration_ms: None,
+            },
+        }),
+        None,
+    );
+
+    assert_eq!(chat.unified_exec_processes.len(), 1);
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::CommandExecution {
+                id: "cmd-1".to_string(),
+                command: "cat README.md".to_string(),
+                cwd: PathBuf::from("/home/user/project"),
+                process_id: Some("proc-1".to_string()),
+                source: codex_app_server_protocol::CommandExecutionSource::UnifiedExecStartup,
+                status: codex_app_server_protocol::CommandExecutionStatus::Completed,
+                command_actions: Vec::new(),
+                aggregated_output: Some("done".to_string()),
+                exit_code: Some(0),
+                duration_ms: Some(5),
+            },
+        }),
+        None,
+    );
+
+    let inserted = drain_insert_history(&mut rx);
+    assert_eq!(chat.unified_exec_processes.len(), 0);
+    assert_eq!(inserted.len(), 1);
+    assert!(lines_to_single_string(&inserted[0]).contains("cat README.md"));
+}
+
+#[tokio::test]
+async fn live_app_server_completed_file_change_does_not_duplicate_started_patch_row() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let item = AppServerThreadItem::FileChange {
+        id: "patch-1".to_string(),
+        changes: vec![FileUpdateChange {
+            path: "foo.txt".to_string(),
+            kind: PatchChangeKind::Add,
+            diff: "hello\n".to_string(),
+        }],
+        status: AppServerPatchApplyStatus::InProgress,
+    };
+
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item,
+        }),
+        None,
+    );
+
+    let started = drain_insert_history(&mut rx);
+    assert_eq!(started.len(), 1);
+    assert!(lines_to_single_string(&started[0]).contains("foo.txt"));
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::FileChange {
+                id: "patch-1".to_string(),
+                changes: vec![FileUpdateChange {
+                    path: "foo.txt".to_string(),
+                    kind: PatchChangeKind::Add,
+                    diff: "hello\n".to_string(),
+                }],
+                status: AppServerPatchApplyStatus::Completed,
+            },
+        }),
+        None,
+    );
+
+    assert!(drain_insert_history(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn live_app_server_completed_review_start_does_not_duplicate_started_banner() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let item = AppServerThreadItem::EnteredReviewMode {
+        id: "review-1".to_string(),
+        review: "feature branch".to_string(),
+    };
+
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: item.clone(),
+        }),
+        None,
+    );
+
+    let started = drain_insert_history(&mut rx);
+    assert_eq!(started.len(), 1);
+    assert!(lines_to_single_string(&started[0]).contains("Code review started"));
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item,
+        }),
+        None,
+    );
+
+    assert!(drain_insert_history(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn live_app_server_review_notifications_restore_pre_review_context_and_running_state() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    let context_window = 13_000;
+    let pre_review_tokens = 12_700;
+    let review_tokens = 12_030;
+
+    chat.handle_codex_event(Event {
+        id: "token-before".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(make_token_info(pre_review_tokens, context_window)),
+            rate_limits: None,
+        }),
+    });
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert!(!chat.bottom_pane.is_task_running());
+
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::EnteredReviewMode {
+                id: "review-1".to_string(),
+                review: "feature branch".to_string(),
+            },
+        }),
+        None,
+    );
+
+    let started = drain_insert_history(&mut rx);
+    assert_eq!(started.len(), 1);
+    assert!(lines_to_single_string(&started[0]).contains("Code review started"));
+    assert!(chat.is_review_mode);
+    assert!(chat.bottom_pane.is_task_running());
+
+    chat.handle_codex_event(Event {
+        id: "token-review".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(make_token_info(review_tokens, context_window)),
+            rate_limits: None,
+        }),
+    });
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(97));
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::ExitedReviewMode {
+                id: "review-end".to_string(),
+                review: "Final review summary".to_string(),
+            },
+        }),
+        None,
+    );
+
+    let completed = drain_insert_history(&mut rx);
+    assert_eq!(completed.len(), 2);
+    assert!(lines_to_single_string(&completed[0]).contains("Final review summary"));
+    assert!(lines_to_single_string(&completed[1]).contains("Code review finished"));
+    assert!(!chat.is_review_mode);
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert!(!chat.bottom_pane.is_task_running());
+}
+
+#[tokio::test]
+async fn live_app_server_review_notifications_preserve_existing_running_state() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.bottom_pane.set_task_running(/*running*/ true);
+
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::EnteredReviewMode {
+                id: "review-1".to_string(),
+                review: "feature branch".to_string(),
+            },
+        }),
+        None,
+    );
+
+    let started = drain_insert_history(&mut rx);
+    assert_eq!(started.len(), 1);
+    assert!(chat.bottom_pane.is_task_running());
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::ExitedReviewMode {
+                id: "review-end".to_string(),
+                review: "Final review summary".to_string(),
+            },
+        }),
+        None,
+    );
+
+    let completed = drain_insert_history(&mut rx);
+    assert_eq!(completed.len(), 2);
+    assert!(chat.bottom_pane.is_task_running());
 }
 
 #[tokio::test]
@@ -12005,6 +12261,145 @@ async fn replayed_in_progress_turn_marks_task_running() {
         .status_widget()
         .expect("status indicator should be visible");
     assert_eq!(status.header(), "Working");
+}
+
+#[tokio::test]
+async fn replayed_completed_unified_exec_surfaces_history_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.replay_thread_turns(
+        vec![AppServerTurn {
+            id: "turn-1".to_string(),
+            items: vec![AppServerThreadItem::CommandExecution {
+                id: "cmd-1".to_string(),
+                command: "cat codex-rs/tui_app_server/src/chatwidget.rs".to_string(),
+                cwd: PathBuf::from("/home/user/project"),
+                process_id: Some("proc-1".to_string()),
+                source: codex_app_server_protocol::CommandExecutionSource::UnifiedExecStartup,
+                status: codex_app_server_protocol::CommandExecutionStatus::Completed,
+                command_actions: vec![codex_app_server_protocol::CommandAction::Read {
+                    command: "cat codex-rs/tui_app_server/src/chatwidget.rs".to_string(),
+                    name: "chatwidget.rs".to_string(),
+                    path: PathBuf::from("codex-rs/tui_app_server/src/chatwidget.rs"),
+                }],
+                aggregated_output: Some("rendered contents".to_string()),
+                exit_code: Some(0),
+                duration_ms: Some(12),
+            }],
+            status: AppServerTurnStatus::Completed,
+            error: None,
+        }],
+        ReplayKind::ResumeInitialMessages,
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_snapshot!("replayed_completed_unified_exec_history", rendered);
+}
+
+#[tokio::test]
+async fn replayed_review_finish_banner_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.replay_thread_turns(
+        vec![AppServerTurn {
+            id: "turn-1".to_string(),
+            items: vec![
+                AppServerThreadItem::EnteredReviewMode {
+                    id: "review-start".to_string(),
+                    review: "Audit this diff".to_string(),
+                },
+                AppServerThreadItem::ExitedReviewMode {
+                    id: "review-end".to_string(),
+                    review: "Final review summary".to_string(),
+                },
+            ],
+            status: AppServerTurnStatus::Completed,
+            error: None,
+        }],
+        ReplayKind::ResumeInitialMessages,
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_snapshot!("replayed_review_finish_banner", rendered);
+    assert!(chat.pre_review_task_running.is_none());
+}
+
+#[tokio::test]
+async fn replayed_begin_only_web_and_image_rows_stay_hidden() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.replay_thread_turns(
+        vec![AppServerTurn {
+            id: "turn-1".to_string(),
+            items: vec![
+                AppServerThreadItem::WebSearch {
+                    id: "search-1".to_string(),
+                    query: String::new(),
+                    action: None,
+                },
+                AppServerThreadItem::ImageGeneration {
+                    id: "image-1".to_string(),
+                    status: String::new(),
+                    revised_prompt: None,
+                    result: String::new(),
+                    saved_path: None,
+                },
+            ],
+            status: AppServerTurnStatus::Completed,
+            error: None,
+        }],
+        ReplayKind::ResumeInitialMessages,
+    );
+
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "expected begin-only web/image replay rows to stay hidden"
+    );
+}
+
+#[tokio::test]
+async fn replayed_declined_file_change_surfaces_failure() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.replay_thread_turns(
+        vec![AppServerTurn {
+            id: "turn-1".to_string(),
+            items: vec![AppServerThreadItem::FileChange {
+                id: "patch-1".to_string(),
+                changes: vec![FileUpdateChange {
+                    path: "foo.txt".to_string(),
+                    kind: PatchChangeKind::Add,
+                    diff: "hello from resume\n".to_string(),
+                }],
+                status: AppServerPatchApplyStatus::Declined,
+            }],
+            status: AppServerTurnStatus::Completed,
+            error: None,
+        }],
+        ReplayKind::ResumeInitialMessages,
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_snapshot!("replayed_declined_file_change_failure", rendered);
+    assert!(
+        rendered.contains("Failed to apply patch"),
+        "expected replayed declined file-change to surface failure, got {rendered:?}"
+    );
 }
 
 #[tokio::test]

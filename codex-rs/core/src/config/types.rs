@@ -701,6 +701,14 @@ impl fmt::Display for NotificationMethod {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResumeHistoryMode {
+    Full,
+    #[default]
+    SinceLastCompaction,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ModelAvailabilityNuxConfig {
@@ -765,6 +773,17 @@ pub struct Tui {
     /// Use `/theme` in the TUI or see `$CODEX_HOME/themes` for custom themes.
     #[serde(default)]
     pub theme: Option<String>,
+
+    // Merge-safety anchor: resume-history mode is a workspace-local persisted
+    // contract; plain/app-server TUI resume plus docs/schema must stay aligned
+    // on default truncation at the last surviving visible compaction marker.
+    /// Controls how much history the TUI renders when resuming a stored session.
+    ///
+    /// - `since-last-compaction` (default): render only the suffix starting at the
+    ///   last surviving visible `Context compacted` marker.
+    /// - `full`: render the entire reconstructed persisted transcript.
+    #[serde(default)]
+    pub resume_history: ResumeHistoryMode,
 
     /// Startup tooltip availability NUX state persisted by the TUI.
     #[serde(default)]

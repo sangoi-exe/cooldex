@@ -1463,6 +1463,13 @@
         }
       ]
     },
+    "ResumeHistoryMode": {
+      "enum": [
+        "full",
+        "since-last-compaction"
+      ],
+      "type": "string"
+    },
     "SandboxMode": {
       "enum": [
         "read-only",
@@ -1702,6 +1709,15 @@
           ],
           "default": true,
           "description": "Enable desktop notifications from the TUI when the terminal is unfocused. Defaults to `true`."
+        },
+        "resume_history": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ResumeHistoryMode"
+            }
+          ],
+          "default": "since-last-compaction",
+          "description": "Controls how much history the TUI renders when resuming a stored session.\n\n- `since-last-compaction` (default): render only the suffix starting at the last surviving visible `Context compacted` marker. - `full`: render the entire reconstructed persisted transcript."
         },
         "show_tooltips": {
           "default": true,

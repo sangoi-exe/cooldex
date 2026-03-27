@@ -20,7 +20,16 @@ use crate::protocol::v2::TurnStatus;
 use crate::protocol::v2::UserInput;
 use crate::protocol::v2::WebSearchAction;
 use codex_protocol::items::parse_hook_prompt_message;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::LocalShellAction;
+use codex_protocol::models::LocalShellStatus;
 use codex_protocol::models::MessagePhase;
+use codex_protocol::models::ReasoningItemContent;
+use codex_protocol::models::ReasoningItemReasoningSummary;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::models::ShellCommandToolCallParams;
+use codex_protocol::models::ShellToolCallParams;
 use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::AgentReasoningRawContentEvent;
 use codex_protocol::protocol::AgentStatus;
@@ -50,7 +59,9 @@ use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::ViewImageToolCallEvent;
 use codex_protocol::protocol::WebSearchBeginEvent;
 use codex_protocol::protocol::WebSearchEndEvent;
+use codex_shell_command::parse_command::parse_command;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -71,8 +82,144 @@ pub fn build_turns_from_rollout_items(items: &[RolloutItem]) -> Vec<Turn> {
     builder.finish()
 }
 
+// Merge-safety anchor: resume truncation must use the last surviving visible
+// `ContextCompaction` item after rollback-aware turn reconstruction, not the
+// raw rollout order, or resumed transcripts drift from the history the runtime
+// already kept alive.
+pub fn truncate_turns_since_last_context_compaction(turns: Vec<Turn>) -> Vec<Turn> {
+    let Some((turn_index, item_index)) =
+        turns
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(turn_index, turn)| {
+                turn.items
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(item_index, item)| {
+                        matches!(item, ThreadItem::ContextCompaction { .. })
+                            .then_some((turn_index, item_index))
+                    })
+            })
+    else {
+        return turns;
+    };
+
+    turns
+        .into_iter()
+        .enumerate()
+        .filter_map(|(current_turn_index, mut turn)| {
+            if current_turn_index < turn_index {
+                return None;
+            }
+            if current_turn_index == turn_index {
+                turn.items = turn.items.into_iter().skip(item_index).collect();
+            }
+            Some(turn)
+        })
+        .collect()
+}
+
 fn is_prompt_gc_compaction_marker(compacted: &CompactedItem) -> bool {
     compacted.prompt_gc.is_some() || compacted.message == "[internal] prompt_gc"
+}
+
+fn assistant_message_text(content: &[ContentItem]) -> Option<String> {
+    let mut text = String::new();
+    for item in content {
+        if let ContentItem::OutputText { text: segment } = item {
+            text.push_str(segment);
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+fn response_item_completed(status: Option<&str>) -> bool {
+    status.is_none_or(|status| status == "completed")
+}
+
+fn turn_contains_user_message(turn: &Turn) -> bool {
+    turn.items
+        .iter()
+        .any(|item| matches!(item, ThreadItem::UserMessage { .. }))
+}
+
+fn web_search_action_detail(action: &codex_protocol::models::WebSearchAction) -> String {
+    match action {
+        codex_protocol::models::WebSearchAction::Search { query, queries } => query
+            .clone()
+            .filter(|query| !query.is_empty())
+            .unwrap_or_else(|| {
+                let first = queries
+                    .as_ref()
+                    .and_then(|queries| queries.first())
+                    .cloned()
+                    .unwrap_or_default();
+                if queries
+                    .as_ref()
+                    .is_some_and(|queries| queries.len() > 1 && !first.is_empty())
+                {
+                    format!("{first} ...")
+                } else {
+                    first
+                }
+            }),
+        codex_protocol::models::WebSearchAction::OpenPage { url } => {
+            url.clone().unwrap_or_default()
+        }
+        codex_protocol::models::WebSearchAction::FindInPage { url, pattern } => {
+            match (pattern, url) {
+                (Some(pattern), Some(url)) => format!("'{pattern}' in {url}"),
+                (Some(pattern), None) => format!("'{pattern}'"),
+                (None, Some(url)) => url.clone(),
+                (None, None) => String::new(),
+            }
+        }
+        codex_protocol::models::WebSearchAction::Other => String::new(),
+    }
+}
+
+fn local_shell_status_to_command_status(status: &LocalShellStatus) -> CommandExecutionStatus {
+    match status {
+        LocalShellStatus::Completed => CommandExecutionStatus::Completed,
+        LocalShellStatus::InProgress => CommandExecutionStatus::InProgress,
+        LocalShellStatus::Incomplete => CommandExecutionStatus::Failed,
+    }
+}
+
+fn function_call_output_status(output: &FunctionCallOutputPayload) -> CommandExecutionStatus {
+    match output.success {
+        Some(false) => CommandExecutionStatus::Failed,
+        _ => CommandExecutionStatus::Completed,
+    }
+}
+
+fn shell_command_execution_item(
+    item_id: String,
+    command: Vec<String>,
+    cwd: Option<String>,
+    status: CommandExecutionStatus,
+    aggregated_output: Option<String>,
+) -> ThreadItem {
+    let command_display =
+        shlex::try_join(command.iter().map(String::as_str)).unwrap_or_else(|_| command.join(" "));
+    let command_actions = parse_command(&command)
+        .into_iter()
+        .map(CommandAction::from)
+        .collect();
+    ThreadItem::CommandExecution {
+        id: item_id,
+        command: command_display,
+        cwd: cwd.map_or_else(PathBuf::new, PathBuf::from),
+        process_id: None,
+        source: crate::protocol::v2::CommandExecutionSource::Agent,
+        status,
+        command_actions,
+        aggregated_output,
+        exit_code: None,
+        duration_ms: None,
+    }
 }
 
 pub struct ThreadHistoryBuilder {
@@ -195,30 +342,182 @@ impl ThreadHistoryBuilder {
         }
     }
 
-    fn handle_response_item(&mut self, item: &codex_protocol::models::ResponseItem) {
-        let codex_protocol::models::ResponseItem::Message {
-            role, content, id, ..
-        } = item
-        else {
-            return;
-        };
-
-        if role != "user" {
-            return;
+    // Merge-safety anchor: this bounded ResponseItem replay matrix intentionally
+    // mirrors the visible resume contract for limited rollouts; if core changes
+    // which persisted raw items backfill visible transcript rows, update this
+    // reducer with the same ownership split instead of letting plain-TUI resume
+    // drift from app-server or runtime history reconstruction.
+    fn handle_response_item(&mut self, item: &ResponseItem) {
+        match item {
+            ResponseItem::Message {
+                role,
+                content,
+                id,
+                phase,
+                ..
+            } => match role.as_str() {
+                "user" => {
+                    let Some(hook_prompt) = parse_hook_prompt_message(id.as_ref(), content) else {
+                        return;
+                    };
+                    self.ensure_turn().items.push(ThreadItem::HookPrompt {
+                        id: hook_prompt.id,
+                        fragments: hook_prompt
+                            .fragments
+                            .into_iter()
+                            .map(crate::protocol::v2::HookPromptFragment::from)
+                            .collect(),
+                    });
+                }
+                "assistant" => {
+                    let Some(text) = assistant_message_text(content) else {
+                        return;
+                    };
+                    if self.current_turn_contains_agent_message(&text, phase) {
+                        return;
+                    }
+                    let id = id.clone().unwrap_or_else(|| self.next_item_id());
+                    self.upsert_item_in_current_turn(ThreadItem::AgentMessage {
+                        id,
+                        text,
+                        phase: phase.clone(),
+                        memory_citation: None,
+                    });
+                }
+                _ => {}
+            },
+            ResponseItem::Reasoning {
+                id,
+                summary,
+                content,
+                ..
+            } => {
+                let summary = summary
+                    .iter()
+                    .map(|entry| match entry {
+                        ReasoningItemReasoningSummary::SummaryText { text } => text.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let content = content
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|entry| match entry {
+                        ReasoningItemContent::ReasoningText { text }
+                        | ReasoningItemContent::Text { text } => text,
+                    })
+                    .collect::<Vec<_>>();
+                if summary.is_empty() && content.is_empty() {
+                    return;
+                }
+                if self.current_turn_contains_reasoning(&summary, &content) {
+                    return;
+                }
+                self.upsert_item_in_current_turn(ThreadItem::Reasoning {
+                    id: id.clone(),
+                    summary,
+                    content,
+                });
+            }
+            ResponseItem::LocalShellCall {
+                id,
+                call_id,
+                status,
+                action,
+            } => {
+                let LocalShellAction::Exec(exec) = action;
+                let item_id = call_id
+                    .clone()
+                    .or_else(|| id.clone())
+                    .unwrap_or_else(|| self.next_item_id());
+                self.upsert_item_in_current_turn(shell_command_execution_item(
+                    item_id,
+                    exec.command.clone(),
+                    exec.working_directory.clone(),
+                    local_shell_status_to_command_status(status),
+                    /*aggregated_output*/ None,
+                ));
+            }
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                if matches!(name.as_str(), "shell" | "shell_command" | "container.exec")
+                    && let Some((command, cwd)) =
+                        Self::shell_like_response_command(name.as_str(), arguments)
+                {
+                    self.upsert_item_in_current_turn(shell_command_execution_item(
+                        call_id.clone(),
+                        command,
+                        cwd,
+                        CommandExecutionStatus::InProgress,
+                        /*aggregated_output*/ None,
+                    ));
+                }
+            }
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                let Some(ThreadItem::CommandExecution {
+                    command,
+                    cwd,
+                    process_id,
+                    source,
+                    command_actions,
+                    ..
+                }) = self.find_turn_item(call_id).cloned()
+                else {
+                    return;
+                };
+                let aggregated_output = output.body.to_text().filter(|text| !text.is_empty());
+                self.upsert_item_in_current_turn(ThreadItem::CommandExecution {
+                    id: call_id.clone(),
+                    command,
+                    cwd,
+                    process_id,
+                    source,
+                    status: function_call_output_status(output),
+                    command_actions,
+                    aggregated_output,
+                    exit_code: None,
+                    duration_ms: None,
+                });
+            }
+            ResponseItem::WebSearchCall { id, status, action } => {
+                if !response_item_completed(status.as_deref()) {
+                    return;
+                }
+                let action = action.clone();
+                let query = action
+                    .as_ref()
+                    .map(web_search_action_detail)
+                    .unwrap_or_default();
+                let id = id.clone().unwrap_or_else(|| self.next_item_id());
+                self.upsert_item_in_current_turn(ThreadItem::WebSearch {
+                    id,
+                    query,
+                    action: action.map(WebSearchAction::from),
+                });
+            }
+            ResponseItem::ImageGenerationCall {
+                id,
+                status,
+                revised_prompt,
+                result,
+            } => {
+                if !response_item_completed(Some(status.as_str())) {
+                    return;
+                }
+                self.upsert_item_in_current_turn(ThreadItem::ImageGeneration {
+                    id: id.clone(),
+                    status: status.clone(),
+                    revised_prompt: revised_prompt.clone(),
+                    result: result.clone(),
+                    saved_path: None,
+                });
+            }
+            _ => {}
         }
-
-        let Some(hook_prompt) = parse_hook_prompt_message(id.as_ref(), content) else {
-            return;
-        };
-
-        self.ensure_turn().items.push(ThreadItem::HookPrompt {
-            id: hook_prompt.id,
-            fragments: hook_prompt
-                .fragments
-                .into_iter()
-                .map(crate::protocol::v2::HookPromptFragment::from)
-                .collect(),
-        });
     }
 
     fn handle_user_message(&mut self, payload: &UserMessageEvent) {
@@ -1085,10 +1384,21 @@ impl ThreadHistoryBuilder {
         self.finish_current_turn();
 
         let n = usize::try_from(payload.num_turns).unwrap_or(usize::MAX);
-        if n >= self.turns.len() {
-            self.turns.clear();
-        } else {
-            self.turns.truncate(self.turns.len().saturating_sub(n));
+        if n != 0 {
+            let user_turn_positions = self
+                .turns
+                .iter()
+                .enumerate()
+                .filter_map(|(index, turn)| turn_contains_user_message(turn).then_some(index))
+                .collect::<Vec<_>>();
+            if let Some(first_user_turn_idx) = user_turn_positions.first().copied() {
+                let cut_idx = if n >= user_turn_positions.len() {
+                    first_user_turn_idx
+                } else {
+                    user_turn_positions[user_turn_positions.len() - n]
+                };
+                self.turns.truncate(cut_idx);
+            }
         }
 
         let item_count: usize = self.turns.iter().map(|t| t.items.len()).sum();
@@ -1180,6 +1490,69 @@ impl ThreadHistoryBuilder {
             content.push(UserInput::LocalImage { path: path.clone() });
         }
         content
+    }
+
+    fn current_turn_contains_agent_message(
+        &self,
+        text: &str,
+        phase: &Option<MessagePhase>,
+    ) -> bool {
+        self.current_turn.as_ref().is_some_and(|turn| {
+            turn.items.iter().any(|item| {
+                matches!(
+                    item,
+                    ThreadItem::AgentMessage {
+                        text: existing_text,
+                        phase: existing_phase,
+                        ..
+                    } if existing_text == text && existing_phase == phase
+                )
+            })
+        })
+    }
+
+    fn current_turn_contains_reasoning(&self, summary: &[String], content: &[String]) -> bool {
+        self.current_turn.as_ref().is_some_and(|turn| {
+            turn.items.iter().any(|item| {
+                matches!(
+                    item,
+                    ThreadItem::Reasoning {
+                        summary: existing_summary,
+                        content: existing_content,
+                        ..
+                    } if existing_summary == summary && existing_content == content
+                )
+            })
+        })
+    }
+
+    fn find_turn_item(&self, item_id: &str) -> Option<&ThreadItem> {
+        self.current_turn
+            .as_ref()
+            .into_iter()
+            .flat_map(|turn| turn.items.iter())
+            .chain(self.turns.iter().rev().flat_map(|turn| turn.items.iter()))
+            .find(|item| item.id() == item_id)
+    }
+
+    fn shell_like_response_command(
+        name: &str,
+        arguments: &str,
+    ) -> Option<(Vec<String>, Option<String>)> {
+        match name {
+            "shell" | "container.exec" => serde_json::from_str::<ShellToolCallParams>(arguments)
+                .ok()
+                .map(|args| (args.command, args.workdir)),
+            "shell_command" => serde_json::from_str::<ShellCommandToolCallParams>(arguments)
+                .ok()
+                .map(|args| {
+                    (
+                        vec!["bash".to_string(), "-lc".to_string(), args.command],
+                        args.workdir,
+                    )
+                }),
+            _ => None,
+        }
     }
 }
 
@@ -1805,6 +2178,92 @@ mod tests {
                 ThreadItem::AgentMessage {
                     id: "item-4".into(),
                     text: "A3".into(),
+                    phase: None,
+                    memory_citation: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn thread_rollback_drops_last_user_turns_without_eating_standalone_turns() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-1".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "First".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "A1".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-1".into(),
+                last_agent_message: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-2".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "Second".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "A2".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-2".into(),
+                last_agent_message: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "standalone".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "standalone".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "standalone".into(),
+                last_agent_message: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+                num_turns: 1,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].id, "turn-1");
+        assert_eq!(
+            turns[0].items,
+            vec![
+                ThreadItem::UserMessage {
+                    id: "item-1".into(),
+                    content: vec![UserInput::Text {
+                        text: "First".into(),
+                        text_elements: Vec::new(),
+                    }],
+                },
+                ThreadItem::AgentMessage {
+                    id: "item-2".into(),
+                    text: "A1".into(),
                     phase: None,
                     memory_citation: None,
                 },
@@ -3227,5 +3686,323 @@ mod tests {
         let turns = build_turns_from_rollout_items(&items);
         assert_eq!(turns.len(), 1);
         assert!(turns[0].items.is_empty());
+    }
+
+    #[test]
+    fn reconstructs_response_item_tool_and_reasoning_history() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::ResponseItem(ResponseItem::Reasoning {
+                id: "reason-1".into(),
+                summary: vec![ReasoningItemReasoningSummary::SummaryText {
+                    text: "Inspecting the resume seams".into(),
+                }],
+                content: Some(vec![ReasoningItemContent::ReasoningText {
+                    text: "Full reasoning detail".into(),
+                }]),
+                encrypted_content: None,
+            }),
+            RolloutItem::ResponseItem(ResponseItem::LocalShellCall {
+                id: None,
+                call_id: Some("call-shell-1".into()),
+                status: LocalShellStatus::Completed,
+                action: LocalShellAction::Exec(codex_protocol::models::LocalShellExecAction {
+                    command: vec!["cat".into(), "runner.py".into()],
+                    timeout_ms: None,
+                    working_directory: Some("/tmp/work".into()),
+                    env: None,
+                    user: None,
+                }),
+            }),
+            RolloutItem::ResponseItem(ResponseItem::WebSearchCall {
+                id: Some("search-1".into()),
+                status: Some("completed".into()),
+                action: Some(codex_protocol::models::WebSearchAction::Search {
+                    query: Some("promptContext.controls".into()),
+                    queries: None,
+                }),
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                last_agent_message: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items,
+            vec![
+                ThreadItem::Reasoning {
+                    id: "reason-1".into(),
+                    summary: vec!["Inspecting the resume seams".into()],
+                    content: vec!["Full reasoning detail".into()],
+                },
+                ThreadItem::CommandExecution {
+                    id: "call-shell-1".into(),
+                    command: "cat runner.py".into(),
+                    cwd: PathBuf::from("/tmp/work"),
+                    process_id: None,
+                    source: CommandExecutionSource::Agent,
+                    status: CommandExecutionStatus::Completed,
+                    command_actions: vec![CommandAction::Read {
+                        command: "cat runner.py".into(),
+                        name: "runner.py".into(),
+                        path: PathBuf::from("runner.py"),
+                    }],
+                    aggregated_output: None,
+                    exit_code: None,
+                    duration_ms: None,
+                },
+                ThreadItem::WebSearch {
+                    id: "search-1".into(),
+                    query: "promptContext.controls".into(),
+                    action: Some(WebSearchAction::Search {
+                        query: Some("promptContext.controls".into()),
+                        queries: None,
+                    }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_incomplete_response_item_web_and_image_history() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::ResponseItem(ResponseItem::WebSearchCall {
+                id: Some("search-1".into()),
+                status: Some("in_progress".into()),
+                action: Some(codex_protocol::models::WebSearchAction::Search {
+                    query: Some("hidden".into()),
+                    queries: None,
+                }),
+            }),
+            RolloutItem::ResponseItem(ResponseItem::WebSearchCall {
+                id: Some("search-2".into()),
+                status: Some("completed".into()),
+                action: Some(codex_protocol::models::WebSearchAction::Search {
+                    query: Some("visible".into()),
+                    queries: None,
+                }),
+            }),
+            RolloutItem::ResponseItem(ResponseItem::ImageGenerationCall {
+                id: "image-1".into(),
+                status: "in_progress".into(),
+                revised_prompt: Some("hidden image".into()),
+                result: "ignored".into(),
+            }),
+            RolloutItem::ResponseItem(ResponseItem::ImageGenerationCall {
+                id: "image-2".into(),
+                status: "completed".into(),
+                revised_prompt: Some("visible image".into()),
+                result: "result-2".into(),
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                last_agent_message: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items,
+            vec![
+                ThreadItem::WebSearch {
+                    id: "search-2".into(),
+                    query: "visible".into(),
+                    action: Some(WebSearchAction::Search {
+                        query: Some("visible".into()),
+                        queries: None,
+                    }),
+                },
+                ThreadItem::ImageGeneration {
+                    id: "image-2".into(),
+                    status: "completed".into(),
+                    revised_prompt: Some("visible image".into()),
+                    result: "result-2".into(),
+                    saved_path: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_failed_view_image_response_items_without_success_event() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                id: None,
+                name: "view_image".into(),
+                namespace: None,
+                arguments: r#"{"path":"missing.png"}"#.into(),
+                call_id: "view-1".into(),
+            }),
+            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                call_id: "view-1".into(),
+                output: codex_protocol::models::FunctionCallOutputPayload {
+                    body: codex_protocol::models::FunctionCallOutputBody::Text(
+                        "missing file".into(),
+                    ),
+                    success: Some(false),
+                },
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                last_agent_message: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].items.is_empty());
+    }
+
+    #[test]
+    fn truncates_turns_since_last_context_compaction_marker() {
+        let turns = vec![
+            Turn {
+                id: "turn-1".into(),
+                items: vec![ThreadItem::AgentMessage {
+                    id: "msg-1".into(),
+                    text: "before".into(),
+                    phase: None,
+                    memory_citation: None,
+                }],
+                status: TurnStatus::Completed,
+                error: None,
+            },
+            Turn {
+                id: "turn-2".into(),
+                items: vec![
+                    ThreadItem::AgentMessage {
+                        id: "msg-2".into(),
+                        text: "still before".into(),
+                        phase: None,
+                        memory_citation: None,
+                    },
+                    ThreadItem::ContextCompaction {
+                        id: "compact-1".into(),
+                    },
+                    ThreadItem::AgentMessage {
+                        id: "msg-3".into(),
+                        text: "after".into(),
+                        phase: None,
+                        memory_citation: None,
+                    },
+                ],
+                status: TurnStatus::Completed,
+                error: None,
+            },
+        ];
+
+        let truncated = truncate_turns_since_last_context_compaction(turns);
+
+        assert_eq!(
+            truncated,
+            vec![Turn {
+                id: "turn-2".into(),
+                items: vec![
+                    ThreadItem::ContextCompaction {
+                        id: "compact-1".into(),
+                    },
+                    ThreadItem::AgentMessage {
+                        id: "msg-3".into(),
+                        text: "after".into(),
+                        phase: None,
+                        memory_citation: None,
+                    },
+                ],
+                status: TurnStatus::Completed,
+                error: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn truncate_ignores_rolled_back_context_compaction_marker() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-1".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "before".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "before".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-1".into(),
+                last_agent_message: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-2".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "rolled back".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::EventMsg(EventMsg::ContextCompacted(ContextCompactedEvent {})),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "rolled back".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-2".into(),
+                last_agent_message: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+                num_turns: 1,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-3".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "after rollback".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-3".into(),
+                last_agent_message: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(
+            truncate_turns_since_last_context_compaction(turns.clone()),
+            turns
+        );
     }
 }

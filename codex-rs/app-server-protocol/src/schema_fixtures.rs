@@ -5,6 +5,7 @@ use crate::ServerRequest;
 use crate::export::GENERATED_TS_HEADER;
 use crate::export::filter_experimental_ts_tree;
 use crate::export::generate_index_ts_tree;
+use crate::export::normalize_generated_ts_contents;
 use crate::protocol::common::visit_client_response_types;
 use crate::protocol::common::visit_server_response_types;
 use anyhow::Context;
@@ -276,10 +277,10 @@ fn collect_typescript_fixture_file<T: TS + 'static + ?Sized>(
 
     let contents = T::export_to_string().context("export TypeScript fixture content")?;
     let output_path = normalize_relative_fixture_path(&output_path);
-    files.insert(
-        output_path,
-        contents.replace("\r\n", "\n").replace('\r', "\n"),
-    );
+    // Merge-safety anchor: fixture-side TypeScript normalization must share the
+    // same content contract as export.rs or schema tests and vendored refreshes
+    // drift on whitespace-only output.
+    files.insert(output_path, normalize_generated_ts_contents(&contents));
 
     let mut visitor = TypeScriptFixtureCollector {
         files,

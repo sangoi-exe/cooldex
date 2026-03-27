@@ -55,9 +55,13 @@ use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::PluginReadParams;
 use codex_app_server_protocol::PluginReadResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::Turn;
+use codex_app_server_protocol::build_turns_from_rollout_items;
+use codex_app_server_protocol::truncate_turns_since_last_context_compaction;
 use codex_arg0::Arg0DispatchPaths;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
+use codex_core::RolloutRecorder;
 use codex_core::ThreadManager;
 use codex_core::auth::CLIENT_ID;
 use codex_core::config::Config;
@@ -151,6 +155,44 @@ fn format_account_display(label: Option<&str>, email: Option<&str>, fallback: &s
         (None, Some(email)) => email.to_string(),
         (None, None) => fallback.to_string(),
     }
+}
+
+// Merge-safety anchor: plain-TUI resume truncation must stay aligned with the
+// shared rollback-aware turn reconstruction and the persisted
+// `[tui].resume_history` contract; do not reintroduce raw-rollout slicing here.
+fn apply_resume_history_mode(config: &Config, turns: Vec<Turn>) -> Vec<Turn> {
+    match config.tui_resume_history {
+        codex_core::config::types::ResumeHistoryMode::Full => turns,
+        codex_core::config::types::ResumeHistoryMode::SinceLastCompaction => {
+            truncate_turns_since_last_context_compaction(turns)
+        }
+    }
+}
+
+async fn best_effort_resume_history_turns(
+    config: &Config,
+    rollout_path: &Path,
+) -> Option<Vec<Turn>> {
+    // Merge-safety anchor: plain-TUI resume prefers reconstructed turn replay
+    // over legacy `initial_messages`; once rollout-backed turns load, they
+    // define the resume boundary even if the surviving suffix is non-renderable.
+    let initial_history = match RolloutRecorder::get_rollout_history(rollout_path).await {
+        Ok(initial_history) => initial_history,
+        Err(err) => {
+            tracing::warn!(
+                path = %rollout_path.display(),
+                error = %err,
+                "failed to load rollout history for faithful resume replay; falling back to legacy initial_messages"
+            );
+            return None;
+        }
+    };
+    let rollout_items = initial_history.get_rollout_items();
+    if rollout_items.is_empty() {
+        return None;
+    }
+    let turns = build_turns_from_rollout_items(&rollout_items);
+    (!turns.is_empty()).then(|| apply_resume_history_mode(config, turns))
 }
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
@@ -2492,10 +2534,14 @@ impl App {
             self.chat_widget
                 .replay_prompt_gc_context_usage_info(token_usage_info);
         }
+        if snapshot.prompt_gc_active {
+            self.chat_widget
+                .restore_status_indicator_from_current_status();
+        }
         self.chat_widget
             .set_prompt_gc_activity(snapshot.prompt_gc_active);
         if resume_restored_queue {
-            self.chat_widget.maybe_send_next_queued_input();
+            self.chat_widget.maybe_send_restored_follow_up();
         }
         self.refresh_status_surfaces();
     }
@@ -2760,6 +2806,8 @@ impl App {
                 ChatWidget::new(init, thread_manager.clone())
             }
             SessionSelection::Resume(target_session) => {
+                let pending_resume_turns =
+                    best_effort_resume_history_turns(&config, &target_session.path).await;
                 let resumed = thread_manager
                     .resume_thread_from_rollout(
                         config.clone(),
@@ -2795,7 +2843,12 @@ impl App {
                     terminal_title_invalid_items_warned: terminal_title_invalid_items_warned
                         .clone(),
                 };
-                ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured)
+                ChatWidget::new_from_existing(
+                    init,
+                    resumed.thread,
+                    resumed.session_configured,
+                    pending_resume_turns,
+                )
             }
             SessionSelection::Fork(target_session) => {
                 session_telemetry.counter(
@@ -2839,7 +2892,12 @@ impl App {
                     terminal_title_invalid_items_warned: terminal_title_invalid_items_warned
                         .clone(),
                 };
-                ChatWidget::new_from_existing(init, forked.thread, forked.session_configured)
+                ChatWidget::new_from_existing(
+                    init,
+                    forked.thread,
+                    forked.session_configured,
+                    /*pending_resume_turns*/ None,
+                )
             }
         };
 
@@ -3169,6 +3227,9 @@ impl App {
                             self.chat_widget.thread_id(),
                             self.chat_widget.thread_name(),
                         );
+                        let pending_resume_turns =
+                            best_effort_resume_history_turns(&resume_config, &target_session.path)
+                                .await;
                         match self
                             .server
                             .resume_thread_from_rollout(
@@ -3192,6 +3253,7 @@ impl App {
                                     init,
                                     resumed.thread,
                                     resumed.session_configured,
+                                    pending_resume_turns,
                                 ));
                                 self.reset_thread_event_state();
                                 if let Some(summary) = summary {
@@ -3263,6 +3325,7 @@ impl App {
                                     init,
                                     forked.thread,
                                     forked.session_configured,
+                                    /*pending_resume_turns*/ None,
                                 ));
                                 self.reset_thread_event_state();
                                 if let Some(summary) = summary {
@@ -5259,6 +5322,9 @@ mod tests {
     use assert_matches::assert_matches;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
+    use codex_app_server_protocol::Turn as AppServerTurn;
+    use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
     use codex_core::AuthManager;
     use codex_core::CodexAuth;
     use codex_core::auth::AccountUsageCache;
@@ -5268,6 +5334,7 @@ mod tests {
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
     use codex_core::config::types::ModelAvailabilityNuxConfig;
+    use codex_core::config::types::ResumeHistoryMode;
     use codex_core::token_data::TokenData;
     use codex_core::token_data::parse_chatgpt_jwt_claims;
     use codex_otel::SessionTelemetry;
@@ -9548,6 +9615,92 @@ guardian_approval = true
             user_messages,
             vec!["first prompt".to_string(), "third prompt".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn apply_resume_history_mode_since_last_compaction_keeps_suffix_only() {
+        let mut config = ConfigBuilder::default().build().await.expect("config");
+        config.tui_resume_history = ResumeHistoryMode::SinceLastCompaction;
+
+        let turns = vec![
+            AppServerTurn {
+                id: "turn-1".to_string(),
+                status: AppServerTurnStatus::Completed,
+                error: None,
+                items: vec![AppServerThreadItem::AgentMessage {
+                    id: "msg-1".to_string(),
+                    text: "before compaction".to_string(),
+                    phase: None,
+                    memory_citation: None,
+                }],
+            },
+            AppServerTurn {
+                id: "turn-2".to_string(),
+                status: AppServerTurnStatus::Completed,
+                error: None,
+                items: vec![
+                    AppServerThreadItem::ContextCompaction {
+                        id: "compact-1".to_string(),
+                    },
+                    AppServerThreadItem::AgentMessage {
+                        id: "msg-2".to_string(),
+                        text: "after compaction".to_string(),
+                        phase: None,
+                        memory_citation: None,
+                    },
+                ],
+            },
+        ];
+
+        let truncated = apply_resume_history_mode(&config, turns);
+
+        assert_eq!(truncated.len(), 1);
+        assert_eq!(truncated[0].id, "turn-2");
+        assert_eq!(
+            truncated[0].items,
+            vec![
+                AppServerThreadItem::ContextCompaction {
+                    id: "compact-1".to_string(),
+                },
+                AppServerThreadItem::AgentMessage {
+                    id: "msg-2".to_string(),
+                    text: "after compaction".to_string(),
+                    phase: None,
+                    memory_citation: None,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_resume_history_mode_full_keeps_entire_transcript() {
+        let mut config = ConfigBuilder::default().build().await.expect("config");
+        config.tui_resume_history = ResumeHistoryMode::Full;
+
+        let turns = vec![
+            AppServerTurn {
+                id: "turn-1".to_string(),
+                status: AppServerTurnStatus::Completed,
+                error: None,
+                items: vec![AppServerThreadItem::AgentMessage {
+                    id: "msg-1".to_string(),
+                    text: "before compaction".to_string(),
+                    phase: None,
+                    memory_citation: None,
+                }],
+            },
+            AppServerTurn {
+                id: "turn-2".to_string(),
+                status: AppServerTurnStatus::Completed,
+                error: None,
+                items: vec![AppServerThreadItem::ContextCompaction {
+                    id: "compact-1".to_string(),
+                }],
+            },
+        ];
+
+        let full = apply_resume_history_mode(&config, turns.clone());
+        assert_eq!(full, turns);
     }
 
     #[tokio::test]

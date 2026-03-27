@@ -16,8 +16,8 @@ use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::openai_models::ReasoningEffort;
 
-/// Merge-safety anchor: profile fields here carry workspace-local child-agent,
-/// approvals, and auth/runtime config overlays that must survive upstream syncs.
+// Merge-safety anchor: profile fields here carry workspace-local child-agent,
+// approvals, and auth/runtime config overlays that must survive upstream syncs.
 /// Collection of common configuration options that a user can define as a unit
 /// in `config.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]

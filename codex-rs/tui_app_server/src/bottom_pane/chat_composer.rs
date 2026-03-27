@@ -389,6 +389,7 @@ pub(crate) struct ChatComposer {
     selected_remote_image_index: Option<usize>,
     footer_flash: Option<FooterFlash>,
     context_window_percent: Option<i64>,
+    is_wsl: bool,
     // Monotonically increasing identifier for textarea elements we insert.
     #[cfg(not(target_os = "linux"))]
     next_element_id: u64,
@@ -514,6 +515,7 @@ impl ChatComposer {
             selected_remote_image_index: None,
             footer_flash: None,
             context_window_percent: None,
+            is_wsl: crate::clipboard_paste::is_probably_wsl(),
             #[cfg(not(target_os = "linux"))]
             next_element_id: 0,
             context_window_used_tokens: None,
@@ -3199,16 +3201,10 @@ impl ChatComposer {
 
     fn footer_props(&self) -> FooterProps {
         let mode = self.footer_mode();
-        let is_wsl = {
-            #[cfg(target_os = "linux")]
-            {
-                mode == FooterMode::ShortcutOverlay && crate::clipboard_paste::is_probably_wsl()
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                false
-            }
-        };
+        // Merge-safety anchor: app-server footer snapshot parity depends on the
+        // stored `is_wsl` state here, not ad hoc environment reads in tests or
+        // render call sites, so plain/app-server footer behavior stays aligned.
+        let is_wsl = mode == FooterMode::ShortcutOverlay && self.is_wsl;
 
         FooterProps {
             mode,
@@ -3745,6 +3741,11 @@ impl ChatComposer {
         }
         self.context_window_percent = percent;
         self.context_window_used_tokens = used_tokens;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_is_wsl_for_test(&mut self, is_wsl: bool) {
+        self.is_wsl = is_wsl;
     }
 
     pub(crate) fn set_esc_backtrack_hint(&mut self, show: bool) {
@@ -4724,6 +4725,7 @@ mod tests {
         use crossterm::event::KeyModifiers;
 
         snapshot_composer_state("footer_mode_shortcut_overlay", true, |composer| {
+            composer.set_is_wsl_for_test(false);
             composer.set_esc_backtrack_hint(true);
             let _ =
                 composer.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));

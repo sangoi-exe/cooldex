@@ -5,6 +5,9 @@
 //! changes show up as stable, reviewable diffs.
 // Merge-safety anchor: prompt-GC TUI tests here must keep the private-token
 // clear/reset behavior aligned with app-level prompt-GC event handling.
+// Merge-safety anchor: resume-history replay tests and snapshots here must stay
+// aligned with the rollout-backed resume contract, renderability fallback, and
+// the visible replay surfaces that plain-TUI resume promises to keep.
 
 use super::*;
 use crate::app_event::AppEvent;
@@ -22,6 +25,25 @@ use crate::tui::FrameRequester;
 use assert_matches::assert_matches;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use codex_app_server_protocol::CollabAgentRef as AppServerCollabAgentRef;
+use codex_app_server_protocol::CollabAgentState as AppServerCollabAgentState;
+use codex_app_server_protocol::CollabAgentStatus as AppServerCollabAgentStatus;
+use codex_app_server_protocol::CollabAgentTool as AppServerCollabAgentTool;
+use codex_app_server_protocol::CollabAgentToolCallStatus as AppServerCollabAgentToolCallStatus;
+use codex_app_server_protocol::CollabWaitReturnWhen as AppServerCollabWaitReturnWhen;
+use codex_app_server_protocol::CollabWaitState as AppServerCollabWaitState;
+use codex_app_server_protocol::CommandAction as AppServerCommandAction;
+use codex_app_server_protocol::CommandExecutionSource as AppServerCommandExecutionSource;
+use codex_app_server_protocol::CommandExecutionStatus as AppServerCommandExecutionStatus;
+use codex_app_server_protocol::FileUpdateChange as AppServerFileUpdateChange;
+use codex_app_server_protocol::HookPromptFragment as AppServerHookPromptFragment;
+use codex_app_server_protocol::PatchApplyStatus as AppServerPatchApplyStatus;
+use codex_app_server_protocol::PatchChangeKind as AppServerPatchChangeKind;
+use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
+use codex_app_server_protocol::Turn as AppServerTurn;
+use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
+use codex_app_server_protocol::UserInput as AppServerUserInput;
+use codex_app_server_protocol::WebSearchAction as AppServerWebSearchAction;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::auth::AuthStore;
@@ -301,6 +323,491 @@ async fn resumed_initial_messages_render_history() {
     assert!(
         text_blob.contains("assistant reply"),
         "expected replayed agent message",
+    );
+}
+
+#[tokio::test]
+async fn resumed_turn_history_replays_original_rollout_snapshot() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.pending_resume_turns = Some(vec![AppServerTurn {
+        id: "turn-1".to_string(),
+        status: AppServerTurnStatus::Completed,
+        error: None,
+        items: vec![
+            AppServerThreadItem::UserMessage {
+                id: "user-1".to_string(),
+                content: vec![AppServerUserInput::Text {
+                    text: "hello from original rollout".to_string(),
+                    text_elements: Vec::new(),
+                }],
+            },
+            AppServerThreadItem::Reasoning {
+                id: "reasoning-1".to_string(),
+                summary: vec!["**Inspecting** the resume render path".to_string()],
+                content: Vec::new(),
+            },
+            AppServerThreadItem::CommandExecution {
+                id: "cmd-1".to_string(),
+                command: "cat codex-rs/tui/src/chatwidget.rs".to_string(),
+                cwd: PathBuf::from("/home/user/project"),
+                process_id: Some("proc-1".to_string()),
+                source: AppServerCommandExecutionSource::UnifiedExecStartup,
+                status: AppServerCommandExecutionStatus::Completed,
+                command_actions: vec![AppServerCommandAction::Read {
+                    command: "cat codex-rs/tui/src/chatwidget.rs".to_string(),
+                    name: "chatwidget.rs".to_string(),
+                    path: PathBuf::from("codex-rs/tui/src/chatwidget.rs"),
+                }],
+                aggregated_output: Some("rendered contents".to_string()),
+                exit_code: Some(0),
+                duration_ms: Some(12),
+            },
+            AppServerThreadItem::WebSearch {
+                id: "search-1".to_string(),
+                query: "promptContext.controls".to_string(),
+                action: Some(AppServerWebSearchAction::Search {
+                    query: Some("promptContext.controls".to_string()),
+                    queries: None,
+                }),
+            },
+            AppServerThreadItem::AgentMessage {
+                id: "assistant-1".to_string(),
+                text: "assistant reply from stored history".to_string(),
+                phase: None,
+                memory_citation: None,
+            },
+        ],
+    }]);
+
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+            session_id: conversation_id,
+            forked_from_id: None,
+            thread_name: None,
+            model: "test-model".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            service_tier: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            cwd: PathBuf::from("/home/user/project"),
+            reasoning_effort: Some(ReasoningEffortConfig::default()),
+            history_log_id: 0,
+            history_entry_count: 0,
+            initial_messages: Some(vec![EventMsg::AgentMessage(AgentMessageEvent {
+                message: "legacy fallback should not render".to_string(),
+                phase: None,
+                memory_citation: None,
+            })]),
+            network_proxy: None,
+            rollout_path: Some(rollout_file.path().to_path_buf()),
+        }),
+    });
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !rendered.contains("legacy fallback should not render"),
+        "expected rich replay to suppress legacy initial_messages fallback, got {rendered:?}"
+    );
+    assert_snapshot!("resumed_turn_history_replays_original_rollout", rendered);
+}
+
+#[tokio::test]
+async fn resume_reconstructed_boundary_blocks_initial_messages_for_empty_turns() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.pending_resume_turns = Some(vec![AppServerTurn {
+        id: "turn-1".to_string(),
+        status: AppServerTurnStatus::Completed,
+        error: None,
+        items: Vec::new(),
+    }]);
+
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+            session_id: ThreadId::new(),
+            forked_from_id: None,
+            thread_name: None,
+            model: "test-model".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            service_tier: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            cwd: PathBuf::from("/home/user/project"),
+            reasoning_effort: Some(ReasoningEffortConfig::default()),
+            history_log_id: 0,
+            history_entry_count: 0,
+            initial_messages: Some(vec![EventMsg::AgentMessage(AgentMessageEvent {
+                message: "legacy fallback should still render".to_string(),
+                phase: None,
+                memory_citation: None,
+            })]),
+            network_proxy: None,
+            rollout_path: None,
+        }),
+    });
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !rendered.contains("legacy fallback should still render"),
+        "expected reconstructed-turn boundary to suppress legacy initial_messages replay, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn resume_reconstructed_boundary_blocks_initial_messages_for_hook_prompt_only_turns() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.pending_resume_turns = Some(vec![AppServerTurn {
+        id: "turn-1".to_string(),
+        status: AppServerTurnStatus::Completed,
+        error: None,
+        items: vec![AppServerThreadItem::HookPrompt {
+            id: "hook-1".to_string(),
+            fragments: vec![AppServerHookPromptFragment {
+                text: "Run the pre-commit hook now.".to_string(),
+                hook_run_id: "hook-run-1".to_string(),
+            }],
+        }],
+    }]);
+
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+            session_id: ThreadId::new(),
+            forked_from_id: None,
+            thread_name: None,
+            model: "test-model".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            service_tier: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            cwd: PathBuf::from("/home/user/project"),
+            reasoning_effort: Some(ReasoningEffortConfig::default()),
+            history_log_id: 0,
+            history_entry_count: 0,
+            initial_messages: Some(vec![EventMsg::AgentMessage(AgentMessageEvent {
+                message: "legacy fallback should still render".to_string(),
+                phase: None,
+                memory_citation: None,
+            })]),
+            network_proxy: None,
+            rollout_path: None,
+        }),
+    });
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !rendered.contains("legacy fallback should still render"),
+        "expected hook-prompt-only replay to stay on the reconstructed boundary, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn replayed_begin_only_web_and_image_rows_stay_hidden() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.replay_thread_turns(
+        vec![AppServerTurn {
+            id: "turn-1".to_string(),
+            status: AppServerTurnStatus::Completed,
+            error: None,
+            items: vec![
+                AppServerThreadItem::WebSearch {
+                    id: "search-1".to_string(),
+                    query: String::new(),
+                    action: None,
+                },
+                AppServerThreadItem::ImageGeneration {
+                    id: "image-1".to_string(),
+                    status: String::new(),
+                    revised_prompt: None,
+                    result: String::new(),
+                    saved_path: None,
+                },
+            ],
+        }],
+        ReplayKind::ResumeInitialMessages,
+    );
+
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "expected begin-only web/image replay rows to stay hidden"
+    );
+}
+
+#[tokio::test]
+async fn resumed_turn_history_replays_review_finish_banner() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.pending_resume_turns = Some(vec![AppServerTurn {
+        id: "turn-1".to_string(),
+        status: AppServerTurnStatus::Completed,
+        error: None,
+        items: vec![
+            AppServerThreadItem::EnteredReviewMode {
+                id: "review-start".to_string(),
+                review: "Resume review".to_string(),
+            },
+            AppServerThreadItem::ExitedReviewMode {
+                id: "review-end".to_string(),
+                review: "Final review verdict".to_string(),
+            },
+        ],
+    }]);
+
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+            session_id: ThreadId::new(),
+            forked_from_id: None,
+            thread_name: None,
+            model: "test-model".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            service_tier: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            cwd: PathBuf::from("/home/user/project"),
+            reasoning_effort: Some(ReasoningEffortConfig::default()),
+            history_log_id: 0,
+            history_entry_count: 0,
+            initial_messages: None,
+            network_proxy: None,
+            rollout_path: None,
+        }),
+    });
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("Code review started: Resume review"),
+        "expected replayed review start banner, got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("Code review finished"),
+        "expected replayed review finish banner, got {rendered:?}"
+    );
+    assert!(chat.pre_review_task_running.is_none());
+    assert!(!chat.is_review_mode);
+}
+
+#[tokio::test]
+async fn resumed_turn_history_replays_completed_file_change_cell() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.pending_resume_turns = Some(vec![AppServerTurn {
+        id: "turn-1".to_string(),
+        status: AppServerTurnStatus::Completed,
+        error: None,
+        items: vec![AppServerThreadItem::FileChange {
+            id: "patch-1".to_string(),
+            changes: vec![AppServerFileUpdateChange {
+                path: "foo.txt".to_string(),
+                kind: AppServerPatchChangeKind::Add,
+                diff: "hello from resume\n".to_string(),
+            }],
+            status: AppServerPatchApplyStatus::Completed,
+        }],
+    }]);
+
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+            session_id: ThreadId::new(),
+            forked_from_id: None,
+            thread_name: None,
+            model: "test-model".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            service_tier: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            cwd: PathBuf::from("/home/user/project"),
+            reasoning_effort: Some(ReasoningEffortConfig::default()),
+            history_log_id: 0,
+            history_entry_count: 0,
+            initial_messages: Some(vec![EventMsg::AgentMessage(AgentMessageEvent {
+                message: "legacy fallback should not render".to_string(),
+                phase: None,
+                memory_citation: None,
+            })]),
+            network_proxy: None,
+            rollout_path: None,
+        }),
+    });
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !rendered.contains("legacy fallback should not render"),
+        "expected visible file-change replay to suppress fallback, got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("Added foo.txt") || rendered.contains("Edited foo.txt"),
+        "expected resumed file-change replay to render the edited block, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn resumed_turn_history_replays_declined_file_change_failure() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.pending_resume_turns = Some(vec![AppServerTurn {
+        id: "turn-1".to_string(),
+        status: AppServerTurnStatus::Completed,
+        error: None,
+        items: vec![AppServerThreadItem::FileChange {
+            id: "patch-1".to_string(),
+            changes: vec![AppServerFileUpdateChange {
+                path: "foo.txt".to_string(),
+                kind: AppServerPatchChangeKind::Add,
+                diff: "hello from resume\n".to_string(),
+            }],
+            status: AppServerPatchApplyStatus::Declined,
+        }],
+    }]);
+
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+            session_id: ThreadId::new(),
+            forked_from_id: None,
+            thread_name: None,
+            model: "test-model".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            service_tier: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            cwd: PathBuf::from("/home/user/project"),
+            reasoning_effort: Some(ReasoningEffortConfig::default()),
+            history_log_id: 0,
+            history_entry_count: 0,
+            initial_messages: None,
+            network_proxy: None,
+            rollout_path: None,
+        }),
+    });
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("Failed to apply patch"),
+        "expected resumed declined file-change replay to surface the rejection, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn resumed_turn_history_replays_collab_waiting_cells() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    let sender_thread_id = ThreadId::new();
+    let receiver_thread_id = ThreadId::new();
+
+    chat.pending_resume_turns = Some(vec![AppServerTurn {
+        id: "turn-1".to_string(),
+        status: AppServerTurnStatus::Completed,
+        error: None,
+        items: vec![AppServerThreadItem::CollabAgentToolCall {
+            id: "wait-1".to_string(),
+            tool: AppServerCollabAgentTool::Wait,
+            status: AppServerCollabAgentToolCallStatus::Completed,
+            sender_thread_id: sender_thread_id.to_string(),
+            receiver_thread_ids: vec![receiver_thread_id.to_string()],
+            receiver_agents: vec![AppServerCollabAgentRef {
+                thread_id: receiver_thread_id.to_string(),
+                agent_nickname: Some("Watcher".to_string()),
+                agent_role: Some("observer".to_string()),
+            }],
+            prompt: None,
+            profile: None,
+            model: None,
+            reasoning_effort: None,
+            agents_states: std::collections::HashMap::from([(
+                receiver_thread_id.to_string(),
+                AppServerCollabAgentState {
+                    status: AppServerCollabAgentStatus::Completed,
+                    message: Some("done".to_string()),
+                    agent_nickname: Some("Watcher".to_string()),
+                    agent_role: Some("observer".to_string()),
+                    last_activity: None,
+                },
+            )]),
+            wait_state: Some(AppServerCollabWaitState {
+                return_when: AppServerCollabWaitReturnWhen::AnyFinal,
+                disable_timeout: false,
+                condition_enabled: false,
+                timed_out: None,
+            }),
+        }],
+    }]);
+
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+            session_id: sender_thread_id,
+            forked_from_id: None,
+            thread_name: None,
+            model: "test-model".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            service_tier: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            cwd: PathBuf::from("/home/user/project"),
+            reasoning_effort: Some(ReasoningEffortConfig::default()),
+            history_log_id: 0,
+            history_entry_count: 0,
+            initial_messages: None,
+            network_proxy: None,
+            rollout_path: None,
+        }),
+    });
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("Finished waiting"),
+        "expected replayed collab wait cell, got {rendered:?}"
     );
 }
 
@@ -1672,6 +2179,7 @@ async fn review_restores_context_window_indicator() {
         }),
     });
     assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert!(!chat.bottom_pane.is_task_running());
 
     chat.handle_codex_event(Event {
         id: "review-start".into(),
@@ -1682,6 +2190,7 @@ async fn review_restores_context_window_indicator() {
             user_facing_hint: Some("feature branch".to_string()),
         }),
     });
+    assert!(chat.bottom_pane.is_task_running());
 
     chat.handle_codex_event(Event {
         id: "token-review".into(),
@@ -1701,6 +2210,7 @@ async fn review_restores_context_window_indicator() {
     let _ = drain_insert_history(&mut rx);
 
     assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert!(!chat.bottom_pane.is_task_running());
     assert!(!chat.is_review_mode);
 }
 
@@ -2235,6 +2745,7 @@ async fn make_chatwidget_manual(
         session_telemetry,
         session_header: SessionHeader::new(resolved_model.clone()),
         initial_user_message: None,
+        pending_resume_turns: None,
         token_info: None,
         token_info_is_prompt_gc_private: false,
         prompt_gc_context_usage_unknown: false,
@@ -2293,6 +2804,7 @@ async fn make_chatwidget_manual(
         is_review_mode: false,
         pre_review_token_info: None,
         pre_review_token_info_is_prompt_gc_private: None,
+        pre_review_task_running: None,
         needs_final_message_separator: false,
         had_work_activity: false,
         saw_plan_update_this_turn: false,

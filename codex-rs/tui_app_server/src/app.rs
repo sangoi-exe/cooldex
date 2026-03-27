@@ -64,6 +64,7 @@ use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::truncate_turns_since_last_context_compaction;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -289,6 +290,18 @@ fn session_summary(
         usage_line,
         resume_command,
     })
+}
+
+// Merge-safety anchor: app-server-backed resume truncation must match the
+// plain-TUI `[tui].resume_history` contract and cut only after shared
+// rollback-aware turn reconstruction.
+fn apply_resume_history_mode(config: &Config, turns: Vec<Turn>) -> Vec<Turn> {
+    match config.tui_resume_history {
+        codex_core::config::types::ResumeHistoryMode::Full => turns,
+        codex_core::config::types::ResumeHistoryMode::SinceLastCompaction => {
+            truncate_turns_since_last_context_compaction(turns)
+        }
+    }
 }
 
 fn errors_for_cwd(cwd: &Path, response: &ListSkillsResponseEvent) -> Vec<SkillErrorInfo> {
@@ -2748,7 +2761,7 @@ impl App {
             .set_initial_user_message_submit_suppressed(/*suppressed*/ false);
         self.chat_widget.submit_initial_user_message_if_pending();
         if resume_restored_queue {
-            self.chat_widget.maybe_send_next_queued_input();
+            self.chat_widget.maybe_send_restored_follow_up();
         }
         self.refresh_status_line();
     }
@@ -2894,13 +2907,14 @@ impl App {
                 (ChatWidget::new_with_app_event(init), Some(started))
             }
             SessionSelection::Resume(target_session) => {
-                let resumed = app_server
+                let mut resumed = app_server
                     .resume_thread(config.clone(), target_session.thread_id)
                     .await
                     .wrap_err_with(|| {
                         let target_label = target_session.display_label();
                         format!("Failed to resume session from {target_label}")
                     })?;
+                resumed.turns = apply_resume_history_mode(&config, resumed.turns);
                 let init = crate::chatwidget::ChatWidgetInit {
                     config: config.clone(),
                     frame_requester: tui.frame_requester(),
@@ -3308,11 +3322,13 @@ impl App {
                             .resume_thread(resume_config.clone(), target_session.thread_id)
                             .await
                         {
-                            Ok(resumed) => {
+                            Ok(mut resumed) => {
                                 self.shutdown_current_thread(app_server).await;
                                 self.config = resume_config;
                                 tui.set_notification_method(self.config.tui_notification_method);
                                 self.file_search.update_search_dir(self.config.cwd.clone());
+                                resumed.turns =
+                                    apply_resume_history_mode(&self.config, resumed.turns);
                                 match self
                                     .replace_chat_widget_with_app_server_thread(tui, resumed)
                                     .await
@@ -5192,6 +5208,7 @@ mod tests {
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
     use codex_core::config::types::ModelAvailabilityNuxConfig;
+    use codex_core::config::types::ResumeHistoryMode;
     use codex_otel::SessionTelemetry;
     use codex_protocol::ThreadId;
     use codex_protocol::config_types::CollaborationMode;
@@ -5394,6 +5411,92 @@ mod tests {
             App::should_handle_active_thread_events(wait_for_fork, true),
             true
         );
+    }
+
+    #[tokio::test]
+    async fn apply_resume_history_mode_since_last_compaction_keeps_suffix_only() {
+        let mut config = ConfigBuilder::default().build().await.expect("config");
+        config.tui_resume_history = ResumeHistoryMode::SinceLastCompaction;
+
+        let turns = vec![
+            Turn {
+                id: "turn-1".to_string(),
+                status: TurnStatus::Completed,
+                error: None,
+                items: vec![ThreadItem::AgentMessage {
+                    id: "msg-1".to_string(),
+                    text: "before compaction".to_string(),
+                    phase: None,
+                    memory_citation: None,
+                }],
+            },
+            Turn {
+                id: "turn-2".to_string(),
+                status: TurnStatus::Completed,
+                error: None,
+                items: vec![
+                    ThreadItem::ContextCompaction {
+                        id: "compact-1".to_string(),
+                    },
+                    ThreadItem::AgentMessage {
+                        id: "msg-2".to_string(),
+                        text: "after compaction".to_string(),
+                        phase: None,
+                        memory_citation: None,
+                    },
+                ],
+            },
+        ];
+
+        let truncated = apply_resume_history_mode(&config, turns);
+
+        assert_eq!(truncated.len(), 1);
+        assert_eq!(truncated[0].id, "turn-2");
+        assert_eq!(
+            truncated[0].items,
+            vec![
+                ThreadItem::ContextCompaction {
+                    id: "compact-1".to_string(),
+                },
+                ThreadItem::AgentMessage {
+                    id: "msg-2".to_string(),
+                    text: "after compaction".to_string(),
+                    phase: None,
+                    memory_citation: None,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_resume_history_mode_full_keeps_entire_transcript() {
+        let mut config = ConfigBuilder::default().build().await.expect("config");
+        config.tui_resume_history = ResumeHistoryMode::Full;
+
+        let turns = vec![
+            Turn {
+                id: "turn-1".to_string(),
+                status: TurnStatus::Completed,
+                error: None,
+                items: vec![ThreadItem::AgentMessage {
+                    id: "msg-1".to_string(),
+                    text: "before compaction".to_string(),
+                    phase: None,
+                    memory_citation: None,
+                }],
+            },
+            Turn {
+                id: "turn-2".to_string(),
+                status: TurnStatus::Completed,
+                error: None,
+                items: vec![ThreadItem::ContextCompaction {
+                    id: "compact-1".to_string(),
+                }],
+            },
+        ];
+
+        let full = apply_resume_history_mode(&config, turns.clone());
+        assert_eq!(full, turns);
     }
 
     #[tokio::test]

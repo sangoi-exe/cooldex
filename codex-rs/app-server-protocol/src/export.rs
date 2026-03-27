@@ -179,6 +179,12 @@ pub fn generate_ts_with_options(
         }
     }
 
+    if !ts_files.is_empty() {
+        for file in &ts_files {
+            normalize_generated_ts_file(file)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1904,6 +1910,34 @@ fn prepend_header_if_missing(path: &Path) -> Result<()> {
         .with_context(|| format!("Failed to write header to {}", path.display()))?;
     f.write_all(content.as_bytes())
         .with_context(|| format!("Failed to write content to {}", path.display()))?;
+    Ok(())
+}
+
+pub(crate) fn normalize_generated_ts_contents(contents: &str) -> String {
+    // Merge-safety anchor: app-server TypeScript export normalization must stay
+    // aligned with schema_fixtures.rs so vendored schema refreshes and fixture
+    // comparisons agree on newline and trailing-whitespace handling.
+    let normalized_newlines = contents.replace("\r\n", "\n").replace('\r', "\n");
+    normalized_newlines
+        .split('\n')
+        .map(|line| line.trim_end_matches([' ', '\t']))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_generated_ts_file(path: &Path) -> Result<()> {
+    let mut content = String::new();
+    fs::File::open(path)
+        .with_context(|| format!("Failed to open {} for reading", path.display()))?
+        .read_to_string(&mut content)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+
+    let normalized = normalize_generated_ts_contents(&content);
+    if normalized == content {
+        return Ok(());
+    }
+
+    fs::write(path, normalized).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }
 

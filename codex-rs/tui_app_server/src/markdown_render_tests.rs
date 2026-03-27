@@ -1132,7 +1132,7 @@ HTML block:
 <div style="border:1px solid #ccc;padding:2px">inline block</div>
 Escapes: \_underscores\_, backslash \\, ticks ``code with `backtick` inside``.
 Emoji shortcodes: :sparkles: :tada: (if supported).
-Hard break test (line ends with two spaces)
+Hard break test (line ends with two spaces)__HARD_BREAK__
 Next line should be close to previous.
 Footnote reference here[^1] and another[^longnote].
 Horizontal rule with asterisks:
@@ -1156,9 +1156,10 @@ Character entities: &amp; &lt; &gt; &quot; &#39;
 Escaped pipe in text: a \| b \| c.
 URL with parentheses: [link](https://example.com/path_(with)_parens).
 [r1]: https://example.com/ref "Reference link title"
-"#;
+"#
+    .replace("__HARD_BREAK__", "  ");
 
-    let text = render_markdown_text(md);
+    let text = render_markdown_text(&md);
     // Convert to plain text lines for snapshot (ignore styles)
     let rendered = text
         .lines
