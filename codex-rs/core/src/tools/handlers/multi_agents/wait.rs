@@ -3,11 +3,13 @@
 
 use super::*;
 use crate::agent::status::is_final;
+use crate::error::CodexErr;
 use codex_protocol::protocol::CollabWaitReturnWhen;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch::Receiver;
 use tokio::time::Instant;

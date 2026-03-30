@@ -1,4 +1,5 @@
 use super::*;
+use crate::context_manager::is_user_turn_boundary;
 use crate::prompt_gc_rollout::compaction_replacement_history_is_hydratable;
 use crate::prompt_gc_rollout::is_private_prompt_gc_compaction_marker;
 use std::collections::HashSet;
@@ -233,9 +234,12 @@ impl Session {
                         );
                     }
                 }
-                RolloutItem::ResponseItem(_)
-                | RolloutItem::EventMsg(_)
-                | RolloutItem::SessionMeta(_) => {}
+                RolloutItem::ResponseItem(response_item) => {
+                    let active_segment =
+                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    active_segment.counts_as_user_turn |= is_user_turn_boundary(response_item);
+                }
+                RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => {}
             }
 
             if base_replacement_history.is_some()

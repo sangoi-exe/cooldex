@@ -8,7 +8,6 @@
 use crate::agent::AgentRuntimeState;
 use crate::agent::AgentStatus;
 use crate::agent::agent_resolver::resolve_agent_target;
-use crate::agent::agent_resolver::resolve_agent_targets;
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::codex::Session;
 use crate::codex::TurnContext;
@@ -17,10 +16,10 @@ use crate::config::ConfigOverrides;
 use crate::config::deserialize_config_toml_with_base;
 use crate::error::CodexErr;
 use crate::function_tool::FunctionCallError;
-use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+pub(crate) use crate::tools::handlers::multi_agents_common::*;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
@@ -51,57 +50,29 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub(crate) fn parse_agent_id_target(target: &str) -> Result<ThreadId, FunctionCallError> {
+    ThreadId::from_string(target).map_err(|err| {
+        FunctionCallError::RespondToModel(format!("invalid agent id {target}: {err:?}"))
+    })
+}
+
+pub(crate) async fn resolve_agent_targets(
+    session: &Arc<Session>,
+    turn: &Arc<TurnContext>,
+    targets: Vec<String>,
+) -> Result<Vec<ThreadId>, FunctionCallError> {
+    let mut resolved = Vec::with_capacity(targets.len());
+    for target in targets {
+        resolved.push(resolve_agent_target(session, turn, &target).await?);
+    }
+    Ok(resolved)
+}
+
 pub(crate) use close_agent::Handler as CloseAgentHandler;
 pub(crate) use resume_agent::Handler as ResumeAgentHandler;
 pub(crate) use send_input::Handler as SendInputHandler;
 pub(crate) use spawn::Handler as SpawnAgentHandler;
 pub(crate) use wait::Handler as WaitAgentHandler;
-
-/// Minimum wait timeout to prevent tight polling loops from burning CPU.
-pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
-pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
-pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = 3600 * 1000;
-
-fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
-    match payload {
-        ToolPayload::Function { arguments } => Ok(arguments),
-        _ => Err(FunctionCallError::RespondToModel(
-            "collab handler received unsupported payload".to_string(),
-        )),
-    }
-}
-
-fn tool_output_json_text<T>(value: &T, tool_name: &str) -> String
-where
-    T: Serialize,
-{
-    serde_json::to_string(value).unwrap_or_else(|err| {
-        JsonValue::String(format!("failed to serialize {tool_name} result: {err}")).to_string()
-    })
-}
-
-fn tool_output_response_item<T>(
-    call_id: &str,
-    payload: &ToolPayload,
-    value: &T,
-    success: Option<bool>,
-    tool_name: &str,
-) -> ResponseInputItem
-where
-    T: Serialize,
-{
-    FunctionToolOutput::from_text(tool_output_json_text(value, tool_name), success)
-        .to_response_item(call_id, payload)
-}
-
-fn tool_output_code_mode_result<T>(value: &T, tool_name: &str) -> JsonValue
-where
-    T: Serialize,
-{
-    serde_json::to_value(value).unwrap_or_else(|err| {
-        JsonValue::String(format!("failed to serialize {tool_name} result: {err}"))
-    })
-}
 
 pub mod close_agent;
 mod resume_agent;
@@ -232,24 +203,6 @@ fn parse_collab_input(
     }
 }
 
-fn input_preview(items: &[UserInput]) -> String {
-    let parts: Vec<String> = items
-        .iter()
-        .map(|item| match item {
-            UserInput::Text { text, .. } => text.clone(),
-            UserInput::Image { .. } => "[image]".to_string(),
-            UserInput::LocalImage { path } => format!("[local_image:{}]", path.display()),
-            UserInput::Skill { name, path } => {
-                format!("[skill:${name}]({})", path.display())
-            }
-            UserInput::Mention { name, path } => format!("[mention:${name}]({path})"),
-            _ => "[input]".to_string(),
-        })
-        .collect();
-
-    parts.join("\n")
-}
-
 /// Builds the base config snapshot for a newly spawned sub-agent.
 ///
 /// The returned config starts from the parent's effective config and then refreshes the
@@ -373,7 +326,7 @@ fn apply_spawn_agent_profile_override(
         merged_config,
         ConfigOverrides {
             config_profile: Some(profile_name.to_string()),
-            cwd: Some(config.cwd.clone()),
+            cwd: Some(config.cwd.clone().to_path_buf()),
             codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
             main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
             js_repl_node_path: config.js_repl_node_path.clone(),
@@ -547,7 +500,6 @@ fn collab_wait_state(
         timed_out,
     }
 }
-
 #[cfg(test)]
 #[path = "multi_agents_tests.rs"]
 mod tests;

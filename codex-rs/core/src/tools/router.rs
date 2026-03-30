@@ -7,9 +7,7 @@ use crate::sandboxing::SandboxPermissions;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
-use crate::tools::discoverable::DiscoverableTool;
 use crate::tools::registry::AnyToolResult;
-use crate::tools::registry::ConfiguredToolSpec;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::registry::ToolRegistryBuilder;
 use crate::tools::spec::ToolsConfig;
@@ -19,6 +17,8 @@ use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SearchToolCallParams;
 use codex_protocol::models::ShellToolCallParams;
+use codex_tools::ConfiguredToolSpec;
+use codex_tools::DiscoverableTool;
 use rmcp::model::Tool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -67,7 +67,7 @@ impl ToolRouter {
             specs
                 .iter()
                 .filter_map(|configured_tool| {
-                    if !codex_code_mode::is_code_mode_nested_tool(configured_tool.spec.name()) {
+                    if !codex_code_mode::is_code_mode_nested_tool(configured_tool.name()) {
                         Some(configured_tool.spec.clone())
                     } else {
                         None
@@ -118,7 +118,7 @@ impl ToolRouter {
     pub fn find_spec(&self, tool_name: &str) -> Option<ToolSpec> {
         self.specs
             .iter()
-            .find(|config| config.spec.name() == tool_name)
+            .find(|config| config.name() == tool_name)
             .map(|config| config.spec.clone())
     }
 
@@ -126,7 +126,7 @@ impl ToolRouter {
         self.specs
             .iter()
             .filter(|config| config.supports_parallel_tool_calls)
-            .any(|config| config.spec.name() == tool_name)
+            .any(|config| config.name() == tool_name)
     }
 
     #[instrument(level = "trace", skip_all, err)]

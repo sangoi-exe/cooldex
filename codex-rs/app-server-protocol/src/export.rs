@@ -2332,10 +2332,6 @@ mod tests {
             command_execution_request_approval_ts.contains("additionalPermissions"),
             true
         );
-        assert_eq!(
-            command_execution_request_approval_ts.contains("skillMetadata"),
-            true
-        );
 
         Ok(())
     }
@@ -2728,7 +2724,7 @@ export type Config = { stableField: Keep, unstableField: string | null } & ({ [k
     fn generate_json_filters_experimental_fields_and_methods() -> Result<()> {
         let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
         fs::create_dir(&output_dir)?;
-        generate_json_with_experimental(&output_dir, false)?;
+        generate_json_with_experimental(&output_dir, /*experimental_api*/ false)?;
 
         let thread_start_json =
             fs::read_to_string(output_dir.join("v2").join("ThreadStartParams.json"))?;
@@ -2737,10 +2733,6 @@ export type Config = { stableField: Keep, unstableField: string | null } & ({ [k
             fs::read_to_string(output_dir.join("CommandExecutionRequestApprovalParams.json"))?;
         assert_eq!(
             command_execution_request_approval_json.contains("additionalPermissions"),
-            false
-        );
-        assert_eq!(
-            command_execution_request_approval_json.contains("skillMetadata"),
             false
         );
 
@@ -2755,7 +2747,6 @@ export type Config = { stableField: Keep, unstableField: string | null } & ({ [k
             fs::read_to_string(output_dir.join("codex_app_server_protocol.schemas.json"))?;
         assert_eq!(bundle_json.contains("mockExperimentalField"), false);
         assert_eq!(bundle_json.contains("additionalPermissions"), false);
-        assert_eq!(bundle_json.contains("skillMetadata"), false);
         assert_eq!(bundle_json.contains("MockExperimentalMethodParams"), false);
         assert_eq!(
             bundle_json.contains("MockExperimentalMethodResponse"),
@@ -2765,7 +2756,6 @@ export type Config = { stableField: Keep, unstableField: string | null } & ({ [k
             fs::read_to_string(output_dir.join("codex_app_server_protocol.v2.schemas.json"))?;
         assert_eq!(flat_v2_bundle_json.contains("mockExperimentalField"), false);
         assert_eq!(flat_v2_bundle_json.contains("additionalPermissions"), false);
-        assert_eq!(flat_v2_bundle_json.contains("skillMetadata"), false);
         assert_eq!(
             flat_v2_bundle_json.contains("MockExperimentalMethodParams"),
             false

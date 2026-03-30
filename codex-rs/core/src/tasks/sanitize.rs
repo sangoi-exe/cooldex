@@ -2243,7 +2243,7 @@ mod tests {
         let items = [input_text_message("user", "hello")];
         state.record_items(
             items.iter(),
-            crate::truncate::TruncationPolicy::Tokens(4_096),
+            codex_utils_output_truncation::TruncationPolicy::Tokens(4_096),
         );
 
         let baseline = state.history_snapshot_lenient();
@@ -2263,7 +2263,7 @@ mod tests {
         ];
         state.record_items(
             items.iter(),
-            crate::truncate::TruncationPolicy::Tokens(4_096),
+            codex_utils_output_truncation::TruncationPolicy::Tokens(4_096),
         );
         let baseline = state.history_snapshot_lenient();
 
@@ -2303,7 +2303,7 @@ mod tests {
         ];
         state.record_items(
             items.iter(),
-            crate::truncate::TruncationPolicy::Tokens(4_096),
+            codex_utils_output_truncation::TruncationPolicy::Tokens(4_096),
         );
         let baseline = state.history_snapshot_lenient();
 
@@ -2327,7 +2327,7 @@ mod tests {
         let baseline = [input_text_message("user", "baseline")];
         state.record_items(
             baseline.iter(),
-            crate::truncate::TruncationPolicy::Tokens(4_096),
+            codex_utils_output_truncation::TruncationPolicy::Tokens(4_096),
         );
         let baseline_snapshot = state.history_snapshot_lenient();
 
@@ -2348,7 +2348,7 @@ mod tests {
         ];
         state.record_items(
             extra_items.iter(),
-            crate::truncate::TruncationPolicy::Tokens(4_096),
+            codex_utils_output_truncation::TruncationPolicy::Tokens(4_096),
         );
 
         let sanitize_generated_non_tool_items = [input_text_message(
@@ -2379,7 +2379,7 @@ mod tests {
         ];
         state.record_items(
             baseline.iter(),
-            crate::truncate::TruncationPolicy::Tokens(4_096),
+            codex_utils_output_truncation::TruncationPolicy::Tokens(4_096),
         );
         let baseline_snapshot = state.history_snapshot_lenient();
 
@@ -2390,7 +2390,7 @@ mod tests {
         ];
         state.record_items(
             extra_items.iter(),
-            crate::truncate::TruncationPolicy::Tokens(4_096),
+            codex_utils_output_truncation::TruncationPolicy::Tokens(4_096),
         );
         state.set_context_inclusion(&[0], false);
 
@@ -2435,7 +2435,7 @@ mod tests {
         let baseline = [input_text_message("user", "baseline")];
         state.record_items(
             baseline.iter(),
-            crate::truncate::TruncationPolicy::Tokens(4_096),
+            codex_utils_output_truncation::TruncationPolicy::Tokens(4_096),
         );
         let baseline_snapshot = state.history_snapshot_lenient();
 
@@ -2446,7 +2446,7 @@ mod tests {
         ];
         state.record_items(
             extra_items.iter(),
-            crate::truncate::TruncationPolicy::Tokens(4_096),
+            codex_utils_output_truncation::TruncationPolicy::Tokens(4_096),
         );
         state.set_context_inclusion(&[0], false);
 

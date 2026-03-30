@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::control::SpawnAgentOptions;
+use crate::agent::control::render_input_preview;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
 
@@ -35,13 +36,14 @@ impl ToolHandler for Handler {
             .as_deref()
             .map(str::trim)
             .filter(|role| !role.is_empty());
+        let requested_task_name = args.task_name.clone();
         let profile_name = args
             .profile
             .as_deref()
             .map(str::trim)
             .filter(|profile| !profile.is_empty());
-        let input_items = parse_collab_input(args.message, args.items)?;
-        let prompt = input_preview(&input_items);
+        let initial_operation = parse_collab_input(args.message, args.items)?.into();
+        let prompt = render_input_preview(&initial_operation);
         let session_source = turn.session_source.clone();
         let child_depth = next_thread_spawn_depth(&session_source);
         let max_depth = turn.config.agent_max_depth;
@@ -92,13 +94,13 @@ impl ToolHandler for Handler {
             .agent_control
             .spawn_agent_with_metadata(
                 config,
-                input_items,
+                initial_operation,
                 Some(thread_spawn_source(
                     session.conversation_id,
                     &turn.session_source,
                     child_depth,
                     role_name,
-                    args.task_name.clone(),
+                    requested_task_name.clone(),
                 )?),
                 SpawnAgentOptions {
                     fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
@@ -153,7 +155,6 @@ impl ToolHandler for Handler {
             .and_then(|snapshot| snapshot.reasoning_effort)
             .or(configured_reasoning_effort);
         let nickname = new_agent_nickname.clone();
-        let task_name = new_agent_path.clone();
         session
             .send_event(
                 &turn,
@@ -179,6 +180,15 @@ impl ToolHandler for Handler {
             /*inc*/ 1,
             &[("role", role_tag)],
         );
+        let task_name = if requested_task_name.is_some() {
+            Some(new_agent_path.ok_or_else(|| {
+                FunctionCallError::Fatal(format!(
+                    "spawned agent {new_thread_id} missing canonical task name after successful spawn"
+                ))
+            })?)
+        } else {
+            None
+        };
 
         Ok(SpawnAgentResult {
             agent_id: task_name.is_none().then(|| new_thread_id.to_string()),

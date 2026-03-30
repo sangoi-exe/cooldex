@@ -1,7 +1,10 @@
 //! Session-wide mutable state.
 
+use codex_instructions::AGENTS_MD_FRAGMENT;
+use codex_instructions::SKILL_FRAGMENT;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -9,8 +12,6 @@ use std::collections::HashSet;
 use crate::codex::PreviousTurnSettings;
 use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
-use crate::contextual_user_message::AGENTS_MD_FRAGMENT;
-use crate::contextual_user_message::SKILL_FRAGMENT;
 use crate::contextual_user_message::is_prompt_gc_contextual_fragment;
 use crate::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 use crate::protocol::PINNED_NOTES_CLOSE_TAG;
@@ -24,18 +25,17 @@ use crate::protocol::TokenUsageInfo;
 use crate::response_item_utils::is_unified_exec_output_frame;
 use crate::response_item_utils::is_unified_exec_token_qty_marker_line;
 use crate::rid::rid_to_string;
-use crate::sandboxing::merge_permission_profiles;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::state::ContextItemSummary;
 use crate::state::ContextItemsEvent;
 use crate::state::ContextOverlay;
 use crate::state::PruneCategory;
-use crate::truncate::TruncationPolicy;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::TurnContextItem;
+use codex_utils_output_truncation::TruncationPolicy;
 
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {

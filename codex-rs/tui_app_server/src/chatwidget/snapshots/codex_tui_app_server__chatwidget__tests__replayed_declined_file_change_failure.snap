@@ -1,9 +1,0 @@
----
-source: tui_app_server/src/chatwidget/tests.rs
-expression: rendered
----
-• Added foo.txt (+1 -0)
-    1 +hello from resume
-
-
-✘ Failed to apply patch

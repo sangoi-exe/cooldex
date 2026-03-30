@@ -14,12 +14,13 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
-codex-protocol = { workspace = true }
 codex-experimental-api-macros = { workspace = true }
 # Merge-safety anchor: resume-history replay reconstructs shell/unified-exec
 # rows from persisted protocol state through this shared parser dependency; keep
 # this dependency aligned with `thread_history.rs` when syncing upstream.
 codex-shell-command = { workspace = true }
+codex-git-utils = { workspace = true }
+codex-protocol = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
