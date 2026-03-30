@@ -14,6 +14,7 @@ use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::PluginReadParams;
 use codex_app_server_protocol::PluginReadResponse;
 use codex_chatgpt::connectors::AppInfo;
+use codex_core::PromptGcActivityEdge;
 use codex_file_search::FileMatch;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
@@ -105,7 +106,7 @@ pub(crate) enum AppEvent {
 
     /// Private live prompt-GC activity for the primary thread.
     PromptGcActivity {
-        active: bool,
+        edge: PromptGcActivityEdge,
     },
 
     /// Merge-safety anchor: prompt-GC completion refresh stays on the TUI-private app event bus
@@ -117,7 +118,7 @@ pub(crate) enum AppEvent {
     /// Private live prompt-GC activity for a non-primary thread.
     ThreadPromptGcActivity {
         thread_id: ThreadId,
-        active: bool,
+        edge: PromptGcActivityEdge,
     },
 
     /// Private prompt-GC completion context-usage refresh for a non-primary thread.

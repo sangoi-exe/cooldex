@@ -1,5 +1,5 @@
 // Merge-safety anchor: child-thread export/import and first-user-message filtering stay
-// aligned with workspace-local sub-agent isolation and preview invariants during syncs.
+// aligned with workspace-local sub-agent inheritance and preview invariants during syncs.
 
 use crate::agent::AgentRuntimeState;
 use crate::agent::AgentStatus;
@@ -9,7 +9,6 @@ use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::resolve_role_config;
 use crate::agent::status::is_final;
 use crate::codex_thread::ThreadConfigSnapshot;
-use crate::contextual_user_message::AGENTS_MD_FRAGMENT;
 use crate::contextual_user_message::ENVIRONMENT_CONTEXT_FRAGMENT;
 use crate::contextual_user_message::PINNED_NOTES_FRAGMENT;
 use crate::contextual_user_message::REASONING_CONTEXT_FRAGMENT;
@@ -136,13 +135,12 @@ fn export_forked_subagent_response_items(items: Vec<ResponseItem>) -> Vec<Respon
         .collect()
 }
 
-fn is_forked_subagent_prompt_fragment(content_item: &ContentItem) -> bool {
+fn is_forked_subagent_filtered_prompt_fragment(content_item: &ContentItem) -> bool {
     let ContentItem::InputText { text } = content_item else {
         return false;
     };
 
-    AGENTS_MD_FRAGMENT.matches_text(text)
-        || ENVIRONMENT_CONTEXT_FRAGMENT.matches_text(text)
+    ENVIRONMENT_CONTEXT_FRAGMENT.matches_text(text)
         || SKILL_FRAGMENT.matches_text(text)
         || TOOL_CONTEXT_FRAGMENT.matches_text(text)
         || REASONING_CONTEXT_FRAGMENT.matches_text(text)
@@ -159,7 +157,8 @@ fn export_forked_subagent_response_item(item: ResponseItem) -> Option<ResponseIt
             end_turn,
             phase,
         } if role == "user" => {
-            content.retain(|content_item| !is_forked_subagent_prompt_fragment(content_item));
+            content
+                .retain(|content_item| !is_forked_subagent_filtered_prompt_fragment(content_item));
             if content.is_empty() {
                 None
             } else {
@@ -176,8 +175,7 @@ fn export_forked_subagent_response_item(item: ResponseItem) -> Option<ResponseIt
     }
 }
 
-fn export_forked_subagent_turn_context(mut turn_context: TurnContextItem) -> TurnContextItem {
-    turn_context.user_instructions = None;
+fn export_forked_subagent_turn_context(turn_context: TurnContextItem) -> TurnContextItem {
     turn_context
 }
 

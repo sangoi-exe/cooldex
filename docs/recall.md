@@ -15,6 +15,7 @@
   - `EventMsg::ContextCompacted(_)`, or
   - a legacy/standard non-prompt-gc `RolloutItem::Compacted` with `replacement_history: None` (`boundary.last_boundary_kind = "compacted_marker"`), or
   - `RolloutItem::Compacted` with `replacement_history: Some(...)` from standard compaction, or from prompt-gc apply only when that marker is immediately followed by its persisted `TurnContext` item (`boundary.last_boundary_kind = "replacement_history_compacted"`).
+- Legacy message-only prompt-gc markers (`message == "[internal] prompt_gc"` with `prompt_gc: null`) are treated as incompatible private artifacts: they do not count as upper/lower boundaries, they do not hydrate `replacement_history`, and surviving copies disable future prompt-gc for that session instead of being replayed as standard compaction.
 - If that lower boundary is `replacement_history_compacted`, `recall` starts from the sanitized `replacement_history` persisted on that boundary, hydrates assistant/reasoning items plus prompt-gc context notes stored as tagged note messages, and then appends newer rollout items after the marker until the latest compaction marker.
 - Otherwise, returned scan starts at `lower_boundary_index + 1`.
 - If no lower boundary marker exists, scan starts at rollout index `0`.
@@ -26,7 +27,7 @@
 
 - Includes assistant messages, reasoning text, and prompt-gc tool/reasoning context notes hydrated from `replacement_history` boundaries.
 - Excludes ordinary user messages, tool calls, and tool outputs.
-- Reasoning uses summary text first and falls back to reasoning content when needed.
+- Reasoning uses summary text first and falls back to reasoning content when needed; opaque encrypted-only reasoning is intentionally skipped because it has no semantic payload to hydrate.
 - Applies `recall_kbytes_limit` (default `256` KiB) as a byte cap from the tail of matching items.
 
 ### Output Modes

@@ -713,7 +713,6 @@ async fn spawn_agent_role_preserves_role_developer_instructions() {
         child_config.developer_instructions.as_deref(),
         Some("role-dev")
     );
-    assert_eq!(child_config.user_instructions, None);
 }
 
 #[tokio::test]
@@ -2170,6 +2169,12 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     let mut base_config = (*turn.config).clone();
     base_config.subagent_base_instructions = Some("base".to_string());
     base_config.developer_instructions = Some("base-dev".to_string());
+    base_config.user_instructions = Some("base-user".to_string());
+    base_config.project_doc_max_bytes = 4_321;
+    base_config
+        .features
+        .enable(Feature::ChildAgentsMd)
+        .expect("child agents md should enable");
     turn.config = Arc::new(base_config.clone());
     turn.developer_instructions = Some("resolved-dev".to_string());
     turn.compact_prompt = Some("compact".to_string());
@@ -2204,7 +2209,6 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     expected.model_reasoning_effort = turn.reasoning_effort;
     expected.model_reasoning_summary = Some(turn.reasoning_summary);
     expected.developer_instructions = Some("base-dev".to_string());
-    expected.user_instructions = None;
     expected.compact_prompt = turn.compact_prompt.clone();
     expected.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
     expected.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
@@ -2223,13 +2227,11 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     expected.permissions.network_sandbox_policy = network_sandbox_policy;
     expected.pos_compact_instructions =
         Some(crate::codex::SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY.to_string());
-    expected.project_doc_max_bytes = 0;
-    let _ = expected.features.disable(Feature::ChildAgentsMd);
     assert_eq!(config, expected);
 }
 
 #[tokio::test]
-async fn build_agent_spawn_config_clears_user_instructions() {
+async fn build_agent_spawn_config_preserves_user_instructions() {
     let (_session, mut turn) = make_session_and_context().await;
     let mut base_config = (*turn.config).clone();
     base_config.user_instructions = Some("base-user".to_string());
@@ -2238,7 +2240,7 @@ async fn build_agent_spawn_config_clears_user_instructions() {
 
     let config = build_agent_spawn_config(&turn).expect("spawn config");
 
-    assert_eq!(config.user_instructions, None);
+    assert_eq!(config.user_instructions.as_deref(), Some("base-user"));
 }
 
 #[tokio::test]
@@ -2247,6 +2249,12 @@ async fn build_agent_resume_config_clears_base_instructions() {
     let mut base_config = (*turn.config).clone();
     base_config.base_instructions = Some("caller-base".to_string());
     base_config.developer_instructions = Some("resume-dev".to_string());
+    base_config.user_instructions = Some("resume-user".to_string());
+    base_config.project_doc_max_bytes = 2_468;
+    base_config
+        .features
+        .enable(Feature::ChildAgentsMd)
+        .expect("child agents md should enable");
     turn.config = Arc::new(base_config);
     turn.developer_instructions = Some("resolved-resume-dev".to_string());
     turn.approval_policy
@@ -2262,7 +2270,6 @@ async fn build_agent_resume_config_clears_base_instructions() {
     expected.model_reasoning_effort = turn.reasoning_effort;
     expected.model_reasoning_summary = Some(turn.reasoning_summary);
     expected.developer_instructions = Some("resume-dev".to_string());
-    expected.user_instructions = None;
     expected.compact_prompt = turn.compact_prompt.clone();
     expected.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
     expected.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
@@ -2279,7 +2286,5 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .expect("sandbox policy set");
     expected.pos_compact_instructions =
         Some(crate::codex::SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY.to_string());
-    expected.project_doc_max_bytes = 0;
-    let _ = expected.features.disable(Feature::ChildAgentsMd);
     assert_eq!(config, expected);
 }

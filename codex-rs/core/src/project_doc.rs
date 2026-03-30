@@ -1,6 +1,7 @@
 //! Merge-safety anchor: project-doc assembly is a customized seam; merge work must
-//! preserve the AGENTS/ChildAgentsMd behavior while staying structurally close to
-//! upstream when the surrounding assembly flow changes.
+//! preserve the AGENTS/ChildAgentsMd behavior for both lead and child sessions
+//! while staying structurally close to upstream when the surrounding assembly
+//! flow changes.
 //!
 //! Project-level documentation discovery.
 //!
@@ -109,8 +110,8 @@ pub(crate) async fn get_user_instructions(config: &Config) -> Option<String> {
         output.push_str(&js_repl_section);
     }
 
-    // Merge-safety anchor: lead threads may append ChildAgentsMd guidance here,
-    // while child threads explicitly disable this feature in multi_agents.rs.
+    // Merge-safety anchor: lead and child threads may append ChildAgentsMd
+    // guidance here when the feature stays enabled on their effective config.
     if config.features.enabled(Feature::ChildAgentsMd) {
         if !output.is_empty() {
             output.push_str("\n\n");

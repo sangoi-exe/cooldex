@@ -2722,9 +2722,9 @@ impl Config {
             .or(cfg.subagent_instructions_file.as_ref());
         // Merge-safety anchor: child-agent base instructions come from
         // `subagent_instructions_file`; spawn/resume flows in multi_agents.rs
-        // still strip inherited user/project-doc prompt state, but child
-        // `developer_instructions` may now remain active for role/local
-        // specialization.
+        // still inherit AGENTS/project-doc prompt state from the workspace
+        // while letting child `developer_instructions` remain active for
+        // role/local specialization.
         let subagent_base_instructions = Self::try_read_non_empty_file(
             subagent_instructions_path,
             "sub-agent instructions file",

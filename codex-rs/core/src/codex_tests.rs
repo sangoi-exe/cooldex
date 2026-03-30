@@ -472,9 +472,6 @@ async fn prompt_gc_sidecar_no_eligible_chunks_complete_without_visible_accountin
     )
     .await;
 
-    let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
-    assert_eq!(status.last_error, None);
     session.flush_rollout().await;
     assert_eq!(
         prompt_gc_rollout_markers(&rollout_path).await,
@@ -549,6 +546,48 @@ fn prompt_gc_plan_build_failure_details_preserves_structured_state_hash_mismatch
     assert!(details.blocks_remaining_turn);
 }
 
+#[test]
+fn prompt_gc_plan_build_failure_details_blocks_on_incompatible_rollout_history() {
+    let error = FunctionCallError::RespondToModel(
+        json!({
+            "mode": "error",
+            "stop_reason": "incompatible_rollout_history",
+            "message": "Prompt GC disabled: incompatible rollout history.",
+        })
+        .to_string(),
+    );
+
+    let details = prompt_gc_plan_build_failure_details(&error);
+
+    assert_eq!(details.marker_stop_reason, "incompatible_rollout_history");
+    assert_eq!(
+        details.status_error,
+        "Prompt GC disabled: incompatible rollout history."
+    );
+    assert!(details.blocks_remaining_turn);
+}
+
+#[test]
+fn prompt_gc_plan_build_failure_details_blocks_when_rollout_recorder_is_missing() {
+    let error = FunctionCallError::RespondToModel(
+        json!({
+            "mode": "error",
+            "stop_reason": "missing_rollout_recorder",
+            "message": "Prompt GC disabled: missing rollout recorder.",
+        })
+        .to_string(),
+    );
+
+    let details = prompt_gc_plan_build_failure_details(&error);
+
+    assert_eq!(details.marker_stop_reason, "missing_rollout_recorder");
+    assert_eq!(
+        details.status_error,
+        "Prompt GC disabled: missing rollout recorder."
+    );
+    assert!(details.blocks_remaining_turn);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prompt_gc_sidecar_skips_when_function_call_output_lacks_token_qty_without_rollout_markers()
 {
@@ -603,8 +642,6 @@ async fn prompt_gc_sidecar_skips_when_function_call_output_lacks_token_qty_witho
 
     let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
     let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, None);
-    assert_eq!(status.last_error, None);
     assert_eq!(status.blocked_reason, None);
     assert!(sidecar.lock().await.checkpoint(&checkpoint_id).is_none());
     session.flush_rollout().await;
@@ -688,8 +725,6 @@ async fn prompt_gc_sidecar_final_answer_reasoning_burden_triggers_without_functi
     .await;
 
     let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
-    assert_eq!(status.last_error, None);
     assert_eq!(status.blocked_reason, None);
     session.flush_rollout().await;
     let markers = prompt_gc_rollout_markers(&rollout_path).await;
@@ -751,12 +786,32 @@ async fn prompt_gc_sidecar_final_answer_below_fallback_threshold_still_skips_wit
 
     let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
     let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, None);
-    assert_eq!(status.last_error, None);
     assert_eq!(status.blocked_reason, None);
     assert!(sidecar.lock().await.checkpoint(&checkpoint_id).is_none());
     session.flush_rollout().await;
-    assert_eq!(prompt_gc_rollout_markers(&rollout_path).await, Vec::new());
+    assert_eq!(
+        prompt_gc_rollout_markers(&rollout_path).await,
+        vec![
+            PromptGcCompactionMetadata {
+                checkpoint_id: checkpoint_id.clone(),
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::Started,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: None,
+                error_message: None,
+                applied_unit_count: None,
+            },
+            PromptGcCompactionMetadata {
+                checkpoint_id,
+                checkpoint_seq: 0,
+                kind: PromptGcOutcomeKind::NoEligibleChunks,
+                phase: Some(PromptGcExecutionPhase::Prepare),
+                stop_reason: Some("no_eligible_chunks".to_string()),
+                error_message: None,
+                applied_unit_count: Some(0),
+            },
+        ]
+    );
 
     let tool_calls = {
         let active = session.active_turn.lock().await;
@@ -838,8 +893,6 @@ async fn prompt_gc_sidecar_final_answer_tool_result_burden_triggers_without_func
     .await;
 
     let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
-    assert_eq!(status.last_error, None);
     assert_eq!(status.blocked_reason, None);
     session.flush_rollout().await;
     let markers = prompt_gc_rollout_markers(&rollout_path).await;
@@ -925,8 +978,6 @@ async fn prompt_gc_sidecar_final_answer_custom_tool_burden_triggers_without_func
     .await;
 
     let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
-    assert_eq!(status.last_error, None);
     assert_eq!(status.blocked_reason, None);
     session.flush_rollout().await;
     let markers = prompt_gc_rollout_markers(&rollout_path).await;
@@ -1016,8 +1067,6 @@ async fn prompt_gc_sidecar_function_call_output_token_qty_over_200_triggers_belo
     .await;
 
     let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
-    assert_eq!(status.last_error, None);
     assert_eq!(status.blocked_reason, None);
     session.flush_rollout().await;
     let markers = prompt_gc_rollout_markers(&rollout_path).await;
@@ -1107,8 +1156,6 @@ async fn prompt_gc_sidecar_function_call_output_token_qty_over_200_triggers_for_
     .await;
 
     let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
-    assert_eq!(status.last_error, None);
     assert_eq!(status.blocked_reason, None);
     session.flush_rollout().await;
     let markers = prompt_gc_rollout_markers(&rollout_path).await;
@@ -1190,8 +1237,6 @@ async fn prompt_gc_sidecar_ignores_ambiguous_exec_command_local_shell_collision_
 
     let checkpoint_id = format!("{}:prompt_gc:0", turn_context.sub_id);
     let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
-    assert_eq!(status.last_error, None);
     assert_eq!(status.blocked_reason, None);
     assert!(sidecar.lock().await.checkpoint(&checkpoint_id).is_none());
     session.flush_rollout().await;
@@ -1294,7 +1339,6 @@ async fn prompt_gc_state_hash_mismatch_blocks_remaining_turn() {
     .await;
 
     let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, None);
     assert!(status.blocked_reason.is_some(), "{status:?}");
     session.flush_rollout().await;
     let first_markers = prompt_gc_rollout_markers(&rollout_path).await;
@@ -1397,9 +1441,6 @@ async fn prompt_gc_sidecar_skips_after_tool_use_hooks() {
     )
     .await;
 
-    let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
-    assert_eq!(status.last_error, None);
     assert_eq!(
         hook_calls.load(Ordering::SeqCst),
         0,
@@ -1416,7 +1457,6 @@ async fn prompt_gc_persist_replacement_history_flush_failure_keeps_live_history_
         checkpoint_seq: 7,
         eligible_unit_count: 0,
         phase: codex_protocol::models::MessagePhase::Commentary,
-        assistant_item_id: None,
     };
     let history_before = {
         let mut state = session.state.lock().await;
@@ -1458,7 +1498,6 @@ async fn prompt_gc_persist_replacement_history_records_apply_succeeded_marker() 
         checkpoint_seq: 3,
         eligible_unit_count: 0,
         phase: codex_protocol::models::MessagePhase::Commentary,
-        assistant_item_id: None,
     };
     let replacement_history = vec![assistant_message("replacement history")];
 
@@ -1486,7 +1525,7 @@ async fn prompt_gc_persist_replacement_history_records_apply_succeeded_marker() 
             RolloutItem::Compacted(compacted)
                 if compacted.prompt_gc.is_some()
                     || compacted.message
-                        == crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER =>
+                        == codex_protocol::protocol::PROMPT_GC_COMPACTION_MESSAGE =>
             {
                 Some(compacted)
             }
@@ -1738,13 +1777,8 @@ async fn prompt_gc_sidecar_invalid_summary_payload_is_terminal_after_request() {
     .await;
 
     session.flush_rollout().await;
-    let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, None);
-    assert_eq!(
-        status.last_error.as_deref(),
-        Some("prompt_gc summary response requires a non-empty summaries list")
-    );
-    session.flush_rollout().await;
+    let invalid_summary_error =
+        "prompt_gc summary response requires a non-empty summaries list".to_string();
     assert_eq!(
         prompt_gc_rollout_markers(&rollout_path).await,
         vec![
@@ -1763,9 +1797,7 @@ async fn prompt_gc_sidecar_invalid_summary_payload_is_terminal_after_request() {
                 kind: PromptGcOutcomeKind::Failed,
                 phase: Some(PromptGcExecutionPhase::Summarize),
                 stop_reason: Some("invalid_summary_payload".to_string()),
-                error_message: Some(
-                    "prompt_gc summary response requires a non-empty summaries list".to_string(),
-                ),
+                error_message: Some(invalid_summary_error),
                 applied_unit_count: None,
             },
         ]
@@ -1892,15 +1924,17 @@ async fn prompt_gc_sidecar_incomplete_summary_payload_fails_apply_validation() {
     )
     .await;
 
-    let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, None);
-    let last_error = status.last_error.expect("apply validation error");
+    session.flush_rollout().await;
+    let rollout_markers = prompt_gc_rollout_markers(&rollout_path).await;
+    let last_error = rollout_markers
+        .last()
+        .and_then(|marker| marker.error_message.clone())
+        .expect("apply validation error");
     assert!(last_error.contains("invalid_summary_schema"));
     assert!(last_error.contains("prompt_gc requires summaries for every chunk_manifest entry"));
     assert!(last_error.contains("prompt_gc_chunk_1"));
-    session.flush_rollout().await;
     assert_eq!(
-        prompt_gc_rollout_markers(&rollout_path).await,
+        rollout_markers,
         vec![
             PromptGcCompactionMetadata {
                 checkpoint_id: checkpoint_id.clone(),
@@ -1976,9 +2010,12 @@ async fn prompt_gc_sidecar_non_reducing_summary_fails_apply_validation() {
     )
     .await;
 
-    let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, None);
-    let last_error = status.last_error.expect("apply validation error");
+    session.flush_rollout().await;
+    let rollout_markers = prompt_gc_rollout_markers(&rollout_path).await;
+    let last_error = rollout_markers
+        .last()
+        .and_then(|marker| marker.error_message.clone())
+        .expect("apply validation error");
     assert!(
         last_error.contains("prompt_gc summary did not reduce projected prompt cost"),
         "last_error={last_error}"
@@ -1988,9 +2025,8 @@ async fn prompt_gc_sidecar_non_reducing_summary_fails_apply_validation() {
         state.history_snapshot_lenient()
     };
     assert_eq!(history_after, history_before);
-    session.flush_rollout().await;
     assert_eq!(
-        prompt_gc_rollout_markers(&rollout_path).await,
+        rollout_markers,
         vec![
             PromptGcCompactionMetadata {
                 checkpoint_id: checkpoint_id.clone(),
@@ -2019,6 +2055,7 @@ async fn prompt_gc_sidecar_non_reducing_summary_fails_apply_validation() {
 async fn prompt_gc_hidden_usage_limit_auto_switches_and_retries() {
     let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
     let server = MockServer::start().await;
+    attach_rollout_recorder(&session).await;
     let observed_headers = Arc::new(std::sync::Mutex::new(Vec::new()));
     let auth_home = tempfile::tempdir().expect("create auth tempdir");
     let auth_store = crate::auth::AuthStore {
@@ -2100,8 +2137,6 @@ async fn prompt_gc_hidden_usage_limit_auto_switches_and_retries() {
     .await;
 
     let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
-    assert_eq!(status.last_error, None);
     assert_eq!(status.blocked_reason, None);
     assert_eq!(
         auth_manager
@@ -2109,7 +2144,7 @@ async fn prompt_gc_hidden_usage_limit_auto_switches_and_retries() {
             .into_iter()
             .find(|account| account.is_active)
             .map(|account| account.id),
-        Some("acc-1".to_string())
+        Some("chatgpt-user:user-12345:workspace:acc-1".to_string())
     );
     assert_eq!(
         *observed_headers
@@ -2174,9 +2209,11 @@ async fn prompt_gc_hidden_usage_limit_blocks_remaining_turn_after_unrecoverable_
     .await;
 
     let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, None);
-    assert!(status.last_error.is_some());
     assert!(status.blocked_reason.is_some());
+    let blocked_reason = status
+        .blocked_reason
+        .clone()
+        .expect("usage limit should block the turn");
     assert!(
         status
             .blocked_reason
@@ -2226,7 +2263,7 @@ async fn prompt_gc_hidden_usage_limit_blocks_remaining_turn_after_unrecoverable_
                 kind: PromptGcOutcomeKind::Failed,
                 phase: Some(PromptGcExecutionPhase::Request),
                 stop_reason: Some("usage_limit_reached".to_string()),
-                error_message: status.last_error,
+                error_message: Some(blocked_reason),
                 applied_unit_count: None,
             },
         ]
@@ -2269,12 +2306,14 @@ async fn prompt_gc_hidden_request_error_does_not_apply() {
     )
     .await;
 
-    let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_applied_checkpoint_seq, None);
-    assert!(status.last_error.is_some());
     session.flush_rollout().await;
+    let rollout_markers = prompt_gc_rollout_markers(&rollout_path).await;
+    let request_error = rollout_markers
+        .last()
+        .and_then(|marker| marker.error_message.clone())
+        .expect("request error must be recorded");
     assert_eq!(
-        prompt_gc_rollout_markers(&rollout_path).await,
+        rollout_markers,
         vec![
             PromptGcCompactionMetadata {
                 checkpoint_id: checkpoint_id.clone(),
@@ -2291,7 +2330,7 @@ async fn prompt_gc_hidden_request_error_does_not_apply() {
                 kind: PromptGcOutcomeKind::Failed,
                 phase: Some(PromptGcExecutionPhase::Request),
                 stop_reason: Some("request_failed".to_string()),
-                error_message: status.last_error,
+                error_message: Some(request_error),
                 applied_unit_count: None,
             },
         ]
@@ -2356,9 +2395,6 @@ async fn prompt_gc_sidecar_recovers_noted_apply_outcome_after_stream_failure() {
     )
     .await;
 
-    let status = sidecar.lock().await.status.clone();
-    assert_eq!(status.last_error, None);
-    assert_eq!(status.last_applied_checkpoint_seq, Some(0));
     assert!(
         rx.try_recv().is_err(),
         "noted hidden prompt_gc recovery should not emit visible events"
@@ -2722,8 +2758,12 @@ fn prompt_gc_large_reasoning_unit(id: &str) -> ResponseItem {
     ResponseItem::Reasoning {
         id: id.to_string(),
         summary: Vec::new(),
-        content: None,
-        encrypted_content: Some("x".repeat(2_000)),
+        content: Some(vec![
+            codex_protocol::models::ReasoningItemContent::ReasoningText {
+                text: "x".repeat(2_000),
+            },
+        ]),
+        encrypted_content: None,
     }
 }
 

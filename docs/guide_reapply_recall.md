@@ -11,17 +11,19 @@ This document lists the required maintenance touchpoints and validation when `re
 - Any unknown argument fails loud with `stop_reason = "invalid_contract"`.
 - The rollout source is always the current session rollout recorder.
 - The upper boundary is the latest non-observational compaction marker:
-  - a legacy `RolloutItem::Compacted` without prompt-gc observational metadata, or
+  - a legacy/standard `RolloutItem::Compacted` without prompt-gc observational metadata, excluding legacy message-only prompt-gc markers, or
   - a prompt-gc `RolloutItem::Compacted` only when it carries `replacement_history: Some(...)`.
 - For standard compactions, the matching `EventMsg::ContextCompacted(_)` is a legacy event emitted after the `ContextCompaction` item completes, so the current compaction's own legacy event is not part of the pre-`Compacted` scan.
 - The lower boundary is the most recent earlier marker before that upper boundary where the marker is either:
   - `EventMsg::ContextCompacted(_)` from a previous compaction, or
   - a legacy/standard non-prompt-gc `RolloutItem::Compacted` with `replacement_history: None` (`boundary.last_boundary_kind = "compacted_marker"`), or
   - `RolloutItem::Compacted` with `replacement_history: Some(...)` from a previous standard compaction, or from a previous prompt-gc apply only when that marker is immediately followed by its persisted `TurnContext` item (`boundary.last_boundary_kind = "replacement_history_compacted"`).
+- Legacy message-only prompt-gc markers (`message == "[internal] prompt_gc"` with `prompt_gc: null`) are private incompatibility evidence, not valid recall boundaries: skip them for boundary selection/hydration and let prompt-gc disable itself on sessions where one survives rollback discard.
 - If that lower boundary is `replacement_history_compacted`, recall hydrates the sanitized `replacement_history` stored on that marker as the base of the returned reasoning/assistant/context-note window, decodes tagged prompt-gc note messages into explicit recall item kinds, then appends newer matching rollout items after the marker.
 - Otherwise, returned rollout scan starts immediately after the lower boundary marker; when no lower boundary exists, scan starts at index `0`.
 - Returned items include assistant messages, reasoning text, and prompt-gc tool/reasoning context notes hydrated from replacement-history boundaries.
 - Returned items exclude ordinary user messages, tool calls, and tool outputs.
+- Opaque encrypted-only reasoning is intentionally skipped because it has no semantic payload to reapply.
 - `recall_kbytes_limit` applies a KiB byte cap from the tail of matching items.
 - `recall_debug` controls output shape:
   - unset/`false` (default): compact payload (`mode = "recall_pre_compact_compact"`)

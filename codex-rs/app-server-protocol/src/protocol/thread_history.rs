@@ -122,7 +122,12 @@ pub fn truncate_turns_since_last_context_compaction(turns: Vec<Turn>) -> Vec<Tur
 }
 
 fn is_prompt_gc_compaction_marker(compacted: &CompactedItem) -> bool {
-    compacted.prompt_gc.is_some() || compacted.message == "[internal] prompt_gc"
+    compacted.prompt_gc.is_some()
+}
+
+fn is_legacy_prompt_gc_compaction_marker(compacted: &CompactedItem) -> bool {
+    compacted.prompt_gc.is_none()
+        && compacted.message == codex_protocol::protocol::PROMPT_GC_COMPACTION_MESSAGE
 }
 
 fn assistant_message_text(content: &[ContentItem]) -> Option<String> {
@@ -1374,7 +1379,8 @@ impl ThreadHistoryBuilder {
         // Merge-safety anchor: hidden prompt_gc compaction markers must stay on
         // the private replay seam so app-server thread history does not mint
         // empty turns or synthetic ids from internal maintenance markers.
-        if is_prompt_gc_compaction_marker(payload) {
+        if is_prompt_gc_compaction_marker(payload) || is_legacy_prompt_gc_compaction_marker(payload)
+        {
             return;
         }
         self.ensure_turn().saw_compaction = true;
@@ -3039,7 +3045,7 @@ mod tests {
     #[test]
     fn ignores_prompt_gc_compaction_only_turn() {
         let items = vec![RolloutItem::Compacted(CompactedItem {
-            message: "[internal] prompt_gc".into(),
+            message: codex_protocol::protocol::PROMPT_GC_COMPACTION_MESSAGE.into(),
             replacement_history: None,
             prompt_gc: Some(PromptGcCompactionMetadata {
                 checkpoint_id: "turn-compact:prompt_gc:0".into(),
@@ -3059,7 +3065,7 @@ mod tests {
     #[test]
     fn ignores_legacy_prompt_gc_compaction_marker_without_metadata() {
         let items = vec![RolloutItem::Compacted(CompactedItem {
-            message: "[internal] prompt_gc".into(),
+            message: codex_protocol::protocol::PROMPT_GC_COMPACTION_MESSAGE.into(),
             replacement_history: None,
             prompt_gc: None,
         })];

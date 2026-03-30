@@ -7,6 +7,8 @@ use crate::config::AgentRoleConfig;
 use crate::config::Config;
 use crate::config::ConfigBuilder;
 use crate::config_loader::LoaderOverrides;
+use crate::contextual_user_message::AGENTS_MD_FRAGMENT;
+use crate::contextual_user_message::ENVIRONMENT_CONTEXT_FRAGMENT;
 use crate::contextual_user_message::SUBAGENT_NOTIFICATION_OPEN_TAG;
 use assert_matches::assert_matches;
 use chrono::Utc;
@@ -29,8 +31,8 @@ use tokio::time::sleep;
 use tokio::time::timeout;
 use toml::Value as TomlValue;
 
-// Merge-safety anchor: forked-child export tests must preserve role/lead
-// developer_instructions while still stripping user-only prompt state.
+// Merge-safety anchor: forked-child export tests must preserve inherited AGENTS/user prompt state
+// while still filtering the non-AGENTS contextual fragments that remain lead-only scaffolding.
 
 async fn test_config_with_cli_overrides(
     cli_overrides: Vec<(String, TomlValue)>,
@@ -505,7 +507,7 @@ async fn spawn_agent_can_fork_parent_thread_history() {
 }
 
 #[tokio::test]
-async fn export_forked_subagent_turn_context_preserves_developer_instructions() {
+async fn export_forked_subagent_turn_context_preserves_inherited_instructions() {
     let harness = AgentControlHarness::new().await;
     let (_thread_id, thread) = harness.start_thread().await;
     let mut turn_context = thread
@@ -519,13 +521,54 @@ async fn export_forked_subagent_turn_context_preserves_developer_instructions() 
 
     let exported = export_forked_subagent_turn_context(turn_context);
 
-    assert_eq!(exported.user_instructions, None);
+    assert_eq!(exported.user_instructions.as_deref(), Some("user-only"));
     assert_eq!(exported.developer_instructions.as_deref(), Some("role-dev"));
 
     let _ = thread
         .submit(Op::Shutdown {})
         .await
         .expect("thread shutdown should submit");
+}
+
+#[test]
+fn export_forked_subagent_response_item_preserves_agents_fragment() {
+    let item = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: AGENTS_MD_FRAGMENT.wrap("workspace rules".to_string()),
+            },
+            ContentItem::InputText {
+                text: ENVIRONMENT_CONTEXT_FRAGMENT.wrap("cwd=/tmp".to_string()),
+            },
+            ContentItem::InputText {
+                text: "plain context".to_string(),
+            },
+        ],
+        end_turn: None,
+        phase: None,
+    };
+
+    let exported = export_forked_subagent_response_item(item).expect("exported user message");
+
+    assert_eq!(
+        exported,
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: AGENTS_MD_FRAGMENT.wrap("workspace rules".to_string()),
+                },
+                ContentItem::InputText {
+                    text: "plain context".to_string(),
+                },
+            ],
+            end_turn: None,
+            phase: None,
+        }
+    );
 }
 
 #[tokio::test]

@@ -5,7 +5,9 @@ use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
 use crate::prompt_gc_rollout::compaction_replacement_history_is_hydratable;
 use crate::prompt_gc_rollout::discarded_rollout_indices_for_rolled_back_turns;
-use crate::prompt_gc_rollout::is_prompt_gc_compaction_marker;
+use crate::prompt_gc_rollout::is_legacy_prompt_gc_compaction_marker;
+use crate::prompt_gc_rollout::is_private_prompt_gc_compaction_marker;
+use crate::prompt_gc_rollout::is_prompt_gc_compaction;
 use crate::rollout::RolloutRecorder;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -196,6 +198,7 @@ fn build_recall_payload(
             .find_map(|(index, item)| match item {
                 RolloutItem::Compacted(compacted)
                     if !discarded_rollout_indices.contains(&index)
+                        && !is_legacy_prompt_gc_compaction_marker(compacted)
                         && !is_prompt_gc_observational_marker(compacted) =>
                 {
                     Some(index)
@@ -396,7 +399,7 @@ fn previous_recall_boundary_before(
                 })
             }
             RolloutItem::Compacted(compacted)
-                if !is_prompt_gc_compaction_marker(compacted)
+                if !is_private_prompt_gc_compaction_marker(compacted)
                     && compacted.replacement_history.is_none() =>
             {
                 Some(RecallBoundary {
@@ -414,7 +417,7 @@ fn rollout_parse_error_message(parse_errors: usize) -> String {
 }
 
 fn is_prompt_gc_observational_marker(compacted: &CompactedItem) -> bool {
-    is_prompt_gc_compaction_marker(compacted) && compacted.replacement_history.is_none()
+    is_prompt_gc_compaction(compacted) && compacted.replacement_history.is_none()
 }
 
 fn recall_item_from_response_item(
@@ -760,7 +763,7 @@ mod tests {
 
     fn prompt_gc_observational_marker(kind: PromptGcOutcomeKind) -> RolloutItem {
         RolloutItem::Compacted(CompactedItem {
-            message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
+            message: codex_protocol::protocol::PROMPT_GC_COMPACTION_MESSAGE.to_string(),
             replacement_history: None,
             prompt_gc: Some(PromptGcCompactionMetadata {
                 checkpoint_id: "turn-1:prompt_gc:0".to_string(),
@@ -776,7 +779,7 @@ mod tests {
 
     fn prompt_gc_replacement_history_marker(replacement_history: Vec<ResponseItem>) -> RolloutItem {
         RolloutItem::Compacted(CompactedItem {
-            message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
+            message: codex_protocol::protocol::PROMPT_GC_COMPACTION_MESSAGE.to_string(),
             replacement_history: Some(replacement_history),
             prompt_gc: Some(PromptGcCompactionMetadata {
                 checkpoint_id: "turn-1:prompt_gc:1".to_string(),

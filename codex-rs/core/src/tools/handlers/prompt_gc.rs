@@ -2,6 +2,7 @@ use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::context_manager::ContextManager;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
+use crate::prompt_gc_rollout::surviving_legacy_prompt_gc_marker_indices;
 use crate::prompt_gc_sidecar::MAX_RAW_BYTES_PER_RETRIEVE;
 use crate::prompt_gc_sidecar::MAX_UNITS_PER_RETRIEVE;
 use crate::prompt_gc_sidecar::PromptGcApplyOutcome;
@@ -55,6 +56,8 @@ pub(crate) struct PromptGcRuntimePlan {
 enum StopReason {
     InvalidContract,
     InvalidSummarySchema,
+    IncompatibleRolloutHistory,
+    MissingRolloutRecorder,
     NoPromptReduction,
     StateHashMismatch,
 }
@@ -64,11 +67,17 @@ impl StopReason {
         match self {
             Self::InvalidContract => "invalid_contract",
             Self::InvalidSummarySchema => "invalid_summary_schema",
+            Self::IncompatibleRolloutHistory => "incompatible_rollout_history",
+            Self::MissingRolloutRecorder => "missing_rollout_recorder",
             Self::NoPromptReduction => "no_prompt_reduction",
             Self::StateHashMismatch => "state_hash_mismatch",
         }
     }
 }
+
+const INCOMPATIBLE_ROLLOUT_HISTORY_STATUS: &str =
+    "Prompt GC disabled: incompatible rollout history.";
+const MISSING_ROLLOUT_RECORDER_STATUS: &str = "Prompt GC disabled: missing rollout recorder.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PromptProjectionCost {
@@ -226,6 +235,34 @@ fn projected_prompt_cost(
     }
 }
 
+async fn ensure_rollout_compatible_for_prompt_gc(
+    session: &Session,
+) -> Result<(), crate::function_tool::FunctionCallError> {
+    session.flush_rollout().await;
+    let Some(rollout_path) = session.current_rollout_path().await else {
+        return Err(contract_error(
+            StopReason::MissingRolloutRecorder,
+            MISSING_ROLLOUT_RECORDER_STATUS,
+        ));
+    };
+    let (rollout_items, _thread_id, parse_errors) =
+        crate::rollout::RolloutRecorder::load_rollout_items(rollout_path.as_path())
+            .await
+            .map_err(|_| {
+                contract_error(
+                    StopReason::IncompatibleRolloutHistory,
+                    INCOMPATIBLE_ROLLOUT_HISTORY_STATUS,
+                )
+            })?;
+    if parse_errors > 0 || !surviving_legacy_prompt_gc_marker_indices(&rollout_items).is_empty() {
+        return Err(contract_error(
+            StopReason::IncompatibleRolloutHistory,
+            INCOMPATIBLE_ROLLOUT_HISTORY_STATUS,
+        ));
+    }
+    Ok(())
+}
+
 fn order_chunk_summaries(
     chunk_manifest: &[PromptGcResolvedChunk],
     chunk_summaries: &[PromptGcChunkSummary],
@@ -280,6 +317,7 @@ pub(crate) async fn build_runtime_plan(
     turn: &TurnContext,
     checkpoint_id: &str,
 ) -> Result<PromptGcRuntimePlan, crate::function_tool::FunctionCallError> {
+    ensure_rollout_compatible_for_prompt_gc(session).await?;
     let checkpoint = prompt_gc_checkpoint_for_id(session, turn, checkpoint_id).await?;
     let sidecar = session
         .prompt_gc_sidecar_for_sub_id(&turn.sub_id)
@@ -559,11 +597,16 @@ mod tests {
     use super::*;
     use crate::codex::make_session_and_context;
     use crate::protocol::TokenUsage;
+    use crate::rollout::RolloutRecorder;
+    use crate::rollout::RolloutRecorderParams;
+    use crate::rollout::policy::EventPersistenceMode;
     use crate::state::ActiveTurn;
     use crate::state::RunningTask;
     use crate::state::TaskKind;
     use crate::tasks::RegularTask;
     use crate::tasks::SessionTask;
+    use codex_protocol::ThreadId;
+    use codex_protocol::models::BaseInstructions;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::FunctionCallOutputPayload;
     use codex_protocol::models::LocalShellAction;
@@ -572,16 +615,43 @@ mod tests {
     use codex_protocol::models::MessagePhase;
     use codex_protocol::models::ReasoningItemContent;
     use codex_protocol::models::WebSearchAction;
+    use codex_protocol::protocol::SessionSource;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
     use tokio_util::task::AbortOnDropHandle;
 
+    async fn attach_rollout_recorder(session: &Session) {
+        let config = session.get_config().await;
+        let recorder = RolloutRecorder::new(
+            config.as_ref(),
+            RolloutRecorderParams::new(
+                ThreadId::default(),
+                None,
+                SessionSource::Exec,
+                BaseInstructions::default(),
+                Vec::new(),
+                EventPersistenceMode::Limited,
+            ),
+            None,
+            None,
+        )
+        .await
+        .expect("create rollout recorder");
+        {
+            let mut rollout = session.services.rollout.lock().await;
+            *rollout = Some(recorder);
+        }
+        session.ensure_rollout_materialized().await;
+        session.flush_rollout().await;
+    }
+
     async fn install_prompt_gc_active_turn(
         session: &Session,
         turn_context: Arc<TurnContext>,
     ) -> Arc<tokio::sync::Mutex<crate::prompt_gc_sidecar::PromptGcSidecar>> {
+        attach_rollout_recorder(session).await;
         let mut active_turn = ActiveTurn::default();
         let sidecar = active_turn.ensure_prompt_gc_sidecar();
         sidecar.lock().await.bind_turn(turn_context.sub_id.clone());
@@ -642,12 +712,7 @@ mod tests {
         let sidecar = install_prompt_gc_active_turn(&session, Arc::clone(&turn_context)).await;
 
         let items = vec![
-            ResponseItem::Reasoning {
-                id: "reasoning-1".to_string(),
-                summary: Vec::new(),
-                content: None,
-                encrypted_content: None,
-            },
+            verbose_reasoning_item("reasoning-1"),
             commentary_phase_message("phase-1"),
         ];
         session
@@ -691,18 +756,8 @@ mod tests {
         let sidecar = install_prompt_gc_active_turn(&session, Arc::clone(&turn_context)).await;
 
         let items = vec![
-            ResponseItem::Reasoning {
-                id: "reasoning-1".to_string(),
-                summary: Vec::new(),
-                content: None,
-                encrypted_content: None,
-            },
-            ResponseItem::Reasoning {
-                id: "reasoning-2".to_string(),
-                summary: Vec::new(),
-                content: None,
-                encrypted_content: None,
-            },
+            verbose_reasoning_item("reasoning-1"),
+            verbose_reasoning_item("reasoning-2"),
             commentary_phase_message("phase-1"),
         ];
         session

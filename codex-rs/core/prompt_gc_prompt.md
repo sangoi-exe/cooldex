@@ -12,5 +12,6 @@ Rules:
 - Preserve semantic meaning while reducing prompt bloat.
 - Keep exactly one summary object per provided `chunk_id`.
 - Use only `chunk_id` values from the provided `chunk_manifest`.
+- Opaque encrypted-only reasoning is intentionally omitted upstream; do not infer or recreate missing chunks.
 - `tool_context` and `reasoning_context` may be empty individually, but not both at the same time for the same chunk.
 - Do not emit markdown, explanations, or code fences.

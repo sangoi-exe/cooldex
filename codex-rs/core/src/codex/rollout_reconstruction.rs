@@ -1,6 +1,6 @@
 use super::*;
 use crate::prompt_gc_rollout::compaction_replacement_history_is_hydratable;
-use crate::prompt_gc_rollout::is_prompt_gc_compaction_marker;
+use crate::prompt_gc_rollout::is_private_prompt_gc_compaction_marker;
 use std::collections::HashSet;
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
@@ -122,7 +122,7 @@ impl Session {
         for (index, item) in rollout_items.iter().enumerate().rev() {
             match item {
                 RolloutItem::Compacted(compacted) => {
-                    if is_prompt_gc_compaction_marker(compacted)
+                    if is_private_prompt_gc_compaction_marker(compacted)
                         && compacted.replacement_history.is_none()
                     {
                         continue;
@@ -285,7 +285,7 @@ impl Session {
                     if discarded_compaction_indices.contains(&index) {
                         continue;
                     }
-                    if is_prompt_gc_compaction_marker(compacted) {
+                    if is_private_prompt_gc_compaction_marker(compacted) {
                         continue;
                     }
                     if let Some(replacement_history) = &compacted.replacement_history {

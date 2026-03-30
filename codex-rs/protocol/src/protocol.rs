@@ -2530,6 +2530,8 @@ pub enum PromptGcExecutionPhase {
     Unknown,
 }
 
+pub const PROMPT_GC_COMPACTION_MESSAGE: &str = "[internal] prompt_gc";
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
 pub struct PromptGcCompactionMetadata {
     pub checkpoint_id: String,

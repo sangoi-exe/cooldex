@@ -127,7 +127,9 @@ impl CodexThread {
 
     #[doc(hidden)]
     /// Workspace-internal ordered prompt-GC activity edges for live UI updates.
-    pub fn subscribe_prompt_gc_activity_edges(&self) -> tokio::sync::broadcast::Receiver<bool> {
+    pub fn subscribe_prompt_gc_activity_edges(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::PromptGcActivityEdge> {
         self.codex.subscribe_prompt_gc_activity_edges()
     }
 

@@ -35,7 +35,6 @@ use crate::models_manager::manager::ModelsManager;
 use crate::models_manager::manager::RefreshStrategy;
 use crate::parse_command::parse_command;
 use crate::parse_turn_item;
-use crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER;
 use crate::prompt_gc_sidecar::PROMPT_GC_MIN_FINAL_ANSWER_SELECTABLE_RAW_BYTES;
 use crate::prompt_gc_sidecar::PROMPT_GC_MIN_FUNCTION_CALL_OUTPUT_TOKEN_QTY;
 use crate::prompt_gc_sidecar::PromptGcApplyOutcome;
@@ -349,6 +348,7 @@ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CollabAgentActivity;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::PROMPT_GC_COMPACTION_MESSAGE;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_readiness::Readiness;
@@ -364,7 +364,7 @@ pub struct Codex {
     // Last known activity of the agent.
     pub(crate) agent_last_activity: watch::Receiver<Option<CollabAgentActivity>>,
     pub(crate) prompt_gc_active: watch::Receiver<bool>,
-    pub(crate) prompt_gc_activity_edges: tokio::sync::broadcast::Sender<bool>,
+    pub(crate) prompt_gc_activity_edges: tokio::sync::broadcast::Sender<PromptGcActivityEdge>,
     pub(crate) session: Arc<Session>,
     // Shared future for the background submission loop completion so multiple
     // callers can wait for shutdown.
@@ -372,6 +372,12 @@ pub struct Codex {
 }
 
 pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PromptGcActivityEdge {
+    pub active: bool,
+    pub refresh_private_context_usage: bool,
+}
 
 /// Wrapper returned by [`Codex::spawn`] containing the spawned [`Codex`],
 /// the submission id for the initial `ConfigureSession` request and the
@@ -767,7 +773,9 @@ impl Codex {
     }
 
     #[doc(hidden)]
-    pub fn subscribe_prompt_gc_activity_edges(&self) -> tokio::sync::broadcast::Receiver<bool> {
+    pub fn subscribe_prompt_gc_activity_edges(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<PromptGcActivityEdge> {
         self.prompt_gc_activity_edges.subscribe()
     }
 
@@ -809,7 +817,7 @@ pub(crate) struct Session {
     agent_status: watch::Sender<AgentStatus>,
     agent_last_activity: watch::Sender<Option<CollabAgentActivity>>,
     prompt_gc_active: watch::Sender<bool>,
-    prompt_gc_activity_edges: tokio::sync::broadcast::Sender<bool>,
+    prompt_gc_activity_edges: tokio::sync::broadcast::Sender<PromptGcActivityEdge>,
     pub(crate) state: Mutex<SessionState>,
     out_of_band_elicitation_paused: watch::Sender<bool>,
     /// The set of enabled features should be invariant for the lifetime of the
@@ -1487,7 +1495,7 @@ impl Session {
         agent_status: watch::Sender<AgentStatus>,
         agent_last_activity: watch::Sender<Option<CollabAgentActivity>>,
         prompt_gc_active: watch::Sender<bool>,
-        prompt_gc_activity_edges: tokio::sync::broadcast::Sender<bool>,
+        prompt_gc_activity_edges: tokio::sync::broadcast::Sender<PromptGcActivityEdge>,
         initial_history: InitialHistory,
         session_source: SessionSource,
         skills_manager: Arc<SkillsManager>,
@@ -2723,8 +2731,15 @@ impl Session {
     // Merge-safety anchor: prompt-GC activity must stay on private watcher channels so the
     // hidden sidecar can drive live TUI state without emitting visible protocol events.
     fn set_prompt_gc_activity(&self, active: bool) {
-        self.prompt_gc_active.send_replace(active);
-        let _ = self.prompt_gc_activity_edges.send(active);
+        self.emit_prompt_gc_activity_edge(PromptGcActivityEdge {
+            active,
+            refresh_private_context_usage: false,
+        });
+    }
+
+    fn emit_prompt_gc_activity_edge(&self, edge: PromptGcActivityEdge) {
+        self.prompt_gc_active.send_replace(edge.active);
+        let _ = self.prompt_gc_activity_edges.send(edge);
     }
 
     async fn deliver_event_raw(&self, event: Event) {
@@ -3438,15 +3453,11 @@ impl Session {
         // stored history tail, not the pre-processed input items. History write
         // processing can truncate tool outputs, and the runtime-owned prompt_gc
         // plan later resolves against the stored history snapshot.
-        let (start_index, appended_items) =
+        let (_start_index, appended_items) =
             state.record_items_and_snapshot_appended(items.iter(), turn_context.truncation_policy);
         appended_items
             .into_iter()
-            .enumerate()
-            .map(|(offset, item)| PromptGcObservedItem::Recorded {
-                history_index: start_index + offset,
-                item,
-            })
+            .map(|item| PromptGcObservedItem::Recorded { item })
             .collect()
     }
 
@@ -3577,7 +3588,7 @@ impl Session {
             // Merge-safety anchor: prompt_gc compaction markers must stay
             // distinguishable from normal compaction so resume can reject lone
             // partial prompt_gc writes without weakening other compaction paths.
-            message: PROMPT_GC_COMPACTION_MARKER.to_string(),
+            message: PROMPT_GC_COMPACTION_MESSAGE.to_string(),
             replacement_history: Some(replacement_history.clone()),
             prompt_gc: Some(prompt_gc_compaction_metadata(
                 checkpoint,
@@ -3626,7 +3637,7 @@ impl Session {
             // Merge-safety anchor: prompt_gc observational rollout markers must
             // stay on the private compaction seam so they do not replay as live
             // protocol events or leak hidden sidecar execution into the UI.
-            message: PROMPT_GC_COMPACTION_MARKER.to_string(),
+            message: PROMPT_GC_COMPACTION_MESSAGE.to_string(),
             replacement_history: None,
             prompt_gc: Some(prompt_gc_compaction_metadata(
                 checkpoint,
@@ -4463,7 +4474,7 @@ async fn persist_prompt_gc_rollout_items(
     rollout_items: &[RolloutItem],
 ) -> Result<(), String> {
     let Some(recorder) = recorder else {
-        return Ok(());
+        return Err("prompt_gc replacement_history requires a rollout recorder".to_string());
     };
     if let Err(error) = recorder.persist_items_atomically(rollout_items).await {
         return Err(format!(
@@ -4528,7 +4539,12 @@ fn prompt_gc_plan_build_failure_details(
         error_message,
         marker_stop_reason: stop_reason.unwrap_or("plan_build_failed").to_string(),
         status_error,
-        blocks_remaining_turn: matches!(stop_reason, Some("state_hash_mismatch")),
+        blocks_remaining_turn: matches!(
+            stop_reason,
+            Some(
+                "state_hash_mismatch" | "incompatible_rollout_history" | "missing_rollout_recorder"
+            )
+        ),
     }
 }
 
@@ -6655,19 +6671,31 @@ async fn run_prompt_gc_sidecar_if_needed(
     .await;
     struct PromptGcActivityGuard<'a> {
         session: &'a Session,
+        refresh_private_context_usage: bool,
     }
     impl<'a> PromptGcActivityGuard<'a> {
         fn new(session: &'a Session) -> Self {
             session.set_prompt_gc_activity(/*active*/ true);
-            Self { session }
+            Self {
+                session,
+                refresh_private_context_usage: false,
+            }
+        }
+
+        fn request_private_context_usage_refresh(&mut self) {
+            self.refresh_private_context_usage = true;
         }
     }
     impl<'a> Drop for PromptGcActivityGuard<'a> {
         fn drop(&mut self) {
-            self.session.set_prompt_gc_activity(/*active*/ false);
+            self.session
+                .emit_prompt_gc_activity_edge(PromptGcActivityEdge {
+                    active: false,
+                    refresh_private_context_usage: self.refresh_private_context_usage,
+                });
         }
     }
-    let _prompt_gc_activity_guard = PromptGcActivityGuard::new(sess.as_ref());
+    let mut prompt_gc_activity_guard = PromptGcActivityGuard::new(sess.as_ref());
 
     let plan = match crate::tools::handlers::prompt_gc::build_runtime_plan(
         sess.as_ref(),
@@ -6887,7 +6915,10 @@ async fn run_prompt_gc_sidecar_if_needed(
     )
     .await
     {
-        Ok(outcome) => sidecar.lock().await.complete_cycle(outcome),
+        Ok(outcome) => {
+            prompt_gc_activity_guard.request_private_context_usage_refresh();
+            sidecar.lock().await.complete_cycle(outcome);
+        }
         Err(error) => {
             warn!(
                 turn_id = %turn_context.sub_id,

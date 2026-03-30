@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use codex_core::CodexThread;
 use codex_core::NewThread;
+use codex_core::PromptGcActivityEdge;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_protocol::protocol::Event;
@@ -26,10 +27,13 @@ async fn initialize_app_server_client_name(thread: &CodexThread) {
     }
 }
 
-fn prompt_gc_activity_event(thread_id: Option<codex_protocol::ThreadId>, active: bool) -> AppEvent {
+fn prompt_gc_activity_event(
+    thread_id: Option<codex_protocol::ThreadId>,
+    edge: PromptGcActivityEdge,
+) -> AppEvent {
     match thread_id {
-        Some(thread_id) => AppEvent::ThreadPromptGcActivity { thread_id, active },
-        None => AppEvent::PromptGcActivity { active },
+        Some(thread_id) => AppEvent::ThreadPromptGcActivity { thread_id, edge },
+        None => AppEvent::PromptGcActivity { edge },
     }
 }
 
@@ -53,7 +57,13 @@ fn initial_prompt_gc_bootstrap_event(
     token_usage_info: Option<TokenUsageInfo>,
 ) -> Option<AppEvent> {
     if prompt_gc_active {
-        Some(prompt_gc_activity_event(thread_id, /*active*/ true))
+        Some(prompt_gc_activity_event(
+            thread_id,
+            PromptGcActivityEdge {
+                active: true,
+                refresh_private_context_usage: false,
+            },
+        ))
     } else if seed_prompt_gc_context_usage_if_idle {
         Some(prompt_gc_context_usage_event(thread_id, token_usage_info))
     } else {
@@ -68,6 +78,10 @@ fn allow_idle_prompt_gc_bootstrap(
     seed_prompt_gc_context_usage_if_idle: bool,
 ) -> bool {
     seed_prompt_gc_context_usage_if_idle && !matches!(session_source, SessionSource::SubAgent(_))
+}
+
+fn should_emit_prompt_gc_context_usage_refresh(edge: PromptGcActivityEdge) -> bool {
+    !edge.active && edge.refresh_private_context_usage
 }
 
 // Merge-safety anchor: prompt-GC completion usage refresh must stay on the private TUI runtime
@@ -131,9 +145,9 @@ pub(crate) async fn forward_thread_runtime(
             }
             edge = prompt_gc_edge_rx.recv() => {
                 match edge {
-                    Ok(active) => {
-                        app_event_tx.send(prompt_gc_activity_event(thread_id, active));
-                        if !active {
+                    Ok(edge) => {
+                        app_event_tx.send(prompt_gc_activity_event(thread_id, edge));
+                        if should_emit_prompt_gc_context_usage_refresh(edge) {
                             emit_prompt_gc_context_usage_update(
                                 thread.as_ref(),
                                 &app_event_tx,
@@ -144,8 +158,12 @@ pub(crate) async fn forward_thread_runtime(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let active = *prompt_gc_state_rx.borrow();
-                        app_event_tx.send(prompt_gc_activity_event(thread_id, active));
-                        if !active {
+                        let edge = PromptGcActivityEdge {
+                            active,
+                            refresh_private_context_usage: false,
+                        };
+                        app_event_tx.send(prompt_gc_activity_event(thread_id, edge));
+                        if should_emit_prompt_gc_context_usage_refresh(edge) {
                             emit_prompt_gc_context_usage_update(
                                 thread.as_ref(),
                                 &app_event_tx,
@@ -161,8 +179,13 @@ pub(crate) async fn forward_thread_runtime(
     }
 
     if *prompt_gc_state_rx.borrow() {
-        app_event_tx.send(prompt_gc_activity_event(thread_id, /*active*/ false));
-        emit_prompt_gc_context_usage_update(thread.as_ref(), &app_event_tx, thread_id).await;
+        app_event_tx.send(prompt_gc_activity_event(
+            thread_id,
+            PromptGcActivityEdge {
+                active: false,
+                refresh_private_context_usage: false,
+            },
+        ));
     }
 }
 
@@ -369,5 +392,27 @@ mod tests {
     fn idle_prompt_gc_bootstrap_stays_enabled_for_lead_sessions() {
         assert!(allow_idle_prompt_gc_bootstrap(&SessionSource::Cli, true));
         assert!(!allow_idle_prompt_gc_bootstrap(&SessionSource::Cli, false));
+    }
+
+    #[test]
+    fn prompt_gc_refresh_edge_emits_context_usage_only_after_apply_success() {
+        assert!(!should_emit_prompt_gc_context_usage_refresh(
+            PromptGcActivityEdge {
+                active: true,
+                refresh_private_context_usage: false,
+            }
+        ));
+        assert!(!should_emit_prompt_gc_context_usage_refresh(
+            PromptGcActivityEdge {
+                active: false,
+                refresh_private_context_usage: false,
+            }
+        ));
+        assert!(should_emit_prompt_gc_context_usage_refresh(
+            PromptGcActivityEdge {
+                active: false,
+                refresh_private_context_usage: true,
+            }
+        ));
     }
 }

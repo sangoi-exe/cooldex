@@ -1334,7 +1334,7 @@ async fn record_initial_history_resumed_ignores_truncated_prompt_gc_compaction_w
             },
         )),
         RolloutItem::Compacted(CompactedItem {
-            message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
+            message: codex_protocol::protocol::PROMPT_GC_COMPACTION_MESSAGE.to_string(),
             replacement_history: Some(vec![assistant_message("should not replace")]),
             prompt_gc: None,
         }),
@@ -1366,7 +1366,7 @@ async fn reconstruct_history_ignores_prompt_gc_observational_markers() {
     let rollout_items = vec![
         RolloutItem::ResponseItem(before.clone()),
         RolloutItem::Compacted(CompactedItem {
-            message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
+            message: codex_protocol::protocol::PROMPT_GC_COMPACTION_MESSAGE.to_string(),
             replacement_history: None,
             prompt_gc: Some(PromptGcCompactionMetadata {
                 checkpoint_id: "turn-1:prompt_gc:0".to_string(),
@@ -1379,7 +1379,7 @@ async fn reconstruct_history_ignores_prompt_gc_observational_markers() {
             }),
         }),
         RolloutItem::Compacted(CompactedItem {
-            message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
+            message: codex_protocol::protocol::PROMPT_GC_COMPACTION_MESSAGE.to_string(),
             replacement_history: None,
             prompt_gc: Some(PromptGcCompactionMetadata {
                 checkpoint_id: "turn-1:prompt_gc:0".to_string(),
@@ -1403,7 +1403,8 @@ async fn reconstruct_history_ignores_prompt_gc_observational_markers() {
 }
 
 #[tokio::test]
-async fn record_initial_history_resumed_uses_prompt_gc_compaction_with_matching_turn_context() {
+async fn record_initial_history_resumed_ignores_legacy_prompt_gc_compaction_with_matching_turn_context()
+ {
     let (session, turn_context) = make_session_and_context().await;
     let current_context_item = turn_context.to_turn_context_item();
     let current_turn_id = current_context_item
@@ -1428,7 +1429,7 @@ async fn record_initial_history_resumed_uses_prompt_gc_compaction_with_matching_
             },
         )),
         RolloutItem::Compacted(CompactedItem {
-            message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
+            message: codex_protocol::protocol::PROMPT_GC_COMPACTION_MESSAGE.to_string(),
             replacement_history: Some(replacement_history.clone()),
             prompt_gc: None,
         }),
@@ -1444,7 +1445,7 @@ async fn record_initial_history_resumed_uses_prompt_gc_compaction_with_matching_
         .await;
 
     let history = session.clone_history().await;
-    assert_eq!(history.raw_items(), replacement_history.as_slice());
+    assert!(history.raw_items().is_empty());
     assert_eq!(
         serde_json::to_value(session.reference_context_item().await)
             .expect("serialize seeded reference context item"),
@@ -1525,7 +1526,7 @@ async fn record_initial_history_resumed_rollback_discards_prompt_gc_compaction_f
             },
         )),
         RolloutItem::Compacted(CompactedItem {
-            message: crate::prompt_gc_sidecar::PROMPT_GC_COMPACTION_MARKER.to_string(),
+            message: codex_protocol::protocol::PROMPT_GC_COMPACTION_MESSAGE.to_string(),
             replacement_history: Some(replacement_history.clone()),
             prompt_gc: None,
         }),

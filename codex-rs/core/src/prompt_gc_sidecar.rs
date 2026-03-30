@@ -6,10 +6,10 @@ use crate::response_item_utils::local_shell_call_output_id;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::MessagePhase;
+use codex_protocol::models::ReasoningItemContent;
+use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 
-pub(crate) const PROMPT_GC_TOOL_NAME: &str = "prompt_gc";
-pub(crate) const PROMPT_GC_COMPACTION_MARKER: &str = "[internal] prompt_gc";
 pub(crate) const MAX_UNITS_PER_RETRIEVE: usize = 16;
 pub(crate) const MAX_RAW_BYTES_PER_RETRIEVE: usize = 24_000;
 pub(crate) const PROMPT_GC_MIN_FUNCTION_CALL_OUTPUT_TOKEN_QTY: usize = 200;
@@ -18,10 +18,7 @@ pub(crate) const PROMPT_GC_MIN_FINAL_ANSWER_SELECTABLE_RAW_BYTES: usize =
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PromptGcObservedItem {
-    Recorded {
-        history_index: usize,
-        item: ResponseItem,
-    },
+    Recorded { item: ResponseItem },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,7 +27,6 @@ pub(crate) struct PromptGcCheckpoint {
     pub(crate) checkpoint_seq: u64,
     pub(crate) eligible_unit_count: usize,
     pub(crate) phase: MessagePhase,
-    pub(crate) assistant_item_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,17 +73,13 @@ pub(crate) struct PromptGcPendingCall {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PromptGcCheckpointEligibility {
-    pub(crate) uncompacted_unit_count: usize,
     pub(crate) triggering_function_call_output_count: usize,
-    pub(crate) max_token_qty: usize,
     pub(crate) selectable_unit_count: usize,
     pub(crate) selectable_raw_bytes: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PromptGcStatus {
-    pub(crate) last_error: Option<String>,
-    pub(crate) last_applied_checkpoint_seq: Option<u64>,
     pub(crate) blocked_reason: Option<String>,
 }
 
@@ -121,13 +113,15 @@ impl PromptGcSidecar {
         self.status.blocked_reason = None;
     }
 
-    pub(crate) fn observe_recorded_item(&mut self, _history_index: usize, item: &ResponseItem) {
+    pub(crate) fn observe_recorded_item(&mut self, item: &ResponseItem) {
         if self.status.blocked_reason.is_some() {
             return;
         }
         match item {
             ResponseItem::Reasoning { .. } => {
-                self.push_reasoning_unit(item);
+                if let Some(payload_text) = reasoning_payload_text(item) {
+                    self.push_reasoning_unit(item, payload_text);
+                }
             }
             ResponseItem::FunctionCall {
                 call_id,
@@ -135,9 +129,6 @@ impl PromptGcSidecar {
                 arguments,
                 ..
             } => {
-                if name == PROMPT_GC_TOOL_NAME {
-                    return;
-                }
                 let payload_text =
                     format!("tool_call\nname: {name}\ncall_id: {call_id}\narguments:\n{arguments}");
                 let pending = PromptGcPendingCall {
@@ -156,9 +147,6 @@ impl PromptGcSidecar {
                 input,
                 ..
             } => {
-                if name == PROMPT_GC_TOOL_NAME {
-                    return;
-                }
                 let payload_text =
                     format!("tool_call\nname: {name}\ncall_id: {call_id}\ninput:\n{input}");
                 let pending = PromptGcPendingCall {
@@ -199,14 +187,11 @@ impl PromptGcSidecar {
                     .push(pending);
             }
             ResponseItem::FunctionCallOutput { call_id, output } => {
-                if proven_pending_function_call_name(&self.pending_function_calls, call_id)
-                    .is_some()
-                {
-                    if let Some(pending) =
-                        pop_pending_call(&mut self.pending_function_calls, call_id)
-                    {
-                        self.push_tool_pair_unit(call_id, output, item, pending);
-                    }
+                if let Some(pending) = take_unambiguous_pending_function_call(
+                    &mut self.pending_function_calls,
+                    call_id,
+                ) {
+                    self.push_tool_pair_unit(call_id, output, item, pending);
                 } else {
                     // Merge-safety anchor: if multiple function-like producers share the same
                     // logical call_id, PromptGcSidecar cannot prove which call owns this output.
@@ -216,11 +201,21 @@ impl PromptGcSidecar {
                 }
             }
             ResponseItem::CustomToolCallOutput {
-                call_id, output, ..
+                call_id,
+                name,
+                output,
+                ..
             } => {
-                if let Some(pending) = pop_pending_call(&mut self.pending_custom_calls, call_id) {
+                if let Some(pending) = take_pending_custom_call_for_output(
+                    &mut self.pending_custom_calls,
+                    call_id,
+                    name.as_deref(),
+                ) {
                     self.push_tool_pair_unit(call_id, output, item, pending);
                 }
+            }
+            ResponseItem::ToolSearchOutput { .. } => {
+                self.push_tool_result_unit("tool_search", item);
             }
             ResponseItem::WebSearchCall { .. } => {
                 // Merge-safety anchor: some tool classes materialize their
@@ -231,13 +226,11 @@ impl PromptGcSidecar {
             ResponseItem::ImageGenerationCall { .. } => {
                 self.push_tool_result_unit("image_generation", item);
             }
-            ResponseItem::Message {
-                id, role, phase, ..
-            } => {
+            ResponseItem::Message { role, phase, .. } => {
                 if role == "assistant"
                     && let Some(phase) = phase.clone()
                 {
-                    self.observe_phase_checkpoint(phase, id.clone());
+                    self.observe_phase_checkpoint(phase);
                 }
             }
             _ => {}
@@ -249,12 +242,8 @@ impl PromptGcSidecar {
             return;
         }
         for observed in observed_items {
-            match observed {
-                PromptGcObservedItem::Recorded {
-                    history_index,
-                    item,
-                } => self.observe_recorded_item(*history_index, item),
-            }
+            let PromptGcObservedItem::Recorded { item } = observed;
+            self.observe_recorded_item(item);
         }
     }
 
@@ -304,22 +293,13 @@ impl PromptGcSidecar {
             MAX_UNITS_PER_RETRIEVE,
             MAX_RAW_BYTES_PER_RETRIEVE,
         );
-        let uncompacted_units = self
-            .units
-            .iter()
-            .take(checkpoint.eligible_unit_count)
-            .filter(|unit| !self.compacted_unit_keys.contains(&unit.unit_key));
-        let mut uncompacted_unit_count = 0usize;
         let mut triggering_function_call_output_count = 0usize;
-        let mut max_token_qty = 0usize;
-        for unit in uncompacted_units {
-            uncompacted_unit_count = uncompacted_unit_count.saturating_add(1);
+        for unit in &selectable_units {
             if let Some(token_qty) = unit.function_call_output_token_qty
                 && token_qty > PROMPT_GC_MIN_FUNCTION_CALL_OUTPUT_TOKEN_QTY
             {
                 triggering_function_call_output_count =
                     triggering_function_call_output_count.saturating_add(1);
-                max_token_qty = max_token_qty.max(token_qty);
             }
         }
         let selectable_unit_count = selectable_units.len();
@@ -327,9 +307,7 @@ impl PromptGcSidecar {
             .iter()
             .fold(0usize, |acc, unit| acc.saturating_add(unit.approx_bytes));
         Some(PromptGcCheckpointEligibility {
-            uncompacted_unit_count,
             triggering_function_call_output_count,
-            max_token_qty,
             selectable_unit_count,
             selectable_raw_bytes,
         })
@@ -339,8 +317,6 @@ impl PromptGcSidecar {
         for unit_key in outcome.applied_unit_keys {
             self.compacted_unit_keys.insert(unit_key);
         }
-        self.status.last_applied_checkpoint_seq = Some(outcome.checkpoint_seq);
-        self.status.last_error = None;
         self.status.blocked_reason = None;
         self.running = false;
         if self
@@ -385,23 +361,7 @@ impl PromptGcSidecar {
     }
 
     pub(crate) fn fail_cycle(&mut self, checkpoint_id: &str, error: impl Into<String>) {
-        let failed_checkpoint_seq = self
-            .active_checkpoint
-            .as_ref()
-            .filter(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)
-            .map(|checkpoint| checkpoint.checkpoint_seq)
-            .or_else(|| {
-                self.pending_apply_outcome
-                    .as_ref()
-                    .filter(|pending| pending.checkpoint_id == checkpoint_id)
-                    .map(|pending| pending.checkpoint_seq)
-            });
-        self.status.last_error = Some(error.into());
-        if failed_checkpoint_seq.is_some()
-            && self.status.last_applied_checkpoint_seq == failed_checkpoint_seq
-        {
-            self.status.last_applied_checkpoint_seq = None;
-        }
+        let _ = error.into();
         self.running = false;
         if self
             .pending_apply_outcome
@@ -458,7 +418,7 @@ impl PromptGcSidecar {
         Some(outcome)
     }
 
-    fn observe_phase_checkpoint(&mut self, phase: MessagePhase, assistant_item_id: Option<String>) {
+    fn observe_phase_checkpoint(&mut self, phase: MessagePhase) {
         if self.status.blocked_reason.is_some() {
             return;
         }
@@ -470,12 +430,10 @@ impl PromptGcSidecar {
             checkpoint_seq,
             eligible_unit_count: self.units.len(),
             phase,
-            assistant_item_id,
         });
     }
 
-    fn push_reasoning_unit(&mut self, item: &ResponseItem) {
-        let payload_text = response_item_payload_text(item);
+    fn push_reasoning_unit(&mut self, item: &ResponseItem, payload_text: String) {
         let unit_key = self.next_unit_key;
         self.next_unit_key += 1;
         let chunk_id = format!("prompt_gc_chunk_{}", self.next_chunk_seq);
@@ -500,9 +458,6 @@ impl PromptGcSidecar {
         output_item: &ResponseItem,
         pending: PromptGcPendingCall,
     ) {
-        if pending.call_name == PROMPT_GC_TOOL_NAME {
-            return;
-        }
         let output_text = function_call_output_text(output);
         let payload_text = format!(
             "{}\n\ntool_output\ncall_id: {call_id}\noutput:\n{output_text}",
@@ -588,6 +543,40 @@ fn response_item_payload_text(item: &ResponseItem) -> String {
         .unwrap_or_else(|error| format!("failed_to_serialize: {error}"))
 }
 
+fn reasoning_payload_text(item: &ResponseItem) -> Option<String> {
+    let ResponseItem::Reasoning {
+        summary, content, ..
+    } = item
+    else {
+        return None;
+    };
+    let mut segments: Vec<String> = summary
+        .iter()
+        .filter_map(|summary_item| match summary_item {
+            ReasoningItemReasoningSummary::SummaryText { text } => {
+                let trimmed = text.trim();
+                (!trimmed.is_empty()).then_some(trimmed.to_string())
+            }
+        })
+        .collect();
+    if segments.is_empty()
+        && let Some(content_items) = content
+    {
+        for content_item in content_items {
+            match content_item {
+                ReasoningItemContent::ReasoningText { text }
+                | ReasoningItemContent::Text { text } => {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        segments.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+    (!segments.is_empty()).then(|| segments.join("\n"))
+}
+
 fn response_item_fingerprint(item: &ResponseItem) -> String {
     serde_json::to_string(item).unwrap_or_else(|error| format!("failed_to_serialize:{error}"))
 }
@@ -617,23 +606,47 @@ fn pop_pending_call(
     pending
 }
 
+fn take_unambiguous_pending_function_call(
+    pending_calls: &mut HashMap<String, Vec<PromptGcPendingCall>>,
+    call_id: &str,
+) -> Option<PromptGcPendingCall> {
+    let calls = pending_calls.get(call_id)?;
+    if calls.len() != 1 {
+        return None;
+    }
+    pop_pending_call(pending_calls, call_id)
+}
+
+fn take_pending_custom_call_for_output(
+    pending_calls: &mut HashMap<String, Vec<PromptGcPendingCall>>,
+    call_id: &str,
+    output_name: Option<&str>,
+) -> Option<PromptGcPendingCall> {
+    let mut calls = pending_calls.remove(call_id)?;
+    if calls.len() == 1 {
+        return calls.pop();
+    }
+    let output_name = output_name?;
+    let mut matching_indices = calls
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pending)| (pending.call_name == output_name).then_some(index));
+    let match_index = matching_indices.next()?;
+    if matching_indices.next().is_some() {
+        return None;
+    }
+    let pending = calls.remove(match_index);
+    if !calls.is_empty() {
+        pending_calls.insert(call_id.to_string(), calls);
+    }
+    Some(pending)
+}
+
 fn discard_pending_calls(
     pending_calls: &mut HashMap<String, Vec<PromptGcPendingCall>>,
     call_id: &str,
 ) {
     pending_calls.remove(call_id);
-}
-
-fn proven_pending_function_call_name<'a>(
-    pending_calls: &'a HashMap<String, Vec<PromptGcPendingCall>>,
-    call_id: &str,
-) -> Option<&'a str> {
-    let calls = pending_calls.get(call_id)?;
-    let first_call_name = calls.first()?.call_name.as_str();
-    calls
-        .iter()
-        .all(|pending| pending.call_name == first_call_name)
-        .then_some(first_call_name)
 }
 
 #[cfg(test)]
@@ -654,10 +667,14 @@ mod tests {
         let reasoning = ResponseItem::Reasoning {
             id: String::new(),
             summary: Vec::new(),
-            content: None,
+            content: Some(vec![
+                codex_protocol::models::ReasoningItemContent::ReasoningText {
+                    text: "captured reasoning".to_string(),
+                },
+            ]),
             encrypted_content: None,
         };
-        sidecar.observe_recorded_item(0, &reasoning);
+        sidecar.observe_recorded_item(&reasoning);
 
         let call = ResponseItem::FunctionCall {
             id: None,
@@ -666,7 +683,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
-        sidecar.observe_recorded_item(1, &call);
+        sidecar.observe_recorded_item(&call);
 
         let output = ResponseItem::FunctionCallOutput {
             call_id: "call-1".to_string(),
@@ -675,7 +692,7 @@ mod tests {
                 success: Some(true),
             },
         };
-        sidecar.observe_recorded_item(2, &output);
+        sidecar.observe_recorded_item(&output);
 
         let phase_message = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -686,7 +703,7 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(3, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
 
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         let units = sidecar
@@ -721,7 +738,7 @@ mod tests {
                 user: None,
             }),
         };
-        sidecar.observe_recorded_item(0, &shell_call);
+        sidecar.observe_recorded_item(&shell_call);
 
         let shell_output = ResponseItem::FunctionCallOutput {
             call_id: "shell-1".to_string(),
@@ -730,7 +747,7 @@ mod tests {
                 success: Some(true),
             },
         };
-        sidecar.observe_recorded_item(1, &shell_output);
+        sidecar.observe_recorded_item(&shell_output);
 
         let web_search = ResponseItem::WebSearchCall {
             id: Some("ws_1".to_string()),
@@ -740,7 +757,7 @@ mod tests {
                 queries: None,
             }),
         };
-        sidecar.observe_recorded_item(2, &web_search);
+        sidecar.observe_recorded_item(&web_search);
 
         let image_generation = ResponseItem::ImageGenerationCall {
             id: "ig_1".to_string(),
@@ -748,7 +765,7 @@ mod tests {
             revised_prompt: Some("cat".to_string()),
             result: "image-ref".to_string(),
         };
-        sidecar.observe_recorded_item(3, &image_generation);
+        sidecar.observe_recorded_item(&image_generation);
 
         let phase_message = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -759,7 +776,7 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(4, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
 
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         let units = sidecar
@@ -781,6 +798,142 @@ mod tests {
     }
 
     #[test]
+    fn captures_tool_search_output_as_tool_result() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let tool_search_output = ResponseItem::ToolSearchOutput {
+            call_id: Some("tool-search-1".to_string()),
+            status: "completed".to_string(),
+            execution: "ok".to_string(),
+            tools: vec![serde_json::json!({"name": "ripgrep"})],
+        };
+        sidecar.observe_recorded_item(&tool_search_output);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(&phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let units = sidecar
+            .selectable_units(
+                checkpoint.checkpoint_id.as_str(),
+                MAX_UNITS_PER_RETRIEVE,
+                MAX_RAW_BYTES_PER_RETRIEVE,
+            )
+            .expect("units");
+
+        assert_eq!(units.len(), 1);
+        assert!(matches!(units[0].kind, PromptGcUnitKind::ToolResult));
+        assert!(units[0].payload_text.contains("tool_search"));
+        assert!(units[0].payload_text.contains("tool-search-1"));
+    }
+
+    #[test]
+    fn custom_tool_output_name_disambiguates_duplicate_call_id() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let first_call = ResponseItem::CustomToolCall {
+            id: None,
+            call_id: "shared".to_string(),
+            name: "alpha_tool".to_string(),
+            input: "{\"query\":\"alpha\"}".to_string(),
+            status: None,
+        };
+        sidecar.observe_recorded_item(&first_call);
+
+        let second_call = ResponseItem::CustomToolCall {
+            id: None,
+            call_id: "shared".to_string(),
+            name: "beta_tool".to_string(),
+            input: "{\"query\":\"beta\"}".to_string(),
+            status: None,
+        };
+        sidecar.observe_recorded_item(&second_call);
+
+        let output = ResponseItem::CustomToolCallOutput {
+            call_id: "shared".to_string(),
+            name: Some("beta_tool".to_string()),
+            output: FunctionCallOutputPayload::from_text("beta result".to_string()),
+        };
+        sidecar.observe_recorded_item(&output);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(&phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let units = sidecar
+            .selectable_units(
+                checkpoint.checkpoint_id.as_str(),
+                MAX_UNITS_PER_RETRIEVE,
+                MAX_RAW_BYTES_PER_RETRIEVE,
+            )
+            .expect("units");
+
+        assert_eq!(units.len(), 1);
+        assert!(matches!(units[0].kind, PromptGcUnitKind::ToolPair));
+        assert!(units[0].payload_text.contains("name: beta_tool"));
+        assert!(!units[0].payload_text.contains("name: alpha_tool"));
+    }
+
+    #[test]
+    fn encrypted_only_reasoning_does_not_create_selectable_units() {
+        let mut sidecar = PromptGcSidecar::default();
+        sidecar.bind_turn("turn-1");
+
+        let reasoning = ResponseItem::Reasoning {
+            id: "reasoning-1".to_string(),
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: Some("opaque".repeat(512)),
+        };
+        sidecar.observe_recorded_item(&reasoning);
+
+        let phase_message = ResponseItem::Message {
+            id: Some("msg-1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "phase done".to_string(),
+            }],
+            end_turn: None,
+            phase: Some(MessagePhase::Commentary),
+        };
+        sidecar.observe_recorded_item(&phase_message);
+
+        let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
+        let eligibility = sidecar
+            .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
+            .expect("eligibility");
+        let units = sidecar
+            .selectable_units(
+                checkpoint.checkpoint_id.as_str(),
+                MAX_UNITS_PER_RETRIEVE,
+                MAX_RAW_BYTES_PER_RETRIEVE,
+            )
+            .expect("units");
+
+        assert_eq!(checkpoint.eligible_unit_count, 0);
+        assert_eq!(eligibility.selectable_unit_count, 0);
+        assert_eq!(units.len(), 0);
+    }
+
+    #[test]
     fn checkpoint_eligibility_function_call_output_token_qty_over_200_triggers() {
         let mut sidecar = PromptGcSidecar::default();
         sidecar.bind_turn("turn-1");
@@ -792,7 +945,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
-        sidecar.observe_recorded_item(0, &call);
+        sidecar.observe_recorded_item(&call);
 
         let output = ResponseItem::FunctionCallOutput {
             call_id: "call-1".to_string(),
@@ -803,7 +956,7 @@ mod tests {
                 success: Some(true),
             },
         };
-        sidecar.observe_recorded_item(1, &output);
+        sidecar.observe_recorded_item(&output);
 
         let phase_message = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -814,16 +967,13 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(2, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
 
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         let eligibility = sidecar
             .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
             .expect("eligibility");
-
-        assert_eq!(eligibility.uncompacted_unit_count, 1);
         assert_eq!(eligibility.triggering_function_call_output_count, 1);
-        assert_eq!(eligibility.max_token_qty, 201);
     }
 
     #[test]
@@ -838,7 +988,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
-        sidecar.observe_recorded_item(0, &call);
+        sidecar.observe_recorded_item(&call);
 
         let output = ResponseItem::FunctionCallOutput {
             call_id: "call-1".to_string(),
@@ -849,7 +999,7 @@ mod tests {
                 success: Some(true),
             },
         };
-        sidecar.observe_recorded_item(1, &output);
+        sidecar.observe_recorded_item(&output);
 
         let phase_message = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -860,16 +1010,13 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(2, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
 
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         let eligibility = sidecar
             .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
             .expect("eligibility");
-
-        assert_eq!(eligibility.uncompacted_unit_count, 1);
         assert_eq!(eligibility.triggering_function_call_output_count, 0);
-        assert_eq!(eligibility.max_token_qty, 0);
     }
 
     #[test]
@@ -884,7 +1031,7 @@ mod tests {
             input: "{\"cmd\":\"pwd\"}".to_string(),
             status: None,
         };
-        sidecar.observe_recorded_item(0, &call);
+        sidecar.observe_recorded_item(&call);
 
         let output = ResponseItem::CustomToolCallOutput {
             call_id: "call-1".to_string(),
@@ -893,7 +1040,7 @@ mod tests {
                 "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nhello".to_string(),
             ),
         };
-        sidecar.observe_recorded_item(1, &output);
+        sidecar.observe_recorded_item(&output);
 
         let phase_message = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -904,16 +1051,13 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(2, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
 
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         let eligibility = sidecar
             .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
             .expect("eligibility");
-
-        assert_eq!(eligibility.uncompacted_unit_count, 1);
         assert_eq!(eligibility.triggering_function_call_output_count, 0);
-        assert_eq!(eligibility.max_token_qty, 0);
     }
 
     #[test]
@@ -928,7 +1072,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
-        sidecar.observe_recorded_item(0, &valid_call);
+        sidecar.observe_recorded_item(&valid_call);
 
         let valid_output = ResponseItem::FunctionCallOutput {
             call_id: "call-1".to_string(),
@@ -936,7 +1080,7 @@ mod tests {
                 "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nvalid".to_string(),
             ),
         };
-        sidecar.observe_recorded_item(1, &valid_output);
+        sidecar.observe_recorded_item(&valid_output);
 
         let ambiguous_exec_command = ResponseItem::FunctionCall {
             id: None,
@@ -945,7 +1089,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
-        sidecar.observe_recorded_item(2, &ambiguous_exec_command);
+        sidecar.observe_recorded_item(&ambiguous_exec_command);
 
         let ambiguous_local_shell = ResponseItem::LocalShellCall {
             id: None,
@@ -959,7 +1103,7 @@ mod tests {
                 user: None,
             }),
         };
-        sidecar.observe_recorded_item(3, &ambiguous_local_shell);
+        sidecar.observe_recorded_item(&ambiguous_local_shell);
 
         let ambiguous_output = ResponseItem::FunctionCallOutput {
             call_id: "shared".to_string(),
@@ -967,7 +1111,7 @@ mod tests {
                 "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nambiguous".to_string(),
             ),
         };
-        sidecar.observe_recorded_item(4, &ambiguous_output);
+        sidecar.observe_recorded_item(&ambiguous_output);
 
         let phase_message = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -978,7 +1122,7 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(5, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
 
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         let eligibility = sidecar
@@ -991,10 +1135,7 @@ mod tests {
                 MAX_RAW_BYTES_PER_RETRIEVE,
             )
             .expect("units");
-
-        assert_eq!(eligibility.uncompacted_unit_count, 1);
         assert_eq!(eligibility.triggering_function_call_output_count, 1);
-        assert_eq!(eligibility.max_token_qty, 900);
         assert_eq!(units.len(), 1);
         assert!(units[0].payload_text.contains("call-1"));
         assert!(!units[0].payload_text.contains("call_id: shared"));
@@ -1012,7 +1153,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"printf old\"}".to_string(),
         };
-        sidecar.observe_recorded_item(0, &ambiguous_exec_command);
+        sidecar.observe_recorded_item(&ambiguous_exec_command);
 
         let ambiguous_local_shell = ResponseItem::LocalShellCall {
             id: None,
@@ -1026,7 +1167,7 @@ mod tests {
                 user: None,
             }),
         };
-        sidecar.observe_recorded_item(1, &ambiguous_local_shell);
+        sidecar.observe_recorded_item(&ambiguous_local_shell);
 
         let ambiguous_output = ResponseItem::FunctionCallOutput {
             call_id: "shared".to_string(),
@@ -1034,7 +1175,7 @@ mod tests {
                 "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nambiguous".to_string(),
             ),
         };
-        sidecar.observe_recorded_item(2, &ambiguous_output);
+        sidecar.observe_recorded_item(&ambiguous_output);
 
         let later_exec_command = ResponseItem::FunctionCall {
             id: None,
@@ -1043,7 +1184,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"printf later\"}".to_string(),
         };
-        sidecar.observe_recorded_item(3, &later_exec_command);
+        sidecar.observe_recorded_item(&later_exec_command);
 
         let later_output = ResponseItem::FunctionCallOutput {
             call_id: "shared".to_string(),
@@ -1051,7 +1192,7 @@ mod tests {
                 "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nlater".to_string(),
             ),
         };
-        sidecar.observe_recorded_item(4, &later_output);
+        sidecar.observe_recorded_item(&later_output);
 
         let phase_message = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -1062,7 +1203,7 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(5, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
 
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         let eligibility = sidecar
@@ -1075,10 +1216,7 @@ mod tests {
                 MAX_RAW_BYTES_PER_RETRIEVE,
             )
             .expect("units");
-
-        assert_eq!(eligibility.uncompacted_unit_count, 1);
         assert_eq!(eligibility.triggering_function_call_output_count, 1);
-        assert_eq!(eligibility.max_token_qty, 900);
         assert_eq!(units.len(), 1);
         assert!(units[0].payload_text.contains("printf later"));
         assert!(!units[0].payload_text.contains("printf old"));
@@ -1097,7 +1235,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
-        sidecar.observe_recorded_item(0, &call);
+        sidecar.observe_recorded_item(&call);
 
         let output = ResponseItem::FunctionCallOutput {
             call_id: "call-1".to_string(),
@@ -1105,7 +1243,7 @@ mod tests {
                 "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nhello".to_string(),
             ),
         };
-        sidecar.observe_recorded_item(1, &output);
+        sidecar.observe_recorded_item(&output);
 
         let phase_message = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -1116,16 +1254,13 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(2, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
 
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         let eligibility = sidecar
             .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
             .expect("eligibility");
-
-        assert_eq!(eligibility.uncompacted_unit_count, 1);
         assert_eq!(eligibility.triggering_function_call_output_count, 1);
-        assert_eq!(eligibility.max_token_qty, 900);
     }
 
     #[test]
@@ -1140,7 +1275,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
-        sidecar.observe_recorded_item(0, &exec_command);
+        sidecar.observe_recorded_item(&exec_command);
 
         let local_shell = ResponseItem::LocalShellCall {
             id: None,
@@ -1154,7 +1289,7 @@ mod tests {
                 user: None,
             }),
         };
-        sidecar.observe_recorded_item(1, &local_shell);
+        sidecar.observe_recorded_item(&local_shell);
 
         let output = ResponseItem::FunctionCallOutput {
             call_id: "shared".to_string(),
@@ -1162,7 +1297,7 @@ mod tests {
                 "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nhello".to_string(),
             ),
         };
-        sidecar.observe_recorded_item(2, &output);
+        sidecar.observe_recorded_item(&output);
 
         let phase_message = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -1173,16 +1308,13 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(3, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
 
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         let eligibility = sidecar
             .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
             .expect("eligibility");
-
-        assert_eq!(eligibility.uncompacted_unit_count, 0);
         assert_eq!(eligibility.triggering_function_call_output_count, 0);
-        assert_eq!(eligibility.max_token_qty, 0);
     }
 
     #[test]
@@ -1197,7 +1329,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"echo hi\"}".to_string(),
         };
-        sidecar.observe_recorded_item(0, &other_tool);
+        sidecar.observe_recorded_item(&other_tool);
 
         let exec_command = ResponseItem::FunctionCall {
             id: None,
@@ -1206,7 +1338,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
-        sidecar.observe_recorded_item(1, &exec_command);
+        sidecar.observe_recorded_item(&exec_command);
 
         let output = ResponseItem::FunctionCallOutput {
             call_id: "shared".to_string(),
@@ -1214,7 +1346,7 @@ mod tests {
                 "Wall time: 0.1000 seconds\nToken qty: 900\nOutput:\nhello".to_string(),
             ),
         };
-        sidecar.observe_recorded_item(2, &output);
+        sidecar.observe_recorded_item(&output);
 
         let phase_message = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -1225,16 +1357,13 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(3, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
 
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         let eligibility = sidecar
             .checkpoint_eligibility(checkpoint.checkpoint_id.as_str())
             .expect("eligibility");
-
-        assert_eq!(eligibility.uncompacted_unit_count, 0);
         assert_eq!(eligibility.triggering_function_call_output_count, 0);
-        assert_eq!(eligibility.max_token_qty, 0);
     }
 
     #[test]
@@ -1249,7 +1378,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"cat huge.log\"}".to_string(),
         };
-        sidecar.observe_recorded_item(0, &call);
+        sidecar.observe_recorded_item(&call);
 
         let output = ResponseItem::FunctionCallOutput {
             call_id: "call-1".to_string(),
@@ -1258,15 +1387,19 @@ mod tests {
                 success: Some(true),
             },
         };
-        sidecar.observe_recorded_item(1, &output);
+        sidecar.observe_recorded_item(&output);
 
         let later_reasoning = ResponseItem::Reasoning {
             id: "reasoning-1".to_string(),
             summary: Vec::new(),
-            content: None,
-            encrypted_content: Some("y".repeat(2_000)),
+            content: Some(vec![
+                codex_protocol::models::ReasoningItemContent::ReasoningText {
+                    text: "y".repeat(2_000),
+                },
+            ]),
+            encrypted_content: None,
         };
-        sidecar.observe_recorded_item(2, &later_reasoning);
+        sidecar.observe_recorded_item(&later_reasoning);
 
         let phase_message = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -1277,7 +1410,7 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(3, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
 
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         let units = sidecar
@@ -1301,15 +1434,23 @@ mod tests {
 
         let first = ResponseItem::Reasoning {
             id: "reasoning-1".to_string(),
-            summary: Vec::new(),
+            summary: vec![
+                codex_protocol::models::ReasoningItemReasoningSummary::SummaryText {
+                    text: "first".to_string(),
+                },
+            ],
             content: None,
-            encrypted_content: Some("x".repeat(2_000)),
+            encrypted_content: None,
         };
         let second = ResponseItem::Reasoning {
             id: "reasoning-2".to_string(),
-            summary: Vec::new(),
+            summary: vec![
+                codex_protocol::models::ReasoningItemReasoningSummary::SummaryText {
+                    text: "second".to_string(),
+                },
+            ],
             content: None,
-            encrypted_content: Some("y".repeat(2_000)),
+            encrypted_content: None,
         };
         let phase_one = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -1321,9 +1462,9 @@ mod tests {
             phase: Some(MessagePhase::Commentary),
         };
 
-        sidecar.observe_recorded_item(0, &first);
-        sidecar.observe_recorded_item(1, &second);
-        sidecar.observe_recorded_item(2, &phase_one);
+        sidecar.observe_recorded_item(&first);
+        sidecar.observe_recorded_item(&second);
+        sidecar.observe_recorded_item(&phase_one);
 
         let checkpoint_one = sidecar.take_pending_checkpoint().expect("checkpoint one");
         let first_unit_key = sidecar.units[0].unit_key;
@@ -1342,18 +1483,15 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(3, &phase_two);
+        sidecar.observe_recorded_item(&phase_two);
 
         let checkpoint_two = sidecar.take_pending_checkpoint().expect("checkpoint two");
         let eligibility = sidecar
             .checkpoint_eligibility(checkpoint_two.checkpoint_id.as_str())
             .expect("eligibility");
-
-        assert_eq!(eligibility.uncompacted_unit_count, 1);
         assert_eq!(eligibility.triggering_function_call_output_count, 0);
-        assert_eq!(eligibility.max_token_qty, 0);
         assert_eq!(eligibility.selectable_unit_count, 1);
-        assert!(eligibility.selectable_raw_bytes >= 2_000);
+        assert!(eligibility.selectable_raw_bytes > 0);
     }
 
     #[test]
@@ -1373,7 +1511,7 @@ mod tests {
                 user: None,
             }),
         };
-        sidecar.observe_recorded_item(0, &shell_call);
+        sidecar.observe_recorded_item(&shell_call);
 
         let shell_output = ResponseItem::FunctionCallOutput {
             call_id: "legacy-shell".to_string(),
@@ -1382,7 +1520,7 @@ mod tests {
                 success: Some(true),
             },
         };
-        sidecar.observe_recorded_item(1, &shell_output);
+        sidecar.observe_recorded_item(&shell_output);
 
         let phase_message = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -1393,7 +1531,7 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(2, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
 
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         let units = sidecar
@@ -1422,7 +1560,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"old\"}".to_string(),
         };
-        sidecar.observe_recorded_item(0, &old_call);
+        sidecar.observe_recorded_item(&old_call);
         sidecar.clear_pending_calls_for_rewrite();
 
         let new_call = ResponseItem::FunctionCall {
@@ -1432,7 +1570,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"new\"}".to_string(),
         };
-        sidecar.observe_recorded_item(1, &new_call);
+        sidecar.observe_recorded_item(&new_call);
 
         let output = ResponseItem::FunctionCallOutput {
             call_id: "call-1".to_string(),
@@ -1441,7 +1579,7 @@ mod tests {
                 success: Some(true),
             },
         };
-        sidecar.observe_recorded_item(2, &output);
+        sidecar.observe_recorded_item(&output);
 
         let phase_message = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -1452,7 +1590,7 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(3, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
 
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         let units = sidecar
@@ -1482,7 +1620,7 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(0, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         sidecar.block_remaining_turn(&checkpoint.checkpoint_id, "usage limit");
 
@@ -1495,7 +1633,7 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::FinalAnswer),
         };
-        sidecar.observe_recorded_item(1, &later_phase_message);
+        sidecar.observe_recorded_item(&later_phase_message);
 
         assert!(sidecar.take_pending_checkpoint().is_none());
         assert_eq!(
@@ -1516,7 +1654,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"pwd\"}".to_string(),
         };
-        sidecar.observe_recorded_item(0, &call);
+        sidecar.observe_recorded_item(&call);
 
         let phase_message = ResponseItem::Message {
             id: Some("msg-1".to_string()),
@@ -1527,7 +1665,7 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(1, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
         sidecar.block_remaining_turn(&checkpoint.checkpoint_id, "usage limit");
 
@@ -1540,7 +1678,7 @@ mod tests {
             content: None,
             encrypted_content: None,
         };
-        sidecar.observe_recorded_item(2, &reasoning);
+        sidecar.observe_recorded_item(&reasoning);
 
         let later_call = ResponseItem::FunctionCall {
             id: None,
@@ -1549,7 +1687,7 @@ mod tests {
             namespace: None,
             arguments: "{\"cmd\":\"later\"}".to_string(),
         };
-        sidecar.observe_recorded_item(3, &later_call);
+        sidecar.observe_recorded_item(&later_call);
 
         assert_eq!(sidecar.units.len(), 0);
         assert!(sidecar.pending_function_calls.is_empty());
@@ -1557,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn fail_cycle_clears_applied_seq_for_the_same_checkpoint() {
+    fn fail_cycle_clears_runtime_state_without_blocking_turn() {
         let mut sidecar = PromptGcSidecar::default();
         sidecar.bind_turn("turn-1");
 
@@ -1570,15 +1708,14 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(0, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
-        sidecar.active_checkpoint = Some(checkpoint.clone());
-        sidecar.status.last_applied_checkpoint_seq = Some(checkpoint.checkpoint_seq);
 
         sidecar.fail_cycle(&checkpoint.checkpoint_id, "request failed");
 
-        assert_eq!(sidecar.status.last_applied_checkpoint_seq, None);
-        assert_eq!(sidecar.status.last_error.as_deref(), Some("request failed"));
+        assert!(!sidecar.running);
+        assert!(sidecar.active_checkpoint.is_none());
+        assert_eq!(sidecar.status.blocked_reason, None);
     }
 
     #[test]
@@ -1595,17 +1732,13 @@ mod tests {
             end_turn: None,
             phase: Some(MessagePhase::Commentary),
         };
-        sidecar.observe_recorded_item(0, &phase_message);
+        sidecar.observe_recorded_item(&phase_message);
         let checkpoint = sidecar.take_pending_checkpoint().expect("checkpoint");
-        sidecar.status.last_error = Some("older failure".to_string());
-        sidecar.status.last_applied_checkpoint_seq = Some(7);
 
         sidecar.skip_cycle(&checkpoint.checkpoint_id);
 
         assert!(!sidecar.running);
         assert!(sidecar.active_checkpoint.is_none());
-        assert_eq!(sidecar.status.last_error.as_deref(), Some("older failure"));
-        assert_eq!(sidecar.status.last_applied_checkpoint_seq, Some(7));
         assert_eq!(sidecar.status.blocked_reason, None);
     }
 }
