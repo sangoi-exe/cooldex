@@ -119,7 +119,7 @@ fn build_wait_agent_statuses(
     entries
 }
 
-fn collab_spawn_error(err: CodexErr) -> FunctionCallError {
+pub(crate) fn collab_spawn_error(err: CodexErr) -> FunctionCallError {
     match err {
         CodexErr::UnsupportedOperation(message) if message == "thread manager dropped" => {
             FunctionCallError::RespondToModel("collab manager unavailable".to_string())
@@ -144,7 +144,7 @@ fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionCallError {
     }
 }
 
-fn thread_spawn_source(
+pub(crate) fn thread_spawn_source(
     parent_thread_id: ThreadId,
     parent_session_source: &SessionSource,
     depth: i32,
@@ -170,7 +170,7 @@ fn thread_spawn_source(
     }))
 }
 
-fn parse_collab_input(
+pub(crate) fn parse_collab_input(
     message: Option<String>,
     items: Option<Vec<UserInput>>,
 ) -> Result<Vec<UserInput>, FunctionCallError> {
@@ -259,7 +259,7 @@ fn apply_child_prompt_overrides(config: &mut Config) {
         Some(crate::codex::SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY.to_string());
 }
 
-async fn finalize_spawn_agent_prompt_config(
+pub(crate) async fn finalize_spawn_agent_prompt_config(
     config: &mut Config,
     turn: &TurnContext,
     models_manager: &crate::models_manager::manager::ModelsManager,
@@ -298,7 +298,7 @@ async fn finalize_spawn_agent_prompt_config(
     );
 }
 
-fn apply_spawn_agent_profile_override(
+pub(crate) fn apply_spawn_agent_profile_override(
     config: &mut Config,
     profile_name: Option<&str>,
 ) -> Result<(), FunctionCallError> {
@@ -351,7 +351,7 @@ fn apply_spawn_agent_profile_override(
 ///
 /// These values are chosen by the live turn rather than persisted config, so leaving them stale
 /// can make a child agent disagree with its parent about approval policy, cwd, or sandboxing.
-fn apply_spawn_agent_runtime_overrides(
+pub(crate) fn apply_spawn_agent_runtime_overrides(
     config: &mut Config,
     turn: &TurnContext,
 ) -> Result<(), FunctionCallError> {
@@ -438,7 +438,7 @@ fn apply_spawn_agent_runtime_overrides(
     Ok(())
 }
 
-fn apply_spawn_agent_overrides(config: &mut Config, child_depth: i32) {
+pub(crate) fn apply_spawn_agent_overrides(config: &mut Config, child_depth: i32) {
     if child_depth >= config.agent_max_depth {
         let _ = config.features.disable(Feature::SpawnCsv);
         let _ = config.features.disable(Feature::Collab);

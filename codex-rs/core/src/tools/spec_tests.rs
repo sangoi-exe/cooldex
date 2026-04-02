@@ -1,3 +1,6 @@
+// Merge-safety anchor: touched collaboration tool spec tests must stay aligned
+// with the workspace-local MultiAgentV2 production surface and schema contract.
+
 use crate::config::test_config;
 use crate::models_manager::manager::ModelsManager;
 use crate::models_manager::model_info::with_config_overrides;
@@ -434,7 +437,7 @@ fn test_build_specs_collab_tools_enabled() {
 }
 
 #[test]
-fn test_build_specs_multi_agent_v2_uses_task_names_and_keeps_wait_resume_contract() {
+fn test_build_specs_multi_agent_v2_uses_task_names_and_v2_collab_surface() {
     let config = test_config();
     let model_info = ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
     let mut features = Features::with_defaults();
@@ -534,7 +537,7 @@ fn test_build_specs_multi_agent_v2_uses_task_names_and_keeps_wait_resume_contrac
         Some(&vec!["target".to_string(), "items".to_string()])
     );
 
-    let wait = find_tool(&tools, "wait");
+    let wait = find_tool(&tools, "wait_agent");
     let ToolSpec::Function(ResponsesApiTool {
         parameters,
         output_schema,
@@ -556,26 +559,8 @@ fn test_build_specs_multi_agent_v2_uses_task_names_and_keeps_wait_resume_contrac
     let output_schema = output_schema
         .as_ref()
         .expect("wait should define output schema");
-    assert_eq!(
-        output_schema["properties"]["agents"]["description"],
-        json!(
-            "Current runtime state keyed by agent id for every requested agent when the wait returns."
-        )
-    );
-    let resume_agent = find_tool(&tools, "resume_agent");
-    let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = &resume_agent.spec else {
-        panic!("resume_agent should be a function tool");
-    };
-    let JsonSchema::Object {
-        properties,
-        required,
-        ..
-    } = parameters
-    else {
-        panic!("resume_agent should use object params");
-    };
-    assert!(properties.contains_key("id"));
-    assert_eq!(required.as_ref(), Some(&vec!["id".to_string()]));
+    assert_eq!(output_schema["required"], json!(["message", "timed_out"]));
+    assert_lacks_tool_name(&tools, "resume_agent");
 }
 
 #[test]

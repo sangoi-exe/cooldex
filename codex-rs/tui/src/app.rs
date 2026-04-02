@@ -215,7 +215,7 @@ async fn best_effort_resume_history_turns(
         return None;
     }
     let turns = build_turns_from_rollout_items(&rollout_items);
-    (!turns.is_empty()).then(|| apply_resume_history_mode(config, turns))
+    Some(apply_resume_history_mode(config, turns))
 }
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
@@ -6948,11 +6948,16 @@ mod tests {
     use codex_protocol::models::PermissionProfile;
     use codex_protocol::openai_models::ModelAvailabilityNux;
     use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::Event;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::McpAuthStatus;
     use codex_protocol::protocol::NetworkApprovalContext;
     use codex_protocol::protocol::NetworkApprovalProtocol;
+    use codex_protocol::protocol::PROMPT_GC_COMPACTION_MESSAGE;
+    use codex_protocol::protocol::PromptGcCompactionMetadata;
+    use codex_protocol::protocol::PromptGcExecutionPhase;
+    use codex_protocol::protocol::PromptGcOutcomeKind;
     use codex_protocol::protocol::RateLimitWindow;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::RolloutLine;
@@ -12160,6 +12165,45 @@ guardian_approval = true
 
         let full = apply_resume_history_mode(&config, turns.clone());
         assert_eq!(full, turns);
+    }
+
+    #[tokio::test]
+    async fn best_effort_resume_history_turns_keeps_boundary_for_prompt_gc_only_rollout() {
+        let mut config = ConfigBuilder::default().build().await.expect("config");
+        config.tui_resume_history = ResumeHistoryMode::SinceLastCompaction;
+
+        let temp_dir = tempdir().expect("tempdir");
+        let rollout_path = temp_dir.path().join("rollout.jsonl");
+        let rollout = RolloutLine {
+            timestamp: "t0".to_string(),
+            item: RolloutItem::Compacted(CompactedItem {
+                message: PROMPT_GC_COMPACTION_MESSAGE.to_string(),
+                replacement_history: None,
+                prompt_gc: Some(PromptGcCompactionMetadata {
+                    checkpoint_id: "turn-compact:prompt_gc:0".to_string(),
+                    checkpoint_seq: 0,
+                    kind: PromptGcOutcomeKind::Failed,
+                    phase: Some(PromptGcExecutionPhase::Prepare),
+                    stop_reason: Some("invalid_contract".to_string()),
+                    error_message: Some("bad override".to_string()),
+                    applied_unit_count: None,
+                }),
+            }),
+        };
+        std::fs::write(
+            &rollout_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&rollout).expect("rollout json")
+            ),
+        )
+        .expect("write rollout");
+
+        let turns = best_effort_resume_history_turns(&config, &rollout_path)
+            .await
+            .expect("rollout load should still define the resume boundary");
+
+        assert!(turns.is_empty());
     }
 
     #[tokio::test]

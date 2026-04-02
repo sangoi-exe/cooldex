@@ -1,3 +1,6 @@
+// Merge-safety anchor: mailbox sequence subscriptions back the workspace-local
+// MultiAgentV2 wait/list surfaces; keep delivery order and watcher ownership aligned.
+
 use codex_protocol::protocol::InterAgentCommunication;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicU64;
@@ -36,7 +39,6 @@ impl Mailbox {
         )
     }
 
-    #[cfg(test)]
     pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
         self.seq_tx.subscribe()
     }

@@ -1,3 +1,7 @@
+// Merge-safety anchor: regular lead-turn execution remains a prompt_gc-adjacent
+// seam; keep the regular-task entrypoint aligned with prompt_gc rollout and
+// resume-boundary contracts called out in `AGENTS.md`.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

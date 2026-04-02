@@ -1,11 +1,22 @@
+// Merge-safety anchor: MultiAgentV2 spawn owns the canonical task-name contract
+// for spawned children; keep the runtime handler aligned with the V2 tool spec,
+// task-path metadata, and inherited child-instruction behavior.
+
 use super::*;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::control::render_input_preview;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
+use crate::tools::handlers::multi_agents::apply_spawn_agent_overrides;
+use crate::tools::handlers::multi_agents::apply_spawn_agent_profile_override;
+use crate::tools::handlers::multi_agents::apply_spawn_agent_runtime_overrides;
+use crate::tools::handlers::multi_agents::build_agent_spawn_config;
+use crate::tools::handlers::multi_agents::collab_spawn_error;
+use crate::tools::handlers::multi_agents::finalize_spawn_agent_prompt_config;
+use crate::tools::handlers::multi_agents::parse_collab_input;
+use crate::tools::handlers::multi_agents::thread_spawn_source;
 use codex_protocol::AgentPath;
-use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 
@@ -38,8 +49,13 @@ impl ToolHandler for Handler {
             .as_deref()
             .map(str::trim)
             .filter(|role| !role.is_empty());
-
-        let initial_operation = parse_collab_input(args.message, args.items)?;
+        let requested_task_name = args.task_name.clone();
+        let profile_name = args
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|profile| !profile.is_empty());
+        let initial_operation: Op = parse_collab_input(args.message, args.items)?.into();
         let prompt = render_input_preview(&initial_operation);
 
         let session_source = turn.session_source.clone();
@@ -50,6 +66,25 @@ impl ToolHandler for Handler {
                 "Agent depth limit reached. Solve the task yourself.".to_string(),
             ));
         }
+        let mut config = build_agent_spawn_config(turn.as_ref())?;
+        apply_spawn_agent_profile_override(&mut config, profile_name)?;
+        apply_role_to_config(&mut config, role_name)
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
+        apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+        finalize_spawn_agent_prompt_config(
+            &mut config,
+            turn.as_ref(),
+            session.services.models_manager.as_ref(),
+        )
+        .await;
+        apply_spawn_agent_overrides(&mut config, child_depth);
+        let configured_model = config
+            .model
+            .clone()
+            .unwrap_or_else(|| turn.model_info.slug.clone());
+        let configured_reasoning_effort = config.model_reasoning_effort;
+        let configured_profile = config.active_profile.clone();
         session
             .send_event(
                 &turn,
@@ -57,61 +92,47 @@ impl ToolHandler for Handler {
                     call_id: call_id.clone(),
                     sender_thread_id: session.conversation_id,
                     prompt: prompt.clone(),
-                    profile: None,
-                    model: args.model.clone().unwrap_or_default(),
-                    reasoning_effort: args.reasoning_effort,
+                    profile: configured_profile.clone(),
+                    model: configured_model.clone(),
+                    reasoning_effort: configured_reasoning_effort,
                 }
                 .into(),
             )
             .await;
-        let mut config =
-            build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
-        apply_requested_spawn_agent_model_overrides(
-            &session,
-            turn.as_ref(),
-            &mut config,
-            args.model.as_deref(),
-            args.reasoning_effort,
-        )
-        .await?;
-        apply_role_to_config(&mut config, role_name)
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
-        apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
-        apply_spawn_agent_overrides(&mut config, child_depth);
 
         let spawn_source = thread_spawn_source(
             session.conversation_id,
             &turn.session_source,
             child_depth,
             role_name,
-            Some(args.task_name.clone()),
+            Some(requested_task_name.clone()),
         )?;
+        let spawn_operation = if let (Some(recipient), Op::UserInput { items, .. }) =
+            (spawn_source.get_agent_path(), &initial_operation)
+            && items
+                .iter()
+                .all(|item| matches!(item, UserInput::Text { .. }))
+        {
+            Op::InterAgentCommunication {
+                communication: InterAgentCommunication::new(
+                    turn.session_source
+                        .get_agent_path()
+                        .unwrap_or_else(AgentPath::root),
+                    recipient,
+                    Vec::new(),
+                    prompt.clone(),
+                    /*trigger_turn*/ true,
+                ),
+            }
+        } else {
+            initial_operation
+        };
         let result = session
             .services
             .agent_control
             .spawn_agent_with_metadata(
                 config,
-                match (spawn_source.get_agent_path(), initial_operation) {
-                    (Some(recipient), Op::UserInput { items, .. })
-                        if items
-                            .iter()
-                            .all(|item| matches!(item, UserInput::Text { .. })) =>
-                    {
-                        Op::InterAgentCommunication {
-                            communication: InterAgentCommunication::new(
-                                turn.session_source
-                                    .get_agent_path()
-                                    .unwrap_or_else(AgentPath::root),
-                                recipient,
-                                Vec::new(),
-                                prompt.clone(),
-                                /*trigger_turn*/ true,
-                            ),
-                        }
-                    }
-                    (_, initial_operation) => initial_operation,
-                },
+                spawn_operation,
                 Some(spawn_source),
                 SpawnAgentOptions {
                     fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
@@ -154,11 +175,11 @@ impl ToolHandler for Handler {
         let effective_model = agent_snapshot
             .as_ref()
             .map(|snapshot| snapshot.model.clone())
-            .unwrap_or_else(|| args.model.clone().unwrap_or_default());
+            .unwrap_or_else(|| configured_model.clone());
         let effective_reasoning_effort = agent_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.reasoning_effort)
-            .or(args.reasoning_effort);
+            .or(configured_reasoning_effort);
         let nickname = new_agent_nickname.clone();
         session
             .send_event(
@@ -170,7 +191,7 @@ impl ToolHandler for Handler {
                     new_agent_nickname,
                     new_agent_role,
                     prompt,
-                    profile: None,
+                    profile: configured_profile,
                     model: effective_model,
                     reasoning_effort: effective_reasoning_effort,
                     status,
@@ -200,13 +221,13 @@ impl ToolHandler for Handler {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SpawnAgentArgs {
     message: Option<String>,
     items: Option<Vec<UserInput>>,
     task_name: String,
     agent_type: Option<String>,
-    model: Option<String>,
-    reasoning_effort: Option<ReasoningEffort>,
+    profile: Option<String>,
     #[serde(default)]
     fork_context: bool,
 }

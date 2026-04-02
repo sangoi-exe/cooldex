@@ -1,4 +1,8 @@
+// Merge-safety anchor: MultiAgentV2 close-agent output must stay aligned with
+// the workspace-local runtime status contract used by reviewable operator surfaces.
+
 use super::*;
+use crate::tools::handlers::multi_agents_common::collab_agent_error;
 
 pub(crate) struct Handler;
 

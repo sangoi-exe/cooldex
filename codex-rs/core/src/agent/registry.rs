@@ -1,3 +1,6 @@
+// Merge-safety anchor: registry snapshots and agent-prefix resolution back the
+// workspace-local MultiAgentV2 runtime surfaces; keep live-agent ownership canonical.
+
 use crate::error::CodexErr;
 use crate::error::Result;
 use codex_protocol::AgentPath;
@@ -152,7 +155,6 @@ impl AgentRegistry {
             .cloned()
     }
 
-    #[cfg(test)]
     pub(crate) fn live_agents(&self) -> Vec<AgentMetadata> {
         self.active_agents
             .lock()

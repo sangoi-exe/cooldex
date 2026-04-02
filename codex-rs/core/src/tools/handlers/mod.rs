@@ -8,7 +8,6 @@ mod mcp;
 mod mcp_resource;
 pub(crate) mod multi_agents;
 pub(crate) mod multi_agents_common;
-#[cfg(test)]
 pub(crate) mod multi_agents_v2;
 mod plan;
 // Merge-safety anchor: prompt_gc helper exposure must stay crate-visible for the

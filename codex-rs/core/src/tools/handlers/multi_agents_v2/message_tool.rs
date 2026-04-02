@@ -2,9 +2,12 @@
 //!
 //! `send_message` and `assign_task` intentionally expose the same input shape and differ only in
 //! whether the resulting `InterAgentCommunication` should wake the target immediately.
+// Merge-safety anchor: the workspace-local send_message/assign_task V2 contract
+// shares one text-only parser and fail-loud dispatch owner here.
 
 use super::*;
 use crate::agent::control::render_input_preview;
+use crate::tools::handlers::multi_agents_common::collab_agent_error;
 use codex_protocol::protocol::InterAgentCommunication;
 
 #[derive(Clone, Copy)]

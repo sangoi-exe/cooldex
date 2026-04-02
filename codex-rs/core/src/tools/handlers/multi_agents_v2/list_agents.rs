@@ -1,5 +1,9 @@
+// Merge-safety anchor: MultiAgentV2 agent listing must stay aligned with the
+// workspace-local live-agent registry projection and list_agents tool schema.
+
 use super::*;
 use crate::agent::control::ListedAgent;
+use crate::tools::handlers::multi_agents_common::collab_spawn_error;
 
 pub(crate) struct Handler;
 

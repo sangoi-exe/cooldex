@@ -1,3 +1,7 @@
+// Merge-safety anchor: unified TUI app-server session state owns the live
+// bridge between app-server thread/session metadata and the single TUI replay
+// surface; keep resume, review, approval, and account-state adapters aligned.
+
 use crate::bottom_pane::FeedbackAudience;
 use crate::status::StatusAccountDisplay;
 use crate::status::plan_type_display_name;

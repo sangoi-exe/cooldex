@@ -41,8 +41,6 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::user_input::UserInput;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
-#[cfg(test)]
-use serde::Serialize;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -52,7 +50,6 @@ use tracing::warn;
 
 const AGENT_NAMES: &str = include_str!("agent_names.txt");
 const FORKED_SPAWN_AGENT_OUTPUT_MESSAGE: &str = "You are the newly spawned agent. The prior conversation history was forked from your parent agent. Treat the next user message as your new task, and use the forked history only as background context.";
-#[cfg(test)]
 const ROOT_LAST_TASK_MESSAGE: &str = "Main thread";
 
 #[derive(Clone, Debug, Default)]
@@ -67,8 +64,7 @@ pub(crate) struct LiveAgent {
     pub(crate) status: AgentStatus,
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
 pub(crate) struct ListedAgent {
     pub(crate) agent_name: String,
     pub(crate) agent_status: AgentStatus,
@@ -814,7 +810,6 @@ impl AgentControl {
             .join("\n")
     }
 
-    #[cfg(test)]
     pub(crate) async fn list_agents(
         &self,
         current_session_source: &SessionSource,
@@ -1168,7 +1163,6 @@ fn thread_spawn_parent_thread_id(session_source: &SessionSource) -> Option<Threa
     }
 }
 
-#[cfg(test)]
 fn agent_matches_prefix(agent_path: Option<&AgentPath>, prefix: &AgentPath) -> bool {
     if prefix.is_root() {
         return true;

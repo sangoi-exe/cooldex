@@ -1,3 +1,6 @@
+// Merge-safety anchor: shared collab error helpers define the fail-loud operator
+// contract reused by the workspace-local MultiAgentV2 handlers.
+
 #[cfg(test)]
 use crate::agent::AgentStatus;
 #[cfg(test)]
@@ -6,7 +9,6 @@ use crate::codex::Session;
 use crate::codex::TurnContext;
 #[cfg(test)]
 use crate::config::Config;
-#[cfg(test)]
 use crate::error::CodexErr;
 use crate::function_tool::FunctionCallError;
 #[cfg(test)]
@@ -18,7 +20,6 @@ use crate::tools::context::ToolPayload;
 use codex_features::Feature;
 #[cfg(test)]
 use codex_protocol::AgentPath;
-#[cfg(test)]
 use codex_protocol::ThreadId;
 #[cfg(test)]
 use codex_protocol::models::BaseInstructions;
@@ -130,7 +131,6 @@ pub(crate) fn build_wait_agent_statuses(
     entries
 }
 
-#[cfg(test)]
 pub(crate) fn collab_spawn_error(err: CodexErr) -> FunctionCallError {
     match err {
         CodexErr::UnsupportedOperation(message) if message == "thread manager dropped" => {
@@ -141,7 +141,6 @@ pub(crate) fn collab_spawn_error(err: CodexErr) -> FunctionCallError {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionCallError {
     match err {
         CodexErr::ThreadNotFound(id) => {

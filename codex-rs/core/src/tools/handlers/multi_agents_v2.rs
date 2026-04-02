@@ -1,4 +1,6 @@
 //! Implements the MultiAgentV2 collaboration tool surface.
+// Merge-safety anchor: the workspace-local production V2 collaboration surface is
+// owned here; keep handler exports aligned with the spec/tool registration switch.
 
 use crate::agent::AgentStatus;
 use crate::agent::agent_resolver::resolve_agent_target;
@@ -7,7 +9,7 @@ use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
-use crate::tools::handlers::multi_agents_common::*;
+pub(crate) use crate::tools::handlers::multi_agents_common::*;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
@@ -27,17 +29,11 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
-#[cfg(test)]
 pub(crate) use assign_task::Handler as AssignTaskHandler;
-#[cfg(test)]
 pub(crate) use close_agent::Handler as CloseAgentHandler;
-#[cfg(test)]
 pub(crate) use list_agents::Handler as ListAgentsHandler;
-#[cfg(test)]
 pub(crate) use send_message::Handler as SendMessageHandler;
-#[cfg(test)]
 pub(crate) use spawn::Handler as SpawnAgentHandler;
-#[cfg(test)]
 pub(crate) use wait::Handler as WaitAgentHandler;
 
 mod assign_task;

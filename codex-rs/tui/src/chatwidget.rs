@@ -2373,8 +2373,7 @@ impl ChatWidget {
         // reconstructed turns were available at all.
         if let Some(turns) = self.pending_resume_turns.take() {
             self.replay_thread_turns(turns, ReplayKind::ResumeInitialMessages);
-        }
-        if let Some(messages) = initial_messages {
+        } else if let Some(messages) = initial_messages {
             self.replay_initial_messages(messages);
         }
         self.submit_op(AppCommand::list_skills(
@@ -7128,20 +7127,28 @@ impl ChatWidget {
                 changes,
                 status,
             } => {
+                let core_changes = app_server_patch_changes_to_core(changes);
+                self.on_patch_apply_begin(PatchApplyBeginEvent {
+                    call_id: id.clone(),
+                    turn_id: turn_id.clone(),
+                    auto_approved: false,
+                    changes: core_changes.clone(),
+                });
                 if !matches!(
                     status,
                     codex_app_server_protocol::PatchApplyStatus::InProgress
+                        | codex_app_server_protocol::PatchApplyStatus::Completed
                 ) {
                     self.on_patch_apply_end(codex_protocol::protocol::PatchApplyEndEvent {
                         call_id: id,
                         turn_id: turn_id.clone(),
                         stdout: String::new(),
                         stderr: String::new(),
-                        success: !matches!(
+                        success: matches!(
                             status,
-                            codex_app_server_protocol::PatchApplyStatus::Failed
+                            codex_app_server_protocol::PatchApplyStatus::Completed
                         ),
-                        changes: app_server_patch_changes_to_core(changes),
+                        changes: core_changes,
                         status: match status {
                             codex_app_server_protocol::PatchApplyStatus::Completed => {
                                 codex_protocol::protocol::PatchApplyStatus::Completed

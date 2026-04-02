@@ -42,10 +42,18 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_tools::CommandToolOptions;
 use codex_tools::DiscoverableTool;
 use codex_tools::ShellToolOptions;
+use codex_tools::SpawnAgentToolOptions;
 use codex_tools::ToolSearchAppInfo;
 use codex_tools::ToolSuggestEntry;
 use codex_tools::ViewImageToolOptions;
+use codex_tools::WaitAgentTimeoutOptions;
 use codex_tools::augment_tool_spec_for_code_mode;
+use codex_tools::create_assign_task_tool;
+use codex_tools::create_close_agent_tool_v2;
+use codex_tools::create_list_agents_tool;
+use codex_tools::create_send_message_tool;
+use codex_tools::create_spawn_agent_tool_v2;
+use codex_tools::create_wait_agent_tool_v2;
 use codex_tools::dynamic_tool_to_responses_api_tool;
 use codex_tools::mcp_tool_to_responses_api_tool;
 use codex_tools::tool_spec_to_code_mode_tool_definition;
@@ -1665,6 +1673,12 @@ pub(crate) fn build_specs_with_discoverable_tools(
     use crate::tools::handlers::multi_agents::SendInputHandler;
     use crate::tools::handlers::multi_agents::SpawnAgentHandler;
     use crate::tools::handlers::multi_agents::WaitAgentHandler;
+    use crate::tools::handlers::multi_agents_v2::AssignTaskHandler as AssignTaskHandlerV2;
+    use crate::tools::handlers::multi_agents_v2::CloseAgentHandler as CloseAgentHandlerV2;
+    use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
+    use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
+    use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
+    use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
     use crate::tools::handlers::unified_exec::UNIFIED_EXEC_FUNCTION_TOOL_NAME;
     use std::sync::Arc;
 
@@ -2029,19 +2043,71 @@ pub(crate) fn build_specs_with_discoverable_tools(
     builder.register_handler("recall", recall_handler);
 
     if config.collab_tools {
-        push_tool_spec(
-            &mut builder,
-            create_spawn_agent_tool(config),
-            /*supports_parallel_tool_calls*/ false,
-            config.code_mode_enabled,
-        );
-        push_tool_spec(
-            &mut builder,
-            create_send_input_tool(),
-            /*supports_parallel_tool_calls*/ false,
-            config.code_mode_enabled,
-        );
-        if !config.multi_agent_v2 {
+        if config.multi_agent_v2 {
+            push_tool_spec(
+                &mut builder,
+                create_spawn_agent_tool_v2(SpawnAgentToolOptions {
+                    available_models: &config.available_models,
+                    agent_type_description: crate::agent::role::spawn_tool_spec::build(
+                        &config.agent_roles,
+                    ),
+                }),
+                /*supports_parallel_tool_calls*/ false,
+                config.code_mode_enabled,
+            );
+            push_tool_spec(
+                &mut builder,
+                create_send_message_tool(),
+                /*supports_parallel_tool_calls*/ false,
+                config.code_mode_enabled,
+            );
+            push_tool_spec(
+                &mut builder,
+                create_assign_task_tool(),
+                /*supports_parallel_tool_calls*/ false,
+                config.code_mode_enabled,
+            );
+            push_tool_spec(
+                &mut builder,
+                create_wait_agent_tool_v2(WaitAgentTimeoutOptions {
+                    default_timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+                    min_timeout_ms: MIN_WAIT_TIMEOUT_MS,
+                    max_timeout_ms: MAX_WAIT_TIMEOUT_MS,
+                }),
+                /*supports_parallel_tool_calls*/ false,
+                config.code_mode_enabled,
+            );
+            push_tool_spec(
+                &mut builder,
+                create_close_agent_tool_v2(),
+                /*supports_parallel_tool_calls*/ false,
+                config.code_mode_enabled,
+            );
+            push_tool_spec(
+                &mut builder,
+                create_list_agents_tool(),
+                /*supports_parallel_tool_calls*/ false,
+                config.code_mode_enabled,
+            );
+            builder.register_handler("spawn_agent", Arc::new(SpawnAgentHandlerV2));
+            builder.register_handler("send_message", Arc::new(SendMessageHandlerV2));
+            builder.register_handler("assign_task", Arc::new(AssignTaskHandlerV2));
+            builder.register_handler("wait_agent", Arc::new(WaitAgentHandlerV2));
+            builder.register_handler("close_agent", Arc::new(CloseAgentHandlerV2));
+            builder.register_handler("list_agents", Arc::new(ListAgentsHandlerV2));
+        } else {
+            push_tool_spec(
+                &mut builder,
+                create_spawn_agent_tool(config),
+                /*supports_parallel_tool_calls*/ false,
+                config.code_mode_enabled,
+            );
+            push_tool_spec(
+                &mut builder,
+                create_send_input_tool(),
+                /*supports_parallel_tool_calls*/ false,
+                config.code_mode_enabled,
+            );
             push_tool_spec(
                 &mut builder,
                 create_resume_agent_tool(),
@@ -2049,23 +2115,23 @@ pub(crate) fn build_specs_with_discoverable_tools(
                 config.code_mode_enabled,
             );
             builder.register_handler("resume_agent", Arc::new(ResumeAgentHandler));
+            push_tool_spec(
+                &mut builder,
+                create_wait_agent_tool(),
+                /*supports_parallel_tool_calls*/ false,
+                config.code_mode_enabled,
+            );
+            push_tool_spec(
+                &mut builder,
+                create_close_agent_tool(),
+                /*supports_parallel_tool_calls*/ false,
+                config.code_mode_enabled,
+            );
+            builder.register_handler("spawn_agent", Arc::new(SpawnAgentHandler));
+            builder.register_handler("send_input", Arc::new(SendInputHandler));
+            builder.register_handler("wait", Arc::new(WaitAgentHandler));
+            builder.register_handler("close_agent", Arc::new(CloseAgentHandler));
         }
-        push_tool_spec(
-            &mut builder,
-            create_wait_agent_tool(),
-            /*supports_parallel_tool_calls*/ false,
-            config.code_mode_enabled,
-        );
-        push_tool_spec(
-            &mut builder,
-            create_close_agent_tool(),
-            /*supports_parallel_tool_calls*/ false,
-            config.code_mode_enabled,
-        );
-        builder.register_handler("spawn_agent", Arc::new(SpawnAgentHandler));
-        builder.register_handler("send_input", Arc::new(SendInputHandler));
-        builder.register_handler("wait", Arc::new(WaitAgentHandler));
-        builder.register_handler("close_agent", Arc::new(CloseAgentHandler));
     }
 
     if config.agent_jobs_tools {
