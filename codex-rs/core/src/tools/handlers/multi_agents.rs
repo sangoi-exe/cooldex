@@ -7,7 +7,6 @@
 
 use crate::agent::AgentRuntimeState;
 use crate::agent::AgentStatus;
-use crate::agent::agent_resolver::resolve_agent_target;
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::codex::Session;
 use crate::codex::TurnContext;
@@ -48,24 +47,11 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 pub(crate) fn parse_agent_id_target(target: &str) -> Result<ThreadId, FunctionCallError> {
     ThreadId::from_string(target).map_err(|err| {
         FunctionCallError::RespondToModel(format!("invalid agent id {target}: {err:?}"))
     })
-}
-
-pub(crate) async fn resolve_agent_targets(
-    session: &Arc<Session>,
-    turn: &Arc<TurnContext>,
-    targets: Vec<String>,
-) -> Result<Vec<ThreadId>, FunctionCallError> {
-    let mut resolved = Vec::with_capacity(targets.len());
-    for target in targets {
-        resolved.push(resolve_agent_target(session, turn, &target).await?);
-    }
-    Ok(resolved)
 }
 
 pub(crate) use close_agent::Handler as CloseAgentHandler;

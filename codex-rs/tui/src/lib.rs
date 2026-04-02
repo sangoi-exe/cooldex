@@ -1272,6 +1272,10 @@ async fn run_ratatui_app(
         }
         None => None,
     };
+    let target_config_path = match action_and_target_session_if_resume_or_fork {
+        Some((_, target_session)) => read_session_config_path(target_session.path.as_deref()).await,
+        None => None,
+    };
 
     let mut config = match &session_selection {
         resume_picker::SessionSelection::Resume(_) | resume_picker::SessionSelection::Fork(_) => {
@@ -1280,6 +1284,7 @@ async fn run_ratatui_app(
                 overrides.clone(),
                 cloud_requirements.clone(),
                 fallback_cwd,
+                target_config_path,
             )
             .await
         }
@@ -1397,6 +1402,22 @@ pub(crate) async fn read_session_cwd(
                 %rollout_path,
                 %err,
                 "Failed to read session metadata from rollout"
+            );
+            None
+        }
+    }
+}
+
+pub(crate) async fn read_session_config_path(path: Option<&Path>) -> Option<PathBuf> {
+    let path = path?;
+    match read_session_meta_line(path).await {
+        Ok(meta_line) => meta_line.meta.config_path,
+        Err(err) => {
+            let rollout_path = path.display().to_string();
+            tracing::warn!(
+                %rollout_path,
+                %err,
+                "Failed to read session config path from rollout"
             );
             None
         }
@@ -1585,6 +1606,7 @@ async fn load_config_or_exit(
         overrides,
         cloud_requirements,
         /*fallback_cwd*/ None,
+        /*fallback_config_path*/ None,
     )
     .await
 }
@@ -1594,6 +1616,7 @@ async fn load_config_or_exit_with_fallback_cwd(
     overrides: ConfigOverrides,
     cloud_requirements: CloudRequirementsLoader,
     fallback_cwd: Option<PathBuf>,
+    fallback_config_path: Option<PathBuf>,
 ) -> Config {
     #[allow(clippy::print_stderr)]
     match ConfigBuilder::default()
@@ -1601,6 +1624,7 @@ async fn load_config_or_exit_with_fallback_cwd(
         .harness_overrides(overrides)
         .cloud_requirements(cloud_requirements)
         .fallback_cwd(fallback_cwd)
+        .user_config_path(fallback_config_path)
         .build()
         .await
     {
@@ -2213,6 +2237,35 @@ trust_level = "untrusted"
             .await
             .expect("expected cwd");
         assert_eq!(cwd, session_cwd);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_session_config_path_falls_back_to_session_meta() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let rollout_path = temp_dir.path().join("rollout.jsonl");
+        let session_config_path = temp_dir.path().join("session-config.toml");
+        let session_meta = SessionMeta {
+            config_path: Some(session_config_path.clone()),
+            ..SessionMeta::default()
+        };
+        let meta_line = RolloutLine {
+            timestamp: "t0".to_string(),
+            item: RolloutItem::SessionMeta(SessionMetaLine {
+                meta: session_meta,
+                git: None,
+            }),
+        };
+        let text = format!(
+            "{}\n",
+            serde_json::to_string(&meta_line).expect("serialize meta")
+        );
+        std::fs::write(&rollout_path, text)?;
+
+        let config_path = read_session_config_path(Some(&rollout_path))
+            .await
+            .expect("expected config path");
+        assert_eq!(config_path, session_config_path);
         Ok(())
     }
 

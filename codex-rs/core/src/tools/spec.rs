@@ -138,29 +138,20 @@ fn agent_status_output_schema() -> JsonValue {
     })
 }
 
-fn spawn_agent_output_schema(multi_agent_v2: bool) -> JsonValue {
-    let task_name_description = if multi_agent_v2 {
-        "Canonical task name for the spawned agent."
-    } else {
-        "Canonical task name for the spawned agent when one was assigned."
-    };
+fn spawn_agent_output_schema() -> JsonValue {
     json!({
         "type": "object",
         "properties": {
             "agent_id": {
-                "type": ["string", "null"],
-                "description": "Thread identifier for the spawned agent when no task name was assigned."
-            },
-            "task_name": {
-                "type": ["string", "null"],
-                "description": task_name_description
+                "type": "string",
+                "description": "Thread identifier for the spawned agent."
             },
             "nickname": {
                 "type": ["string", "null"],
                 "description": "User-facing nickname for the spawned agent when available."
             }
         },
-        "required": ["agent_id", "task_name", "nickname"],
+        "required": ["agent_id", "nickname"],
         "additionalProperties": false
     })
 }
@@ -239,12 +230,12 @@ fn close_agent_output_schema() -> JsonValue {
     json!({
         "type": "object",
         "properties": {
-            "status": {
+            "previous_status": {
                 "description": "The agent status observed before shutdown was requested.",
                 "allOf": [agent_status_output_schema()]
             }
         },
-        "required": ["status"],
+        "required": ["previous_status"],
         "additionalProperties": false
     })
 }
@@ -669,8 +660,9 @@ fn create_collab_input_items_schema() -> JsonSchema {
 
 fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
     let available_models_description = spawn_agent_models_description(&config.available_models);
-    let return_value_description = "Returns the canonical task name when the spawned agent was named, otherwise the agent id, plus the user-facing nickname when available.";
-    let mut properties = BTreeMap::from([
+    let return_value_description =
+        "Returns the spawned agent id plus the user-facing nickname when available.";
+    let properties = BTreeMap::from([
         (
             "message".to_string(),
             JsonSchema::String {
@@ -708,15 +700,6 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
             },
         ),
     ]);
-    properties.insert(
-        "task_name".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Optional task name for the new agent. Use lowercase letters, digits, and underscores."
-                    .to_string(),
-            ),
-        },
-    );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agent".to_string(),
@@ -749,10 +732,10 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
 - For code-edit subtasks, decompose work so each delegated task has a disjoint write set.
 
 ### After you delegate
-- Call wait very sparingly. Only call wait when you need the result immediately for the next critical-path step and you are blocked until it returns.
+- Call wait_agent very sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns.
 - Do not redo delegated subagent tasks yourself; focus on integrating results or tackling non-overlapping work.
 - While the subagent is running in the background, do meaningful non-overlapping work immediately.
-- Do not repeatedly wait by reflex.
+- Do not repeatedly call wait_agent by reflex.
 - When a delegated coding task returns, quickly review the uploaded changes, then integrate or refine them.
 
 ### Parallel delegation patterns
@@ -768,7 +751,7 @@ fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
             required: None,
             additional_properties: Some(false.into()),
         },
-        output_schema: Some(spawn_agent_output_schema(config.multi_agent_v2)),
+        output_schema: Some(spawn_agent_output_schema()),
     })
 }
 
@@ -939,9 +922,7 @@ fn create_send_input_tool() -> ToolSpec {
         (
             "target".to_string(),
             JsonSchema::String {
-                description: Some(
-                    "Agent id or canonical task name to message (from spawn_agent).".to_string(),
-                ),
+                description: Some("Agent id to message (from spawn_agent).".to_string()),
             },
         ),
         (
@@ -992,7 +973,7 @@ fn create_resume_agent_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "resume_agent".to_string(),
         description:
-            "Resume a previously closed agent by id so it can receive send_input and wait calls."
+            "Resume a previously closed agent by id so it can receive send_input and wait_agent calls."
                 .to_string(),
         strict: false,
         defer_loading: None,
@@ -1011,10 +992,7 @@ fn create_wait_agent_tool() -> ToolSpec {
         "ids".to_string(),
         JsonSchema::Array {
             items: Box::new(JsonSchema::String { description: None }),
-            description: Some(
-                "Agent ids or canonical task names to wait on. Duplicate resolved ids are rejected."
-                    .to_string(),
-            ),
+            description: Some("Agent ids to wait on. Duplicate ids are rejected.".to_string()),
         },
     );
     properties.insert(
@@ -1045,11 +1023,11 @@ fn create_wait_agent_tool() -> ToolSpec {
     );
 
     ToolSpec::Function(ResponsesApiTool {
-        name: "wait".to_string(),
+        name: "wait_agent".to_string(),
         // Merge-safety anchor: keep wait-tool docs aligned with the emitted wait metadata so
         // timeout returns and all_final waits do not regress into stale “first finish wins”
         // guidance.
-        description: "Wait for agents in one of two modes. Timed convenience mode: omit `return_when` and `wait` will return when a requested agent reaches a final status or the timeout elapses. Condition mode: set `return_when` to `any_final` or `all_final` and also set `disable_timeout=true`; `any_final` waits for the next requested agent that is not already final to reach a final status unless every requested agent is already terminal, and `all_final` waits for every requested agent to be terminal. Returns current state for every requested agent, including running agents on timeout, with recent lastActivity metadata when available. When the wait returns, a notification message will be received containing the same updated agent states."
+        description: "Wait for agents in one of two modes. Timed convenience mode: omit `return_when` and `wait_agent` will return when a requested agent reaches a final status or the timeout elapses. Condition mode: set `return_when` to `any_final` or `all_final` and also set `disable_timeout=true`; `any_final` waits for the next requested agent that is not already final to reach a final status unless every requested agent is already terminal, and `all_final` waits for every requested agent to be terminal. Returns current state for every requested agent, including running agents on timeout, with recent lastActivity metadata when available. When the wait returns, a notification message will be received containing the same updated agent states."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -1067,9 +1045,7 @@ fn create_close_agent_tool() -> ToolSpec {
     properties.insert(
         "target".to_string(),
         JsonSchema::String {
-            description: Some(
-                "Agent id or canonical task name to close (from spawn_agent).".to_string(),
-            ),
+            description: Some("Agent id to close (from spawn_agent).".to_string()),
         },
     );
 
@@ -2129,7 +2105,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
             );
             builder.register_handler("spawn_agent", Arc::new(SpawnAgentHandler));
             builder.register_handler("send_input", Arc::new(SendInputHandler));
-            builder.register_handler("wait", Arc::new(WaitAgentHandler));
+            builder.register_handler("wait_agent", Arc::new(WaitAgentHandler));
             builder.register_handler("close_agent", Arc::new(CloseAgentHandler));
         }
     }

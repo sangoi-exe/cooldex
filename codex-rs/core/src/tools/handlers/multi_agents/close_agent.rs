@@ -30,6 +30,15 @@ impl ToolHandler for Handler {
             .agent_control
             .get_agent_metadata(agent_id)
             .unwrap_or_default();
+        if receiver_agent
+            .agent_path
+            .as_ref()
+            .is_some_and(AgentPath::is_root)
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "root is not a spawned agent".to_string(),
+            ));
+        }
         session
             .send_event(
                 &turn,
@@ -68,8 +77,8 @@ impl ToolHandler for Handler {
             }
         };
         // Merge-safety anchor: close_agent must fail loud when running-child preemption is not
-        // allowed, while still emitting the authoritative status in both the end event and the
-        // tool result payload.
+        // allowed, while still emitting the authoritative pre-close status in both the end event
+        // and the tool result payload.
         let result = match ensure_running_subagent_preemption_allowed(
             turn.config.as_ref(),
             "close",
@@ -102,13 +111,15 @@ impl ToolHandler for Handler {
             .await;
         result?;
 
-        Ok(CloseAgentResult { status })
+        Ok(CloseAgentResult {
+            previous_status: status,
+        })
     }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct CloseAgentResult {
-    pub(crate) status: AgentStatus,
+    pub(crate) previous_status: AgentStatus,
 }
 
 impl ToolOutput for CloseAgentResult {

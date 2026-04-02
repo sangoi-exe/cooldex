@@ -122,6 +122,7 @@ pub(crate) struct ThreadSessionState {
     pub(crate) approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer,
     pub(crate) sandbox_policy: SandboxPolicy,
     pub(crate) cwd: PathBuf,
+    pub(crate) config_path: Option<PathBuf>,
     pub(crate) reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
     pub(crate) history_log_id: u64,
     pub(crate) history_entry_count: u64,
@@ -842,6 +843,19 @@ fn sandbox_mode_from_policy(
     }
 }
 
+fn thread_config_path_from_config(
+    config: &Config,
+    thread_params_mode: ThreadParamsMode,
+) -> Option<String> {
+    match thread_params_mode {
+        ThreadParamsMode::Embedded => config
+            .active_user_config_path()
+            .ok()
+            .map(|path| path.to_string_lossy().to_string()),
+        ThreadParamsMode::Remote => None,
+    }
+}
+
 fn thread_start_params_from_config(
     config: &Config,
     thread_params_mode: ThreadParamsMode,
@@ -850,10 +864,13 @@ fn thread_start_params_from_config(
         model: config.model.clone(),
         model_provider: thread_params_mode.model_provider_from_config(config),
         cwd: thread_cwd_from_config(config, thread_params_mode),
+        config_path: thread_config_path_from_config(config, thread_params_mode),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override_from_config(config),
         sandbox: sandbox_mode_from_policy(config.permissions.sandbox_policy.get().clone()),
         config: config_request_overrides_from_config(config),
+        base_instructions: config.base_instructions.clone(),
+        developer_instructions: config.developer_instructions.clone(),
         ephemeral: Some(config.ephemeral),
         persist_extended_history: true,
         ..ThreadStartParams::default()
@@ -870,10 +887,13 @@ fn thread_resume_params_from_config(
         model: config.model.clone(),
         model_provider: thread_params_mode.model_provider_from_config(&config),
         cwd: thread_cwd_from_config(&config, thread_params_mode),
+        config_path: thread_config_path_from_config(&config, thread_params_mode),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override_from_config(&config),
         sandbox: sandbox_mode_from_policy(config.permissions.sandbox_policy.get().clone()),
         config: config_request_overrides_from_config(&config),
+        base_instructions: config.base_instructions.clone(),
+        developer_instructions: config.developer_instructions.clone(),
         persist_extended_history: true,
         ..ThreadResumeParams::default()
     }
@@ -889,10 +909,13 @@ fn thread_fork_params_from_config(
         model: config.model.clone(),
         model_provider: thread_params_mode.model_provider_from_config(&config),
         cwd: thread_cwd_from_config(&config, thread_params_mode),
+        config_path: thread_config_path_from_config(&config, thread_params_mode),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override_from_config(&config),
         sandbox: sandbox_mode_from_policy(config.permissions.sandbox_policy.get().clone()),
         config: config_request_overrides_from_config(&config),
+        base_instructions: config.base_instructions.clone(),
+        developer_instructions: config.developer_instructions.clone(),
         ephemeral: config.ephemeral,
         persist_extended_history: true,
         ..ThreadForkParams::default()
@@ -960,6 +983,7 @@ async fn thread_session_state_from_thread_start_response(
         response.approvals_reviewer.to_core(),
         response.sandbox.to_core(),
         response.cwd.clone(),
+        Some(response.config_path.clone()),
         response.reasoning_effort,
         config,
     )
@@ -981,6 +1005,7 @@ async fn thread_session_state_from_thread_resume_response(
         response.approvals_reviewer.to_core(),
         response.sandbox.to_core(),
         response.cwd.clone(),
+        Some(response.config_path.clone()),
         response.reasoning_effort,
         config,
     )
@@ -1002,6 +1027,7 @@ async fn thread_session_state_from_thread_fork_response(
         response.approvals_reviewer.to_core(),
         response.sandbox.to_core(),
         response.cwd.clone(),
+        Some(response.config_path.clone()),
         response.reasoning_effort,
         config,
     )
@@ -1042,6 +1068,7 @@ async fn thread_session_state_from_thread_response(
     approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer,
     sandbox_policy: SandboxPolicy,
     cwd: PathBuf,
+    config_path: Option<PathBuf>,
     reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
     config: &Config,
 ) -> Result<ThreadSessionState, String> {
@@ -1061,6 +1088,7 @@ async fn thread_session_state_from_thread_response(
         approvals_reviewer,
         sandbox_policy,
         cwd,
+        config_path,
         reasoning_effort,
         history_log_id,
         history_entry_count,
@@ -1147,10 +1175,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_lifecycle_params_omit_local_overrides_for_remote_sessions() {
+    async fn thread_start_params_forward_instruction_overrides_for_embedded_sessions() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&temp_dir).await;
+        config.base_instructions = Some("embedded base".to_string());
+        config.developer_instructions = Some("embedded developer".to_string());
+
+        let params = thread_start_params_from_config(&config, ThreadParamsMode::Embedded);
+
+        assert_eq!(params.base_instructions, config.base_instructions);
+        assert_eq!(params.developer_instructions, config.developer_instructions);
+    }
+
+    #[tokio::test]
+    async fn thread_start_params_forward_config_path_for_embedded_sessions() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+
+        let params = thread_start_params_from_config(&config, ThreadParamsMode::Embedded);
+
+        assert_eq!(
+            params.config_path,
+            Some(
+                config
+                    .active_user_config_path()
+                    .expect("embedded config should expose active user config path")
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_resume_params_forward_instruction_overrides_for_embedded_sessions() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&temp_dir).await;
+        let thread_id = ThreadId::new();
+        config.base_instructions = Some("resume base".to_string());
+        config.developer_instructions = Some("resume developer".to_string());
+
+        let params =
+            thread_resume_params_from_config(config.clone(), thread_id, ThreadParamsMode::Embedded);
+
+        assert_eq!(params.base_instructions, config.base_instructions);
+        assert_eq!(params.developer_instructions, config.developer_instructions);
+    }
+
+    #[tokio::test]
+    async fn thread_resume_params_forward_config_path_for_embedded_sessions() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = build_config(&temp_dir).await;
         let thread_id = ThreadId::new();
+
+        let params =
+            thread_resume_params_from_config(config.clone(), thread_id, ThreadParamsMode::Embedded);
+
+        assert_eq!(
+            params.config_path,
+            Some(
+                config
+                    .active_user_config_path()
+                    .expect("embedded config should expose active user config path")
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_fork_params_forward_instruction_overrides_for_embedded_sessions() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&temp_dir).await;
+        let thread_id = ThreadId::new();
+        config.base_instructions = Some("fork base".to_string());
+        config.developer_instructions = Some("fork developer".to_string());
+
+        let params =
+            thread_fork_params_from_config(config.clone(), thread_id, ThreadParamsMode::Embedded);
+
+        assert_eq!(params.base_instructions, config.base_instructions);
+        assert_eq!(params.developer_instructions, config.developer_instructions);
+    }
+
+    #[tokio::test]
+    async fn thread_fork_params_forward_config_path_for_embedded_sessions() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let thread_id = ThreadId::new();
+
+        let params =
+            thread_fork_params_from_config(config.clone(), thread_id, ThreadParamsMode::Embedded);
+
+        assert_eq!(
+            params.config_path,
+            Some(
+                config
+                    .active_user_config_path()
+                    .expect("embedded config should expose active user config path")
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_lifecycle_params_keep_remote_config_path_omitted() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&temp_dir).await;
+        let thread_id = ThreadId::new();
+        config.base_instructions = Some("remote base".to_string());
+        config.developer_instructions = Some("remote developer".to_string());
 
         let start = thread_start_params_from_config(&config, ThreadParamsMode::Remote);
         let resume =
@@ -1163,6 +1297,24 @@ mod tests {
         assert_eq!(start.model_provider, None);
         assert_eq!(resume.model_provider, None);
         assert_eq!(fork.model_provider, None);
+        assert_eq!(start.config_path, None);
+        assert_eq!(resume.config_path, None);
+        assert_eq!(fork.config_path, None);
+        assert_eq!(start.base_instructions.as_deref(), Some("remote base"));
+        assert_eq!(resume.base_instructions.as_deref(), Some("remote base"));
+        assert_eq!(fork.base_instructions.as_deref(), Some("remote base"));
+        assert_eq!(
+            start.developer_instructions.as_deref(),
+            Some("remote developer")
+        );
+        assert_eq!(
+            resume.developer_instructions.as_deref(),
+            Some("remote developer")
+        );
+        assert_eq!(
+            fork.developer_instructions.as_deref(),
+            Some("remote developer")
+        );
     }
 
     #[tokio::test]
@@ -1224,6 +1376,7 @@ mod tests {
             .expect("resume response should map");
         assert_eq!(started.turns.len(), 1);
         assert_eq!(started.turns[0], response.thread.turns[0]);
+        assert_eq!(started.session.config_path, Some(response.config_path));
     }
 
     #[tokio::test]
@@ -1250,6 +1403,7 @@ mod tests {
             codex_protocol::config_types::ApprovalsReviewer::User,
             SandboxPolicy::new_read_only_policy(),
             PathBuf::from("/tmp/project"),
+            config.active_user_config_path().ok(),
             /*reasoning_effort*/ None,
             &config,
         )

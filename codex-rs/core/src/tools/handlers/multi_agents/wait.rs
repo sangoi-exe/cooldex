@@ -68,7 +68,11 @@ impl ToolHandler for Handler {
         }
         let return_when = args.return_when.unwrap_or_default();
 
-        let receiver_thread_ids = resolve_agent_targets(&session, &turn, args.ids).await?;
+        let receiver_thread_ids = args
+            .ids
+            .into_iter()
+            .map(|id| parse_agent_id_target(&id))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut seen_receiver_thread_ids = HashSet::with_capacity(receiver_thread_ids.len());
         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
         for receiver_thread_id in &receiver_thread_ids {
@@ -236,7 +240,7 @@ pub(crate) struct WaitResult {
 
 impl ToolOutput for WaitResult {
     fn log_preview(&self) -> String {
-        tool_output_json_text(self, "wait")
+        tool_output_json_text(self, "wait_agent")
     }
 
     fn success_for_logging(&self) -> bool {
@@ -244,11 +248,11 @@ impl ToolOutput for WaitResult {
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        tool_output_response_item(call_id, payload, self, /*success*/ None, "wait")
+        tool_output_response_item(call_id, payload, self, /*success*/ None, "wait_agent")
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        tool_output_code_mode_result(self, "wait")
+        tool_output_code_mode_result(self, "wait_agent")
     }
 }
 

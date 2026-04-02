@@ -36,7 +36,6 @@ impl ToolHandler for Handler {
             .as_deref()
             .map(str::trim)
             .filter(|role| !role.is_empty());
-        let requested_task_name = args.task_name.clone();
         let profile_name = args
             .profile
             .as_deref()
@@ -100,7 +99,7 @@ impl ToolHandler for Handler {
                     &turn.session_source,
                     child_depth,
                     role_name,
-                    requested_task_name.clone(),
+                    /*task_name*/ None,
                 )?),
                 SpawnAgentOptions {
                     fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
@@ -132,7 +131,7 @@ impl ToolHandler for Handler {
             }
             None => None,
         };
-        let (new_agent_path, new_agent_nickname, new_agent_role) =
+        let (_new_agent_path, new_agent_nickname, new_agent_role) =
             match (&agent_snapshot, new_agent_metadata) {
                 (Some(snapshot), _) => (
                     snapshot.session_source.get_agent_path().map(String::from),
@@ -180,19 +179,9 @@ impl ToolHandler for Handler {
             /*inc*/ 1,
             &[("role", role_tag)],
         );
-        let task_name = if requested_task_name.is_some() {
-            Some(new_agent_path.ok_or_else(|| {
-                FunctionCallError::Fatal(format!(
-                    "spawned agent {new_thread_id} missing canonical task name after successful spawn"
-                ))
-            })?)
-        } else {
-            None
-        };
 
         Ok(SpawnAgentResult {
-            agent_id: task_name.is_none().then(|| new_thread_id.to_string()),
-            task_name,
+            agent_id: new_thread_id.to_string(),
             nickname,
         })
     }
@@ -203,7 +192,6 @@ impl ToolHandler for Handler {
 struct SpawnAgentArgs {
     message: Option<String>,
     items: Option<Vec<UserInput>>,
-    task_name: Option<String>,
     agent_type: Option<String>,
     profile: Option<String>,
     #[serde(default)]
@@ -212,8 +200,7 @@ struct SpawnAgentArgs {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SpawnAgentResult {
-    agent_id: Option<String>,
-    task_name: Option<String>,
+    agent_id: String,
     nickname: Option<String>,
 }
 

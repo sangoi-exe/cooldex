@@ -34,7 +34,6 @@ use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_config::CONFIG_TOML_FILE;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
-use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseInputItem;
@@ -362,7 +361,7 @@ async fn spawn_agent_returns_agent_id_without_task_name() {
         serde_json::from_str(&content).expect("spawn_agent result should be json");
 
     assert!(result["agent_id"].is_string());
-    assert_eq!(result["task_name"], serde_json::Value::Null);
+    assert!(result.get("task_name").is_none());
     assert!(result.get("nickname").is_some());
     assert_eq!(success, Some(true));
 }
@@ -2031,7 +2030,7 @@ async fn wait_rejects_non_positive_timeout() {
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
-        "wait",
+        "wait_agent",
         function_payload(json!({
             "ids": [ThreadId::new().to_string()],
             "timeout_ms": 0
@@ -2052,7 +2051,7 @@ async fn wait_rejects_unknown_agent_reference() {
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
-        "wait",
+        "wait_agent",
         function_payload(json!({"ids": ["invalid"]})),
     );
     let Err(err) = WaitAgentHandler.handle(invocation).await else {
@@ -2070,7 +2069,7 @@ async fn wait_rejects_empty_ids() {
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
-        "wait",
+        "wait_agent",
         function_payload(json!({"ids": []})),
     );
     let Err(err) = WaitAgentHandler.handle(invocation).await else {
@@ -2088,7 +2087,7 @@ async fn wait_rejects_return_when_without_disabled_timeout() {
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
-        "wait",
+        "wait_agent",
         function_payload(json!({
             "ids": [ThreadId::new().to_string()],
             "return_when": "any_final",
@@ -2196,7 +2195,7 @@ async fn wait_rejects_disable_timeout_without_return_when() {
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
-        "wait",
+        "wait_agent",
         function_payload(json!({
             "ids": [ThreadId::new().to_string()],
             "disable_timeout": true
@@ -2221,7 +2220,7 @@ async fn wait_returns_not_found_for_missing_agents() {
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
-        "wait",
+        "wait_agent",
         function_payload(json!({
             "ids": [id_a.to_string(), id_b.to_string()],
             "timeout_ms": 1000
@@ -2258,7 +2257,7 @@ async fn wait_times_out_when_status_is_not_final() {
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
-        "wait",
+        "wait_agent",
         function_payload(json!({
             "ids": [agent_id.to_string()],
             "timeout_ms": MIN_WAIT_TIMEOUT_MS
@@ -2297,7 +2296,7 @@ async fn wait_clamps_short_timeouts_to_minimum() {
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
-        "wait",
+        "wait_agent",
         function_payload(json!({
             "ids": [agent_id.to_string()],
             "timeout_ms": 10
@@ -2347,7 +2346,7 @@ async fn wait_without_explicit_condition_returns_final_status_before_timeout() {
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
-        "wait",
+        "wait_agent",
         function_payload(json!({
             "ids": [agent_id.to_string()],
             "timeout_ms": 1000
@@ -2402,7 +2401,7 @@ async fn wait_without_explicit_condition_returns_immediately_when_any_agent_is_a
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
-        "wait",
+        "wait_agent",
         function_payload(json!({
             "ids": [final_agent_id.to_string(), running_agent_id.to_string()],
             "timeout_ms": MIN_WAIT_TIMEOUT_MS
@@ -2455,7 +2454,7 @@ async fn wait_without_explicit_condition_returns_immediately_when_any_agent_is_n
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
-        "wait",
+        "wait_agent",
         function_payload(json!({
             "ids": [missing_agent_id.to_string(), running_agent_id.to_string()],
             "timeout_ms": MIN_WAIT_TIMEOUT_MS
@@ -2523,7 +2522,7 @@ async fn wait_any_final_ignores_agents_already_final_at_start() {
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
-        "wait",
+        "wait_agent",
         function_payload(json!({
             "ids": [final_agent_id.to_string(), running_agent_id.to_string()],
             "return_when": "any_final",
@@ -2578,7 +2577,7 @@ async fn wait_any_final_ignores_not_found_agents_at_start() {
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
-        "wait",
+        "wait_agent",
         function_payload(json!({
             "ids": [missing_agent_id.to_string(), running_agent_id.to_string()],
             "return_when": "any_final",
@@ -2648,7 +2647,7 @@ async fn wait_all_final_waits_for_remaining_non_final_agents() {
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
-        "wait",
+        "wait_agent",
         function_payload(json!({
             "ids": [final_agent_id.to_string(), running_agent_id.to_string()],
             "return_when": "all_final",
@@ -2685,99 +2684,6 @@ async fn wait_all_final_waits_for_remaining_non_final_agents() {
         running_agent_id,
         AgentStatus::Shutdown,
     ));
-}
-
-#[tokio::test]
-async fn multi_agent_v2_wait_accepts_relative_path_ids() {
-    #[derive(Debug, Deserialize)]
-    struct SpawnAgentResult {
-        task_name: String,
-    }
-    let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
-    let root = manager
-        .start_thread((*turn.config).clone())
-        .await
-        .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
-    session.conversation_id = root.thread_id;
-    let mut config = (*turn.config).clone();
-    config
-        .features
-        .enable(Feature::MultiAgentV2)
-        .expect("test config should allow feature update");
-    turn.config = Arc::new(config);
-
-    let session = Arc::new(session);
-    let turn = Arc::new(turn);
-    let spawn_output = SpawnAgentHandler
-        .handle(invocation(
-            session.clone(),
-            turn.clone(),
-            "spawn_agent",
-            function_payload(json!({
-                "message": "inspect this repo",
-                "task_name": "test_process"
-            })),
-        ))
-        .await
-        .expect("spawn_agent should succeed");
-    let (content, _) = expect_text_output(spawn_output);
-    let spawn_result: SpawnAgentResult =
-        serde_json::from_str(&content).expect("spawn result should parse");
-
-    let agent_id = session
-        .services
-        .agent_control
-        .resolve_agent_reference(
-            session.conversation_id,
-            &turn.session_source,
-            "test_process",
-        )
-        .await
-        .expect("relative path should resolve");
-    let mut status_rx = manager
-        .agent_control()
-        .subscribe_status(agent_id)
-        .await
-        .expect("subscribe should succeed");
-
-    let child_thread = manager
-        .get_thread(agent_id)
-        .await
-        .expect("child should exist");
-    let _ = child_thread
-        .submit(Op::Shutdown {})
-        .await
-        .expect("shutdown should submit");
-    let _ = timeout(Duration::from_secs(1), status_rx.changed())
-        .await
-        .expect("shutdown status should arrive");
-
-    let wait_output = WaitAgentHandler
-        .handle(invocation(
-            session,
-            turn,
-            "wait",
-            function_payload(json!({
-                "ids": ["test_process"],
-                "timeout_ms": 1000
-            })),
-        ))
-        .await
-        .expect("wait should succeed");
-    let (content, success) = expect_text_output(wait_output);
-    let result: wait::WaitResult =
-        serde_json::from_str(&content).expect("wait result should be json");
-    assert_eq!(spawn_result.task_name, "/root/test_process");
-    assert!(!result.timed_out);
-    assert_eq!(result.agents.len(), 1);
-    assert_shutdown_activity(assert_agent_status(
-        &result.agents,
-        agent_id,
-        AgentStatus::Shutdown,
-    ));
-    assert_eq!(success, None);
 }
 
 #[tokio::test]
@@ -3193,7 +3099,7 @@ async fn multi_agent_v2_close_agent_accepts_task_name_target() {
         .await
         .expect("close_agent should succeed for v2 task names");
     let (content, success) = expect_text_output(output);
-    let result: close_agent::CloseAgentResult =
+    let result: crate::tools::handlers::multi_agents_v2::close_agent::CloseAgentResult =
         serde_json::from_str(&content).expect("close_agent result should be json");
     assert_ne!(result.previous_status, AgentStatus::NotFound);
     assert_eq!(success, Some(true));
@@ -3252,7 +3158,85 @@ async fn multi_agent_v2_close_agent_rejects_root_target_and_id() {
 }
 
 #[tokio::test]
-async fn close_agent_submits_shutdown_and_returns_status() {
+async fn close_agent_rejects_invalid_id_target() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.conversation_id = root.thread_id;
+
+    let error = CloseAgentHandler
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "close_agent",
+            function_payload(json!({"target": "worker"})),
+        ))
+        .await
+        .expect_err("close_agent should reject non-id legacy targets");
+    let FunctionCallError::RespondToModel(message) = error else {
+        panic!("expected respond-to-model error");
+    };
+    assert!(message.starts_with("invalid agent id worker:"));
+}
+
+#[tokio::test]
+async fn close_agent_rejects_root_path_target() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.conversation_id = root.thread_id;
+
+    let error = CloseAgentHandler
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "close_agent",
+            function_payload(json!({"target": "/root"})),
+        ))
+        .await
+        .expect_err("close_agent should reject the root path");
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel("root is not a spawned agent".to_string())
+    );
+}
+
+#[tokio::test]
+async fn close_agent_rejects_root_thread_target() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.conversation_id = root.thread_id;
+
+    let error = CloseAgentHandler
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "close_agent",
+            function_payload(json!({"target": root.thread_id.to_string()})),
+        ))
+        .await
+        .expect_err("close_agent should reject the root thread id");
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel("root is not a spawned agent".to_string())
+    );
+}
+
+#[tokio::test]
+async fn close_agent_submits_shutdown_and_returns_previous_status() {
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();
     session.services.agent_control = manager.agent_control();
@@ -3274,7 +3258,7 @@ async fn close_agent_submits_shutdown_and_returns_status() {
     let (content, success) = expect_text_output(output);
     let result: close_agent::CloseAgentResult =
         serde_json::from_str(&content).expect("close_agent result should be json");
-    assert_eq!(result.status, status_before);
+    assert_eq!(result.previous_status, status_before);
     assert_eq!(success, Some(true));
 
     let ops = manager.captured_ops();
@@ -3362,7 +3346,7 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let (close_content, close_success) = expect_text_output(close_output);
     let close_result: close_agent::CloseAgentResult =
         serde_json::from_str(&close_content).expect("close_agent result should be json");
-    assert_ne!(close_result.status, AgentStatus::NotFound);
+    assert_ne!(close_result.previous_status, AgentStatus::NotFound);
     assert_eq!(close_success, Some(true));
     assert_eq!(
         manager.agent_control().get_status(child_thread_id).await,
@@ -3415,7 +3399,7 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let close_again_result: close_agent::CloseAgentResult =
         serde_json::from_str(&close_again_content)
             .expect("second close_agent result should be json");
-    assert_ne!(close_again_result.status, AgentStatus::NotFound);
+    assert_ne!(close_again_result.previous_status, AgentStatus::NotFound);
     assert_eq!(close_again_success, Some(true));
     assert_eq!(
         manager.agent_control().get_status(child_thread_id).await,

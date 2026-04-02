@@ -1283,22 +1283,38 @@ impl App {
         }
     }
 
-    async fn rebuild_config_for_cwd(&self, cwd: PathBuf) -> Result<Config> {
+    async fn rebuild_config_for_cwd(
+        &self,
+        cwd: PathBuf,
+        config_path: Option<PathBuf>,
+    ) -> Result<Config> {
         let mut overrides = self.harness_overrides.clone();
         overrides.cwd = Some(cwd.clone());
         let cwd_display = cwd.display().to_string();
-        ConfigBuilder::default()
+        let mut builder = ConfigBuilder::default()
             .codex_home(self.config.codex_home.clone())
             .cli_overrides(self.cli_kv_overrides.clone())
-            .harness_overrides(overrides)
+            .harness_overrides(overrides);
+        if let Some(config_path) = config_path {
+            builder = builder.user_config_path(Some(config_path));
+        }
+        builder
             .build()
             .await
             .wrap_err_with(|| format!("Failed to rebuild config for cwd {cwd_display}"))
     }
 
     async fn refresh_in_memory_config_from_disk(&mut self) -> Result<()> {
+        let displayed_thread_id = self.current_displayed_thread_id();
+        let config_path = match displayed_thread_id {
+            Some(thread_id) => self
+                .thread_config_path(thread_id)
+                .await
+                .or_else(|| self.config.active_user_config_path().ok()),
+            None => self.config.active_user_config_path().ok(),
+        };
         let mut config = self
-            .rebuild_config_for_cwd(self.chat_widget.config_ref().cwd.to_path_buf())
+            .rebuild_config_for_cwd(self.chat_widget.config_ref().cwd.to_path_buf(), config_path)
             .await?;
         self.apply_runtime_policy_overrides(&mut config);
         self.config = config;
@@ -1320,11 +1336,16 @@ impl App {
         &mut self,
         current_cwd: &Path,
         resume_cwd: PathBuf,
+        config_path: Option<PathBuf>,
     ) -> Result<Config> {
-        match self.rebuild_config_for_cwd(resume_cwd.clone()).await {
+        let explicit_config_path = config_path.is_some();
+        match self
+            .rebuild_config_for_cwd(resume_cwd.clone(), config_path)
+            .await
+        {
             Ok(config) => Ok(config),
             Err(err) => {
-                if crate::cwds_differ(current_cwd, &resume_cwd) {
+                if crate::cwds_differ(current_cwd, &resume_cwd) || explicit_config_path {
                     Err(err)
                 } else {
                     let resume_cwd_display = resume_cwd.display().to_string();
@@ -2055,6 +2076,56 @@ impl App {
         let channel = self.thread_event_channels.get(&thread_id)?;
         let store = channel.store.lock().await;
         store.session.as_ref().map(|session| session.cwd.clone())
+    }
+
+    async fn thread_config_path(&self, thread_id: ThreadId) -> Option<PathBuf> {
+        let channel = self.thread_event_channels.get(&thread_id)?;
+        let store = channel.store.lock().await;
+        store
+            .session
+            .as_ref()
+            .and_then(|session| session.config_path.clone())
+    }
+
+    async fn target_session_config_path(
+        &self,
+        target_session: &crate::resume_picker::SessionTarget,
+    ) -> Option<PathBuf> {
+        if let Some(config_path) =
+            crate::read_session_config_path(target_session.path.as_deref()).await
+        {
+            return Some(config_path);
+        }
+        self.thread_config_path(target_session.thread_id).await
+    }
+
+    async fn sync_in_memory_config_from_thread_session_best_effort(
+        &mut self,
+        session: &ThreadSessionState,
+        action: &str,
+    ) {
+        let Some(config_path) = session.config_path.clone() else {
+            return;
+        };
+        match self
+            .rebuild_config_for_cwd(session.cwd.clone(), Some(config_path))
+            .await
+        {
+            Ok(mut config) => {
+                self.apply_runtime_policy_overrides(&mut config);
+                self.config = config;
+                self.chat_widget.sync_plugin_mentions_config(&self.config);
+                self.file_search
+                    .update_search_dir(self.config.cwd.to_path_buf());
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    action,
+                    "failed to sync in-memory config from thread session; continuing with current in-memory config"
+                );
+            }
+        }
     }
 
     async fn interactive_request_for_thread_request(
@@ -3246,6 +3317,7 @@ impl App {
                 approvals_reviewer: self.config.approvals_reviewer,
                 sandbox_policy: self.config.permissions.sandbox_policy.get().clone(),
                 cwd: thread.cwd.clone(),
+                config_path: self.config.active_user_config_path().ok(),
                 reasoning_effort: self.chat_widget.current_reasoning_effort(),
                 history_log_id: 0,
                 history_entry_count: 0,
@@ -3549,6 +3621,12 @@ impl App {
         app_server: &mut AppServerSession,
         started: AppServerStartedThread,
     ) -> Result<()> {
+        self.sync_in_memory_config_from_thread_session_best_effort(
+            &started.session,
+            "switching to an app-server-backed thread",
+        )
+        .await;
+        tui.set_notification_method(self.config.tui_notification_method);
         self.reset_thread_event_state();
         let init = self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
@@ -4510,8 +4588,14 @@ impl App {
                                 }
                             }
                         };
+                        let target_config_path =
+                            self.target_session_config_path(&target_session).await;
                         let mut resume_config = match self
-                            .rebuild_config_for_resume_or_fallback(&current_cwd, resume_cwd)
+                            .rebuild_config_for_resume_or_fallback(
+                                &current_cwd,
+                                resume_cwd,
+                                target_config_path,
+                            )
                             .await
                         {
                             Ok(cfg) => cfg,
@@ -6963,6 +7047,8 @@ mod tests {
     use codex_protocol::protocol::RolloutLine;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionConfiguredEvent;
+    use codex_protocol::protocol::SessionMeta;
+    use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadRolledBackEvent;
     use codex_protocol::protocol::TokenCountEvent;
@@ -10926,6 +11012,7 @@ guardian_approval = true
             approvals_reviewer: ApprovalsReviewer::User,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             cwd,
+            config_path: None,
             reasoning_effort: None,
             history_log_id: 0,
             history_entry_count: 0,
@@ -11706,6 +11793,143 @@ guardian_approval = true
     }
 
     #[tokio::test]
+    async fn non_default_config_path_roundtrip_survives_resume_or_fork_transition() -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        let default_config_path = codex_home.path().join("config.toml");
+        let custom_config_dir = tempdir()?;
+        let custom_config_path = custom_config_dir.path().join("custom-config.toml");
+        std::fs::write(
+            &default_config_path,
+            "developer_instructions = \"default instructions\"\n",
+        )?;
+        std::fs::write(
+            &custom_config_path,
+            "developer_instructions = \"custom instructions\"\n",
+        )?;
+        app.config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+
+        let thread_id = ThreadId::new();
+        let session = ThreadSessionState {
+            config_path: Some(custom_config_path.clone()),
+            ..test_thread_session(thread_id, app.config.cwd.to_path_buf())
+        };
+        app.thread_event_channels.insert(
+            thread_id,
+            ThreadEventChannel::new_with_session(/*capacity*/ 4, session.clone(), Vec::new()),
+        );
+        app.active_thread_id = Some(thread_id);
+        app.primary_thread_id = Some(thread_id);
+        app.primary_session_configured = Some(session.clone());
+
+        app.sync_in_memory_config_from_thread_session_best_effort(
+            &session,
+            "testing non-default config roundtrip",
+        )
+        .await;
+
+        assert_eq!(app.config.active_user_config_path()?, custom_config_path,);
+        assert_eq!(
+            app.config.developer_instructions.as_deref(),
+            Some("custom instructions")
+        );
+
+        std::fs::write(
+            &custom_config_path,
+            "developer_instructions = \"updated custom instructions\"\n",
+        )?;
+
+        app.refresh_in_memory_config_from_disk().await?;
+
+        assert_eq!(app.config.active_user_config_path()?, custom_config_path);
+        assert_eq!(
+            app.config.developer_instructions.as_deref(),
+            Some("updated custom instructions")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn target_session_resume_config_uses_target_rollout_config_path_instead_of_displayed_thread()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let current_thread_id = ThreadId::new();
+        let target_thread_id = ThreadId::new();
+        let current_config_dir = tempdir()?;
+        let current_config_path = current_config_dir.path().join("current-config.toml");
+        let target_config_dir = tempdir()?;
+        let target_config_path = target_config_dir.path().join("target-config.toml");
+        std::fs::write(
+            &current_config_path,
+            "developer_instructions = \"current thread instructions\"\n",
+        )?;
+        std::fs::write(
+            &target_config_path,
+            "developer_instructions = \"target thread instructions\"\n",
+        )?;
+
+        let mut current_session =
+            test_thread_session(current_thread_id, app.config.cwd.to_path_buf());
+        current_session.config_path = Some(current_config_path.clone());
+        app.thread_event_channels.insert(
+            current_thread_id,
+            ThreadEventChannel::new_with_session(/*capacity*/ 4, current_session, Vec::new()),
+        );
+        app.active_thread_id = Some(current_thread_id);
+        app.primary_thread_id = Some(current_thread_id);
+
+        let target_rollout_dir = tempdir()?;
+        let target_rollout_path = target_rollout_dir.path().join("target-rollout.jsonl");
+        let target_session_meta = RolloutLine {
+            timestamp: "t0".to_string(),
+            item: RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    id: target_thread_id,
+                    timestamp: "t0".to_string(),
+                    cwd: app.config.cwd.to_path_buf(),
+                    config_path: Some(target_config_path.clone()),
+                    source: SessionSource::Cli,
+                    ..SessionMeta::default()
+                },
+                git: None,
+            }),
+        };
+        std::fs::write(
+            &target_rollout_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&target_session_meta).expect("target session meta json")
+            ),
+        )?;
+
+        let target_session = crate::resume_picker::SessionTarget {
+            path: Some(target_rollout_path),
+            thread_id: target_thread_id,
+        };
+        let resolved_config_path = app.target_session_config_path(&target_session).await;
+        assert_eq!(resolved_config_path, Some(target_config_path.clone()));
+        let current_cwd = app.config.cwd.clone();
+
+        let rebuilt = app
+            .rebuild_config_for_resume_or_fallback(
+                &current_cwd,
+                current_cwd.to_path_buf(),
+                resolved_config_path,
+            )
+            .await?;
+
+        assert_eq!(rebuilt.active_user_config_path()?, target_config_path);
+        assert_eq!(
+            rebuilt.developer_instructions.as_deref(),
+            Some("target thread instructions")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rebuild_config_for_resume_or_fallback_uses_current_config_on_same_cwd_error()
     -> Result<()> {
         let mut app = make_test_app().await;
@@ -11716,7 +11940,11 @@ guardian_approval = true
         let current_cwd = current_config.cwd.clone();
 
         let resume_config = app
-            .rebuild_config_for_resume_or_fallback(&current_cwd, current_cwd.to_path_buf())
+            .rebuild_config_for_resume_or_fallback(
+                &current_cwd,
+                current_cwd.to_path_buf(),
+                /*config_path*/ None,
+            )
             .await?;
 
         assert_eq!(resume_config, current_config);
@@ -11734,7 +11962,32 @@ guardian_approval = true
         let next_cwd = next_cwd_tmp.path().to_path_buf();
 
         let result = app
-            .rebuild_config_for_resume_or_fallback(&current_cwd, next_cwd)
+            .rebuild_config_for_resume_or_fallback(
+                &current_cwd,
+                next_cwd,
+                /*config_path*/ None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_config_for_resume_or_fallback_errors_for_same_cwd_when_target_config_path_is_explicit()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf();
+        let current_cwd = app.config.cwd.clone();
+        let missing_config_path = codex_home.path().join("missing-config.toml");
+
+        let result = app
+            .rebuild_config_for_resume_or_fallback(
+                &current_cwd,
+                current_cwd.to_path_buf(),
+                Some(missing_config_path),
+            )
             .await;
 
         assert!(result.is_err());
@@ -12174,6 +12427,20 @@ guardian_approval = true
 
         let temp_dir = tempdir().expect("tempdir");
         let rollout_path = temp_dir.path().join("rollout.jsonl");
+        let thread_id = ThreadId::new();
+        let session_meta = RolloutLine {
+            timestamp: "t0".to_string(),
+            item: RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    id: thread_id,
+                    timestamp: "t0".to_string(),
+                    cwd: temp_dir.path().to_path_buf(),
+                    source: SessionSource::Cli,
+                    ..SessionMeta::default()
+                },
+                git: None,
+            }),
+        };
         let rollout = RolloutLine {
             timestamp: "t0".to_string(),
             item: RolloutItem::Compacted(CompactedItem {
@@ -12193,7 +12460,8 @@ guardian_approval = true
         std::fs::write(
             &rollout_path,
             format!(
-                "{}\n",
+                "{}\n{}\n",
+                serde_json::to_string(&session_meta).expect("session meta json"),
                 serde_json::to_string(&rollout).expect("rollout json")
             ),
         )
