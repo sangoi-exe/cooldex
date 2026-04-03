@@ -12,6 +12,14 @@ use crate::auth::save_auth;
 use crate::client_common::Prompt;
 use base64::Engine;
 use chrono::Utc;
+use codex_api::api_bridge::CoreAuthProvider;
+use codex_app_server_protocol::AuthMode;
+use codex_login::AuthManager;
+use codex_login::token_data::IdTokenInfo;
+use codex_login::token_data::TokenData;
+use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::WireApi;
+use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
@@ -51,11 +59,8 @@ fn test_model_client(session_source: SessionSource) -> ModelClient {
     )
 }
 
-fn test_provider(base_url: &str) -> crate::ModelProviderInfo {
-    let mut provider = crate::model_provider_info::create_oss_provider_with_base_url(
-        base_url,
-        crate::model_provider_info::WireApi::Responses,
-    );
+fn test_provider(base_url: &str) -> ModelProviderInfo {
+    let mut provider = create_oss_provider_with_base_url(base_url, WireApi::Responses);
     provider.supports_websockets = true;
     provider
 }
@@ -105,7 +110,7 @@ fn test_session_telemetry() -> SessionTelemetry {
     )
 }
 
-fn test_chatgpt_token_data(chatgpt_account_id: &str) -> crate::token_data::TokenData {
+fn test_chatgpt_token_data(chatgpt_account_id: &str) -> TokenData {
     #[derive(Serialize)]
     struct Header {
         alg: &'static str,
@@ -132,10 +137,10 @@ fn test_chatgpt_token_data(chatgpt_account_id: &str) -> crate::token_data::Token
     let signature_b64 = b64(b"sig");
     let fake_jwt = format!("{header_b64}.{payload_b64}.{signature_b64}");
 
-    crate::token_data::TokenData {
-        id_token: crate::token_data::IdTokenInfo {
+    TokenData {
+        id_token: IdTokenInfo {
             raw_jwt: fake_jwt,
-            ..crate::token_data::IdTokenInfo::default()
+            ..IdTokenInfo::default()
         },
         access_token: format!("access-{chatgpt_account_id}"),
         refresh_token: format!("refresh-{chatgpt_account_id}"),
@@ -326,7 +331,7 @@ async fn subagent_websocket_reconnects_when_auth_account_changes_mid_session() {
         AuthCredentialsStoreMode::File,
     )
     .expect("persist auth store");
-    let auth_manager = crate::AuthManager::shared(
+    let auth_manager = AuthManager::shared(
         auth_home.path().to_path_buf(),
         false,
         AuthCredentialsStoreMode::File,
@@ -485,7 +490,7 @@ async fn subagent_preconnect_reconnects_when_auth_account_changes_mid_session() 
         AuthCredentialsStoreMode::File,
     )
     .expect("persist auth store");
-    let auth_manager = crate::AuthManager::shared(
+    let auth_manager = AuthManager::shared(
         auth_home.path().to_path_buf(),
         false,
         AuthCredentialsStoreMode::File,
@@ -574,8 +579,8 @@ async fn subagent_preconnect_reconnects_when_auth_account_changes_mid_session() 
 #[test]
 fn auth_request_telemetry_context_tracks_attached_auth_and_retry_phase() {
     let auth_context = AuthRequestTelemetryContext::new(
-        Some(crate::auth::AuthMode::Chatgpt),
-        &crate::api_bridge::CoreAuthProvider::for_test(Some("access-token"), Some("workspace-123")),
+        Some(AuthMode::Chatgpt),
+        &CoreAuthProvider::for_test(Some("access-token"), Some("workspace-123")),
         PendingUnauthorizedRetry::from_recovery(UnauthorizedRecoveryExecution {
             mode: "managed",
             phase: "refresh_token",

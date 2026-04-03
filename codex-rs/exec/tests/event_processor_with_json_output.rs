@@ -4,8 +4,8 @@ use codex_app_server_protocol::CollabAgentState as ApiCollabAgentState;
 use codex_app_server_protocol::CollabAgentStatus as ApiCollabAgentStatus;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus as ApiCollabAgentToolCallStatus;
-use codex_app_server_protocol::CollabWaitReturnWhen;
-use codex_app_server_protocol::CollabWaitState;
+use codex_app_server_protocol::CollabWaitReturnWhen as ApiCollabWaitReturnWhen;
+use codex_app_server_protocol::CollabWaitState as ApiCollabWaitState;
 use codex_app_server_protocol::CommandAction;
 use codex_app_server_protocol::CommandExecutionSource;
 use codex_app_server_protocol::CommandExecutionStatus as ApiCommandExecutionStatus;
@@ -34,6 +34,8 @@ use codex_app_server_protocol::WebSearchAction as ApiWebSearchAction;
 use codex_protocol::ThreadId;
 use codex_protocol::models::WebSearchAction;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CollabWaitReturnWhen;
+use codex_protocol::protocol::CollabWaitState;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use pretty_assertions::assert_eq;
@@ -708,6 +710,9 @@ fn collab_spawn_begin_and_end_emit_item_events() {
                     ApiCollabAgentState {
                         status: ApiCollabAgentStatus::Running,
                         message: None,
+                        agent_nickname: None,
+                        agent_role: None,
+                        last_activity: None,
                     },
                 )]),
                 wait_state: None,
@@ -791,6 +796,9 @@ fn collab_wait_completion_preserves_wait_state() {
                         ApiCollabAgentState {
                             status: ApiCollabAgentStatus::Completed,
                             message: Some("done".to_string()),
+                            agent_nickname: None,
+                            agent_role: None,
+                            last_activity: None,
                         },
                     ),
                     (
@@ -798,11 +806,14 @@ fn collab_wait_completion_preserves_wait_state() {
                         ApiCollabAgentState {
                             status: ApiCollabAgentStatus::Errored,
                             message: Some("boom".to_string()),
+                            agent_nickname: None,
+                            agent_role: None,
+                            last_activity: None,
                         },
                     ),
                 ]),
-                wait_state: Some(CollabWaitState {
-                    return_when: CollabWaitReturnWhen::AnyFinal,
+                wait_state: Some(ApiCollabWaitState {
+                    return_when: ApiCollabWaitReturnWhen::AnyFinal,
                     disable_timeout: false,
                     condition_enabled: false,
                     timed_out: Some(false),

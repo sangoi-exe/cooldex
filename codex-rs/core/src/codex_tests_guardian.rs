@@ -7,7 +7,6 @@ use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecParams;
 use crate::exec_policy::ExecPolicyManager;
 use crate::guardian::GUARDIAN_REVIEWER_NAME;
-use crate::protocol::AskForApproval;
 use crate::sandboxing::SandboxPermissions;
 use crate::tools::context::FunctionToolOutput;
 use crate::turn_diff_tracker::TurnDiffTracker;
@@ -24,8 +23,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
-use core_test_support::PathExt;
-use core_test_support::TempDirExt;
+use codex_protocol::protocol::AskForApproval;
 use core_test_support::codex_linux_sandbox_exe_or_skip;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -389,7 +387,9 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
     .expect("write policy file");
 
     let mut config = build_test_config(codex_home.path()).await;
-    config.cwd = project_dir.path().to_path_buf();
+    config.cwd =
+        codex_utils_absolute_path::AbsolutePathBuf::try_from(project_dir.path().to_path_buf())
+            .expect("project cwd should be absolute");
     // Merge-safety anchor: guardian subagent tests must build both user and project config layers
     // so child isolation keeps matching the customized multi-agent reload path.
     config.config_layer_stack = ConfigLayerStack::new(

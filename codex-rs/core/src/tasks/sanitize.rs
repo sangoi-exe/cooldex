@@ -3,9 +3,13 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use async_trait::async_trait;
+use codex_protocol::error::CodexErr;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::user_input::UserInput;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -13,11 +17,6 @@ use tokio_util::sync::CancellationToken;
 use crate::client_common::SANITIZE_PROMPT;
 use crate::codex::TurnContext;
 use crate::codex::run_sampling_request;
-use crate::error::CodexErr;
-use crate::protocol::CompactedItem;
-use crate::protocol::EventMsg;
-use crate::protocol::RolloutItem;
-use crate::protocol::TurnStartedEvent;
 use crate::response_item_utils::local_shell_call_output_id;
 use crate::state::TaskKind;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -367,7 +366,6 @@ impl SanitizeTask {
     }
 }
 
-#[async_trait]
 impl SessionTask for SanitizeTask {
     fn kind(&self) -> TaskKind {
         TaskKind::Sanitize

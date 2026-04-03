@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::agent::status::is_final;
-use crate::error::CodexErr;
+use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::CollabWaitReturnWhen;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -23,7 +23,6 @@ struct StatusSubscription {
     was_final_at_start: bool,
 }
 
-#[async_trait]
 impl ToolHandler for Handler {
     type Output = WaitResult;
 

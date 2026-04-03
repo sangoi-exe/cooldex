@@ -3,13 +3,13 @@
 // task-path metadata, and inherited child-instruction behavior.
 
 use super::*;
+use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::control::render_input_preview;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
 use crate::tools::handlers::multi_agents::apply_spawn_agent_overrides;
-use crate::tools::handlers::multi_agents::apply_spawn_agent_profile_override;
 use crate::tools::handlers::multi_agents::apply_spawn_agent_runtime_overrides;
 use crate::tools::handlers::multi_agents::build_agent_spawn_config;
 use crate::tools::handlers::multi_agents::collab_spawn_error;
@@ -17,12 +17,12 @@ use crate::tools::handlers::multi_agents::finalize_spawn_agent_prompt_config;
 use crate::tools::handlers::multi_agents::parse_collab_input;
 use crate::tools::handlers::multi_agents::thread_spawn_source;
 use codex_protocol::AgentPath;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 
 pub(crate) struct Handler;
 
-#[async_trait]
 impl ToolHandler for Handler {
     type Output = SpawnAgentResult;
 
@@ -44,18 +44,14 @@ impl ToolHandler for Handler {
         } = invocation;
         let arguments = function_arguments(payload)?;
         let args: SpawnAgentArgs = parse_arguments(&arguments)?;
+        let fork_mode = args.fork_mode()?;
         let role_name = args
             .agent_type
             .as_deref()
             .map(str::trim)
             .filter(|role| !role.is_empty());
         let requested_task_name = args.task_name.clone();
-        let profile_name = args
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .filter(|profile| !profile.is_empty());
-        let initial_operation: Op = parse_collab_input(args.message, args.items)?.into();
+        let initial_operation: Op = parse_collab_input(Some(args.message), /*items*/ None)?.into();
         let prompt = render_input_preview(&initial_operation);
 
         let session_source = turn.session_source.clone();
@@ -67,7 +63,14 @@ impl ToolHandler for Handler {
             ));
         }
         let mut config = build_agent_spawn_config(turn.as_ref())?;
-        apply_spawn_agent_profile_override(&mut config, profile_name)?;
+        apply_requested_spawn_agent_model_overrides(
+            &session,
+            turn.as_ref(),
+            &mut config,
+            args.model.as_deref(),
+            args.reasoning_effort,
+        )
+        .await?;
         apply_role_to_config(&mut config, role_name)
             .await
             .map_err(FunctionCallError::RespondToModel)?;
@@ -135,7 +138,8 @@ impl ToolHandler for Handler {
                 spawn_operation,
                 Some(spawn_source),
                 SpawnAgentOptions {
-                    fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
+                    fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
+                    fork_mode,
                 },
             )
             .await
@@ -223,13 +227,52 @@ impl ToolHandler for Handler {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpawnAgentArgs {
-    message: Option<String>,
-    items: Option<Vec<UserInput>>,
+    message: String,
     task_name: String,
     agent_type: Option<String>,
-    profile: Option<String>,
-    #[serde(default)]
-    fork_context: bool,
+    model: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
+    fork_turns: Option<String>,
+    fork_context: Option<bool>,
+}
+
+impl SpawnAgentArgs {
+    fn fork_mode(&self) -> Result<Option<SpawnAgentForkMode>, FunctionCallError> {
+        if self.fork_context.is_some() {
+            return Err(FunctionCallError::RespondToModel(
+                "fork_context is not supported in MultiAgentV2; use fork_turns instead".to_string(),
+            ));
+        }
+
+        let Some(fork_turns) = self
+            .fork_turns
+            .as_deref()
+            .map(str::trim)
+            .filter(|fork_turns| !fork_turns.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        if fork_turns.eq_ignore_ascii_case("none") {
+            return Ok(None);
+        }
+        if fork_turns.eq_ignore_ascii_case("all") {
+            return Ok(Some(SpawnAgentForkMode::FullHistory));
+        }
+
+        let last_n_turns = fork_turns.parse::<usize>().map_err(|_| {
+            FunctionCallError::RespondToModel(
+                "fork_turns must be `none`, `all`, or a positive integer string".to_string(),
+            )
+        })?;
+        if last_n_turns == 0 {
+            return Err(FunctionCallError::RespondToModel(
+                "fork_turns must be `none`, `all`, or a positive integer string".to_string(),
+            ));
+        }
+
+        Ok(Some(SpawnAgentForkMode::LastNTurns(last_n_turns)))
+    }
 }
 
 #[derive(Debug, Serialize)]

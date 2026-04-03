@@ -13,15 +13,6 @@ use crate::codex::PreviousTurnSettings;
 use crate::codex::SessionConfiguration;
 use crate::context_manager::ContextManager;
 use crate::contextual_user_message::is_prompt_gc_contextual_fragment;
-use crate::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
-use crate::protocol::PINNED_NOTES_CLOSE_TAG;
-use crate::protocol::PINNED_NOTES_OPEN_TAG;
-use crate::protocol::REASONING_CONTEXT_CLOSE_TAG;
-use crate::protocol::REASONING_CONTEXT_OPEN_TAG;
-use crate::protocol::RateLimitSnapshot;
-use crate::protocol::TOOL_CONTEXT_OPEN_TAG;
-use crate::protocol::TokenUsage;
-use crate::protocol::TokenUsageInfo;
 use crate::response_item_utils::is_unified_exec_output_frame;
 use crate::response_item_utils::is_unified_exec_token_qty_marker_line;
 use crate::rid::rid_to_string;
@@ -34,6 +25,15 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::openai_models::InputModality;
+use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
+use codex_protocol::protocol::PINNED_NOTES_CLOSE_TAG;
+use codex_protocol::protocol::PINNED_NOTES_OPEN_TAG;
+use codex_protocol::protocol::REASONING_CONTEXT_CLOSE_TAG;
+use codex_protocol::protocol::REASONING_CONTEXT_OPEN_TAG;
+use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::TOOL_CONTEXT_OPEN_TAG;
+use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
 use codex_utils_output_truncation::TruncationPolicy;
 
@@ -785,8 +785,9 @@ fn merge_rate_limit_fields(
 mod tests {
     use super::*;
     use crate::codex::make_session_configuration_for_tests;
-    use crate::protocol::RateLimitWindow;
-    use crate::protocol::TOOL_CONTEXT_CLOSE_TAG;
+    use codex_protocol::protocol::CreditsSnapshot;
+    use codex_protocol::protocol::RateLimitWindow;
+    use codex_protocol::protocol::TOOL_CONTEXT_CLOSE_TAG;
     use pretty_assertions::assert_eq;
 
     #[tokio::test]
@@ -898,7 +899,7 @@ mod tests {
                 resets_at: Some(100),
             }),
             secondary: None,
-            credits: Some(crate::protocol::CreditsSnapshot {
+            credits: Some(CreditsSnapshot {
                 has_credits: true,
                 unlimited: false,
                 balance: Some("50".to_string()),
@@ -930,7 +931,7 @@ mod tests {
                     resets_at: Some(200),
                 }),
                 secondary: None,
-                credits: Some(crate::protocol::CreditsSnapshot {
+                credits: Some(CreditsSnapshot {
                     has_credits: true,
                     unlimited: false,
                     balance: Some("50".to_string()),

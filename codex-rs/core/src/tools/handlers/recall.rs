@@ -14,7 +14,6 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
-use async_trait::async_trait;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemContent;
@@ -91,7 +90,6 @@ struct RecallItem {
     phase: Option<String>,
 }
 
-#[async_trait]
 impl ToolHandler for RecallHandler {
     type Output = FunctionToolOutput;
 

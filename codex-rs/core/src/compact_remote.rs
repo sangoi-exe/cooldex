@@ -12,15 +12,15 @@ use crate::context_manager::ContextManager;
 use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
 use crate::context_manager::is_codex_generated_item;
-use crate::error::CodexErr;
-use crate::error::Result as CodexResult;
-use crate::protocol::CompactedItem;
-use crate::protocol::EventMsg;
-use crate::protocol::TurnStartedEvent;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::TurnStartedEvent;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::info;
@@ -407,6 +407,8 @@ mod tests {
     use crate::client::ModelClient;
     use crate::codex::make_session_and_context_with_rx;
     use crate::features::Feature;
+    use codex_login::token_data;
+    use codex_model_provider_info::built_in_model_providers;
     use codex_protocol::models::ContentItem;
     use codex_protocol::protocol::Event;
     use codex_protocol::protocol::RateLimitSnapshot;
@@ -449,7 +451,7 @@ mod tests {
         }
     }
 
-    fn token_data_for_account(account_id: &str) -> crate::token_data::TokenData {
+    fn token_data_for_account(account_id: &str) -> token_data::TokenData {
         #[derive(serde::Serialize)]
         struct Header {
             alg: &'static str,
@@ -476,8 +478,8 @@ mod tests {
         let signature_b64 = encode(b"sig");
         let fake_jwt = format!("{header_b64}.{payload_b64}.{signature_b64}");
 
-        crate::token_data::TokenData {
-            id_token: crate::token_data::parse_chatgpt_jwt_claims(&fake_jwt)
+        token_data::TokenData {
+            id_token: token_data::parse_chatgpt_jwt_claims(&fake_jwt)
                 .expect("parse fake chatgpt jwt"),
             access_token: format!("access-{account_id}"),
             refresh_token: format!("refresh-{account_id}"),
@@ -586,7 +588,7 @@ mod tests {
             "fixture auth manager should select acc-2 as the auto-switch target"
         );
 
-        let mut provider = crate::built_in_model_providers(None)["openai"].clone();
+        let mut provider = built_in_model_providers(None)["openai"].clone();
         provider.base_url = Some(format!("{}/v1", server.uri()));
 
         let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");

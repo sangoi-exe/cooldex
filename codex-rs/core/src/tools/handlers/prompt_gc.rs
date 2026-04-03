@@ -10,11 +10,11 @@ use crate::prompt_gc_sidecar::PromptGcCapturedUnit;
 use crate::prompt_gc_sidecar::PromptGcCheckpoint;
 use crate::prompt_gc_sidecar::PromptGcUnitKind;
 use crate::prompt_gc_sidecar::PromptGcUnitResolver;
-use crate::protocol::REASONING_CONTEXT_CLOSE_TAG;
-use crate::protocol::REASONING_CONTEXT_OPEN_TAG;
-use crate::protocol::TOOL_CONTEXT_CLOSE_TAG;
-use crate::protocol::TOOL_CONTEXT_OPEN_TAG;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::REASONING_CONTEXT_CLOSE_TAG;
+use codex_protocol::protocol::REASONING_CONTEXT_OPEN_TAG;
+use codex_protocol::protocol::TOOL_CONTEXT_CLOSE_TAG;
+use codex_protocol::protocol::TOOL_CONTEXT_OPEN_TAG;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
 use serde::Deserialize;
@@ -596,15 +596,14 @@ fn contract_error(
 mod tests {
     use super::*;
     use crate::codex::make_session_and_context;
-    use crate::protocol::TokenUsage;
     use crate::rollout::RolloutRecorder;
     use crate::rollout::RolloutRecorderParams;
     use crate::rollout::policy::EventPersistenceMode;
     use crate::state::ActiveTurn;
     use crate::state::RunningTask;
     use crate::state::TaskKind;
+    use crate::tasks::AnySessionTask;
     use crate::tasks::RegularTask;
-    use crate::tasks::SessionTask;
     use codex_protocol::ThreadId;
     use codex_protocol::models::BaseInstructions;
     use codex_protocol::models::ContentItem;
@@ -616,6 +615,7 @@ mod tests {
     use codex_protocol::models::ReasoningItemContent;
     use codex_protocol::models::WebSearchAction;
     use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::TokenUsage;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use tokio::sync::Notify;
@@ -658,7 +658,7 @@ mod tests {
         active_turn.add_task(RunningTask {
             done: Arc::new(Notify::new()),
             kind: TaskKind::Regular,
-            task: Arc::new(RegularTask) as Arc<dyn SessionTask>,
+            task: Arc::new(RegularTask) as Arc<dyn AnySessionTask>,
             cancellation_token: CancellationToken::new(),
             handle: Arc::new(AbortOnDropHandle::new(tokio::spawn(async {}))),
             turn_context: Arc::clone(&turn_context),

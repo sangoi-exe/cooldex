@@ -2,17 +2,17 @@ use super::*;
 
 // Merge-safety anchor: rollout reconstruction tests must preserve prompt_gc
 // marker semantics and rollback hydration invariants for resume/fork recovery.
-use crate::protocol::CompactedItem;
-use crate::protocol::InitialHistory;
-use crate::protocol::PromptGcCompactionMetadata;
-use crate::protocol::PromptGcExecutionPhase;
-use crate::protocol::PromptGcOutcomeKind;
-use crate::protocol::ResumedHistory;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::PromptGcCompactionMetadata;
+use codex_protocol::protocol::PromptGcExecutionPhase;
+use codex_protocol::protocol::PromptGcOutcomeKind;
+use codex_protocol::protocol::ResumedHistory;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
 
@@ -1576,7 +1576,7 @@ async fn record_initial_history_resumed_rollback_discards_prompt_gc_compaction_f
     let rolled_back_context_item = TurnContextItem {
         turn_id: Some(rolled_back_turn_id.clone()),
         trace_id: turn_context.trace_id.clone(),
-        cwd: turn_context.cwd.clone(),
+        cwd: turn_context.cwd.to_path_buf(),
         current_date: turn_context.current_date.clone(),
         timezone: turn_context.timezone.clone(),
         approval_policy: turn_context.approval_policy.value(),
@@ -1591,7 +1591,7 @@ async fn record_initial_history_resumed_rollback_discards_prompt_gc_compaction_f
         user_instructions: None,
         developer_instructions: None,
         final_output_json_schema: None,
-        truncation_policy: Some(turn_context.truncation_policy.into()),
+        truncation_policy: Some(turn_context.truncation_policy),
     };
     let replacement_history = vec![assistant_message("prompt-gc summary")];
 

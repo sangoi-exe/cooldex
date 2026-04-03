@@ -13,7 +13,6 @@ use crate::codex::TurnContext;
 use crate::config::Config;
 use crate::config::ConfigOverrides;
 use crate::config::deserialize_config_toml_with_base;
-use crate::error::CodexErr;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -22,11 +21,13 @@ pub(crate) use crate::tools::handlers::multi_agents_common::*;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
-use async_trait::async_trait;
+use codex_config::types::WindowsSandboxModeToml;
 use codex_features::Feature;
+use codex_models_manager::manager::ModelsManager;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::CollabAgentInteractionBeginEvent;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
@@ -248,7 +249,7 @@ fn apply_child_prompt_overrides(config: &mut Config) {
 pub(crate) async fn finalize_spawn_agent_prompt_config(
     config: &mut Config,
     turn: &TurnContext,
-    models_manager: &crate::models_manager::manager::ModelsManager,
+    models_manager: &ModelsManager,
 ) {
     // Merge-safety anchor: role/profile reloads rebuild `Config` from persisted layers, which can
     // restore the lead post-compact ritual. Normalize the child prompt after the final reload so
@@ -259,7 +260,10 @@ pub(crate) async fn finalize_spawn_agent_prompt_config(
         .model
         .clone()
         .unwrap_or_else(|| turn.model_info.slug.clone());
-    let model_info = models_manager.get_model_info(model.as_str(), config).await;
+    let models_manager_config = config.to_models_manager_config();
+    let model_info = models_manager
+        .get_model_info(model.as_str(), &models_manager_config)
+        .await;
     if !model_info.used_fallback_model_metadata
         && let Some(reasoning_effort) = config.model_reasoning_effort
         && !model_info
@@ -362,8 +366,7 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
     config.permissions.network_sandbox_policy = turn.network_sandbox_policy;
     match turn.windows_sandbox_level {
         WindowsSandboxLevel::Elevated => {
-            config.permissions.windows_sandbox_mode =
-                Some(crate::config::types::WindowsSandboxModeToml::Elevated);
+            config.permissions.windows_sandbox_mode = Some(WindowsSandboxModeToml::Elevated);
             config
                 .features
                 .enable(Feature::WindowsSandbox)
@@ -382,8 +385,7 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
                 })?;
         }
         WindowsSandboxLevel::RestrictedToken => {
-            config.permissions.windows_sandbox_mode =
-                Some(crate::config::types::WindowsSandboxModeToml::Unelevated);
+            config.permissions.windows_sandbox_mode = Some(WindowsSandboxModeToml::Unelevated);
             config
                 .features
                 .enable(Feature::WindowsSandbox)

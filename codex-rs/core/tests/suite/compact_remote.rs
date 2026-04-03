@@ -4,9 +4,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use codex_core::CodexAuth;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::features::Feature;
+use codex_login::CodexAuth;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
@@ -64,7 +64,8 @@ const AUTO_COMPACT_RECON_WARNING: &str = "STOP. Codex CLI has just performed an 
 // auto-compact warning injection so recall-first assertions stay coherent.
 fn model_info_with_context_window(slug: &str, context_window: i64) -> ModelInfo {
     let models_response: ModelsResponse =
-        serde_json::from_str(include_str!("../../models.json")).expect("valid models.json");
+        serde_json::from_str(include_str!("../../../models-manager/models.json"))
+            .expect("valid models.json");
     let mut model_info = models_response
         .models
         .into_iter()

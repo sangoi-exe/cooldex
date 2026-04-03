@@ -75,8 +75,10 @@ In the codex-rs folder where the rust code lives:
 - When you cannot make that API change and still need a small positional-literal callsite in Rust, follow the `argument_comment_lint` convention:
   - Use an exact `/*param_name*/` comment before opaque literal arguments such as `None`, booleans, and numeric literals when passing them by position.
   - Do not add these comments for string or char literals unless the comment adds real clarity; those literals are intentionally exempt from the lint.
-  - If you add one of these comments, the parameter name must exactly match the callee signature.
+  - The parameter name in the comment must exactly match the callee signature.
+  - You can run `just argument-comment-lint` to run the lint check locally. This is powered by Bazel, so running it the first time can be slow if Bazel is not warmed up, though incremental invocations should take <15s. Most of the time, it is best to update the PR and let CI take responsibility for checking this (or run it asynchronously in the background after submitting the PR). Note CI checks all three platforms, which the local run does not.
 - When possible, make `match` statements exhaustive and avoid wildcard arms.
+- Newly added traits should include doc comments that explain their role and how implementations are expected to use them.
 - When writing tests, prefer comparing the equality of entire objects over fields one by one.
 - When making a change that adds or changes an API, ensure that the documentation in the `docs/` folder is up to date if applicable.
 - If you change `ConfigToml` or nested config types, run `just write-config-schema` to update `codex-rs/core/config.schema.json`.
@@ -115,8 +117,6 @@ For Rust validation in `codex-rs`, use this light-first ladder:
 6. When warnings must be blocking for the selected target set, run `just clippy-strict ...` after the compile ladder. Add `--tests` only when test targets are intentionally in scope. If the deliverable is a shipped binary or another top-level target whose local dependencies must also be warning-clean under plain rustc, also run `just check-strict ...` on that same exact surface (for example `just check-strict -p codex-cli --bin codex`).
 
 Before finalizing a large change to `codex-rs`, run `just fix -p <project>` (from the workspace root or inside `codex-rs`; the recipe routes through `./scripts/cargo-guard.sh`) to fix any linter issues in the code. Prefer scoping with `-p` to avoid slow workspace‑wide Clippy builds; only run `just fix` without `-p` if you changed shared crates. Do not re-run tests after running `fix` or `fmt`.
-
-Also run `just argument-comment-lint` to ensure the codebase is clean of comment lint errors.
 
 ## The `codex-core` crate
 

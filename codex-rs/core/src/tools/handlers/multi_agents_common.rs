@@ -1,49 +1,21 @@
 // Merge-safety anchor: shared collab error helpers define the fail-loud operator
 // contract reused by the workspace-local MultiAgentV2 handlers.
 
-#[cfg(test)]
-use crate::agent::AgentStatus;
-#[cfg(test)]
 use crate::codex::Session;
-#[cfg(test)]
 use crate::codex::TurnContext;
-#[cfg(test)]
 use crate::config::Config;
-use crate::error::CodexErr;
 use crate::function_tool::FunctionCallError;
-#[cfg(test)]
-use crate::models_manager::manager::RefreshStrategy;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
-#[cfg(test)]
-use codex_features::Feature;
-#[cfg(test)]
-use codex_protocol::AgentPath;
+use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::ThreadId;
-#[cfg(test)]
-use codex_protocol::models::BaseInstructions;
+use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
-#[cfg(test)]
 use codex_protocol::openai_models::ReasoningEffort;
-#[cfg(test)]
 use codex_protocol::openai_models::ReasoningEffortPreset;
-#[cfg(test)]
-use codex_protocol::protocol::CollabAgentRef;
-#[cfg(test)]
-use codex_protocol::protocol::CollabAgentStatusEntry;
-#[cfg(test)]
-use codex_protocol::protocol::Op;
-#[cfg(test)]
-use codex_protocol::protocol::SessionSource;
-#[cfg(test)]
-use codex_protocol::protocol::SubAgentSource;
-#[cfg(test)]
-use codex_protocol::user_input::UserInput;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-#[cfg(test)]
-use std::collections::HashMap;
 
 /// Minimum wait timeout to prevent tight polling loops from burning CPU.
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
@@ -91,46 +63,6 @@ where
     })
 }
 
-#[cfg(test)]
-pub(crate) fn build_wait_agent_statuses(
-    statuses: &HashMap<ThreadId, AgentStatus>,
-    receiver_agents: &[CollabAgentRef],
-) -> Vec<CollabAgentStatusEntry> {
-    if statuses.is_empty() {
-        return Vec::new();
-    }
-
-    let mut entries = Vec::with_capacity(statuses.len());
-    let mut seen = HashMap::with_capacity(receiver_agents.len());
-    for receiver_agent in receiver_agents {
-        seen.insert(receiver_agent.thread_id, ());
-        if let Some(status) = statuses.get(&receiver_agent.thread_id) {
-            entries.push(CollabAgentStatusEntry {
-                thread_id: receiver_agent.thread_id,
-                agent_nickname: receiver_agent.agent_nickname.clone(),
-                agent_role: receiver_agent.agent_role.clone(),
-                status: status.clone(),
-                last_activity: None,
-            });
-        }
-    }
-
-    let mut extras = statuses
-        .iter()
-        .filter(|(thread_id, _)| !seen.contains_key(thread_id))
-        .map(|(thread_id, status)| CollabAgentStatusEntry {
-            thread_id: *thread_id,
-            agent_nickname: None,
-            agent_role: None,
-            status: status.clone(),
-            last_activity: None,
-        })
-        .collect::<Vec<_>>();
-    extras.sort_by(|left, right| left.thread_id.to_string().cmp(&right.thread_id.to_string()));
-    entries.extend(extras);
-    entries
-}
-
 pub(crate) fn collab_spawn_error(err: CodexErr) -> FunctionCallError {
     match err {
         CodexErr::UnsupportedOperation(message) if message == "thread manager dropped" => {
@@ -156,152 +88,6 @@ pub(crate) fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionC
     }
 }
 
-#[cfg(test)]
-pub(crate) fn thread_spawn_source(
-    parent_thread_id: ThreadId,
-    parent_session_source: &SessionSource,
-    depth: i32,
-    agent_role: Option<&str>,
-    task_name: Option<String>,
-) -> Result<SessionSource, FunctionCallError> {
-    let agent_path = task_name
-        .as_deref()
-        .map(|task_name| {
-            parent_session_source
-                .get_agent_path()
-                .unwrap_or_else(AgentPath::root)
-                .join(task_name)
-                .map_err(FunctionCallError::RespondToModel)
-        })
-        .transpose()?;
-    Ok(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-        parent_thread_id,
-        depth,
-        agent_path,
-        agent_nickname: None,
-        agent_role: agent_role.map(str::to_string),
-    }))
-}
-
-#[cfg(test)]
-pub(crate) fn parse_collab_input(
-    message: Option<String>,
-    items: Option<Vec<UserInput>>,
-) -> Result<Op, FunctionCallError> {
-    match (message, items) {
-        (Some(_), Some(_)) => Err(FunctionCallError::RespondToModel(
-            "Provide either message or items, but not both".to_string(),
-        )),
-        (None, None) => Err(FunctionCallError::RespondToModel(
-            "Provide one of: message or items".to_string(),
-        )),
-        (Some(message), None) => {
-            if message.trim().is_empty() {
-                return Err(FunctionCallError::RespondToModel(
-                    "Empty message can't be sent to an agent".to_string(),
-                ));
-            }
-            Ok(vec![UserInput::Text {
-                text: message,
-                text_elements: Vec::new(),
-            }]
-            .into())
-        }
-        (None, Some(items)) => {
-            if items.is_empty() {
-                return Err(FunctionCallError::RespondToModel(
-                    "Items can't be empty".to_string(),
-                ));
-            }
-            Ok(items.into())
-        }
-    }
-}
-
-#[cfg(test)]
-/// Builds the base config snapshot for a newly spawned sub-agent.
-///
-/// The returned config starts from the parent's effective config and then refreshes the
-/// runtime-owned fields carried on `turn`, including model selection, reasoning settings,
-/// approval policy, sandbox, and cwd. Role-specific overrides are layered after this step;
-/// skipping this helper and cloning stale config state directly can send the child agent out with
-/// the wrong provider or runtime policy.
-pub(crate) fn build_agent_spawn_config(
-    base_instructions: &BaseInstructions,
-    turn: &TurnContext,
-) -> Result<Config, FunctionCallError> {
-    let mut config = build_agent_shared_config(turn)?;
-    config.base_instructions = Some(base_instructions.text.clone());
-    Ok(config)
-}
-
-#[cfg(test)]
-pub(crate) fn build_agent_resume_config(
-    turn: &TurnContext,
-    child_depth: i32,
-) -> Result<Config, FunctionCallError> {
-    let mut config = build_agent_shared_config(turn)?;
-    apply_spawn_agent_overrides(&mut config, child_depth);
-    // For resume, keep base instructions sourced from rollout/session metadata.
-    config.base_instructions = None;
-    Ok(config)
-}
-
-#[cfg(test)]
-fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
-    let base_config = turn.config.clone();
-    let mut config = (*base_config).clone();
-    config.model = Some(turn.model_info.slug.clone());
-    config.model_provider = turn.provider.clone();
-    config.model_reasoning_effort = turn.reasoning_effort;
-    config.model_reasoning_summary = Some(turn.reasoning_summary);
-    config.developer_instructions = turn.developer_instructions.clone();
-    config.compact_prompt = turn.compact_prompt.clone();
-    apply_spawn_agent_runtime_overrides(&mut config, turn)?;
-
-    Ok(config)
-}
-
-#[cfg(test)]
-/// Copies runtime-only turn state onto a child config before it is handed to `AgentControl`.
-///
-/// These values are chosen by the live turn rather than persisted config, so leaving them stale
-/// can make a child agent disagree with its parent about approval policy, cwd, or sandboxing.
-pub(crate) fn apply_spawn_agent_runtime_overrides(
-    config: &mut Config,
-    turn: &TurnContext,
-) -> Result<(), FunctionCallError> {
-    config
-        .permissions
-        .approval_policy
-        .set(turn.approval_policy.value())
-        .map_err(|err| {
-            FunctionCallError::RespondToModel(format!("approval_policy is invalid: {err}"))
-        })?;
-    config.permissions.shell_environment_policy = turn.shell_environment_policy.clone();
-    config.codex_linux_sandbox_exe = turn.codex_linux_sandbox_exe.clone();
-    config.cwd = turn.cwd.clone();
-    config
-        .permissions
-        .sandbox_policy
-        .set(turn.sandbox_policy.get().clone())
-        .map_err(|err| {
-            FunctionCallError::RespondToModel(format!("sandbox_policy is invalid: {err}"))
-        })?;
-    config.permissions.file_system_sandbox_policy = turn.file_system_sandbox_policy.clone();
-    config.permissions.network_sandbox_policy = turn.network_sandbox_policy;
-    Ok(())
-}
-
-#[cfg(test)]
-pub(crate) fn apply_spawn_agent_overrides(config: &mut Config, child_depth: i32) {
-    if child_depth >= config.agent_max_depth && !config.features.enabled(Feature::MultiAgentV2) {
-        let _ = config.features.disable(Feature::SpawnCsv);
-        let _ = config.features.disable(Feature::Collab);
-    }
-}
-
-#[cfg(test)]
 pub(crate) async fn apply_requested_spawn_agent_model_overrides(
     session: &Session,
     turn: &TurnContext,
@@ -323,7 +109,7 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
         let selected_model_info = session
             .services
             .models_manager
-            .get_model_info(&selected_model_name, config)
+            .get_model_info(&selected_model_name, &config.to_models_manager_config())
             .await;
 
         config.model = Some(selected_model_name.clone());
@@ -353,7 +139,6 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
     Ok(())
 }
 
-#[cfg(test)]
 fn find_spawn_agent_model_name(
     available_models: &[codex_protocol::openai_models::ModelPreset],
     requested_model: &str,
@@ -374,7 +159,6 @@ fn find_spawn_agent_model_name(
         })
 }
 
-#[cfg(test)]
 fn validate_spawn_agent_reasoning_effort(
     model: &str,
     supported_reasoning_levels: &[ReasoningEffortPreset],

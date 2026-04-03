@@ -1,10 +1,6 @@
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
-use crate::protocol::REASONING_CONTEXT_CLOSE_TAG;
-use crate::protocol::REASONING_CONTEXT_OPEN_TAG;
-use crate::protocol::TOOL_CONTEXT_CLOSE_TAG;
-use crate::protocol::TOOL_CONTEXT_OPEN_TAG;
 use crate::response_item_utils::local_shell_call_output_id;
 use crate::rid::parse_rid;
 use crate::state::ContextItemsEvent;
@@ -15,10 +11,13 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
-use async_trait::async_trait;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::REASONING_CONTEXT_CLOSE_TAG;
+use codex_protocol::protocol::REASONING_CONTEXT_OPEN_TAG;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::TOOL_CONTEXT_CLOSE_TAG;
+use codex_protocol::protocol::TOOL_CONTEXT_OPEN_TAG;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
@@ -125,7 +124,6 @@ struct ManageContextResult {
     json: serde_json::Value,
 }
 
-#[async_trait]
 impl ToolHandler for ManageContextHandler {
     type Output = FunctionToolOutput;
 
@@ -1028,15 +1026,16 @@ mod tests {
     use super::*;
     use crate::client::ModelClient;
     use crate::features::Feature;
-    use crate::protocol::Event;
-    use crate::protocol::EventMsg;
     use crate::tasks::RegularTask;
+    use codex_model_provider_info::built_in_model_providers;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::FunctionCallOutputBody;
     use codex_protocol::models::LocalShellAction;
     use codex_protocol::models::LocalShellExecAction;
     use codex_protocol::models::LocalShellStatus;
     use codex_protocol::openai_models::InputModality;
+    use codex_protocol::protocol::Event;
+    use codex_protocol::protocol::EventMsg;
     use codex_protocol::user_input::UserInput;
     use serde_json::Value;
     use std::fmt::Write as _;
@@ -2512,7 +2511,7 @@ mod tests {
             .await;
 
         let (mut session, turn, rx) = crate::codex::make_session_and_context_with_rx().await;
-        let mut provider = crate::built_in_model_providers(None)["openai"].clone();
+        let mut provider = built_in_model_providers(None)["openai"].clone();
         provider.base_url = Some(format!("{}/v1", server.uri()));
 
         let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
