@@ -105,6 +105,8 @@ use codex_core::message_history;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_features::Feature;
 use codex_login::AuthManager;
+use codex_login::ChatgptAccountAuthResolution;
+use codex_login::ChatgptAccountRefreshMode;
 use codex_login::ServerOptions;
 use codex_login::run_login_server;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
@@ -358,37 +360,75 @@ fn accounts_cache_fallback_expires_at(
 }
 
 fn spawn_next_accounts_rate_limit_fetch(
-    join_set: &mut tokio::task::JoinSet<(String, Option<RateLimitSnapshot>)>,
+    join_set: &mut tokio::task::JoinSet<AccountsRateLimitFetchOutcome>,
     pending: &mut impl Iterator<Item = String>,
-    auth_manager: &AuthManager,
+    auth_manager: &Arc<AuthManager>,
     base_url: &str,
 ) -> bool {
-    for store_account_id in pending.by_ref() {
-        let Some(auth) = auth_manager.chatgpt_auth_for_store_account_id(&store_account_id) else {
-            continue;
-        };
+    if let Some(store_account_id) = pending.by_ref().next() {
+        let auth_manager = Arc::clone(auth_manager);
         let base_url = base_url.to_string();
         join_set.spawn(async move {
             let account_id_for_log = store_account_id.clone();
-            let snapshots = match tokio::time::timeout(
-                ACCOUNTS_RATE_LIMIT_FETCH_TIMEOUT,
-                crate::chatwidget::fetch_rate_limits(base_url, auth),
-            )
-            .await
+            match auth_manager
+                .resolve_chatgpt_auth_for_store_account_id(
+                    &store_account_id,
+                    ChatgptAccountRefreshMode::IfStale,
+                )
+                .await
             {
-                Ok(snapshots) => snapshots,
-                Err(_) => {
+                Ok(ChatgptAccountAuthResolution::Auth(auth)) => {
+                    let snapshots = match tokio::time::timeout(
+                        ACCOUNTS_RATE_LIMIT_FETCH_TIMEOUT,
+                        crate::chatwidget::fetch_rate_limits(base_url, auth),
+                    )
+                    .await
+                    {
+                        Ok(snapshots) => snapshots,
+                        Err(_) => {
+                            tracing::warn!(
+                                account_id = %account_id_for_log,
+                                "timed out while fetching account rate limits"
+                            );
+                            Vec::new()
+                        }
+                    };
+                    AccountsRateLimitFetchOutcome {
+                        store_account_id,
+                        snapshot: crate::chatwidget::preferred_rate_limit_snapshot(snapshots),
+                        fetch_attempted: true,
+                    }
+                }
+                Ok(ChatgptAccountAuthResolution::Removed(error)) => {
+                    tracing::info!(
+                        account_id = %account_id_for_log,
+                        failed_reason = ?error.reason,
+                        "removed saved ChatGPT account while refreshing /accounts status"
+                    );
+                    AccountsRateLimitFetchOutcome {
+                        store_account_id,
+                        snapshot: None,
+                        fetch_attempted: false,
+                    }
+                }
+                Ok(ChatgptAccountAuthResolution::Missing) => AccountsRateLimitFetchOutcome {
+                    store_account_id,
+                    snapshot: None,
+                    fetch_attempted: false,
+                },
+                Err(err) => {
                     tracing::warn!(
                         account_id = %account_id_for_log,
-                        "timed out while fetching account rate limits"
+                        error = %err,
+                        "failed to resolve ChatGPT account while refreshing /accounts status"
                     );
-                    Vec::new()
+                    AccountsRateLimitFetchOutcome {
+                        store_account_id,
+                        snapshot: None,
+                        fetch_attempted: false,
+                    }
                 }
-            };
-            (
-                store_account_id,
-                crate::chatwidget::preferred_rate_limit_snapshot(snapshots),
-            )
+            }
         });
         return true;
     }
@@ -418,13 +458,17 @@ async fn fetch_accounts_rate_limit_updates(
         ) {
             break;
         }
-        attempted_fetches += 1;
     }
 
     while let Some(result) = join_set.join_next().await {
-        if let Ok((store_account_id, Some(snapshot))) = result {
-            updates.push((store_account_id, snapshot));
-            successful_fetches += 1;
+        if let Ok(outcome) = result {
+            if outcome.fetch_attempted {
+                attempted_fetches += 1;
+            }
+            if let Some(snapshot) = outcome.snapshot {
+                updates.push((outcome.store_account_id, snapshot));
+                successful_fetches += 1;
+            }
         }
 
         if spawn_next_accounts_rate_limit_fetch(
@@ -432,9 +476,7 @@ async fn fetch_accounts_rate_limit_updates(
             &mut pending,
             &auth_manager,
             &base_url,
-        ) {
-            attempted_fetches += 1;
-        }
+        ) {}
     }
 
     AccountsRateLimitRefreshResult {
@@ -442,6 +484,12 @@ async fn fetch_accounts_rate_limit_updates(
         attempted_fetches,
         successful_fetches,
     }
+}
+
+struct AccountsRateLimitFetchOutcome {
+    store_account_id: String,
+    snapshot: Option<RateLimitSnapshot>,
+    fetch_attempted: bool,
 }
 
 struct AccountsRateLimitRefreshResult {

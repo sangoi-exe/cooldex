@@ -73,6 +73,8 @@ use codex_hooks::HookResult;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
 use codex_login::AuthManager;
+use codex_login::ChatgptAccountAuthResolution;
+use codex_login::ChatgptAccountRefreshMode;
 use codex_login::CodexAuth;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
 use codex_login::default_client::originator;
@@ -8579,12 +8581,33 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
     let mut updates = Vec::new();
     let mut freshly_unsupported_store_account_ids = HashSet::new();
     for store_account_id in account_ids {
-        let Some(auth) = sess
+        let auth = match sess
             .services
             .auth_manager
-            .chatgpt_auth_for_store_account_id(&store_account_id)
-        else {
-            continue;
+            .resolve_chatgpt_auth_for_store_account_id(
+                &store_account_id,
+                ChatgptAccountRefreshMode::IfStale,
+            )
+            .await
+        {
+            Ok(ChatgptAccountAuthResolution::Auth(auth)) => auth,
+            Ok(ChatgptAccountAuthResolution::Removed(error)) => {
+                debug!(
+                    store_account_id = %store_account_id,
+                    failed_reason = ?error.reason,
+                    "removed saved ChatGPT account before usage-limit auto-switch refresh"
+                );
+                continue;
+            }
+            Ok(ChatgptAccountAuthResolution::Missing) => continue,
+            Err(err) => {
+                debug!(
+                    store_account_id = %store_account_id,
+                    error = %err,
+                    "failed to resolve ChatGPT account before usage-limit auto-switch"
+                );
+                continue;
+            }
         };
         match fetch_account_rate_limits_snapshot(&turn_context.config.chatgpt_base_url, &auth).await
         {

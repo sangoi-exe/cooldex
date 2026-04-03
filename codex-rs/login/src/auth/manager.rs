@@ -176,6 +176,28 @@ pub struct ExternalAuthRefreshContext {
     pub previous_account_id: Option<String>,
 }
 
+/// Refresh policy for resolving a saved ChatGPT account before using it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatgptAccountRefreshMode {
+    /// Reuse the stored account auth snapshot as-is.
+    Never,
+    /// Refresh the account only when the cached access token looks stale.
+    IfStale,
+    /// Force a refresh attempt before returning the account.
+    Force,
+}
+
+/// Result of resolving a saved ChatGPT account from the auth store.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChatgptAccountAuthResolution {
+    /// The stored account is still usable and resolved to a current auth snapshot.
+    Auth(CodexAuth),
+    /// The stored account was removed because refresh-token failure is terminal.
+    Removed(RefreshTokenFailedError),
+    /// The requested stored account was already absent.
+    Missing,
+}
+
 #[async_trait]
 /// Pluggable auth provider used by `AuthManager` for externally managed auth flows.
 ///
@@ -1499,6 +1521,81 @@ impl AuthManager {
         )
     }
 
+    // Merge-safety anchor: `/accounts`, usage-limit auto-switch, and active auth recovery must use
+    // one canonical owner for per-account refresh failure eviction.
+    pub async fn resolve_chatgpt_auth_for_store_account_id(
+        &self,
+        store_account_id: &str,
+        refresh_mode: ChatgptAccountRefreshMode,
+    ) -> Result<ChatgptAccountAuthResolution, RefreshTokenError> {
+        let Some(auth) = self.chatgpt_auth_for_store_account_id(store_account_id) else {
+            return Ok(ChatgptAccountAuthResolution::Missing);
+        };
+        let CodexAuth::Chatgpt(chatgpt_auth) = &auth else {
+            return Ok(ChatgptAccountAuthResolution::Auth(auth));
+        };
+
+        let cached_refresh_failure =
+            self.auth_cached()
+                .as_ref()
+                .and_then(|cached_auth| match cached_auth {
+                    CodexAuth::Chatgpt(cached_chatgpt_auth)
+                        if cached_chatgpt_auth.store_account_id
+                            == chatgpt_auth.store_account_id =>
+                    {
+                        self.refresh_failure_for_auth(cached_auth)
+                    }
+                    _ => None,
+                });
+        if let Some(error) = cached_refresh_failure.or_else(|| self.refresh_failure_for_auth(&auth))
+        {
+            return if self.remove_chatgpt_store_account_for_terminal_refresh_failure(
+                chatgpt_auth.store_account_id.as_str(),
+                &error,
+            )? {
+                Ok(ChatgptAccountAuthResolution::Removed(error))
+            } else {
+                Err(RefreshTokenError::Permanent(error))
+            };
+        }
+
+        let should_refresh = match refresh_mode {
+            ChatgptAccountRefreshMode::Never => false,
+            ChatgptAccountRefreshMode::IfStale => Self::is_stale_for_proactive_refresh(&auth),
+            ChatgptAccountRefreshMode::Force => true,
+        };
+        if !should_refresh {
+            return Ok(ChatgptAccountAuthResolution::Auth(auth));
+        }
+
+        let token_data = chatgpt_auth.current_token_data().ok_or_else(|| {
+            RefreshTokenError::Transient(std::io::Error::other("Token data is not available."))
+        })?;
+        match self
+            .refresh_and_persist_chatgpt_token(chatgpt_auth, token_data.refresh_token)
+            .await
+        {
+            Ok(_) => {
+                self.reload();
+                Ok(self
+                    .chatgpt_auth_for_store_account_id(store_account_id)
+                    .map(ChatgptAccountAuthResolution::Auth)
+                    .unwrap_or(ChatgptAccountAuthResolution::Missing))
+            }
+            Err(RefreshTokenError::Permanent(error)) => {
+                if self.remove_chatgpt_store_account_for_terminal_refresh_failure(
+                    chatgpt_auth.store_account_id.as_str(),
+                    &error,
+                )? {
+                    Ok(ChatgptAccountAuthResolution::Removed(error))
+                } else {
+                    Err(RefreshTokenError::Permanent(error))
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn list_accounts(&self) -> Vec<AccountSummary> {
         let Ok(guard) = self.inner.read() else {
             return Vec::new();
@@ -1962,7 +2059,7 @@ impl AuthManager {
             && let Err(err) = self.refresh_token().await
         {
             tracing::error!("Failed to refresh token: {}", err);
-            return Some(auth);
+            return self.auth_cached().or(Some(auth));
         }
         self.auth_cached()
     }
@@ -2081,70 +2178,6 @@ impl AuthManager {
             (Some(a), Some(b)) => a == b,
             _ => false,
         }
-    }
-
-    fn apply_refresh_to_cached_chatgpt_account(
-        &self,
-        store_account_id: &str,
-        refreshed: &RefreshResponse,
-    ) -> Result<(), RefreshTokenError> {
-        let now = Utc::now();
-
-        let refreshed_id_token = match refreshed.id_token.as_deref() {
-            Some(id_token) => Some(
-                parse_chatgpt_jwt_claims(id_token)
-                    .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?,
-            ),
-            None => None,
-        };
-        let refreshed_access_token = refreshed.access_token.clone();
-        let refreshed_refresh_token = refreshed.refresh_token.clone();
-
-        let Ok(mut guard) = self.inner.write() else {
-            return Err(RefreshTokenError::Transient(std::io::Error::other(
-                "failed to lock cached auth state",
-            )));
-        };
-
-        let mut store = guard.store.clone();
-        let Some(account) = store
-            .accounts
-            .iter_mut()
-            .find(|account| account.id == store_account_id)
-        else {
-            return Err(RefreshTokenError::Transient(std::io::Error::other(
-                "cached auth store is missing the refreshed account",
-            )));
-        };
-
-        if let Some(id_token) = refreshed_id_token {
-            account.tokens.id_token = id_token;
-        }
-        if let Some(access_token) = refreshed_access_token {
-            account.tokens.access_token = access_token;
-        }
-        if let Some(refresh_token) = refreshed_refresh_token {
-            account.tokens.refresh_token = refresh_token;
-        }
-        account.last_refresh = Some(now);
-
-        store
-            .validate()
-            .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?;
-
-        let Some(auth) = Self::derive_chatgpt_auth_from_store_account(
-            &store,
-            store_account_id,
-            Arc::clone(&self.storage),
-        ) else {
-            return Err(RefreshTokenError::Transient(std::io::Error::other(
-                "failed to rebuild cached auth after refresh",
-            )));
-        };
-
-        guard.store = store;
-        guard.auth = Some(auth);
-        Ok(())
     }
 
     fn derive_auth_from_store(
@@ -2494,9 +2527,6 @@ impl AuthManager {
             Some(auth) => auth,
             None => return Ok(()),
         };
-        if let Some(error) = self.refresh_failure_for_auth(&auth) {
-            return Err(RefreshTokenError::Permanent(error));
-        }
 
         let attempted_auth = auth.clone();
         let result = match auth {
@@ -2505,31 +2535,35 @@ impl AuthManager {
                     .await
             }
             CodexAuth::Chatgpt(chatgpt_auth) => {
-                let token_data = chatgpt_auth.current_token_data().ok_or_else(|| {
-                    RefreshTokenError::Transient(std::io::Error::other(
-                        "Token data is not available.",
-                    ))
-                })?;
-                let expected_account_id = token_data.account_id.clone();
-                let refreshed = self
-                    .refresh_and_persist_chatgpt_token(&chatgpt_auth, token_data.refresh_token)
-                    .await?;
-
-                match self.reload_if_account_id_matches(expected_account_id.as_deref()) {
-                    ReloadOutcome::ReloadedChanged | ReloadOutcome::ReloadedNoChange => {
-                        tracing::info!("Reloaded auth after token refresh");
-                        Ok(())
+                match self
+                    .resolve_chatgpt_auth_for_store_account_id(
+                        chatgpt_auth.store_account_id.as_str(),
+                        ChatgptAccountRefreshMode::Force,
+                    )
+                    .await?
+                {
+                    ChatgptAccountAuthResolution::Auth(_) => Ok(()),
+                    ChatgptAccountAuthResolution::Removed(error) => {
+                        let auth_after_removal = self.auth_cached();
+                        if !Self::auths_equal_for_refresh(
+                            Some(&attempted_auth),
+                            auth_after_removal.as_ref(),
+                        ) && auth_after_removal.is_some()
+                        {
+                            tracing::info!(
+                                removed_store_account_id = chatgpt_auth.store_account_id.as_str(),
+                                "removed active ChatGPT account after terminal refresh-token failure and switched auth"
+                            );
+                            Ok(())
+                        } else {
+                            Err(RefreshTokenError::Permanent(error))
+                        }
                     }
-                    ReloadOutcome::Skipped => {
-                        tracing::info!(
-                            store_account_id = chatgpt_auth.store_account_id.as_str(),
-                            expected_account_id = expected_account_id.as_deref(),
-                            "Skipping auth reload after token refresh; updating cached tokens"
-                        );
-                        self.apply_refresh_to_cached_chatgpt_account(
-                            chatgpt_auth.store_account_id.as_str(),
-                            &refreshed,
-                        )
+                    ChatgptAccountAuthResolution::Missing => {
+                        Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                            RefreshTokenFailedReason::Other,
+                            REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE.to_string(),
+                        )))
                     }
                 }
             }
@@ -2539,6 +2573,35 @@ impl AuthManager {
             self.record_permanent_refresh_failure_if_unchanged(&attempted_auth, error);
         }
         result
+    }
+
+    fn remove_chatgpt_store_account_for_terminal_refresh_failure(
+        &self,
+        store_account_id: &str,
+        error: &RefreshTokenFailedError,
+    ) -> Result<bool, RefreshTokenError> {
+        if !matches!(
+            error.reason,
+            RefreshTokenFailedReason::Expired
+                | RefreshTokenFailedReason::Exhausted
+                | RefreshTokenFailedReason::Revoked
+        ) {
+            return Ok(false);
+        }
+
+        let removed = self.remove_account(store_account_id).map_err(|io_error| {
+            RefreshTokenError::Transient(std::io::Error::other(format!(
+                "failed to remove saved ChatGPT account '{store_account_id}' after terminal refresh-token failure: {io_error}"
+            )))
+        })?;
+        if removed {
+            tracing::warn!(
+                store_account_id,
+                failed_reason = ?error.reason,
+                "removed saved ChatGPT account after terminal refresh-token failure"
+            );
+        }
+        Ok(removed)
     }
 
     /// Log out by deleting the on‑disk auth.json (if present). Returns Ok(true)

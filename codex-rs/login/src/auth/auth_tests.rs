@@ -480,6 +480,76 @@ fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
     assert_eq!(manager.refresh_failure_for_auth(&updated_auth), None);
 }
 
+#[tokio::test]
+async fn resolve_chatgpt_auth_for_store_account_id_removes_terminal_refresh_failure_account() {
+    let codex_home = tempdir().unwrap();
+    let store_account_id = persist_test_chatgpt_accounts(codex_home.path(), &["org-primary"], 0);
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let auth = manager.auth_cached().expect("auth should be cached");
+    let error = RefreshTokenFailedError::new(
+        RefreshTokenFailedReason::Revoked,
+        "refresh token invalidated",
+    );
+    manager.record_permanent_refresh_failure_if_unchanged(&auth, &error);
+
+    let resolution = manager
+        .resolve_chatgpt_auth_for_store_account_id(
+            &store_account_id,
+            ChatgptAccountRefreshMode::Force,
+        )
+        .await
+        .expect("resolution should succeed");
+
+    assert_eq!(resolution, ChatgptAccountAuthResolution::Removed(error));
+    assert_eq!(manager.list_accounts(), Vec::new());
+    assert_eq!(manager.auth_cached(), None);
+}
+
+#[tokio::test]
+async fn unauthorized_recovery_drops_invalidated_active_account_and_switches_to_fallback() {
+    let codex_home = tempdir().unwrap();
+    let active_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-primary", "org-fallback"], 0);
+    let fallback_store_account_id =
+        test_store_account_id("org-fallback").expect("fallback store account id");
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let auth = manager.auth_cached().expect("auth should be cached");
+    let error = RefreshTokenFailedError::new(
+        RefreshTokenFailedReason::Revoked,
+        "refresh token invalidated",
+    );
+    manager.record_permanent_refresh_failure_if_unchanged(&auth, &error);
+
+    let mut recovery = manager.unauthorized_recovery();
+    let reload_result = recovery.next().await.expect("reload step should succeed");
+    assert!(reload_result.auth_state_changed().is_some());
+
+    let refresh_result = recovery
+        .next()
+        .await
+        .expect("refresh step should switch to fallback");
+    assert_eq!(refresh_result.auth_state_changed(), Some(true));
+
+    let accounts = manager.list_accounts();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].id, fallback_store_account_id);
+    assert!(accounts[0].is_active);
+    assert!(
+        accounts
+            .iter()
+            .all(|account| account.id != active_store_account_id),
+        "the invalidated account should be removed from the saved store"
+    );
+}
+
 #[test]
 fn external_auth_tokens_without_chatgpt_metadata_cannot_seed_chatgpt_auth() {
     let err = AuthDotJson::from_external_tokens(
@@ -769,6 +839,58 @@ fn fake_jwt_for_auth_file_params(params: &AuthFileParams) -> std::io::Result<Str
     let payload_b64 = b64(&serde_json::to_vec(&payload)?);
     let signature_b64 = b64(b"sig");
     Ok(format!("{header_b64}.{payload_b64}.{signature_b64}"))
+}
+
+fn test_chatgpt_token_data(chatgpt_account_id: &str) -> TokenData {
+    let access_token = make_test_chatgpt_jwt(
+        Some("pro".to_string()),
+        Some(chatgpt_account_id.to_string()),
+    )
+    .expect("jwt");
+    TokenData {
+        id_token: crate::token_data::parse_chatgpt_jwt_claims(&access_token).expect("id token"),
+        access_token,
+        refresh_token: format!("refresh-{chatgpt_account_id}"),
+        account_id: Some(chatgpt_account_id.to_string()),
+    }
+}
+
+fn test_store_account_id(chatgpt_account_id: &str) -> Option<String> {
+    test_chatgpt_token_data(chatgpt_account_id).preferred_store_account_id()
+}
+
+fn persist_test_chatgpt_accounts(
+    codex_home: &Path,
+    chatgpt_account_ids: &[&str],
+    active_index: usize,
+) -> String {
+    let accounts = chatgpt_account_ids
+        .iter()
+        .map(|chatgpt_account_id| {
+            let tokens = test_chatgpt_token_data(chatgpt_account_id);
+            let store_account_id = tokens
+                .preferred_store_account_id()
+                .expect("store account id");
+            StoredAccount {
+                id: store_account_id,
+                label: None,
+                tokens,
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let active_account_id = accounts
+        .get(active_index)
+        .map(|account| account.id.clone())
+        .expect("active account id");
+    let store = AuthStore {
+        active_account_id: Some(active_account_id.clone()),
+        accounts,
+        ..AuthStore::default()
+    };
+    save_auth(codex_home, &store, AuthCredentialsStoreMode::File).expect("save auth store");
+    active_account_id
 }
 
 async fn build_config(

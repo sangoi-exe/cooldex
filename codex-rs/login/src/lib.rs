@@ -30,6 +30,8 @@ pub use auth::AuthManager;
 pub use auth::AuthStore;
 pub use auth::CLIENT_ID;
 pub use auth::CODEX_API_KEY_ENV_VAR;
+pub use auth::ChatgptAccountAuthResolution;
+pub use auth::ChatgptAccountRefreshMode;
 pub use auth::CodexAuth;
 pub use auth::EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE;
 pub use auth::EXTERNAL_SUPPORTED_CHATGPT_PLAN_REQUIRED_MESSAGE;
