@@ -152,21 +152,12 @@ impl AuthStore {
             }
         }
 
-        match self.active_account_id.as_deref() {
-            Some(active) => {
-                if !ids.contains(active) {
-                    return Err(std::io::Error::other(format!(
-                        "active_account_id '{active}' does not exist in stored accounts",
-                    )));
-                }
-            }
-            None => {
-                if !self.accounts.is_empty() {
-                    return Err(std::io::Error::other(
-                        "active_account_id must be set when accounts are present",
-                    ));
-                }
-            }
+        if let Some(active) = self.active_account_id.as_deref()
+            && !ids.contains(active)
+        {
+            return Err(std::io::Error::other(format!(
+                "active_account_id '{active}' does not exist in stored accounts",
+            )));
         }
 
         if self.accounts.is_empty() && self.active_account_id.is_some() {

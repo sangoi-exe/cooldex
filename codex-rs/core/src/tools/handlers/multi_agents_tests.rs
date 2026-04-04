@@ -1612,7 +1612,7 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_spawn_includes_agent_id_key_when_named() {
+async fn multi_agent_v2_spawn_returns_only_task_name_and_nickname() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
@@ -1644,9 +1644,9 @@ async fn multi_agent_v2_spawn_includes_agent_id_key_when_named() {
     let result: serde_json::Value =
         serde_json::from_str(&content).expect("spawn_agent result should be json");
 
-    assert_eq!(result["agent_id"], serde_json::Value::Null);
     assert_eq!(result["task_name"], "/root/test_process");
     assert!(result.get("nickname").is_some());
+    assert!(result.get("agent_id").is_none());
     assert_eq!(success, Some(true));
 }
 

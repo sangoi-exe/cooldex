@@ -193,9 +193,20 @@ pub enum ChatgptAccountAuthResolution {
     /// The stored account is still usable and resolved to a current auth snapshot.
     Auth(CodexAuth),
     /// The stored account was removed because refresh-token failure is terminal.
-    Removed(RefreshTokenFailedError),
+    Removed {
+        error: RefreshTokenFailedError,
+        switched_to_store_account_id: Option<String>,
+    },
     /// The requested stored account was already absent.
     Missing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TerminalRefreshFailureAccountRemoval {
+    NotRemoved,
+    Removed {
+        switched_to_store_account_id: Option<String>,
+    },
 }
 
 #[async_trait]
@@ -429,7 +440,7 @@ impl CodexAuth {
     /// Consider this private to integration tests.
     pub fn create_dummy_chatgpt_auth_for_testing() -> Self {
         let auth_dot_json = AuthDotJson {
-            auth_mode: Some(ApiAuthMode::Chatgpt),
+            auth_mode: None,
             openai_api_key: None,
             tokens: Some(TokenData {
                 id_token: Default::default(),
@@ -729,11 +740,7 @@ fn load_auth(
     );
     let auth_dot_json_from_store =
         |store: AuthStore, auth_mode: ApiAuthMode| -> Option<(String, AuthDotJson)> {
-            let active_account = store
-                .active_account_id
-                .as_deref()
-                .and_then(|id| store.accounts.iter().find(|account| account.id == id))
-                .or_else(|| store.accounts.first())?;
+            let active_account = active_chatgpt_account_from_store(&store)?;
 
             let store_account_id = active_account.id.clone();
             let tokens = active_account.tokens.clone();
@@ -778,6 +785,10 @@ fn load_auth(
             return Ok(Some(auth));
         }
 
+        if !store.accounts.is_empty() {
+            return Ok(None);
+        }
+
         if let Some(api_key) = store.openai_api_key.as_deref() {
             return Ok(Some(CodexAuth::from_api_key(api_key)));
         }
@@ -805,11 +816,22 @@ fn load_auth(
         return Ok(Some(auth));
     }
 
+    if !store.accounts.is_empty() {
+        return Ok(None);
+    }
+
     if let Some(api_key) = store.openai_api_key.as_deref() {
         return Ok(Some(CodexAuth::from_api_key(api_key)));
     }
 
     Ok(None)
+}
+
+fn active_chatgpt_account_from_store(store: &AuthStore) -> Option<&StoredAccount> {
+    store
+        .active_account_id
+        .as_deref()
+        .and_then(|id| store.accounts.iter().find(|account| account.id == id))
 }
 
 async fn update_tokens(
@@ -1508,11 +1530,7 @@ impl AuthManager {
         self.inner.read().ok().and_then(|c| c.auth.clone())
     }
 
-    pub fn chatgpt_auth_for_store_account_id(&self, store_account_id: &str) -> Option<CodexAuth> {
-        if self.get_auth_mode() != Some(ApiAuthMode::Chatgpt) {
-            return None;
-        }
-
+    fn chatgpt_auth_for_store_account_id(&self, store_account_id: &str) -> Option<CodexAuth> {
         let store = self.inner.read().ok()?.store.clone();
         Self::derive_chatgpt_auth_from_store_account(
             &store,
@@ -1549,11 +1567,16 @@ impl AuthManager {
                 });
         if let Some(error) = cached_refresh_failure.or_else(|| self.refresh_failure_for_auth(&auth))
         {
-            return if self.remove_chatgpt_store_account_for_terminal_refresh_failure(
+            return if let TerminalRefreshFailureAccountRemoval::Removed {
+                switched_to_store_account_id,
+            } = self.remove_chatgpt_store_account_for_terminal_refresh_failure(
                 chatgpt_auth.store_account_id.as_str(),
                 &error,
             )? {
-                Ok(ChatgptAccountAuthResolution::Removed(error))
+                Ok(ChatgptAccountAuthResolution::Removed {
+                    error,
+                    switched_to_store_account_id,
+                })
             } else {
                 Err(RefreshTokenError::Permanent(error))
             };
@@ -1583,11 +1606,16 @@ impl AuthManager {
                     .unwrap_or(ChatgptAccountAuthResolution::Missing))
             }
             Err(RefreshTokenError::Permanent(error)) => {
-                if self.remove_chatgpt_store_account_for_terminal_refresh_failure(
+                if let TerminalRefreshFailureAccountRemoval::Removed {
+                    switched_to_store_account_id,
+                } = self.remove_chatgpt_store_account_for_terminal_refresh_failure(
                     chatgpt_auth.store_account_id.as_str(),
                     &error,
                 )? {
-                    Ok(ChatgptAccountAuthResolution::Removed(error))
+                    Ok(ChatgptAccountAuthResolution::Removed {
+                        error,
+                        switched_to_store_account_id,
+                    })
                 } else {
                     Err(RefreshTokenError::Permanent(error))
                 }
@@ -1681,7 +1709,7 @@ impl AuthManager {
     }
 
     pub fn update_usage_for_active(&self, snapshot: RateLimitSnapshot) -> std::io::Result<()> {
-        if self.get_auth_mode() != Some(ApiAuthMode::Chatgpt) {
+        if !self.has_saved_chatgpt_accounts() {
             return Ok(());
         }
         self.update_store(|store| {
@@ -1711,7 +1739,7 @@ impl AuthManager {
         store_account_id: &str,
         snapshot: RateLimitSnapshot,
     ) -> std::io::Result<()> {
-        if self.get_auth_mode() != Some(ApiAuthMode::Chatgpt) {
+        if !self.has_saved_chatgpt_accounts() {
             return Ok(());
         }
 
@@ -1740,7 +1768,7 @@ impl AuthManager {
         &self,
         updates: impl IntoIterator<Item = (String, RateLimitSnapshot)>,
     ) -> std::io::Result<usize> {
-        if self.get_auth_mode() != Some(ApiAuthMode::Chatgpt) {
+        if !self.has_saved_chatgpt_accounts() {
             return Ok(0);
         }
 
@@ -1771,7 +1799,7 @@ impl AuthManager {
         resets_at: Option<DateTime<Utc>>,
         snapshot: Option<RateLimitSnapshot>,
     ) -> std::io::Result<()> {
-        if self.get_auth_mode() != Some(ApiAuthMode::Chatgpt) {
+        if !self.has_saved_chatgpt_accounts() {
             return Ok(());
         }
         self.update_store(|store| {
@@ -1808,7 +1836,7 @@ impl AuthManager {
         freshly_unsupported_store_account_ids: &HashSet<String>,
         protected_store_account_id: Option<&str>,
     ) -> std::io::Result<Option<String>> {
-        if self.get_auth_mode() != Some(ApiAuthMode::Chatgpt) {
+        if !self.has_saved_chatgpt_accounts() {
             return Ok(None);
         }
 
@@ -1980,29 +2008,23 @@ impl AuthManager {
         required_workspace_id: Option<&str>,
         exclude_store_account_id: Option<&str>,
     ) -> Option<String> {
-        if self.get_auth_mode() != Some(ApiAuthMode::Chatgpt) {
+        if !self.has_saved_chatgpt_accounts() {
             return None;
         }
         let store = self.inner.read().ok()?.store.clone();
-        let now = Utc::now();
-        let mut candidates = store
-            .accounts
-            .iter()
-            .filter(|account| {
-                Some(account.id.as_str()) != exclude_store_account_id
-                    && account_selectable(account, required_workspace_id, now)
-            })
-            .collect::<Vec<_>>();
-
-        candidates.sort_by(|a, b| compare_auto_switch_candidates(a, b));
-        candidates.first().map(|account| account.id.clone())
+        select_account_for_auto_switch_from_store(
+            &store,
+            required_workspace_id,
+            exclude_store_account_id,
+            Utc::now(),
+        )
     }
 
     pub fn accounts_rate_limits_cache_expires_at(
         &self,
         now: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
-        if self.get_auth_mode() != Some(ApiAuthMode::Chatgpt) {
+        if !self.has_saved_chatgpt_accounts() {
             return None;
         }
 
@@ -2059,7 +2081,7 @@ impl AuthManager {
             && let Err(err) = self.refresh_token().await
         {
             tracing::error!("Failed to refresh token: {}", err);
-            return self.auth_cached().or(Some(auth));
+            return self.auth_cached();
         }
         self.auth_cached()
     }
@@ -2190,17 +2212,11 @@ impl AuthManager {
         }
 
         let client = crate::default_client::create_client();
-        let active_account = store
-            .active_account_id
-            .as_deref()
-            .and_then(|id| store.accounts.iter().find(|account| account.id == id))
-            .or_else(|| store.accounts.first());
-
-        if let Some(active_account) = active_account {
+        if let Some(active_account) = active_chatgpt_account_from_store(store) {
             let store_account_id = active_account.id.clone();
             let tokens = active_account.tokens.clone();
             let auth_dot_json = AuthDotJson {
-                auth_mode: Some(ApiAuthMode::Chatgpt),
+                auth_mode: None,
                 openai_api_key: None,
                 tokens: Some(tokens),
                 last_refresh: active_account.last_refresh,
@@ -2216,11 +2232,33 @@ impl AuthManager {
             }));
         }
 
+        if !store.accounts.is_empty() {
+            return None;
+        }
+
         if let Some(api_key) = store.openai_api_key.as_deref() {
             return Some(CodexAuth::from_api_key(api_key));
         }
 
         None
+    }
+
+    fn set_cached_with_auth(&self, store: AuthStore, new_auth: Option<CodexAuth>) -> bool {
+        if let Ok(mut guard) = self.inner.write() {
+            let previous = guard.auth.as_ref();
+            let changed = !AuthManager::auths_equal(previous, new_auth.as_ref());
+            let auth_changed_for_refresh =
+                !Self::auths_equal_for_refresh(previous, new_auth.as_ref());
+            if auth_changed_for_refresh {
+                guard.permanent_refresh_failure = None;
+            }
+            tracing::info!("Reloaded auth, changed: {changed}");
+            guard.store = store;
+            guard.auth = new_auth;
+            changed
+        } else {
+            false
+        }
     }
 
     fn load_store_from_storage(&self) -> AuthStore {
@@ -2270,33 +2308,13 @@ impl AuthManager {
         }
     }
 
-    fn load_auth_from_storage(&self) -> Option<CodexAuth> {
-        load_auth(
-            &self.codex_home,
-            self.enable_codex_api_key_env,
-            self.auth_credentials_store_mode,
-        )
-        .ok()
-        .flatten()
-    }
-
     fn set_cached(&self, store: AuthStore) -> bool {
-        let new_auth = self.load_auth_from_storage();
-        if let Ok(mut guard) = self.inner.write() {
-            let previous = guard.auth.as_ref();
-            let changed = !AuthManager::auths_equal(previous, new_auth.as_ref());
-            let auth_changed_for_refresh =
-                !Self::auths_equal_for_refresh(previous, new_auth.as_ref());
-            if auth_changed_for_refresh {
-                guard.permanent_refresh_failure = None;
-            }
-            tracing::info!("Reloaded auth, changed: {changed}");
-            guard.store = store;
-            guard.auth = new_auth;
-            changed
-        } else {
-            false
-        }
+        let new_auth = Self::derive_auth_from_store(
+            &store,
+            Arc::clone(&self.storage),
+            self.enable_codex_api_key_env,
+        );
+        self.set_cached_with_auth(store, new_auth)
     }
 
     fn derive_chatgpt_auth_from_store_account(
@@ -2312,7 +2330,7 @@ impl AuthManager {
         let store_account_id = account.id.clone();
         let tokens = account.tokens.clone();
         let auth_dot_json = AuthDotJson {
-            auth_mode: Some(ApiAuthMode::Chatgpt),
+            auth_mode: None,
             openai_api_key: None,
             tokens: Some(tokens),
             last_refresh: account.last_refresh,
@@ -2543,16 +2561,23 @@ impl AuthManager {
                     .await?
                 {
                     ChatgptAccountAuthResolution::Auth(_) => Ok(()),
-                    ChatgptAccountAuthResolution::Removed(error) => {
+                    ChatgptAccountAuthResolution::Removed {
+                        error,
+                        switched_to_store_account_id,
+                    } => {
                         let auth_after_removal = self.auth_cached();
-                        if !Self::auths_equal_for_refresh(
-                            Some(&attempted_auth),
-                            auth_after_removal.as_ref(),
-                        ) && auth_after_removal.is_some()
+                        if let Some(switched_to_store_account_id) =
+                            switched_to_store_account_id.as_deref()
+                            && Some(switched_to_store_account_id)
+                                == auth_after_removal
+                                    .as_ref()
+                                    .and_then(CodexAuth::get_account_id)
+                                    .as_deref()
                         {
                             tracing::info!(
                                 removed_store_account_id = chatgpt_auth.store_account_id.as_str(),
-                                "removed active ChatGPT account after terminal refresh-token failure and switched auth"
+                                switched_to_store_account_id,
+                                "removed active ChatGPT account after terminal refresh-token failure and switched to eligible ChatGPT fallback"
                             );
                             Ok(())
                         } else {
@@ -2579,29 +2604,107 @@ impl AuthManager {
         &self,
         store_account_id: &str,
         error: &RefreshTokenFailedError,
-    ) -> Result<bool, RefreshTokenError> {
+    ) -> Result<TerminalRefreshFailureAccountRemoval, RefreshTokenError> {
         if !matches!(
             error.reason,
             RefreshTokenFailedReason::Expired
                 | RefreshTokenFailedReason::Exhausted
                 | RefreshTokenFailedReason::Revoked
         ) {
-            return Ok(false);
+            return Ok(TerminalRefreshFailureAccountRemoval::NotRemoved);
         }
 
-        let removed = self.remove_account(store_account_id).map_err(|io_error| {
-            RefreshTokenError::Transient(std::io::Error::other(format!(
-                "failed to remove saved ChatGPT account '{store_account_id}' after terminal refresh-token failure: {io_error}"
-            )))
-        })?;
-        if removed {
-            tracing::warn!(
-                store_account_id,
-                failed_reason = ?error.reason,
-                "removed saved ChatGPT account after terminal refresh-token failure"
+        let _lock = storage::lock_auth_store(&self.codex_home)?;
+        let mut store = match self.storage.load().map_err(RefreshTokenError::Transient)? {
+            Some(store) => store,
+            None => {
+                if self._test_home_guard.is_some() {
+                    self.inner
+                        .read()
+                        .ok()
+                        .map(|cached| cached.store.clone())
+                        .unwrap_or_default()
+                } else {
+                    AuthStore::default()
+                }
+            }
+        };
+        let removed_before_mutation = enforce_supported_chatgpt_auth_accounts(&mut store);
+        if !removed_before_mutation.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_before_mutation,
+                "removed accounts with unsupported ChatGPT plans before terminal refresh-token eviction"
             );
         }
-        Ok(removed)
+
+        let was_active = store.active_account_id.as_deref() == Some(store_account_id);
+        let previous_account_count = store.accounts.len();
+        store
+            .accounts
+            .retain(|account| account.id != store_account_id);
+        if store.accounts.len() == previous_account_count {
+            return Ok(TerminalRefreshFailureAccountRemoval::NotRemoved);
+        }
+
+        let required_workspace_id = self.forced_chatgpt_workspace_id();
+        let switched_to_store_account_id = if was_active {
+            let next_store_account_id = select_account_for_auto_switch_from_store(
+                &store,
+                required_workspace_id.as_deref(),
+                /*exclude_store_account_id*/ None,
+                Utc::now(),
+            );
+            store.active_account_id = next_store_account_id.clone();
+            next_store_account_id
+        } else {
+            store.active_account_id = store.active_account_id.clone().filter(|active_account_id| {
+                store
+                    .accounts
+                    .iter()
+                    .any(|account| &account.id == active_account_id)
+            });
+            None
+        };
+
+        let removed_after_mutation = enforce_supported_chatgpt_auth_accounts(&mut store);
+        if !removed_after_mutation.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_after_mutation,
+                "removed accounts with unsupported ChatGPT plans after terminal refresh-token eviction"
+            );
+        }
+
+        store.validate().map_err(RefreshTokenError::Transient)?;
+        self.storage
+            .save(&store)
+            .map_err(RefreshTokenError::Transient)?;
+
+        let cached_auth =
+            if let Some(switched_to_store_account_id) = switched_to_store_account_id.as_deref() {
+                Self::derive_chatgpt_auth_from_store_account(
+                    &store,
+                    switched_to_store_account_id,
+                    Arc::clone(&self.storage),
+                )
+            } else if was_active {
+                None
+            } else {
+                Self::derive_auth_from_store(
+                    &store,
+                    Arc::clone(&self.storage),
+                    self.enable_codex_api_key_env,
+                )
+            };
+        self.set_cached_with_auth(store, cached_auth);
+        tracing::warn!(
+            store_account_id,
+            failed_reason = ?error.reason,
+            switched_to_store_account_id,
+            "removed saved ChatGPT account after terminal refresh-token failure"
+        );
+        Ok(TerminalRefreshFailureAccountRemoval::Removed {
+            switched_to_store_account_id,
+        })
     }
 
     /// Log out by deleting the on‑disk auth.json (if present). Returns Ok(true)
@@ -2624,6 +2727,13 @@ impl AuthManager {
 
     pub fn get_auth_mode(&self) -> Option<ApiAuthMode> {
         self.get_api_auth_mode()
+    }
+
+    fn has_saved_chatgpt_accounts(&self) -> bool {
+        self.inner
+            .read()
+            .ok()
+            .is_some_and(|cached| !cached.store.accounts.is_empty())
     }
 
     pub fn auth_mode(&self) -> Option<AuthMode> {
@@ -2883,16 +2993,17 @@ fn enforce_supported_chatgpt_auth_accounts(store: &mut AuthStore) -> Vec<String>
         keep_account
     });
 
-    let has_active_account = store
-        .active_account_id
-        .as_ref()
-        .is_some_and(|active_account_id| {
-            store
-                .accounts
-                .iter()
-                .any(|account| &account.id == active_account_id)
-        });
-    if !has_active_account {
+    let active_account_missing =
+        store
+            .active_account_id
+            .as_ref()
+            .is_some_and(|active_account_id| {
+                !store
+                    .accounts
+                    .iter()
+                    .any(|account| &account.id == active_account_id)
+            });
+    if active_account_missing {
         store.active_account_id = store.accounts.first().map(|account| account.id.clone());
     }
 
@@ -3007,6 +3118,25 @@ fn account_selectable(
     }
 
     true
+}
+
+fn select_account_for_auto_switch_from_store(
+    store: &AuthStore,
+    required_workspace_id: Option<&str>,
+    exclude_store_account_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let mut candidates = store
+        .accounts
+        .iter()
+        .filter(|account| {
+            Some(account.id.as_str()) != exclude_store_account_id
+                && account_selectable(account, required_workspace_id, now)
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|a, b| compare_auto_switch_candidates(a, b));
+    candidates.first().map(|account| account.id.clone())
 }
 
 fn compare_auto_switch_candidates(a: &StoredAccount, b: &StoredAccount) -> std::cmp::Ordering {

@@ -243,10 +243,7 @@ fn test_build_specs_multi_agent_v2_uses_task_names_and_hides_resume() {
     let output_schema = output_schema
         .as_ref()
         .expect("spawn_agent should define output schema");
-    assert_eq!(
-        output_schema["required"],
-        json!(["agent_id", "task_name", "nickname"])
-    );
+    assert_eq!(output_schema["required"], json!(["task_name", "nickname"]));
 
     let send_message = find_tool(&tools, "send_message");
     let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = &send_message.spec else {
@@ -345,6 +342,76 @@ fn test_build_specs_multi_agent_v2_uses_task_names_and_hides_resume() {
     );
     assert_lacks_tool_name(&tools, "send_input");
     assert_lacks_tool_name(&tools, "resume_agent");
+}
+
+#[test]
+fn test_build_specs_multi_agent_v1_uses_ids_and_wait_conditions() {
+    let model_info = model_info();
+    let mut features = Features::with_defaults();
+    features.enable(Feature::Collab);
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    );
+
+    assert_contains_tool_names(
+        &tools,
+        &[
+            "spawn_agent",
+            "send_input",
+            "resume_agent",
+            "wait_agent",
+            "close_agent",
+        ],
+    );
+    assert_lacks_tool_name(&tools, "send_message");
+    assert_lacks_tool_name(&tools, "followup_task");
+    assert_lacks_tool_name(&tools, "list_agents");
+
+    let wait_agent = find_tool(&tools, "wait_agent");
+    let ToolSpec::Function(ResponsesApiTool {
+        parameters,
+        output_schema,
+        ..
+    }) = &wait_agent.spec
+    else {
+        panic!("wait_agent should be a function tool");
+    };
+    let JsonSchema::Object {
+        properties,
+        required,
+        ..
+    } = parameters
+    else {
+        panic!("wait_agent should use object params");
+    };
+    assert!(properties.contains_key("ids"));
+    assert!(properties.contains_key("timeout_ms"));
+    assert!(properties.contains_key("disable_timeout"));
+    assert!(properties.contains_key("return_when"));
+    assert!(!properties.contains_key("targets"));
+    assert_eq!(required.as_ref(), Some(&vec!["ids".to_string()]));
+
+    let output_schema = output_schema
+        .as_ref()
+        .expect("wait_agent should define output schema");
+    assert_eq!(output_schema["required"], json!(["agents", "timed_out"]));
+    assert_eq!(
+        output_schema["properties"]["agents"]["additionalProperties"]["required"],
+        json!(["status", "last_activity"])
+    );
 }
 
 #[test]

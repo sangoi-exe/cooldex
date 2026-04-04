@@ -217,7 +217,6 @@ impl ToolHandler for Handler {
         })?;
 
         Ok(SpawnAgentResult {
-            agent_id: None,
             task_name,
             nickname,
         })
@@ -277,7 +276,6 @@ impl SpawnAgentArgs {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SpawnAgentResult {
-    agent_id: Option<String>,
     task_name: String,
     nickname: Option<String>,
 }

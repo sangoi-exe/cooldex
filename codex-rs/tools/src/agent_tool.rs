@@ -219,7 +219,7 @@ pub fn create_resume_agent_tool() -> ToolSpec {
 pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Once the agent reaches a final status, a notification message will be received containing the same completed status."
+        description: "Wait on the requested agent ids. Omit return_when for the timed convenience mode, or combine disable_timeout=true with return_when=any_final|all_final for a blocking final-status wait."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -366,10 +366,6 @@ fn spawn_agent_output_schema_v2() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "agent_id": {
-                "type": ["string", "null"],
-                "description": "Legacy thread identifier for the spawned agent."
-            },
             "task_name": {
                 "type": "string",
                 "description": "Canonical task name for the spawned agent."
@@ -379,7 +375,7 @@ fn spawn_agent_output_schema_v2() -> Value {
                 "description": "User-facing nickname for the spawned agent when available."
             }
         },
-        "required": ["agent_id", "task_name", "nickname"],
+        "required": ["task_name", "nickname"],
         "additionalProperties": false
     })
 }
@@ -446,17 +442,44 @@ fn wait_output_schema_v1() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "status": {
+            "agents": {
                 "type": "object",
-                "description": "Final statuses keyed by agent id.",
-                "additionalProperties": agent_status_output_schema()
+                "description": "Current runtime states keyed by agent id.",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                        "status": agent_status_output_schema(),
+                        "last_activity": {
+                            "type": ["object", "null"],
+                            "description": "Most recent observed activity for the agent, when available.",
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["message", "reasoning", "command", "edit", "task", "status"]
+                                },
+                                "summary": {
+                                    "type": "string",
+                                    "description": "Short, user-facing summary of the observed activity."
+                                },
+                                "occurred_at": {
+                                    "type": "integer",
+                                    "description": "Unix timestamp in seconds when the activity was observed."
+                                }
+                            },
+                            "required": ["kind", "summary", "occurred_at"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["status", "last_activity"],
+                    "additionalProperties": false
+                }
             },
             "timed_out": {
                 "type": "boolean",
-                "description": "Whether the wait call returned due to timeout before any agent reached a final status."
+                "description": "Whether the wait call returned due to timeout before the requested completion condition was satisfied."
             }
         },
-        "required": ["status", "timed_out"],
+        "required": ["agents", "timed_out"],
         "additionalProperties": false
     })
 }
@@ -471,7 +494,7 @@ fn wait_output_schema_v2() -> Value {
             },
             "timed_out": {
                 "type": "boolean",
-                "description": "Whether the wait call returned due to timeout before any agent reached a final status."
+                "description": "Whether the wait call returned due to timeout before any mailbox update arrived."
             }
         },
         "required": ["message", "timed_out"],
@@ -712,11 +735,11 @@ fn spawn_agent_models_description(models: &[ModelPreset]) -> String {
 fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema {
     let properties = BTreeMap::from([
         (
-            "targets".to_string(),
+            "ids".to_string(),
             JsonSchema::Array {
                 items: Box::new(JsonSchema::String { description: None }),
                 description: Some(
-                    "Agent ids to wait on. Pass multiple ids to wait for whichever finishes first."
+                    "Agent ids to wait on."
                         .to_string(),
                 ),
             },
@@ -730,11 +753,29 @@ fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema
                 )),
             },
         ),
+        (
+            "disable_timeout".to_string(),
+            JsonSchema::Boolean {
+                description: Some(
+                    "When true, disable the timeout and require return_when. Cannot be combined with timeout_ms."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "return_when".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Optional completion condition when disable_timeout=true: any_final waits for the next requested non-final agent to newly become final, while all_final waits for every requested agent to be final."
+                        .to_string(),
+                ),
+            },
+        ),
     ]);
 
     JsonSchema::Object {
         properties,
-        required: Some(vec!["targets".to_string()]),
+        required: Some(vec!["ids".to_string()]),
         additional_properties: Some(false.into()),
     }
 }

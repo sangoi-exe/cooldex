@@ -2,6 +2,10 @@
 This module holds the temporary adapter layer between the TUI and the app
 server during the hybrid migration period.
 
+Merge-safety anchor: resume replay and session-adapter wiring here must stay
+aligned with the rollout-backed thread-history boundary contract preserved in
+`AGENTS.md`, `codex-rs/tui/src/app.rs`, and `codex-rs/tui/src/app_server_session.rs`.
+
 For now, the TUI still owns its existing direct-core behavior, but startup
 allocates a local in-process app server and drains its event stream. Keeping
 the app-server-specific wiring here keeps that transitional logic out of the

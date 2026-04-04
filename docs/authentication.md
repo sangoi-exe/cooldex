@@ -27,9 +27,9 @@ When using ChatGPT authentication, `auth.json` (or the keyring entry) stores a *
 - Each ChatGPT login **upserts** the account and makes it **active**.
 - Supported ChatGPT plans for saved-account auth are **Plus**, **Pro**, **Team**, **Business**, **Enterprise**, and **Edu**; unsupported plans fail the login, and stale unsupported accounts are purged on load or refresh if they are already present.
 - External ChatGPT token login (`chatgptAuthTokens`) follows the same supported-plan policy; missing or unsupported plans fail before ephemeral auth can become active.
-- Terminal refresh-token failures (`expired`, `reused`, or `invalidated`) evict the matching saved ChatGPT account instead of leaving it in the store with a sticky dead refresh state. If that account was active and another saved ChatGPT account is eligible, Codex switches to the fallback immediately.
+- Terminal refresh-token failures (`expired`, `reused`, or `invalidated`) evict the matching saved ChatGPT account instead of leaving it in the store with a sticky dead refresh state. If that account was active and another saved ChatGPT account is eligible, Codex switches to the fallback immediately; otherwise the current runtime becomes unauthenticated until you select or sign in to another account.
 - `codex logout` deletes the stored credentials (removes the `auth.json` file and the keyring entry, if present).
-- In the TUIs, use `/accounts` to switch the active account and add additional accounts. When multiple accounts are stored, `/logout` lets you choose between logging out all accounts or removing a single account (then exits). `/accounts` status refresh also prunes saved accounts that hit a terminal refresh-token failure while their usage data is being refreshed.
+- In the TUIs, use `/accounts` to switch the active account and add additional accounts. When multiple accounts are stored, `/logout` lets you choose between logging out all accounts or removing a single account (then exits). `/accounts` status refresh also prunes saved accounts that hit a terminal refresh-token failure while their usage data is being refreshed, and it does not advance cache freshness when account resolution fails transiently before usage fetch starts.
 - Keep this aligned with `AuthManager::list_accounts()` and TUI account popups: `/accounts` renders only the summary fields exposed there.
 - This multi-account management surface is currently a TUI feature. App-server account APIs expose the current account and current-account rate limits, not the full list/switch/remove workflow used by `/accounts`.
 
@@ -39,7 +39,7 @@ When using ChatGPT authentication, `auth.json` (or the keyring entry) stores a *
 When the backend returns `usage_limit_reached` (HTTP 429) for the active **ChatGPT** account, Codex will:
 
 1) mark the active account as exhausted until its reset time (when available),
-2) refresh stored account usage before fallback selection, evict any saved account whose refresh token fails terminally during that refresh, remove any fallback candidates whose just-fetched usage snapshot reports plan `free` or `unknown`, then switch to another stored ChatGPT account that is not exhausted (and matches `forced_chatgpt_workspace_id` when set), and
+2) refresh stored account usage before fallback selection, evict any saved account whose refresh token fails terminally during that refresh, remove any fallback candidates whose just-fetched usage snapshot reports plan `free` or `unknown`, then switch to another stored ChatGPT account that is not exhausted (and matches `forced_chatgpt_workspace_id` when set), and if no eligible ChatGPT fallback remains leave the current runtime unauthenticated instead of silently switching to another auth mode, and
 3) retry the request **in the same turn**.
 
 Codex emits a warning event when this happens.

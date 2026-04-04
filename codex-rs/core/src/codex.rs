@@ -8591,7 +8591,7 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
             .await
         {
             Ok(ChatgptAccountAuthResolution::Auth(auth)) => auth,
-            Ok(ChatgptAccountAuthResolution::Removed(error)) => {
+            Ok(ChatgptAccountAuthResolution::Removed { error, .. }) => {
                 debug!(
                     store_account_id = %store_account_id,
                     failed_reason = ?error.reason,

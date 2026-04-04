@@ -399,7 +399,7 @@ fn spawn_next_accounts_rate_limit_fetch(
                         fetch_attempted: true,
                     }
                 }
-                Ok(ChatgptAccountAuthResolution::Removed(error)) => {
+                Ok(ChatgptAccountAuthResolution::Removed { error, .. }) => {
                     tracing::info!(
                         account_id = %account_id_for_log,
                         failed_reason = ?error.reason,
@@ -425,7 +425,7 @@ fn spawn_next_accounts_rate_limit_fetch(
                     AccountsRateLimitFetchOutcome {
                         store_account_id,
                         snapshot: None,
-                        fetch_attempted: false,
+                        fetch_attempted: true,
                     }
                 }
             }
@@ -7606,6 +7606,7 @@ mod tests {
     fn accounts_status_cache_fully_refreshed_requires_complete_success() {
         assert!(accounts_status_cache_fully_refreshed(0, 0, true));
         assert!(accounts_status_cache_fully_refreshed(2, 2, true));
+        assert!(!accounts_status_cache_fully_refreshed(1, 0, true));
         assert!(!accounts_status_cache_fully_refreshed(2, 1, true));
         assert!(!accounts_status_cache_fully_refreshed(2, 2, false));
     }

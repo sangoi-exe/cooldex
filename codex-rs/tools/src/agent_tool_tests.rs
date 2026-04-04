@@ -72,7 +72,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     );
     assert_eq!(
         output_schema.expect("spawn_agent output schema")["required"],
-        json!(["agent_id", "task_name", "nickname"])
+        json!(["task_name", "nickname"])
     );
 }
 
@@ -155,6 +155,49 @@ fn followup_task_tool_requires_message_and_uses_submission_output() {
     assert_eq!(
         output_schema.expect("followup_task output schema")["required"],
         json!(["submission_id"])
+    );
+}
+
+#[test]
+fn wait_agent_tool_v1_exposes_ids_conditions_and_agents_output() {
+    let ToolSpec::Function(ResponsesApiTool {
+        parameters,
+        output_schema,
+        ..
+    }) = create_wait_agent_tool_v1(WaitAgentTimeoutOptions {
+        default_timeout_ms: 30_000,
+        min_timeout_ms: 10_000,
+        max_timeout_ms: 3_600_000,
+    })
+    else {
+        panic!("wait_agent should be a function tool");
+    };
+    let JsonSchema::Object {
+        properties,
+        required,
+        ..
+    } = parameters
+    else {
+        panic!("wait_agent should use object params");
+    };
+    assert!(properties.contains_key("ids"));
+    assert!(properties.contains_key("timeout_ms"));
+    assert!(properties.contains_key("disable_timeout"));
+    assert!(properties.contains_key("return_when"));
+    assert!(!properties.contains_key("targets"));
+    assert_eq!(required, Some(vec!["ids".to_string()]));
+
+    let output_schema = output_schema.expect("wait output schema");
+    assert_eq!(output_schema["required"], json!(["agents", "timed_out"]));
+    assert_eq!(
+        output_schema["properties"]["agents"]["additionalProperties"]["required"],
+        json!(["status", "last_activity"])
+    );
+    assert_eq!(
+        output_schema["properties"]["timed_out"]["description"],
+        json!(
+            "Whether the wait call returned due to timeout before the requested completion condition was satisfied."
+        )
     );
 }
 
