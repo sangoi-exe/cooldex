@@ -140,7 +140,8 @@
     "NonSteerableTurnKind": {
       "enum": [
         "review",
-        "compact"
+        "compact",
+        "sanitize"
       ],
       "type": "string"
     },

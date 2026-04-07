@@ -5,6 +5,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use crate::agent::AgentControl;
 use crate::agent::AgentStatus;
@@ -58,9 +60,11 @@ use chrono::Utc;
 use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::AppInvocation;
 use codex_analytics::InvocationType;
+use codex_analytics::SubAgentThreadStartedInput;
 use codex_analytics::build_track_events_context;
 use codex_app_server_protocol::McpServerElicitationRequest;
 use codex_app_server_protocol::McpServerElicitationRequestParams;
+use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server::Environment;
 use codex_exec_server::EnvironmentManager;
 use codex_features::FEATURES;
@@ -78,11 +82,11 @@ use codex_login::ChatgptAccountRefreshMode;
 use codex_login::CodexAuth;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
 use codex_login::default_client::originator;
-use codex_mcp::mcp_connection_manager::McpConnectionManager;
-use codex_mcp::mcp_connection_manager::SandboxState;
-use codex_mcp::mcp_connection_manager::ToolInfo as McpToolInfo;
-use codex_mcp::mcp_connection_manager::codex_apps_tools_cache_key;
-use codex_mcp::mcp_connection_manager::filter_non_codex_apps_mcp_tools_only;
+use codex_mcp::McpConnectionManager;
+use codex_mcp::SandboxState;
+use codex_mcp::ToolInfo as McpToolInfo;
+use codex_mcp::codex_apps_tools_cache_key;
+use codex_mcp::filter_non_codex_apps_mcp_tools_only;
 #[cfg(test)]
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_models_manager::manager::ModelsManager;
@@ -137,7 +141,6 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
-use codex_rmcp_client::OAuthCredentialsStoreMode;
 use codex_rollout::state_db;
 use codex_shell_command::parse_command::parse_command;
 use codex_terminal_detection::user_agent;
@@ -159,7 +162,6 @@ use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
 use rmcp::model::RequestId;
 use serde::Deserialize;
-use serde_json;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
@@ -332,12 +334,12 @@ use crate::util::backoff;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_async_utils::OrCancelExt;
 use codex_git_utils::get_git_repo_root;
-use codex_mcp::mcp::CODEX_APPS_MCP_SERVER_NAME;
-use codex_mcp::mcp::auth::compute_auth_statuses;
-use codex_mcp::mcp::with_codex_apps_mcp;
+use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+use codex_mcp::compute_auth_statuses;
+use codex_mcp::with_codex_apps_mcp;
 use codex_otel::SessionTelemetry;
+use codex_otel::THREAD_STARTED_METRIC;
 use codex_otel::TelemetryAuthMode;
-use codex_otel::metrics::names::THREAD_STARTED_METRIC;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
@@ -436,8 +438,6 @@ pub struct PromptGcActivityEdge {
 pub struct CodexSpawnOk {
     pub codex: Codex,
     pub thread_id: ThreadId,
-    #[deprecated(note = "use thread_id")]
-    pub conversation_id: ThreadId,
 }
 
 pub(crate) struct CodexSpawnArgs {
@@ -569,7 +569,11 @@ impl Codex {
             config.startup_warnings.push(message);
         }
 
-        let user_instructions = get_user_instructions(&config).await;
+        let environment = environment_manager
+            .current()
+            .await
+            .map_err(|err| CodexErr::Fatal(format!("failed to create environment: {err}")))?;
+        let user_instructions = get_user_instructions(&config, environment.as_deref()).await;
 
         let exec_policy = if crate::guardian::is_guardian_reviewer_source(&session_source) {
             // Guardian review should rely on the built-in shell safety checks,
@@ -610,11 +614,15 @@ impl Codex {
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
-        let base_instructions = config
-            .base_instructions
-            .clone()
-            .or_else(|| conversation_history.get_base_instructions().map(|s| s.text))
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality));
+        let base_instructions = match config.base_instructions.clone() {
+            Some(base_instructions) => base_instructions,
+            None => conversation_history
+                .get_base_instructions()
+                .map(|base_instructions| {
+                    base_instructions.map(|base_instructions| base_instructions.text)
+                })
+                .unwrap_or_else(|| Some(model_info.get_model_instructions(config.personality))),
+        };
 
         // Respect thread-start tools. When missing (resumed/forked threads), read from the db
         // first, then fall back to rollout-file tools.
@@ -643,6 +651,14 @@ impl Codex {
             dynamic_tools
         };
 
+        let developer_instructions_override = config
+            .developer_instructions_override
+            .clone()
+            .or_else(|| conversation_history.get_developer_instructions());
+        let developer_instructions = developer_instructions_override
+            .clone()
+            .unwrap_or_else(|| config.developer_instructions.clone());
+
         // TODO (aibrahim): Consolidate config.model and config.model_reasoning_effort into config.collaboration_mode
         // to avoid extracting these fields separately and constructing CollaborationMode here.
         let collaboration_mode = CollaborationMode {
@@ -659,7 +675,8 @@ impl Codex {
             collaboration_mode_reasoning_effort_explicit: false,
             model_reasoning_summary: config.model_reasoning_summary,
             service_tier: config.service_tier,
-            developer_instructions: config.developer_instructions.clone(),
+            developer_instructions,
+            developer_instructions_override,
             user_instructions,
             personality: config.personality,
             base_instructions,
@@ -677,6 +694,7 @@ impl Codex {
             original_config_do_not_use: Arc::clone(&config),
             metrics_service_name,
             app_server_client_name: None,
+            app_server_client_version: None,
             session_source,
             dynamic_tools,
             persist_extended_history,
@@ -705,12 +723,12 @@ impl Codex {
             prompt_gc_activity_edges.clone(),
             conversation_history,
             session_source_clone,
-            environment_manager,
             skills_manager,
             plugins_manager,
             mcp_manager.clone(),
             skills_watcher,
             agent_control,
+            environment,
         )
         .await
         .map_err(|e| {
@@ -737,12 +755,7 @@ impl Codex {
             session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
         };
 
-        #[allow(deprecated)]
-        Ok(CodexSpawnOk {
-            codex,
-            thread_id,
-            conversation_id: thread_id,
-        })
+        Ok(CodexSpawnOk { codex, thread_id })
     }
 
     /// Submit the `op` wrapped in a `Submission` with a unique ID.
@@ -806,13 +819,15 @@ impl Codex {
         self.session.steer_input(input, expected_turn_id).await
     }
 
-    pub(crate) async fn set_app_server_client_name(
+    pub(crate) async fn set_app_server_client_info(
         &self,
         app_server_client_name: Option<String>,
+        app_server_client_version: Option<String>,
     ) -> ConstraintResult<()> {
         self.session
             .update_settings(SessionSettingsUpdate {
                 app_server_client_name,
+                app_server_client_version,
                 ..Default::default()
             })
             .await
@@ -923,7 +938,7 @@ pub(crate) struct TurnContext {
     pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
     pub(crate) reasoning_summary: ReasoningSummaryConfig,
     pub(crate) session_source: SessionSource,
-    pub(crate) environment: Arc<Environment>,
+    pub(crate) environment: Option<Arc<Environment>>,
     /// The session's absolute working directory. All relative paths provided
     /// by the model as well as sandbox policies are resolved against this path
     /// instead of `std::env::current_dir()`.
@@ -966,8 +981,13 @@ impl TurnContext {
     }
 
     pub(crate) fn apps_enabled(&self) -> bool {
-        self.features
-            .apps_enabled_cached(self.auth_manager.as_deref())
+        let is_chatgpt_auth = self
+            .auth_manager
+            .as_deref()
+            .and_then(AuthManager::auth_cached)
+            .as_ref()
+            .is_some_and(CodexAuth::is_chatgpt_auth);
+        self.features.apps_enabled_for_auth(is_chatgpt_auth)
     }
 
     pub(crate) async fn with_model(&self, model: String, models_manager: &ModelsManager) -> Self {
@@ -1019,6 +1039,7 @@ impl TurnContext {
         .with_unified_exec_shell_mode(self.tools_config.unified_exec_shell_mode.clone())
         .with_web_search_config(self.tools_config.web_search_config.clone())
         .with_allow_login_shell(self.tools_config.allow_login_shell)
+        .with_has_environment(self.tools_config.has_environment)
         .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
             &config.agent_roles,
         ));
@@ -1038,7 +1059,7 @@ impl TurnContext {
             reasoning_effort,
             reasoning_summary: self.reasoning_summary,
             session_source: self.session_source.clone(),
-            environment: Arc::clone(&self.environment),
+            environment: self.environment.clone(),
             cwd: self.cwd.clone(),
             current_date: self.current_date.clone(),
             timezone: self.timezone.clone(),
@@ -1151,6 +1172,10 @@ pub(crate) struct SessionConfiguration {
     /// Developer instructions that supplement the base instructions.
     developer_instructions: Option<String>,
 
+    /// Explicit developer instructions override, preserving `null` as distinct
+    /// from a missing override.
+    developer_instructions_override: Option<Option<String>>,
+
     /// Model instructions that are appended to the base instructions.
     user_instructions: Option<String>,
 
@@ -1158,7 +1183,7 @@ pub(crate) struct SessionConfiguration {
     personality: Option<Personality>,
 
     /// Base instructions for the session.
-    base_instructions: String,
+    base_instructions: Option<String>,
 
     /// Compact prompt override.
     compact_prompt: Option<String>,
@@ -1189,6 +1214,7 @@ pub(crate) struct SessionConfiguration {
     /// Optional service name tag for session metrics.
     metrics_service_name: Option<String>,
     app_server_client_name: Option<String>,
+    app_server_client_version: Option<String>,
     /// Source of the session (cli, vscode, exec, mcp, ...)
     session_source: SessionSource,
     dynamic_tools: Vec<DynamicToolSpec>,
@@ -1296,6 +1322,9 @@ impl SessionConfiguration {
         if let Some(app_server_client_name) = updates.app_server_client_name.clone() {
             next_configuration.app_server_client_name = Some(app_server_client_name);
         }
+        if let Some(app_server_client_version) = updates.app_server_client_version.clone() {
+            next_configuration.app_server_client_version = Some(app_server_client_version);
+        }
         Ok(next_configuration)
     }
 }
@@ -1314,6 +1343,12 @@ pub(crate) struct SessionSettingsUpdate {
     pub(crate) final_output_json_schema: Option<Option<Value>>,
     pub(crate) personality: Option<Personality>,
     pub(crate) app_server_client_name: Option<String>,
+    pub(crate) app_server_client_version: Option<String>,
+}
+
+pub(crate) struct AppServerClientMetadata {
+    pub(crate) client_name: Option<String>,
+    pub(crate) client_version: Option<String>,
 }
 
 #[async_trait]
@@ -1329,6 +1364,17 @@ impl PromptGcRolloutSink for crate::rollout::RolloutRecorder {
 }
 
 impl Session {
+    pub(crate) async fn app_server_client_metadata(&self) -> AppServerClientMetadata {
+        let state = self.state.lock().await;
+        AppServerClientMetadata {
+            client_name: state.session_configuration.app_server_client_name.clone(),
+            client_version: state
+                .session_configuration
+                .app_server_client_version
+                .clone(),
+        }
+    }
+
     /// Builds the `x-codex-beta-features` header value for this session.
     ///
     /// `ModelClient` is session-scoped and intentionally does not depend on the full `Config`, so
@@ -1479,7 +1525,7 @@ impl Session {
         model_info: ModelInfo,
         models_manager: &ModelsManager,
         network: Option<NetworkProxy>,
-        environment: Arc<Environment>,
+        environment: Option<Arc<Environment>>,
         sub_id: String,
         js_repl: Arc<JsReplHandle>,
         skills_outcome: Arc<SkillLoadOutcome>,
@@ -1512,6 +1558,7 @@ impl Session {
         )
         .with_web_search_config(per_turn_config.web_search_config.clone())
         .with_allow_login_shell(per_turn_config.permissions.allow_login_shell)
+        .with_has_environment(environment.is_some())
         .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
             &per_turn_config.agent_roles,
         ));
@@ -1587,12 +1634,12 @@ impl Session {
         prompt_gc_activity_edges: tokio::sync::broadcast::Sender<PromptGcActivityEdge>,
         initial_history: InitialHistory,
         session_source: SessionSource,
-        environment_manager: Arc<EnvironmentManager>,
         skills_manager: Arc<SkillsManager>,
         plugins_manager: Arc<PluginsManager>,
         mcp_manager: Arc<McpManager>,
         skills_watcher: Arc<SkillsWatcher>,
         agent_control: AgentControl,
+        environment: Option<Arc<Environment>>,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
             "Configuring session: model={}; provider={:?}",
@@ -1610,9 +1657,13 @@ impl Session {
                         conversation_id,
                         forked_from_id,
                         session_source,
-                        BaseInstructions {
-                            text: session_configuration.base_instructions.clone(),
-                        },
+                        session_configuration
+                            .base_instructions
+                            .clone()
+                            .map(|text| BaseInstructions { text }),
+                        session_configuration
+                            .developer_instructions_override
+                            .clone(),
                         session_configuration.dynamic_tools.clone(),
                         if session_configuration.persist_extended_history {
                             EventPersistenceMode::Extended
@@ -1633,6 +1684,17 @@ impl Session {
                     },
                 ),
             ),
+        };
+        let window_generation = match &initial_history {
+            InitialHistory::Resumed(resumed_history) => u64::try_from(
+                resumed_history
+                    .history
+                    .iter()
+                    .filter(|item| matches!(item, RolloutItem::Compacted(_)))
+                    .count(),
+            )
+            .unwrap_or(u64::MAX),
+            InitialHistory::New | InitialHistory::Forked(_) => 0,
         };
         let state_builder = match &initial_history {
             InitialHistory::Resumed(resumed) => metadata::builder_from_items(
@@ -2021,8 +2083,11 @@ impl Session {
             code_mode_service: crate::tools::code_mode::CodeModeService::new(
                 config.js_repl_node_path.clone(),
             ),
-            environment: environment_manager.current().await?,
+            environment,
         };
+        services
+            .model_client
+            .set_window_generation(window_generation);
         let js_repl = Arc::new(JsReplHandle::with_node_path(
             config.js_repl_node_path.clone(),
             config.js_repl_node_module_dirs.clone(),
@@ -2163,8 +2228,9 @@ impl Session {
                 ));
             }
         }
-        sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
-            .await;
+        if let Some(base_instructions) = session_configuration.base_instructions.clone() {
+            sess.schedule_startup_prewarm(base_instructions).await;
+        }
         let session_start_source = match &initial_history {
             InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
             InitialHistory::New | InitialHistory::Forked(_) => {
@@ -2275,11 +2341,13 @@ impl Session {
         history.estimate_token_count(turn_context)
     }
 
-    pub(crate) async fn get_base_instructions(&self) -> BaseInstructions {
+    pub(crate) async fn get_base_instructions(&self) -> Option<BaseInstructions> {
         let state = self.state.lock().await;
-        BaseInstructions {
-            text: state.session_configuration.base_instructions.clone(),
-        }
+        state
+            .session_configuration
+            .base_instructions
+            .clone()
+            .map(|text| BaseInstructions { text })
     }
 
     // Merges connector IDs into the session-level explicit connector selection.
@@ -2616,7 +2684,7 @@ impl Session {
                 .network_proxy
                 .as_ref()
                 .map(StartedNetworkProxy::proxy),
-            Arc::clone(&self.services.environment),
+            self.services.environment.clone(),
             sub_id,
             Arc::clone(&self.js_repl),
             skills_outcome,
@@ -3700,6 +3768,7 @@ impl Session {
             self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item)])
                 .await;
         }
+        self.services.model_client.advance_window_generation();
     }
 
     pub(crate) async fn persist_prompt_gc_replacement_history(
@@ -3854,7 +3923,11 @@ impl Session {
                 state.reference_context_item(),
                 state.previous_turn_settings(),
                 state.session_configuration.collaboration_mode.clone(),
-                state.session_configuration.base_instructions.clone(),
+                state
+                    .session_configuration
+                    .base_instructions
+                    .clone()
+                    .unwrap_or_default(),
                 state.session_configuration.session_source.clone(),
             )
         };
@@ -3866,22 +3939,24 @@ impl Session {
         {
             developer_sections.push(model_switch_message.into_text());
         }
-        developer_sections.push(
-            DeveloperInstructions::from_policy(
-                turn_context.sandbox_policy.get(),
-                turn_context.approval_policy.value(),
-                turn_context.config.approvals_reviewer,
-                self.services.exec_policy.current().as_ref(),
-                &turn_context.cwd,
-                turn_context
-                    .features
-                    .enabled(Feature::ExecPermissionApprovals),
-                turn_context
-                    .features
-                    .enabled(Feature::RequestPermissionsTool),
-            )
-            .into_text(),
-        );
+        if turn_context.config.include_permissions_instructions {
+            developer_sections.push(
+                DeveloperInstructions::from_policy(
+                    turn_context.sandbox_policy.get(),
+                    turn_context.approval_policy.value(),
+                    turn_context.config.approvals_reviewer,
+                    self.services.exec_policy.current().as_ref(),
+                    &turn_context.cwd,
+                    turn_context
+                        .features
+                        .enabled(Feature::ExecPermissionApprovals),
+                    turn_context
+                        .features
+                        .enabled(Feature::RequestPermissionsTool),
+                )
+                .into_text(),
+            );
+        }
         let separate_guardian_developer_message =
             crate::guardian::is_guardian_reviewer_source(&session_source);
         // Keep the guardian policy prompt out of the aggregated developer bundle so it
@@ -3931,7 +4006,7 @@ impl Session {
                 );
             }
         }
-        if turn_context.apps_enabled() {
+        if turn_context.config.include_apps_instructions && turn_context.apps_enabled() {
             let mcp_connection_manager = self.services.mcp_connection_manager.read().await;
             let accessible_and_enabled_connectors =
                 connectors::list_accessible_and_enabled_connectors_from_manager(
@@ -3974,16 +4049,18 @@ impl Session {
                 .serialize_to_text(),
             );
         }
-        let subagents = self
-            .services
-            .agent_control
-            .format_environment_context_subagents(self.conversation_id)
-            .await;
-        contextual_user_sections.push(
-            EnvironmentContext::from_turn_context(turn_context, shell.as_ref())
-                .with_subagents(subagents)
-                .serialize_to_xml(),
-        );
+        if turn_context.config.include_environment_context {
+            let subagents = self
+                .services
+                .agent_control
+                .format_environment_context_subagents(self.conversation_id)
+                .await;
+            contextual_user_sections.push(
+                EnvironmentContext::from_turn_context(turn_context, shell.as_ref())
+                    .with_subagents(subagents)
+                    .serialize_to_xml(),
+            );
+        }
 
         let mut items = Vec::with_capacity(3);
         if let Some(developer_message) =
@@ -4112,7 +4189,13 @@ impl Session {
         emit_token_count_event: bool,
     ) {
         let history = self.clone_history().await;
-        let base_instructions = self.get_base_instructions().await;
+        let empty_base_instructions = BaseInstructions {
+            text: String::new(),
+        };
+        let base_instructions = self
+            .get_base_instructions()
+            .await
+            .unwrap_or(empty_base_instructions);
         let Some(estimated_total_tokens) =
             history.estimate_token_count_with_base_instructions(&base_instructions)
         else {
@@ -4829,6 +4912,37 @@ fn prompt_gc_plan_build_failure_details(
     }
 }
 
+pub(crate) fn emit_subagent_session_started(
+    analytics_events_client: &AnalyticsEventsClient,
+    client_metadata: AppServerClientMetadata,
+    thread_id: ThreadId,
+    thread_config: ThreadConfigSnapshot,
+    subagent_source: SubAgentSource,
+) {
+    let AppServerClientMetadata {
+        client_name,
+        client_version,
+    } = client_metadata;
+    let (Some(client_name), Some(client_version)) = (client_name, client_version) else {
+        tracing::warn!("skipping subagent thread analytics: missing inherited client metadata");
+        return;
+    };
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    analytics_events_client.track_subagent_thread_started(SubAgentThreadStartedInput {
+        thread_id: thread_id.to_string(),
+        product_client_id: client_name.clone(),
+        client_name,
+        client_version,
+        model: thread_config.model,
+        ephemeral: thread_config.ephemeral,
+        subagent_source,
+        created_at,
+    });
+}
+
 async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiver<Submission>) {
     // To break out of this loop, send Op::Shutdown.
     while let Ok(sub) = rx_sub.recv().await {
@@ -5101,8 +5215,8 @@ mod handlers {
     use crate::tasks::UserShellCommandMode;
     use crate::tasks::UserShellCommandTask;
     use crate::tasks::execute_user_shell_command;
-    use codex_mcp::mcp::auth::compute_auth_statuses;
-    use codex_mcp::mcp::collect_mcp_snapshot_from_manager;
+    use codex_mcp::collect_mcp_snapshot_from_manager;
+    use codex_mcp::compute_auth_statuses;
     use codex_protocol::protocol::CodexErrorInfo;
     use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::Event;
@@ -5221,6 +5335,7 @@ mod handlers {
                         final_output_json_schema: Some(final_output_json_schema),
                         personality,
                         app_server_client_name: None,
+                        app_server_client_version: None,
                     },
                 )
             }
@@ -5979,6 +6094,7 @@ async fn spawn_review_thread(
     )
     .with_web_search_config(/*web_search_config*/ None)
     .with_allow_login_shell(config.permissions.allow_login_shell)
+    .with_has_environment(parent_turn_context.environment.is_some())
     .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
         &config.agent_roles,
     ));
@@ -6037,7 +6153,7 @@ async fn spawn_review_thread(
         reasoning_effort,
         reasoning_summary,
         session_source,
-        environment: Arc::clone(&parent_turn_context.environment),
+        environment: parent_turn_context.environment.clone(),
         tools_config,
         features: parent_turn_context.features.clone(),
         ghost_snapshot: parent_turn_context.ghost_snapshot.clone(),
@@ -6172,13 +6288,20 @@ pub(crate) async fn run_turn(
 
     let model_info = turn_context.model_info.clone();
     let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
+    let mut prewarmed_client_session = prewarmed_client_session;
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
-    if let Err(err) = run_pre_sampling_compact(&sess, &turn_context).await {
-        error!("Failed to run pre-sampling compact: {err}");
-        return None;
+    let pre_sampling_compacted = match run_pre_sampling_compact(&sess, &turn_context).await {
+        Ok(pre_sampling_compacted) => pre_sampling_compacted,
+        Err(err) => {
+            error!("Failed to run pre-sampling compact: {err}");
+            return None;
+        }
+    };
+    if pre_sampling_compacted && let Some(mut client_session) = prewarmed_client_session.take() {
+        client_session.reset_websocket_session();
     }
 
     let skills_outcome = Some(turn_context.turn_skills.outcome.as_ref());
@@ -6504,6 +6627,7 @@ pub(crate) async fn run_turn(
                     {
                         return None;
                     }
+                    client_session.reset_websocket_session();
                     continue;
                 }
 
@@ -6664,9 +6788,9 @@ pub(crate) async fn run_turn(
 async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-) -> CodexResult<()> {
+) -> CodexResult<bool> {
     let total_usage_tokens_before_compaction = sess.get_total_token_usage().await;
-    maybe_run_previous_model_inline_compact(
+    let mut pre_sampling_compacted = maybe_run_previous_model_inline_compact(
         sess,
         turn_context,
         total_usage_tokens_before_compaction,
@@ -6685,8 +6809,9 @@ async fn run_pre_sampling_compact(
             CompactionInitialContextPlacement::PromptTop,
         )
         .await?;
+        pre_sampling_compacted = true;
     }
-    Ok(())
+    Ok(pre_sampling_compacted)
 }
 
 /// Runs pre-sampling compaction against the previous model when switching to a smaller
@@ -6941,7 +7066,7 @@ pub(crate) fn build_prompt(
     input: Vec<ResponseItem>,
     tools: Vec<ToolSpec>,
     turn_context: &TurnContext,
-    base_instructions: BaseInstructions,
+    base_instructions: Option<BaseInstructions>,
 ) -> Prompt {
     let deferred_dynamic_tools = turn_context
         .dynamic_tools
@@ -7155,7 +7280,7 @@ async fn run_prompt_gc_sidecar_if_needed(
         input,
         tools: Vec::new(),
         parallel_tool_calls: false,
-        base_instructions,
+        base_instructions: Some(base_instructions),
         personality: None,
         output_schema: Some(prompt_gc_summary_output_schema()),
     };
@@ -8974,6 +9099,25 @@ async fn try_run_sampling_request(
                 };
                 let completed_item = item.clone();
 
+                let preempt_for_mailbox_mail = match &item {
+                    ResponseItem::Message { role, phase, .. } => {
+                        role == "assistant" && matches!(phase, Some(MessagePhase::Commentary))
+                    }
+                    ResponseItem::Reasoning { .. } => true,
+                    ResponseItem::LocalShellCall { .. }
+                    | ResponseItem::FunctionCall { .. }
+                    | ResponseItem::ToolSearchCall { .. }
+                    | ResponseItem::FunctionCallOutput { .. }
+                    | ResponseItem::CustomToolCall { .. }
+                    | ResponseItem::CustomToolCallOutput { .. }
+                    | ResponseItem::ToolSearchOutput { .. }
+                    | ResponseItem::WebSearchCall { .. }
+                    | ResponseItem::ImageGenerationCall { .. }
+                    | ResponseItem::GhostSnapshot { .. }
+                    | ResponseItem::Compaction { .. }
+                    | ResponseItem::Other => false,
+                };
+
                 let output_result = handle_output_item_done(&mut ctx, item, previously_active_item)
                     .instrument(handle_responses)
                     .await?;
@@ -8989,6 +9133,15 @@ async fn try_run_sampling_request(
                     last_agent_message = Some(agent_message);
                 }
                 needs_follow_up |= output_result.needs_follow_up;
+                // todo: remove before stabilizing multi-agent v2
+                if preempt_for_mailbox_mail && sess.mailbox_rx.lock().await.has_pending() {
+                    break Ok(SamplingRequestResult {
+                        needs_follow_up: true,
+                        last_agent_message,
+                        non_tool_response_items: std::mem::take(&mut non_tool_response_items),
+                        recorded_response_items: std::mem::take(&mut recorded_response_items),
+                    });
+                }
             }
             ResponseEvent::OutputItemAdded(item) => {
                 if let Some(turn_item) = handle_non_tool_response_item(

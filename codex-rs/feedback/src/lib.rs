@@ -14,8 +14,6 @@ use anyhow::anyhow;
 use codex_login::AuthEnvTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
-use feedback_diagnostics::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
-use feedback_diagnostics::FeedbackDiagnostics;
 use tracing::Event;
 use tracing::Level;
 use tracing::field::Visit;
@@ -24,7 +22,10 @@ use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::registry::LookupSpan;
 
-pub mod feedback_diagnostics;
+pub(crate) mod feedback_diagnostics;
+pub use feedback_diagnostics::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
+pub use feedback_diagnostics::FeedbackDiagnostic;
+pub use feedback_diagnostics::FeedbackDiagnostics;
 
 const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const SENTRY_DSN: &str =
@@ -609,7 +610,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use feedback_diagnostics::FeedbackDiagnostic;
+    use crate::FeedbackDiagnostic;
     use pretty_assertions::assert_eq;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -650,8 +651,9 @@ mod tests {
         let snapshot_with_diagnostics = CodexFeedback::new()
             .snapshot(/*session_id*/ None)
             .with_feedback_diagnostics(FeedbackDiagnostics::new(vec![FeedbackDiagnostic {
-                headline: "OPENAI_BASE_URL is set and may affect connectivity.".to_string(),
-                details: vec!["OPENAI_BASE_URL = https://example.com/v1".to_string()],
+                headline: "Proxy environment variables are set and may affect connectivity."
+                    .to_string(),
+                details: vec!["HTTPS_PROXY = https://example.com:443".to_string()],
             }]));
 
         let attachments_with_diagnostics = snapshot_with_diagnostics.feedback_attachments(
@@ -674,7 +676,7 @@ mod tests {
         assert_eq!(attachments_with_diagnostics[0].buffer, vec![1]);
         assert_eq!(
             attachments_with_diagnostics[1].buffer,
-            b"Connectivity diagnostics\n\n- OPENAI_BASE_URL is set and may affect connectivity.\n  - OPENAI_BASE_URL = https://example.com/v1".to_vec()
+            b"Connectivity diagnostics\n\n- Proxy environment variables are set and may affect connectivity.\n  - HTTPS_PROXY = https://example.com:443".to_vec()
         );
         assert_eq!(attachments_with_diagnostics[2].buffer, b"rollout".to_vec());
         assert_eq!(

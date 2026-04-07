@@ -61,7 +61,7 @@ pub(crate) use send_input::Handler as SendInputHandler;
 pub(crate) use spawn::Handler as SpawnAgentHandler;
 pub(crate) use wait::Handler as WaitAgentHandler;
 
-pub mod close_agent;
+pub(crate) mod close_agent;
 mod resume_agent;
 mod send_input;
 mod spawn;
@@ -203,10 +203,10 @@ pub(crate) fn build_agent_spawn_config(turn: &TurnContext) -> Result<Config, Fun
     // Merge-safety anchor: seed child base instructions for the no-reload path here. If role or
     // profile reloads rebuild the config later, `finalize_spawn_agent_prompt_config` recomputes
     // this same source from the child config that actually ships.
-    config.base_instructions = Some(
-        subagent_instructions
-            .unwrap_or_else(|| turn.model_info.get_model_instructions(turn.personality)),
-    );
+    config.base_instructions =
+        Some(Some(subagent_instructions.unwrap_or_else(|| {
+            turn.model_info.get_model_instructions(turn.personality)
+        })));
     Ok(config)
 }
 
@@ -280,12 +280,12 @@ pub(crate) async fn finalize_spawn_agent_prompt_config(
         );
         config.model_reasoning_effort = normalized_reasoning_effort;
     }
-    config.base_instructions = Some(
+    config.base_instructions = Some(Some(
         config
             .subagent_base_instructions
             .clone()
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
-    );
+    ));
 }
 
 pub(crate) fn apply_spawn_agent_profile_override(

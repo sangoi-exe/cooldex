@@ -133,6 +133,7 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -150,6 +151,8 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
     ];
@@ -195,6 +198,7 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_com
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: first_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -214,11 +218,14 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_com
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: first_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: rolled_back_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -238,6 +245,8 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_com
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: rolled_back_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
@@ -285,6 +294,7 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_inc
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: first_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -304,11 +314,14 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_inc
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: first_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: incomplete_turn_id,
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -370,6 +383,7 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: first_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -389,11 +403,14 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: first_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: second_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -412,11 +429,14 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: second_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: standalone_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -426,6 +446,8 @@ async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metad
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: standalone_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
@@ -476,6 +498,7 @@ async fn reconstruct_history_rollback_counts_inter_agent_assistant_turns() {
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: first_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -495,11 +518,14 @@ async fn reconstruct_history_rollback_counts_inter_agent_assistant_turns() {
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: first_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: assistant_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -511,6 +537,8 @@ async fn reconstruct_history_rollback_counts_inter_agent_assistant_turns() {
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: assistant_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
@@ -556,6 +584,7 @@ async fn reconstruct_history_rollback_clears_history_and_metadata_when_exceeding
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: only_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -575,6 +604,8 @@ async fn reconstruct_history_rollback_clears_history_and_metadata_when_exceeding
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: only_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
@@ -604,6 +635,7 @@ async fn record_initial_history_resumed_rollback_skips_only_user_turns() {
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: user_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -621,12 +653,15 @@ async fn record_initial_history_resumed_rollback_skips_only_user_turns() {
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: user_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         // Standalone task turn (no UserMessage) should not consume rollback skips.
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: standalone_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -635,6 +670,8 @@ async fn record_initial_history_resumed_rollback_skips_only_user_turns() {
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: standalone_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
@@ -668,6 +705,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -686,11 +724,14 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: previous_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: incomplete_turn_id,
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -834,6 +875,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: current_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -851,6 +893,8 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: current_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
     ];
@@ -895,6 +939,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -918,6 +963,8 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: previous_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
     ];
@@ -999,6 +1046,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1016,11 +1064,14 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: previous_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: aborted_turn_id,
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1037,6 +1088,8 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
             codex_protocol::protocol::TurnAbortedEvent {
                 turn_id: None,
                 reason: TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::Compacted(CompactedItem {
@@ -1101,6 +1154,7 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1118,11 +1172,14 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: previous_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: current_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1139,6 +1196,8 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
             codex_protocol::protocol::TurnAbortedEvent {
                 turn_id: Some(unmatched_abort_turn_id),
                 reason: TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::TurnContext(current_context_item.clone()),
@@ -1146,6 +1205,8 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: current_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
     ];
@@ -1208,6 +1269,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1225,11 +1287,14 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: previous_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: incomplete_turn_id,
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1280,6 +1345,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_preserves_turn_
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: current_turn_id,
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1354,6 +1420,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: previous_turn_id.clone(),
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1371,11 +1438,14 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: previous_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: compacted_incomplete_turn_id,
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1398,6 +1468,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_id: replacing_turn_id,
+                started_at: None,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
             },
@@ -1432,6 +1503,7 @@ async fn record_initial_history_resumed_ignores_truncated_prompt_gc_compaction_w
                 turn_id: "truncated-prompt-gc-turn".to_string(),
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
+                started_at: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::UserMessage(
@@ -1527,6 +1599,7 @@ async fn record_initial_history_resumed_ignores_legacy_prompt_gc_compaction_with
                 turn_id: current_turn_id,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
+                started_at: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::UserMessage(
@@ -1601,6 +1674,7 @@ async fn record_initial_history_resumed_rollback_discards_prompt_gc_compaction_f
                 turn_id: previous_turn_id.clone(),
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
+                started_at: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::UserMessage(
@@ -1617,6 +1691,8 @@ async fn record_initial_history_resumed_rollback_discards_prompt_gc_compaction_f
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: previous_turn_id,
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
@@ -1624,6 +1700,7 @@ async fn record_initial_history_resumed_rollback_discards_prompt_gc_compaction_f
                 turn_id: rolled_back_turn_id,
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
+                started_at: None,
             },
         )),
         RolloutItem::EventMsg(EventMsg::UserMessage(

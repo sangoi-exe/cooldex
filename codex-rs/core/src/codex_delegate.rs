@@ -36,6 +36,7 @@ use crate::codex::CodexSpawnOk;
 use crate::codex::SUBMISSION_CHANNEL_CAPACITY;
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::codex::emit_subagent_session_started;
 use crate::config::Config;
 use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::review_approval_request_with_cancel;
@@ -74,15 +75,15 @@ pub(crate) async fn run_codex_thread_interactive(
         config,
         auth_manager,
         models_manager,
-        environment_manager: Arc::new(EnvironmentManager::new(
-            parent_ctx.environment.exec_server_url().map(str::to_owned),
+        environment_manager: Arc::new(EnvironmentManager::from_environment(
+            parent_ctx.environment.as_deref(),
         )),
         skills_manager: Arc::clone(&parent_session.services.skills_manager),
         plugins_manager: Arc::clone(&parent_session.services.plugins_manager),
         mcp_manager: Arc::clone(&parent_session.services.mcp_manager),
         skills_watcher: Arc::clone(&parent_session.services.skills_watcher),
         conversation_history: initial_history.unwrap_or(InitialHistory::New),
-        session_source: SessionSource::SubAgent(subagent_source),
+        session_source: SessionSource::SubAgent(subagent_source.clone()),
         agent_control: parent_session.services.agent_control.clone(),
         dynamic_tools: Vec::new(),
         persist_extended_history: false,
@@ -93,6 +94,17 @@ pub(crate) async fn run_codex_thread_interactive(
         parent_trace: None,
     })
     .await?;
+    if parent_session.enabled(codex_features::Feature::GeneralAnalytics) {
+        let thread_config = codex.thread_config_snapshot().await;
+        let client_metadata = parent_session.app_server_client_metadata().await;
+        emit_subagent_session_started(
+            &parent_session.services.analytics_events_client,
+            client_metadata,
+            codex.session.conversation_id,
+            thread_config,
+            subagent_source,
+        );
+    }
     let codex = Arc::new(codex);
 
     // Use a child token so parent cancel cascades but we can scope it to this task
@@ -899,6 +911,8 @@ mod tests {
                 msg: EventMsg::TurnAborted(TurnAbortedEvent {
                     turn_id: Some("turn-1".to_string()),
                     reason: TurnAbortReason::Interrupted,
+                    completed_at: None,
+                    duration_ms: None,
                 }),
             })
             .await

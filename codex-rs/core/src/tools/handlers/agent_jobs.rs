@@ -1,3 +1,6 @@
+// Merge-safety anchor: agent_jobs must keep using the legacy child-spawn config owner from
+// `multi_agents` so batch launches do not accidentally adopt V2-only spawn semantics mid-merge.
+
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::status::is_final;

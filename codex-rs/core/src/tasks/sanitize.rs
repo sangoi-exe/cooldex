@@ -389,6 +389,7 @@ impl SessionTask for SanitizeTask {
             turn_id: ctx.sub_id.clone(),
             model_context_window: ctx.model_context_window(),
             collaboration_mode_kind: ctx.collaboration_mode.mode,
+            started_at: None,
         });
         sess.send_event(ctx.as_ref(), started).await;
 
@@ -2490,7 +2491,8 @@ mod tests {
                 session.conversation_id,
                 None,
                 turn.session_source.clone(),
-                codex_protocol::models::BaseInstructions::default(),
+                Some(codex_protocol::models::BaseInstructions::default()),
+                None,
                 Vec::new(),
                 crate::rollout::policy::EventPersistenceMode::Limited,
             ),

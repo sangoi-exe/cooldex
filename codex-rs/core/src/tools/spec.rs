@@ -5,8 +5,8 @@ use crate::tools::handlers::multi_agents_common::DEFAULT_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents_common::MAX_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents_common::MIN_WAIT_TIMEOUT_MS;
 use crate::tools::registry::ToolRegistryBuilder;
-use codex_mcp::mcp::CODEX_APPS_MCP_SERVER_NAME;
-use codex_mcp::mcp_connection_manager::ToolInfo;
+use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+use codex_mcp::ToolInfo;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_tools::DiscoverableTool;
 use codex_tools::JsonSchema;
@@ -243,7 +243,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
             // Merge-safety anchor: keep the upstream shared planner as the structural base here,
             // but layer the local `manage_context`/`recall` tools back in immediately after
             // `view_image` so the workspace runtime/docs/tests stay canonically aligned.
-            if config.request_user_input {
+            if config.default_mode_request_user_input {
                 builder.push_spec(create_manage_context_tool());
             }
             builder.push_spec(create_recall_tool());
@@ -252,7 +252,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
     }
 
     if !injected_local_lead_tools {
-        if config.request_user_input {
+        if config.default_mode_request_user_input {
             builder.push_spec(create_manage_context_tool());
         }
         builder.push_spec(create_recall_tool());
@@ -362,7 +362,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
             }
         }
     }
-    if config.request_user_input {
+    if config.default_mode_request_user_input {
         builder.register_handler("manage_context", manage_context_handler);
     }
     builder.register_handler("recall", recall_handler);

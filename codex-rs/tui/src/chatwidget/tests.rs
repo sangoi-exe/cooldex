@@ -464,6 +464,9 @@ async fn resumed_turn_history_replays_original_rollout_snapshot() {
         id: "turn-1".to_string(),
         status: AppServerTurnStatus::Completed,
         error: None,
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
         items: vec![
             AppServerThreadItem::UserMessage {
                 id: "user-1".to_string(),
@@ -564,6 +567,9 @@ async fn resumed_turn_history_since_last_compaction_boundary_snapshot() {
                 id: "turn-0".to_string(),
                 status: AppServerTurnStatus::Completed,
                 error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
                 items: vec![AppServerThreadItem::AgentMessage {
                     id: "assistant-0".to_string(),
                     text: "before compaction should stay hidden".to_string(),
@@ -575,6 +581,9 @@ async fn resumed_turn_history_since_last_compaction_boundary_snapshot() {
                 id: "turn-1".to_string(),
                 status: AppServerTurnStatus::Completed,
                 error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
                 items: vec![
                     AppServerThreadItem::ContextCompaction {
                         id: "compact-1".to_string(),
@@ -653,6 +662,9 @@ async fn resume_reconstructed_boundary_blocks_initial_messages_for_empty_turns()
         id: "turn-1".to_string(),
         status: AppServerTurnStatus::Completed,
         error: None,
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
         items: Vec::new(),
     }]);
 
@@ -702,6 +714,9 @@ async fn resume_reconstructed_boundary_blocks_initial_messages_for_hook_prompt_o
         id: "turn-1".to_string(),
         status: AppServerTurnStatus::Completed,
         error: None,
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
         items: vec![AppServerThreadItem::HookPrompt {
             id: "hook-1".to_string(),
             fragments: vec![AppServerHookPromptFragment {
@@ -758,6 +773,9 @@ async fn replayed_begin_only_web_and_image_rows_stay_hidden() {
             id: "turn-1".to_string(),
             status: AppServerTurnStatus::Completed,
             error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
             items: vec![
                 AppServerThreadItem::WebSearch {
                     id: "search-1".to_string(),
@@ -790,6 +808,9 @@ async fn resumed_turn_history_replays_review_finish_banner() {
         id: "turn-1".to_string(),
         status: AppServerTurnStatus::Completed,
         error: None,
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
         items: vec![
             AppServerThreadItem::EnteredReviewMode {
                 id: "review-start".to_string(),
@@ -854,6 +875,9 @@ async fn resumed_turn_history_replays_completed_file_change_cell() {
         id: "turn-1".to_string(),
         status: AppServerTurnStatus::Completed,
         error: None,
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
         items: vec![AppServerThreadItem::FileChange {
             id: "patch-1".to_string(),
             changes: vec![AppServerFileUpdateChange {
@@ -915,6 +939,9 @@ async fn resumed_turn_history_replays_declined_file_change_failure() {
         id: "turn-1".to_string(),
         status: AppServerTurnStatus::Completed,
         error: None,
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
         items: vec![AppServerThreadItem::FileChange {
             id: "patch-1".to_string(),
             changes: vec![AppServerFileUpdateChange {
@@ -971,6 +998,9 @@ async fn resumed_turn_history_replays_collab_waiting_cells() {
         id: "turn-1".to_string(),
         status: AppServerTurnStatus::Completed,
         error: None,
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
         items: vec![AppServerThreadItem::CollabAgentToolCall {
             id: "wait-1".to_string(),
             tool: AppServerCollabAgentTool::Wait,
@@ -2074,6 +2104,8 @@ async fn interrupted_turn_restores_queued_messages_with_images_and_elements() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -2139,6 +2171,8 @@ async fn interrupted_turn_restore_keeps_active_mode_for_resubmission() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -2342,6 +2376,7 @@ async fn steer_rejection_queues_review_follow_up_before_existing_queued_messages
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     chat.handle_codex_event(Event {
@@ -2423,6 +2458,8 @@ async fn steer_rejection_queues_review_follow_up_before_existing_queued_messages
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -2442,6 +2479,8 @@ async fn steer_rejection_queues_review_follow_up_before_existing_queued_messages
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-2".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -2637,6 +2676,7 @@ async fn turn_started_uses_runtime_context_window_before_first_token_count() {
             turn_id: "turn-1".to_string(),
             model_context_window: Some(950_000),
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -2730,6 +2770,7 @@ async fn turn_started_clears_prompt_gc_private_usage_and_starts_fresh_window() {
             turn_id: "turn-2".to_string(),
             model_context_window: Some(13_000),
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -2759,6 +2800,7 @@ async fn turn_started_without_window_clears_prompt_gc_private_usage() {
             turn_id: "turn-2".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -2907,6 +2949,7 @@ async fn turn_started_keeps_visible_usage_when_token_info_is_not_prompt_gc_priva
             turn_id: "turn-2".to_string(),
             model_context_window: Some(950_000),
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -2967,6 +3010,7 @@ async fn review_restore_preserves_prompt_gc_token_info_provenance() {
             turn_id: "turn-2".to_string(),
             model_context_window: Some(13_000),
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -4380,6 +4424,8 @@ async fn plan_implementation_popup_skips_replayed_turn_complete() {
     chat.replay_initial_messages(vec![EventMsg::TurnComplete(TurnCompleteEvent {
         turn_id: "turn-1".to_string(),
         last_agent_message: Some("Plan details".to_string()),
+        completed_at: None,
+        duration_ms: None,
     })]);
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
@@ -4404,6 +4450,8 @@ async fn plan_implementation_popup_shows_once_when_replay_precedes_live_turn_com
     chat.replay_initial_messages(vec![EventMsg::TurnComplete(TurnCompleteEvent {
         turn_id: "turn-1".to_string(),
         last_agent_message: Some("Plan details".to_string()),
+        completed_at: None,
+        duration_ms: None,
     })]);
     let replay_popup = render_bottom_popup(&chat, /*width*/ 80);
     assert!(
@@ -4416,6 +4464,8 @@ async fn plan_implementation_popup_shows_once_when_replay_precedes_live_turn_com
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: Some("Plan details".to_string()),
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -4437,6 +4487,8 @@ async fn plan_implementation_popup_shows_once_when_replay_precedes_live_turn_com
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: Some("Plan details".to_string()),
+            completed_at: None,
+            duration_ms: None,
         }),
     });
     let duplicate_popup = render_bottom_popup(&chat, /*width*/ 80);
@@ -5805,6 +5857,9 @@ async fn submit_user_message_queues_while_compaction_turn_is_running() {
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -5848,6 +5903,9 @@ async fn submit_user_message_queues_while_compaction_turn_is_running() {
                 items: Vec::new(),
                 status: AppServerTurnStatus::Completed,
                 error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -6052,6 +6110,9 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -6091,6 +6152,9 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
                 items: Vec::new(),
                 status: AppServerTurnStatus::Completed,
                 error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -6405,6 +6469,9 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -6440,6 +6507,9 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
                     codex_error_info: None,
                     additional_details: None,
                 }),
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -6461,6 +6531,9 @@ async fn replayed_retryable_app_server_error_keeps_turn_running() {
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         Some(ReplayKind::ThreadSnapshot),
@@ -6503,6 +6576,9 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -6557,6 +6633,9 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -6738,6 +6817,9 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -7693,6 +7775,8 @@ async fn replaced_turn_clears_pending_steers_but_keeps_queued_drafts() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Replaced,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -8196,6 +8280,7 @@ async fn unified_exec_wait_after_final_agent_message_snapshot() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -8208,6 +8293,8 @@ async fn unified_exec_wait_after_final_agent_message_snapshot() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: Some("Final response.".into()),
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -8228,6 +8315,7 @@ async fn unified_exec_wait_before_streamed_agent_message_snapshot() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -8250,6 +8338,8 @@ async fn unified_exec_wait_before_streamed_agent_message_snapshot() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -8315,6 +8405,8 @@ async fn unified_exec_waiting_multiple_empty_snapshots() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -8393,6 +8485,8 @@ async fn unified_exec_non_empty_then_empty_snapshots() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -8903,6 +8997,8 @@ async fn slash_copy_state_tracks_turn_complete_final_reply() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: Some("Final reply **markdown**".to_string()),
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -8933,6 +9029,8 @@ async fn slash_copy_state_tracks_plan_item_completion() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -8966,6 +9064,8 @@ async fn slash_copy_state_is_preserved_during_running_task() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: Some("Previous completed reply".to_string()),
+            completed_at: None,
+            duration_ms: None,
         }),
     });
     chat.on_task_started();
@@ -8985,6 +9085,8 @@ async fn slash_copy_state_clears_on_thread_rollback() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: Some("Reply that will be rolled back".to_string()),
+            completed_at: None,
+            duration_ms: None,
         }),
     });
     chat.handle_codex_event(Event {
@@ -9013,6 +9115,8 @@ async fn slash_copy_is_unavailable_when_legacy_agent_message_is_not_repeated_on_
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
     let _ = drain_insert_history(&mut rx);
@@ -9040,6 +9144,7 @@ async fn slash_copy_uses_agent_message_item_when_turn_complete_omits_final_text(
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     complete_assistant_message(
@@ -9054,6 +9159,8 @@ async fn slash_copy_uses_agent_message_item_when_turn_complete_omits_final_text(
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
     let _ = drain_insert_history(&mut rx);
@@ -9085,6 +9192,7 @@ async fn slash_copy_does_not_return_stale_output_after_thread_rollback() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     complete_assistant_message(
@@ -9099,6 +9207,8 @@ async fn slash_copy_does_not_return_stale_output_after_thread_rollback() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
     let _ = drain_insert_history(&mut rx);
@@ -9790,6 +9900,8 @@ async fn interrupt_exec_marks_failed_snapshot() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -9817,6 +9929,7 @@ async fn interrupted_turn_error_message_snapshot() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -9826,6 +9939,8 @@ async fn interrupted_turn_error_message_snapshot() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -9854,6 +9969,7 @@ async fn interrupted_turn_pending_steers_message_snapshot() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -9862,6 +9978,8 @@ async fn interrupted_turn_pending_steers_message_snapshot() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -12255,12 +12373,10 @@ async fn feedback_upload_consent_popup_snapshot() {
         chat.app_event_tx.clone(),
         crate::app_event::FeedbackCategory::Bug,
         chat.current_rollout_path.clone(),
-        &codex_feedback::feedback_diagnostics::FeedbackDiagnostics::new(vec![
-            codex_feedback::feedback_diagnostics::FeedbackDiagnostic {
-                headline: "OPENAI_BASE_URL is set and may affect connectivity.".to_string(),
-                details: vec!["OPENAI_BASE_URL = hello".to_string()],
-            },
-        ]),
+        &codex_feedback::FeedbackDiagnostics::new(vec![codex_feedback::FeedbackDiagnostic {
+            headline: "OPENAI_BASE_URL is set and may affect connectivity.".to_string(),
+            details: vec!["OPENAI_BASE_URL = hello".to_string()],
+        }]),
     ));
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
@@ -12275,12 +12391,10 @@ async fn feedback_good_result_consent_popup_includes_connectivity_diagnostics_fi
         chat.app_event_tx.clone(),
         crate::app_event::FeedbackCategory::GoodResult,
         chat.current_rollout_path.clone(),
-        &codex_feedback::feedback_diagnostics::FeedbackDiagnostics::new(vec![
-            codex_feedback::feedback_diagnostics::FeedbackDiagnostic {
-                headline: "OPENAI_BASE_URL is set and may affect connectivity.".to_string(),
-                details: vec!["OPENAI_BASE_URL = hello".to_string()],
-            },
-        ]),
+        &codex_feedback::FeedbackDiagnostics::new(vec![codex_feedback::FeedbackDiagnostic {
+            headline: "OPENAI_BASE_URL is set and may affect connectivity.".to_string(),
+            details: vec!["OPENAI_BASE_URL = hello".to_string()],
+        }]),
     ));
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
@@ -13315,6 +13429,8 @@ async fn interrupt_restores_queued_messages_into_composer() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -13354,6 +13470,8 @@ async fn interrupt_prepends_queued_messages_before_existing_composer_text() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -13383,6 +13501,8 @@ async fn interrupt_preserves_unified_exec_processes() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -13420,6 +13540,8 @@ async fn review_ended_keeps_unified_exec_processes() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::ReviewEnded,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -13454,6 +13576,7 @@ async fn interrupt_preserves_unified_exec_wait_streak_snapshot() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -13465,6 +13588,8 @@ async fn interrupt_preserves_unified_exec_wait_streak_snapshot() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -13492,6 +13617,8 @@ async fn turn_complete_keeps_unified_exec_processes() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -13547,6 +13674,7 @@ async fn ui_snapshots_small_heights_task_running() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     chat.handle_codex_event(Event {
@@ -13580,6 +13708,7 @@ async fn status_widget_and_approval_modal_snapshot() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     // Provide a deterministic header for the status line.
@@ -13854,6 +13983,7 @@ async fn status_widget_active_snapshot() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     // Provide a deterministic header via a bold reasoning chunk.
@@ -13911,6 +14041,7 @@ async fn mcp_startup_complete_does_not_clear_running_task() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -13939,6 +14070,7 @@ async fn task_complete_hands_status_owner_back_to_mcp_startup() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     chat.handle_codex_event(Event {
@@ -13972,6 +14104,7 @@ async fn task_complete_restores_hidden_status_indicator_for_mcp_startup() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     chat.handle_codex_event(Event {
@@ -14018,6 +14151,7 @@ async fn finalize_turn_hands_status_owner_back_to_mcp_startup() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     chat.handle_codex_event(Event {
@@ -14051,6 +14185,7 @@ async fn finalize_turn_restores_hidden_status_indicator_for_mcp_startup() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     chat.handle_codex_event(Event {
@@ -15464,6 +15599,7 @@ async fn replayed_turn_started_does_not_mark_task_running() {
         turn_id: "turn-1".to_string(),
         model_context_window: None,
         collaboration_mode_kind: ModeKind::Default,
+        started_at: None,
     })]);
 
     assert!(!chat.bottom_pane.is_task_running());
@@ -15480,6 +15616,7 @@ async fn thread_snapshot_replayed_turn_started_marks_task_running() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -15502,6 +15639,9 @@ async fn replayed_in_progress_turn_marks_task_running() {
             items: Vec::new(),
             status: AppServerTurnStatus::InProgress,
             error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
         }],
         ReplayKind::ResumeInitialMessages,
     );
@@ -15546,6 +15686,7 @@ async fn thread_snapshot_replayed_stream_recovery_restores_previous_status_heade
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     drain_insert_history(&mut rx);
@@ -15582,6 +15723,7 @@ async fn resume_replay_interrupted_reconnect_does_not_leave_stale_working_state(
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
         EventMsg::StreamError(StreamErrorEvent {
             message: "Reconnecting... 1/5".to_string(),
@@ -15613,6 +15755,7 @@ async fn replayed_interrupted_reconnect_footer_row_snapshot() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
         EventMsg::StreamError(StreamErrorEvent {
             message: "Reconnecting... 2/5".to_string(),
@@ -15731,6 +15874,8 @@ async fn status_line_branch_refreshes_after_turn_complete() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -15749,6 +15894,8 @@ async fn status_line_branch_refreshes_after_interrupt() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -15930,6 +16077,7 @@ async fn stream_recovery_restores_previous_status_header() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     drain_insert_history(&mut rx);
@@ -16014,6 +16162,7 @@ async fn multiple_agent_messages_in_single_turn_emit_multiple_headers() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -16034,6 +16183,8 @@ async fn multiple_agent_messages_in_single_turn_emit_multiple_headers() {
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -16382,6 +16533,7 @@ async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     chat.handle_codex_event(Event {
@@ -16433,6 +16585,7 @@ async fn chatwidget_markdown_code_blocks_vt100_snapshot() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     // Build a vt100 visual from the history insertions only (no UI overlay)
@@ -16505,6 +16658,8 @@ printf 'fenced within fenced\n'
         msg: EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
     for lines in drain_insert_history(&mut rx) {
@@ -16527,6 +16682,7 @@ async fn chatwidget_tall() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
     for i in 0..30 {
@@ -16557,6 +16713,7 @@ async fn enter_submits_steer_while_review_is_running() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -16605,6 +16762,7 @@ async fn review_queues_user_messages_snapshot() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 
@@ -16655,6 +16813,7 @@ async fn compact_queues_user_messages_snapshot() {
             turn_id: "turn-1".to_string(),
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }),
     });
 

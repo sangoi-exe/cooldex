@@ -25,7 +25,6 @@ use std::thread;
 use std::time::Duration;
 
 use crate::AuthManager;
-use crate::auth::AuthCredentialsStoreMode;
 use crate::auth::StoredAccount;
 use crate::auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
 use crate::auth::update_auth_store;
@@ -37,6 +36,7 @@ use crate::token_data::parse_chatgpt_jwt_claims;
 use base64::Engine;
 use chrono::Utc;
 use codex_client::build_reqwest_client_with_custom_ca;
+use codex_config::types::AuthCredentialsStoreMode;
 use codex_utils_template::Template;
 use rand::RngCore;
 use serde_json::Value as JsonValue;

@@ -202,6 +202,7 @@ mod tests {
                 turn_id: "turn-1".to_string(),
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
+                started_at: None,
             })),
         ];
         let RolloutItem::Compacted(compacted) = &rollout_items[0] else {
@@ -222,6 +223,7 @@ mod tests {
                 turn_id: "turn-1".to_string(),
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
+                started_at: None,
             })),
             RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
                 message: "first".to_string(),
@@ -233,11 +235,14 @@ mod tests {
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-1".to_string(),
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             })),
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-2".to_string(),
                 model_context_window: Some(128_000),
                 collaboration_mode_kind: ModeKind::Default,
+                started_at: None,
             })),
             RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
                 message: "second".to_string(),
@@ -249,6 +254,8 @@ mod tests {
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-2".to_string(),
                 last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
             })),
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
                 num_turns: 1,

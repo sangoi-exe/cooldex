@@ -20,7 +20,7 @@ const TUI_NOTIFY_CLIENT: &str = "codex-tui";
 
 async fn initialize_app_server_client_name(thread: &CodexThread) {
     if let Err(err) = thread
-        .set_app_server_client_name(Some(TUI_NOTIFY_CLIENT.to_string()))
+        .set_app_server_client_info(Some(TUI_NOTIFY_CLIENT.to_string()), None)
         .await
     {
         tracing::error!("failed to set app server client name: {err}");

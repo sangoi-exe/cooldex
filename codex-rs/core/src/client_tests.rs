@@ -2,7 +2,11 @@ use super::AuthRequestTelemetryContext;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
 use super::UnauthorizedRecoveryExecution;
+use super::X_CODEX_PARENT_THREAD_ID_HEADER;
+use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_TURN_STATE_HEADER;
+use super::X_CODEX_WINDOW_ID_HEADER;
+use super::X_OPENAI_SUBAGENT_HEADER;
 use super::build_responses_headers;
 use crate::ResponseEvent;
 use crate::auth::AuthCredentialsStoreMode;
@@ -12,7 +16,7 @@ use crate::auth::save_auth;
 use crate::client_common::Prompt;
 use base64::Engine;
 use chrono::Utc;
-use codex_api::api_bridge::CoreAuthProvider;
+use codex_api::CoreAuthProvider;
 use codex_app_server_protocol::AuthMode;
 use codex_login::AuthManager;
 use codex_login::token_data::IdTokenInfo;
@@ -155,9 +159,47 @@ fn build_subagent_headers_sets_other_subagent_label() {
     )));
     let headers = client.build_subagent_headers();
     let value = headers
-        .get("x-openai-subagent")
+        .get(X_OPENAI_SUBAGENT_HEADER)
         .and_then(|value| value.to_str().ok());
     assert_eq!(value, Some("memory_consolidation"));
+}
+
+#[test]
+fn build_ws_client_metadata_includes_window_lineage_and_turn_metadata() {
+    let parent_thread_id = ThreadId::new();
+    let client = test_model_client(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: 2,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    }));
+
+    client.advance_window_generation();
+
+    let client_metadata = client.build_ws_client_metadata(Some(r#"{"turn_id":"turn-123"}"#));
+    let conversation_id = client.state.conversation_id;
+    assert_eq!(
+        client_metadata,
+        std::collections::HashMap::from([
+            (
+                X_CODEX_WINDOW_ID_HEADER.to_string(),
+                format!("{conversation_id}:1"),
+            ),
+            (
+                X_OPENAI_SUBAGENT_HEADER.to_string(),
+                "collab_spawn".to_string(),
+            ),
+            (
+                X_CODEX_PARENT_THREAD_ID_HEADER.to_string(),
+                parent_thread_id.to_string(),
+            ),
+            (
+                X_CODEX_TURN_METADATA_HEADER.to_string(),
+                r#"{"turn_id":"turn-123"}"#.to_string(),
+            ),
+        ])
+    );
 }
 
 #[tokio::test]
@@ -248,9 +290,9 @@ async fn prompt_gc_hidden_child_session_stream_fallback_keeps_visible_websockets
         input: Vec::new(),
         tools: Vec::new(),
         parallel_tool_calls: false,
-        base_instructions: BaseInstructions {
+        base_instructions: Some(BaseInstructions {
             text: "hidden prompt gc".to_string(),
-        },
+        }),
         personality: None,
         output_schema: None,
     };
@@ -359,9 +401,9 @@ async fn subagent_websocket_reconnects_when_auth_account_changes_mid_session() {
         input: Vec::new(),
         tools: Vec::new(),
         parallel_tool_calls: false,
-        base_instructions: BaseInstructions {
+        base_instructions: Some(BaseInstructions {
             text: "auth-sensitive websocket reuse".to_string(),
-        },
+        }),
         personality: None,
         output_schema: None,
     };

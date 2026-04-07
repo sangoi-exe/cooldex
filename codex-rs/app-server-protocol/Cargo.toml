@@ -26,7 +26,6 @@ schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
-shlex = { workspace = true }
 strum_macros = { workspace = true }
 thiserror = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [
@@ -35,6 +34,7 @@ rmcp = { workspace = true, default-features = false, features = [
     "schemars",
     "server",
 ] }
+shlex = { workspace = true }
 ts-rs = { workspace = true }
 inventory = { workspace = true }
 tracing = { workspace = true }

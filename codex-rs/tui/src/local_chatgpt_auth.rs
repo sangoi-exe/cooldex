@@ -1,7 +1,9 @@
+#![cfg(test)]
+
 use std::path::Path;
 
-use codex_core::auth::AuthCredentialsStoreMode;
-use codex_core::auth::load_auth_store;
+use codex_config::types::AuthCredentialsStoreMode;
+use codex_login::load_auth_store;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalChatgptAuth {
@@ -70,10 +72,10 @@ mod tests {
     use base64::Engine;
     use chrono::Utc;
     use codex_app_server_protocol::AuthMode;
-    use codex_core::auth::AuthDotJson;
-    use codex_core::auth::AuthStore;
-    use codex_core::auth::save_auth;
+    use codex_login::AuthDotJson;
+    use codex_login::AuthStore;
     use codex_login::auth::login_with_chatgpt_auth_tokens;
+    use codex_login::save_auth;
     use codex_login::token_data::TokenData;
     use pretty_assertions::assert_eq;
     use serde::Serialize;

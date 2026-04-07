@@ -2,9 +2,7 @@ use super::LoaderOverrides;
 use super::load_config_layers_state;
 use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
-use crate::config::ConfigToml;
 use crate::config::ConstraintError;
-use crate::config::ProjectConfig;
 use crate::config_loader::CloudRequirementsLoadError;
 use crate::config_loader::CloudRequirementsLoader;
 use crate::config_loader::ConfigLayerEntry;
@@ -16,6 +14,8 @@ use crate::config_loader::RequirementSource;
 use crate::config_loader::load_requirements_toml;
 use crate::config_loader::version_for_toml;
 use codex_config::CONFIG_TOML_FILE;
+use codex_config::config_toml::ConfigToml;
+use codex_config::config_toml::ProjectConfig;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::protocol::AskForApproval;
@@ -28,6 +28,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use tempfile::tempdir;
 use toml::Value as TomlValue;
+
+// Merge-safety anchor: config-loader tests keep the local managed-config test
+// override helpers aligned with loader behavior so merge work does not regress
+// the workspace-specific config stack expectations.
 
 fn config_error_from_io(err: &std::io::Error) -> &super::ConfigError {
     err.get_ref()
@@ -135,11 +139,7 @@ async fn returns_config_error_for_invalid_managed_config_toml() {
     let contents = "model = \"gpt-4\"\ninvalid = [";
     std::fs::write(&managed_path, contents).expect("write managed config");
 
-    let overrides = LoaderOverrides {
-        user_config_path: None,
-        managed_config_path: Some(managed_path.clone()),
-        ..Default::default()
-    };
+    let overrides = LoaderOverrides::with_managed_config_path_for_tests(managed_path.clone());
 
     let cwd = AbsolutePathBuf::try_from(tmp.path()).expect("cwd");
     let err = load_config_layers_state(
@@ -223,13 +223,7 @@ extra = true
     )
     .expect("write managed config");
 
-    let overrides = LoaderOverrides {
-        user_config_path: None,
-        managed_config_path: Some(managed_path),
-        #[cfg(target_os = "macos")]
-        managed_preferences_base64: None,
-        macos_managed_config_requirements_base64: None,
-    };
+    let overrides = LoaderOverrides::with_managed_config_path_for_tests(managed_path);
 
     let cwd = AbsolutePathBuf::try_from(tmp.path()).expect("cwd");
     let state = load_config_layers_state(
@@ -261,15 +255,7 @@ async fn returns_empty_when_all_layers_missing() {
     let tmp = tempdir().expect("tempdir");
     let managed_path = tmp.path().join("managed_config.toml");
 
-    let overrides = LoaderOverrides {
-        user_config_path: None,
-        managed_config_path: Some(managed_path),
-        #[cfg(target_os = "macos")]
-        // Force managed preferences to resolve as empty so this test does not
-        // inherit non-empty machine-specific managed state.
-        managed_preferences_base64: Some(String::new()),
-        macos_managed_config_requirements_base64: None,
-    };
+    let overrides = LoaderOverrides::with_managed_config_path_for_tests(managed_path);
 
     let cwd = AbsolutePathBuf::try_from(tmp.path()).expect("cwd");
     let layers = load_config_layers_state(
@@ -360,14 +346,9 @@ value = "managed"
 flag = false
 "#;
 
-    let overrides = LoaderOverrides {
-        user_config_path: None,
-        managed_config_path: Some(managed_path),
-        managed_preferences_base64: Some(
-            base64::prelude::BASE64_STANDARD.encode(raw_managed_preferences.as_bytes()),
-        ),
-        macos_managed_config_requirements_base64: None,
-    };
+    let mut overrides = LoaderOverrides::with_managed_config_path_for_tests(managed_path);
+    overrides.managed_preferences_base64 =
+        Some(base64::prelude::BASE64_STANDARD.encode(raw_managed_preferences.as_bytes()));
 
     let cwd = AbsolutePathBuf::try_from(tmp.path()).expect("cwd");
     let state = load_config_layers_state(
@@ -415,23 +396,23 @@ async fn managed_preferences_expand_home_directory_in_workspace_write_roots() ->
     };
     let tmp = tempdir()?;
 
-    let config = ConfigBuilder::default()
-        .codex_home(tmp.path().to_path_buf())
-        .fallback_cwd(Some(tmp.path().to_path_buf()))
-        .loader_overrides(LoaderOverrides {
-            managed_config_path: Some(tmp.path().join("managed_config.toml")),
-            managed_preferences_base64: Some(
-                base64::prelude::BASE64_STANDARD.encode(
-                    r#"
+    let mut loader_overrides =
+        LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml"));
+    loader_overrides.managed_preferences_base64 = Some(
+        base64::prelude::BASE64_STANDARD.encode(
+            r#"
 sandbox_mode = "workspace-write"
 [sandbox_workspace_write]
 writable_roots = ["~/code"]
 "#
-                    .as_bytes(),
-                ),
-            ),
-            macos_managed_config_requirements_base64: None,
-        })
+            .as_bytes(),
+        ),
+    );
+
+    let config = ConfigBuilder::default()
+        .codex_home(tmp.path().to_path_buf())
+        .fallback_cwd(Some(tmp.path().to_path_buf()))
+        .loader_overrides(loader_overrides)
         .build()
         .await?;
 
@@ -459,24 +440,23 @@ async fn managed_preferences_requirements_are_applied() -> anyhow::Result<()> {
 
     let tmp = tempdir()?;
 
+    let mut loader_overrides =
+        LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml"));
+    loader_overrides.macos_managed_config_requirements_base64 = Some(
+        base64::prelude::BASE64_STANDARD.encode(
+            r#"
+allowed_approval_policies = ["never"]
+allowed_sandbox_modes = ["read-only"]
+"#
+            .as_bytes(),
+        ),
+    );
+
     let state = load_config_layers_state(
         tmp.path(),
         Some(AbsolutePathBuf::try_from(tmp.path())?),
         &[] as &[(String, TomlValue)],
-        LoaderOverrides {
-            user_config_path: None,
-            managed_config_path: Some(tmp.path().join("managed_config.toml")),
-            managed_preferences_base64: Some(String::new()),
-            macos_managed_config_requirements_base64: Some(
-                base64::prelude::BASE64_STANDARD.encode(
-                    r#"
-allowed_approval_policies = ["never"]
-allowed_sandbox_modes = ["read-only"]
-"#
-                    .as_bytes(),
-                ),
-            ),
-        },
+        loader_overrides,
         CloudRequirementsLoader::default(),
     )
     .await?;
@@ -523,23 +503,21 @@ async fn managed_preferences_requirements_take_precedence() -> anyhow::Result<()
 
     tokio::fs::write(&managed_path, "approval_policy = \"on-request\"\n").await?;
 
+    let mut loader_overrides = LoaderOverrides::with_managed_config_path_for_tests(managed_path);
+    loader_overrides.macos_managed_config_requirements_base64 = Some(
+        base64::prelude::BASE64_STANDARD.encode(
+            r#"
+allowed_approval_policies = ["never"]
+"#
+            .as_bytes(),
+        ),
+    );
+
     let state = load_config_layers_state(
         tmp.path(),
         Some(AbsolutePathBuf::try_from(tmp.path())?),
         &[] as &[(String, TomlValue)],
-        LoaderOverrides {
-            user_config_path: None,
-            managed_config_path: Some(managed_path),
-            managed_preferences_base64: Some(String::new()),
-            macos_managed_config_requirements_base64: Some(
-                base64::prelude::BASE64_STANDARD.encode(
-                    r#"
-allowed_approval_policies = ["never"]
-"#
-                    .as_bytes(),
-                ),
-            ),
-        },
+        loader_overrides,
         CloudRequirementsLoader::default(),
     )
     .await?;
@@ -657,24 +635,24 @@ async fn cloud_requirements_take_precedence_over_mdm_requirements() -> anyhow::R
     use base64::Engine;
 
     let tmp = tempdir()?;
+    let mut loader_overrides = LoaderOverrides::without_managed_config_for_tests();
+    loader_overrides.macos_managed_config_requirements_base64 = Some(
+        base64::prelude::BASE64_STANDARD.encode(
+            r#"
+allowed_approval_policies = ["on-request"]
+"#
+            .as_bytes(),
+        ),
+    );
     let state = load_config_layers_state(
         tmp.path(),
         Some(AbsolutePathBuf::try_from(tmp.path())?),
         &[] as &[(String, TomlValue)],
-        LoaderOverrides {
-            macos_managed_config_requirements_base64: Some(
-                base64::prelude::BASE64_STANDARD.encode(
-                    r#"
-allowed_approval_policies = ["on-request"]
-"#
-                    .as_bytes(),
-                ),
-            ),
-            ..LoaderOverrides::default()
-        },
+        loader_overrides,
         CloudRequirementsLoader::new(async {
             Ok(Some(ConfigRequirementsToml {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
                 feature_requirements: None,
@@ -726,6 +704,7 @@ allowed_approval_policies = ["on-request"]
         RequirementSource::CloudRequirements,
         ConfigRequirementsToml {
             allowed_approval_policies: Some(vec![AskForApproval::Never]),
+            allowed_approvals_reviewers: None,
             allowed_sandbox_modes: None,
             allowed_web_search_modes: None,
             feature_requirements: None,
@@ -766,6 +745,7 @@ async fn load_config_layers_includes_cloud_requirements() -> anyhow::Result<()> 
 
     let requirements = ConfigRequirementsToml {
         allowed_approval_policies: Some(vec![AskForApproval::Never]),
+        allowed_approvals_reviewers: None,
         allowed_sandbox_modes: None,
         allowed_web_search_modes: None,
         feature_requirements: None,
@@ -949,7 +929,7 @@ model_instructions_file = "child.txt"
         .await?;
 
     assert_eq!(
-        config.base_instructions.as_deref(),
+        config.base_instructions.as_ref().and_then(Option::as_deref),
         Some("child instructions")
     );
 
@@ -985,7 +965,7 @@ async fn cli_override_model_instructions_file_sets_base_instructions() -> std::i
         .await?;
 
     assert_eq!(
-        config.base_instructions.as_deref(),
+        config.base_instructions.as_ref().and_then(Option::as_deref),
         Some("cli override instructions")
     );
 

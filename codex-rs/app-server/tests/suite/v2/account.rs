@@ -28,7 +28,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnStatus;
-use codex_login::AuthCredentialsStoreMode;
+use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE;
 use codex_login::EXTERNAL_SUPPORTED_CHATGPT_PLAN_REQUIRED_MESSAGE;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;

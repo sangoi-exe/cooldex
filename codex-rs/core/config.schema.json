@@ -366,6 +366,9 @@
             "connectors": {
               "type": "boolean"
             },
+            "debug_hide_spawn_agent_metadata": {
+              "type": "boolean"
+            },
             "default_mode_request_user_input": {
               "type": "boolean"
             },
@@ -439,6 +442,9 @@
               "type": "boolean"
             },
             "realtime_conversation": {
+              "type": "boolean"
+            },
+            "remote_control": {
               "type": "boolean"
             },
             "remote_models": {
@@ -523,6 +529,15 @@
           "type": "object"
         },
         "include_apply_patch_tool": {
+          "type": "boolean"
+        },
+        "include_apps_instructions": {
+          "type": "boolean"
+        },
+        "include_environment_context": {
+          "type": "boolean"
+        },
+        "include_permissions_instructions": {
           "type": "boolean"
         },
         "js_repl_node_module_dirs": {
@@ -2122,6 +2137,9 @@
         "connectors": {
           "type": "boolean"
         },
+        "debug_hide_spawn_agent_metadata": {
+          "type": "boolean"
+        },
         "default_mode_request_user_input": {
           "type": "boolean"
         },
@@ -2195,6 +2213,9 @@
           "type": "boolean"
         },
         "realtime_conversation": {
+          "type": "boolean"
+        },
+        "remote_control": {
           "type": "boolean"
         },
         "remote_models": {
@@ -2330,6 +2351,18 @@
       "default": null,
       "description": "Settings that govern if and what will be written to `~/.codex/history.jsonl`."
     },
+    "include_apps_instructions": {
+      "description": "Whether to inject the `<apps_instructions>` developer block.",
+      "type": "boolean"
+    },
+    "include_environment_context": {
+      "description": "Whether to inject the `<environment_context>` user block.",
+      "type": "boolean"
+    },
+    "include_permissions_instructions": {
+      "description": "Whether to inject the `<permissions instructions>` developer block.",
+      "type": "boolean"
+    },
     "instructions": {
       "description": "System instructions.",
       "type": "string"
@@ -2418,7 +2451,7 @@
       "description": "Optional path to a JSON model catalog (applied on startup only). Per-thread `config` overrides are accepted but do not reapply this (no-ops)."
     },
     "model_context_window": {
-      "description": "Requested context window override, in tokens.\n\nWhen remote model metadata provides a context window, this value is clamped so it cannot exceed the remote model's context window.",
+      "description": "Size of the context window for the model, in tokens.",
       "format": "int64",
       "type": "integer"
     },
@@ -2466,7 +2499,7 @@
           "$ref": "#/definitions/Notice"
         }
       ],
-      "description": "Collection of in-product notices (different from notifications) See [`codex_config::types::Notice`] for more details"
+      "description": "Collection of in-product notices (different from notifications) See [`crate::types::Notice`] for more details"
     },
     "notify": {
       "default": null,
@@ -2573,7 +2606,7 @@
       "description": "Experimental / do not use. Realtime websocket session selection. `version` controls v1/v2 and `type` controls conversational/transcription."
     },
     "recall_debug": {
-      "description": "Controls recall payload verbosity. When unset/false, use a compact string-list payload. When true, use the full/debug payload. Keep docs/recall.md and docs/guide_reapply_recall.md aligned with this default.",
+      "description": "Controls recall payload verbosity. When unset/false, use a compact string-list payload. When true, use the full/debug payload. Keep recall runtime/docs/schema aligned with this default.",
       "type": "boolean"
     },
     "recall_kbytes_limit": {

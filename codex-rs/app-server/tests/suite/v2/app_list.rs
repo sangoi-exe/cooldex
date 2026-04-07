@@ -34,7 +34,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
-use codex_login::AuthCredentialsStoreMode;
+use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::AuthStore;
 use codex_login::save_auth;
 use pretty_assertions::assert_eq;
@@ -54,6 +54,10 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+
+// Merge-safety anchor: app-list auth fixtures keep `/accounts` and connector
+// startup behavior aligned so account-store changes do not silently regress app
+// availability tests.
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 

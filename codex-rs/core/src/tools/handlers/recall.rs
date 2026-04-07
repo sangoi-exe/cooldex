@@ -814,6 +814,7 @@ mod tests {
             turn_id: turn_id.to_string(),
             model_context_window: Some(128_000),
             collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
         }))
     }
 
@@ -821,6 +822,8 @@ mod tests {
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: turn_id.to_string(),
             last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
         }))
     }
 
@@ -1637,7 +1640,8 @@ mod tests {
                 session.conversation_id,
                 None,
                 turn.session_source.clone(),
-                BaseInstructions::default(),
+                Some(BaseInstructions::default()),
+                None,
                 Vec::new(),
                 crate::rollout::policy::EventPersistenceMode::Limited,
             ),
@@ -1681,7 +1685,8 @@ mod tests {
                 session.conversation_id,
                 None,
                 turn.session_source.clone(),
-                BaseInstructions::default(),
+                Some(BaseInstructions::default()),
+                None,
                 Vec::new(),
                 crate::rollout::policy::EventPersistenceMode::Limited,
             ),

@@ -81,7 +81,8 @@ pub enum RolloutRecorderParams {
         conversation_id: ThreadId,
         forked_from_id: Option<ThreadId>,
         source: SessionSource,
-        base_instructions: BaseInstructions,
+        base_instructions: Option<BaseInstructions>,
+        developer_instructions: Option<Option<String>>,
         dynamic_tools: Vec<DynamicToolSpec>,
         event_persistence_mode: EventPersistenceMode,
     },
@@ -114,7 +115,8 @@ impl RolloutRecorderParams {
         conversation_id: ThreadId,
         forked_from_id: Option<ThreadId>,
         source: SessionSource,
-        base_instructions: BaseInstructions,
+        base_instructions: Option<BaseInstructions>,
+        developer_instructions: Option<Option<String>>,
         dynamic_tools: Vec<DynamicToolSpec>,
         event_persistence_mode: EventPersistenceMode,
     ) -> Self {
@@ -123,6 +125,7 @@ impl RolloutRecorderParams {
             forked_from_id,
             source,
             base_instructions,
+            developer_instructions,
             dynamic_tools,
             event_persistence_mode,
         }
@@ -384,6 +387,7 @@ impl RolloutRecorder {
                     forked_from_id,
                     source,
                     base_instructions,
+                    developer_instructions,
                     dynamic_tools,
                     event_persistence_mode,
                 } => {
@@ -414,6 +418,7 @@ impl RolloutRecorder {
                         source,
                         model_provider: Some(config.model_provider_id().to_string()),
                         base_instructions: Some(base_instructions),
+                        developer_instructions,
                         dynamic_tools: if dynamic_tools.is_empty() {
                             None
                         } else {

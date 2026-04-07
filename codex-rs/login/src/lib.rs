@@ -9,6 +9,7 @@ mod pkce;
 mod server;
 
 pub use codex_client::BuildCustomCaTransportError as BuildLoginHttpClientError;
+pub use codex_config::types::AuthCredentialsStoreMode;
 pub use device_code_auth::DeviceCode;
 pub use device_code_auth::complete_device_code_login;
 pub use device_code_auth::request_device_code;
@@ -24,9 +25,9 @@ pub use api_bridge::auth_provider_from_auth;
 pub use auth::AccountSummary;
 pub use auth::AccountUsageCache;
 pub use auth::AuthConfig;
-pub use auth::AuthCredentialsStoreMode;
 pub use auth::AuthDotJson;
 pub use auth::AuthManager;
+pub use auth::AuthManagerConfig;
 pub use auth::AuthStore;
 pub use auth::CLIENT_ID;
 pub use auth::CODEX_API_KEY_ENV_VAR;
