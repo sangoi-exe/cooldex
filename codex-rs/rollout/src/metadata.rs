@@ -441,10 +441,12 @@ async fn collect_rollout_paths(root: &Path) -> std::io::Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RolloutConfig;
     use chrono::DateTime;
     use chrono::NaiveDateTime;
     use chrono::Timelike;
     use chrono::Utc;
+    use codex_git_utils::GitSha;
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::GitInfo;
@@ -462,6 +464,16 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    fn test_config(codex_home: PathBuf) -> RolloutConfig {
+        RolloutConfig {
+            sqlite_home: codex_home.clone(),
+            cwd: codex_home.clone(),
+            codex_home,
+            model_provider_id: "test-provider".to_string(),
+            generate_memories: true,
+        }
+    }
 
     #[tokio::test]
     async fn extract_metadata_from_rollout_uses_session_meta() {
@@ -645,7 +657,7 @@ mod tests {
         ))
         .await;
 
-        let mut config = crate::config::test_config();
+        let mut config = test_config(codex_home.clone());
         config.codex_home = codex_home.clone();
         config.model_provider_id = "test-provider".to_string();
         backfill_sessions(runtime.as_ref(), &config).await;
@@ -693,7 +705,7 @@ mod tests {
             "2026-01-27T12:34:56Z",
             thread_uuid,
             Some(GitInfo {
-                commit_hash: Some("rollout-sha".to_string()),
+                commit_hash: Some(GitSha::new("rollout-sha")),
                 branch: Some("rollout-branch".to_string()),
                 repository_url: Some("git@example.com:openai/codex.git".to_string()),
             }),
@@ -716,7 +728,7 @@ mod tests {
             .await
             .expect("existing metadata upsert");
 
-        let mut config = crate::config::test_config();
+        let mut config = test_config(codex_home.clone());
         config.codex_home = codex_home.clone();
         config.model_provider_id = "test-provider".to_string();
         backfill_sessions(runtime.as_ref(), &config).await;
@@ -754,7 +766,7 @@ mod tests {
                 .await
                 .expect("initialize runtime");
 
-        let mut config = crate::config::test_config();
+        let mut config = test_config(codex_home.clone());
         config.codex_home = codex_home.clone();
         config.model_provider_id = "test-provider".to_string();
         backfill_sessions(runtime.as_ref(), &config).await;

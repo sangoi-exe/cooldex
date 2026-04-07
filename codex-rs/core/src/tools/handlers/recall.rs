@@ -41,7 +41,6 @@ enum StopReason {
     InvalidContract,
     Unavailable,
     NoCompactionMarker,
-    RolloutParseError,
     RolloutReadError,
 }
 
@@ -51,7 +50,6 @@ impl StopReason {
             Self::InvalidContract => "invalid_contract",
             Self::Unavailable => "unavailable",
             Self::NoCompactionMarker => "no_compaction_marker",
-            Self::RolloutParseError => "rollout_parse_error",
             Self::RolloutReadError => "rollout_read_error",
         }
     }
@@ -141,7 +139,7 @@ async fn handle_recall(
     })?;
     let rollout_path = rollout_recorder.rollout_path().to_path_buf();
     let (rollout_items, _thread_id, parse_errors) =
-        RolloutRecorder::load_rollout_items(rollout_path.as_path())
+        RolloutRecorder::load_rollout_items_skipping_malformed_lines(rollout_path.as_path())
             .await
             .map_err(|error| {
                 contract_error(
@@ -176,13 +174,6 @@ fn build_recall_payload(
     parse_errors: usize,
     recall_debug: bool,
 ) -> Result<serde_json::Value, FunctionCallError> {
-    if parse_errors > 0 {
-        return Err(contract_error(
-            StopReason::RolloutParseError,
-            rollout_parse_error_message(parse_errors),
-        ));
-    }
-
     let discarded_rollout_indices = discarded_rollout_indices_for_rolled_back_turns(rollout_items);
     let compacted_markers_seen = rollout_items
         .iter()
@@ -263,7 +254,7 @@ fn build_recall_payload(
         "mode": "recall_pre_compact",
         "source": "current_session_rollout",
         "integrity": {
-            "status": "ok",
+            "status": recall_integrity_status(parse_errors),
             "rollout_parse_errors": parse_errors,
         },
         "boundary": {
@@ -287,6 +278,10 @@ fn build_recall_payload(
         },
         "items": matching_items,
     }))
+}
+
+fn recall_integrity_status(parse_errors: usize) -> &'static str {
+    if parse_errors > 0 { "degraded" } else { "ok" }
 }
 
 #[derive(Debug)]
@@ -408,10 +403,6 @@ fn previous_recall_boundary_before(
             _ => None,
         })
         .next_back()
-}
-
-fn rollout_parse_error_message(parse_errors: usize) -> String {
-    format!("current session rollout is malformed (rollout parse errors: {parse_errors})")
 }
 
 fn is_prompt_gc_observational_marker(compacted: &CompactedItem) -> bool {
@@ -897,20 +888,16 @@ mod tests {
     }
 
     #[test]
-    fn recall_parse_errors_take_precedence_over_no_compaction_marker() {
+    fn recall_no_compaction_marker_still_wins_when_rollout_parsing_is_degraded() {
         let rollout_items = vec![assistant_message("before", None), reasoning("analysis")];
 
         let error = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 2, true)
-            .expect_err("must fail loud when rollout parsing is degraded");
+            .expect_err("must still fail when no compaction marker exists");
         let payload = parse_error_payload(error);
 
         assert_eq!(
             payload.get("stop_reason").and_then(Value::as_str),
-            Some(StopReason::RolloutParseError.as_str())
-        );
-        assert_eq!(
-            payload.get("message").and_then(Value::as_str),
-            Some("current session rollout is malformed (rollout parse errors: 2)")
+            Some(StopReason::NoCompactionMarker.as_str())
         );
     }
 
@@ -1486,23 +1473,22 @@ mod tests {
     }
 
     #[test]
-    fn recall_fails_loud_when_rollout_has_parse_errors() {
+    fn recall_reports_degraded_integrity_when_rollout_has_parse_errors() {
         let rollout_items = vec![
             assistant_message("assistant before compact", None),
             compacted_marker(),
         ];
 
-        let error = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 1, true)
-            .expect_err("malformed rollout must fail loud");
-        let payload = parse_error_payload(error);
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 1, true)
+            .expect("malformed rollout lines should be skipped");
 
         assert_eq!(
-            payload.get("stop_reason").and_then(Value::as_str),
-            Some(StopReason::RolloutParseError.as_str())
+            payload.pointer("/integrity/status"),
+            Some(&json!("degraded"))
         );
         assert_eq!(
-            payload.get("message").and_then(Value::as_str),
-            Some("current session rollout is malformed (rollout parse errors: 1)")
+            payload.pointer("/integrity/rollout_parse_errors"),
+            Some(&json!(1))
         );
     }
 
@@ -1568,6 +1554,11 @@ mod tests {
         assert_eq!(
             payload.pointer("/filters/include_context_notes"),
             Some(&json!(true))
+        );
+        assert_eq!(payload.pointer("/integrity/status"), Some(&json!("ok")));
+        assert_eq!(
+            payload.pointer("/integrity/rollout_parse_errors"),
+            Some(&json!(0))
         );
         assert_eq!(items[0].get("kind"), Some(&json!("tool_context_note")));
         assert_eq!(items[0].get("source"), Some(&json!("replacement_history")));
@@ -1635,7 +1626,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recall_fails_loud_when_rollout_contains_invalid_line() {
+    async fn recall_returns_rollout_read_error_when_current_rollout_path_is_missing() {
+        let (session, mut turn) = crate::codex::make_session_and_context().await;
+        let mut config = (*turn.config).clone();
+        config.recall_debug = Some(true);
+        turn.config = std::sync::Arc::new(config);
+        let recorder = crate::rollout::RolloutRecorder::new(
+            turn.config.as_ref(),
+            crate::rollout::RolloutRecorderParams::new(
+                session.conversation_id,
+                None,
+                turn.session_source.clone(),
+                BaseInstructions::default(),
+                Vec::new(),
+                crate::rollout::policy::EventPersistenceMode::Limited,
+            ),
+            None,
+            None,
+        )
+        .await
+        .expect("create rollout recorder");
+        let rollout_path = recorder.rollout_path().to_path_buf();
+        {
+            let mut guard = session.services.rollout.lock().await;
+            *guard = Some(recorder.clone());
+        }
+
+        session.persist_rollout_items(&[compacted_marker()]).await;
+        session.ensure_rollout_materialized().await;
+        recorder.flush().await.expect("flush rollout");
+        tokio::fs::remove_file(&rollout_path)
+            .await
+            .expect("remove rollout path");
+
+        let error = handle_recall(&session, &turn, &RecallToolArgs {})
+            .await
+            .expect_err("missing rollout path must still fail");
+
+        assert_eq!(
+            parse_error_stop_reason(error),
+            StopReason::RolloutReadError.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_ignores_malformed_rollout_line_and_reports_degraded_integrity() {
         let (session, mut turn) = crate::codex::make_session_and_context().await;
         let mut config = (*turn.config).clone();
         config.recall_debug = Some(true);
@@ -1683,18 +1718,22 @@ mod tests {
         .expect("append malformed rollout line");
         file.flush().await.expect("flush malformed line");
 
-        let error = handle_recall(&session, &turn, &RecallToolArgs {})
+        let payload = handle_recall(&session, &turn, &RecallToolArgs {})
             .await
-            .expect_err("malformed rollout must fail loud");
-        let payload = parse_error_payload(error);
+            .expect("malformed rollout line should be skipped");
 
         assert_eq!(
-            payload.get("stop_reason").and_then(Value::as_str),
-            Some(StopReason::RolloutParseError.as_str())
+            payload.pointer("/integrity/status"),
+            Some(&json!("degraded"))
         );
         assert_eq!(
-            payload.get("message").and_then(Value::as_str),
-            Some("current session rollout is malformed (rollout parse errors: 1)")
+            payload.pointer("/integrity/rollout_parse_errors"),
+            Some(&json!(1))
+        );
+        assert_eq!(payload.pointer("/counts/returned_items"), Some(&json!(1)));
+        assert_eq!(
+            payload.pointer("/items/0/text"),
+            Some(&json!("assistant before compact"))
         );
     }
 }

@@ -625,8 +625,26 @@ impl RolloutRecorder {
         Ok((items, thread_id, parse_errors))
     }
 
+    // Merge-safety anchor: resume/recall crash recovery must share this
+    // recorder-owned JSONL tolerance seam so malformed-line policy cannot drift
+    // per caller after upstream merges.
+    pub async fn load_rollout_items_skipping_malformed_lines(
+        path: &Path,
+    ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+        let (items, thread_id, parse_errors) = Self::load_rollout_items(path).await?;
+        if parse_errors > 0 {
+            warn!(
+                path = %path.display(),
+                parse_errors,
+                "ignored malformed rollout JSONL lines while loading tolerant session history"
+            );
+        }
+        Ok((items, thread_id, parse_errors))
+    }
+
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
-        let (items, thread_id, _parse_errors) = Self::load_rollout_items(path).await?;
+        let (items, thread_id, _parse_errors) =
+            Self::load_rollout_items_skipping_malformed_lines(path).await?;
         let conversation_id = thread_id
             .ok_or_else(|| IoError::other("failed to parse thread ID from rollout file"))?;
 
@@ -1256,8 +1274,7 @@ fn cwd_matches(session_cwd: &Path, cwd: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ConfigBuilder;
-    use crate::features::Feature;
+    use crate::config::RolloutConfig;
     use chrono::TimeZone;
     use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
     use codex_protocol::models::ContentItem;
@@ -1278,6 +1295,16 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use uuid::Uuid;
+
+    fn test_config(codex_home: &Path) -> RolloutConfig {
+        RolloutConfig {
+            codex_home: codex_home.to_path_buf(),
+            sqlite_home: codex_home.to_path_buf(),
+            cwd: codex_home.to_path_buf(),
+            model_provider_id: "test-provider".to_string(),
+            generate_memories: true,
+        }
+    }
 
     fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<PathBuf> {
         let day_dir = root.join("sessions/2025/01/03");
@@ -1314,10 +1341,7 @@ mod tests {
     #[tokio::test]
     async fn recorder_materializes_only_after_explicit_persist() -> std::io::Result<()> {
         let home = TempDir::new().expect("temp dir");
-        let config = ConfigBuilder::default()
-            .codex_home(home.path().to_path_buf())
-            .build()
-            .await?;
+        let config = test_config(home.path());
         let thread_id = ThreadId::new();
         let recorder = RolloutRecorder::new(
             &config,
@@ -1401,14 +1425,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_irrelevant_events_touch_state_db_updated_at() -> std::io::Result<()> {
         let home = TempDir::new().expect("temp dir");
-        let mut config = ConfigBuilder::default()
-            .codex_home(home.path().to_path_buf())
-            .build()
-            .await?;
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow sqlite");
+        let config = test_config(home.path());
 
         let state_db =
             StateRuntime::init(home.path().to_path_buf(), config.model_provider_id.clone())
@@ -1490,14 +1507,7 @@ mod tests {
     async fn metadata_irrelevant_events_fall_back_to_upsert_when_thread_missing()
     -> std::io::Result<()> {
         let home = TempDir::new().expect("temp dir");
-        let mut config = ConfigBuilder::default()
-            .codex_home(home.path().to_path_buf())
-            .build()
-            .await?;
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow sqlite");
+        let config = test_config(home.path());
 
         let state_db =
             StateRuntime::init(home.path().to_path_buf(), config.model_provider_id.clone())
@@ -1542,14 +1552,7 @@ mod tests {
     #[tokio::test]
     async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Result<()> {
         let home = TempDir::new().expect("temp dir");
-        let mut config = ConfigBuilder::default()
-            .codex_home(home.path().to_path_buf())
-            .build()
-            .await?;
-        config
-            .features
-            .disable(Feature::Sqlite)
-            .expect("test config should allow sqlite to be disabled");
+        let config = test_config(home.path());
 
         let newest = write_session_file(home.path(), "2025-01-03T12-00-00", Uuid::from_u128(9001))?;
         let middle = write_session_file(home.path(), "2025-01-02T12-00-00", Uuid::from_u128(9002))?;
@@ -1591,14 +1594,7 @@ mod tests {
     #[tokio::test]
     async fn list_threads_db_enabled_drops_missing_rollout_paths() -> std::io::Result<()> {
         let home = TempDir::new().expect("temp dir");
-        let mut config = ConfigBuilder::default()
-            .codex_home(home.path().to_path_buf())
-            .build()
-            .await?;
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow sqlite");
+        let config = test_config(home.path());
 
         let uuid = Uuid::from_u128(9010);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
@@ -1659,14 +1655,7 @@ mod tests {
     #[tokio::test]
     async fn list_threads_db_enabled_repairs_stale_rollout_paths() -> std::io::Result<()> {
         let home = TempDir::new().expect("temp dir");
-        let mut config = ConfigBuilder::default()
-            .codex_home(home.path().to_path_buf())
-            .build()
-            .await?;
-        config
-            .features
-            .enable(Feature::Sqlite)
-            .expect("test config should allow sqlite");
+        let config = test_config(home.path());
 
         let uuid = Uuid::from_u128(9011);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
@@ -1777,10 +1766,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_gc_persist_items_atomically_writes_both_rollout_items() -> std::io::Result<()> {
         let home = TempDir::new().expect("temp dir");
-        let config = ConfigBuilder::default()
-            .codex_home(home.path().to_path_buf())
-            .build()
-            .await?;
+        let config = test_config(home.path());
         let recorder = RolloutRecorder::new(
             &config,
             RolloutRecorderParams::new(
@@ -1851,6 +1837,56 @@ mod tests {
         );
 
         recorder.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tolerant_rollout_loading_skips_malformed_lines_and_preserves_count()
+    -> std::io::Result<()> {
+        let home = TempDir::new().expect("temp dir");
+        let session_uuid = Uuid::from_u128(9911);
+        let path = write_session_file(home.path(), "2025-01-03T13-00-00", session_uuid)?;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+        writeln!(
+            file,
+            "timestamp\":\"2025-01-03T13:00:02Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\"}}"
+        )?;
+        let trailing_event = RolloutLine {
+            timestamp: "2025-01-03T13:00:03Z".to_string(),
+            item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "after malformed line".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+            })),
+        };
+        writeln!(file, "{}", serde_json::to_string(&trailing_event)?)?;
+
+        let (items, thread_id, parse_errors) =
+            RolloutRecorder::load_rollout_items_skipping_malformed_lines(path.as_path()).await?;
+        assert_eq!(parse_errors, 1);
+        assert_eq!(
+            thread_id,
+            Some(ThreadId::from_string(&session_uuid.to_string()).expect("valid thread id"))
+        );
+        assert_eq!(items.len(), 3);
+        assert!(matches!(
+            &items[2],
+            RolloutItem::EventMsg(EventMsg::UserMessage(event))
+                if event.message == "after malformed line"
+        ));
+
+        let history = RolloutRecorder::get_rollout_history(path.as_path()).await?;
+        let InitialHistory::Resumed(resumed) = history else {
+            panic!("expected resumed history");
+        };
+        assert_eq!(resumed.history.len(), items.len());
+        assert!(matches!(
+            &resumed.history[2],
+            RolloutItem::EventMsg(EventMsg::UserMessage(event))
+                if event.message == "after malformed line"
+        ));
+
         Ok(())
     }
 }

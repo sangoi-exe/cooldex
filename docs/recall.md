@@ -19,8 +19,8 @@
 - If that lower boundary is `replacement_history_compacted`, `recall` starts from the sanitized `replacement_history` persisted on that boundary, hydrates assistant/reasoning items plus prompt-gc context notes stored as tagged note messages, and then appends newer rollout items after the marker until the latest compaction marker.
 - Otherwise, returned scan starts at `lower_boundary_index + 1`.
 - If no lower boundary marker exists, scan starts at rollout index `0`.
-- If rollout parsing encounters malformed lines, the tool fails with `stop_reason = "rollout_parse_error"`.
-- If no upper boundary marker exists and rollout parsing succeeded, the tool fails with `stop_reason = "no_compaction_marker"`.
+- If rollout parsing encounters malformed JSONL lines, `recall` skips those lines and continues from the remaining valid rollout items.
+- If no upper boundary marker exists after malformed lines are skipped, the tool fails with `stop_reason = "no_compaction_marker"`.
 - Merge-safety note: this boundary behavior must stay aligned with `codex-rs/core/src/tools/handlers/recall.rs` and compaction paths that persist `replacement_history`.
 
 ### Filtering and Size Budget
@@ -44,8 +44,8 @@
 - Debug mode (`recall_debug = true`):
   - `mode = "recall_pre_compact"`
   - `source = "current_session_rollout"`
-  - `integrity.status = "ok"` on every successful response
-  - `integrity.rollout_parse_errors = 0` on every successful response
+  - `integrity.status = "ok"` when no malformed rollout lines were skipped, or `"degraded"` when `recall` skipped malformed JSONL lines
+  - `integrity.rollout_parse_errors = <real skipped-line count>` on every successful response
   - `boundary.start_index`
   - `boundary.last_boundary_index` (nullable)
   - `boundary.last_boundary_kind` (`"context_compacted_event" | "compacted_marker" | "replacement_history_compacted" | null`)

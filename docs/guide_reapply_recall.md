@@ -32,8 +32,9 @@ This document lists the required maintenance touchpoints and validation when `re
 - In debug mode, `filters.include_context_notes = true`.
 - In debug mode, replacement-history-derived items must report `source = "replacement_history"` and may use `rollout_index = null`; raw rollout-derived items use `source = "rollout"` with a concrete rollout index.
 - In debug mode, hydrated prompt-gc notes use `kind = "tool_context_note"` or `kind = "reasoning_context_note"` and preserve the tagged note body, including the leading `chunk_id=...` line.
-- Rollout parse errors fail loud with `stop_reason = "rollout_parse_error"` before normal payload construction.
-- If no compaction marker exists and rollout parsing succeeded, recall fails loud with `stop_reason = "no_compaction_marker"`.
+- Malformed rollout JSONL lines are skipped before normal payload construction; in debug mode, successful responses must expose the skipped-line count via `integrity.rollout_parse_errors`.
+- In debug mode, `integrity.status` must be exactly `"ok"` when no malformed lines were skipped and `"degraded"` when at least one malformed line was skipped.
+- If no compaction marker exists after malformed lines are skipped, recall fails loud with `stop_reason = "no_compaction_marker"`.
 - Merge-safety note: keep this recall-first recovery contract aligned with auto-compact warning coverage in `codex-rs/core/tests/suite/compact.rs` and `codex-rs/core/tests/suite/compact_remote.rs`.
 
 ## Required Touchpoints for Contract Changes
@@ -57,8 +58,11 @@ Run only focused checks unless broader coverage is explicitly required:
 
 ```bash
 (cd codex-rs && just fmt)
+bash ./scripts/cargo-guard.sh cargo check -p codex-rollout
+bash ./scripts/cargo-guard.sh cargo check -p codex-rollout --tests
 bash ./scripts/cargo-guard.sh cargo check -p codex-core
 bash ./scripts/cargo-guard.sh cargo check -p codex-core --tests
+bash ./scripts/cargo-guard.sh cargo test -p codex-rollout --no-run
 bash ./scripts/cargo-guard.sh cargo test -p codex-core --no-run
 bash ./scripts/cargo-guard.sh cargo test -p codex-core recall_
 DYLINT_DRIVER_PATH=/tmp/dylint_drivers bash ./tools/argument-comment-lint/run.sh
