@@ -20,6 +20,7 @@ use crate::bottom_pane::MentionBinding;
 use crate::chatwidget::realtime::RealtimeConversationPhase;
 use crate::history_cell::UserHistoryCell;
 use crate::model_catalog::ModelCatalog;
+use crate::resume_history::apply_resume_history_mode;
 use crate::test_backend::VT100Backend;
 use crate::test_support::PathBufExt;
 use crate::test_support::test_path_display;
@@ -90,6 +91,7 @@ use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
 use codex_app_server_protocol::UserInput as AppServerUserInput;
 use codex_app_server_protocol::WebSearchAction as AppServerWebSearchAction;
 use codex_config::types::Notifications;
+use codex_config::types::ResumeHistoryMode;
 #[cfg(target_os = "windows")]
 use codex_config::types::WindowsSandboxModeToml;
 use codex_core::config::Config;
@@ -547,6 +549,100 @@ async fn resumed_turn_history_replays_original_rollout_snapshot() {
         "expected rich replay to suppress legacy initial_messages fallback, got {rendered:?}"
     );
     assert_snapshot!("resumed_turn_history_replays_original_rollout", rendered);
+}
+
+#[tokio::test]
+async fn resumed_turn_history_since_last_compaction_boundary_snapshot() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+    let mut config = test_config().await;
+    config.tui_resume_history = ResumeHistoryMode::SinceLastCompaction;
+
+    chat.pending_resume_turns = Some(apply_resume_history_mode(
+        &config,
+        vec![
+            AppServerTurn {
+                id: "turn-0".to_string(),
+                status: AppServerTurnStatus::Completed,
+                error: None,
+                items: vec![AppServerThreadItem::AgentMessage {
+                    id: "assistant-0".to_string(),
+                    text: "before compaction should stay hidden".to_string(),
+                    phase: None,
+                    memory_citation: None,
+                }],
+            },
+            AppServerTurn {
+                id: "turn-1".to_string(),
+                status: AppServerTurnStatus::Completed,
+                error: None,
+                items: vec![
+                    AppServerThreadItem::ContextCompaction {
+                        id: "compact-1".to_string(),
+                    },
+                    AppServerThreadItem::UserMessage {
+                        id: "user-1".to_string(),
+                        content: vec![AppServerUserInput::Text {
+                            text: "hello after compaction".to_string(),
+                            text_elements: Vec::new(),
+                        }],
+                    },
+                    AppServerThreadItem::AgentMessage {
+                        id: "assistant-1".to_string(),
+                        text: "assistant reply after compaction".to_string(),
+                        phase: None,
+                        memory_citation: None,
+                    },
+                ],
+            },
+        ],
+    ));
+
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+            session_id: conversation_id,
+            forked_from_id: None,
+            thread_name: None,
+            model: "test-model".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            service_tier: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            cwd: PathBuf::from("/home/user/project"),
+            reasoning_effort: Some(ReasoningEffortConfig::default()),
+            history_log_id: 0,
+            history_entry_count: 0,
+            initial_messages: Some(vec![EventMsg::AgentMessage(AgentMessageEvent {
+                message: "legacy fallback should not render".to_string(),
+                phase: None,
+                memory_citation: None,
+            })]),
+            network_proxy: None,
+            rollout_path: Some(rollout_file.path().to_path_buf()),
+        }),
+    });
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !rendered.contains("before compaction should stay hidden"),
+        "expected compaction boundary to hide pre-compaction transcript, got {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("legacy fallback should not render"),
+        "expected rich replay to suppress legacy initial_messages fallback, got {rendered:?}"
+    );
+    assert_snapshot!(
+        "resumed_turn_history_since_last_compaction_boundary",
+        rendered
+    );
 }
 
 #[tokio::test]

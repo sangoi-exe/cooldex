@@ -46,6 +46,7 @@ use crate::pager_overlay::Overlay;
 use crate::read_session_model;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
+use crate::resume_history::apply_resume_history_mode;
 use crate::resume_picker::SessionSelection;
 #[cfg(test)]
 use crate::test_support::PathBufExt;
@@ -87,10 +88,8 @@ use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError as AppServerTurnError;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::build_turns_from_rollout_items;
-use codex_app_server_protocol::truncate_turns_since_last_context_compaction;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::ModelAvailabilityNuxConfig;
-use codex_config::types::ResumeHistoryMode;
 use codex_core::PromptGcActivityEdge;
 use codex_core::RolloutRecorder;
 use codex_core::auth::CLIENT_ID;
@@ -186,18 +185,6 @@ fn format_account_display(label: Option<&str>, email: Option<&str>, fallback: &s
         (Some(label), None) => label.to_string(),
         (None, Some(email)) => email.to_string(),
         (None, None) => fallback.to_string(),
-    }
-}
-
-// Merge-safety anchor: plain-TUI resume truncation must stay aligned with the
-// shared rollback-aware turn reconstruction and the persisted
-// `[tui].resume_history` contract; do not reintroduce raw-rollout slicing here.
-fn apply_resume_history_mode(config: &Config, turns: Vec<Turn>) -> Vec<Turn> {
-    match config.tui_resume_history {
-        ResumeHistoryMode::Full => turns,
-        ResumeHistoryMode::SinceLastCompaction => {
-            truncate_turns_since_last_context_compaction(turns)
-        }
     }
 }
 
@@ -3617,7 +3604,7 @@ impl App {
                     .await
                 {
                     Ok(thread) => {
-                        let turns = thread.turns.clone();
+                        let turns = apply_resume_history_mode(&self.config, thread.turns.clone());
                         (thread, turns)
                     }
                     Err(err) if Self::can_fallback_from_include_turns_error(&err) => {
@@ -12873,7 +12860,7 @@ guardian_approval = true
     }
 
     #[tokio::test]
-    async fn apply_resume_history_mode_since_last_compaction_keeps_suffix_only() {
+    async fn app_server_replay_since_last_compaction_keeps_suffix_only() {
         let mut config = ConfigBuilder::default().build().await.expect("config");
         config.tui_resume_history = ResumeHistoryMode::SinceLastCompaction;
 
@@ -12928,7 +12915,7 @@ guardian_approval = true
     }
 
     #[tokio::test]
-    async fn apply_resume_history_mode_full_keeps_entire_transcript() {
+    async fn app_server_replay_full_keeps_entire_transcript() {
         let mut config = ConfigBuilder::default().build().await.expect("config");
         config.tui_resume_history = ResumeHistoryMode::Full;
 
@@ -13176,7 +13163,7 @@ guardian_approval = true
     }
 
     #[tokio::test]
-    async fn refreshed_snapshot_session_persists_resumed_turns() {
+    async fn refreshed_snapshot_session_persists_resumed_turn_boundary() {
         let mut app = make_test_app().await;
         let thread_id = ThreadId::new();
         let initial_session = test_thread_session(thread_id, PathBuf::from("/tmp/original"));
@@ -13189,17 +13176,37 @@ guardian_approval = true
             ),
         );
 
-        let resumed_turns = vec![test_turn(
-            "turn-1",
-            TurnStatus::Completed,
-            vec![ThreadItem::UserMessage {
-                id: "user-1".to_string(),
-                content: vec![AppServerUserInput::Text {
-                    text: "restored prompt".to_string(),
-                    text_elements: Vec::new(),
-                }],
-            }],
-        )];
+        let resumed_turns = apply_resume_history_mode(
+            &app.config,
+            vec![
+                test_turn(
+                    "turn-0",
+                    TurnStatus::Completed,
+                    vec![ThreadItem::AgentMessage {
+                        id: "assistant-0".to_string(),
+                        text: "before compaction".to_string(),
+                        phase: None,
+                        memory_citation: None,
+                    }],
+                ),
+                test_turn(
+                    "turn-1",
+                    TurnStatus::Completed,
+                    vec![
+                        ThreadItem::ContextCompaction {
+                            id: "compact-1".to_string(),
+                        },
+                        ThreadItem::UserMessage {
+                            id: "user-1".to_string(),
+                            content: vec![AppServerUserInput::Text {
+                                text: "restored prompt".to_string(),
+                                text_elements: Vec::new(),
+                            }],
+                        },
+                    ],
+                ),
+            ],
+        );
         let resumed_session = ThreadSessionState {
             cwd: PathBuf::from("/tmp/refreshed"),
             ..initial_session.clone()

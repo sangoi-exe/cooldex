@@ -3,6 +3,7 @@
 // surface; keep resume, review, approval, and account-state adapters aligned.
 
 use crate::bottom_pane::FeedbackAudience;
+use crate::resume_history::apply_resume_history_mode;
 use crate::status::StatusAccountDisplay;
 use crate::status::plan_type_display_name;
 use codex_app_server_client::AppServerClient;
@@ -951,7 +952,7 @@ async fn started_thread_from_resume_response(
         .map_err(color_eyre::eyre::Report::msg)?;
     Ok(AppServerStartedThread {
         session,
-        turns: response.thread.turns,
+        turns: apply_resume_history_mode(config, response.thread.turns),
     })
 }
 
@@ -1160,6 +1161,7 @@ mod tests {
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnStatus;
+    use codex_config::types::ResumeHistoryMode;
     use codex_core::config::ConfigBuilder;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
@@ -1170,6 +1172,45 @@ mod tests {
             .build()
             .await
             .expect("config should build")
+    }
+
+    fn resume_turns_with_context_compaction() -> Vec<Turn> {
+        vec![
+            Turn {
+                id: "turn-0".to_string(),
+                items: vec![codex_app_server_protocol::ThreadItem::AgentMessage {
+                    id: "assistant-0".to_string(),
+                    text: "before compaction".to_string(),
+                    phase: None,
+                    memory_citation: None,
+                }],
+                status: TurnStatus::Completed,
+                error: None,
+            },
+            Turn {
+                id: "turn-1".to_string(),
+                items: vec![
+                    codex_app_server_protocol::ThreadItem::ContextCompaction {
+                        id: "compact-1".to_string(),
+                    },
+                    codex_app_server_protocol::ThreadItem::UserMessage {
+                        id: "user-1".to_string(),
+                        content: vec![codex_app_server_protocol::UserInput::Text {
+                            text: "hello from history".to_string(),
+                            text_elements: Vec::new(),
+                        }],
+                    },
+                    codex_app_server_protocol::ThreadItem::AgentMessage {
+                        id: "assistant-1".to_string(),
+                        text: "assistant reply".to_string(),
+                        phase: None,
+                        memory_citation: None,
+                    },
+                ],
+                status: TurnStatus::Completed,
+                error: None,
+            },
+        ]
     }
 
     #[tokio::test]
@@ -1327,11 +1368,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_response_restores_turns_from_thread_items() {
+    async fn resume_response_defaults_to_since_last_compaction_boundary() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = build_config(&temp_dir).await;
         let thread_id = ThreadId::new();
         let forked_from_id = ThreadId::new();
+        let response_turns = resume_turns_with_context_compaction();
         let response = ThreadResumeResponse {
             thread: codex_app_server_protocol::Thread {
                 id: thread_id.to_string(),
@@ -1350,26 +1392,7 @@ mod tests {
                 agent_role: None,
                 git_info: None,
                 name: None,
-                turns: vec![Turn {
-                    id: "turn-1".to_string(),
-                    items: vec![
-                        codex_app_server_protocol::ThreadItem::UserMessage {
-                            id: "user-1".to_string(),
-                            content: vec![codex_app_server_protocol::UserInput::Text {
-                                text: "hello from history".to_string(),
-                                text_elements: Vec::new(),
-                            }],
-                        },
-                        codex_app_server_protocol::ThreadItem::AgentMessage {
-                            id: "assistant-1".to_string(),
-                            text: "assistant reply".to_string(),
-                            phase: None,
-                            memory_citation: None,
-                        },
-                    ],
-                    status: TurnStatus::Completed,
-                    error: None,
-                }],
+                turns: response_turns.clone(),
             },
             model: "gpt-5.4".to_string(),
             model_provider: "openai".to_string(),
@@ -1387,7 +1410,53 @@ mod tests {
             .expect("resume response should map");
         assert_eq!(started.session.forked_from_id, Some(forked_from_id));
         assert_eq!(started.turns.len(), 1);
-        assert_eq!(started.turns[0], response.thread.turns[0]);
+        assert_eq!(started.turns[0], response.thread.turns[1]);
+        assert_eq!(started.session.config_path, Some(response.config_path));
+    }
+
+    #[tokio::test]
+    async fn resume_response_preserves_full_history_when_configured() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&temp_dir).await;
+        config.tui_resume_history = ResumeHistoryMode::Full;
+        let thread_id = ThreadId::new();
+        let response_turns = resume_turns_with_context_compaction();
+        let response = ThreadResumeResponse {
+            thread: codex_app_server_protocol::Thread {
+                id: thread_id.to_string(),
+                forked_from_id: None,
+                preview: "hello".to_string(),
+                ephemeral: false,
+                model_provider: "openai".to_string(),
+                created_at: 1,
+                updated_at: 2,
+                status: ThreadStatus::Idle,
+                path: None,
+                cwd: PathBuf::from("/tmp/project"),
+                cli_version: "0.0.0".to_string(),
+                source: codex_protocol::protocol::SessionSource::Cli.into(),
+                agent_nickname: None,
+                agent_role: None,
+                git_info: None,
+                name: None,
+                turns: response_turns.clone(),
+            },
+            model: "gpt-5.4".to_string(),
+            model_provider: "openai".to_string(),
+            service_tier: None,
+            cwd: PathBuf::from("/tmp/project"),
+            config_path: PathBuf::from("/tmp/project/config.toml"),
+            approval_policy: codex_protocol::protocol::AskForApproval::Never.into(),
+            approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
+            sandbox: codex_protocol::protocol::SandboxPolicy::new_read_only_policy().into(),
+            reasoning_effort: None,
+        };
+
+        let started = started_thread_from_resume_response(response.clone(), &config)
+            .await
+            .expect("resume response should map");
+
+        assert_eq!(started.turns, response.thread.turns);
         assert_eq!(started.session.config_path, Some(response.config_path));
     }
 
