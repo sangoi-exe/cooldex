@@ -17,6 +17,7 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -769,7 +770,7 @@ fn export_forked_subagent_response_item_preserves_agents_fragment() {
 }
 
 #[tokio::test]
-async fn spawn_agent_fork_injects_output_for_parent_spawn_call() {
+async fn spawn_agent_fork_does_not_leak_parent_spawn_tool_items_into_child_history() {
     let harness = AgentControlHarness::new().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
     let turn_context = parent_thread.codex.session.new_default_turn().await;
@@ -820,21 +821,26 @@ async fn spawn_agent_fork_injects_output_for_parent_spawn_call() {
         .await
         .expect("child thread should be registered");
     let history = child_thread.codex.session.clone_history().await;
-    let injected_output = history.raw_items().iter().find_map(|item| match item {
-        ResponseItem::FunctionCallOutput { call_id, output }
-            if call_id == &parent_spawn_call_id =>
-        {
-            Some(output)
-        }
-        _ => None,
-    });
-    let injected_output =
-        injected_output.expect("forked child should contain synthetic tool output");
-    assert_eq!(
-        injected_output.text_content(),
-        Some(FORKED_SPAWN_AGENT_OUTPUT_MESSAGE)
+    let prompt_items = history.clone().for_prompt(&[InputModality::Text]);
+
+    assert!(
+        !history.raw_items().iter().any(|item| matches!(
+            item,
+            ResponseItem::FunctionCall { call_id, .. }
+                | ResponseItem::FunctionCallOutput { call_id, .. }
+                if call_id == &parent_spawn_call_id
+        )),
+        "forked child history should not retain parent spawn tool items",
     );
-    assert_eq!(injected_output.success, Some(true));
+    assert!(
+        !prompt_items.iter().any(|item| matches!(
+            item,
+            ResponseItem::FunctionCall { call_id, .. }
+                | ResponseItem::FunctionCallOutput { call_id, .. }
+                if call_id == &parent_spawn_call_id
+        )),
+        "forked child prompt should normalize without parent spawn tool items",
+    );
 
     let _ = harness
         .control

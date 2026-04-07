@@ -29,7 +29,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
@@ -53,7 +52,6 @@ use tracing::warn;
 
 const AGENT_NAMES: &str = include_str!("agent_names.txt");
 const ROOT_LAST_TASK_MESSAGE: &str = "Main thread";
-const FORKED_SPAWN_AGENT_OUTPUT_MESSAGE: &str = "You are the newly spawned agent. The prior conversation history was forked from your parent agent. Treat the next user message as your new task, and use the forked history only as background context.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SpawnAgentForkMode {
@@ -136,26 +134,11 @@ fn keep_forked_rollout_item(item: &RolloutItem) -> bool {
     }
 }
 
-fn build_forked_subagent_export(
-    parent_rollout_items: Vec<RolloutItem>,
-    parent_spawn_call_id: &str,
-) -> Vec<RolloutItem> {
-    let mut exported_items = parent_rollout_items
+fn export_forked_subagent_history(parent_rollout_items: Vec<RolloutItem>) -> Vec<RolloutItem> {
+    parent_rollout_items
         .into_iter()
         .filter_map(export_forked_subagent_rollout_item)
-        .collect::<Vec<_>>();
-
-    let mut output =
-        FunctionCallOutputPayload::from_text(FORKED_SPAWN_AGENT_OUTPUT_MESSAGE.to_string());
-    output.success = Some(true);
-    exported_items.push(RolloutItem::ResponseItem(
-        ResponseItem::FunctionCallOutput {
-            call_id: parent_spawn_call_id.to_string(),
-            output,
-        },
-    ));
-
-    exported_items
+        .collect()
 }
 
 fn export_forked_subagent_rollout_item(item: RolloutItem) -> Option<RolloutItem> {
@@ -446,13 +429,6 @@ impl AgentControl {
                 "spawn_agent fork requires a fork mode".to_string(),
             ));
         };
-        let parent_spawn_call_id =
-            options
-                .fork_parent_spawn_call_id
-                .as_deref()
-                .ok_or_else(|| {
-                    CodexErr::Fatal("spawn_agent fork requires a parent spawn call id".to_string())
-                })?;
         let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id, ..
         }) = &session_source
@@ -501,10 +477,7 @@ impl AgentControl {
         state
             .fork_thread_with_source(
                 config,
-                InitialHistory::Forked(build_forked_subagent_export(
-                    forked_rollout_items,
-                    parent_spawn_call_id,
-                )),
+                InitialHistory::Forked(export_forked_subagent_history(forked_rollout_items)),
                 self.clone(),
                 session_source,
                 /*persist_extended_history*/ false,
