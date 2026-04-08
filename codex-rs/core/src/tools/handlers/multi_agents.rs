@@ -31,6 +31,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::CollabAgentInteractionBeginEvent;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
+use codex_protocol::protocol::CollabAgentInteractionTool;
 use codex_protocol::protocol::CollabAgentRef;
 use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
@@ -84,6 +85,7 @@ fn build_wait_agent_statuses(
                 thread_id: receiver_agent.thread_id,
                 agent_nickname: receiver_agent.agent_nickname.clone(),
                 agent_role: receiver_agent.agent_role.clone(),
+                task_name: receiver_agent.task_name.clone(),
                 status: state.status.clone(),
                 last_activity: state.last_activity.clone(),
             });
@@ -97,6 +99,7 @@ fn build_wait_agent_statuses(
             thread_id: *thread_id,
             agent_nickname: None,
             agent_role: None,
+            task_name: None,
             status: state.status.clone(),
             last_activity: state.last_activity.clone(),
         })

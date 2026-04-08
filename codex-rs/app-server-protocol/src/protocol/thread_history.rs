@@ -926,6 +926,7 @@ impl ThreadHistoryBuilder {
                     payload.status.clone(),
                     payload.new_agent_nickname.clone(),
                     payload.new_agent_role.clone(),
+                    payload.new_agent_task_name.clone(),
                 );
                 (
                     vec![receiver_id.clone()],
@@ -948,6 +949,7 @@ impl ThreadHistoryBuilder {
                         thread_id.to_string(),
                         payload.new_agent_nickname.clone(),
                         payload.new_agent_role.clone(),
+                        payload.new_agent_task_name.clone(),
                     )
                 })
                 .collect(),
@@ -966,11 +968,16 @@ impl ThreadHistoryBuilder {
     ) {
         let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
-            tool: CollabAgentTool::SendInput,
+            tool: payload.tool.clone().into(),
             status: CollabAgentToolCallStatus::InProgress,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
-            receiver_agents: Vec::new(),
+            receiver_agents: vec![Self::collab_agent_ref(
+                payload.receiver_thread_id.to_string(),
+                /*agent_nickname*/ None,
+                /*agent_role*/ None,
+                payload.receiver_agent_task_name.clone(),
+            )],
             prompt: Some(payload.prompt.clone()),
             profile: None,
             model: None,
@@ -994,10 +1001,11 @@ impl ThreadHistoryBuilder {
             payload.status.clone(),
             payload.receiver_agent_nickname.clone(),
             payload.receiver_agent_role.clone(),
+            payload.receiver_agent_task_name.clone(),
         );
         self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
-            tool: CollabAgentTool::SendInput,
+            tool: payload.tool.clone().into(),
             status,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![receiver_id.clone()],
@@ -1005,6 +1013,7 @@ impl ThreadHistoryBuilder {
                 receiver_id.clone(),
                 payload.receiver_agent_nickname.clone(),
                 payload.receiver_agent_role.clone(),
+                payload.receiver_agent_task_name.clone(),
             )],
             prompt: Some(payload.prompt.clone()),
             profile: None,
@@ -1139,6 +1148,7 @@ impl ThreadHistoryBuilder {
                 payload.status.clone(),
                 payload.receiver_agent_nickname.clone(),
                 payload.receiver_agent_role.clone(),
+                payload.receiver_agent_task_name.clone(),
             ),
         )]
         .into_iter()
@@ -1153,6 +1163,7 @@ impl ThreadHistoryBuilder {
                 receiver_id,
                 payload.receiver_agent_nickname.clone(),
                 payload.receiver_agent_role.clone(),
+                payload.receiver_agent_task_name.clone(),
             )],
             prompt: None,
             profile: None,
@@ -1177,6 +1188,7 @@ impl ThreadHistoryBuilder {
                 payload.receiver_thread_id.to_string(),
                 payload.receiver_agent_nickname.clone(),
                 payload.receiver_agent_role.clone(),
+                payload.receiver_agent_task_name.clone(),
             )],
             prompt: None,
             profile: None,
@@ -1203,6 +1215,7 @@ impl ThreadHistoryBuilder {
                 payload.status.clone(),
                 payload.receiver_agent_nickname.clone(),
                 payload.receiver_agent_role.clone(),
+                payload.receiver_agent_task_name.clone(),
             ),
         )]
         .into_iter()
@@ -1217,6 +1230,7 @@ impl ThreadHistoryBuilder {
                 receiver_id,
                 payload.receiver_agent_nickname.clone(),
                 payload.receiver_agent_role.clone(),
+                payload.receiver_agent_task_name.clone(),
             )],
             prompt: None,
             profile: None,
@@ -1231,11 +1245,13 @@ impl ThreadHistoryBuilder {
         thread_id: String,
         agent_nickname: Option<String>,
         agent_role: Option<String>,
+        task_name: Option<String>,
     ) -> CollabAgentRef {
         CollabAgentRef {
             thread_id,
             agent_nickname,
             agent_role,
+            task_name,
         }
     }
 
@@ -1243,10 +1259,12 @@ impl ThreadHistoryBuilder {
         status: AgentStatus,
         agent_nickname: Option<String>,
         agent_role: Option<String>,
+        task_name: Option<String>,
     ) -> CollabAgentState {
         let mut state = CollabAgentState::from(status);
         state.agent_nickname = agent_nickname;
         state.agent_role = agent_role;
+        state.task_name = task_name;
         state
     }
 
@@ -2190,6 +2208,7 @@ mod tests {
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-1".into(),
+                started_at: None,
                 model_context_window: None,
                 collaboration_mode_kind: Default::default(),
             })),
@@ -2206,10 +2225,13 @@ mod tests {
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-1".into(),
+                completed_at: None,
+                duration_ms: None,
                 last_agent_message: None,
             })),
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-2".into(),
+                started_at: None,
                 model_context_window: None,
                 collaboration_mode_kind: Default::default(),
             })),
@@ -2226,10 +2248,13 @@ mod tests {
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-2".into(),
+                completed_at: None,
+                duration_ms: None,
                 last_agent_message: None,
             })),
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "standalone".into(),
+                started_at: None,
                 model_context_window: None,
                 collaboration_mode_kind: Default::default(),
             })),
@@ -2240,6 +2265,8 @@ mod tests {
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "standalone".into(),
+                completed_at: None,
+                duration_ms: None,
                 last_agent_message: None,
             })),
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
@@ -3257,6 +3284,7 @@ mod tests {
                     .expect("valid receiver thread id"),
                 receiver_agent_nickname: None,
                 receiver_agent_role: None,
+                receiver_agent_task_name: None,
                 status: AgentStatus::Completed(None),
             }),
         ];
@@ -3280,6 +3308,7 @@ mod tests {
                     thread_id: "00000000-0000-0000-0000-000000000002".into(),
                     agent_nickname: None,
                     agent_role: None,
+                    task_name: None,
                 }],
                 prompt: None,
                 profile: None,
@@ -3292,6 +3321,7 @@ mod tests {
                         message: None,
                         agent_nickname: None,
                         agent_role: None,
+                        task_name: None,
                         last_activity: None,
                     },
                 )]
@@ -3315,6 +3345,7 @@ mod tests {
                 thread_id: receiver_thread_id,
                 agent_nickname: Some("Watcher".into()),
                 agent_role: Some("observer".into()),
+                task_name: None,
             }],
             call_id: "wait-1".into(),
             wait_state: CoreCollabWaitState {
@@ -3331,6 +3362,7 @@ mod tests {
                 thread_id: receiver_thread_id,
                 agent_nickname: Some("Watcher".into()),
                 agent_role: Some("observer".into()),
+                task_name: None,
                 status: AgentStatus::Completed(Some("done".into())),
                 last_activity: None,
             }],
@@ -3372,6 +3404,7 @@ mod tests {
                     thread_id: receiver_thread_id.to_string(),
                     agent_nickname: Some("Watcher".into()),
                     agent_role: Some("observer".into()),
+                    task_name: None,
                 }],
                 prompt: None,
                 profile: None,
@@ -3403,6 +3436,7 @@ mod tests {
                     thread_id: receiver_thread_id.to_string(),
                     agent_nickname: Some("Watcher".into()),
                     agent_role: Some("observer".into()),
+                    task_name: None,
                 }],
                 prompt: None,
                 profile: None,
@@ -3415,6 +3449,7 @@ mod tests {
                         message: Some("done".into()),
                         agent_nickname: Some("Watcher".into()),
                         agent_role: Some("observer".into()),
+                        task_name: None,
                         last_activity: None,
                     },
                 )]
@@ -3498,6 +3533,7 @@ mod tests {
                         message: Some("done".into()),
                         agent_nickname: None,
                         agent_role: None,
+                        task_name: None,
                         last_activity: None,
                     },
                 )]
@@ -3532,6 +3568,7 @@ mod tests {
                 new_thread_id: Some(spawned_thread_id),
                 new_agent_nickname: Some("Scout".into()),
                 new_agent_role: Some("explorer".into()),
+                new_agent_task_name: None,
                 prompt: "inspect the repo".into(),
                 profile: Some("subxhigh".into()),
                 model: "gpt-5.4-mini".into(),
@@ -3559,6 +3596,7 @@ mod tests {
                     thread_id: "00000000-0000-0000-0000-000000000002".into(),
                     agent_nickname: Some("Scout".into()),
                     agent_role: Some("explorer".into()),
+                    task_name: None,
                 }],
                 prompt: Some("inspect the repo".into()),
                 profile: Some("subxhigh".into()),
@@ -3571,6 +3609,7 @@ mod tests {
                         message: None,
                         agent_nickname: Some("Scout".into()),
                         agent_role: Some("explorer".into()),
+                        task_name: None,
                         last_activity: None,
                     },
                 )]
@@ -3602,6 +3641,8 @@ mod tests {
                     call_id: "send-1".into(),
                     sender_thread_id: sender,
                     receiver_thread_id: receiver,
+                    receiver_agent_task_name: None,
+                    tool: codex_protocol::protocol::CollabAgentInteractionTool::SendInput,
                     prompt: "new task".into(),
                 },
             ),
@@ -3612,6 +3653,8 @@ mod tests {
                     receiver_thread_id: receiver,
                     receiver_agent_nickname: None,
                     receiver_agent_role: None,
+                    receiver_agent_task_name: None,
+                    tool: codex_protocol::protocol::CollabAgentInteractionTool::SendInput,
                     prompt: "new task".into(),
                     status: AgentStatus::Interrupted,
                 },
@@ -3637,6 +3680,7 @@ mod tests {
                     thread_id: receiver.to_string(),
                     agent_nickname: None,
                     agent_role: None,
+                    task_name: None,
                 }],
                 prompt: Some("new task".into()),
                 profile: None,
@@ -3649,6 +3693,7 @@ mod tests {
                         message: None,
                         agent_nickname: None,
                         agent_role: None,
+                        task_name: None,
                         last_activity: None,
                     },
                 )]
@@ -3880,6 +3925,7 @@ mod tests {
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
+                started_at: None,
                 model_context_window: None,
                 collaboration_mode_kind: Default::default(),
             })),
@@ -3915,6 +3961,8 @@ mod tests {
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-a".into(),
+                completed_at: None,
+                duration_ms: None,
                 last_agent_message: None,
             })),
         ];
@@ -3963,6 +4011,7 @@ mod tests {
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
+                started_at: None,
                 model_context_window: None,
                 collaboration_mode_kind: Default::default(),
             })),
@@ -3996,6 +4045,8 @@ mod tests {
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-a".into(),
+                completed_at: None,
+                duration_ms: None,
                 last_agent_message: None,
             })),
         ];
@@ -4030,6 +4081,7 @@ mod tests {
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-a".into(),
+                started_at: None,
                 model_context_window: None,
                 collaboration_mode_kind: Default::default(),
             })),
@@ -4051,6 +4103,8 @@ mod tests {
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-a".into(),
+                completed_at: None,
+                duration_ms: None,
                 last_agent_message: None,
             })),
         ];
@@ -4066,6 +4120,9 @@ mod tests {
         let turns = vec![
             Turn {
                 id: "turn-1".into(),
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
                 items: vec![ThreadItem::AgentMessage {
                     id: "msg-1".into(),
                     text: "before".into(),
@@ -4077,6 +4134,9 @@ mod tests {
             },
             Turn {
                 id: "turn-2".into(),
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
                 items: vec![
                     ThreadItem::AgentMessage {
                         id: "msg-2".into(),
@@ -4105,6 +4165,9 @@ mod tests {
             truncated,
             vec![Turn {
                 id: "turn-2".into(),
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
                 items: vec![
                     ThreadItem::ContextCompaction {
                         id: "compact-1".into(),
@@ -4127,6 +4190,7 @@ mod tests {
         let items = vec![
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-1".into(),
+                started_at: None,
                 model_context_window: None,
                 collaboration_mode_kind: Default::default(),
             })),
@@ -4143,10 +4207,13 @@ mod tests {
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-1".into(),
+                completed_at: None,
+                duration_ms: None,
                 last_agent_message: None,
             })),
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-2".into(),
+                started_at: None,
                 model_context_window: None,
                 collaboration_mode_kind: Default::default(),
             })),
@@ -4164,6 +4231,8 @@ mod tests {
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-2".into(),
+                completed_at: None,
+                duration_ms: None,
                 last_agent_message: None,
             })),
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
@@ -4171,6 +4240,7 @@ mod tests {
             })),
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-3".into(),
+                started_at: None,
                 model_context_window: None,
                 collaboration_mode_kind: Default::default(),
             })),
@@ -4181,6 +4251,8 @@ mod tests {
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-3".into(),
+                completed_at: None,
+                duration_ms: None,
                 last_agent_message: None,
             })),
         ];

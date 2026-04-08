@@ -84,6 +84,8 @@ The bridge still must not claim replay/backfill or mid-turn process resurrection
 - Invalid `session_poll` cursors fail loud with `BAD_REQUEST`.
 - Empty `session_poll` results preserve the current cursor instead of resetting it to `null`.
 - `session_open` and `session_poll` do not rebuild from Codex-native replay in this slice.
+<!-- Merge-safety anchor: session cwd/configPath bridge contract bullets must stay aligned with src/bridge/runtime.js thread/start + thread/resume response validation. -->
+
 - `session_create` accepts optional `cwd`, optional `configPath`, and optional `operator`.
 - `session_rename` requires a non-empty `title` string and persists it on the existing bridge-owned session row.
 - When `session_create.cwd` is omitted or null, the bridge resolves the effective cwd to `/home/lucas/work/avmb-plus`.
@@ -96,8 +98,8 @@ The bridge still must not claim replay/backfill or mid-turn process resurrection
 - Invalid `session_create.configPath` values fail loud as `BAD_REQUEST`.
 - Invalid `session_create.operator` values fail loud as `BAD_REQUEST`.
 - Every `turn/start` call sends the stored session cwd explicitly.
-- `thread/start` receives resolved session `configPath` only when it is non-null, and the bridge fails loud if the response `configPath` mismatches the expected resolved value.
-- The first `message_send` after a bridge restart resumes the stored `threadId` with the stored `cwd`, and it reuses the stored `configPath` unless that session was created without an explicit config override.
+- `thread/start` receives resolved session `configPath` only when it is non-null, and `thread/start` / `thread/resume` must return top-level `cwd` and `configPath` strings; nested `response.thread.{cwd,configPath}` is not part of the bridge contract.
+- The first `message_send` after a bridge restart resumes the stored `threadId` with the stored `cwd`, and the bridge fails loud if `thread/resume` returns malformed top-level `cwd` / `configPath` fields or values that disagree with stored session state.
 - `message_send` does not send `configPath` to `turn/start`; the config path is fixed at session creation time, and `message_send` fails loud if stored resolved session state is missing required fields.
 - A successful `message_send` appends a durable `user_message` event to the session journal with `payload.method = "bridge/user_message"`, `payload.params.text`, and `payload.params.messageId`.
 - `message_send.nextCursor` is the cursor that existed before that durable `user_message` append, so the next `session_poll` can observe the operator message and any later events in one pass.

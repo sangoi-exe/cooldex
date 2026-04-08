@@ -490,9 +490,18 @@ impl CodexMessageProcessor {
     }
 
     fn current_account_updated_notification(&self) -> AccountUpdatedNotification {
-        let auth = self.auth_manager.auth_cached();
+        Self::account_updated_notification_from_auth_manager(self.auth_manager.as_ref())
+    }
+
+    fn account_updated_notification_from_auth_manager(
+        auth_manager: &AuthManager,
+    ) -> AccountUpdatedNotification {
+        let auth = auth_manager.auth_cached();
         AccountUpdatedNotification {
             auth_mode: auth.as_ref().map(CodexAuth::api_auth_mode),
+            label: auth_manager
+                .active_chatgpt_account_summary()
+                .and_then(|summary| summary.label),
             plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
         }
     }
@@ -1227,11 +1236,9 @@ impl CodexMessageProcessor {
                             .await;
 
                             // Notify clients with the actual current auth mode.
-                            let auth = auth_manager.auth_cached();
-                            let payload_v2 = AccountUpdatedNotification {
-                                auth_mode: auth.as_ref().map(CodexAuth::api_auth_mode),
-                                plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
-                            };
+                            let payload_v2 = Self::account_updated_notification_from_auth_manager(
+                                auth_manager.as_ref(),
+                            );
                             outgoing_clone
                                 .send_server_notification(ServerNotification::AccountUpdated(
                                     payload_v2,
@@ -1340,11 +1347,9 @@ impl CodexMessageProcessor {
                             )
                             .await;
 
-                            let auth = auth_manager.auth_cached();
-                            let payload_v2 = AccountUpdatedNotification {
-                                auth_mode: auth.as_ref().map(CodexAuth::api_auth_mode),
-                                plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
-                            };
+                            let payload_v2 = Self::account_updated_notification_from_auth_manager(
+                                auth_manager.as_ref(),
+                            );
                             outgoing_clone
                                 .send_server_notification(ServerNotification::AccountUpdated(
                                     payload_v2,
@@ -1553,6 +1558,7 @@ impl CodexMessageProcessor {
 
                 let payload_v2 = AccountUpdatedNotification {
                     auth_mode: current_auth_method,
+                    label: None,
                     plan_type: None,
                 };
                 self.outgoing
@@ -1665,19 +1671,32 @@ impl CodexMessageProcessor {
             Some(auth) => match auth.auth_mode() {
                 CoreAuthMode::ApiKey => Some(Account::ApiKey {}),
                 CoreAuthMode::Chatgpt | CoreAuthMode::ChatgptAuthTokens => {
-                    let email = auth.get_account_email();
                     let plan_type = auth.account_plan_type();
+                    let summary = self.auth_manager.active_chatgpt_account_summary();
 
-                    match (email, plan_type) {
-                        (Some(email), Some(plan_type)) => {
-                            Some(Account::Chatgpt { email, plan_type })
-                        }
+                    match (summary, plan_type) {
+                        (Some(summary), Some(plan_type)) => match summary.email {
+                            Some(email) => Some(Account::Chatgpt {
+                                label: summary.label,
+                                email,
+                                plan_type,
+                            }),
+                            None => {
+                                let error = JSONRPCErrorError {
+                                    code: INVALID_REQUEST_ERROR_CODE,
+                                    message:
+                                        "label/email summary and plan type are required for chatgpt authentication".to_string(),
+                                    data: None,
+                                };
+                                self.outgoing.send_error(request_id, error).await;
+                                return;
+                            }
+                        },
                         _ => {
                             let error = JSONRPCErrorError {
                                 code: INVALID_REQUEST_ERROR_CODE,
                                 message:
-                                    "email and plan type are required for chatgpt authentication"
-                                        .to_string(),
+                                    "label/email summary and plan type are required for chatgpt authentication".to_string(),
                                 data: None,
                             };
                             self.outgoing.send_error(request_id, error).await;

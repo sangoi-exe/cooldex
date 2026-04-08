@@ -369,7 +369,7 @@ fn spawn_next_accounts_rate_limit_fetch(
                 Ok(ChatgptAccountAuthResolution::Auth(auth)) => {
                     let snapshots = match tokio::time::timeout(
                         ACCOUNTS_RATE_LIMIT_FETCH_TIMEOUT,
-                        crate::chatwidget::fetch_rate_limits(base_url, auth),
+                        crate::chatwidget::fetch_rate_limits(base_url, *auth),
                     )
                     .await
                     {
@@ -13172,6 +13172,7 @@ guardian_approval = true
                                 thread_id: receiver_thread_id.to_string(),
                                 agent_nickname: Some("Robie".to_string()),
                                 agent_role: Some("explorer".to_string()),
+                                task_name: None,
                             }],
                             prompt: None,
                             profile: None,

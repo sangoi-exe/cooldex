@@ -26,6 +26,7 @@ use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnCompletedNotification;
 use codex_app_server_protocol::TurnError;
 use codex_app_server_protocol::TurnPlanStep;
+// Merge-safety anchor: exec JSON output tests pin the workspace-local collab tool/task rendering so merge fallout cannot silently collapse V2 events back to legacy output.
 use codex_app_server_protocol::TurnPlanStepStatus;
 use codex_app_server_protocol::TurnPlanUpdatedNotification;
 use codex_app_server_protocol::TurnStartedNotification;
@@ -715,6 +716,7 @@ fn collab_spawn_begin_and_end_emit_item_events() {
                         message: None,
                         agent_nickname: None,
                         agent_role: None,
+                        task_name: None,
                         last_activity: None,
                     },
                 )]),
@@ -801,6 +803,7 @@ fn collab_wait_completion_preserves_wait_state() {
                             message: Some("done".to_string()),
                             agent_nickname: None,
                             agent_role: None,
+                            task_name: None,
                             last_activity: None,
                         },
                     ),
@@ -811,6 +814,7 @@ fn collab_wait_completion_preserves_wait_state() {
                             message: Some("boom".to_string()),
                             agent_nickname: None,
                             agent_role: None,
+                            task_name: None,
                             last_activity: None,
                         },
                     ),
@@ -870,6 +874,74 @@ fn collab_wait_completion_preserves_wait_state() {
             status: CodexStatus::Running,
         }
     );
+}
+
+#[test]
+fn collab_message_tools_preserve_tool_identity() {
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+
+    for (source_tool, expected_tool) in [
+        (CollabAgentTool::SendMessage, CollabTool::SendMessage),
+        (CollabAgentTool::FollowupTask, CollabTool::FollowupTask),
+    ] {
+        let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
+            ItemCompletedNotification {
+                item: ThreadItem::CollabAgentToolCall {
+                    id: "collab-message-1".to_string(),
+                    tool: source_tool,
+                    status: ApiCollabAgentToolCallStatus::Completed,
+                    sender_thread_id: "thread-parent".to_string(),
+                    receiver_thread_ids: vec!["thread-child".to_string()],
+                    receiver_agents: Vec::new(),
+                    prompt: Some("keep going".to_string()),
+                    profile: None,
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: std::collections::HashMap::from([(
+                        "thread-child".to_string(),
+                        ApiCollabAgentState {
+                            status: ApiCollabAgentStatus::Running,
+                            message: None,
+                            agent_nickname: None,
+                            agent_role: None,
+                            task_name: None,
+                            last_activity: None,
+                        },
+                    )]),
+                    wait_state: None,
+                },
+                thread_id: "thread-parent".to_string(),
+                turn_id: "turn-1".to_string(),
+            },
+        ));
+
+        assert_eq!(
+            collected,
+            CollectedThreadEvents {
+                events: vec![ThreadEvent::ItemCompleted(ItemCompletedEvent {
+                    item: ExecThreadItem {
+                        id: "item_0".to_string(),
+                        details: ThreadItemDetails::CollabToolCall(CollabToolCallItem {
+                            tool: expected_tool,
+                            sender_thread_id: "thread-parent".to_string(),
+                            receiver_thread_ids: vec!["thread-child".to_string()],
+                            prompt: Some("keep going".to_string()),
+                            agents_states: std::collections::HashMap::from([(
+                                "thread-child".to_string(),
+                                CollabAgentState {
+                                    status: CollabAgentStatus::Running,
+                                    message: None,
+                                },
+                            )]),
+                            status: CollabToolCallStatus::Completed,
+                            wait_state: None,
+                        }),
+                    },
+                })],
+                status: CodexStatus::Running,
+            }
+        );
+    }
 }
 
 #[test]

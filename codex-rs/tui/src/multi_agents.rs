@@ -12,6 +12,7 @@ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::CollabAgentActivity;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
+use codex_protocol::protocol::CollabAgentInteractionTool;
 use codex_protocol::protocol::CollabAgentRef;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
 use codex_protocol::protocol::CollabAgentStatusEntry;
@@ -54,6 +55,7 @@ struct AgentLabel<'a> {
     thread_id: Option<ThreadId>,
     nickname: Option<&'a str>,
     role: Option<&'a str>,
+    task_name: Option<&'a str>,
 }
 
 pub(crate) fn agent_picker_status_dot_spans(is_closed: bool) -> Vec<Span<'static>> {
@@ -176,6 +178,7 @@ pub(crate) fn spawn_end(ev: CollabAgentSpawnEndEvent) -> PlainHistoryCell {
         new_thread_id,
         new_agent_nickname,
         new_agent_role,
+        new_agent_task_name,
         prompt,
         profile,
         model,
@@ -191,6 +194,7 @@ pub(crate) fn spawn_end(ev: CollabAgentSpawnEndEvent) -> PlainHistoryCell {
                 thread_id: Some(thread_id),
                 nickname: new_agent_nickname.as_deref(),
                 role: new_agent_role.as_deref(),
+                task_name: new_agent_task_name.as_deref(),
             }));
             spans.extend(spawn_config_spans(
                 profile.as_deref(),
@@ -219,16 +223,24 @@ pub(crate) fn interaction_end(ev: CollabAgentInteractionEndEvent) -> PlainHistor
         receiver_thread_id,
         receiver_agent_nickname,
         receiver_agent_role,
+        receiver_agent_task_name,
         prompt,
+        tool,
         status: _,
+        ..
     } = ev;
 
     let title = title_with_agent(
-        "Sent input to",
+        match tool {
+            CollabAgentInteractionTool::SendInput => "Sent input to",
+            CollabAgentInteractionTool::SendMessage => "Sent message to",
+            CollabAgentInteractionTool::FollowupTask => "Queued follow-up for",
+        },
         AgentLabel {
             thread_id: Some(receiver_thread_id),
             nickname: receiver_agent_nickname.as_deref(),
             role: receiver_agent_role.as_deref(),
+            task_name: receiver_agent_task_name.as_deref(),
         },
     );
 
@@ -292,7 +304,9 @@ pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
         receiver_thread_id,
         receiver_agent_nickname,
         receiver_agent_role,
+        receiver_agent_task_name,
         status: _,
+        ..
     } = ev;
 
     collab_event(
@@ -302,6 +316,7 @@ pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
                 thread_id: Some(receiver_thread_id),
                 nickname: receiver_agent_nickname.as_deref(),
                 role: receiver_agent_role.as_deref(),
+                task_name: receiver_agent_task_name.as_deref(),
             },
         ),
         Vec::new(),
@@ -315,6 +330,8 @@ pub(crate) fn resume_begin(ev: CollabResumeBeginEvent) -> PlainHistoryCell {
         receiver_thread_id,
         receiver_agent_nickname,
         receiver_agent_role,
+        receiver_agent_task_name,
+        ..
     } = ev;
 
     collab_event(
@@ -324,6 +341,7 @@ pub(crate) fn resume_begin(ev: CollabResumeBeginEvent) -> PlainHistoryCell {
                 thread_id: Some(receiver_thread_id),
                 nickname: receiver_agent_nickname.as_deref(),
                 role: receiver_agent_role.as_deref(),
+                task_name: receiver_agent_task_name.as_deref(),
             },
         ),
         Vec::new(),
@@ -337,7 +355,9 @@ pub(crate) fn resume_end(ev: CollabResumeEndEvent) -> PlainHistoryCell {
         receiver_thread_id,
         receiver_agent_nickname,
         receiver_agent_role,
+        receiver_agent_task_name,
         status,
+        ..
     } = ev;
 
     collab_event(
@@ -347,6 +367,7 @@ pub(crate) fn resume_end(ev: CollabResumeEndEvent) -> PlainHistoryCell {
                 thread_id: Some(receiver_thread_id),
                 nickname: receiver_agent_nickname.as_deref(),
                 role: receiver_agent_role.as_deref(),
+                task_name: receiver_agent_task_name.as_deref(),
             },
         ),
         vec![status_summary_line(&status)],
@@ -383,6 +404,7 @@ fn agent_label_from_ref(agent: &CollabAgentRef) -> AgentLabel<'_> {
         thread_id: Some(agent.thread_id),
         nickname: agent.agent_nickname.as_deref(),
         role: agent.agent_role.as_deref(),
+        task_name: agent.task_name.as_deref(),
     }
 }
 
@@ -397,9 +419,15 @@ fn agent_label_spans(agent: AgentLabel<'_>) -> Vec<Span<'static>> {
         .map(str::trim)
         .filter(|nickname| !nickname.is_empty());
     let role = agent.role.map(str::trim).filter(|role| !role.is_empty());
+    let task_name = agent
+        .task_name
+        .map(str::trim)
+        .filter(|task_name| !task_name.is_empty());
 
     if let Some(nickname) = nickname {
         spans.push(Span::from(nickname.to_string()).cyan().bold());
+    } else if let Some(task_name) = task_name {
+        spans.push(Span::from(task_name.to_string()).cyan().bold());
     } else if let Some(thread_id) = agent.thread_id {
         spans.push(Span::from(thread_id.to_string()).cyan());
     } else {
@@ -465,6 +493,7 @@ fn merge_wait_receivers(
                 thread_id: *thread_id,
                 agent_nickname: None,
                 agent_role: None,
+                task_name: None,
             })
             .collect();
     }
@@ -479,6 +508,7 @@ fn merge_wait_receivers(
                 thread_id: *thread_id,
                 agent_nickname: None,
                 agent_role: None,
+                task_name: None,
             });
         }
     }
@@ -561,6 +591,7 @@ fn wait_complete_lines(
                 thread_id: *thread_id,
                 agent_nickname: None,
                 agent_role: None,
+                task_name: None,
                 status: status.clone(),
                 last_activity: None,
             })
@@ -580,6 +611,7 @@ fn wait_complete_lines(
                 thread_id: *thread_id,
                 agent_nickname: None,
                 agent_role: None,
+                task_name: None,
                 status: status.clone(),
                 last_activity: None,
             })
@@ -596,6 +628,7 @@ fn wait_complete_lines(
                 thread_id,
                 agent_nickname,
                 agent_role,
+                task_name,
                 status,
                 last_activity,
             } = entry;
@@ -603,6 +636,7 @@ fn wait_complete_lines(
                 thread_id: Some(thread_id),
                 nickname: agent_nickname.as_deref(),
                 role: agent_role.as_deref(),
+                task_name: task_name.as_deref(),
             });
             spans.push(Span::from(": ").dim());
             spans.extend(status_summary_spans(&status, last_activity.as_ref()));
@@ -703,6 +737,7 @@ mod tests {
             new_thread_id: Some(robie_id),
             new_agent_nickname: Some("Robie".to_string()),
             new_agent_role: Some("explorer".to_string()),
+            new_agent_task_name: Some("/root/robie".to_string()),
             prompt: "Compute 11! and reply with just the integer result.".to_string(),
             profile: Some("subxhigh".to_string()),
             model: "gpt-5".to_string(),
@@ -716,7 +751,9 @@ mod tests {
             receiver_thread_id: robie_id,
             receiver_agent_nickname: Some("Robie".to_string()),
             receiver_agent_role: Some("explorer".to_string()),
+            receiver_agent_task_name: Some("/root/robie".to_string()),
             prompt: "Please continue and return the answer only.".to_string(),
+            tool: CollabAgentInteractionTool::FollowupTask,
             status: AgentStatus::Running,
         });
 
@@ -727,6 +764,7 @@ mod tests {
                 thread_id: robie_id,
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
+                task_name: Some("/root/robie".to_string()),
             }],
             call_id: "call-wait".to_string(),
             wait_state: CollabWaitState::default(),
@@ -747,6 +785,7 @@ mod tests {
                     thread_id: robie_id,
                     agent_nickname: Some("Robie".to_string()),
                     agent_role: Some("explorer".to_string()),
+                    task_name: Some("/root/robie".to_string()),
                     status: AgentStatus::Completed(Some("39916800".to_string())),
                     last_activity: None,
                 },
@@ -754,6 +793,7 @@ mod tests {
                     thread_id: bob_id,
                     agent_nickname: Some("Bob".to_string()),
                     agent_role: Some("worker".to_string()),
+                    task_name: Some("/root/bob".to_string()),
                     status: AgentStatus::Errored("tool timeout".to_string()),
                     last_activity: None,
                 },
@@ -761,6 +801,7 @@ mod tests {
                     thread_id: alice_id,
                     agent_nickname: Some("Alice".to_string()),
                     agent_role: Some("reviewer".to_string()),
+                    task_name: Some("/root/alice".to_string()),
                     status: AgentStatus::Running,
                     last_activity: Some(CollabAgentActivity {
                         kind: CollabAgentActivityKind::Reasoning,
@@ -784,6 +825,7 @@ mod tests {
             receiver_thread_id: robie_id,
             receiver_agent_nickname: Some("Robie".to_string()),
             receiver_agent_role: Some("explorer".to_string()),
+            receiver_agent_task_name: None,
             status: AgentStatus::Completed(Some("39916800".to_string())),
         });
 
@@ -862,11 +904,13 @@ mod tests {
                     thread_id: robie_id,
                     agent_nickname: Some("Robie".to_string()),
                     agent_role: Some("explorer".to_string()),
+                    task_name: None,
                 },
                 CollabAgentRef {
                     thread_id: bob_id,
                     agent_nickname: Some("Bob".to_string()),
                     agent_role: Some("worker".to_string()),
+                    task_name: None,
                 },
             ],
             call_id: "call-wait".to_string(),
@@ -896,6 +940,7 @@ mod tests {
                 thread_id: robie_id,
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
+                task_name: None,
                 status: AgentStatus::Running,
                 last_activity: None,
             }],
@@ -924,6 +969,7 @@ mod tests {
                 thread_id: robie_id,
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
+                task_name: None,
                 status: AgentStatus::Running,
                 last_activity: None,
             }],
@@ -952,6 +998,7 @@ mod tests {
                 thread_id: robie_id,
                 agent_nickname: Some("Robie".to_string()),
                 agent_role: Some("explorer".to_string()),
+                task_name: None,
                 status: AgentStatus::Running,
                 last_activity: None,
             }],
@@ -979,6 +1026,7 @@ mod tests {
             new_thread_id: Some(robie_id),
             new_agent_nickname: Some("Robie".to_string()),
             new_agent_role: Some("explorer".to_string()),
+            new_agent_task_name: Some("/root/robie".to_string()),
             prompt: String::new(),
             profile: Some("subxhigh".to_string()),
             model: "gpt-5".to_string(),
@@ -1013,6 +1061,7 @@ mod tests {
             new_thread_id: Some(robie_id),
             new_agent_nickname: Some("Robie".to_string()),
             new_agent_role: Some("explorer".to_string()),
+            new_agent_task_name: Some("/root/robie".to_string()),
             prompt: String::new(),
             profile: Some("subxhigh".to_string()),
             model: "gpt-5".to_string(),
@@ -1038,6 +1087,7 @@ mod tests {
             new_thread_id: Some(robie_id),
             new_agent_nickname: Some("Robie".to_string()),
             new_agent_role: Some("explorer".to_string()),
+            new_agent_task_name: Some("/root/robie".to_string()),
             prompt: "<protocol violation: missing model>".to_string(),
             profile: Some("subxhigh".to_string()),
             model: "gpt-5".to_string(),
@@ -1074,6 +1124,7 @@ mod tests {
             receiver_thread_id: robie_id,
             receiver_agent_nickname: Some("Robie".to_string()),
             receiver_agent_role: Some("explorer".to_string()),
+            receiver_agent_task_name: None,
             status: AgentStatus::Interrupted,
         });
 

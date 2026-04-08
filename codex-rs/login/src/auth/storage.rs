@@ -198,6 +198,16 @@ impl AuthStore {
             *active_account_id = rewritten_active_id.clone();
         }
     }
+
+    pub fn account(&self, id: &str) -> Option<&StoredAccount> {
+        self.accounts.iter().find(|account| account.id == id)
+    }
+
+    pub fn active_account(&self) -> Option<&StoredAccount> {
+        self.active_account_id
+            .as_deref()
+            .and_then(|id| self.account(id))
+    }
 }
 
 pub(super) fn get_auth_file(codex_home: &Path) -> PathBuf {

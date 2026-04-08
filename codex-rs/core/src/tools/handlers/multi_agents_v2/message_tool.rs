@@ -30,6 +30,13 @@ impl MessageDeliveryMode {
             },
         }
     }
+
+    fn tool(self) -> CollabAgentInteractionTool {
+        match self {
+            Self::QueueOnly => CollabAgentInteractionTool::SendMessage,
+            Self::TriggerTurn => CollabAgentInteractionTool::FollowupTask,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,18 +97,17 @@ async fn handle_message_submission(
         call_id,
         ..
     } = invocation;
-    let receiver_thread_id = resolve_agent_target(&session, &turn, &target).await?;
+    let receiver_thread_id = resolve_agent_task_path_target(&session, &turn, &target).await?;
     let receiver_agent = session
         .services
         .agent_control
         .get_agent_metadata(receiver_thread_id)
         .unwrap_or_default();
-    if mode == MessageDeliveryMode::TriggerTurn
-        && receiver_agent
-            .agent_path
-            .as_ref()
-            .is_some_and(AgentPath::is_root)
-    {
+    let receiver_agent_path = receiver_agent.agent_path.clone().ok_or_else(|| {
+        FunctionCallError::RespondToModel("target agent is missing an agent_path".to_string())
+    })?;
+    let receiver_agent_task_name = Some(receiver_agent_path.to_string());
+    if mode == MessageDeliveryMode::TriggerTurn && receiver_agent_path.is_root() {
         return Err(FunctionCallError::RespondToModel(
             "Tasks can't be assigned to the root agent".to_string(),
         ));
@@ -119,16 +125,15 @@ async fn handle_message_submission(
             &turn,
             CollabAgentInteractionBeginEvent {
                 call_id: call_id.clone(),
+                tool: mode.tool(),
                 sender_thread_id: session.conversation_id,
                 receiver_thread_id,
+                receiver_agent_task_name: receiver_agent_task_name.clone(),
                 prompt: prompt.clone(),
             }
             .into(),
         )
         .await;
-    let receiver_agent_path = receiver_agent.agent_path.clone().ok_or_else(|| {
-        FunctionCallError::RespondToModel("target agent is missing an agent_path".to_string())
-    })?;
     let communication = InterAgentCommunication::new(
         turn.session_source
             .get_agent_path()
@@ -154,10 +159,12 @@ async fn handle_message_submission(
             &turn,
             CollabAgentInteractionEndEvent {
                 call_id,
+                tool: mode.tool(),
                 sender_thread_id: session.conversation_id,
                 receiver_thread_id,
                 receiver_agent_nickname: receiver_agent.agent_nickname,
                 receiver_agent_role: receiver_agent.agent_role,
+                receiver_agent_task_name,
                 prompt,
                 status,
             }

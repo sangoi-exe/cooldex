@@ -4,15 +4,18 @@ use crate::function_tool::FunctionCallError;
 use codex_protocol::ThreadId;
 use std::sync::Arc;
 
-/// Resolves a single tool-facing agent target to a thread id.
-pub(crate) async fn resolve_agent_target(
+// Merge-safety anchor: MultiAgentV2 target resolution stays task-path-only in this workspace; do not reintroduce raw thread-id fallback into the V2 surface.
+/// Resolves a MultiAgentV2 tool-facing target using only canonical task-path syntax.
+pub(crate) async fn resolve_agent_task_path_target(
     session: &Arc<Session>,
     turn: &Arc<TurnContext>,
     target: &str,
 ) -> Result<ThreadId, FunctionCallError> {
     register_session_root(session, turn);
-    if let Ok(thread_id) = ThreadId::from_string(target) {
-        return Ok(thread_id);
+    if ThreadId::from_string(target).is_ok() {
+        return Err(FunctionCallError::RespondToModel(
+            "MultiAgentV2 targets must use canonical task paths, not agent ids".to_string(),
+        ));
     }
 
     session

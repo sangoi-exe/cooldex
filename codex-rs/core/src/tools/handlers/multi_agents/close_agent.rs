@@ -45,6 +45,7 @@ impl ToolHandler for Handler {
                     call_id: call_id.clone(),
                     sender_thread_id: session.conversation_id,
                     receiver_thread_id: agent_id,
+                    receiver_agent_task_name: receiver_agent.agent_path.clone().map(String::from),
                 }
                 .into(),
             )
@@ -67,6 +68,10 @@ impl ToolHandler for Handler {
                             receiver_thread_id: agent_id,
                             receiver_agent_nickname: receiver_agent.agent_nickname.clone(),
                             receiver_agent_role: receiver_agent.agent_role.clone(),
+                            receiver_agent_task_name: receiver_agent
+                                .agent_path
+                                .clone()
+                                .map(String::from),
                             status,
                         }
                         .into(),
@@ -103,6 +108,7 @@ impl ToolHandler for Handler {
                     receiver_thread_id: agent_id,
                     receiver_agent_nickname: receiver_agent.agent_nickname,
                     receiver_agent_role: receiver_agent.agent_role,
+                    receiver_agent_task_name: receiver_agent.agent_path.map(String::from),
                     status: status.clone(),
                 }
                 .into(),

@@ -3,6 +3,7 @@
 //! The same sandbox- and feature-gating rules are used by both the composer
 //! and the command popup. Centralizing them here keeps those call sites small
 //! and ensures they stay in sync.
+// Merge-safety anchor: slash-command filtering must preserve the workspace-local `/subagents` canon and keep stale `/multi-agents` aliases from creeping back in.
 use std::str::FromStr;
 
 use codex_utils_fuzzy_match::fuzzy_match;
@@ -42,7 +43,7 @@ pub(crate) fn builtins_for_input(flags: BuiltinCommandFlags) -> Vec<(&'static st
 
 pub(crate) fn builtin_search_aliases(command: SlashCommand) -> &'static [&'static str] {
     match command {
-        SlashCommand::MultiAgents => &["multi-agents"],
+        SlashCommand::MultiAgents => &[],
         _ => &[],
     }
 }
@@ -117,14 +118,14 @@ mod tests {
     }
 
     #[test]
-    fn multi_agents_alias_resolves_for_dispatch() {
-        assert_eq!(
-            find_builtin_command("multi-agents", all_enabled_flags()),
-            Some(SlashCommand::MultiAgents)
-        );
+    fn subagents_dispatch_uses_canonical_name_only() {
         assert_eq!(
             find_builtin_command("subagents", all_enabled_flags()),
             Some(SlashCommand::MultiAgents)
+        );
+        assert_eq!(
+            find_builtin_command("multi-agents", all_enabled_flags()),
+            None
         );
     }
 

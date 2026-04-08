@@ -55,6 +55,12 @@
         }
       ]
     },
+    "label": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "planType": {
       "anyOf": [
         {

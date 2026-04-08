@@ -18,6 +18,7 @@ use codex_protocol::models::WebSearchAction;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use serde_json::json;
 
+// Merge-safety anchor: exec JSONL output must preserve the workspace-local collab tool/task identity fields so operator surfaces match app-server/TUI history.
 pub use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use crate::event_processor::handle_last_message;
@@ -255,6 +256,8 @@ impl EventProcessorWithJsonOutput {
                     tool: match tool {
                         CollabAgentTool::SpawnAgent => CollabTool::SpawnAgent,
                         CollabAgentTool::SendInput => CollabTool::SendInput,
+                        CollabAgentTool::SendMessage => CollabTool::SendMessage,
+                        CollabAgentTool::FollowupTask => CollabTool::FollowupTask,
                         CollabAgentTool::ResumeAgent => CollabTool::Wait,
                         CollabAgentTool::Wait => CollabTool::Wait,
                         CollabAgentTool::CloseAgent => CollabTool::CloseAgent,

@@ -2,6 +2,7 @@ use super::*;
 use crate::agent::next_thread_spawn_depth;
 use std::sync::Arc;
 
+// Merge-safety anchor: legacy `resume_agent` remains id-centric while still propagating workspace-local receiver identity metadata for replay/operator surfaces.
 pub(crate) struct Handler;
 
 impl ToolHandler for Handler {
@@ -50,6 +51,7 @@ impl ToolHandler for Handler {
                     receiver_thread_id,
                     receiver_agent_nickname: receiver_agent.agent_nickname.clone(),
                     receiver_agent_role: receiver_agent.agent_role.clone(),
+                    receiver_agent_task_name: receiver_agent.agent_path.clone().map(String::from),
                 }
                 .into(),
             )
@@ -98,6 +100,7 @@ impl ToolHandler for Handler {
                     receiver_thread_id,
                     receiver_agent_nickname: receiver_agent.agent_nickname,
                     receiver_agent_role: receiver_agent.agent_role,
+                    receiver_agent_task_name: receiver_agent.agent_path.map(String::from),
                     status: status.clone(),
                 }
                 .into(),

@@ -2122,8 +2122,9 @@ impl Session {
             *guard = Arc::downgrade(&sess);
         }
         // Dispatch the SessionConfiguredEvent first and then report any errors.
-        // If resuming, include converted initial messages in the payload so UIs can render them immediately.
-        let initial_messages = initial_history.get_event_msgs();
+        // Only include the legacy event-only fallback when the rollout does not already carry the
+        // durable replay items used by reconstructed-turn resume ownership.
+        let initial_messages = initial_history.legacy_initial_messages();
         let events = std::iter::once(Event {
             id: INITIAL_SUBMIT_ID.to_owned(),
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
@@ -3762,11 +3763,17 @@ impl Session {
         self.replace_history(items, reference_context_item.clone())
             .await;
 
-        self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-            .await;
+        self.persist_rollout_items_required(
+            &[RolloutItem::Compacted(compacted_item)],
+            "persist compacted history",
+        )
+        .await;
         if let Some(turn_context_item) = reference_context_item {
-            self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item)])
-                .await;
+            self.persist_rollout_items_required(
+                &[RolloutItem::TurnContext(turn_context_item)],
+                "persist compacted reference context",
+            )
+            .await;
         }
         self.services.model_client.advance_window_generation();
     }
@@ -4088,16 +4095,27 @@ impl Session {
     }
 
     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
+        if let Err(error) = self.try_persist_rollout_items(items).await {
+            error!("failed to record rollout items: {error:#}");
+        }
+    }
+
+    async fn persist_rollout_items_required(&self, items: &[RolloutItem], context: &str) {
+        if let Err(error) = self.try_persist_rollout_items(items).await {
+            error!(%context, "failed to record rollout items: {error:#}");
+            panic!("{context}: {error:#}");
+        }
+    }
+
+    async fn try_persist_rollout_items(&self, items: &[RolloutItem]) -> std::io::Result<()> {
         let recorder = {
             let guard = self.services.rollout.lock().await;
             guard.clone()
         };
-        if let Some(rec) = recorder
-            && let Err(e) = rec.record_items(items).await
-        {
-            error!("failed to record rollout items: {e:#}");
-            panic!("failed to record rollout items: {e:#}");
+        if let Some(recorder) = recorder {
+            recorder.record_items(items).await?;
         }
+        Ok(())
     }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {
@@ -5886,8 +5904,11 @@ mod handlers {
             .into_iter()
             .chain(std::iter::once(RolloutItem::EventMsg(rollback_msg.clone())))
             .collect::<Vec<_>>();
-        sess.persist_rollout_items(&[RolloutItem::EventMsg(rollback_msg.clone())])
-            .await;
+        sess.persist_rollout_items_required(
+            &[RolloutItem::EventMsg(rollback_msg.clone())],
+            "persist thread rollback marker",
+        )
+        .await;
         // Flush and rebuild the in-memory rollout view before notifying clients because rollback
         // consumers re-read the rollout file synchronously on receipt of the event.
         sess.flush_rollout().await;

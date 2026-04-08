@@ -219,6 +219,8 @@ pub enum CollabToolCallStatus {
 pub enum CollabTool {
     SpawnAgent,
     SendInput,
+    SendMessage,
+    FollowupTask,
     Wait,
     CloseAgent,
 }

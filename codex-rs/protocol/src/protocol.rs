@@ -2330,6 +2330,13 @@ impl InitialHistory {
         }
     }
 
+    pub fn legacy_initial_messages(&self) -> Option<Vec<EventMsg>> {
+        if self.has_durable_replay_items() {
+            return None;
+        }
+        self.get_event_msgs()
+    }
+
     pub fn get_event_msgs(&self) -> Option<Vec<EventMsg>> {
         match self {
             InitialHistory::New => None,
@@ -2369,6 +2376,23 @@ impl InitialHistory {
                 RolloutItem::SessionMeta(meta_line) => meta_line.meta.base_instructions.clone(),
                 _ => None,
             }),
+        }
+    }
+
+    fn has_durable_replay_items(&self) -> bool {
+        fn is_durable_replay_item(item: &RolloutItem) -> bool {
+            matches!(
+                item,
+                RolloutItem::ResponseItem(_)
+                    | RolloutItem::Compacted(_)
+                    | RolloutItem::TurnContext(_)
+            )
+        }
+
+        match self {
+            InitialHistory::New => false,
+            InitialHistory::Resumed(resumed) => resumed.history.iter().any(is_durable_replay_item),
+            InitialHistory::Forked(items) => items.iter().any(is_durable_replay_item),
         }
     }
 
@@ -3391,8 +3415,9 @@ pub struct SessionConfiguredEvent {
     /// Current number of entries in the history log.
     pub history_entry_count: usize,
 
-    /// Optional initial messages (as events) for resumed sessions.
-    /// When present, UIs can use these to seed the history.
+    /// Legacy event-only fallback for resumed-session history seeding.
+    /// When the rollout already carries durable replay items, reconstructed turns are the sole
+    /// owner and this field stays absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_messages: Option<Vec<EventMsg>>,
 
@@ -3541,6 +3566,19 @@ pub struct CollabAgentRef {
     /// Optional role (agent_role) assigned to an AgentControl-spawned sub-agent.
     #[serde(default, alias = "agent_type", skip_serializing_if = "Option::is_none")]
     pub agent_role: Option<String>,
+    /// Optional canonical task path assigned to an AgentControl-spawned sub-agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum CollabAgentInteractionTool {
+    #[default]
+    SendInput,
+    SendMessage,
+    FollowupTask,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -3575,6 +3613,9 @@ pub struct CollabAgentStatusEntry {
     /// Optional role (agent_role) assigned to an AgentControl-spawned sub-agent.
     #[serde(default, alias = "agent_type", skip_serializing_if = "Option::is_none")]
     pub agent_role: Option<String>,
+    /// Optional canonical task path assigned to an AgentControl-spawned sub-agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_name: Option<String>,
     /// Last known status of the agent.
     pub status: AgentStatus,
     /// Most recent observed activity for the agent, when available.
@@ -3596,6 +3637,9 @@ pub struct CollabAgentSpawnEndEvent {
     /// Optional role assigned to the new agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_agent_role: Option<String>,
+    /// Optional canonical task path assigned to the new agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_agent_task_name: Option<String>,
     /// Initial prompt sent to the agent. Can be empty to prevent CoT leaking at the
     /// beginning.
     pub prompt: String,
@@ -3620,10 +3664,19 @@ pub struct CollabAgentSpawnEndEvent {
 pub struct CollabAgentInteractionBeginEvent {
     /// Identifier for the collab tool call.
     pub call_id: String,
+    // Merge-safety anchor: historical collab interaction rollout events predate the explicit
+    // tool field, so deserialization must keep defaulting missing data to the legacy
+    // `send_input` label instead of dropping old history lines on upgrade.
+    /// Name of the collab interaction tool that emitted the event.
+    #[serde(default)]
+    pub tool: CollabAgentInteractionTool,
     /// Thread ID of the sender.
     pub sender_thread_id: ThreadId,
     /// Thread ID of the receiver.
     pub receiver_thread_id: ThreadId,
+    /// Optional canonical task path assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_agent_task_name: Option<String>,
     /// Prompt sent from the sender to the receiver. Can be empty to prevent CoT
     /// leaking at the beginning.
     pub prompt: String,
@@ -3633,6 +3686,9 @@ pub struct CollabAgentInteractionBeginEvent {
 pub struct CollabAgentInteractionEndEvent {
     /// Identifier for the collab tool call.
     pub call_id: String,
+    /// Name of the collab interaction tool that emitted the event.
+    #[serde(default)]
+    pub tool: CollabAgentInteractionTool,
     /// Thread ID of the sender.
     pub sender_thread_id: ThreadId,
     /// Thread ID of the receiver.
@@ -3643,6 +3699,9 @@ pub struct CollabAgentInteractionEndEvent {
     /// Optional role assigned to the receiver agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver_agent_role: Option<String>,
+    /// Optional canonical task path assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_agent_task_name: Option<String>,
     /// Prompt sent from the sender to the receiver. Can be empty to prevent CoT
     /// leaking at the beginning.
     pub prompt: String,
@@ -3749,6 +3808,9 @@ pub struct CollabCloseBeginEvent {
     pub sender_thread_id: ThreadId,
     /// Thread ID of the receiver.
     pub receiver_thread_id: ThreadId,
+    /// Optional canonical task path assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_agent_task_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -3765,6 +3827,9 @@ pub struct CollabCloseEndEvent {
     /// Optional role assigned to the receiver agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver_agent_role: Option<String>,
+    /// Optional canonical task path assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_agent_task_name: Option<String>,
     /// Last known status of the receiver agent reported to the sender agent before
     /// the close.
     pub status: AgentStatus,
@@ -3784,6 +3849,9 @@ pub struct CollabResumeBeginEvent {
     /// Optional role assigned to the receiver agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver_agent_role: Option<String>,
+    /// Optional canonical task path assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_agent_task_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -3800,6 +3868,9 @@ pub struct CollabResumeEndEvent {
     /// Optional role assigned to the receiver agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver_agent_role: Option<String>,
+    /// Optional canonical task path assigned to the receiver agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver_agent_task_name: Option<String>,
     /// Last known status of the receiver agent reported to the sender agent after
     /// resume.
     pub status: AgentStatus,
@@ -3973,6 +4044,33 @@ mod tests {
             SessionSource::Unknown.restriction_product(),
             Some(Product::Codex)
         );
+    }
+
+    #[test]
+    fn collab_interaction_begin_defaults_missing_legacy_tool_field() {
+        let event: CollabAgentInteractionBeginEvent = serde_json::from_value(json!({
+            "call_id": "call-1",
+            "sender_thread_id": "00000000-0000-0000-0000-000000000001",
+            "receiver_thread_id": "00000000-0000-0000-0000-000000000002",
+            "prompt": "continue"
+        }))
+        .expect("legacy begin event should deserialize");
+
+        assert_eq!(event.tool, CollabAgentInteractionTool::SendInput);
+    }
+
+    #[test]
+    fn collab_interaction_end_defaults_missing_legacy_tool_field() {
+        let event: CollabAgentInteractionEndEvent = serde_json::from_value(json!({
+            "call_id": "call-1",
+            "sender_thread_id": "00000000-0000-0000-0000-000000000001",
+            "receiver_thread_id": "00000000-0000-0000-0000-000000000002",
+            "prompt": "continue",
+            "status": "pending_init"
+        }))
+        .expect("legacy end event should deserialize");
+
+        assert_eq!(event.tool, CollabAgentInteractionTool::SendInput);
     }
 
     #[test]

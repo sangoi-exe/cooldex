@@ -26,6 +26,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+// Merge-safety anchor: client-suite replay tests guard the workspace-local rollout fallback boundary so `SessionConfigured.initial_messages` stays legacy-only.
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
@@ -368,14 +369,9 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
     let codex = test.codex.clone();
     let session_configured = test.session_configured;
 
-    // 1) Assert initial_messages only includes existing EventMsg entries; response items are not converted
-    let initial_msgs = session_configured
-        .initial_messages
-        .clone()
-        .expect("expected initial messages option for resumed session");
-    let initial_json = serde_json::to_value(&initial_msgs).unwrap();
-    let expected_initial_json = json!([]);
-    assert_eq!(initial_json, expected_initial_json);
+    // 1) Durable replay items already exist in the rollout, so the legacy initial_messages
+    // fallback must stay absent.
+    assert!(session_configured.initial_messages.is_none());
 
     // 2) Submit new input; the request body must include the prior items, then initial context, then new user input.
     codex

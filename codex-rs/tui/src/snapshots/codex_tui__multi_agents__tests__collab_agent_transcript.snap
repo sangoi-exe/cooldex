@@ -1,12 +1,11 @@
 ---
 source: tui/src/multi_agents.rs
-assertion_line: 791
 expression: snapshot
 ---
 • Spawned Robie [explorer] (profile=subxhigh, gpt-5 high)
   └ Compute 11! and reply with just the integer result.
 
-• Sent input to Robie [explorer]
+• Queued follow-up for Robie [explorer]
   └ Please continue and return the answer only.
 
 • Waiting for Robie [explorer]

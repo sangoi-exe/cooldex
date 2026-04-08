@@ -51,6 +51,12 @@
             }
           ]
         },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "planType": {
           "anyOf": [
             {
@@ -588,6 +594,12 @@
             "null"
           ]
         },
+        "taskName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "threadId": {
           "type": "string"
         }
@@ -629,6 +641,12 @@
         },
         "status": {
           "$ref": "#/definitions/CollabAgentStatus"
+        },
+        "taskName": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -652,6 +670,8 @@
       "enum": [
         "spawnAgent",
         "sendInput",
+        "sendMessage",
+        "followupTask",
         "resumeAgent",
         "wait",
         "closeAgent"

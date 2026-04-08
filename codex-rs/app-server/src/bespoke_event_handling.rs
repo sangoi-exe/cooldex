@@ -1034,6 +1034,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                         end_event.status.clone(),
                         end_event.new_agent_nickname.clone(),
                         end_event.new_agent_role.clone(),
+                        end_event.new_agent_task_name.clone(),
                     );
                     (
                         vec![receiver_id.clone()],
@@ -1056,6 +1057,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                             thread_id.to_string(),
                             end_event.new_agent_nickname.clone(),
                             end_event.new_agent_role.clone(),
+                            end_event.new_agent_task_name.clone(),
                         )
                     })
                     .collect(),
@@ -1079,11 +1081,16 @@ pub(crate) async fn apply_bespoke_event_handling(
             let receiver_thread_ids = vec![begin_event.receiver_thread_id.to_string()];
             let item = ThreadItem::CollabAgentToolCall {
                 id: begin_event.call_id,
-                tool: CollabAgentTool::SendInput,
+                tool: begin_event.tool.into(),
                 status: V2CollabToolCallStatus::InProgress,
                 sender_thread_id: begin_event.sender_thread_id.to_string(),
                 receiver_thread_ids,
-                receiver_agents: Vec::new(),
+                receiver_agents: vec![collab_agent_ref(
+                    begin_event.receiver_thread_id.to_string(),
+                    /*agent_nickname*/ None,
+                    /*agent_role*/ None,
+                    begin_event.receiver_agent_task_name,
+                )],
                 prompt: Some(begin_event.prompt),
                 profile: None,
                 model: None,
@@ -1111,10 +1118,11 @@ pub(crate) async fn apply_bespoke_event_handling(
                 end_event.status,
                 end_event.receiver_agent_nickname.clone(),
                 end_event.receiver_agent_role.clone(),
+                end_event.receiver_agent_task_name.clone(),
             );
             let item = ThreadItem::CollabAgentToolCall {
                 id: end_event.call_id,
-                tool: CollabAgentTool::SendInput,
+                tool: end_event.tool.into(),
                 status,
                 sender_thread_id: end_event.sender_thread_id.to_string(),
                 receiver_thread_ids: vec![receiver_id.clone()],
@@ -1122,6 +1130,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     receiver_id.clone(),
                     end_event.receiver_agent_nickname.clone(),
                     end_event.receiver_agent_role.clone(),
+                    end_event.receiver_agent_task_name.clone(),
                 )],
                 prompt: Some(end_event.prompt),
                 profile: None,
@@ -1168,7 +1177,12 @@ pub(crate) async fn apply_bespoke_event_handling(
                 status: V2CollabToolCallStatus::InProgress,
                 sender_thread_id: begin_event.sender_thread_id.to_string(),
                 receiver_thread_ids: vec![begin_event.receiver_thread_id.to_string()],
-                receiver_agents: Vec::new(),
+                receiver_agents: vec![collab_agent_ref(
+                    begin_event.receiver_thread_id.to_string(),
+                    /*agent_nickname*/ None,
+                    /*agent_role*/ None,
+                    begin_event.receiver_agent_task_name,
+                )],
                 prompt: None,
                 profile: None,
                 model: None,
@@ -1207,6 +1221,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     end_event.status,
                     end_event.receiver_agent_nickname.clone(),
                     end_event.receiver_agent_role.clone(),
+                    end_event.receiver_agent_task_name.clone(),
                 ),
             )]
             .into_iter()
@@ -1221,6 +1236,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     end_event.receiver_thread_id.to_string(),
                     end_event.receiver_agent_nickname.clone(),
                     end_event.receiver_agent_role.clone(),
+                    end_event.receiver_agent_task_name.clone(),
                 )],
                 prompt: None,
                 profile: None,
@@ -2782,6 +2798,7 @@ fn collab_resume_begin_item(
             begin_event.receiver_thread_id.to_string(),
             begin_event.receiver_agent_nickname,
             begin_event.receiver_agent_role,
+            begin_event.receiver_agent_task_name,
         )],
         prompt: None,
         profile: None,
@@ -2805,6 +2822,7 @@ fn collab_resume_end_item(end_event: codex_protocol::protocol::CollabResumeEndEv
             end_event.status,
             end_event.receiver_agent_nickname.clone(),
             end_event.receiver_agent_role.clone(),
+            end_event.receiver_agent_task_name.clone(),
         ),
     )]
     .into_iter()
@@ -2819,6 +2837,7 @@ fn collab_resume_end_item(end_event: codex_protocol::protocol::CollabResumeEndEv
             receiver_id,
             end_event.receiver_agent_nickname.clone(),
             end_event.receiver_agent_role,
+            end_event.receiver_agent_task_name,
         )],
         prompt: None,
         profile: None,
@@ -2926,11 +2945,13 @@ fn collab_agent_ref(
     thread_id: String,
     agent_nickname: Option<String>,
     agent_role: Option<String>,
+    task_name: Option<String>,
 ) -> V2CollabAgentRef {
     V2CollabAgentRef {
         thread_id,
         agent_nickname,
         agent_role,
+        task_name,
     }
 }
 
@@ -2938,10 +2959,12 @@ fn collab_agent_state_with_identity(
     status: codex_protocol::protocol::AgentStatus,
     agent_nickname: Option<String>,
     agent_role: Option<String>,
+    task_name: Option<String>,
 ) -> V2CollabAgentStatus {
     let mut state = V2CollabAgentStatus::from(status);
     state.agent_nickname = agent_nickname;
     state.agent_role = agent_role;
+    state.task_name = task_name;
     state
 }
 
@@ -3775,6 +3798,7 @@ mod tests {
             receiver_thread_id: ThreadId::new(),
             receiver_agent_nickname: Some("Scout".to_string()),
             receiver_agent_role: Some("reviewer".to_string()),
+            receiver_agent_task_name: Some("/root/scout".to_string()),
         };
 
         let item = collab_resume_begin_item(event.clone());
@@ -3788,6 +3812,7 @@ mod tests {
                 thread_id: event.receiver_thread_id.to_string(),
                 agent_nickname: Some("Scout".to_string()),
                 agent_role: Some("reviewer".to_string()),
+                task_name: Some("/root/scout".to_string()),
             }],
             prompt: None,
             profile: None,
@@ -3807,6 +3832,7 @@ mod tests {
             receiver_thread_id: ThreadId::new(),
             receiver_agent_nickname: Some("Closer".to_string()),
             receiver_agent_role: Some("maintainer".to_string()),
+            receiver_agent_task_name: Some("/root/closer".to_string()),
             status: codex_protocol::protocol::AgentStatus::NotFound,
         };
 
@@ -3822,6 +3848,7 @@ mod tests {
                 thread_id: receiver_id.clone(),
                 agent_nickname: Some("Closer".to_string()),
                 agent_role: Some("maintainer".to_string()),
+                task_name: Some("/root/closer".to_string()),
             }],
             prompt: None,
             profile: None,
@@ -3833,6 +3860,7 @@ mod tests {
                     codex_protocol::protocol::AgentStatus::NotFound,
                     Some("Closer".to_string()),
                     Some("maintainer".to_string()),
+                    Some("/root/closer".to_string()),
                 ),
             )]
             .into_iter()
@@ -3852,6 +3880,7 @@ mod tests {
                 thread_id: receiver_thread_id,
                 agent_nickname: Some("Watcher".to_string()),
                 agent_role: Some("observer".to_string()),
+                task_name: Some("/root/watcher".to_string()),
             }],
             call_id: "wait-call-1".to_string(),
             wait_state: CoreCollabWaitState {
@@ -3903,6 +3932,7 @@ mod tests {
                 thread_id: receiver_thread_id,
                 agent_nickname: Some("Watcher".to_string()),
                 agent_role: Some("observer".to_string()),
+                task_name: Some("/root/watcher".to_string()),
                 status: codex_protocol::protocol::AgentStatus::Completed(Some("done".to_string())),
                 last_activity: None,
             }],
@@ -3931,6 +3961,7 @@ mod tests {
                 thread_id: receiver_thread_id.to_string(),
                 agent_nickname: Some("Watcher".to_string()),
                 agent_role: Some("observer".to_string()),
+                task_name: Some("/root/watcher".to_string()),
             }],
             prompt: None,
             profile: None,
@@ -3942,6 +3973,7 @@ mod tests {
                     codex_protocol::protocol::AgentStatus::Completed(Some("done".to_string())),
                     Some("Watcher".to_string()),
                     Some("observer".to_string()),
+                    Some("/root/watcher".to_string()),
                 ),
             )]
             .into_iter()

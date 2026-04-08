@@ -1336,6 +1336,7 @@ mod tests {
                 model_provider: "openai".to_string(),
                 service_tier: None,
                 cwd: PathBuf::from("/tmp"),
+                config_path: PathBuf::from("/tmp/config.toml"),
                 approval_policy: v2::AskForApproval::OnFailure,
                 approvals_reviewer: v2::ApprovalsReviewer::User,
                 sandbox: v2::SandboxPolicy::DangerFullAccess,
@@ -1375,6 +1376,7 @@ mod tests {
                     "modelProvider": "openai",
                     "serviceTier": null,
                     "cwd": "/tmp",
+                    "configPath": "/tmp/config.toml",
                     "approvalPolicy": "on-failure",
                     "approvalsReviewer": "user",
                     "sandbox": {
@@ -1538,12 +1540,14 @@ mod tests {
         );
 
         let chatgpt = v2::Account::Chatgpt {
+            label: None,
             email: "user@example.com".to_string(),
             plan_type: PlanType::Plus,
         };
         assert_eq!(
             json!({
                 "type": "chatgpt",
+                "label": null,
                 "email": "user@example.com",
                 "planType": "plus",
             }),

@@ -28,6 +28,12 @@
             "email": {
               "type": "string"
             },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "planType": {
               "$ref": "#/definitions/PlanType"
             },
@@ -98,6 +104,12 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
           ]
         },
         "planType": {
@@ -2417,6 +2429,12 @@
             "null"
           ]
         },
+        "taskName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "threadId": {
           "type": "string"
         }
@@ -2458,6 +2476,12 @@
         },
         "status": {
           "$ref": "#/definitions/CollabAgentStatus"
+        },
+        "taskName": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -2481,6 +2505,8 @@
       "enum": [
         "spawnAgent",
         "sendInput",
+        "sendMessage",
+        "followupTask",
         "resumeAgent",
         "wait",
         "closeAgent"

@@ -89,6 +89,7 @@ impl ToolHandler for Handler {
                 thread_id: *receiver_thread_id,
                 agent_nickname: agent_metadata.agent_nickname,
                 agent_role: agent_metadata.agent_role,
+                task_name: agent_metadata.agent_path.map(String::from),
             });
         }
 

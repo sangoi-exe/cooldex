@@ -3,7 +3,7 @@
 // owned here; keep handler exports aligned with the spec/tool registration switch.
 
 use crate::agent::AgentStatus;
-use crate::agent::agent_resolver::resolve_agent_target;
+use crate::agent::agent_resolver::resolve_agent_task_path_target;
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
@@ -17,6 +17,7 @@ use codex_protocol::AgentPath;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::CollabAgentInteractionBeginEvent;
 use codex_protocol::protocol::CollabAgentInteractionEndEvent;
+use codex_protocol::protocol::CollabAgentInteractionTool;
 use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
 use codex_protocol::protocol::CollabAgentSpawnEndEvent;
 use codex_protocol::protocol::CollabCloseBeginEvent;

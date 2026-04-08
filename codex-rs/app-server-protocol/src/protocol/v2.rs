@@ -51,6 +51,7 @@ use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::CollabAgentActivity as CoreCollabAgentActivity;
 use codex_protocol::protocol::CollabAgentActivityKind as CoreCollabAgentActivityKind;
+use codex_protocol::protocol::CollabAgentInteractionTool as CoreCollabAgentInteractionTool;
 use codex_protocol::protocol::CollabAgentRef as CoreCollabAgentRef;
 use codex_protocol::protocol::CollabAgentStatusEntry as CoreCollabAgentStatusEntry;
 use codex_protocol::protocol::CollabWaitReturnWhen as CoreCollabWaitReturnWhen;
@@ -1588,7 +1589,11 @@ pub enum Account {
 
     #[serde(rename = "chatgpt", rename_all = "camelCase")]
     #[ts(rename = "chatgpt", rename_all = "camelCase")]
-    Chatgpt { email: String, plan_type: PlanType },
+    Chatgpt {
+        label: Option<String>,
+        email: String,
+        plan_type: PlanType,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
@@ -3716,6 +3721,7 @@ pub struct Thread {
 #[ts(export_to = "v2/")]
 pub struct AccountUpdatedNotification {
     pub auth_mode: Option<AuthMode>,
+    pub label: Option<String>,
     pub plan_type: Option<PlanType>,
 }
 
@@ -4949,9 +4955,21 @@ v2_enum_from_core! {
 pub enum CollabAgentTool {
     SpawnAgent,
     SendInput,
+    SendMessage,
+    FollowupTask,
     ResumeAgent,
     Wait,
     CloseAgent,
+}
+
+impl From<CoreCollabAgentInteractionTool> for CollabAgentTool {
+    fn from(value: CoreCollabAgentInteractionTool) -> Self {
+        match value {
+            CoreCollabAgentInteractionTool::SendInput => Self::SendInput,
+            CoreCollabAgentInteractionTool::SendMessage => Self::SendMessage,
+            CoreCollabAgentInteractionTool::FollowupTask => Self::FollowupTask,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -5181,6 +5199,7 @@ pub struct CollabAgentRef {
     pub thread_id: String,
     pub agent_nickname: Option<String>,
     pub agent_role: Option<String>,
+    pub task_name: Option<String>,
 }
 
 impl From<CoreCollabAgentRef> for CollabAgentRef {
@@ -5189,6 +5208,7 @@ impl From<CoreCollabAgentRef> for CollabAgentRef {
             thread_id: value.thread_id.to_string(),
             agent_nickname: value.agent_nickname,
             agent_role: value.agent_role,
+            task_name: value.task_name,
         }
     }
 }
@@ -5199,6 +5219,7 @@ impl From<&CoreCollabAgentRef> for CollabAgentRef {
             thread_id: value.thread_id.to_string(),
             agent_nickname: value.agent_nickname.clone(),
             agent_role: value.agent_role.clone(),
+            task_name: value.task_name.clone(),
         }
     }
 }
@@ -5209,6 +5230,7 @@ impl From<&CoreCollabAgentStatusEntry> for CollabAgentRef {
             thread_id: value.thread_id.to_string(),
             agent_nickname: value.agent_nickname.clone(),
             agent_role: value.agent_role.clone(),
+            task_name: value.task_name.clone(),
         }
     }
 }
@@ -5240,6 +5262,7 @@ pub struct CollabAgentState {
     pub message: Option<String>,
     pub agent_nickname: Option<String>,
     pub agent_role: Option<String>,
+    pub task_name: Option<String>,
     pub last_activity: Option<CollabAgentActivity>,
 }
 
@@ -5251,6 +5274,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                 message: None,
                 agent_nickname: None,
                 agent_role: None,
+                task_name: None,
                 last_activity: None,
             },
             CoreAgentStatus::Running => Self {
@@ -5258,6 +5282,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                 message: None,
                 agent_nickname: None,
                 agent_role: None,
+                task_name: None,
                 last_activity: None,
             },
             CoreAgentStatus::Interrupted => Self {
@@ -5265,6 +5290,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                 message: None,
                 agent_nickname: None,
                 agent_role: None,
+                task_name: None,
                 last_activity: None,
             },
             CoreAgentStatus::Completed(message) => Self {
@@ -5272,6 +5298,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                 message,
                 agent_nickname: None,
                 agent_role: None,
+                task_name: None,
                 last_activity: None,
             },
             CoreAgentStatus::Errored(message) => Self {
@@ -5279,6 +5306,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                 message: Some(message),
                 agent_nickname: None,
                 agent_role: None,
+                task_name: None,
                 last_activity: None,
             },
             CoreAgentStatus::Shutdown => Self {
@@ -5286,6 +5314,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                 message: None,
                 agent_nickname: None,
                 agent_role: None,
+                task_name: None,
                 last_activity: None,
             },
             CoreAgentStatus::NotFound => Self {
@@ -5293,6 +5322,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                 message: None,
                 agent_nickname: None,
                 agent_role: None,
+                task_name: None,
                 last_activity: None,
             },
         }
@@ -5304,6 +5334,7 @@ impl From<&CoreCollabAgentStatusEntry> for CollabAgentState {
         let mut state = Self::from(value.status.clone());
         state.agent_nickname = value.agent_nickname.clone();
         state.agent_role = value.agent_role.clone();
+        state.task_name = value.task_name.clone();
         state.last_activity = value.last_activity.clone().map(CollabAgentActivity::from);
         state
     }
@@ -6630,6 +6661,7 @@ mod tests {
                 message: None,
                 agent_nickname: None,
                 agent_role: None,
+                task_name: None,
                 last_activity: None,
             }
         );

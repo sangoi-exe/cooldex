@@ -22,6 +22,7 @@ use tracing::Span;
 use tracing::warn;
 
 use crate::error_code::INTERNAL_ERROR_CODE;
+// Merge-safety anchor: outgoing app-server notifications must preserve the workspace-local collab/account payload fields so TUI and exec do not drift from the root protocol owners.
 use crate::server_request_error::TURN_TRANSITION_PENDING_REQUEST_ERROR_REASON;
 
 #[cfg(test)]
@@ -768,6 +769,7 @@ mod tests {
     fn verify_account_updated_notification_serialization() {
         let notification = ServerNotification::AccountUpdated(AccountUpdatedNotification {
             auth_mode: Some(AuthMode::ApiKey),
+            label: None,
             plan_type: None,
         });
 
@@ -777,6 +779,7 @@ mod tests {
                 "method": "account/updated",
                 "params": {
                     "authMode": "apikey",
+                    "label": null,
                     "planType": null
                 },
             }),

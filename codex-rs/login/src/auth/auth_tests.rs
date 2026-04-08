@@ -128,18 +128,27 @@ async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
     assert_eq!(AuthMode::Chatgpt, auth.auth_mode());
     assert_eq!(auth.get_chatgpt_user_id().as_deref(), Some("user-12345"));
 
-    let auth_dot_json = auth
-        .get_current_auth_json()
-        .expect("AuthDotJson should exist");
-    let last_refresh = auth_dot_json
+    let active_account = auth
+        .current_chatgpt_account_snapshot()
+        .expect("active account snapshot should exist");
+    let last_refresh = active_account
         .last_refresh
         .expect("last_refresh should be recorded");
+    assert_eq!(
+        auth.active_chatgpt_account_summary(),
+        Some(ActiveChatgptAccountSummary {
+            store_account_id: "chatgpt-user:user-12345".to_string(),
+            label: None,
+            email: Some("user@example.com".to_string()),
+            auth_mode: AuthMode::Chatgpt,
+        })
+    );
 
     assert_eq!(
-        AuthDotJson {
-            auth_mode: None,
-            openai_api_key: None,
-            tokens: Some(TokenData {
+        ActiveChatgptAccountSnapshot {
+            store_account_id: "chatgpt-user:user-12345".to_string(),
+            label: None,
+            tokens: TokenData {
                 id_token: IdTokenInfo {
                     email: Some("user@example.com".to_string()),
                     chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Pro)),
@@ -150,10 +159,11 @@ async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
                 access_token: "test-access-token".to_string(),
                 refresh_token: "test-refresh-token".to_string(),
                 account_id: None,
-            }),
+            },
             last_refresh: Some(last_refresh),
+            auth_mode: AuthMode::Chatgpt,
         },
-        auth_dot_json
+        active_account.clone()
     );
 }
 
@@ -448,26 +458,19 @@ fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
     )
     .expect("load auth")
     .expect("auth available");
-    let mut updated_auth_dot_json = auth
-        .get_current_auth_json()
-        .expect("AuthDotJson should exist");
-    let updated_tokens = updated_auth_dot_json
-        .tokens
-        .as_mut()
-        .expect("tokens should exist");
-    updated_tokens.access_token = "new-access-token".to_string();
-    updated_tokens.refresh_token = "new-refresh-token".to_string();
-    let store_account_id = updated_auth_dot_json
-        .tokens
-        .as_ref()
-        .and_then(crate::token_data::TokenData::preferred_store_account_id);
-    let updated_auth = CodexAuth::from_auth_dot_json(
-        codex_home.path(),
-        store_account_id,
-        updated_auth_dot_json,
+    let mut updated_active_account = auth
+        .current_chatgpt_account_snapshot()
+        .expect("active account snapshot should exist")
+        .clone();
+    updated_active_account.tokens.access_token = "new-access-token".to_string();
+    updated_active_account.tokens.refresh_token = "new-refresh-token".to_string();
+    let storage = create_auth_storage(
+        codex_home.path().to_path_buf(),
         AuthCredentialsStoreMode::File,
-    )
-    .expect("updated auth should parse");
+    );
+    let updated_auth =
+        CodexAuth::from_chatgpt_active_account_snapshot(updated_active_account, Some(storage))
+            .expect("updated auth should parse");
 
     let manager = AuthManager::from_auth_for_testing(auth.clone());
     let error = RefreshTokenFailedError::new(
@@ -478,6 +481,43 @@ fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
 
     assert_eq!(manager.refresh_failure_for_auth(&auth), Some(error));
     assert_eq!(manager.refresh_failure_for_auth(&updated_auth), None);
+}
+
+#[test]
+fn active_chatgpt_account_summary_comes_from_runtime_snapshot() {
+    let codex_home = tempdir().unwrap();
+    let account = StoredAccount {
+        label: Some("Primary workspace".to_string()),
+        ..stored_test_chatgpt_account("org_workspace", Some(Utc::now()))
+    };
+    let expected_summary = ActiveChatgptAccountSummary {
+        store_account_id: account.id.clone(),
+        label: account.label.clone(),
+        email: account.tokens.id_token.email.clone(),
+        auth_mode: AuthMode::Chatgpt,
+    };
+    let store = AuthStore {
+        active_account_id: Some(account.id.clone()),
+        accounts: vec![account],
+        ..AuthStore::default()
+    };
+    save_auth(codex_home.path(), &store, AuthCredentialsStoreMode::File).expect("save auth store");
+
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let auth = manager.auth_cached().expect("auth should be cached");
+
+    assert_eq!(
+        auth.active_chatgpt_account_summary(),
+        Some(expected_summary.clone())
+    );
+    assert_eq!(
+        manager.active_chatgpt_account_summary(),
+        Some(expected_summary)
+    );
 }
 
 #[tokio::test]

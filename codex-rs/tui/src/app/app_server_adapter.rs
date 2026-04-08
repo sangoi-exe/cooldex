@@ -178,6 +178,7 @@ impl App {
                 self.chat_widget.update_account_state(
                     status_account_display_from_auth_mode(
                         notification.auth_mode,
+                        notification.label.clone(),
                         notification.plan_type,
                     ),
                     notification.plan_type,

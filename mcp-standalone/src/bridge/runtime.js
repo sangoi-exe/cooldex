@@ -25,24 +25,22 @@ function normalizeTranscriptText(value) {
   return normalized.length > 0 ? normalized : null;
 }
 
-function extractResponseConfigPath(response) {
-  if (typeof response?.configPath === "string") {
-    return response.configPath;
+function expectTopLevelResponseString(response, method, fieldName) {
+  const value = response?.[fieldName];
+  if (typeof value === "string" && value.length > 0) {
+    return value;
   }
-  if (typeof response?.thread?.configPath === "string") {
-    return response.thread.configPath;
-  }
-  return null;
-}
 
-function extractResponseCwd(response) {
-  if (typeof response?.cwd === "string") {
-    return response.cwd;
-  }
-  if (typeof response?.thread?.cwd === "string") {
-    return response.thread.cwd;
-  }
-  return null;
+  throw createBridgeRuntimeError(
+    502,
+    "APP_SERVER_INVALID_RESPONSE",
+    `${method} response ${fieldName} must be a non-empty top-level string.`,
+    {
+      fieldName,
+      actualValue: value ?? null,
+      legacyNestedValue: response?.thread?.[fieldName] ?? null,
+    },
+  );
 }
 
 function cloneBridgeParams(params) {
@@ -1154,7 +1152,7 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
       );
     }
 
-    const resumedCwd = extractResponseCwd(threadResumeResponse);
+    const resumedCwd = expectTopLevelResponseString(threadResumeResponse, "thread/resume", "cwd");
     if (resumedCwd !== session.cwd) {
       throw createBridgeRuntimeError(
         502,
@@ -1167,7 +1165,7 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
       );
     }
 
-    const resumedConfigPath = extractResponseConfigPath(threadResumeResponse);
+    const resumedConfigPath = expectTopLevelResponseString(threadResumeResponse, "thread/resume", "configPath");
     if (session.configPath !== null && resumedConfigPath !== session.configPath) {
       throw createBridgeRuntimeError(
         502,
@@ -1300,7 +1298,7 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
           threadStartResponse ?? null,
         );
       }
-      const responseCwd = extractResponseCwd(threadStartResponse);
+      const responseCwd = expectTopLevelResponseString(threadStartResponse, "thread/start", "cwd");
       if (responseCwd !== cwd) {
         throw createBridgeRuntimeError(
           502,
@@ -1312,7 +1310,7 @@ export function createBridgeRuntime({ config, logger, onFatal }) {
           },
         );
       }
-      const responseConfigPath = extractResponseConfigPath(threadStartResponse);
+      const responseConfigPath = expectTopLevelResponseString(threadStartResponse, "thread/start", "configPath");
       if (resolvedConfigPath !== null && responseConfigPath !== resolvedConfigPath) {
         throw createBridgeRuntimeError(
           502,

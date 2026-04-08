@@ -1,6 +1,7 @@
 use super::*;
 use crate::agent::control::render_input_preview;
 
+// Merge-safety anchor: legacy `send_input` must keep its V1 tool identity while forwarding workspace-local receiver task metadata needed by replay/operator surfaces.
 pub(crate) struct Handler;
 
 impl ToolHandler for Handler {
@@ -56,8 +57,10 @@ impl ToolHandler for Handler {
                 &turn,
                 CollabAgentInteractionBeginEvent {
                     call_id: call_id.clone(),
+                    tool: CollabAgentInteractionTool::SendInput,
                     sender_thread_id: session.conversation_id,
                     receiver_thread_id,
+                    receiver_agent_task_name: receiver_agent.agent_path.clone().map(String::from),
                     prompt: prompt.clone(),
                 }
                 .into(),
@@ -78,10 +81,12 @@ impl ToolHandler for Handler {
                 &turn,
                 CollabAgentInteractionEndEvent {
                     call_id,
+                    tool: CollabAgentInteractionTool::SendInput,
                     sender_thread_id: session.conversation_id,
                     receiver_thread_id,
                     receiver_agent_nickname: receiver_agent.agent_nickname,
                     receiver_agent_role: receiver_agent.agent_role,
+                    receiver_agent_task_name: receiver_agent.agent_path.map(String::from),
                     prompt,
                     status,
                 }

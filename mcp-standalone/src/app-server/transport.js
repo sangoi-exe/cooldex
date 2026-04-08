@@ -36,6 +36,7 @@ export class AppServerTransport extends EventEmitter {
     this.pendingRequests = new Map();
     this.nextRequestId = 1;
     this.startPromise = null;
+    this.stopPromise = null;
     this.started = false;
     this.stopping = false;
     this.stdoutReader = null;
@@ -43,13 +44,20 @@ export class AppServerTransport extends EventEmitter {
   }
 
   async start() {
-    if (this.started) {
-      return;
-    }
     if (this.startPromise) {
       return this.startPromise;
     }
+    if (this.started) {
+      return;
+    }
+    if (this.stopPromise) {
+      await this.stopPromise;
+      if (this.started) {
+        return;
+      }
+    }
 
+    this.stopping = false;
     this.startPromise = this.#startInternal();
     try {
       await this.startPromise;
@@ -60,42 +68,15 @@ export class AppServerTransport extends EventEmitter {
   }
 
   async stop() {
-    this.stopping = true;
-
-    for (const pending of this.pendingRequests.values()) {
-      clearTimeout(pending.timeoutId);
-      pending.reject(new Error("app-server transport stopped before the request completed."));
-    }
-    this.pendingRequests.clear();
-
-    if (!this.child) {
-      return;
+    if (this.stopPromise) {
+      return this.stopPromise;
     }
 
-    const child = this.child;
-    this.child = null;
-
-    if (this.stdoutReader) {
-      this.stdoutReader.close();
-      this.stdoutReader = null;
-    }
-    if (this.stderrReader) {
-      this.stderrReader.close();
-      this.stderrReader = null;
-    }
-
-    if (child.killed) {
-      return;
-    }
-
-    child.kill("SIGTERM");
-    const timeoutPromise = new Promise((resolve) => {
-      setTimeout(resolve, this.config.appServerShutdownTimeoutMs);
-    });
-    await Promise.race([once(child, "exit"), timeoutPromise]);
-    if (child.exitCode === null && child.signalCode === null) {
-      child.kill("SIGKILL");
-      await once(child, "exit");
+    this.stopPromise = this.#stopInternal();
+    try {
+      await this.stopPromise;
+    } finally {
+      this.stopPromise = null;
     }
   }
 
@@ -122,6 +103,47 @@ export class AppServerTransport extends EventEmitter {
       id,
       error,
     });
+  }
+
+  async #stopInternal() {
+    this.stopping = true;
+    this.started = false;
+
+    try {
+      for (const pending of this.pendingRequests.values()) {
+        clearTimeout(pending.timeoutId);
+        pending.reject(new Error("app-server transport stopped before the request completed."));
+      }
+      this.pendingRequests.clear();
+
+      const child = this.child;
+      this.child = null;
+
+      if (this.stdoutReader) {
+        this.stdoutReader.close();
+        this.stdoutReader = null;
+      }
+      if (this.stderrReader) {
+        this.stderrReader.close();
+        this.stderrReader = null;
+      }
+
+      if (!child || child.killed || child.exitCode !== null || child.signalCode !== null) {
+        return;
+      }
+
+      child.kill("SIGTERM");
+      const timeoutPromise = new Promise((resolve) => {
+        setTimeout(resolve, this.config.appServerShutdownTimeoutMs);
+      });
+      await Promise.race([once(child, "exit"), timeoutPromise]);
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await once(child, "exit");
+      }
+    } finally {
+      this.stopping = false;
+    }
   }
 
   async #requestInternal(method, params, timeoutMs) {
@@ -163,7 +185,7 @@ export class AppServerTransport extends EventEmitter {
   }
 
   async #startInternal() {
-    // Merge anchor: process boot cwd must stay aligned with bridge default-session
+    // Merge-safety anchor: process boot cwd must stay aligned with bridge default-session
     // cwd semantics used by runtime thread/start and thread/resume checks.
     const child = spawn(this.config.codexCommand, this.config.codexArgs, {
       cwd: this.config.defaultSessionCwd,

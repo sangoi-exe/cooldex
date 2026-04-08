@@ -211,6 +211,7 @@ impl ToolHandler for Handler {
                     new_thread_id,
                     new_agent_nickname,
                     new_agent_role,
+                    new_agent_task_name: new_agent_path.clone(),
                     prompt,
                     profile: configured_profile,
                     model: effective_model,

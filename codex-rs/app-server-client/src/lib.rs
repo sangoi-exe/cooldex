@@ -14,6 +14,7 @@
 //! [`InProcessClientHandle`](codex_app_server::in_process::InProcessClientHandle),
 //! bridging async `mpsc` channels on both sides. Queues are bounded so overload
 //! surfaces as channel-full errors rather than unbounded memory growth.
+// Merge-safety anchor: app-server-client must stay aligned with the app-server v2 collab/account payload owners so in-process consumers see the same task-name/tool/account-label contract as TUI and exec.
 
 mod remote;
 
@@ -1461,6 +1462,7 @@ mod tests {
                         serde_json::to_value(ServerNotification::AccountUpdated(
                             AccountUpdatedNotification {
                                 auth_mode: None,
+                                label: None,
                                 plan_type: None,
                             },
                         ))
