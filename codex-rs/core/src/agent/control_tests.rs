@@ -15,12 +15,15 @@ use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
+use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnAbortReason;
@@ -767,6 +770,38 @@ fn export_forked_subagent_response_item_preserves_agents_fragment() {
             phase: None,
         }
     );
+}
+
+#[test]
+fn export_forked_subagent_history_filters_parent_spawn_tool_items_from_compaction_history() {
+    let parent_spawn_call_id = "spawn-call-compacted";
+
+    let exported = export_forked_subagent_history(vec![RolloutItem::Compacted(CompactedItem {
+        message: String::new(),
+        replacement_history: Some(vec![
+            spawn_agent_call(parent_spawn_call_id),
+            ResponseItem::FunctionCallOutput {
+                call_id: parent_spawn_call_id.to_string(),
+                output: FunctionCallOutputPayload::from_text("done".to_string()),
+            },
+            assistant_message("keep this final answer", Some(MessagePhase::FinalAnswer)),
+        ]),
+        prompt_gc: None,
+    })]);
+
+    let [RolloutItem::Compacted(compacted)] = exported.as_slice() else {
+        panic!("expected one compacted rollout item");
+    };
+
+    assert_eq!(compacted.message, String::new());
+    assert_eq!(
+        compacted.replacement_history,
+        Some(vec![assistant_message(
+            "keep this final answer",
+            Some(MessagePhase::FinalAnswer),
+        )])
+    );
+    assert_eq!(compacted.prompt_gc, None);
 }
 
 #[tokio::test]

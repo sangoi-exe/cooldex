@@ -181,6 +181,19 @@ fn is_forked_subagent_filtered_prompt_fragment(content_item: &ContentItem) -> bo
 
 fn export_forked_subagent_response_item(item: ResponseItem) -> Option<ResponseItem> {
     match item {
+        ResponseItem::Reasoning { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::ToolSearchOutput { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. }
+        | ResponseItem::GhostSnapshot { .. }
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::Other => None,
         ResponseItem::Message { role, .. } if role == "developer" => None,
         ResponseItem::Message {
             id,
