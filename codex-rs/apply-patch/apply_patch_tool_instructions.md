@@ -1,3 +1,5 @@
+<!-- Merge-safety anchor: apply_patch shell guidance must stay aligned with the runtime parser and tool metadata on whether patch file references may be relative, absolute, or both. -->
+
 ## `apply_patch`
 
 Use the `apply_patch` shell command to edit files.
@@ -66,7 +68,7 @@ It is important to remember:
 
 - You must include a header with your intended action (Add/Delete/Update)
 - You must prefix new lines with `+` even when creating a new file
-- File references can only be relative, NEVER ABSOLUTE.
+- File references may be relative or absolute. Relative paths resolve against the current working directory (or the patch workdir, when provided).
 
 You can invoke apply_patch like:
 
