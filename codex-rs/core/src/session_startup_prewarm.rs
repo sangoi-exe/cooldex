@@ -220,9 +220,9 @@ async fn schedule_startup_prewarm_inner(
         Vec::new(),
         startup_router.model_visible_specs(),
         startup_turn_context.as_ref(),
-        Some(BaseInstructions {
+        BaseInstructions {
             text: base_instructions,
-        }),
+        },
     );
     let startup_turn_metadata_header = startup_turn_context
         .turn_metadata_state

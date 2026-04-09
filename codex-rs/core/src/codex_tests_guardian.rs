@@ -399,8 +399,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
                     file: AbsolutePathBuf::resolve_path_against_base(
                         "config.toml",
                         codex_home.path(),
-                    )
-                    .expect("absolute user config path"),
+                    ),
                 },
                 toml::Value::Table(Default::default()),
             ),

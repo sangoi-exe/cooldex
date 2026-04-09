@@ -86,16 +86,10 @@ async fn run_remote_compact_task_inner_impl(
         extract_trailing_model_switch_update_for_compaction_request(&mut history);
 
     let base_instructions = sess.get_base_instructions().await;
-    let token_count_base_instructions =
-        base_instructions
-            .clone()
-            .unwrap_or_else(|| BaseInstructions {
-                text: String::new(),
-            });
     let deleted_items = trim_function_call_history_to_fit_context_window(
         &mut history,
         turn_context.as_ref(),
-        &token_count_base_instructions,
+        &base_instructions,
     );
     if deleted_items > 0 {
         info!(
@@ -130,11 +124,7 @@ async fn run_remote_compact_task_inner_impl(
         output_schema: None,
     };
 
-    let base_instruction_text = prompt
-        .base_instructions
-        .as_ref()
-        .map(|base_instructions| base_instructions.text.as_str())
-        .unwrap_or("");
+    let base_instruction_text = prompt.base_instructions.text.as_str();
     let compact_request_log_data =
         build_compact_request_log_data(&prompt.input, base_instruction_text);
     let mut new_history = loop {
@@ -608,6 +598,7 @@ mod tests {
         session_mut.services.model_client = ModelClient::new(
             Some(Arc::clone(&auth_manager)),
             session_mut.conversation_id,
+            "11111111-1111-4111-8111-111111111111".to_string(),
             provider,
             turn_context.session_source.clone(),
             turn_context.config.model_verbosity,

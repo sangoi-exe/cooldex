@@ -191,7 +191,7 @@ pub async fn load_config_layers_state(
     let explicit_user_config_path_provided = user_config_path.is_some();
     let user_file = match user_config_path {
         Some(path) => AbsolutePathBuf::from_absolute_path(path)?,
-        None => AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, codex_home)?,
+        None => AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, codex_home),
     };
     let user_config_base_dir = user_file
         .parent()
@@ -858,7 +858,7 @@ async fn load_project_layers(
         if dot_codex_abs == codex_home_abs || dot_codex_normalized == codex_home_normalized {
             continue;
         }
-        let config_file = dot_codex_abs.join(CONFIG_TOML_FILE)?;
+        let config_file = dot_codex_abs.join(CONFIG_TOML_FILE);
         match tokio::fs::read_to_string(&config_file).await {
             Ok(contents) => {
                 let config: TomlValue = match toml::from_str(&contents) {
@@ -994,7 +994,7 @@ foo = "xyzzy"
         expected_toml_value.insert(
             "model_instructions_file".to_string(),
             TomlValue::String(
-                AbsolutePathBuf::resolve_path_against_base("./some_file.md", base_dir)?
+                AbsolutePathBuf::resolve_path_against_base("./some_file.md", base_dir)
                     .as_path()
                     .to_string_lossy()
                     .to_string(),

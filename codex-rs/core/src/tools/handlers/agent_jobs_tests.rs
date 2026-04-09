@@ -1,6 +1,57 @@
+// Merge-safety anchor: agent job arg-parsing tests must keep max_concurrency as the only accepted concurrency field so stale aliases fail loudly.
+
 use super::*;
+use crate::tools::handlers::multi_agents_common::thread_spawn_source;
+use codex_protocol::ThreadId;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+
+#[test]
+fn spawn_agents_on_csv_args_reject_max_workers_alias() {
+    let err = serde_json::from_value::<SpawnAgentsOnCsvArgs>(json!({
+        "csv_path": "input.csv",
+        "instruction": "Return {path}",
+        "max_workers": 1,
+    }))
+    .expect_err("max_workers alias should fail loudly");
+
+    assert!(err.to_string().contains("unknown field `max_workers`"));
+}
+
+#[test]
+fn agent_job_worker_source_keeps_thread_spawn_depth() {
+    let parent_thread_id = ThreadId::new();
+    let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::new(),
+        depth: 2,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let child_depth = next_thread_spawn_depth(&session_source);
+
+    let worker_source = thread_spawn_source(
+        parent_thread_id,
+        &session_source,
+        child_depth,
+        /*agent_role*/ None,
+        /*task_name*/ None,
+    )
+    .expect("agent-job workers should derive thread-spawn metadata");
+
+    assert_eq!(
+        worker_source,
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            depth: child_depth,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        })
+    );
+}
 
 #[test]
 fn parse_csv_supports_quotes_and_commas() {

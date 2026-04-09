@@ -1,0 +1,10 @@
+---
+source: tui/src/history_cell.rs
+expression: cell.display_lines(120)
+---
+[
+    Line::from_iter([
+        Span::from("⚠  ").yellow(),
+        Span::from("Heads up, you have less than 25% of your weekly limit left. Run /status for a breakdown.").yellow(),
+    ]),
+]

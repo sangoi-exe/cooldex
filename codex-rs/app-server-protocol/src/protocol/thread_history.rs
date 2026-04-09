@@ -828,6 +828,7 @@ impl ThreadHistoryBuilder {
                 Some(McpToolCallResult {
                     content: value.content.clone(),
                     structured_content: value.structured_content.clone(),
+                    meta: value.meta.clone(),
                 }),
                 None,
             ),
@@ -968,7 +969,7 @@ impl ThreadHistoryBuilder {
     ) {
         let item = ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
-            tool: payload.tool.clone().into(),
+            tool: payload.tool.into(),
             status: CollabAgentToolCallStatus::InProgress,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
@@ -1005,7 +1006,7 @@ impl ThreadHistoryBuilder {
         );
         self.upsert_item_in_current_turn(ThreadItem::CollabAgentToolCall {
             id: payload.call_id.clone(),
-            tool: payload.tool.clone().into(),
+            tool: payload.tool.into(),
             status,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![receiver_id.clone()],
@@ -1701,6 +1702,7 @@ mod tests {
     use codex_protocol::items::TurnItem as CoreTurnItem;
     use codex_protocol::items::UserMessageItem as CoreUserMessageItem;
     use codex_protocol::items::build_hook_prompt_message;
+    use codex_protocol::mcp::CallToolResult;
     use codex_protocol::models::MessagePhase as CoreMessagePhase;
     use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
     use codex_protocol::parse_command::ParsedCommand;
@@ -2492,6 +2494,67 @@ mod tests {
                 error: Some(McpToolCallError {
                     message: "boom".into(),
                 }),
+                duration_ms: Some(8),
+            }
+        );
+    }
+
+    #[test]
+    fn reconstructs_mcp_tool_result_meta_from_persisted_completion_events() {
+        let events = vec![
+            EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-1".into(),
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+            EventMsg::McpToolCallEnd(McpToolCallEndEvent {
+                call_id: "mcp-1".into(),
+                invocation: McpInvocation {
+                    server: "docs".into(),
+                    tool: "lookup".into(),
+                    arguments: Some(serde_json::json!({"id":"123"})),
+                },
+                duration: Duration::from_millis(8),
+                result: Ok(CallToolResult {
+                    content: vec![serde_json::json!({
+                        "type": "text",
+                        "text": "result"
+                    })],
+                    structured_content: Some(serde_json::json!({"id":"123"})),
+                    is_error: Some(false),
+                    meta: Some(serde_json::json!({
+                        "ui/resourceUri": "ui://widget/lookup.html"
+                    })),
+                }),
+            }),
+        ];
+
+        let items = events
+            .into_iter()
+            .map(RolloutItem::EventMsg)
+            .collect::<Vec<_>>();
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items[0],
+            ThreadItem::McpToolCall {
+                id: "mcp-1".into(),
+                server: "docs".into(),
+                tool: "lookup".into(),
+                status: McpToolCallStatus::Completed,
+                arguments: serde_json::json!({"id":"123"}),
+                result: Some(McpToolCallResult {
+                    content: vec![serde_json::json!({
+                        "type": "text",
+                        "text": "result"
+                    })],
+                    structured_content: Some(serde_json::json!({"id":"123"})),
+                    meta: Some(serde_json::json!({
+                        "ui/resourceUri": "ui://widget/lookup.html"
+                    })),
+                }),
+                error: None,
                 duration_ms: Some(8),
             }
         );

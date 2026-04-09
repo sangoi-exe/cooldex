@@ -178,7 +178,6 @@ mod tests {
                 agent_path: None,
                 model_provider: None,
                 base_instructions: None,
-                developer_instructions: None,
                 dynamic_tools: None,
                 memory_mode: None,
             },

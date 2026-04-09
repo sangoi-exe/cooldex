@@ -1,4 +1,10 @@
+// Merge-safety anchor: legacy collab tool-schema tests here are followers of the shipped V1
+// agent-tool canon; merges must keep these expectations aligned with `agent_tool.rs` and the
+// runtime handlers instead of letting stale aliases survive only in tests.
+
 use super::*;
+use crate::JsonSchemaPrimitiveType;
+use crate::JsonSchemaType;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
@@ -17,6 +23,7 @@ fn model_preset(id: &str, show_in_picker: bool) -> ModelPreset {
             description: "Balanced".to_string(),
         }],
         supports_personality: false,
+        additional_speed_tiers: Vec::new(),
         is_default: false,
         upgrade: None,
         show_in_picker,
@@ -46,14 +53,14 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     else {
         panic!("spawn_agent should be a function tool");
     };
-    let JsonSchema::Object {
-        properties,
-        required,
-        ..
-    } = parameters
-    else {
-        panic!("spawn_agent should use object params");
-    };
+    assert_eq!(
+        parameters.schema_type,
+        Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object))
+    );
+    let properties = parameters
+        .properties
+        .as_ref()
+        .expect("spawn_agent should use object params");
     assert!(description.contains("visible display (`visible-model`)"));
     assert!(!description.contains("hidden display (`hidden-model`)"));
     assert!(properties.contains_key("task_name"));
@@ -63,13 +70,11 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     assert!(!properties.contains_key("fork_context"));
     assert_eq!(
         properties.get("agent_type"),
-        Some(&JsonSchema::String {
-            description: Some("role help".to_string()),
-        })
+        Some(&JsonSchema::string(Some("role help".to_string())))
     );
     assert_eq!(
-        required,
-        Some(vec!["task_name".to_string(), "message".to_string()])
+        parameters.required.as_ref(),
+        Some(&vec!["task_name".to_string(), "message".to_string()])
     );
     assert_eq!(
         output_schema.expect("spawn_agent output schema")["required"],
@@ -88,11 +93,19 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
     let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = tool else {
         panic!("spawn_agent should be a function tool");
     };
-    let JsonSchema::Object { properties, .. } = parameters else {
-        panic!("spawn_agent should use object params");
-    };
+    assert_eq!(
+        parameters.schema_type,
+        Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object))
+    );
+    let properties = parameters
+        .properties
+        .as_ref()
+        .expect("spawn_agent should use object params");
 
     assert!(properties.contains_key("fork_context"));
+    assert!(properties.contains_key("profile"));
+    assert!(!properties.contains_key("model"));
+    assert!(!properties.contains_key("reasoning_effort"));
     assert!(!properties.contains_key("fork_turns"));
 }
 
@@ -106,21 +119,21 @@ fn send_message_tool_requires_message_and_has_no_output_schema() {
     else {
         panic!("send_message should be a function tool");
     };
-    let JsonSchema::Object {
-        properties,
-        required,
-        ..
-    } = parameters
-    else {
-        panic!("send_message should use object params");
-    };
+    assert_eq!(
+        parameters.schema_type,
+        Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object))
+    );
+    let properties = parameters
+        .properties
+        .as_ref()
+        .expect("send_message should use object params");
     assert!(properties.contains_key("target"));
     assert!(properties.contains_key("message"));
     assert!(!properties.contains_key("interrupt"));
     assert!(!properties.contains_key("items"));
     assert_eq!(
-        required,
-        Some(vec!["target".to_string(), "message".to_string()])
+        parameters.required.as_ref(),
+        Some(&vec!["target".to_string(), "message".to_string()])
     );
     assert_eq!(output_schema, None);
 }
@@ -135,21 +148,21 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
     else {
         panic!("followup_task should be a function tool");
     };
-    let JsonSchema::Object {
-        properties,
-        required,
-        ..
-    } = parameters
-    else {
-        panic!("followup_task should use object params");
-    };
+    assert_eq!(
+        parameters.schema_type,
+        Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object))
+    );
+    let properties = parameters
+        .properties
+        .as_ref()
+        .expect("followup_task should use object params");
     assert!(properties.contains_key("target"));
     assert!(properties.contains_key("message"));
     assert!(properties.contains_key("interrupt"));
     assert!(!properties.contains_key("items"));
     assert_eq!(
-        required,
-        Some(vec!["target".to_string(), "message".to_string()])
+        parameters.required.as_ref(),
+        Some(&vec!["target".to_string(), "message".to_string()])
     );
     assert_eq!(output_schema, None);
 }
@@ -168,20 +181,16 @@ fn wait_agent_tool_v1_exposes_ids_conditions_and_agents_output() {
     else {
         panic!("wait_agent should be a function tool");
     };
-    let JsonSchema::Object {
-        properties,
-        required,
-        ..
-    } = parameters
-    else {
-        panic!("wait_agent should use object params");
-    };
+    let properties = parameters
+        .properties
+        .as_ref()
+        .expect("wait_agent should use object params");
     assert!(properties.contains_key("ids"));
     assert!(properties.contains_key("timeout_ms"));
     assert!(properties.contains_key("disable_timeout"));
     assert!(properties.contains_key("return_when"));
     assert!(!properties.contains_key("targets"));
-    assert_eq!(required, Some(vec!["ids".to_string()]));
+    assert_eq!(parameters.required.as_ref(), Some(&vec!["ids".to_string()]));
 
     let output_schema = output_schema.expect("wait output schema");
     assert_eq!(output_schema["required"], json!(["agents", "timed_out"]));
@@ -211,17 +220,17 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
     else {
         panic!("wait_agent should be a function tool");
     };
-    let JsonSchema::Object {
-        properties,
-        required,
-        ..
-    } = parameters
-    else {
-        panic!("wait_agent should use object params");
-    };
+    assert_eq!(
+        parameters.schema_type,
+        Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object))
+    );
+    let properties = parameters
+        .properties
+        .as_ref()
+        .expect("wait_agent should use object params");
     assert!(!properties.contains_key("targets"));
     assert!(properties.contains_key("timeout_ms"));
-    assert_eq!(required, None);
+    assert_eq!(parameters.required.as_ref(), None);
     assert_eq!(
         output_schema.expect("wait output schema")["properties"]["message"]["description"],
         json!("Brief wait summary without the agent's final content.")
@@ -238,9 +247,14 @@ fn list_agents_tool_includes_path_prefix_and_agent_fields() {
     else {
         panic!("list_agents should be a function tool");
     };
-    let JsonSchema::Object { properties, .. } = parameters else {
-        panic!("list_agents should use object params");
-    };
+    assert_eq!(
+        parameters.schema_type,
+        Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object))
+    );
+    let properties = parameters
+        .properties
+        .as_ref()
+        .expect("list_agents should use object params");
     assert!(properties.contains_key("path_prefix"));
     assert_eq!(
         output_schema.expect("list_agents output schema")["properties"]["agents"]["items"]["required"],

@@ -43,6 +43,9 @@ pub(crate) enum StatusRateLimitValue {
     Text(String),
 }
 
+// Merge-safety anchor: status rate-limit availability here is the canonical owner for the
+// CLI-visible missing/unavailable/stale contract; merges must keep renderers/tests aligned to this
+// enum instead of laundering extra no-data shapes elsewhere.
 /// Availability state for rate-limit data shown in status output.
 #[derive(Debug, Clone)]
 pub(crate) enum StatusRateLimitData {
@@ -50,6 +53,8 @@ pub(crate) enum StatusRateLimitData {
     Available(Vec<StatusRateLimitRow>),
     /// Snapshot data exists but is older than the staleness threshold.
     Stale(Vec<StatusRateLimitRow>),
+    /// The refresh completed, but the response did not include displayable usage data.
+    Unavailable,
     /// No snapshot data is currently available.
     Missing,
 }
@@ -269,7 +274,7 @@ pub(crate) fn compose_rate_limit_data_many(
     }
 
     if rows.is_empty() {
-        StatusRateLimitData::Available(vec![])
+        StatusRateLimitData::Unavailable
     } else if stale {
         StatusRateLimitData::Stale(rows)
     } else {

@@ -1764,6 +1764,13 @@ pub(crate) fn new_warning_event(message: String) -> PrefixedWrappedHistoryCell {
     PrefixedWrappedHistoryCell::new(message.red(), "⚠  ".red(), "  ")
 }
 
+// Merge-safety anchor: the weekly/5h rate-limit heads-up warning is intentionally yellow in this
+// workspace, distinct from generic red warnings; keep the owner, tests, and snapshot aligned.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn new_rate_limit_warning_event(message: String) -> PrefixedWrappedHistoryCell {
+    PrefixedWrappedHistoryCell::new(message.yellow(), "⚠  ".yellow(), "  ")
+}
+
 #[derive(Debug)]
 pub(crate) struct DeprecationNoticeCell {
     summary: String,
@@ -3413,6 +3420,44 @@ mod tests {
             1,
             "expected full URL-like token in one rendered line, got: {rendered:?}"
         );
+    }
+
+    #[test]
+    fn rate_limit_warning_event_uses_yellow_styling() {
+        let cell = new_rate_limit_warning_event(
+            "Heads up, you have less than 25% of your weekly limit left. Run /status for a breakdown."
+                .to_string(),
+        );
+        let rendered = cell.display_lines(/*width*/ 120);
+        let first_line = &rendered[0];
+
+        assert_eq!(first_line.spans[0].content.as_ref(), "⚠  ");
+        assert_eq!(first_line.spans[0].style.fg, Some(Color::Yellow));
+        assert_eq!(
+            first_line.spans[1].content.as_ref(),
+            "Heads up, you have less than 25% of your weekly limit left. Run /status for a breakdown."
+        );
+        assert_eq!(first_line.spans[1].style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn rate_limit_warning_event_snapshot() {
+        let cell = new_rate_limit_warning_event(
+            "Heads up, you have less than 25% of your weekly limit left. Run /status for a breakdown."
+                .to_string(),
+        );
+
+        insta::assert_debug_snapshot!(cell.display_lines(/*width*/ 120));
+    }
+
+    #[test]
+    fn generic_warning_event_stays_red() {
+        let cell = new_warning_event("generic warning".to_string());
+        let rendered = cell.display_lines(/*width*/ 120);
+        let first_line = &rendered[0];
+
+        assert_eq!(first_line.spans[0].style.fg, Some(Color::Red));
+        assert_eq!(first_line.spans[1].style.fg, Some(Color::Red));
     }
 
     #[test]

@@ -16,6 +16,13 @@ During any sync/merge with `main` and/or `upstream`, these rules are mandatory:
 
 <!-- Merge-safety anchor: AGENTS.md is the canonical source for the workspace-local customization inventory and merge-policy invariants; future sync work must update this section and keep scratchpads as redirects only. -->
 
+## Codex CLI Customization Boundary
+
+- Workspace-local customizations in this checkout exist only to support the shipped Codex CLI and its operator-facing surfaces, including the TUI and the runtime/tooling/prompt seams they require.
+- Do not add, preserve, or reintroduce workspace-local divergence in files that do not materially affect Codex CLI behavior.
+- If an upstream delta touches non-CLI surfaces, prefer leaving those files identical to upstream instead of carrying local edits there.
+- If a non-CLI file must change only because it is a generated follower or contract artifact of a CLI-owned owner, keep it as a follower of that CLI-owned owner and do not let it become a second home for local behavior.
+
 ## Legacy / Feature-Gate Surface Discipline
 
 - Do not rename an active shipped surface just because a gated or newer surface uses a different name. Public tool/function/command renames require explicit user intent or a separately locked migration plan; additive functionality belongs under the existing active name until that migration is actually adopted.

@@ -146,6 +146,7 @@ use codex_app_server_protocol::ThreadRealtimeAppendTextParams;
 use codex_app_server_protocol::ThreadRealtimeAppendTextResponse;
 use codex_app_server_protocol::ThreadRealtimeStartParams;
 use codex_app_server_protocol::ThreadRealtimeStartResponse;
+use codex_app_server_protocol::ThreadRealtimeStartTransport;
 use codex_app_server_protocol::ThreadRealtimeStopParams;
 use codex_app_server_protocol::ThreadRealtimeStopResponse;
 use codex_app_server_protocol::ThreadResumeParams;
@@ -272,6 +273,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::ConversationStartParams;
+use codex_protocol::protocol::ConversationStartTransport;
 use codex_protocol::protocol::ConversationTextParams;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo as CoreGitInfo;
@@ -3864,7 +3866,6 @@ impl CodexMessageProcessor {
                 &mut typesafe_overrides,
             )
             .await;
-
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let cloud_requirements = self.current_cloud_requirements();
         let cli_overrides = self.current_cli_overrides();
@@ -3875,7 +3876,9 @@ impl CodexMessageProcessor {
             codex_home: &self.config.codex_home,
             runtime_feature_enablement: &runtime_feature_enablement,
         };
-        let config = match derive_config_for_cwd(
+        let request_overrides_for_instruction_reuse = request_overrides.clone();
+        let typesafe_overrides_for_instruction_reuse = typesafe_overrides.clone();
+        let mut config = match derive_config_for_cwd(
             config_inputs,
             request_overrides,
             typesafe_overrides,
@@ -3891,6 +3894,12 @@ impl CodexMessageProcessor {
                 return;
             }
         };
+        apply_persisted_instruction_overrides_from_history(
+            &thread_history,
+            request_overrides_for_instruction_reuse.as_ref(),
+            &typesafe_overrides_for_instruction_reuse,
+            &mut config,
+        );
 
         let fallback_model_provider = config.model_provider_id.clone();
         let response_history = thread_history.clone();
@@ -4425,14 +4434,26 @@ impl CodexMessageProcessor {
             developer_instructions,
             /*personality*/ None,
         );
-        if typesafe_overrides.base_instructions.is_none()
-            && let Ok(history) = RolloutRecorder::get_rollout_history(&rollout_path).await
-            && let Some(base_instructions) = history.get_base_instructions()
-        {
-            typesafe_overrides.base_instructions =
-                Some(base_instructions.map(|base_instructions| base_instructions.text));
-        }
         typesafe_overrides.ephemeral = ephemeral.then_some(true);
+        let fork_history = if typesafe_overrides.base_instructions.is_none()
+            || typesafe_overrides.developer_instructions.is_none()
+        {
+            Some(
+                match read_rollout_items_from_rollout(rollout_path.as_path()).await {
+                    Ok(items) => InitialHistory::Forked(items),
+                    Err(err) => {
+                        self.send_invalid_request_error(
+                            request_id,
+                            format!("failed to read rollout `{}`: {err}", rollout_path.display()),
+                        )
+                        .await;
+                        return;
+                    }
+                },
+            )
+        } else {
+            None
+        };
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let cloud_requirements = self.current_cloud_requirements();
         let cli_overrides = self.current_cli_overrides();
@@ -4443,7 +4464,9 @@ impl CodexMessageProcessor {
             codex_home: &self.config.codex_home,
             runtime_feature_enablement: &runtime_feature_enablement,
         };
-        let config = match derive_config_for_cwd(
+        let request_overrides_for_instruction_reuse = request_overrides.clone();
+        let typesafe_overrides_for_instruction_reuse = typesafe_overrides.clone();
+        let mut config = match derive_config_for_cwd(
             config_inputs,
             request_overrides,
             typesafe_overrides,
@@ -4460,6 +4483,15 @@ impl CodexMessageProcessor {
                 return;
             }
         };
+
+        if let Some(fork_history) = fork_history.as_ref() {
+            apply_persisted_instruction_overrides_from_history(
+                fork_history,
+                request_overrides_for_instruction_reuse.as_ref(),
+                &typesafe_overrides_for_instruction_reuse,
+                &mut config,
+            );
+        }
 
         let fallback_model_provider = config.model_provider_id.clone();
 
@@ -6940,6 +6972,14 @@ impl CodexMessageProcessor {
                 Op::RealtimeConversationStart(ConversationStartParams {
                     prompt: params.prompt,
                     session_id: params.session_id,
+                    transport: params.transport.map(|transport| match transport {
+                        ThreadRealtimeStartTransport::Websocket => {
+                            ConversationStartTransport::Websocket
+                        }
+                        ThreadRealtimeStartTransport::Webrtc { sdp } => {
+                            ConversationStartTransport::Webrtc { sdp }
+                        }
+                    }),
                 }),
             )
             .await;
@@ -8408,6 +8448,81 @@ fn merge_persisted_resume_metadata(
     }
 }
 
+fn apply_persisted_instruction_overrides_from_history(
+    thread_history: &InitialHistory,
+    request_overrides: Option<&HashMap<String, serde_json::Value>>,
+    typesafe_overrides: &ConfigOverrides,
+    config: &mut Config,
+) {
+    if typesafe_overrides.base_instructions.is_none()
+        && !request_overrides_explicitly_override_base_instructions(
+            request_overrides,
+            config.active_profile.as_deref(),
+        )
+        && let Some(base_instructions) = thread_history.get_base_instructions()
+    {
+        config.base_instructions = Some(base_instructions.text);
+    }
+
+    if typesafe_overrides.developer_instructions.is_none()
+        && !request_overrides_explicitly_override_developer_instructions(
+            request_overrides,
+            config.active_profile.as_deref(),
+        )
+        && let Some(developer_instructions) = thread_history.get_developer_instructions()
+    {
+        config.developer_instructions = developer_instructions;
+    }
+}
+
+fn request_overrides_explicitly_override_base_instructions(
+    request_overrides: Option<&HashMap<String, serde_json::Value>>,
+    active_profile: Option<&str>,
+) -> bool {
+    request_overrides_contains_exact_key(request_overrides, "base_instructions")
+        || request_overrides_contains_exact_key(request_overrides, "model_instructions_file")
+        || request_overrides_contains_active_profile_key(
+            request_overrides,
+            active_profile,
+            "base_instructions",
+        )
+        || request_overrides_contains_active_profile_key(
+            request_overrides,
+            active_profile,
+            "model_instructions_file",
+        )
+}
+
+fn request_overrides_explicitly_override_developer_instructions(
+    request_overrides: Option<&HashMap<String, serde_json::Value>>,
+    active_profile: Option<&str>,
+) -> bool {
+    request_overrides_contains_exact_key(request_overrides, "developer_instructions")
+        || request_overrides_contains_active_profile_key(
+            request_overrides,
+            active_profile,
+            "developer_instructions",
+        )
+}
+
+fn request_overrides_contains_exact_key(
+    request_overrides: Option<&HashMap<String, serde_json::Value>>,
+    key: &str,
+) -> bool {
+    request_overrides.is_some_and(|overrides| overrides.contains_key(key))
+}
+
+fn request_overrides_contains_active_profile_key(
+    request_overrides: Option<&HashMap<String, serde_json::Value>>,
+    active_profile: Option<&str>,
+    key: &str,
+) -> bool {
+    active_profile.is_some_and(|profile| {
+        let active_profile_key = format!("profiles.{profile}.{key}");
+        request_overrides.is_some_and(|overrides| overrides.contains_key(&active_profile_key))
+    })
+}
+
 fn has_model_resume_override(
     request_overrides: Option<&HashMap<String, serde_json::Value>>,
     typesafe_overrides: &ConfigOverrides,
@@ -9229,7 +9344,10 @@ mod tests {
     use anyhow::Result;
     use codex_app_server_protocol::ServerRequestPayload;
     use codex_app_server_protocol::ToolRequestUserInputParams;
+    use codex_protocol::config_types::ReasoningSummary;
     use codex_protocol::openai_models::ReasoningEffort;
+    use codex_protocol::protocol::AskForApproval as TurnContextApprovalPolicy;
+    use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
     use pretty_assertions::assert_eq;
@@ -9256,6 +9374,24 @@ mod tests {
             description: "test".to_string(),
             // Missing `type` is common; core sanitizes these to a supported schema.
             input_schema: json!({"properties": {}}),
+            defer_loading: false,
+        }];
+        validate_dynamic_tools(&tools).expect("valid schema");
+    }
+
+    #[test]
+    fn validate_dynamic_tools_accepts_nullable_field_schema() {
+        let tools = vec![ApiDynamicToolSpec {
+            name: "my_tool".to_string(),
+            description: "test".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": ["string", "null"]}
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
             defer_loading: false,
         }];
         validate_dynamic_tools(&tools).expect("valid schema");
@@ -9534,6 +9670,217 @@ mod tests {
         assert_eq!(typesafe_overrides.model, None);
         assert_eq!(request_overrides, None);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_persisted_instruction_overrides_from_history_reuses_effective_history_values() {
+        let thread_id =
+            ThreadId::from_string("3f941c35-29b3-493b-b0a4-e25800d9aeb0").expect("thread id");
+        let history = InitialHistory::Resumed(codex_protocol::protocol::ResumedHistory {
+            conversation_id: thread_id,
+            rollout_path: PathBuf::from("/tmp/rollout.jsonl"),
+            history: vec![
+                RolloutItem::SessionMeta(SessionMetaLine {
+                    meta: SessionMeta {
+                        id: thread_id,
+                        base_instructions: Some(codex_protocol::models::BaseInstructions {
+                            text: "persisted base".to_string(),
+                        }),
+                        ..SessionMeta::default()
+                    },
+                    git: None,
+                }),
+                RolloutItem::TurnContext(codex_protocol::protocol::TurnContextItem {
+                    turn_id: Some("turn-1".to_string()),
+                    trace_id: None,
+                    cwd: PathBuf::from("/workspace"),
+                    current_date: None,
+                    timezone: None,
+                    approval_policy: TurnContextApprovalPolicy::Never,
+                    sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                    network: None,
+                    model: "gpt-5".to_string(),
+                    personality: None,
+                    collaboration_mode: None,
+                    realtime_active: None,
+                    effort: None,
+                    summary: ReasoningSummary::Auto,
+                    user_instructions: None,
+                    developer_instructions: Some("persisted developer".to_string()),
+                    final_output_json_schema: None,
+                    truncation_policy: None,
+                }),
+            ],
+        });
+        let mut config = codex_core::config::ConfigBuilder::default()
+            .build()
+            .await
+            .expect("config should build");
+
+        apply_persisted_instruction_overrides_from_history(
+            &history,
+            None,
+            &ConfigOverrides::default(),
+            &mut config,
+        );
+
+        assert_eq!(config.base_instructions, Some("persisted base".to_string()));
+        assert_eq!(
+            config.developer_instructions,
+            Some("persisted developer".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_persisted_instruction_overrides_from_history_preserves_cleared_developer_instructions()
+     {
+        let history = InitialHistory::Forked(vec![RolloutItem::TurnContext(
+            codex_protocol::protocol::TurnContextItem {
+                turn_id: Some("turn-1".to_string()),
+                trace_id: None,
+                cwd: PathBuf::from("/workspace"),
+                current_date: None,
+                timezone: None,
+                approval_policy: TurnContextApprovalPolicy::Never,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                network: None,
+                model: "gpt-5".to_string(),
+                personality: None,
+                collaboration_mode: None,
+                realtime_active: None,
+                effort: None,
+                summary: ReasoningSummary::Auto,
+                user_instructions: None,
+                developer_instructions: None,
+                final_output_json_schema: None,
+                truncation_policy: None,
+            },
+        )]);
+        let mut config = codex_core::config::ConfigBuilder::default()
+            .build()
+            .await
+            .expect("config should build");
+        let baseline_base_instructions = config.base_instructions.clone();
+        config.developer_instructions = Some("config developer".to_string());
+
+        apply_persisted_instruction_overrides_from_history(
+            &history,
+            None,
+            &ConfigOverrides::default(),
+            &mut config,
+        );
+
+        assert_eq!(config.base_instructions, baseline_base_instructions);
+        assert_eq!(config.developer_instructions, None);
+    }
+
+    #[tokio::test]
+    async fn apply_persisted_instruction_overrides_from_history_respects_request_override_keys() {
+        let thread_id =
+            ThreadId::from_string("3f941c35-29b3-493b-b0a4-e25800d9aeb0").expect("thread id");
+        let history = InitialHistory::Resumed(codex_protocol::protocol::ResumedHistory {
+            conversation_id: thread_id,
+            rollout_path: PathBuf::from("/tmp/rollout.jsonl"),
+            history: vec![
+                RolloutItem::SessionMeta(SessionMetaLine {
+                    meta: SessionMeta {
+                        id: thread_id,
+                        base_instructions: Some(codex_protocol::models::BaseInstructions {
+                            text: "persisted base".to_string(),
+                        }),
+                        ..SessionMeta::default()
+                    },
+                    git: None,
+                }),
+                RolloutItem::TurnContext(codex_protocol::protocol::TurnContextItem {
+                    turn_id: Some("turn-1".to_string()),
+                    trace_id: None,
+                    cwd: PathBuf::from("/workspace"),
+                    current_date: None,
+                    timezone: None,
+                    approval_policy: TurnContextApprovalPolicy::Never,
+                    sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                    network: None,
+                    model: "gpt-5".to_string(),
+                    personality: None,
+                    collaboration_mode: None,
+                    realtime_active: None,
+                    effort: None,
+                    summary: ReasoningSummary::Auto,
+                    user_instructions: None,
+                    developer_instructions: Some("persisted developer".to_string()),
+                    final_output_json_schema: None,
+                    truncation_policy: None,
+                }),
+            ],
+        });
+        let request_overrides = HashMap::from([
+            (
+                "developer_instructions".to_string(),
+                serde_json::Value::String("request developer".to_string()),
+            ),
+            (
+                "model_instructions_file".to_string(),
+                serde_json::Value::String("/tmp/request-base.md".to_string()),
+            ),
+        ]);
+        let mut config = codex_core::config::ConfigBuilder::default()
+            .build()
+            .await
+            .expect("config should build");
+        let baseline_base_instructions = config.base_instructions.clone();
+        let baseline_developer_instructions = config.developer_instructions.clone();
+
+        apply_persisted_instruction_overrides_from_history(
+            &history,
+            Some(&request_overrides),
+            &ConfigOverrides::default(),
+            &mut config,
+        );
+
+        assert_eq!(config.base_instructions, baseline_base_instructions);
+        assert_eq!(
+            config.developer_instructions,
+            baseline_developer_instructions
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_persisted_instruction_overrides_from_history_ignores_inactive_profile_keys() {
+        let thread_id =
+            ThreadId::from_string("3f941c35-29b3-493b-b0a4-e25800d9aeb0").expect("thread id");
+        let history = InitialHistory::Resumed(codex_protocol::protocol::ResumedHistory {
+            conversation_id: thread_id,
+            rollout_path: PathBuf::from("/tmp/rollout.jsonl"),
+            history: vec![RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    id: thread_id,
+                    base_instructions: Some(codex_protocol::models::BaseInstructions {
+                        text: "persisted base".to_string(),
+                    }),
+                    ..SessionMeta::default()
+                },
+                git: None,
+            })],
+        });
+        let request_overrides = HashMap::from([(
+            "profiles.other.model_instructions_file".to_string(),
+            serde_json::Value::String("/tmp/other-base.md".to_string()),
+        )]);
+        let mut config = codex_core::config::ConfigBuilder::default()
+            .build()
+            .await
+            .expect("config should build");
+        config.active_profile = Some("active".to_string());
+
+        apply_persisted_instruction_overrides_from_history(
+            &history,
+            Some(&request_overrides),
+            &ConfigOverrides::default(),
+            &mut config,
+        );
+
+        assert_eq!(config.base_instructions, Some("persisted base".to_string()));
     }
 
     #[test]

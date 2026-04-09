@@ -175,7 +175,7 @@ impl App {
                 return;
             }
             ServerNotification::AccountUpdated(notification) => {
-                self.chat_widget.update_account_state(
+                self.handle_app_server_account_updated(
                     status_account_display_from_auth_mode(
                         notification.auth_mode,
                         notification.label.clone(),
@@ -394,6 +394,9 @@ fn server_notification_thread_target(
             Some(notification.thread_id.as_str())
         }
         ServerNotification::ThreadRealtimeOutputAudioDelta(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeSdp(notification) => {
             Some(notification.thread_id.as_str())
         }
         ServerNotification::ThreadRealtimeError(notification) => {
@@ -628,6 +631,17 @@ fn server_notification_thread_events(
                 msg: EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
                     payload: RealtimeEvent::AudioOut(notification.audio.into()),
                 }),
+            }],
+        )),
+        ServerNotification::ThreadRealtimeSdp(notification) => Some((
+            ThreadId::from_string(&notification.thread_id).ok()?,
+            vec![Event {
+                id: String::new(),
+                msg: EventMsg::RealtimeConversationSdp(
+                    codex_protocol::protocol::RealtimeConversationSdpEvent {
+                        sdp: notification.sdp,
+                    },
+                ),
             }],
         )),
         ServerNotification::ThreadRealtimeError(notification) => Some((

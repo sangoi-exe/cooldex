@@ -2,6 +2,7 @@ use super::AuthRequestTelemetryContext;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
 use super::UnauthorizedRecoveryExecution;
+use super::X_CODEX_INSTALLATION_ID_HEADER;
 use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_TURN_STATE_HEADER;
@@ -54,6 +55,7 @@ fn test_model_client(session_source: SessionSource) -> ModelClient {
     ModelClient::new(
         /*auth_manager*/ None,
         ThreadId::new(),
+        /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
         provider,
         session_source,
         /*model_verbosity*/ None,
@@ -183,6 +185,10 @@ fn build_ws_client_metadata_includes_window_lineage_and_turn_metadata() {
         client_metadata,
         std::collections::HashMap::from([
             (
+                X_CODEX_INSTALLATION_ID_HEADER.to_string(),
+                "11111111-1111-4111-8111-111111111111".to_string(),
+            ),
+            (
                 X_CODEX_WINDOW_ID_HEADER.to_string(),
                 format!("{conversation_id}:1"),
             ),
@@ -275,6 +281,7 @@ async fn prompt_gc_hidden_child_session_stream_fallback_keeps_visible_websockets
     let client = ModelClient::new(
         None,
         ThreadId::new(),
+        "11111111-1111-4111-8111-111111111111".to_string(),
         test_provider(&format!("{}/v1", server.uri())),
         SessionSource::Cli,
         None,
@@ -290,9 +297,9 @@ async fn prompt_gc_hidden_child_session_stream_fallback_keeps_visible_websockets
         input: Vec::new(),
         tools: Vec::new(),
         parallel_tool_calls: false,
-        base_instructions: Some(BaseInstructions {
+        base_instructions: BaseInstructions {
             text: "hidden prompt gc".to_string(),
-        }),
+        },
         personality: None,
         output_schema: None,
     };
@@ -382,6 +389,7 @@ async fn subagent_websocket_reconnects_when_auth_account_changes_mid_session() {
     let client = ModelClient::new(
         Some(auth_manager.clone()),
         ThreadId::new(),
+        "11111111-1111-4111-8111-111111111111".to_string(),
         test_provider(&format!("{}/v1", server.uri())),
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: ThreadId::new(),
@@ -401,9 +409,9 @@ async fn subagent_websocket_reconnects_when_auth_account_changes_mid_session() {
         input: Vec::new(),
         tools: Vec::new(),
         parallel_tool_calls: false,
-        base_instructions: Some(BaseInstructions {
+        base_instructions: BaseInstructions {
             text: "auth-sensitive websocket reuse".to_string(),
-        }),
+        },
         personality: None,
         output_schema: None,
     };
@@ -541,6 +549,7 @@ async fn subagent_preconnect_reconnects_when_auth_account_changes_mid_session() 
     let client = ModelClient::new(
         Some(auth_manager.clone()),
         ThreadId::new(),
+        "11111111-1111-4111-8111-111111111111".to_string(),
         test_provider(&format!("{}/v1", server.uri())),
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id: ThreadId::new(),

@@ -4000,7 +4000,7 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
 
     let config = build_agent_spawn_config(&turn).expect("spawn config");
     let mut expected = base_config;
-    expected.base_instructions = Some(Some("base".to_string()));
+    expected.base_instructions = Some("base".to_string());
     expected.model = Some(turn.model_info.slug.clone());
     expected.model_provider = turn.provider.clone();
     expected.model_reasoning_effort = turn.reasoning_effort;
@@ -4044,7 +4044,7 @@ async fn build_agent_spawn_config_preserves_user_instructions() {
 async fn build_agent_resume_config_clears_base_instructions() {
     let (_session, mut turn) = make_session_and_context().await;
     let mut base_config = (*turn.config).clone();
-    base_config.base_instructions = Some(Some("caller-base".to_string()));
+    base_config.base_instructions = Some("caller-base".to_string());
     base_config.developer_instructions = Some("resume-dev".to_string());
     base_config.user_instructions = Some("resume-user".to_string());
     base_config.project_doc_max_bytes = 2_468;

@@ -1,6 +1,10 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+// Merge-safety anchor: these status/layout tests keep the prefetch gating and live-refresh status
+// behavior aligned with `chatwidget.rs` and `status/card.rs`; merges must not let this follower
+// drift from the owner contract.
+
 /// Receiving a TokenCount event without usage clears the context indicator.
 #[tokio::test]
 async fn token_count_none_resets_context_indicator() {
@@ -144,18 +148,31 @@ async fn helpers_are_available_and_do_not_panic() {
 
 #[tokio::test]
 async fn prefetch_rate_limits_is_gated_on_chatgpt_auth_provider() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     assert!(!chat.should_prefetch_rate_limits());
 
     set_chatgpt_auth(&mut chat);
     assert!(chat.should_prefetch_rate_limits());
 
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 55.0)));
     chat.config.model_provider.requires_openai_auth = false;
     assert!(!chat.should_prefetch_rate_limits());
 
     chat.prefetch_rate_limits();
-    assert!(!chat.should_prefetch_rate_limits());
+    assert!(chat.rate_limit_snapshots_by_limit_id.is_empty());
+    assert_matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty));
+
+    chat.config.model_provider.requires_openai_auth = true;
+    chat.prefetch_rate_limits();
+    assert!(chat.rate_limit_snapshots_by_limit_id.is_empty());
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::RefreshRateLimits {
+            origin: RateLimitRefreshOrigin::StartupPrefetch,
+            account_generation: 0,
+        })
+    );
 }
 
 #[tokio::test]
@@ -574,20 +591,28 @@ async fn commentary_completion_restores_status_indicator_before_exec_begin() {
 #[tokio::test]
 async fn fast_status_indicator_requires_chatgpt_auth() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    set_fast_mode_test_catalog(&mut chat);
+    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
     chat.set_service_tier(Some(ServiceTier::Fast));
 
     assert!(!chat.should_show_fast_status(chat.current_model(), chat.current_service_tier(),));
 
     set_chatgpt_auth(&mut chat);
+    set_fast_mode_test_catalog(&mut chat);
+    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
 
     assert!(chat.should_show_fast_status(chat.current_model(), chat.current_service_tier(),));
 }
 
 #[tokio::test]
-async fn fast_status_indicator_is_hidden_for_non_gpt54_model() {
+async fn fast_status_indicator_is_hidden_for_models_without_fast_support() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    set_fast_mode_test_catalog(&mut chat);
+    assert!(!get_available_model(&chat, "gpt-5.3-codex").supports_fast_mode());
     chat.set_service_tier(Some(ServiceTier::Fast));
     set_chatgpt_auth(&mut chat);
+    set_fast_mode_test_catalog(&mut chat);
+    assert!(!get_available_model(&chat, "gpt-5.3-codex").supports_fast_mode());
 
     assert!(!chat.should_show_fast_status(chat.current_model(), chat.current_service_tier(),));
 }
@@ -595,7 +620,11 @@ async fn fast_status_indicator_is_hidden_for_non_gpt54_model() {
 #[tokio::test]
 async fn fast_status_indicator_is_hidden_when_fast_mode_is_off() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    set_fast_mode_test_catalog(&mut chat);
+    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
     set_chatgpt_auth(&mut chat);
+    set_fast_mode_test_catalog(&mut chat);
+    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
 
     assert!(!chat.should_show_fast_status(chat.current_model(), chat.current_service_tier(),));
 }
@@ -946,8 +975,10 @@ async fn status_line_fast_mode_footer_snapshot() {
 }
 
 #[tokio::test]
-async fn status_line_model_with_reasoning_includes_fast_for_gpt54_only() {
+async fn status_line_model_with_reasoning_includes_fast_for_fast_capable_models() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    set_fast_mode_test_catalog(&mut chat);
+    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
     chat.config.cwd = test_project_path().abs();
     chat.config.tui_status_line = Some(vec![
         "model-with-reasoning".to_string(),
@@ -957,6 +988,8 @@ async fn status_line_model_with_reasoning_includes_fast_for_gpt54_only() {
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
     chat.set_service_tier(Some(ServiceTier::Fast));
     set_chatgpt_auth(&mut chat);
+    set_fast_mode_test_catalog(&mut chat);
+    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
     chat.refresh_status_line();
     let test_cwd = test_path_display("/tmp/project");
 
@@ -1051,6 +1084,8 @@ async fn status_line_model_with_reasoning_fast_footer_snapshot() {
     use ratatui::backend::TestBackend;
 
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    set_fast_mode_test_catalog(&mut chat);
+    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
     chat.show_welcome_banner = false;
     chat.config.cwd = test_project_path().abs();
     chat.config.tui_status_line = Some(vec![
@@ -1061,6 +1096,8 @@ async fn status_line_model_with_reasoning_fast_footer_snapshot() {
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
     chat.set_service_tier(Some(ServiceTier::Fast));
     set_chatgpt_auth(&mut chat);
+    set_fast_mode_test_catalog(&mut chat);
+    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
     chat.refresh_status_line();
 
     let width = 80;

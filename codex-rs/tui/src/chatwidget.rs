@@ -435,6 +435,7 @@ fn app_server_collab_agent_statuses_to_core(
 use crate::app_event::AppEvent;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_event::ExitMode;
+use crate::app_event::RateLimitRefreshOrigin;
 #[cfg(target_os = "windows")]
 use crate::app_event::WindowsSandboxEnableMode;
 use crate::app_event_sender::AppEventSender;
@@ -535,7 +536,6 @@ use unicode_segmentation::UnicodeSegmentation;
 const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it locally";
 const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-const FAST_STATUS_MODEL: &str = "gpt-5.4";
 const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] =
     ["model-with-reasoning", "context-remaining", "current-dir"];
 // Track information about an in-flight exec command.
@@ -722,6 +722,13 @@ enum RateLimitSwitchPromptState {
     Idle,
     Pending,
     Shown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RateLimitEmptyState {
+    #[default]
+    Missing,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -942,6 +949,8 @@ pub(crate) struct ChatWidget {
     token_info_is_prompt_gc_private: bool,
     prompt_gc_context_usage_unknown: bool,
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
+    rate_limit_empty_state: RateLimitEmptyState,
+    rate_limit_account_generation: u64,
     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
     next_status_refresh_request_id: u64,
     plan_type: Option<PlanType>,
@@ -3215,22 +3224,33 @@ impl ChatWidget {
                 rate_limit_snapshot_display_for_limit(&snapshot, limit_label, Local::now());
             self.rate_limit_snapshots_by_limit_id
                 .insert(limit_id, display);
+            self.rate_limit_empty_state = RateLimitEmptyState::Missing;
 
             if !warnings.is_empty() {
                 for warning in warnings {
-                    self.add_to_history(history_cell::new_warning_event(warning));
+                    self.add_to_history(history_cell::new_rate_limit_warning_event(warning));
                 }
                 self.request_redraw();
             }
         } else {
             self.rate_limit_snapshots_by_limit_id.clear();
+            self.rate_limit_empty_state = RateLimitEmptyState::Missing;
         }
         self.refresh_status_line();
     }
 
+    pub(crate) fn replace_rate_limit_snapshots(&mut self, snapshots: Vec<RateLimitSnapshot>) {
+        self.on_rate_limit_snapshot(None);
+        for snapshot in snapshots {
+            self.on_rate_limit_snapshot(Some(snapshot));
+        }
+    }
+
     pub(crate) fn on_active_account_changed(&mut self) {
         self.plan_type = None;
+        self.rate_limit_warnings = RateLimitWarningState::default();
         self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
+        self.rate_limit_account_generation = self.rate_limit_account_generation.wrapping_add(1);
         self.prefetch_rate_limits();
         self.request_redraw();
         self.refresh_status_surfaces();
@@ -5356,6 +5376,8 @@ impl ChatWidget {
             token_info_is_prompt_gc_private: false,
             prompt_gc_context_usage_unknown: false,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+            rate_limit_empty_state: RateLimitEmptyState::Missing,
+            rate_limit_account_generation: 0,
             refreshing_status_outputs: Vec::new(),
             next_status_refresh_request_id: 0,
             plan_type: initial_plan_type,
@@ -5575,6 +5597,8 @@ impl ChatWidget {
             token_info_is_prompt_gc_private: false,
             prompt_gc_context_usage_unknown: false,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+            rate_limit_empty_state: RateLimitEmptyState::Missing,
+            rate_limit_account_generation: 0,
             plan_type: initial_plan_type,
             rate_limit_warnings: RateLimitWarningState::default(),
             rate_limit_switch_prompt: RateLimitSwitchPromptState::default(),
@@ -5979,15 +6003,7 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::ForkCurrentSession);
             }
             SlashCommand::Init => {
-                let init_target = match self.config.cwd.join(DEFAULT_PROJECT_DOC_FILENAME) {
-                    Ok(path) => path,
-                    Err(err) => {
-                        self.add_error_message(format!(
-                            "Failed to prepare {DEFAULT_PROJECT_DOC_FILENAME}: {err}",
-                        ));
-                        return;
-                    }
-                };
+                let init_target = self.config.cwd.join(DEFAULT_PROJECT_DOC_FILENAME);
                 if init_target.exists() {
                     let message = format!(
                         "{DEFAULT_PROJECT_DOC_FILENAME} already exists here. Skipping /init to avoid overwriting it."
@@ -6250,8 +6266,10 @@ impl ChatWidget {
                     self.next_status_refresh_request_id =
                         self.next_status_refresh_request_id.wrapping_add(1);
                     self.add_status_output(/*refreshing_rate_limits*/ true, Some(request_id));
-                    self.app_event_tx
-                        .send(AppEvent::RefreshRateLimits { request_id });
+                    self.app_event_tx.send(AppEvent::RefreshRateLimits {
+                        origin: RateLimitRefreshOrigin::StatusCommand { request_id },
+                        account_generation: self.rate_limit_account_generation,
+                    });
                 } else {
                     self.add_status_output(
                         /*refreshing_rate_limits*/ false, /*request_id*/ None,
@@ -7534,6 +7552,7 @@ impl ChatWidget {
                     );
                 }
             }
+            ServerNotification::ThreadRealtimeSdp(_) => {}
             ServerNotification::ServerRequestResolved(_)
             | ServerNotification::AccountUpdated(_)
             | ServerNotification::AccountRateLimitsUpdated(_)
@@ -8043,6 +8062,7 @@ impl ChatWidget {
                     self.on_realtime_conversation_started(ev);
                 }
             }
+            EventMsg::RealtimeConversationSdp(_) => {}
             EventMsg::RealtimeConversationRealtime(ev) => {
                 if !from_replay {
                     self.on_realtime_conversation_realtime(ev);
@@ -8345,6 +8365,8 @@ impl ChatWidget {
             .values()
             .cloned()
             .collect();
+        let render_unavailable = rate_limit_snapshots.is_empty()
+            && self.rate_limit_empty_state == RateLimitEmptyState::Unavailable;
         let config = self.config.clone();
         let frame_requester = self.frame_requester.clone();
         let (cell, handle) = crate::status::new_status_output_with_rate_limits_handle(
@@ -8364,6 +8386,9 @@ impl ChatWidget {
             "<none>".to_string(),
             refreshing_rate_limits,
         );
+        if render_unavailable {
+            handle.finish_rate_limit_refresh_as_unavailable();
+        }
         let agents_summary_handle = handle.clone();
         tokio::spawn(async move {
             let agents_summary = match crate::status::discover_agents_summary(&config).await {
@@ -8399,6 +8424,49 @@ impl ChatWidget {
             if pending_request_id == request_id {
                 updated_any = true;
                 handle.finish_rate_limit_refresh(rate_limit_snapshots.as_slice(), now);
+            } else {
+                remaining.push((pending_request_id, handle));
+            }
+        }
+        self.refreshing_status_outputs = remaining;
+        if updated_any {
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn finish_status_rate_limit_refresh_without_change(&mut self, request_id: u64) {
+        if self.refreshing_status_outputs.is_empty() {
+            return;
+        }
+
+        let mut remaining = Vec::with_capacity(self.refreshing_status_outputs.len());
+        let mut updated_any = false;
+        for (pending_request_id, handle) in self.refreshing_status_outputs.drain(..) {
+            if pending_request_id == request_id {
+                updated_any = true;
+                handle.finish_rate_limit_refresh_without_change();
+            } else {
+                remaining.push((pending_request_id, handle));
+            }
+        }
+        self.refreshing_status_outputs = remaining;
+        if updated_any {
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn finish_status_rate_limit_refresh_as_unavailable(&mut self, request_id: u64) {
+        self.rate_limit_empty_state = RateLimitEmptyState::Unavailable;
+        if self.refreshing_status_outputs.is_empty() {
+            return;
+        }
+
+        let mut remaining = Vec::with_capacity(self.refreshing_status_outputs.len());
+        let mut updated_any = false;
+        for (pending_request_id, handle) in self.refreshing_status_outputs.drain(..) {
+            if pending_request_id == request_id {
+                updated_any = true;
+                handle.finish_rate_limit_refresh_as_unavailable();
             } else {
                 remaining.push((pending_request_id, handle));
             }
@@ -8618,6 +8686,13 @@ impl ChatWidget {
     #[cfg_attr(not(test), allow(dead_code))]
     fn prefetch_rate_limits(&mut self) {
         self.stop_rate_limit_poller();
+        self.on_rate_limit_snapshot(None);
+        if self.should_prefetch_rate_limits() {
+            self.app_event_tx.send(AppEvent::RefreshRateLimits {
+                origin: RateLimitRefreshOrigin::StartupPrefetch,
+                account_generation: self.rate_limit_account_generation,
+            });
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -10959,6 +11034,15 @@ impl ChatWidget {
         self.plan_type
     }
 
+    pub(crate) fn rate_limit_account_generation(&self) -> u64 {
+        self.rate_limit_account_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rate_limit_snapshot_count(&self) -> usize {
+        self.rate_limit_snapshots_by_limit_id.len()
+    }
+
     pub(crate) fn has_chatgpt_account(&self) -> bool {
         self.has_chatgpt_account
     }
@@ -10981,7 +11065,7 @@ impl ChatWidget {
         model: &str,
         service_tier: Option<ServiceTier>,
     ) -> bool {
-        model == FAST_STATUS_MODEL
+        self.model_supports_fast_mode(model)
             && matches!(service_tier, Some(ServiceTier::Fast))
             && self.has_chatgpt_account
     }
@@ -11094,6 +11178,19 @@ impl ChatWidget {
                     .into_iter()
                     .find(|preset| preset.model == model)
                     .map(|preset| preset.supports_personality)
+            })
+            .unwrap_or(false)
+    }
+
+    fn model_supports_fast_mode(&self, model: &str) -> bool {
+        self.model_catalog
+            .try_list_models()
+            .ok()
+            .and_then(|models| {
+                models
+                    .into_iter()
+                    .find(|preset| preset.model == model)
+                    .map(|preset| preset.supports_fast_mode())
             })
             .unwrap_or(false)
     }

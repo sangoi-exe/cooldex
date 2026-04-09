@@ -7,6 +7,9 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+// Merge-safety anchor: apply_patch tool metadata must stay aligned with the runtime parser and
+// prompt guidance on whether patch file references may be relative, absolute, or both.
+
 const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("tool_apply_patch.lark");
 
 const APPLY_PATCH_JSON_TOOL_DESCRIPTION: &str = r#"Use the `apply_patch` tool to edit files.
@@ -75,7 +78,7 @@ It is important to remember:
 
 - You must include a header with your intended action (Add/Delete/Update)
 - You must prefix new lines with `+` even when creating a new file
-- File references can only be relative, NEVER ABSOLUTE.
+- File references may be relative or absolute. Relative paths resolve against the current working directory (or the patch workdir, when provided).
 "#;
 
 /// TODO(dylan): deprecate once we get rid of json tool
@@ -102,9 +105,9 @@ pub fn create_apply_patch_freeform_tool() -> ToolSpec {
 pub fn create_apply_patch_json_tool() -> ToolSpec {
     let properties = BTreeMap::from([(
         "input".to_string(),
-        JsonSchema::String {
-            description: Some("The entire contents of the apply_patch command".to_string()),
-        },
+        JsonSchema::string(Some(
+            "The entire contents of the apply_patch command".to_string(),
+        )),
     )]);
 
     ToolSpec::Function(ResponsesApiTool {
@@ -112,11 +115,11 @@ pub fn create_apply_patch_json_tool() -> ToolSpec {
         description: APPLY_PATCH_JSON_TOOL_DESCRIPTION.to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::Object {
+        parameters: JsonSchema::object(
             properties,
-            required: Some(vec!["input".to_string()]),
-            additional_properties: Some(false.into()),
-        },
+            Some(vec!["input".to_string()]),
+            Some(false.into()),
+        ),
         output_schema: None,
     })
 }

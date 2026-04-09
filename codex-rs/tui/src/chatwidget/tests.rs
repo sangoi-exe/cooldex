@@ -138,6 +138,7 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffortPreset;
+use codex_protocol::openai_models::SPEED_TIER_FAST;
 use codex_protocol::openai_models::default_input_modalities;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::plan_tool::PlanItemArg;
@@ -231,6 +232,9 @@ use tempfile::tempdir;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
 use toml::Value as TomlValue;
+
+#[path = "tests/status_command_tests.rs"]
+mod status_command_tests;
 
 static NEXT_TEST_CODEX_HOME_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -3087,6 +3091,27 @@ fn test_model_catalog(config: &Config) -> Arc<ModelCatalog> {
     ))
 }
 
+pub(crate) fn set_fast_mode_test_catalog(chat: &mut ChatWidget) {
+    let mut models = codex_core::test_support::all_model_presets().clone();
+    for preset in &mut models {
+        if preset.model == "gpt-5.4" {
+            preset.additional_speed_tiers = vec![SPEED_TIER_FAST.to_string()];
+        } else if preset.model == "gpt-5.3-codex" {
+            preset.additional_speed_tiers.clear();
+        }
+    }
+
+    chat.model_catalog = Arc::new(ModelCatalog::new(
+        models,
+        CollaborationModesConfig {
+            default_mode_request_user_input: chat
+                .config
+                .features
+                .enabled(Feature::DefaultModeRequestUserInput),
+        },
+    ));
+}
+
 // --- Helpers for tests that need direct construction and event draining ---
 async fn make_chatwidget_manual(
     model_override: Option<&str>,
@@ -3157,6 +3182,8 @@ async fn make_chatwidget_manual(
         token_info_is_prompt_gc_private: false,
         prompt_gc_context_usage_unknown: false,
         rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+        rate_limit_empty_state: RateLimitEmptyState::Missing,
+        rate_limit_account_generation: 0,
         refreshing_status_outputs: Vec::new(),
         next_status_refresh_request_id: 0,
         plan_type: None,
@@ -9849,11 +9876,7 @@ async fn custom_prompt_enter_empty_does_not_send() {
 #[tokio::test]
 async fn view_image_tool_call_adds_history_cell() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let image_path = chat
-        .config
-        .cwd
-        .join("example.png")
-        .expect("absolute image path");
+    let image_path = chat.config.cwd.join("example.png");
 
     chat.handle_codex_event(Event {
         id: "sub-image".into(),
@@ -12063,6 +12086,7 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
             description: "medium".to_string(),
         }],
         supports_personality: false,
+        additional_speed_tiers: Vec::new(),
         is_default: false,
         upgrade: None,
         show_in_picker,
@@ -12332,6 +12356,7 @@ async fn single_reasoning_option_skips_selection() {
         default_reasoning_effort: ReasoningEffortConfig::High,
         supported_reasoning_efforts: single_effort,
         supports_personality: false,
+        additional_speed_tiers: Vec::new(),
         is_default: false,
         upgrade: None,
         show_in_picker: true,

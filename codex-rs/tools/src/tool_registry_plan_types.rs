@@ -8,6 +8,10 @@ use codex_protocol::dynamic_tools::DynamicToolSpec;
 use rmcp::model::Tool as McpTool;
 use std::collections::HashMap;
 
+// Merge-safety anchor: these planning enums/params are the typed contract that binds CLI tool
+// namespace planning to the registry-plan owner; merges must keep this schema aligned with that
+// owner instead of re-deriving parallel planning metadata elsewhere.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolHandlerKind {
     AgentJobs,
@@ -58,12 +62,19 @@ pub struct ToolRegistryPlan {
 #[derive(Debug, Clone, Copy)]
 pub struct ToolRegistryPlanParams<'a> {
     pub mcp_tools: Option<&'a HashMap<String, McpTool>>,
+    pub tool_namespaces: Option<&'a HashMap<String, ToolNamespace>>,
     pub app_tools: Option<&'a [ToolRegistryPlanAppTool<'a>]>,
     pub discoverable_tools: Option<&'a [DiscoverableTool]>,
     pub dynamic_tools: &'a [DynamicToolSpec],
     pub default_agent_type_description: &'a str,
     pub wait_agent_timeouts: WaitAgentTimeoutOptions,
     pub codex_apps_mcp_server_name: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolNamespace {
+    pub name: String,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]

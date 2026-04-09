@@ -10,6 +10,10 @@ use std::time::Duration;
 
 const REALTIME_CONVERSATION_PROMPT: &str = "You are in a realtime voice conversation in the Codex TUI. Respond conversationally and concisely.";
 
+// Merge-safety anchor: realtime start/transport params here are the CLI-side owner for the active
+// conversation transport contract; merges must keep them aligned with the app-server adapter and
+// chatwidget event handling.
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum RealtimeConversationPhase {
     #[default]
@@ -227,6 +231,7 @@ impl ChatWidget {
             ConversationStartParams {
                 prompt: REALTIME_CONVERSATION_PROMPT.to_string(),
                 session_id: None,
+                transport: None,
             },
         ));
         self.request_redraw();

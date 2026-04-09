@@ -6,6 +6,9 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 
+// Merge-safety anchor: legacy spawn_agent v1 exported metadata must stay aligned with the
+// active profile-based runtime contract; do not reintroduce dead model/reasoning overrides.
+
 #[derive(Debug, Clone)]
 pub struct SpawnAgentToolOptions<'a> {
     pub available_models: &'a [ModelPreset],
@@ -21,28 +24,19 @@ pub struct WaitAgentTimeoutOptions {
 }
 
 pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions<'_>) -> ToolSpec {
-    let available_models_description = (!options.hide_agent_type_model_reasoning)
-        .then(|| spawn_agent_models_description(options.available_models));
     let return_value_description =
         "Returns the spawned agent id plus the user-facing nickname when available.";
     let mut properties = spawn_agent_common_properties_v1(&options.agent_type_description);
     if options.hide_agent_type_model_reasoning {
-        hide_spawn_agent_metadata_options(&mut properties);
+        hide_spawn_agent_metadata_options_v1(&mut properties);
     }
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agent".to_string(),
-        description: spawn_agent_tool_description(
-            available_models_description.as_deref(),
-            return_value_description,
-        ),
+        description: spawn_agent_tool_description(None, return_value_description),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::Object {
-            properties,
-            required: None,
-            additional_properties: Some(false.into()),
-        },
+        parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
         output_schema: Some(spawn_agent_output_schema_v1()),
     })
 }
@@ -57,16 +51,14 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions<'_>) -> ToolSpe
     };
     let mut properties = spawn_agent_common_properties_v2(&options.agent_type_description);
     if options.hide_agent_type_model_reasoning {
-        hide_spawn_agent_metadata_options(&mut properties);
+        hide_spawn_agent_metadata_options_v2(&mut properties);
     }
     properties.insert(
         "task_name".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Task name for the new agent. Use lowercase letters, digits, and underscores."
-                    .to_string(),
-            ),
-        },
+        JsonSchema::string(Some(
+            "Task name for the new agent. Use lowercase letters, digits, and underscores."
+                .to_string(),
+        )),
     );
 
     ToolSpec::Function(ResponsesApiTool {
@@ -77,11 +69,11 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions<'_>) -> ToolSpe
         ),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::Object {
+        parameters: JsonSchema::object(
             properties,
-            required: Some(vec!["task_name".to_string(), "message".to_string()]),
-            additional_properties: Some(false.into()),
-        },
+            Some(vec!["task_name".to_string(), "message".to_string()]),
+            Some(false.into()),
+        ),
         output_schema: Some(spawn_agent_output_schema_v2(
             options.hide_agent_type_model_reasoning,
         )),
@@ -92,28 +84,22 @@ pub fn create_send_input_tool_v1() -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "target".to_string(),
-            JsonSchema::String {
-                description: Some("Agent id to message (from spawn_agent).".to_string()),
-            },
+            JsonSchema::string(Some("Agent id to message (from spawn_agent).".to_string())),
         ),
         (
             "message".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Legacy plain-text message to send to the agent. Use either message or items."
-                        .to_string(),
-                ),
-            },
+            JsonSchema::string(Some(
+                "Legacy plain-text message to send to the agent. Use either message or items."
+                    .to_string(),
+            )),
         ),
         ("items".to_string(), create_collab_input_items_schema()),
         (
             "interrupt".to_string(),
-            JsonSchema::Boolean {
-                description: Some(
-                    "When true, stop the agent's current task and handle this immediately. When false (default), queue this message."
-                        .to_string(),
-                ),
-            },
+            JsonSchema::boolean(Some(
+                "When true, stop the agent's current task and handle this immediately. When false (default), queue this message."
+                    .to_string(),
+            )),
         ),
     ]);
 
@@ -123,11 +109,7 @@ pub fn create_send_input_tool_v1() -> ToolSpec {
             .to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::Object {
-            properties,
-            required: Some(vec!["target".to_string()]),
-            additional_properties: Some(false.into()),
-        },
+        parameters: JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into())),
         output_schema: Some(send_input_output_schema()),
     })
 }
@@ -136,17 +118,15 @@ pub fn create_send_message_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "target".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Agent id or canonical task name to message (from spawn_agent).".to_string(),
-                ),
-            },
+            JsonSchema::string(Some(
+                "Agent id or canonical task name to message (from spawn_agent).".to_string(),
+            )),
         ),
         (
             "message".to_string(),
-            JsonSchema::String {
-                description: Some("Message text to queue on the target agent.".to_string()),
-            },
+            JsonSchema::string(Some(
+                "Message text to queue on the target agent.".to_string(),
+            )),
         ),
     ]);
 
@@ -156,11 +136,7 @@ pub fn create_send_message_tool() -> ToolSpec {
             .to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::Object {
-            properties,
-            required: Some(vec!["target".to_string(), "message".to_string()]),
-            additional_properties: Some(false.into()),
-        },
+        parameters: JsonSchema::object(properties, Some(vec!["target".to_string(), "message".to_string()]), Some(false.into())),
         output_schema: None,
     })
 }
@@ -169,26 +145,22 @@ pub fn create_followup_task_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "target".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Agent id or canonical task name to message (from spawn_agent).".to_string(),
-                ),
-            },
+            JsonSchema::string(Some(
+                "Agent id or canonical task name to message (from spawn_agent).".to_string(),
+            )),
         ),
         (
             "message".to_string(),
-            JsonSchema::String {
-                description: Some("Message text to send to the target agent.".to_string()),
-            },
+            JsonSchema::string(Some(
+                "Message text to send to the target agent.".to_string(),
+            )),
         ),
         (
             "interrupt".to_string(),
-            JsonSchema::Boolean {
-                description: Some(
-                    "When true, stop the agent's current task and handle this immediately. When false (default), queue this message."
-                        .to_string(),
-                ),
-            },
+            JsonSchema::boolean(Some(
+                "When true, stop the agent's current task and handle this immediately. When false (default), queue this message."
+                    .to_string(),
+            )),
         ),
     ]);
 
@@ -198,11 +170,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
             .to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::Object {
-            properties,
-            required: Some(vec!["target".to_string(), "message".to_string()]),
-            additional_properties: Some(false.into()),
-        },
+        parameters: JsonSchema::object(properties, Some(vec!["target".to_string(), "message".to_string()]), Some(false.into())),
         output_schema: None,
     })
 }
@@ -210,9 +178,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
 pub fn create_resume_agent_tool() -> ToolSpec {
     let properties = BTreeMap::from([(
         "id".to_string(),
-        JsonSchema::String {
-            description: Some("Agent id to resume.".to_string()),
-        },
+        JsonSchema::string(Some("Agent id to resume.".to_string())),
     )]);
 
     ToolSpec::Function(ResponsesApiTool {
@@ -222,11 +188,7 @@ pub fn create_resume_agent_tool() -> ToolSpec {
                 .to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::Object {
-            properties,
-            required: Some(vec!["id".to_string()]),
-            additional_properties: Some(false.into()),
-        },
+        parameters: JsonSchema::object(properties, Some(vec!["id".to_string()]), Some(false.into())),
         output_schema: Some(resume_agent_output_schema()),
     })
 }
@@ -258,12 +220,10 @@ pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
 pub fn create_list_agents_tool() -> ToolSpec {
     let properties = BTreeMap::from([(
         "path_prefix".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Optional task-path prefix. Accepts the same relative or absolute task-path syntax as other MultiAgentV2 agent targets."
-                    .to_string(),
-            ),
-        },
+        JsonSchema::string(Some(
+            "Optional task-path prefix. Accepts the same relative or absolute task-path syntax as other MultiAgentV2 agent targets."
+                .to_string(),
+        )),
     )]);
 
     ToolSpec::Function(ResponsesApiTool {
@@ -273,11 +233,7 @@ pub fn create_list_agents_tool() -> ToolSpec {
                 .to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::Object {
-            properties,
-            required: None,
-            additional_properties: Some(false.into()),
-        },
+        parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
         output_schema: Some(list_agents_output_schema()),
     })
 }
@@ -285,9 +241,7 @@ pub fn create_list_agents_tool() -> ToolSpec {
 pub fn create_close_agent_tool_v1() -> ToolSpec {
     let properties = BTreeMap::from([(
         "target".to_string(),
-        JsonSchema::String {
-            description: Some("Agent id to close (from spawn_agent).".to_string()),
-        },
+        JsonSchema::string(Some("Agent id to close (from spawn_agent).".to_string())),
     )]);
 
     ToolSpec::Function(ResponsesApiTool {
@@ -295,11 +249,7 @@ pub fn create_close_agent_tool_v1() -> ToolSpec {
         description: "Close an agent and any open descendants when they are no longer needed, and return the target agent's previous status before shutdown was requested. Don't keep agents open for too long if they are not needed anymore.".to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::Object {
-            properties,
-            required: Some(vec!["target".to_string()]),
-            additional_properties: Some(false.into()),
-        },
+        parameters: JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into())),
         output_schema: Some(close_agent_output_schema()),
     })
 }
@@ -307,11 +257,9 @@ pub fn create_close_agent_tool_v1() -> ToolSpec {
 pub fn create_close_agent_tool_v2() -> ToolSpec {
     let properties = BTreeMap::from([(
         "target".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Agent id or canonical task name to close (from spawn_agent).".to_string(),
-            ),
-        },
+        JsonSchema::string(Some(
+            "Agent id or canonical task name to close (from spawn_agent).".to_string(),
+        )),
     )]);
 
     ToolSpec::Function(ResponsesApiTool {
@@ -319,11 +267,7 @@ pub fn create_close_agent_tool_v2() -> ToolSpec {
         description: "Close an agent and any open descendants when they are no longer needed, and return the target agent's previous status before shutdown was requested. Don't keep agents open for too long if they are not needed anymore.".to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::Object {
-            properties,
-            required: Some(vec!["target".to_string()]),
-            additional_properties: Some(false.into()),
-        },
+        parameters: JsonSchema::object(properties, Some(vec!["target".to_string()]), Some(false.into())),
         output_schema: Some(close_agent_output_schema()),
     })
 }
@@ -549,98 +493,63 @@ fn create_collab_input_items_schema() -> JsonSchema {
     let properties = BTreeMap::from([
         (
             "type".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Input item type: text, image, local_image, skill, or mention.".to_string(),
-                ),
-            },
+            JsonSchema::string(Some(
+                "Input item type: text, image, local_image, skill, or mention.".to_string(),
+            )),
         ),
         (
             "text".to_string(),
-            JsonSchema::String {
-                description: Some("Text content when type is text.".to_string()),
-            },
+            JsonSchema::string(Some("Text content when type is text.".to_string())),
         ),
         (
             "image_url".to_string(),
-            JsonSchema::String {
-                description: Some("Image URL when type is image.".to_string()),
-            },
+            JsonSchema::string(Some("Image URL when type is image.".to_string())),
         ),
         (
             "path".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Path when type is local_image/skill, or structured mention target such as app://<connector-id> or plugin://<plugin-name>@<marketplace-name> when type is mention."
-                        .to_string(),
-                ),
-            },
+            JsonSchema::string(Some(
+                "Path when type is local_image/skill, or structured mention target such as app://<connector-id> or plugin://<plugin-name>@<marketplace-name> when type is mention."
+                    .to_string(),
+            )),
         ),
         (
             "name".to_string(),
-            JsonSchema::String {
-                description: Some("Display name when type is skill or mention.".to_string()),
-            },
+            JsonSchema::string(Some("Display name when type is skill or mention.".to_string())),
         ),
     ]);
 
-    JsonSchema::Array {
-        items: Box::new(JsonSchema::Object {
-            properties,
-            required: None,
-            additional_properties: Some(false.into()),
-        }),
-        description: Some(
+    JsonSchema::array(JsonSchema::object(properties, /*required*/ None, Some(false.into())), Some(
             "Structured input items. Use this to pass explicit mentions (for example app:// connector paths)."
                 .to_string(),
-        ),
-    }
+        ))
 }
 
 fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<String, JsonSchema> {
     BTreeMap::from([
         (
             "message".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Initial plain-text task for the new agent. Use either message or items."
-                        .to_string(),
-                ),
-            },
+            JsonSchema::string(Some(
+                "Initial plain-text task for the new agent. Use either message or items."
+                    .to_string(),
+            )),
         ),
         ("items".to_string(), create_collab_input_items_schema()),
         (
             "agent_type".to_string(),
-            JsonSchema::String {
-                description: Some(agent_type_description.to_string()),
-            },
+            JsonSchema::string(Some(agent_type_description.to_string())),
         ),
         (
             "fork_context".to_string(),
-            JsonSchema::Boolean {
-                description: Some(
-                    "When true, fork the current thread history into the new agent before sending the initial prompt. This must be used when you want the new agent to have exactly the same context as you."
-                        .to_string(),
-                ),
-            },
+            JsonSchema::boolean(Some(
+                "When true, fork the current thread history into the new agent before sending the initial prompt. This must be used when you want the new agent to have exactly the same context as you."
+                    .to_string(),
+            )),
         ),
         (
-            "model".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Optional model override for the new agent. Replaces the inherited model."
-                        .to_string(),
-                ),
-            },
-        ),
-        (
-            "reasoning_effort".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort."
-                        .to_string(),
-                ),
-            },
+            "profile".to_string(),
+            JsonSchema::string(Some(
+                "Optional config profile selected for the spawned agent.".to_string(),
+            )),
         ),
     ])
 }
@@ -649,47 +558,42 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
     BTreeMap::from([
         (
             "message".to_string(),
-            JsonSchema::String {
-                description: Some("Initial plain-text task for the new agent.".to_string()),
-            },
+            JsonSchema::string(Some("Initial plain-text task for the new agent.".to_string())),
         ),
         (
             "agent_type".to_string(),
-            JsonSchema::String {
-                description: Some(agent_type_description.to_string()),
-            },
+            JsonSchema::string(Some(agent_type_description.to_string())),
         ),
         (
             "fork_turns".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Optional MultiAgentV2 fork mode. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
-                        .to_string(),
-                ),
-            },
+            JsonSchema::string(Some(
+                "Optional MultiAgentV2 fork mode. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
+                    .to_string(),
+            )),
         ),
         (
             "model".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Optional model override for the new agent. Replaces the inherited model."
-                        .to_string(),
-                ),
-            },
+            JsonSchema::string(Some(
+                "Optional model override for the new agent. Replaces the inherited model."
+                    .to_string(),
+            )),
         ),
         (
             "reasoning_effort".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort."
-                        .to_string(),
-                ),
-            },
+            JsonSchema::string(Some(
+                "Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort."
+                    .to_string(),
+            )),
         ),
     ])
 }
 
-fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchema>) {
+fn hide_spawn_agent_metadata_options_v1(properties: &mut BTreeMap<String, JsonSchema>) {
+    properties.remove("agent_type");
+    properties.remove("profile");
+}
+
+fn hide_spawn_agent_metadata_options_v2(properties: &mut BTreeMap<String, JsonSchema>) {
     properties.remove("agent_type");
     properties.remove("model");
     properties.remove("reasoning_effort");
@@ -777,66 +681,51 @@ fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema
     let properties = BTreeMap::from([
         (
             "ids".to_string(),
-            JsonSchema::Array {
-                items: Box::new(JsonSchema::String { description: None }),
-                description: Some(
-                    "Agent ids to wait on."
-                        .to_string(),
-                ),
-            },
+            JsonSchema::array(
+                JsonSchema::string(/*description*/ None),
+                Some("Agent ids to wait on.".to_string()),
+            ),
         ),
         (
             "timeout_ms".to_string(),
-            JsonSchema::Number {
-                description: Some(format!(
-                    "Optional timeout in milliseconds. Defaults to {}, min {}, max {}. Prefer longer waits (minutes) to avoid busy polling.",
-                    options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
-                )),
-            },
+            JsonSchema::number(Some(format!(
+                "Optional timeout in milliseconds. Defaults to {}, min {}, max {}. Prefer longer waits (minutes) to avoid busy polling.",
+                options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
+            ))),
         ),
         (
             "disable_timeout".to_string(),
-            JsonSchema::Boolean {
-                description: Some(
-                    "When true, disable the timeout and require return_when. Cannot be combined with timeout_ms."
-                        .to_string(),
-                ),
-            },
+            JsonSchema::boolean(Some(
+                "When true, disable the timeout and require return_when. Cannot be combined with timeout_ms."
+                    .to_string(),
+            )),
         ),
         (
             "return_when".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Optional completion condition when disable_timeout=true: any_final waits for the next requested non-final agent to newly become final, while all_final waits for every requested agent to be final."
-                        .to_string(),
-                ),
-            },
+            JsonSchema::string(Some(
+                "Optional completion condition when disable_timeout=true: any_final waits for the next requested non-final agent to newly become final, while all_final waits for every requested agent to be final."
+                    .to_string(),
+            )),
         ),
     ]);
 
-    JsonSchema::Object {
+    JsonSchema::object(
         properties,
-        required: Some(vec!["ids".to_string()]),
-        additional_properties: Some(false.into()),
-    }
+        Some(vec!["ids".to_string()]),
+        Some(false.into()),
+    )
 }
 
 fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema {
     let properties = BTreeMap::from([(
         "timeout_ms".to_string(),
-        JsonSchema::Number {
-            description: Some(format!(
-                "Optional timeout in milliseconds. Defaults to {}, min {}, max {}. Prefer longer waits (minutes) to avoid busy polling.",
-                options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
-            )),
-        },
+        JsonSchema::number(Some(format!(
+            "Optional timeout in milliseconds. Defaults to {}, min {}, max {}. Prefer longer waits (minutes) to avoid busy polling.",
+            options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
+        ))),
     )]);
 
-    JsonSchema::Object {
-        properties,
-        required: None,
-        additional_properties: Some(false.into()),
-    }
+    JsonSchema::object(properties, /*required*/ None, Some(false.into()))
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ mod standalone_executable;
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
+use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -13,6 +14,10 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_exec_server::CreateDirectoryOptions;
+use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::RemoveOptions;
+use codex_utils_absolute_path::AbsolutePathBuf;
 pub use parser::Hunk;
 pub use parser::ParseError;
 use parser::ParseError::*;
@@ -25,6 +30,10 @@ pub use invocation::maybe_parse_apply_patch_verified;
 pub use standalone_executable::main;
 
 use crate::invocation::ExtractHeredocError;
+
+// Merge-safety anchor: local apply-patch keeps the host-local atomic rollback owner separate
+// from the executor-fs-backed remote owner; merges must not collapse those paths back into a
+// single filesystem implementation.
 
 /// Detailed instructions for gpt-4.1 on how to use the `apply_patch` tool.
 pub const APPLY_PATCH_TOOL_INSTRUCTIONS: &str = include_str!("../apply_patch_tool_instructions.md");
@@ -138,7 +147,7 @@ pub struct ApplyPatchAction {
     pub patch: String,
 
     /// The working directory that was used to resolve relative paths in the patch.
-    pub cwd: PathBuf,
+    pub cwd: AbsolutePathBuf,
 }
 
 impl ApplyPatchAction {
@@ -153,11 +162,7 @@ impl ApplyPatchAction {
 
     /// Should be used exclusively for testing. (Not worth the overhead of
     /// creating a feature flag for this.)
-    pub fn new_add_for_test(path: &Path, content: String) -> Self {
-        if !path.is_absolute() {
-            panic!("path must be absolute");
-        }
-
+    pub fn new_add_for_test(path: &AbsolutePathBuf, content: String) -> Self {
         #[expect(clippy::expect_used)]
         let filename = path
             .file_name()
@@ -174,82 +179,50 @@ impl ApplyPatchAction {
         #[expect(clippy::expect_used)]
         Self {
             changes,
-            cwd: path
-                .parent()
-                .expect("path should have parent")
-                .to_path_buf(),
+            cwd: path.parent().expect("path should have parent"),
             patch,
         }
     }
 }
 
-/// Applies the patch and prints the result to stdout/stderr.
-pub fn apply_patch(
+/// Applies the patch against the host-local filesystem and prints the result to stdout/stderr.
+pub async fn apply_patch(
     patch: &str,
+    cwd: &AbsolutePathBuf,
     stdout: &mut impl std::io::Write,
     stderr: &mut impl std::io::Write,
 ) -> Result<(), ApplyPatchError> {
-    let hunks = match parse_patch(patch) {
-        Ok(source) => source.hunks,
-        Err(e) => {
-            match &e {
-                InvalidPatchError(message) => {
-                    writeln!(stderr, "Invalid patch: {message}").map_err(ApplyPatchError::from)?;
-                }
-                InvalidHunkError {
-                    message,
-                    line_number,
-                } => {
-                    writeln!(
-                        stderr,
-                        "Invalid patch hunk on line {line_number}: {message}"
-                    )
-                    .map_err(ApplyPatchError::from)?;
-                }
-            }
-            return Err(ApplyPatchError::ParseError(e));
-        }
-    };
+    let hunks = parse_patch_for_apply(patch, stderr)?;
 
-    apply_hunks(&hunks, stdout, stderr)?;
+    apply_hunks(&hunks, cwd, stdout, stderr).await?;
+
+    Ok(())
+}
+
+/// Applies the patch through the provided executor filesystem.
+pub async fn apply_patch_via_executor_fs(
+    patch: &str,
+    cwd: &AbsolutePathBuf,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+    fs: &dyn ExecutorFileSystem,
+) -> Result<(), ApplyPatchError> {
+    let hunks = parse_patch_for_apply(patch, stderr)?;
+
+    apply_hunks_via_executor_fs(&hunks, cwd, stdout, stderr, fs).await?;
 
     Ok(())
 }
 
 /// Applies hunks and continues to update stdout/stderr
-pub fn apply_hunks(
+pub async fn apply_hunks(
     hunks: &[Hunk],
+    cwd: &AbsolutePathBuf,
     stdout: &mut impl std::io::Write,
     stderr: &mut impl std::io::Write,
 ) -> Result<(), ApplyPatchError> {
-    let _existing_paths: Vec<&Path> = hunks
-        .iter()
-        .filter_map(|hunk| match hunk {
-            Hunk::AddFile { .. } => {
-                // The file is being added, so it doesn't exist yet.
-                None
-            }
-            Hunk::DeleteFile { path } => Some(path.as_path()),
-            Hunk::UpdateFile {
-                path, move_path, ..
-            } => match move_path {
-                Some(move_path) => {
-                    if std::fs::metadata(move_path)
-                        .map(|m| m.is_file())
-                        .unwrap_or(false)
-                    {
-                        Some(move_path.as_path())
-                    } else {
-                        None
-                    }
-                }
-                None => Some(path.as_path()),
-            },
-        })
-        .collect::<Vec<&Path>>();
-
     // Delegate to a helper that applies each hunk to the filesystem.
-    match apply_hunks_to_files(hunks) {
+    match apply_hunks_to_files(hunks, cwd).await {
         Ok(affected) => {
             print_summary(&affected, stdout).map_err(ApplyPatchError::from)?;
             Ok(())
@@ -269,9 +242,38 @@ pub fn apply_hunks(
     }
 }
 
+/// Applies hunks through the provided executor filesystem and continues to update stdout/stderr.
+pub async fn apply_hunks_via_executor_fs(
+    hunks: &[Hunk],
+    cwd: &AbsolutePathBuf,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+    fs: &dyn ExecutorFileSystem,
+) -> Result<(), ApplyPatchError> {
+    match apply_hunks_to_executor_fs(hunks, cwd, fs).await {
+        Ok(affected) => {
+            print_summary(&affected, stdout).map_err(ApplyPatchError::from)?;
+            Ok(())
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            writeln!(stderr, "{msg}").map_err(ApplyPatchError::from)?;
+            if let Some(io_error) = err.downcast_ref::<std::io::Error>() {
+                Err(ApplyPatchError::from(io_error))
+            } else {
+                Err(ApplyPatchError::IoError(IoError {
+                    context: msg,
+                    source: std::io::Error::other(err),
+                }))
+            }
+        }
+    }
+}
+
 /// Applies each parsed patch hunk to the filesystem.
 /// Returns an error if any of the changes could not be applied.
-/// Tracks file paths affected by applying a patch.
+/// Tracks file paths affected by applying a patch, preserving the path spelling
+/// from the patch for user-facing summaries.
 pub struct AffectedPaths {
     pub added: Vec<PathBuf>,
     pub modified: Vec<PathBuf>,
@@ -352,19 +354,23 @@ impl VirtualEntry {
 #[derive(Debug)]
 enum PreparedChange {
     Add {
-        path: PathBuf,
+        display_path: PathBuf,
+        path_abs: AbsolutePathBuf,
         contents: String,
     },
     Delete {
-        path: PathBuf,
+        display_path: PathBuf,
+        path_abs: AbsolutePathBuf,
     },
     Update {
-        path: PathBuf,
+        display_path: PathBuf,
+        path_abs: AbsolutePathBuf,
         contents: String,
     },
     Move {
-        source_path: PathBuf,
-        dest_path: PathBuf,
+        source_path_abs: AbsolutePathBuf,
+        dest_display_path: PathBuf,
+        dest_path_abs: AbsolutePathBuf,
         contents: String,
     },
 }
@@ -387,12 +393,15 @@ enum RollbackChange {
 
 /// Apply the hunks to the filesystem, returning which files were added, modified, or deleted.
 /// Returns an error if the patch could not be applied.
-fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
+async fn apply_hunks_to_files(
+    hunks: &[Hunk],
+    cwd: &AbsolutePathBuf,
+) -> anyhow::Result<AffectedPaths> {
     if hunks.is_empty() {
         anyhow::bail!("No files were modified.");
     }
 
-    let prepared_changes = prepare_changes(hunks)?;
+    let prepared_changes = prepare_changes(hunks, cwd)?;
     let mut added: Vec<PathBuf> = Vec::new();
     let mut modified: Vec<PathBuf> = Vec::new();
     let mut deleted: Vec<PathBuf> = Vec::new();
@@ -421,38 +430,160 @@ fn apply_hunks_to_files(hunks: &[Hunk]) -> anyhow::Result<AffectedPaths> {
     })
 }
 
-fn prepare_changes(hunks: &[Hunk]) -> anyhow::Result<Vec<PreparedChange>> {
+async fn apply_hunks_to_executor_fs(
+    hunks: &[Hunk],
+    cwd: &AbsolutePathBuf,
+    fs: &dyn ExecutorFileSystem,
+) -> anyhow::Result<AffectedPaths> {
+    if hunks.is_empty() {
+        anyhow::bail!("No files were modified.");
+    }
+
+    let mut added: Vec<PathBuf> = Vec::new();
+    let mut modified: Vec<PathBuf> = Vec::new();
+    let mut deleted: Vec<PathBuf> = Vec::new();
+    for hunk in hunks {
+        let affected_path = hunk.path().to_path_buf();
+        let path_abs = hunk.resolve_path(cwd);
+        match hunk {
+            Hunk::AddFile { contents, .. } => {
+                if let Some(parent_abs) = path_abs.parent() {
+                    fs.create_directory(&parent_abs, CreateDirectoryOptions { recursive: true })
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to create parent directories for {}",
+                                path_abs.display()
+                            )
+                        })?;
+                }
+                fs.write_file(&path_abs, contents.clone().into_bytes())
+                    .await
+                    .with_context(|| format!("Failed to write file {}", path_abs.display()))?;
+                added.push(affected_path);
+            }
+            Hunk::DeleteFile { .. } => {
+                let result: io::Result<()> = async {
+                    let metadata = fs.get_metadata(&path_abs).await?;
+                    if metadata.is_directory {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "path is a directory",
+                        ));
+                    }
+                    fs.remove(
+                        &path_abs,
+                        RemoveOptions {
+                            recursive: false,
+                            force: false,
+                        },
+                    )
+                    .await
+                }
+                .await;
+                result.with_context(|| format!("Failed to delete file {}", path_abs.display()))?;
+                deleted.push(affected_path);
+            }
+            Hunk::UpdateFile {
+                move_path, chunks, ..
+            } => {
+                let AppliedPatch { new_contents, .. } =
+                    derive_new_contents_from_chunks(&path_abs, chunks, fs).await?;
+                if let Some(dest) = move_path {
+                    let dest_display_path = dest.to_path_buf();
+                    let dest_abs = AbsolutePathBuf::resolve_path_against_base(dest, cwd);
+                    if let Some(parent_abs) = dest_abs.parent() {
+                        fs.create_directory(
+                            &parent_abs,
+                            CreateDirectoryOptions { recursive: true },
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to create parent directories for {}",
+                                dest_abs.display()
+                            )
+                        })?;
+                    }
+                    fs.write_file(&dest_abs, new_contents.into_bytes())
+                        .await
+                        .with_context(|| format!("Failed to write file {}", dest_abs.display()))?;
+                    let result: io::Result<()> = async {
+                        let metadata = fs.get_metadata(&path_abs).await?;
+                        if metadata.is_directory {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "path is a directory",
+                            ));
+                        }
+                        fs.remove(
+                            &path_abs,
+                            RemoveOptions {
+                                recursive: false,
+                                force: false,
+                            },
+                        )
+                        .await
+                    }
+                    .await;
+                    result.with_context(|| {
+                        format!("Failed to remove original {}", path_abs.display())
+                    })?;
+                    modified.push(dest_display_path);
+                } else {
+                    fs.write_file(&path_abs, new_contents.into_bytes())
+                        .await
+                        .with_context(|| format!("Failed to write file {}", path_abs.display()))?;
+                    modified.push(affected_path);
+                }
+            }
+        }
+    }
+
+    Ok(AffectedPaths {
+        added,
+        modified,
+        deleted,
+    })
+}
+
+fn prepare_changes(hunks: &[Hunk], cwd: &AbsolutePathBuf) -> anyhow::Result<Vec<PreparedChange>> {
     let mut prepared_changes = Vec::with_capacity(hunks.len());
     let mut virtual_entries: HashMap<PathBuf, VirtualEntry> = HashMap::new();
 
     for hunk in hunks {
+        let path_abs = hunk.resolve_path(cwd);
         match hunk {
             Hunk::AddFile { path, contents } => {
                 let current_entry = current_virtual_entry(
                     &mut virtual_entries,
-                    path,
+                    path_abs.as_path(),
                     load_virtual_entry_for_write,
                 )?;
                 prepared_changes.push(PreparedChange::Add {
-                    path: path.clone(),
+                    display_path: path.clone(),
+                    path_abs: path_abs.clone(),
                     contents: contents.clone(),
                 });
                 virtual_entries.insert(
-                    path.clone(),
+                    path_abs.to_path_buf(),
                     current_entry.with_updated_contents(contents.clone()),
                 );
             }
             Hunk::DeleteFile { path } => {
                 let current_entry = current_virtual_entry(
                     &mut virtual_entries,
-                    path,
+                    path_abs.as_path(),
                     load_virtual_entry_for_delete,
                 )?;
                 if matches!(current_entry, VirtualEntry::Missing) {
-                    anyhow::bail!("Failed to delete file {}", path.display());
+                    anyhow::bail!("Failed to delete file {}", path_abs.display());
                 }
-                prepared_changes.push(PreparedChange::Delete { path: path.clone() });
-                virtual_entries.insert(path.clone(), VirtualEntry::Missing);
+                prepared_changes.push(PreparedChange::Delete {
+                    display_path: path.clone(),
+                    path_abs: path_abs.clone(),
+                });
+                virtual_entries.insert(path_abs.to_path_buf(), VirtualEntry::Missing);
             }
             Hunk::UpdateFile {
                 path,
@@ -461,37 +592,40 @@ fn prepare_changes(hunks: &[Hunk]) -> anyhow::Result<Vec<PreparedChange>> {
             } => {
                 let source_entry = current_virtual_entry(
                     &mut virtual_entries,
-                    path,
+                    path_abs.as_path(),
                     load_virtual_entry_for_update,
                 )?;
                 let Some(source_contents) = source_entry.current_contents() else {
-                    return Err(missing_update_error(path));
+                    return Err(missing_update_error(path_abs.as_path()));
                 };
                 let AppliedPatch { new_contents, .. } =
-                    derive_new_contents_from_contents(path, source_contents, chunks)?;
+                    derive_new_contents_from_contents(path_abs.as_path(), source_contents, chunks)?;
                 if let Some(dest_path) = move_path {
+                    let dest_path_abs = AbsolutePathBuf::resolve_path_against_base(dest_path, cwd);
                     let dest_entry = current_virtual_entry(
                         &mut virtual_entries,
-                        dest_path,
+                        dest_path_abs.as_path(),
                         load_virtual_entry_for_write,
                     )?;
                     prepared_changes.push(PreparedChange::Move {
-                        source_path: path.clone(),
-                        dest_path: dest_path.clone(),
+                        source_path_abs: path_abs.clone(),
+                        dest_display_path: dest_path.clone(),
+                        dest_path_abs: dest_path_abs.clone(),
                         contents: new_contents.clone(),
                     });
-                    virtual_entries.insert(path.clone(), VirtualEntry::Missing);
+                    virtual_entries.insert(path_abs.to_path_buf(), VirtualEntry::Missing);
                     virtual_entries.insert(
-                        dest_path.clone(),
+                        dest_path_abs.to_path_buf(),
                         dest_entry.with_updated_contents(new_contents),
                     );
                 } else {
                     prepared_changes.push(PreparedChange::Update {
-                        path: path.clone(),
+                        display_path: path.clone(),
+                        path_abs: path_abs.clone(),
                         contents: new_contents.clone(),
                     });
                     virtual_entries.insert(
-                        path.clone(),
+                        path_abs.to_path_buf(),
                         source_entry.with_updated_contents(new_contents),
                     );
                 }
@@ -702,36 +836,49 @@ fn commit_prepared_change(
     rollbacks: &mut Vec<RollbackChange>,
 ) -> anyhow::Result<()> {
     match prepared_change {
-        PreparedChange::Add { path, contents } => {
-            let rollback = commit_write_change(&path, &contents)?;
-            added.push(path);
+        PreparedChange::Add {
+            display_path,
+            path_abs,
+            contents,
+        } => {
+            let rollback = commit_write_change(path_abs.as_path(), &contents)?;
+            added.push(display_path);
             rollbacks.push(rollback);
         }
-        PreparedChange::Delete { path } => {
-            let rollback = commit_delete_change(&path)?;
-            deleted.push(path);
+        PreparedChange::Delete {
+            display_path,
+            path_abs,
+        } => {
+            let rollback = commit_delete_change(path_abs.as_path())?;
+            deleted.push(display_path);
             rollbacks.push(rollback);
         }
-        PreparedChange::Update { path, contents } => {
-            let rollback = commit_write_change(&path, &contents)?;
-            modified.push(path);
+        PreparedChange::Update {
+            display_path,
+            path_abs,
+            contents,
+        } => {
+            let rollback = commit_write_change(path_abs.as_path(), &contents)?;
+            modified.push(display_path);
             rollbacks.push(rollback);
         }
         PreparedChange::Move {
-            source_path,
-            dest_path,
+            source_path_abs,
+            dest_display_path,
+            dest_path_abs,
             contents,
         } => {
             let source_failure_context =
-                format!("Failed to remove original {}", source_path.display());
-            let source_snapshot = snapshot_deleted_path(&source_path, &source_failure_context)?
-                .ok_or_else(|| {
-                    anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
-                        .context(source_failure_context.clone())
-                })?;
-            let dest_rollback = commit_write_change(&dest_path, &contents)?;
-            if let Err(err) =
-                std::fs::remove_file(&source_path).with_context(|| source_failure_context.clone())
+                format!("Failed to remove original {}", source_path_abs.display());
+            let source_snapshot =
+                snapshot_deleted_path(source_path_abs.as_path(), &source_failure_context)?
+                    .ok_or_else(|| {
+                        anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+                            .context(source_failure_context.clone())
+                    })?;
+            let dest_rollback = commit_write_change(dest_path_abs.as_path(), &contents)?;
+            if let Err(err) = std::fs::remove_file(source_path_abs.as_path())
+                .with_context(|| source_failure_context.clone())
             {
                 return match rollback_changes(vec![dest_rollback]) {
                     Ok(()) => Err(err),
@@ -740,10 +887,10 @@ fn commit_prepared_change(
                     }
                 };
             }
-            modified.push(dest_path);
+            modified.push(dest_display_path);
             rollbacks.push(dest_rollback);
             rollbacks.push(RollbackChange::RestoreDeletedPath {
-                path: source_path,
+                path: source_path_abs.to_path_buf(),
                 snapshot: source_snapshot,
             });
         }
@@ -1055,21 +1202,19 @@ fn derive_new_contents_from_contents(
 
 /// Return *only* the new file contents (joined into a single `String`) after
 /// applying the chunks to the file at `path`.
-fn derive_new_contents_from_chunks(
-    path: &Path,
+async fn derive_new_contents_from_chunks(
+    path_abs: &AbsolutePathBuf,
     chunks: &[UpdateFileChunk],
+    fs: &dyn ExecutorFileSystem,
 ) -> std::result::Result<AppliedPatch, ApplyPatchError> {
-    let original_contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(err) => {
-            return Err(ApplyPatchError::IoError(IoError {
-                context: format!("Failed to read file to update {}", path.display()),
-                source: err,
-            }));
-        }
-    };
+    let original_contents = fs.read_file_text(path_abs).await.map_err(|err| {
+        ApplyPatchError::IoError(IoError {
+            context: format!("Failed to read file to update {}", path_abs.display()),
+            source: err,
+        })
+    })?;
 
-    derive_new_contents_from_contents(path, &original_contents, chunks)
+    derive_new_contents_from_contents(path_abs.as_path(), &original_contents, chunks)
 }
 
 /// Compute a list of replacements needed to transform `original_lines` into the
@@ -1165,6 +1310,33 @@ fn compute_replacements(
     Ok(replacements)
 }
 
+fn parse_patch_for_apply(
+    patch: &str,
+    stderr: &mut impl std::io::Write,
+) -> Result<Vec<Hunk>, ApplyPatchError> {
+    match parse_patch(patch) {
+        Ok(source) => Ok(source.hunks),
+        Err(e) => {
+            match &e {
+                InvalidPatchError(message) => {
+                    writeln!(stderr, "Invalid patch: {message}").map_err(ApplyPatchError::from)?;
+                }
+                InvalidHunkError {
+                    message,
+                    line_number,
+                } => {
+                    writeln!(
+                        stderr,
+                        "Invalid patch hunk on line {line_number}: {message}"
+                    )
+                    .map_err(ApplyPatchError::from)?;
+                }
+            }
+            Err(ApplyPatchError::ParseError(e))
+        }
+    }
+}
+
 /// Apply the `(start_index, old_len, new_lines)` replacements to `original_lines`,
 /// returning the modified file contents as a vector of lines.
 fn apply_replacements(
@@ -1200,22 +1372,24 @@ pub struct ApplyPatchFileUpdate {
     content: String,
 }
 
-pub fn unified_diff_from_chunks(
-    path: &Path,
+pub async fn unified_diff_from_chunks(
+    path_abs: &AbsolutePathBuf,
     chunks: &[UpdateFileChunk],
+    fs: &dyn ExecutorFileSystem,
 ) -> std::result::Result<ApplyPatchFileUpdate, ApplyPatchError> {
-    unified_diff_from_chunks_with_context(path, chunks, /*context*/ 1)
+    unified_diff_from_chunks_with_context(path_abs, chunks, /*context*/ 1, fs).await
 }
 
-pub fn unified_diff_from_chunks_with_context(
-    path: &Path,
+pub async fn unified_diff_from_chunks_with_context(
+    path_abs: &AbsolutePathBuf,
     chunks: &[UpdateFileChunk],
     context: usize,
+    fs: &dyn ExecutorFileSystem,
 ) -> std::result::Result<ApplyPatchFileUpdate, ApplyPatchError> {
     let AppliedPatch {
         original_contents,
         new_contents,
-    } = derive_new_contents_from_chunks(path, chunks)?;
+    } = derive_new_contents_from_chunks(path_abs, chunks, fs).await?;
     let text_diff = TextDiff::from_lines(&original_contents, &new_contents);
     let unified_diff = text_diff.unified_diff().context_radius(context).to_string();
     Ok(ApplyPatchFileUpdate {
@@ -1246,6 +1420,8 @@ pub fn print_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_exec_server::LOCAL_FS;
+    use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
     use std::fs;
     use std::string::ToString;
@@ -1256,8 +1432,26 @@ mod tests {
         format!("*** Begin Patch\n{body}\n*** End Patch")
     }
 
-    #[test]
-    fn test_add_file_hunk_creates_file_with_contents() {
+    fn apply_patch_for_test(
+        patch: &str,
+        cwd: &std::path::Path,
+        stdout: &mut Vec<u8>,
+        stderr: &mut Vec<u8>,
+    ) -> Result<(), ApplyPatchError> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(apply_patch(
+                patch,
+                &AbsolutePathBuf::from_absolute_path(cwd).unwrap(),
+                stdout,
+                stderr,
+            ))
+    }
+
+    #[tokio::test]
+    async fn test_add_file_hunk_creates_file_with_contents() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("add.txt");
         let patch = wrap_patch(&format!(
@@ -1268,7 +1462,14 @@ mod tests {
         ));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(
+            &patch,
+            &AbsolutePathBuf::from_absolute_path(dir.path()).unwrap(),
+            &mut stdout,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
         // Verify expected stdout and stderr outputs.
         let stdout_str = String::from_utf8(stdout).unwrap();
         let stderr_str = String::from_utf8(stderr).unwrap();
@@ -1282,15 +1483,87 @@ mod tests {
         assert_eq!(contents, "ab\ncd\n");
     }
 
-    #[test]
-    fn test_delete_file_hunk_removes_file() {
+    #[tokio::test]
+    async fn test_apply_patch_hunks_accept_relative_and_absolute_paths() {
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().abs();
+        let relative_add = dir.path().join("relative-add.txt");
+        let absolute_add = dir.path().join("absolute-add.txt");
+        let relative_delete = dir.path().join("relative-delete.txt");
+        let absolute_delete = dir.path().join("absolute-delete.txt");
+        let relative_update = dir.path().join("relative-update.txt");
+        let absolute_update = dir.path().join("absolute-update.txt");
+        fs::write(&relative_delete, "delete relative\n").unwrap();
+        fs::write(&absolute_delete, "delete absolute\n").unwrap();
+        fs::write(&relative_update, "relative old\n").unwrap();
+        fs::write(&absolute_update, "absolute old\n").unwrap();
+
+        let patch = wrap_patch(&format!(
+            r#"*** Add File: relative-add.txt
++relative add
+*** Add File: {}
++absolute add
+*** Delete File: relative-delete.txt
+*** Delete File: {}
+*** Update File: relative-update.txt
+@@
+-relative old
++relative new
+*** Update File: {}
+@@
+-absolute old
++absolute new"#,
+            absolute_add.display(),
+            absolute_delete.display(),
+            absolute_update.display(),
+        ));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        apply_patch(&patch, &cwd, &mut stdout, &mut stderr)
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(&relative_add).unwrap(), "relative add\n");
+        assert_eq!(fs::read_to_string(&absolute_add).unwrap(), "absolute add\n");
+        assert!(!relative_delete.exists());
+        assert!(!absolute_delete.exists());
+        assert_eq!(
+            fs::read_to_string(&relative_update).unwrap(),
+            "relative new\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&absolute_update).unwrap(),
+            "absolute new\n"
+        );
+        assert_eq!(String::from_utf8(stderr).unwrap(), "");
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!(
+                "Success. Updated the following files:\nA relative-add.txt\nA {}\nM relative-update.txt\nM {}\nD relative-delete.txt\nD {}\n",
+                absolute_add.display(),
+                absolute_update.display(),
+                absolute_delete.display(),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_file_hunk_removes_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("del.txt");
         fs::write(&path, "x").unwrap();
         let patch = wrap_patch(&format!("*** Delete File: {}", path.display()));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(
+            &patch,
+            &AbsolutePathBuf::from_absolute_path(dir.path()).unwrap(),
+            &mut stdout,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
         let stdout_str = String::from_utf8(stdout).unwrap();
         let stderr_str = String::from_utf8(stderr).unwrap();
         let expected_out = format!(
@@ -1302,8 +1575,8 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[test]
-    fn test_update_file_hunk_modifies_content() {
+    #[tokio::test]
+    async fn test_update_file_hunk_modifies_content() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("update.txt");
         fs::write(&path, "foo\nbar\n").unwrap();
@@ -1317,7 +1590,14 @@ mod tests {
         ));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(
+            &patch,
+            &AbsolutePathBuf::from_absolute_path(dir.path()).unwrap(),
+            &mut stdout,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
         // Validate modified file contents and expected stdout/stderr.
         let stdout_str = String::from_utf8(stdout).unwrap();
         let stderr_str = String::from_utf8(stderr).unwrap();
@@ -1331,8 +1611,8 @@ mod tests {
         assert_eq!(contents, "foo\nbaz\n");
     }
 
-    #[test]
-    fn test_update_file_hunk_can_move_file() {
+    #[tokio::test]
+    async fn test_update_file_hunk_can_move_file() {
         let dir = tempdir().unwrap();
         let src = dir.path().join("src.txt");
         let dest = dir.path().join("dst.txt");
@@ -1348,7 +1628,14 @@ mod tests {
         ));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(
+            &patch,
+            &AbsolutePathBuf::from_absolute_path(dir.path()).unwrap(),
+            &mut stdout,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
         // Validate move semantics and expected stdout/stderr.
         let stdout_str = String::from_utf8(stdout).unwrap();
         let stderr_str = String::from_utf8(stderr).unwrap();
@@ -1365,8 +1652,8 @@ mod tests {
 
     /// Verify that a single `Update File` hunk with multiple change chunks can update different
     /// parts of a file and that the file is listed only once in the summary.
-    #[test]
-    fn test_multiple_update_chunks_apply_to_single_file() {
+    #[tokio::test]
+    async fn test_multiple_update_chunks_apply_to_single_file() {
         // Start with a file containing four lines.
         let dir = tempdir().unwrap();
         let path = dir.path().join("multi.txt");
@@ -1388,7 +1675,14 @@ mod tests {
         ));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(
+            &patch,
+            &AbsolutePathBuf::from_absolute_path(dir.path()).unwrap(),
+            &mut stdout,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
         let stdout_str = String::from_utf8(stdout).unwrap();
         let stderr_str = String::from_utf8(stderr).unwrap();
         let expected_out = format!(
@@ -1405,8 +1699,8 @@ mod tests {
     /// replacements in separate chunks that appear in non‑adjacent parts of the
     /// file.  Verifies that all edits are applied and that the summary lists the
     /// file only once.
-    #[test]
-    fn test_update_file_hunk_interleaved_changes() {
+    #[tokio::test]
+    async fn test_update_file_hunk_interleaved_changes() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("interleaved.txt");
 
@@ -1437,7 +1731,14 @@ mod tests {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(
+            &patch,
+            &AbsolutePathBuf::from_absolute_path(dir.path()).unwrap(),
+            &mut stdout,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
 
         let stdout_str = String::from_utf8(stdout).unwrap();
         let stderr_str = String::from_utf8(stderr).unwrap();
@@ -1453,8 +1754,8 @@ mod tests {
         assert_eq!(contents, "a\nB\nc\nd\nE\nf\ng\n");
     }
 
-    #[test]
-    fn test_pure_addition_chunk_followed_by_removal() {
+    #[tokio::test]
+    async fn test_pure_addition_chunk_followed_by_removal() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("panic.txt");
         fs::write(&path, "line1\nline2\nline3\n").unwrap();
@@ -1472,7 +1773,14 @@ mod tests {
         ));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(
+            &patch,
+            &AbsolutePathBuf::from_absolute_path(dir.path()).unwrap(),
+            &mut stdout,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
         let contents = fs::read_to_string(path).unwrap();
         assert_eq!(
             contents,
@@ -1486,8 +1794,8 @@ mod tests {
     /// internal matcher failed requiring an exact byte-for-byte match.  The
     /// fuzzy-matching pass that normalises common punctuation should now bridge
     /// the gap.
-    #[test]
-    fn test_update_line_with_unicode_dash() {
+    #[tokio::test]
+    async fn test_update_line_with_unicode_dash() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("unicode.py");
 
@@ -1506,7 +1814,14 @@ mod tests {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(
+            &patch,
+            &AbsolutePathBuf::from_absolute_path(dir.path()).unwrap(),
+            &mut stdout,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
 
         // File should now contain the replaced comment.
         let expected = "import asyncio  # HELLO\n";
@@ -1525,8 +1840,8 @@ mod tests {
         assert_eq!(String::from_utf8(stderr).unwrap(), "");
     }
 
-    #[test]
-    fn test_unified_diff() {
+    #[tokio::test]
+    async fn test_unified_diff() {
         // Start with a file containing four lines.
         let dir = tempdir().unwrap();
         let path = dir.path().join("multi.txt");
@@ -1549,7 +1864,10 @@ mod tests {
             [Hunk::UpdateFile { chunks, .. }] => chunks,
             _ => panic!("Expected a single UpdateFile hunk"),
         };
-        let diff = unified_diff_from_chunks(&path, update_file_chunks).unwrap();
+        let path_abs = path.as_path().abs();
+        let diff = unified_diff_from_chunks(&path_abs, update_file_chunks, LOCAL_FS.as_ref())
+            .await
+            .unwrap();
         let expected_diff = r#"@@ -1,4 +1,4 @@
  foo
 -bar
@@ -1565,8 +1883,8 @@ mod tests {
         assert_eq!(expected, diff);
     }
 
-    #[test]
-    fn test_unified_diff_first_line_replacement() {
+    #[tokio::test]
+    async fn test_unified_diff_first_line_replacement() {
         // Replace the very first line of the file.
         let dir = tempdir().unwrap();
         let path = dir.path().join("first.txt");
@@ -1588,7 +1906,10 @@ mod tests {
             _ => panic!("Expected a single UpdateFile hunk"),
         };
 
-        let diff = unified_diff_from_chunks(&path, chunks).unwrap();
+        let path_abs = path.as_path().abs();
+        let diff = unified_diff_from_chunks(&path_abs, chunks, LOCAL_FS.as_ref())
+            .await
+            .unwrap();
         let expected_diff = r#"@@ -1,2 +1,2 @@
 -foo
 +FOO
@@ -1601,8 +1922,8 @@ mod tests {
         assert_eq!(expected, diff);
     }
 
-    #[test]
-    fn test_unified_diff_last_line_replacement() {
+    #[tokio::test]
+    async fn test_unified_diff_last_line_replacement() {
         // Replace the very last line of the file.
         let dir = tempdir().unwrap();
         let path = dir.path().join("last.txt");
@@ -1625,7 +1946,10 @@ mod tests {
             _ => panic!("Expected a single UpdateFile hunk"),
         };
 
-        let diff = unified_diff_from_chunks(&path, chunks).unwrap();
+        let path_abs = path.as_path().abs();
+        let diff = unified_diff_from_chunks(&path_abs, chunks, LOCAL_FS.as_ref())
+            .await
+            .unwrap();
         let expected_diff = r#"@@ -2,2 +2,2 @@
  bar
 -baz
@@ -1638,8 +1962,8 @@ mod tests {
         assert_eq!(expected, diff);
     }
 
-    #[test]
-    fn test_unified_diff_insert_at_eof() {
+    #[tokio::test]
+    async fn test_unified_diff_insert_at_eof() {
         // Insert a new line at end‑of‑file.
         let dir = tempdir().unwrap();
         let path = dir.path().join("insert.txt");
@@ -1660,7 +1984,10 @@ mod tests {
             _ => panic!("Expected a single UpdateFile hunk"),
         };
 
-        let diff = unified_diff_from_chunks(&path, chunks).unwrap();
+        let path_abs = path.as_path().abs();
+        let diff = unified_diff_from_chunks(&path_abs, chunks, LOCAL_FS.as_ref())
+            .await
+            .unwrap();
         let expected_diff = r#"@@ -3 +3,2 @@
  baz
 +quux
@@ -1672,8 +1999,8 @@ mod tests {
         assert_eq!(expected, diff);
     }
 
-    #[test]
-    fn test_unified_diff_interleaved_changes() {
+    #[tokio::test]
+    async fn test_unified_diff_interleaved_changes() {
         // Original file with six lines.
         let dir = tempdir().unwrap();
         let path = dir.path().join("interleaved.txt");
@@ -1706,7 +2033,10 @@ mod tests {
             _ => panic!("Expected a single UpdateFile hunk"),
         };
 
-        let diff = unified_diff_from_chunks(&path, chunks).unwrap();
+        let path_abs = path.as_path().abs();
+        let diff = unified_diff_from_chunks(&path_abs, chunks, LOCAL_FS.as_ref())
+            .await
+            .unwrap();
 
         let expected_diff = r#"@@ -1,6 +1,7 @@
  a
@@ -1729,7 +2059,14 @@ mod tests {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch(
+            &patch,
+            &AbsolutePathBuf::from_absolute_path(dir.path()).unwrap(),
+            &mut stdout,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
         let contents = fs::read_to_string(path).unwrap();
         assert_eq!(
             contents,
@@ -1744,8 +2081,8 @@ g
         );
     }
 
-    #[test]
-    fn test_apply_patch_fails_on_write_error() {
+    #[tokio::test]
+    async fn test_apply_patch_fails_on_write_error() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("readonly.txt");
         fs::write(
@@ -1768,7 +2105,13 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let result = apply_patch(&patch, &mut stdout, &mut stderr);
+        let result = apply_patch(
+            &patch,
+            &AbsolutePathBuf::from_absolute_path(dir.path()).unwrap(),
+            &mut stdout,
+            &mut stderr,
+        )
+        .await;
         assert!(result.is_err());
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -1823,7 +2166,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let result = apply_patch(&patch, &mut stdout, &mut stderr);
+        let result = apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr);
 
         fs::set_permissions(&source_dir, fs::Permissions::from_mode(original_mode)).unwrap();
 
@@ -1859,7 +2202,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr).unwrap();
 
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -1893,7 +2236,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr).unwrap();
 
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -1931,7 +2274,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr).unwrap();
 
         assert!(!source_path.exists());
         assert_eq!(
@@ -1966,7 +2309,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr).unwrap();
 
         assert!(
             fs::symlink_metadata(&link_path)
@@ -2006,7 +2349,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr).unwrap();
 
         assert_eq!(
             fs::read_to_string(&original_path).unwrap(),
@@ -2068,7 +2411,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let result = apply_patch(&patch, &mut stdout, &mut stderr);
+        let result = apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr);
 
         fs::set_permissions(&source_dir, fs::Permissions::from_mode(original_mode)).unwrap();
 
@@ -2143,7 +2486,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let result = apply_patch(&patch, &mut stdout, &mut stderr);
+        let result = apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr);
 
         assert!(result.is_err());
         assert_eq!(
@@ -2190,7 +2533,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let result = apply_patch(&patch, &mut stdout, &mut stderr);
+        let result = apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr);
 
         assert!(result.is_err());
         assert_eq!(
@@ -2262,7 +2605,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr).unwrap();
 
         let patched_mode = fs::metadata(&patch_path).unwrap().permissions().mode() & 0o7777;
         assert_eq!(patched_mode, baseline_mode);
@@ -2287,7 +2630,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr).unwrap();
 
         assert!(matches!(
             fs::symlink_metadata(&path).map_err(|err| err.kind()),
@@ -2337,7 +2680,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let result = apply_patch(&patch, &mut stdout, &mut stderr);
+        let result = apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr);
 
         assert!(result.is_err());
         assert_eq!(
@@ -2360,7 +2703,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr).unwrap();
 
         assert!(!path.exists());
         assert_eq!(String::from_utf8(stderr).unwrap(), "");
@@ -2379,7 +2722,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr).unwrap();
 
         assert_eq!(
             fs::read(&path).unwrap(),
@@ -2413,7 +2756,7 @@ g
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        apply_patch(&patch, &mut stdout, &mut stderr).unwrap();
+        apply_patch_for_test(&patch, dir.path(), &mut stdout, &mut stderr).unwrap();
 
         assert!(!source_path.exists());
         assert_eq!(

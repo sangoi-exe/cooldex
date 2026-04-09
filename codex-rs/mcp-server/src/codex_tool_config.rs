@@ -17,6 +17,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// Merge-safety anchor: this MCP callsite is only a follower bridge from flat tool input strings
+// into the CLI-owned `ConfigOverrides` nested-option contract; do not widen MCP-local semantics
+// here for CLI-only workspace changes.
+
 /// Client-supplied configuration for a `codex` tool-call.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "kebab-case")]

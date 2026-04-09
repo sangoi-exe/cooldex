@@ -5,6 +5,7 @@ use crate::app_event::AppEvent;
 use crate::app_event::ChatGptAddAccountOutcome;
 use crate::app_event::ExitMode;
 use crate::app_event::FeedbackCategory;
+use crate::app_event::RateLimitRefreshOrigin;
 use crate::app_event::RealtimeAudioDeviceKind;
 #[cfg(target_os = "windows")]
 use crate::app_event::WindowsSandboxEnableMode;
@@ -48,6 +49,7 @@ use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
 use crate::resume_history::apply_resume_history_mode;
 use crate::resume_picker::SessionSelection;
+use crate::status::StatusAccountDisplay;
 #[cfg(test)]
 use crate::test_support::PathBufExt;
 use crate::tui;
@@ -115,6 +117,7 @@ use codex_models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT
 use codex_models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
+use codex_protocol::account::PlanType;
 use codex_protocol::approvals::ExecApprovalRequestEvent;
 use codex_protocol::config_types::Personality;
 #[cfg(target_os = "windows")]
@@ -1276,7 +1279,7 @@ fn normalize_harness_overrides_for_cwd(
 
     let mut normalized = Vec::with_capacity(overrides.additional_writable_roots.len());
     for root in overrides.additional_writable_roots.drain(..) {
-        let absolute = AbsolutePathBuf::resolve_path_against_base(root, base_cwd)?;
+        let absolute = AbsolutePathBuf::resolve_path_against_base(root, base_cwd);
         normalized.push(absolute.into_path_buf());
     }
     overrides.additional_writable_roots = normalized;
@@ -1909,6 +1912,79 @@ impl App {
         }
     }
 
+    fn sync_chat_widget_account_state_from_auth_manager(&mut self) {
+        match self.auth_manager.get_auth_mode() {
+            Some(AuthMode::ApiKey) => {
+                self.apply_chat_widget_account_state(
+                    Some(StatusAccountDisplay::ApiKey),
+                    None,
+                    false,
+                );
+            }
+            Some(AuthMode::Chatgpt) | Some(AuthMode::ChatgptAuthTokens) => {
+                let accounts = self.auth_manager.list_accounts();
+                let status_account_display =
+                    accounts
+                        .iter()
+                        .find(|account| account.is_active)
+                        .map(|account| StatusAccountDisplay::ChatGpt {
+                            label: account.label.clone(),
+                            email: account.email.clone(),
+                            plan: None,
+                        });
+                self.apply_chat_widget_account_state(
+                    status_account_display,
+                    None,
+                    !accounts.is_empty(),
+                );
+            }
+            None => {
+                self.apply_chat_widget_account_state(None, None, false);
+            }
+        }
+    }
+
+    // Merge-safety anchor: account-switch handling must keep chat-widget account identity and
+    // rate-limit generation state in sync so stale refresh results never repopulate the next
+    // account's `/status` cache or suppress its warnings.
+    fn handle_active_account_changed(&mut self) {
+        self.sync_chat_widget_account_state_from_auth_manager();
+    }
+
+    fn handle_app_server_account_updated(
+        &mut self,
+        status_account_display: Option<StatusAccountDisplay>,
+        plan_type: Option<PlanType>,
+        has_chatgpt_account: bool,
+    ) {
+        self.apply_chat_widget_account_state(
+            status_account_display,
+            plan_type,
+            has_chatgpt_account,
+        );
+    }
+
+    fn apply_chat_widget_account_state(
+        &mut self,
+        status_account_display: Option<StatusAccountDisplay>,
+        plan_type: Option<PlanType>,
+        has_chatgpt_account: bool,
+    ) {
+        let next_status_account_display = status_account_display.clone();
+        let next_plan_type = plan_type.clone();
+        self.chat_widget.update_account_state(
+            next_status_account_display,
+            next_plan_type,
+            has_chatgpt_account,
+        );
+        self.chat_widget.on_active_account_changed();
+        self.chat_widget.update_account_state(
+            status_account_display,
+            plan_type,
+            has_chatgpt_account,
+        );
+    }
+
     fn clear_ui_header_lines_with_version(
         &self,
         width: u16,
@@ -2382,15 +2458,74 @@ impl App {
         });
     }
 
-    fn refresh_rate_limits(&mut self, app_server: &AppServerSession, request_id: u64) {
+    /// Spawns a background task to fetch account rate limits and deliver the
+    /// result as a `RateLimitsLoaded` event.
+    ///
+    /// The `origin` is forwarded to the completion handler so it can distinguish
+    /// a startup prefetch (which only updates cached snapshots and schedules a
+    /// frame) from a `/status`-triggered refresh (which must finalize the
+    /// corresponding status card).
+    fn refresh_rate_limits(
+        &mut self,
+        app_server: &AppServerSession,
+        origin: RateLimitRefreshOrigin,
+        account_generation: u64,
+    ) {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
             let result = fetch_account_rate_limits(request_handle)
                 .await
                 .map_err(|err| err.to_string());
-            app_event_tx.send(AppEvent::RateLimitsLoaded { request_id, result });
+            app_event_tx.send(AppEvent::RateLimitsLoaded {
+                origin,
+                account_generation,
+                result,
+            });
         });
+    }
+
+    fn handle_rate_limits_loaded(
+        &mut self,
+        origin: RateLimitRefreshOrigin,
+        account_generation: u64,
+        result: Result<Vec<RateLimitSnapshot>, String>,
+    ) -> bool {
+        if account_generation != self.chat_widget.rate_limit_account_generation() {
+            if let RateLimitRefreshOrigin::StatusCommand { request_id } = origin {
+                self.chat_widget
+                    .finish_status_rate_limit_refresh_without_change(request_id);
+            }
+            return matches!(origin, RateLimitRefreshOrigin::StartupPrefetch);
+        }
+
+        match result {
+            Ok(snapshots) => {
+                let refresh_returned_no_limits = snapshots.is_empty();
+                self.chat_widget.replace_rate_limit_snapshots(snapshots);
+                match origin {
+                    RateLimitRefreshOrigin::StartupPrefetch => true,
+                    RateLimitRefreshOrigin::StatusCommand { request_id } => {
+                        if refresh_returned_no_limits {
+                            self.chat_widget
+                                .finish_status_rate_limit_refresh_as_unavailable(request_id);
+                        } else {
+                            self.chat_widget
+                                .finish_status_rate_limit_refresh(request_id);
+                        }
+                        false
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!("account/rateLimits/read failed during TUI refresh: {err}");
+                if let RateLimitRefreshOrigin::StatusCommand { request_id } = origin {
+                    self.chat_widget
+                        .finish_status_rate_limit_refresh(request_id);
+                }
+                matches!(origin, RateLimitRefreshOrigin::StartupPrefetch)
+            }
+        }
     }
 
     fn fetch_plugins_list(&mut self, app_server: &AppServerSession, cwd: PathBuf) {
@@ -4331,9 +4466,9 @@ impl App {
         let feedback_audience = bootstrap.feedback_audience;
         let auth_mode = bootstrap.auth_mode;
         let has_chatgpt_account = bootstrap.has_chatgpt_account;
+        let requires_openai_auth = bootstrap.requires_openai_auth;
         let status_account_display = bootstrap.status_account_display.clone();
         let initial_plan_type = bootstrap.plan_type;
-        let startup_rate_limit_snapshots = bootstrap.rate_limit_snapshots;
         let session_telemetry = SessionTelemetry::new(
             ThreadId::new(),
             model.as_str(),
@@ -4475,9 +4610,6 @@ impl App {
             }
         };
 
-        for snapshot in startup_rate_limit_snapshots {
-            chat_widget.on_rate_limit_snapshot(Some(snapshot));
-        }
         chat_widget
             .maybe_prompt_windows_sandbox_enable(should_prompt_windows_sandbox_nux_at_startup);
 
@@ -4583,6 +4715,15 @@ impl App {
         tokio::pin!(tui_events);
 
         tui.frame_requester().schedule_frame();
+        // Kick off a non-blocking rate-limit prefetch so the first `/status`
+        // already has data, without delaying the initial frame render.
+        if requires_openai_auth && has_chatgpt_account {
+            app.refresh_rate_limits(
+                &app_server,
+                RateLimitRefreshOrigin::StartupPrefetch,
+                app.chat_widget.rate_limit_account_generation(),
+            );
+        }
 
         let mut listen_for_app_server_events = true;
         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
@@ -5214,23 +5355,21 @@ impl App {
             AppEvent::FileSearchResult { query, matches } => {
                 self.chat_widget.apply_file_search_result(query, matches);
             }
-            AppEvent::RefreshRateLimits { request_id } => {
-                self.refresh_rate_limits(app_server, request_id);
+            AppEvent::RefreshRateLimits {
+                origin,
+                account_generation,
+            } => {
+                self.refresh_rate_limits(app_server, origin, account_generation);
             }
-            AppEvent::RateLimitsLoaded { request_id, result } => match result {
-                Ok(snapshots) => {
-                    for snapshot in snapshots {
-                        self.chat_widget.on_rate_limit_snapshot(Some(snapshot));
-                    }
-                    self.chat_widget
-                        .finish_status_rate_limit_refresh(request_id);
+            AppEvent::RateLimitsLoaded {
+                origin,
+                account_generation,
+                result,
+            } => {
+                if self.handle_rate_limits_loaded(origin, account_generation, result) {
+                    tui.frame_requester().schedule_frame();
                 }
-                Err(err) => {
-                    tracing::warn!("account/rateLimits/read failed during TUI refresh: {err}");
-                    self.chat_widget
-                        .finish_status_rate_limit_refresh(request_id);
-                }
-            },
+            }
             AppEvent::ConnectorsLoaded { result, is_final } => {
                 self.chat_widget.on_connectors_loaded(result, is_final);
             }
@@ -5296,7 +5435,7 @@ impl App {
                             Utc::now(),
                             /*allow_fallback_timestamp_initialization*/ true,
                         );
-                        self.chat_widget.on_active_account_changed();
+                        self.handle_active_account_changed();
                         self.chat_widget.add_info_message(
                             format!("Active account: {display}"),
                             /*hint*/ None,
@@ -5339,7 +5478,7 @@ impl App {
                         } else {
                             let accounts_after = self.auth_manager.list_accounts();
                             if accounts_after.is_empty() {
-                                self.chat_widget.on_active_account_changed();
+                                self.handle_active_account_changed();
                                 self.chat_widget.add_info_message(
                                     format!(
                                         "Removed account: {removed_display}. You are now logged out."
@@ -5358,7 +5497,7 @@ impl App {
                                         )
                                     })
                                     .unwrap_or_else(|| "<unknown>".to_string());
-                                self.chat_widget.on_active_account_changed();
+                                self.handle_active_account_changed();
                                 self.chat_widget.add_info_message(
                                     format!(
                                         "Removed account: {removed_display}. Active account: {active_display}"
@@ -5485,7 +5624,7 @@ impl App {
                         /*force*/ true, /*open_popup_when_ready*/ false,
                         /*show_loading_popup*/ false,
                     );
-                    self.chat_widget.on_active_account_changed();
+                    self.handle_active_account_changed();
                     if let Some(display) = active_account_display {
                         self.chat_widget.add_info_message(
                             format!("Active account: {display}"),
@@ -7285,6 +7424,7 @@ mod tests {
     use crate::chatwidget::create_initial_user_message;
     use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
     use crate::chatwidget::tests::set_chatgpt_auth;
+    use crate::chatwidget::tests::set_fast_mode_test_catalog;
     use crate::file_search::FileSearchManager;
     use crate::history_cell::AgentMessageCell;
     use crate::history_cell::HistoryCell;
@@ -7352,6 +7492,7 @@ mod tests {
     use codex_login::token_data::parse_chatgpt_jwt_claims;
     use codex_otel::SessionTelemetry;
     use codex_protocol::ThreadId;
+    use codex_protocol::account::PlanType;
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::CollaborationModeMask;
     use codex_protocol::config_types::ModeKind;
@@ -7669,6 +7810,117 @@ mod tests {
         assert_eq!(
             app.accounts_status_cache_last_updated_at,
             Some(refreshed_at)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_rate_limit_refresh_result_is_ignored_after_account_change() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        app.chat_widget.on_active_account_changed();
+
+        let stale_generation = app.chat_widget.rate_limit_account_generation() - 1;
+        let snapshot = RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 88.0,
+                window_minutes: Some(60),
+                resets_at: None,
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: None,
+        };
+
+        let should_schedule_frame = app.handle_rate_limits_loaded(
+            RateLimitRefreshOrigin::StartupPrefetch,
+            stale_generation,
+            Ok(vec![snapshot]),
+        );
+
+        assert!(should_schedule_frame);
+        assert_eq!(app.chat_widget.rate_limit_snapshot_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn handle_active_account_changed_syncs_chat_widget_account_state() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        app.chat_widget.update_account_state(
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some("Stale".to_string()),
+                email: Some("stale@example.com".to_string()),
+                plan: Some("Pro".to_string()),
+            }),
+            Some(PlanType::Pro),
+            true,
+        );
+        seed_chatgpt_accounts(&mut app, "account-b");
+
+        app.handle_active_account_changed();
+
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: None,
+            }) if label == "Secondary" && email == "secondary@example.com"
+        ));
+        assert_eq!(app.chat_widget.current_plan_type(), None);
+        assert!(app.chat_widget.has_chatgpt_account());
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Ok(AppEvent::RefreshRateLimits {
+                origin: RateLimitRefreshOrigin::StartupPrefetch,
+                account_generation: 1,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_app_server_account_updated_invalidates_rate_limit_state() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        app.chat_widget
+            .on_rate_limit_snapshot(Some(RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 55.0,
+                    window_minutes: Some(60),
+                    resets_at: None,
+                }),
+                secondary: None,
+                credits: None,
+                plan_type: None,
+            }));
+
+        app.handle_app_server_account_updated(
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some("Server Account".to_string()),
+                email: None,
+                plan: Some("Plus".to_string()),
+            }),
+            Some(PlanType::Plus),
+            true,
+        );
+
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: None,
+                plan: Some(plan),
+            }) if label == "Server Account" && plan == "Plus"
+        ));
+        assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
+        assert_eq!(app.chat_widget.rate_limit_snapshot_count(), 0);
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Ok(AppEvent::RefreshRateLimits {
+                origin: RateLimitRefreshOrigin::StartupPrefetch,
+                account_generation: 1,
+            })
         );
     }
 
@@ -11176,15 +11428,17 @@ guardian_approval = true
         target_os = "windows",
         ignore = "snapshot path rendering differs on Windows"
     )]
-    async fn clear_ui_header_shows_fast_status_only_for_gpt54() {
+    async fn clear_ui_header_shows_fast_status_for_fast_capable_models() {
         let mut app = make_test_app().await;
         app.config.cwd = PathBuf::from("/tmp/project").abs();
         app.chat_widget.set_model("gpt-5.4");
+        set_fast_mode_test_catalog(&mut app.chat_widget);
         app.chat_widget
             .set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
         app.chat_widget
             .set_service_tier(Some(codex_protocol::config_types::ServiceTier::Fast));
         set_chatgpt_auth(&mut app.chat_widget);
+        set_fast_mode_test_catalog(&mut app.chat_widget);
 
         let rendered = app
             .clear_ui_header_lines_with_version(/*width*/ 80, "<VERSION>")
@@ -11198,7 +11452,7 @@ guardian_approval = true
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert_snapshot!("clear_ui_header_fast_status_gpt54_only", rendered);
+        assert_snapshot!("clear_ui_header_fast_status_fast_capable_models", rendered);
     }
 
     async fn make_test_app() -> App {
@@ -11379,6 +11633,67 @@ guardian_approval = true
                     last_seen_at: Some(Utc::now()),
                 }),
             }],
+            ..AuthStore::default()
+        };
+        save_auth(
+            &app.config.codex_home,
+            &store,
+            app.config.cli_auth_credentials_store_mode,
+        )
+        .expect("save auth store");
+        app.auth_manager = Arc::new(AuthManager::new(
+            app.config.codex_home.clone(),
+            false,
+            app.config.cli_auth_credentials_store_mode,
+        ));
+        app.auth_manager
+            .reload_strict()
+            .expect("reload seeded auth store");
+    }
+
+    fn fake_chatgpt_jwt(email: &str, account_id: &str, plan_type: &str) -> String {
+        let header = serde_json::json!({"alg":"none","typ":"JWT"});
+        let payload = serde_json::json!({
+            "email": email,
+            "email_verified": true,
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": plan_type,
+                "chatgpt_user_id": format!("user-{account_id}"),
+                "user_id": format!("user-{account_id}"),
+                "chatgpt_account_id": account_id,
+            }
+        });
+        format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(header.to_string()),
+            URL_SAFE_NO_PAD.encode(payload.to_string()),
+            URL_SAFE_NO_PAD.encode("sig"),
+        )
+    }
+
+    fn chatgpt_account(id: &str, email: &str, label: Option<&str>) -> StoredAccount {
+        StoredAccount {
+            id: id.to_string(),
+            label: label.map(str::to_string),
+            tokens: TokenData {
+                id_token: parse_chatgpt_jwt_claims(&fake_chatgpt_jwt(email, id, "pro"))
+                    .expect("valid jwt"),
+                access_token: "Access Token".to_string(),
+                refresh_token: "test".to_string(),
+                account_id: Some(id.to_string()),
+            },
+            last_refresh: Some(Utc::now()),
+            usage: None,
+        }
+    }
+
+    fn seed_chatgpt_accounts(app: &mut App, active_account_id: &str) {
+        let store = AuthStore {
+            active_account_id: Some(active_account_id.to_string()),
+            accounts: vec![
+                chatgpt_account("account-a", "primary@example.com", Some("Primary")),
+                chatgpt_account("account-b", "secondary@example.com", Some("Secondary")),
+            ],
             ..AuthStore::default()
         };
         save_auth(

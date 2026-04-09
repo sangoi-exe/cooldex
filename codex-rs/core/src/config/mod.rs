@@ -254,7 +254,7 @@ pub struct Config {
     pub user_instructions: Option<String>,
 
     /// Base instructions override.
-    pub base_instructions: Option<Option<String>>,
+    pub base_instructions: Option<String>,
 
     /// Base instructions override for sub-agent threads spawned via the collab
     /// `spawn_agent` tool.
@@ -262,10 +262,6 @@ pub struct Config {
 
     /// Developer instructions override injected as a separate message.
     pub developer_instructions: Option<String>,
-
-    /// Explicit developer instructions override, preserving `null` as distinct
-    /// from a missing override.
-    pub developer_instructions_override: Option<Option<String>>,
 
     /// Guardian-specific developer instructions override from requirements.toml.
     pub guardian_developer_instructions: Option<String>,
@@ -731,7 +727,7 @@ impl Config {
             model_context_window: self.model_context_window,
             model_auto_compact_token_limit: self.model_auto_compact_token_limit,
             tool_output_token_limit: self.tool_output_token_limit,
-            base_instructions: self.base_instructions.clone().flatten(),
+            base_instructions: self.base_instructions.clone(),
             personality_enabled: self.features.enabled(Feature::Personality),
             model_supports_reasoning_summaries: self.model_supports_reasoning_summaries,
             model_catalog: self.model_catalog.clone(),
@@ -1528,7 +1524,7 @@ impl Config {
         let mut additional_writable_roots: Vec<AbsolutePathBuf> = additional_writable_roots
             .into_iter()
             .map(|path| AbsolutePathBuf::resolve_path_against_base(path, resolved_cwd.as_path()))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
         let active_project = cfg
             .get_active_project(resolved_cwd.as_path())
             .unwrap_or(ProjectConfig { trust_level: None });
@@ -1892,10 +1888,14 @@ impl Config {
             .or(cfg.model_instructions_file.as_ref());
         let file_base_instructions =
             Self::try_read_non_empty_file(model_instructions_path, "model instructions file")?;
-        let base_instructions = base_instructions.or_else(|| file_base_instructions.map(Some));
-        let developer_instructions_override = developer_instructions.clone();
-        let developer_instructions =
-            developer_instructions.unwrap_or_else(|| cfg.developer_instructions.clone());
+        let base_instructions = match base_instructions {
+            Some(base_instructions) => base_instructions,
+            None => file_base_instructions,
+        };
+        let developer_instructions = match developer_instructions {
+            Some(developer_instructions) => developer_instructions,
+            None => cfg.developer_instructions.clone(),
+        };
         let subagent_instructions_path = config_profile
             .subagent_instructions_file
             .as_ref()
@@ -2092,7 +2092,6 @@ impl Config {
             subagent_base_instructions,
             personality,
             developer_instructions,
-            developer_instructions_override,
             compact_prompt,
             pos_compact_instructions,
             commit_attribution,

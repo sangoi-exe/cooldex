@@ -47,6 +47,7 @@ use codex_app_server_protocol::ThreadRealtimeAppendTextParams;
 use codex_app_server_protocol::ThreadRealtimeAppendTextResponse;
 use codex_app_server_protocol::ThreadRealtimeStartParams;
 use codex_app_server_protocol::ThreadRealtimeStartResponse;
+use codex_app_server_protocol::ThreadRealtimeStartTransport;
 use codex_app_server_protocol::ThreadRealtimeStopParams;
 use codex_app_server_protocol::ThreadRealtimeStopResponse;
 use codex_app_server_protocol::ThreadResumeParams;
@@ -81,6 +82,7 @@ use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::ConversationStartParams;
+use codex_protocol::protocol::ConversationStartTransport;
 use codex_protocol::protocol::ConversationTextParams;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::RateLimitSnapshot;
@@ -95,17 +97,25 @@ use color_eyre::eyre::WrapErr;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Data collected during the TUI bootstrap phase that the main event loop
+/// needs to configure the UI, telemetry, and initial rate-limit prefetch.
+///
+/// Rate-limit snapshots are intentionally **not** included here; they are
+/// fetched asynchronously after bootstrap returns so that the TUI can render
+/// its first frame without waiting for the rate-limit round-trip.
 pub(crate) struct AppServerBootstrap {
-    pub(crate) account_auth_mode: Option<AuthMode>,
     pub(crate) account_email: Option<String>,
     pub(crate) auth_mode: Option<TelemetryAuthMode>,
     pub(crate) status_account_display: Option<StatusAccountDisplay>,
     pub(crate) plan_type: Option<codex_protocol::account::PlanType>,
+    /// Whether the configured model provider needs OpenAI-style auth. Combined
+    /// with `has_chatgpt_account` to decide if a startup rate-limit prefetch
+    /// should be fired.
+    pub(crate) requires_openai_auth: bool,
     pub(crate) default_model: String,
     pub(crate) feedback_audience: FeedbackAudience,
     pub(crate) has_chatgpt_account: bool,
     pub(crate) available_models: Vec<ModelPreset>,
-    pub(crate) rate_limit_snapshots: Vec<RateLimitSnapshot>,
 }
 
 pub(crate) struct AppServerSession {
@@ -177,17 +187,7 @@ impl AppServerSession {
     }
 
     pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
-        let account_request_id = self.next_request_id();
-        let account: GetAccountResponse = self
-            .client
-            .request_typed(ClientRequest::GetAccount {
-                request_id: account_request_id,
-                params: GetAccountParams {
-                    refresh_token: false,
-                },
-            })
-            .await
-            .wrap_err("account/read failed during TUI bootstrap")?;
+        let account = self.read_account().await?;
         let model_request_id = self.next_request_id();
         let models: ModelListResponse = self
             .client
@@ -219,7 +219,6 @@ impl AppServerSession {
             .wrap_err("model/list returned no models for TUI bootstrap")?;
 
         let (
-            account_auth_mode,
             account_email,
             auth_mode,
             status_account_display,
@@ -228,7 +227,6 @@ impl AppServerSession {
             has_chatgpt_account,
         ) = match account.account {
             Some(Account::ApiKey {}) => (
-                Some(AuthMode::ApiKey),
                 None,
                 Some(TelemetryAuthMode::ApiKey),
                 Some(StatusAccountDisplay::ApiKey),
@@ -247,7 +245,6 @@ impl AppServerSession {
                     FeedbackAudience::External
                 };
                 (
-                    Some(AuthMode::Chatgpt),
                     Some(email.clone()),
                     Some(TelemetryAuthMode::Chatgpt),
                     Some(StatusAccountDisplay::ChatGpt {
@@ -260,48 +257,36 @@ impl AppServerSession {
                     true,
                 )
             }
-            None => (
-                None,
-                None,
-                None,
-                None,
-                None,
-                FeedbackAudience::External,
-                false,
-            ),
+            None => (None, None, None, None, FeedbackAudience::External, false),
         };
-        let rate_limit_snapshots = if account.requires_openai_auth && has_chatgpt_account {
-            let rate_limit_request_id = self.next_request_id();
-            match self
-                .client
-                .request_typed(ClientRequest::GetAccountRateLimits {
-                    request_id: rate_limit_request_id,
-                    params: None,
-                })
-                .await
-            {
-                Ok(rate_limits) => app_server_rate_limit_snapshots_to_core(rate_limits),
-                Err(err) => {
-                    tracing::warn!("account/rateLimits/read failed during TUI bootstrap: {err}");
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
-
         Ok(AppServerBootstrap {
-            account_auth_mode,
             account_email,
             auth_mode,
             status_account_display,
             plan_type,
+            requires_openai_auth: account.requires_openai_auth,
             default_model,
             feedback_audience,
             has_chatgpt_account,
             available_models,
-            rate_limit_snapshots,
         })
+    }
+
+    /// Fetches the current account info without refreshing the auth token.
+    ///
+    /// Used by both `bootstrap` (to populate the initial UI) and `get_login_status`
+    /// (to check auth mode without the overhead of a full bootstrap).
+    pub(crate) async fn read_account(&mut self) -> Result<GetAccountResponse> {
+        let account_request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::GetAccount {
+                request_id: account_request_id,
+                params: GetAccountParams {
+                    refresh_token: false,
+                },
+            })
+            .await
+            .wrap_err("account/read failed during TUI bootstrap")
     }
 
     pub(crate) async fn next_event(&mut self) -> Option<AppServerEvent> {
@@ -671,6 +656,14 @@ impl AppServerSession {
                     thread_id: thread_id.to_string(),
                     prompt: params.prompt,
                     session_id: params.session_id,
+                    transport: params.transport.map(|transport| match transport {
+                        ConversationStartTransport::Websocket => {
+                            ThreadRealtimeStartTransport::Websocket
+                        }
+                        ConversationStartTransport::Webrtc { sdp } => {
+                            ThreadRealtimeStartTransport::Webrtc { sdp }
+                        }
+                    }),
                 },
             })
             .await
@@ -824,6 +817,7 @@ fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
             })
             .collect(),
         supports_personality: model.supports_personality,
+        additional_speed_tiers: model.additional_speed_tiers,
         is_default: model.is_default,
         upgrade,
         show_in_picker: !model.hidden,
@@ -881,6 +875,12 @@ fn thread_config_path_from_config(
     }
 }
 
+fn thread_instruction_override_from_config(
+    instructions: &Option<String>,
+) -> Option<Option<String>> {
+    instructions.clone().map(Some)
+}
+
 fn thread_start_params_from_config(
     config: &Config,
     thread_params_mode: ThreadParamsMode,
@@ -895,8 +895,10 @@ fn thread_start_params_from_config(
         approvals_reviewer: approvals_reviewer_override_from_config(config),
         sandbox: sandbox_mode_from_policy(config.permissions.sandbox_policy.get().clone()),
         config: config_request_overrides_from_config(config),
-        base_instructions: config.base_instructions.clone(),
-        developer_instructions: Some(config.developer_instructions.clone()),
+        base_instructions: thread_instruction_override_from_config(&config.base_instructions),
+        developer_instructions: thread_instruction_override_from_config(
+            &config.developer_instructions,
+        ),
         ephemeral: Some(config.ephemeral),
         persist_extended_history: true,
         ..ThreadStartParams::default()
@@ -919,8 +921,10 @@ fn thread_resume_params_from_config(
         approvals_reviewer: approvals_reviewer_override_from_config(&config),
         sandbox: sandbox_mode_from_policy(config.permissions.sandbox_policy.get().clone()),
         config: config_request_overrides_from_config(&config),
-        base_instructions: config.base_instructions.clone(),
-        developer_instructions: Some(config.developer_instructions.clone()),
+        base_instructions: thread_instruction_override_from_config(&config.base_instructions),
+        developer_instructions: thread_instruction_override_from_config(
+            &config.developer_instructions,
+        ),
         persist_extended_history: true,
         ..ThreadResumeParams::default()
     }
@@ -942,8 +946,10 @@ fn thread_fork_params_from_config(
         approvals_reviewer: approvals_reviewer_override_from_config(&config),
         sandbox: sandbox_mode_from_policy(config.permissions.sandbox_policy.get().clone()),
         config: config_request_overrides_from_config(&config),
-        base_instructions: config.base_instructions.clone(),
-        developer_instructions: Some(config.developer_instructions.clone()),
+        base_instructions: thread_instruction_override_from_config(&config.base_instructions),
+        developer_instructions: thread_instruction_override_from_config(
+            &config.developer_instructions,
+        ),
         ephemeral: config.ephemeral,
         persist_extended_history: true,
         ..ThreadForkParams::default()
@@ -1271,7 +1277,7 @@ mod tests {
     async fn thread_start_params_forward_instruction_overrides_for_embedded_sessions() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let mut config = build_config(&temp_dir).await;
-        config.base_instructions = Some(Some("embedded base".to_string()));
+        config.base_instructions = Some("embedded base".to_string());
         config.developer_instructions = Some("embedded developer".to_string());
 
         let params = thread_start_params_from_config(
@@ -1280,7 +1286,10 @@ mod tests {
             /*remote_cwd_override*/ None,
         );
 
-        assert_eq!(params.base_instructions, config.base_instructions);
+        assert_eq!(
+            params.base_instructions,
+            Some(config.base_instructions.clone())
+        );
         assert_eq!(
             params.developer_instructions,
             Some(config.developer_instructions)
@@ -1315,7 +1324,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let mut config = build_config(&temp_dir).await;
         let thread_id = ThreadId::new();
-        config.base_instructions = Some(Some("resume base".to_string()));
+        config.base_instructions = Some("resume base".to_string());
         config.developer_instructions = Some("resume developer".to_string());
 
         let params = thread_resume_params_from_config(
@@ -1325,7 +1334,10 @@ mod tests {
             /*remote_cwd_override*/ None,
         );
 
-        assert_eq!(params.base_instructions, config.base_instructions);
+        assert_eq!(
+            params.base_instructions,
+            Some(config.base_instructions.clone())
+        );
         assert_eq!(
             params.developer_instructions,
             Some(config.developer_instructions)
@@ -1362,7 +1374,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let mut config = build_config(&temp_dir).await;
         let thread_id = ThreadId::new();
-        config.base_instructions = Some(Some("fork base".to_string()));
+        config.base_instructions = Some("fork base".to_string());
         config.developer_instructions = Some("fork developer".to_string());
 
         let params = thread_fork_params_from_config(
@@ -1372,7 +1384,10 @@ mod tests {
             /*remote_cwd_override*/ None,
         );
 
-        assert_eq!(params.base_instructions, config.base_instructions);
+        assert_eq!(
+            params.base_instructions,
+            Some(config.base_instructions.clone())
+        );
         assert_eq!(
             params.developer_instructions,
             Some(config.developer_instructions)
@@ -1409,7 +1424,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let mut config = build_config(&temp_dir).await;
         let thread_id = ThreadId::new();
-        config.base_instructions = Some(Some("remote base".to_string()));
+        config.base_instructions = Some("remote base".to_string());
         config.developer_instructions = Some("remote developer".to_string());
 
         let start = thread_start_params_from_config(
@@ -1463,6 +1478,38 @@ mod tests {
             fork.developer_instructions,
             Some(Some("remote developer".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn thread_lifecycle_params_omit_unconfigured_instruction_overrides() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let thread_id = ThreadId::new();
+
+        let start = thread_start_params_from_config(
+            &config,
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+        );
+        let resume = thread_resume_params_from_config(
+            config.clone(),
+            thread_id,
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+        );
+        let fork = thread_fork_params_from_config(
+            config,
+            thread_id,
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+        );
+
+        assert_eq!(start.base_instructions, None);
+        assert_eq!(start.developer_instructions, None);
+        assert_eq!(resume.base_instructions, None);
+        assert_eq!(resume.developer_instructions, None);
+        assert_eq!(fork.base_instructions, None);
+        assert_eq!(fork.developer_instructions, None);
     }
 
     #[tokio::test]

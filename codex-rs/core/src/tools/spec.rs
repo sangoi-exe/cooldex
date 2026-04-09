@@ -12,6 +12,7 @@ use codex_tools::DiscoverableTool;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolHandlerKind;
+use codex_tools::ToolNamespace;
 use codex_tools::ToolRegistryPlanAppTool;
 use codex_tools::ToolRegistryPlanParams;
 use codex_tools::ToolSpec;
@@ -37,65 +38,63 @@ fn create_manage_context_tool() -> ToolSpec {
     let mut chunk_summary_properties = BTreeMap::new();
     chunk_summary_properties.insert(
         "chunk_id".to_string(),
-        JsonSchema::String {
-            description: Some("Identifier for a chunk from chunk_manifest.".to_string()),
-        },
+        JsonSchema::string(Some(
+            "Identifier for a chunk from chunk_manifest.".to_string(),
+        )),
     );
     chunk_summary_properties.insert(
         "tool_context".to_string(),
-        JsonSchema::String {
-            description: Some("Condensed tool-facing context for this chunk.".to_string()),
-        },
+        JsonSchema::string(Some(
+            "Condensed tool-facing context for this chunk.".to_string(),
+        )),
     );
     chunk_summary_properties.insert(
         "reasoning_context".to_string(),
-        JsonSchema::String {
-            description: Some("Condensed reasoning context for this chunk.".to_string()),
-        },
+        JsonSchema::string(Some(
+            "Condensed reasoning context for this chunk.".to_string(),
+        )),
     );
-    let chunk_summary_schema = JsonSchema::Object {
-        properties: chunk_summary_properties,
-        required: Some(vec![
+    let chunk_summary_schema = JsonSchema::object(
+        chunk_summary_properties,
+        Some(vec![
             "chunk_id".to_string(),
             "tool_context".to_string(),
             "reasoning_context".to_string(),
         ]),
-        additional_properties: Some(false.into()),
-    };
+        Some(false.into()),
+    );
 
     let mut properties = BTreeMap::new();
     properties.insert(
         "mode".to_string(),
-        JsonSchema::String {
-            description: Some("Mode: retrieve | apply.".to_string()),
-        },
+        JsonSchema::string(Some("Mode: retrieve | apply.".to_string())),
     );
     properties.insert(
         "policy_id".to_string(),
-        JsonSchema::String {
-            description: Some("Required policy identifier for retrieve/apply.".to_string()),
-        },
+        JsonSchema::string(Some(
+            "Required policy identifier for retrieve/apply.".to_string(),
+        )),
     );
     properties.insert(
         "plan_id".to_string(),
-        JsonSchema::String {
-            description: Some("Required for apply; obtained from retrieve.".to_string()),
-        },
+        JsonSchema::string(Some(
+            "Required for apply; obtained from retrieve.".to_string(),
+        )),
     );
     properties.insert(
         "state_hash".to_string(),
-        JsonSchema::String {
-            description: Some("Required for apply; anti-drift hash from retrieve.".to_string()),
-        },
+        JsonSchema::string(Some(
+            "Required for apply; anti-drift hash from retrieve.".to_string(),
+        )),
     );
     properties.insert(
         "chunk_summaries".to_string(),
-        JsonSchema::Array {
-            items: Box::new(chunk_summary_schema),
-            description: Some(
+        JsonSchema::array(
+            chunk_summary_schema,
+            Some(
                 "Required for apply; one condensed summary object per selected chunk.".to_string(),
             ),
-        },
+        ),
     );
 
     ToolSpec::Function(ResponsesApiTool {
@@ -104,11 +103,11 @@ fn create_manage_context_tool() -> ToolSpec {
             .to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::Object {
+        parameters: JsonSchema::object(
             properties,
-            required: Some(vec!["mode".to_string(), "policy_id".to_string()]),
-            additional_properties: Some(false.into()),
-        },
+            Some(vec!["mode".to_string(), "policy_id".to_string()]),
+            Some(false.into()),
+        ),
         output_schema: None,
     })
 }
@@ -126,11 +125,7 @@ fn create_recall_tool() -> ToolSpec {
                     .to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::Object {
-            properties,
-            required: None,
-            additional_properties: Some(false.into()),
-        },
+        parameters: JsonSchema::object(properties, None, Some(false.into())),
         output_schema: None,
     })
 }
@@ -139,6 +134,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
     config: &ToolsConfig,
     mcp_tools: Option<HashMap<String, rmcp::model::Tool>>,
     app_tools: Option<HashMap<String, ToolInfo>>,
+    tool_namespaces: Option<HashMap<String, ToolNamespace>>,
     discoverable_tools: Option<Vec<DiscoverableTool>>,
     dynamic_tools: &[DynamicToolSpec],
 ) -> ToolRegistryBuilder {
@@ -194,6 +190,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
         config,
         ToolRegistryPlanParams {
             mcp_tools: mcp_tools.as_ref(),
+            tool_namespaces: tool_namespaces.as_ref(),
             app_tools: app_tool_sources.as_deref(),
             discoverable_tools: discoverable_tools.as_deref(),
             dynamic_tools,

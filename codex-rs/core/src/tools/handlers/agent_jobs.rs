@@ -1,5 +1,6 @@
-// Merge-safety anchor: agent_jobs must keep using the legacy child-spawn config owner from
-// `multi_agents` so batch launches do not accidentally adopt V2-only spawn semantics mid-merge.
+// Merge-safety anchor: agent_jobs must use the shared child-spawn config owner in
+// `multi_agents_common` so batch launches keep the legacy CLI child-instruction/depth contract
+// without inheriting V2-only spawn semantics.
 
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
@@ -11,15 +12,15 @@ use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
-use crate::tools::handlers::multi_agents::build_agent_spawn_config;
+use crate::tools::handlers::multi_agents_common::apply_spawn_agent_overrides;
+use crate::tools::handlers::multi_agents_common::build_agent_spawn_config;
+use crate::tools::handlers::multi_agents_common::thread_spawn_source;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::AgentStatus;
-use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -46,6 +47,7 @@ const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_AGENT_JOB_ITEM_TIMEOUT: Duration = Duration::from_secs(60 * 30);
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SpawnAgentsOnCsvArgs {
     csv_path: String,
     instruction: String,
@@ -53,7 +55,6 @@ struct SpawnAgentsOnCsvArgs {
     output_csv_path: Option<String>,
     output_schema: Option<Value>,
     max_concurrency: Option<usize>,
-    max_workers: Option<usize>,
     max_runtime_seconds: Option<u64>,
 }
 
@@ -103,6 +104,7 @@ struct ReportAgentJobResultToolResult {
 #[derive(Debug, Clone)]
 struct JobRunnerOptions {
     max_concurrency: usize,
+    child_depth: i32,
     spawn_config: Config,
 }
 
@@ -341,7 +343,7 @@ mod spawn_agents_on_csv {
                 FunctionCallError::RespondToModel(format!("failed to create agent job: {err}"))
             })?;
 
-        let requested_concurrency = args.max_concurrency.or(args.max_workers);
+        let requested_concurrency = args.max_concurrency;
         let options = match build_runner_options(&session, &turn, requested_concurrency).await {
             Ok(options) => options,
             Err(err) => {
@@ -537,9 +539,11 @@ async fn build_runner_options(
     }
     let max_concurrency =
         normalize_concurrency(requested_concurrency, turn.config.agent_max_threads);
-    let spawn_config = build_agent_spawn_config(turn.as_ref())?;
+    let mut spawn_config = build_agent_spawn_config(turn.as_ref())?;
+    apply_spawn_agent_overrides(&mut spawn_config, child_depth);
     Ok(JobRunnerOptions {
         max_concurrency,
+        child_depth,
         spawn_config,
     })
 }
@@ -600,6 +604,14 @@ async fn run_agent_job_loop(
         .await?;
 
     let mut cancel_requested = db.is_agent_job_cancelled(job_id.as_str()).await?;
+    let worker_session_source = thread_spawn_source(
+        session.conversation_id,
+        &turn.session_source,
+        options.child_depth,
+        /*agent_role*/ None,
+        /*task_name*/ None,
+    )
+    .map_err(|err| anyhow::anyhow!("failed to derive agent-job worker session source: {err}"))?;
     loop {
         let mut progressed = false;
 
@@ -634,9 +646,7 @@ async fn run_agent_job_loop(
                     .spawn_agent(
                         options.spawn_config.clone(),
                         items.into(),
-                        Some(SessionSource::SubAgent(SubAgentSource::Other(format!(
-                            "agent_job:{job_id}"
-                        )))),
+                        Some(worker_session_source.clone()),
                     )
                     .await
                 {

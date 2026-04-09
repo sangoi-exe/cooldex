@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
 # Remote-env setup script for codex-rs integration tests.
+# Merge-safety anchor: this local helper owns the CODEX_TEST_REMOTE_ENV setup/cleanup contract used by Codex CLI remote-environment validation in this workspace.
 #
 # Usage (source-only):
 #   source scripts/test-remote-env.sh
-#   cd codex-rs
-#   cargo test -p codex-core --test all remote_env_connects_creates_temp_dir_and_runs_sample_script
+#   bash ./scripts/cargo-guard.sh cargo test -p codex-core --test all remote_test_env_can_connect_and_use_filesystem
 #   codex_remote_env_cleanup
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,10 +17,12 @@ is_sourced() {
 
 setup_remote_env() {
   local container_name
+  local codex_exec_server_target_dir
   local codex_exec_server_binary_path
 
   container_name="${CODEX_TEST_REMOTE_ENV_CONTAINER_NAME:-codex-remote-test-env-local-$(date +%s)-${RANDOM}}"
-  codex_exec_server_binary_path="${REPO_ROOT}/codex-rs/target/debug/codex-exec-server"
+  codex_exec_server_target_dir="${REPO_ROOT}/codex-rs/target"
+  codex_exec_server_binary_path="${codex_exec_server_target_dir}/debug/codex-exec-server"
 
   if ! command -v docker >/dev/null 2>&1; then
     echo "docker is required (Colima or Docker Desktop)" >&2
@@ -37,10 +39,12 @@ setup_remote_env() {
     return 1
   fi
 
-  (
+  if ! (
     cd "${REPO_ROOT}/codex-rs"
-    cargo build -p codex-exec-server --bin codex-exec-server
-  )
+    CARGO_TARGET_DIR="${codex_exec_server_target_dir}" cargo build -p codex-exec-server --bin codex-exec-server
+  ); then
+    return 1
+  fi
 
   if [[ ! -f "${codex_exec_server_binary_path}" ]]; then
     echo "codex-exec-server binary not found at ${codex_exec_server_binary_path}" >&2
@@ -48,7 +52,14 @@ setup_remote_env() {
   fi
 
   docker rm -f "${container_name}" >/dev/null 2>&1 || true
-  docker run -d --name "${container_name}" ubuntu:24.04 sleep infinity >/dev/null
+  if ! docker run -d --name "${container_name}" ubuntu:24.04 sleep infinity >/dev/null; then
+    docker rm -f "${container_name}" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! docker exec "${container_name}" sh -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 zsh"; then
+    docker rm -f "${container_name}" >/dev/null 2>&1 || true
+    return 1
+  fi
 
   export CODEX_TEST_REMOTE_ENV="${container_name}"
 }
