@@ -160,6 +160,9 @@ mod tests {
     use std::path::PathBuf;
     use uuid::Uuid;
 
+    // Merge-safety anchor: SessionMeta fixture literals in extract tests must stay aligned with
+    // the live protocol shape, including child file-mutation metadata, so rollout/state followers
+    // fail loud when protocol fields change.
     #[test]
     fn response_item_user_messages_do_not_set_title_or_first_user_message() {
         let mut metadata = metadata_for_test();
@@ -257,6 +260,7 @@ mod tests {
                     agent_nickname: None,
                     agent_role: None,
                     model_provider: Some("openai".to_string()),
+                    subagent_file_mutation_mode: Default::default(),
                     base_instructions: None,
                     dynamic_tools: None,
                     memory_mode: None,
@@ -377,6 +381,7 @@ mod tests {
                     forked_from_id: None,
                     timestamp: "2026-02-26T00:00:00.000Z".to_string(),
                     cwd: PathBuf::from("/workspace"),
+                    config_path: None,
                     originator: "codex_cli_rs".to_string(),
                     cli_version: "0.0.0".to_string(),
                     source: SessionSource::Cli,
@@ -384,6 +389,7 @@ mod tests {
                     agent_nickname: None,
                     agent_role: None,
                     model_provider: Some("openai".to_string()),
+                    subagent_file_mutation_mode: Default::default(),
                     base_instructions: None,
                     dynamic_tools: None,
                     memory_mode: None,

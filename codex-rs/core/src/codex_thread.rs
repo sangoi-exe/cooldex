@@ -7,6 +7,7 @@ use codex_features::Feature;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::config_types::SubagentFileMutationMode;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
@@ -36,6 +37,8 @@ pub struct ThreadConfigSnapshot {
     pub model: String,
     pub model_provider_id: String,
     pub service_tier: Option<ServiceTier>,
+    // Merge-safety anchor: thread snapshots surface the already-materialized child file-mutation mode so resume/debug/operator views can verify it against the persisted sandbox state.
+    pub subagent_file_mutation_mode: SubagentFileMutationMode,
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
     pub sandbox_policy: SandboxPolicy,

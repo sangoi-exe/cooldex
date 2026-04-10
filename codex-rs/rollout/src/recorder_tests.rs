@@ -20,6 +20,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
+// Merge-safety anchor: rollout recorder fixtures must keep persisted subagent file-mutation mode aligned with SessionMeta serialization.
+
 fn test_config(codex_home: &Path) -> RolloutConfig {
     RolloutConfig {
         codex_home: codex_home.to_path_buf(),
@@ -27,6 +29,7 @@ fn test_config(codex_home: &Path) -> RolloutConfig {
         cwd: codex_home.to_path_buf(),
         model_provider_id: "test-provider".to_string(),
         generate_memories: true,
+        subagent_file_mutation_mode: Default::default(),
     }
 }
 

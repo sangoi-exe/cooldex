@@ -597,6 +597,14 @@
         "service_tier": {
           "$ref": "#/definitions/ServiceTier"
         },
+        "subagent": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SubagentProfileConfig"
+            }
+          ],
+          "default": null
+        },
         "subagent_instructions_file": {
           "allOf": [
             {
@@ -1709,6 +1717,22 @@
             "$ref": "#/definitions/SkillConfig"
           },
           "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "SubagentFileMutationMode": {
+      "enum": [
+        "inherit",
+        "deny"
+      ],
+      "type": "string"
+    },
+    "SubagentProfileConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "file_mutation": {
+          "$ref": "#/definitions/SubagentFileMutationMode"
         }
       },
       "type": "object"

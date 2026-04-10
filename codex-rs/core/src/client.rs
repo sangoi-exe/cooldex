@@ -1038,9 +1038,12 @@ impl ModelClientSession {
         Ok(())
     }
     /// Returns a websocket connection for this turn.
+    // Merge-safety anchor: keep these high-frequency model-client request spans below the default
+    // info-level TUI file log so routine turns do not flood codex-tui.log, while opt-in debug
+    // tracing still preserves the lifecycle spans for troubleshooting.
     #[instrument(
         name = "model_client.websocket_connection",
-        level = "info",
+        level = "debug",
         skip_all,
         fields(
             provider = %self.client.state.provider.name,
@@ -1130,7 +1133,7 @@ impl ModelClientSession {
     #[allow(clippy::too_many_arguments)]
     #[instrument(
         name = "model_client.stream_responses_api",
-        level = "info",
+        level = "debug",
         skip_all,
         fields(
             model = %model_info.slug,
@@ -1227,7 +1230,7 @@ impl ModelClientSession {
     #[allow(clippy::too_many_arguments)]
     #[instrument(
         name = "model_client.stream_responses_websocket",
-        level = "info",
+        level = "debug",
         skip_all,
         fields(
             model = %model_info.slug,

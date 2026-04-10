@@ -1231,6 +1231,9 @@ impl SessionConfiguration {
             model: self.collaboration_mode.model().to_string(),
             model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
             service_tier: self.service_tier,
+            subagent_file_mutation_mode: self
+                .original_config_do_not_use
+                .subagent_file_mutation_mode,
             approval_policy: self.approval_policy.value(),
             approvals_reviewer: self.approvals_reviewer,
             sandbox_policy: self.sandbox_policy.get().clone(),

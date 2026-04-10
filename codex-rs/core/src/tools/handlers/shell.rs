@@ -12,6 +12,9 @@ use crate::exec_policy::ExecApprovalRequest;
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
 use crate::shell::Shell;
+use crate::subagent_file_mutation::denied_action_message;
+use crate::subagent_file_mutation::file_mutation_is_denied;
+use crate::subagent_file_mutation::shell_request_widens_file_mutation;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -52,6 +55,8 @@ enum ShellCommandBackend {
 pub struct ShellCommandHandler {
     backend: ShellCommandBackend,
 }
+
+// Merge-safety anchor: spawn-only file-mutation denial must block write-widening shell requests before approval or sandbox fallback paths run.
 
 fn shell_payload_command(payload: &ToolPayload) -> Option<String> {
     match payload {
@@ -427,6 +432,18 @@ impl ShellHandler {
         let additional_permissions_allowed = exec_permission_approvals_enabled
             || (session.features().enabled(Feature::RequestPermissionsTool)
                 && effective_additional_permissions.permissions_preapproved);
+        if file_mutation_is_denied(turn.config.as_ref())
+            && shell_request_widens_file_mutation(
+                effective_additional_permissions.sandbox_permissions,
+                effective_additional_permissions
+                    .additional_permissions
+                    .as_ref(),
+            )
+        {
+            return Err(FunctionCallError::RespondToModel(denied_action_message(
+                "this subagent cannot request unsandboxed execution or extra filesystem write access",
+            )));
+        }
         let normalized_additional_permissions = implicit_granted_permissions(
             exec_params.sandbox_permissions,
             requested_additional_permissions.as_ref(),

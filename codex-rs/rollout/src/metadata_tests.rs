@@ -24,6 +24,8 @@ use std::path::PathBuf;
 use tempfile::tempdir;
 use uuid::Uuid;
 
+// Merge-safety anchor: rollout metadata tests must keep SessionMeta fixtures aligned with persisted subagent file-mutation mode.
+
 fn test_config(codex_home: PathBuf) -> RolloutConfig {
     RolloutConfig {
         sqlite_home: codex_home.clone(),
@@ -31,6 +33,7 @@ fn test_config(codex_home: PathBuf) -> RolloutConfig {
         codex_home,
         model_provider_id: "test-provider".to_string(),
         generate_memories: true,
+        subagent_file_mutation_mode: Default::default(),
     }
 }
 
@@ -54,6 +57,7 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
         agent_path: None,
         agent_nickname: None,
         agent_role: None,
+        subagent_file_mutation_mode: Default::default(),
         model_provider: Some("openai".to_string()),
         base_instructions: None,
         dynamic_tools: None,
@@ -105,6 +109,7 @@ async fn extract_metadata_from_rollout_returns_latest_memory_mode() {
         agent_path: None,
         agent_nickname: None,
         agent_role: None,
+        subagent_file_mutation_mode: Default::default(),
         model_provider: Some("openai".to_string()),
         base_instructions: None,
         dynamic_tools: None,
@@ -367,6 +372,7 @@ fn write_rollout_in_sessions_with_cwd(
         agent_path: None,
         agent_nickname: None,
         agent_role: None,
+        subagent_file_mutation_mode: Default::default(),
         model_provider: Some("test-provider".to_string()),
         base_instructions: None,
         dynamic_tools: None,

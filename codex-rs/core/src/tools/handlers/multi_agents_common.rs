@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::config::ConfigOverrides;
 use crate::config::deserialize_config_toml_with_base;
 use crate::function_tool::FunctionCallError;
+use crate::subagent_file_mutation::apply_file_mutation_mode_to_config;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -16,6 +17,7 @@ use codex_models_manager::manager::ModelsManager;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::SubagentFileMutationMode;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
@@ -258,9 +260,9 @@ pub(crate) async fn finalize_spawn_agent_prompt_config(
 pub(crate) fn apply_spawn_agent_profile_override(
     config: &mut Config,
     profile_name: Option<&str>,
-) -> Result<(), FunctionCallError> {
+) -> Result<SubagentFileMutationMode, FunctionCallError> {
     let Some(profile_name) = profile_name else {
-        return Ok(());
+        return Ok(config.subagent_file_mutation_mode);
     };
 
     // Merge-safety anchor: profile reload is the only spawn-time path that may replace inherited
@@ -273,11 +275,25 @@ pub(crate) fn apply_spawn_agent_profile_override(
             ))
         })?;
 
-    merged_config
+    let profile = merged_config
         .get_config_profile(Some(profile_name.to_string()))
         .map_err(|_| {
             FunctionCallError::RespondToModel(format!("config profile `{profile_name}` not found"))
         })?;
+    let inherited_subagent_file_mutation_mode = config.subagent_file_mutation_mode;
+    let requested_subagent_file_mutation_mode = profile
+        .subagent
+        .as_ref()
+        .and_then(|subagent| subagent.file_mutation)
+        .unwrap_or(SubagentFileMutationMode::Inherit);
+    let effective_subagent_file_mutation_mode = if matches!(
+        requested_subagent_file_mutation_mode,
+        SubagentFileMutationMode::Inherit
+    ) {
+        inherited_subagent_file_mutation_mode
+    } else {
+        requested_subagent_file_mutation_mode
+    };
 
     let next_config = Config::load_config_with_layer_stack(
         merged_config,
@@ -301,7 +317,8 @@ pub(crate) fn apply_spawn_agent_profile_override(
     })?;
 
     *config = next_config;
-    Ok(())
+    config.subagent_file_mutation_mode = effective_subagent_file_mutation_mode;
+    Ok(effective_subagent_file_mutation_mode)
 }
 
 /// Copies runtime-only turn state onto a child config before it is handed to `AgentControl`.
@@ -398,6 +415,21 @@ pub(crate) fn apply_spawn_agent_overrides(config: &mut Config, child_depth: i32)
         let _ = config.features.disable(Feature::SpawnCsv);
         let _ = config.features.disable(Feature::Collab);
     }
+}
+
+pub(crate) fn apply_spawn_agent_subagent_overrides(
+    config: &mut Config,
+    subagent_file_mutation_mode: SubagentFileMutationMode,
+) -> Result<(), FunctionCallError> {
+    if matches!(
+        subagent_file_mutation_mode,
+        SubagentFileMutationMode::Inherit
+    ) {
+        return Ok(());
+    }
+
+    apply_file_mutation_mode_to_config(config, subagent_file_mutation_mode)
+        .map_err(FunctionCallError::RespondToModel)
 }
 pub(crate) async fn apply_requested_spawn_agent_model_overrides(
     session: &Session,

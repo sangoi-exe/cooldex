@@ -48,10 +48,13 @@ use codex_mcp::ToolPluginProvenance;
 use codex_mcp::codex_apps_tools_cache_key;
 use codex_mcp::compute_auth_statuses;
 use codex_mcp::with_codex_apps_mcp;
+use reqwest::header::CONTENT_TYPE;
 
 pub use codex_connectors::CONNECTORS_CACHE_TTL;
 const CONNECTORS_READY_TIMEOUT_ON_EMPTY_TOOLS: Duration = Duration::from_secs(30);
 const DIRECTORY_CONNECTORS_TIMEOUT: Duration = Duration::from_secs(60);
+const CONNECTOR_HTTP_ERROR_PREVIEW_LIMIT: usize = 160;
+const CONNECTOR_HTML_ERROR_BODY_OMITTED: &str = "response body omitted for text/html";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AppToolPolicy {
@@ -496,8 +499,57 @@ async fn chatgpt_get_request_with_token<T: DeserializeOwned>(
             .context("failed to parse JSON response")
     } else {
         let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("request failed with status {status}: {body}");
+        if let Some(summary) = summarize_connector_http_error_body(content_type.as_deref(), &body) {
+            anyhow::bail!("request failed with status {status}: {summary}");
+        }
+        anyhow::bail!("request failed with status {status}");
+    }
+}
+
+// Merge-safety anchor: connector-directory HTTP failures must stay status-first and concise so
+// Cloudflare challenge pages or other large HTML bodies never dump into default codex-tui.log.
+fn summarize_connector_http_error_body(content_type: Option<&str>, body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if connector_http_error_body_is_html(content_type, trimmed) {
+        return Some(CONNECTOR_HTML_ERROR_BODY_OMITTED.to_string());
+    }
+
+    let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(truncate_connector_http_error_preview(collapsed))
+}
+
+fn connector_http_error_body_is_html(content_type: Option<&str>, trimmed_body: &str) -> bool {
+    let body_prefix = trimmed_body
+        .chars()
+        .take(32)
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    content_type
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"))
+        || body_prefix.starts_with("<html")
+        || body_prefix.starts_with("<!doctype html")
+}
+
+fn truncate_connector_http_error_preview(preview: String) -> String {
+    if preview.chars().count() <= CONNECTOR_HTTP_ERROR_PREVIEW_LIMIT {
+        preview
+    } else {
+        let truncated: String = preview
+            .chars()
+            .take(CONNECTOR_HTTP_ERROR_PREVIEW_LIMIT)
+            .collect();
+        format!("{truncated}...")
     }
 }
 

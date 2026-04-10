@@ -52,11 +52,13 @@ impl ToolHandler for Handler {
             ));
         }
         let mut config = build_agent_spawn_config(turn.as_ref())?;
-        apply_spawn_agent_profile_override(&mut config, profile_name)?;
+        let subagent_file_mutation_mode =
+            apply_spawn_agent_profile_override(&mut config, profile_name)?;
         apply_role_to_config(&mut config, role_name)
             .await
             .map_err(FunctionCallError::RespondToModel)?;
         apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+        apply_spawn_agent_subagent_overrides(&mut config, subagent_file_mutation_mode)?;
         finalize_spawn_agent_prompt_config(
             &mut config,
             turn.as_ref(),

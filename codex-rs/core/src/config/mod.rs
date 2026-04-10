@@ -68,6 +68,7 @@ use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::config_types::SubagentFileMutationMode;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchConfig;
@@ -259,6 +260,14 @@ pub struct Config {
     /// Base instructions override for sub-agent threads spawned via the collab
     /// `spawn_agent` tool.
     pub subagent_base_instructions: Option<String>,
+
+    // Merge-safety anchor: `subagent_file_mutation_mode` is the live child-only owner; raw profile input and rollout metadata remain followers of this runtime field.
+    /// Effective spawn-only filesystem mutation mode for child agents.
+    ///
+    /// This remains `inherit` for root sessions; spawn flows may tighten it
+    /// after config load when a selected spawn profile requests stricter child
+    /// filesystem behavior.
+    pub subagent_file_mutation_mode: SubagentFileMutationMode,
 
     /// Developer instructions override injected as a separate message.
     pub developer_instructions: Option<String>,
@@ -2200,6 +2209,8 @@ impl Config {
                 .suppress_unstable_features_warning
                 .unwrap_or(false),
             active_profile: active_profile_name,
+            // Merge-safety anchor: root sessions always materialize `inherit`; spawn/resume paths are the only owners allowed to tighten or restore child-only mutation state afterward.
+            subagent_file_mutation_mode: SubagentFileMutationMode::Inherit,
             active_project,
             windows_wsl_setup_acknowledged: cfg.windows_wsl_setup_acknowledged.unwrap_or(false),
             notices: cfg.notice.unwrap_or_default(),

@@ -16,10 +16,13 @@ use crate::contextual_user_message::REASONING_CONTEXT_FRAGMENT;
 use crate::contextual_user_message::TOOL_CONTEXT_FRAGMENT;
 use crate::find_archived_thread_path_by_id_str;
 use crate::find_thread_path_by_id_str;
+use crate::read_session_meta_line;
 use crate::rollout::RolloutRecorder;
+use crate::rollout::read_resumed_child_sandbox_policy;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
 use crate::shell_snapshot::ShellSnapshot;
+use crate::subagent_file_mutation::restore_file_mutation_mode_to_config;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
 use codex_features::Feature;
@@ -36,6 +39,7 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
@@ -43,6 +47,7 @@ use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::user_input::UserInput;
 use codex_rollout::state_db;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -85,6 +90,12 @@ fn default_agent_nickname_list() -> Vec<&'static str> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .collect()
+}
+
+fn parse_persisted_sandbox_policy(value: &str) -> Option<SandboxPolicy> {
+    serde_json::from_str(value)
+        .ok()
+        .or_else(|| serde_json::from_value(Value::String(value.to_string())).ok())
 }
 
 fn agent_nickname_candidates(
@@ -512,10 +523,10 @@ impl AgentControl {
             .resume_single_agent_from_rollout(config.clone(), thread_id, session_source)
             .await?;
         let state = self.upgrade()?;
-        let Ok(resumed_thread) = state.get_thread(resumed_thread_id).await else {
+        let Ok(_) = state.get_thread(resumed_thread_id).await else {
             return Ok(resumed_thread_id);
         };
-        let Some(state_db_ctx) = resumed_thread.state_db() else {
+        let Some(state_db_ctx) = state_db::get_state_db(&config).await else {
             return Ok(resumed_thread_id);
         };
 
@@ -588,42 +599,6 @@ impl AgentControl {
         }
         let state = self.upgrade()?;
         let mut reservation = self.state.reserve_spawn_slot(config.agent_max_threads)?;
-        let (session_source, agent_metadata) = match session_source {
-            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
-                depth,
-                agent_path,
-                agent_role: _,
-                agent_nickname: _,
-            }) => {
-                let (resumed_agent_nickname, resumed_agent_role) =
-                    if let Some(state_db_ctx) = state_db::get_state_db(&config).await {
-                        match state_db_ctx.get_thread(thread_id).await {
-                            Ok(Some(metadata)) => (metadata.agent_nickname, metadata.agent_role),
-                            Ok(None) | Err(_) => (None, None),
-                        }
-                    } else {
-                        (None, None)
-                    };
-                self.prepare_thread_spawn(
-                    &mut reservation,
-                    &config,
-                    parent_thread_id,
-                    depth,
-                    agent_path,
-                    resumed_agent_role,
-                    resumed_agent_nickname,
-                )?
-            }
-            other => (other, AgentMetadata::default()),
-        };
-        let notification_source = session_source.clone();
-        let inherited_shell_snapshot = self
-            .inherited_shell_snapshot_for_source(&state, Some(&session_source))
-            .await;
-        let inherited_exec_policy = self
-            .inherited_exec_policy_for_source(&state, Some(&session_source), &config)
-            .await;
         let rollout_path =
             match find_thread_path_by_id_str(config.codex_home.as_path(), &thread_id.to_string())
                 .await?
@@ -636,6 +611,107 @@ impl AgentControl {
                 .await?
                 .ok_or_else(|| CodexErr::ThreadNotFound(thread_id))?,
             };
+        let meta_line = read_session_meta_line(rollout_path.as_path())
+            .await
+            .map_err(|err| {
+                CodexErr::UnsupportedOperation(format!(
+                    "failed to read session metadata for resumed agent {thread_id}: {err}"
+                ))
+            })?;
+        let (persisted_agent_nickname, persisted_agent_role, persisted_thread_is_child) =
+            match &meta_line.meta.source {
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    agent_nickname,
+                    agent_role,
+                    ..
+                }) => (agent_nickname.clone(), agent_role.clone(), true),
+                _ => (None, None, false),
+            };
+        let (
+            persisted_metadata_nickname,
+            persisted_metadata_role,
+            persisted_metadata_sandbox_policy,
+        ) = if persisted_thread_is_child {
+            if let Some(state_db_ctx) = state_db::get_state_db(&config).await {
+                match state_db_ctx.get_thread(thread_id).await {
+                    Ok(Some(metadata)) => (
+                        metadata.agent_nickname,
+                        metadata.agent_role,
+                        parse_persisted_sandbox_policy(&metadata.sandbox_policy),
+                    ),
+                    Ok(None) | Err(_) => (None, None, None),
+                }
+            } else {
+                (None, None, None)
+            }
+        } else {
+            (None, None, None)
+        };
+        let (session_source, agent_metadata) = match session_source {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth,
+                agent_path,
+                agent_role: _,
+                agent_nickname: _,
+            }) => {
+                let resumed_agent_nickname = persisted_metadata_nickname
+                    .clone()
+                    .or(persisted_agent_nickname.clone());
+                let resumed_agent_role = persisted_metadata_role
+                    .clone()
+                    .or(persisted_agent_role.clone());
+                let (session_source, agent_metadata) = self.prepare_thread_spawn(
+                    &mut reservation,
+                    &config,
+                    parent_thread_id,
+                    depth,
+                    agent_path,
+                    resumed_agent_role,
+                    resumed_agent_nickname,
+                )?;
+                (session_source, agent_metadata)
+            }
+            other => (other, AgentMetadata::default()),
+        };
+        let notification_source = session_source.clone();
+        let inherited_shell_snapshot = self
+            .inherited_shell_snapshot_for_source(&state, Some(&session_source))
+            .await;
+        let inherited_exec_policy = self
+            .inherited_exec_policy_for_source(&state, Some(&session_source), &config)
+            .await;
+        let resumed_sandbox_policy = if persisted_thread_is_child {
+            read_resumed_child_sandbox_policy(rollout_path.as_path())
+                .await
+                .map_err(|err| {
+                    CodexErr::UnsupportedOperation(format!(
+                        "failed to read child sandbox baseline for resumed agent {thread_id}: {err}"
+                    ))
+                })?
+                .or(persisted_metadata_sandbox_policy)
+                .ok_or_else(|| {
+                    CodexErr::UnsupportedOperation(format!(
+                        "failed to resolve child sandbox baseline for resumed agent {thread_id}"
+                    ))
+                })?
+        } else {
+            config.permissions.sandbox_policy.get().clone()
+        };
+        // Merge-safety anchor: resumed child sandbox restoration must prefer the persisted
+        // child-owned rollout baseline over the live caller config so a denied resumer cannot
+        // leak its read-only policy into an `inherit` child, even when the child is resumed
+        // directly or sqlite follower state is unavailable.
+        restore_file_mutation_mode_to_config(
+            &mut config,
+            meta_line.meta.subagent_file_mutation_mode,
+            &resumed_sandbox_policy,
+        )
+        .map_err(|err| {
+            CodexErr::UnsupportedOperation(format!(
+                "failed to restore subagent file-mutation mode for resumed agent {thread_id}: {err}"
+            ))
+        })?;
 
         let resumed_thread = state
             .resume_thread_from_rollout_with_source(

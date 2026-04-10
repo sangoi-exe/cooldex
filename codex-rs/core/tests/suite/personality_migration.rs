@@ -19,6 +19,8 @@ use std::path::Path;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 
+// Merge-safety anchor: integration rollout fixtures must keep SessionMeta followers aligned with persisted subagent file-mutation mode.
+
 const TEST_TIMESTAMP: &str = "2025-01-01T00-00-00";
 
 async fn read_config_toml(codex_home: &Path) -> io::Result<ConfigToml> {
@@ -70,6 +72,7 @@ async fn write_rollout_with_user_event(dir: &Path, thread_id: ThreadId) -> io::R
             agent_path: None,
             agent_nickname: None,
             agent_role: None,
+            subagent_file_mutation_mode: Default::default(),
             model_provider: None,
             base_instructions: None,
             dynamic_tools: None,
@@ -116,6 +119,7 @@ async fn write_rollout_with_meta_only(dir: &Path, thread_id: ThreadId) -> io::Re
             agent_path: None,
             agent_nickname: None,
             agent_role: None,
+            subagent_file_mutation_mode: Default::default(),
             model_provider: None,
             base_instructions: None,
             dynamic_tools: None,

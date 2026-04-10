@@ -11,6 +11,8 @@ use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 
+// Merge-safety anchor: migration rollout fixtures must keep SessionMeta followers aligned with persisted subagent file-mutation mode.
+
 const TEST_TIMESTAMP: &str = "2025-01-01T00-00-00";
 
 async fn read_config_toml(codex_home: &Path) -> io::Result<ConfigToml> {
@@ -41,6 +43,7 @@ async fn write_session_with_user_event(codex_home: &Path) -> io::Result<()> {
             agent_path: None,
             agent_nickname: None,
             agent_role: None,
+            subagent_file_mutation_mode: Default::default(),
             model_provider: None,
             base_instructions: None,
             dynamic_tools: None,

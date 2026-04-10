@@ -2,6 +2,9 @@ use codex_protocol::request_permissions::RequestPermissionsArgs;
 use codex_sandboxing::policy_transforms::normalize_additional_permissions;
 
 use crate::function_tool::FunctionCallError;
+use crate::subagent_file_mutation::denied_action_message;
+use crate::subagent_file_mutation::file_mutation_is_denied;
+use crate::subagent_file_mutation::request_permission_profile_requests_file_system_write;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -45,6 +48,14 @@ impl ToolHandler for RequestPermissionsHandler {
             return Err(FunctionCallError::RespondToModel(
                 "request_permissions requires at least one permission".to_string(),
             ));
+        }
+        // Merge-safety anchor: spawn-only file-mutation denial must reject filesystem write escalations through request_permissions.
+        if file_mutation_is_denied(turn.config.as_ref())
+            && request_permission_profile_requests_file_system_write(&args.permissions)
+        {
+            return Err(FunctionCallError::RespondToModel(denied_action_message(
+                "this subagent cannot request filesystem write permissions",
+            )));
         }
 
         let response = session

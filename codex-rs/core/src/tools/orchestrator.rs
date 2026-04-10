@@ -9,6 +9,8 @@ caching).
 use crate::guardian::GUARDIAN_REJECTION_MESSAGE;
 use crate::guardian::routes_approval_to_guardian;
 use crate::network_policy_decision::network_approval_context_from_payload;
+use crate::subagent_file_mutation::denied_action_message;
+use crate::subagent_file_mutation::file_mutation_is_denied;
 use crate::tools::network_approval::DeferredNetworkApproval;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::begin_network_approval;
@@ -35,6 +37,8 @@ use codex_sandboxing::SandboxType;
 pub(crate) struct ToolOrchestrator {
     sandbox: SandboxManager,
 }
+
+// Merge-safety anchor: spawn-only file-mutation denial must reject unsandboxed first attempts and unsandboxed retries for child sessions.
 
 pub(crate) struct OrchestratorRunResult<Out> {
     pub output: Out,
@@ -178,7 +182,18 @@ impl ToolOrchestrator {
             .requirements_toml()
             .network
             .is_some();
-        let initial_sandbox = match tool.sandbox_mode_for_first_attempt(req) {
+        let first_attempt_override = tool.sandbox_mode_for_first_attempt(req);
+        if file_mutation_is_denied(turn_ctx.config.as_ref())
+            && matches!(
+                first_attempt_override,
+                SandboxOverride::BypassSandboxFirstAttempt
+            )
+        {
+            return Err(ToolError::Rejected(denied_action_message(
+                "this subagent cannot bypass the sandbox on the first attempt",
+            )));
+        }
+        let initial_sandbox = match first_attempt_override {
             SandboxOverride::BypassSandboxFirstAttempt => SandboxType::None,
             SandboxOverride::NoOverride => self.sandbox.select_initial(
                 &turn_ctx.file_system_sandbox_policy,
@@ -246,6 +261,11 @@ impl ToolOrchestrator {
                         output,
                         network_policy_decision,
                     })));
+                }
+                if file_mutation_is_denied(turn_ctx.config.as_ref()) {
+                    return Err(ToolError::Rejected(denied_action_message(
+                        "this subagent cannot retry without the sandbox after a denied write attempt",
+                    )));
                 }
                 // Under `Never` or `OnRequest`, do not retry without sandbox;
                 // surface a concise sandbox denial that preserves the

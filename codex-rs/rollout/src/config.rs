@@ -2,12 +2,19 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use codex_protocol::config_types::SubagentFileMutationMode;
+
+// Merge-safety anchor: rollout config must persist child file-mutation mode so resumed subagents can rehydrate the spawn-only restriction.
+
 pub trait RolloutConfigView {
     fn codex_home(&self) -> &Path;
     fn sqlite_home(&self) -> &Path;
     fn cwd(&self) -> &Path;
     fn model_provider_id(&self) -> &str;
     fn generate_memories(&self) -> bool;
+    fn subagent_file_mutation_mode(&self) -> SubagentFileMutationMode {
+        SubagentFileMutationMode::Inherit
+    }
     fn active_user_config_path(&self) -> std::io::Result<Option<PathBuf>> {
         Ok(None)
     }
@@ -20,6 +27,7 @@ pub struct RolloutConfig {
     pub cwd: PathBuf,
     pub model_provider_id: String,
     pub generate_memories: bool,
+    pub subagent_file_mutation_mode: SubagentFileMutationMode,
 }
 
 pub type Config = RolloutConfig;
@@ -32,6 +40,7 @@ impl RolloutConfig {
             cwd: view.cwd().to_path_buf(),
             model_provider_id: view.model_provider_id().to_string(),
             generate_memories: view.generate_memories(),
+            subagent_file_mutation_mode: view.subagent_file_mutation_mode(),
         }
     }
 }
@@ -55,6 +64,10 @@ impl RolloutConfigView for RolloutConfig {
 
     fn generate_memories(&self) -> bool {
         self.generate_memories
+    }
+
+    fn subagent_file_mutation_mode(&self) -> SubagentFileMutationMode {
+        self.subagent_file_mutation_mode
     }
 
     fn active_user_config_path(&self) -> std::io::Result<Option<PathBuf>> {
@@ -83,6 +96,10 @@ impl<T: RolloutConfigView + ?Sized> RolloutConfigView for &T {
         (*self).generate_memories()
     }
 
+    fn subagent_file_mutation_mode(&self) -> SubagentFileMutationMode {
+        (*self).subagent_file_mutation_mode()
+    }
+
     fn active_user_config_path(&self) -> std::io::Result<Option<PathBuf>> {
         (*self).active_user_config_path()
     }
@@ -107,6 +124,10 @@ impl<T: RolloutConfigView + ?Sized> RolloutConfigView for Arc<T> {
 
     fn generate_memories(&self) -> bool {
         self.as_ref().generate_memories()
+    }
+
+    fn subagent_file_mutation_mode(&self) -> SubagentFileMutationMode {
+        self.as_ref().subagent_file_mutation_mode()
     }
 
     fn active_user_config_path(&self) -> std::io::Result<Option<PathBuf>> {

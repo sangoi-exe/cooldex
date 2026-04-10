@@ -2613,6 +2613,9 @@ pub struct SessionMeta {
     /// Optional canonical agent path assigned to an AgentControl-spawned sub-agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_path: Option<String>,
+    // Merge-safety anchor: SessionMeta persists the effective child file-mutation mode so closed-agent resume can restore the child restriction without inheriting caller-local deny state.
+    #[serde(default)]
+    pub subagent_file_mutation_mode: crate::config_types::SubagentFileMutationMode,
     pub model_provider: Option<String>,
     /// base_instructions for the session. This *should* always be present when creating a new session,
     /// but may be missing for older sessions. If not present, fall back to rendering the base_instructions
@@ -2638,6 +2641,7 @@ impl Default for SessionMeta {
             agent_nickname: None,
             agent_role: None,
             agent_path: None,
+            subagent_file_mutation_mode: crate::config_types::SubagentFileMutationMode::Inherit,
             model_provider: None,
             base_instructions: None,
             dynamic_tools: None,

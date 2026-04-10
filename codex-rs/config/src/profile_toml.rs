@@ -12,6 +12,7 @@ use codex_features::FeaturesToml;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::config_types::SubagentFileMutationMode;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -44,6 +45,8 @@ pub struct ConfigProfile {
     pub model_instructions_file: Option<AbsolutePathBuf>,
     /// Optional path to a file containing sub-agent model instructions.
     pub subagent_instructions_file: Option<AbsolutePathBuf>,
+    #[serde(default)]
+    pub subagent: Option<SubagentProfileConfig>,
     pub js_repl_node_path: Option<AbsolutePathBuf>,
     /// Ordered list of directories to search for Node modules in `js_repl`.
     pub js_repl_node_module_dirs: Option<Vec<AbsolutePathBuf>>,
@@ -71,6 +74,12 @@ pub struct ConfigProfile {
     #[schemars(schema_with = "crate::schema::features_schema")]
     pub features: Option<FeaturesToml>,
     pub oss_provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct SubagentProfileConfig {
+    pub file_mutation: Option<SubagentFileMutationMode>,
 }
 
 impl From<ConfigProfile> for codex_app_server_protocol::Profile {

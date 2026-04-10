@@ -111,6 +111,27 @@ tools may preempt active sub-agents.
 - Plain `send_input` without `interrupt` is unchanged, and terminal/final agents
   can still be closed.
 
+<!-- Merge-safety anchor: this section is the durable operator note for the spawn-only child file-mutation contract and must stay aligned with the legacy spawn/resume runtime owners. -->
+## Spawn-only child file-mutation denial
+
+Profiles can define spawn-only child restrictions under
+`[profiles.<name>.subagent]`.
+
+```toml
+[profiles.recon.subagent]
+file_mutation = "deny"
+```
+
+When that profile is selected through `spawn_agent(profile = "...")`, the
+spawned child keeps read access but cannot mutate files. The restriction stays
+active after `resume_agent`, blocks `apply_patch`, rejects filesystem write
+permission requests, and rejects unsandboxed execution or extra filesystem
+write access for shell-style tools.
+
+Use `file_mutation = "inherit"` or omit the field to keep the existing child
+behavior. This setting is spawn-only; selecting the same profile for the lead
+session does not make the lead read-only.
+
 ## Realtime start instructions
 
 `experimental_realtime_start_instructions` lets you replace the built-in

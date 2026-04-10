@@ -11,6 +11,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+// Merge-safety anchor: rollout test fixtures must carry persisted subagent file-mutation mode so resume/state followers stay truthful.
+
 pub fn rollout_path(codex_home: &Path, filename_ts: &str, thread_id: &str) -> PathBuf {
     let year = &filename_ts[0..4];
     let month = &filename_ts[5..7];
@@ -83,6 +85,7 @@ pub fn create_fake_rollout_with_source(
         agent_path: None,
         agent_nickname: None,
         agent_role: None,
+        subagent_file_mutation_mode: Default::default(),
         model_provider: model_provider.map(str::to_string),
         base_instructions: None,
         dynamic_tools: None,
@@ -167,6 +170,7 @@ pub fn create_fake_rollout_with_text_elements(
         agent_path: None,
         agent_nickname: None,
         agent_role: None,
+        subagent_file_mutation_mode: Default::default(),
         model_provider: model_provider.map(str::to_string),
         base_instructions: None,
         dynamic_tools: None,

@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::config::ConfigBuilder;
 use crate::contextual_user_message::ENVIRONMENT_CONTEXT_FRAGMENT;
 use crate::contextual_user_message::SUBAGENT_NOTIFICATION_OPEN_TAG;
+use crate::subagent_file_mutation::apply_file_mutation_mode_to_config;
 use assert_matches::assert_matches;
 use chrono::Utc;
 use codex_features::Feature;
@@ -14,6 +15,7 @@ use codex_instructions::AGENTS_MD_FRAGMENT;
 use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::SubagentFileMutationMode;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
@@ -23,7 +25,10 @@ use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::ReadOnlyAccess;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnAbortReason;
@@ -1809,6 +1814,415 @@ async fn resume_thread_subagent_restores_stored_nickname_and_role() {
         .shutdown_live_agent(resumed_thread_id)
         .await
         .expect("resumed child shutdown should submit");
+}
+
+#[tokio::test]
+async fn resume_agent_from_rollout_restores_descendant_file_mutation_mode_from_rollout() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+
+    let mut child_config = harness.config.clone();
+    apply_file_mutation_mode_to_config(&mut child_config, SubagentFileMutationMode::Deny)
+        .expect("child deny mode should apply");
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            child_config,
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should exist");
+    persist_thread_for_tree_resume(&parent_thread, "parent persisted").await;
+    persist_thread_for_tree_resume(&child_thread, "child persisted").await;
+    wait_for_live_thread_spawn_children(&harness.control, parent_thread_id, &[child_thread_id])
+        .await;
+
+    let report = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert_eq!(report.submit_failed, Vec::<ThreadId>::new());
+    assert_eq!(report.timed_out, Vec::<ThreadId>::new());
+
+    let resumed_parent_thread_id = harness
+        .control
+        .resume_agent_from_rollout(
+            harness.config.clone(),
+            parent_thread_id,
+            SessionSource::Exec,
+        )
+        .await
+        .expect("tree resume should succeed");
+    assert_eq!(resumed_parent_thread_id, parent_thread_id);
+
+    let resumed_child_snapshot = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("resumed child thread should exist")
+        .config_snapshot()
+        .await;
+    assert_eq!(
+        resumed_child_snapshot.subagent_file_mutation_mode,
+        SubagentFileMutationMode::Deny
+    );
+    assert!(matches!(
+        resumed_child_snapshot.sandbox_policy,
+        codex_protocol::protocol::SandboxPolicy::ReadOnly { .. }
+    ));
+
+    let _ = harness
+        .control
+        .shutdown_agent_tree(parent_thread_id)
+        .await
+        .expect("tree shutdown after resume should succeed");
+}
+
+#[tokio::test]
+async fn resume_agent_from_rollout_restores_inherit_child_sandbox_when_resumer_is_denied() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should exist");
+    let child_snapshot_before_shutdown = child_thread.config_snapshot().await;
+    persist_thread_for_tree_resume(&parent_thread, "parent persisted").await;
+    persist_thread_for_tree_resume(&child_thread, "child persisted").await;
+    wait_for_live_thread_spawn_children(&harness.control, parent_thread_id, &[child_thread_id])
+        .await;
+
+    let report = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert_eq!(report.submit_failed, Vec::<ThreadId>::new());
+    assert_eq!(report.timed_out, Vec::<ThreadId>::new());
+
+    let mut denied_resume_config = harness.config.clone();
+    apply_file_mutation_mode_to_config(&mut denied_resume_config, SubagentFileMutationMode::Deny)
+        .expect("deny mode should apply");
+    let resumed_parent_thread_id = harness
+        .control
+        .resume_agent_from_rollout(denied_resume_config, parent_thread_id, SessionSource::Exec)
+        .await
+        .expect("tree resume should succeed");
+    assert_eq!(resumed_parent_thread_id, parent_thread_id);
+
+    let resumed_child_snapshot = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("resumed child thread should exist")
+        .config_snapshot()
+        .await;
+    assert_eq!(
+        resumed_child_snapshot.subagent_file_mutation_mode,
+        SubagentFileMutationMode::Inherit
+    );
+    assert_eq!(
+        resumed_child_snapshot.sandbox_policy,
+        child_snapshot_before_shutdown.sandbox_policy
+    );
+
+    let _ = harness
+        .control
+        .shutdown_agent_tree(parent_thread_id)
+        .await
+        .expect("tree shutdown after resume should succeed");
+}
+
+#[tokio::test]
+async fn resume_agent_from_rollout_restores_inherit_child_sandbox_on_direct_exec_resume() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should exist");
+    let child_snapshot_before_shutdown = child_thread.config_snapshot().await;
+    persist_thread_for_tree_resume(&child_thread, "child persisted").await;
+
+    let _ = harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("child shutdown should submit");
+
+    let mut denied_resume_config = harness.config.clone();
+    apply_file_mutation_mode_to_config(&mut denied_resume_config, SubagentFileMutationMode::Deny)
+        .expect("deny mode should apply");
+    let resumed_thread_id = harness
+        .control
+        .resume_agent_from_rollout(denied_resume_config, child_thread_id, SessionSource::Exec)
+        .await
+        .expect("direct child resume should succeed");
+    assert_eq!(resumed_thread_id, child_thread_id);
+
+    let resumed_child_snapshot = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("resumed child thread should exist")
+        .config_snapshot()
+        .await;
+    assert_eq!(
+        resumed_child_snapshot.subagent_file_mutation_mode,
+        SubagentFileMutationMode::Inherit
+    );
+    assert_eq!(
+        resumed_child_snapshot.sandbox_policy,
+        child_snapshot_before_shutdown.sandbox_policy
+    );
+
+    let _ = harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("resumed child shutdown should succeed");
+}
+
+#[tokio::test]
+async fn resume_agent_from_rollout_uses_latest_child_turn_context_when_state_db_is_missing() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should exist");
+    persist_thread_for_tree_resume(&parent_thread, "parent persisted").await;
+    persist_thread_for_tree_resume(&child_thread, "child persisted").await;
+    let mut latest_turn_context = child_thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .to_turn_context_item();
+    latest_turn_context.sandbox_policy = SandboxPolicy::ReadOnly {
+        access: ReadOnlyAccess::FullAccess,
+        network_access: true,
+    };
+    let expected_sandbox_policy = latest_turn_context.sandbox_policy.clone();
+    child_thread
+        .codex
+        .session
+        .persist_rollout_items(&[RolloutItem::TurnContext(latest_turn_context)])
+        .await;
+
+    let report = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert_eq!(report.submit_failed, Vec::<ThreadId>::new());
+    assert_eq!(report.timed_out, Vec::<ThreadId>::new());
+
+    tokio::fs::remove_file(codex_state::state_db_path(
+        harness.config.sqlite_home.as_path(),
+    ))
+    .await
+    .expect("state db should be removable");
+
+    let mut denied_resume_config = harness.config.clone();
+    apply_file_mutation_mode_to_config(&mut denied_resume_config, SubagentFileMutationMode::Deny)
+        .expect("deny mode should apply");
+    let resumed_thread_id = harness
+        .control
+        .resume_agent_from_rollout(denied_resume_config, child_thread_id, SessionSource::Exec)
+        .await
+        .expect("direct child resume should succeed");
+    assert_eq!(resumed_thread_id, child_thread_id);
+
+    let resumed_child_snapshot = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("resumed child thread should exist")
+        .config_snapshot()
+        .await;
+    assert_eq!(
+        resumed_child_snapshot.subagent_file_mutation_mode,
+        SubagentFileMutationMode::Inherit
+    );
+    assert_eq!(
+        resumed_child_snapshot.sandbox_policy,
+        expected_sandbox_policy
+    );
+
+    let _ = harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("resumed child shutdown should succeed");
+}
+
+#[tokio::test]
+async fn resume_agent_from_rollout_uses_session_configured_when_no_turn_context_survives() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should exist");
+    let child_snapshot = child_thread.config_snapshot().await;
+    let expected_sandbox_policy = SandboxPolicy::DangerFullAccess;
+    child_thread
+        .codex
+        .session
+        .ensure_rollout_materialized()
+        .await;
+    child_thread
+        .codex
+        .session
+        .persist_rollout_items(&[RolloutItem::EventMsg(EventMsg::SessionConfigured(
+            SessionConfiguredEvent {
+                session_id: child_thread_id,
+                forked_from_id: None,
+                thread_name: None,
+                model: child_snapshot.model.clone(),
+                model_provider_id: child_snapshot.model_provider_id.clone(),
+                service_tier: child_snapshot.service_tier,
+                approval_policy: child_snapshot.approval_policy,
+                approvals_reviewer: child_snapshot.approvals_reviewer,
+                sandbox_policy: expected_sandbox_policy.clone(),
+                cwd: child_snapshot.cwd.clone(),
+                reasoning_effort: child_snapshot.reasoning_effort,
+                history_log_id: 0,
+                history_entry_count: 0,
+                initial_messages: None,
+                network_proxy: None,
+                rollout_path: child_thread.rollout_path(),
+            },
+        ))])
+        .await;
+
+    let _ = harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("child shutdown should submit");
+
+    tokio::fs::remove_file(codex_state::state_db_path(
+        harness.config.sqlite_home.as_path(),
+    ))
+    .await
+    .expect("state db should be removable");
+
+    let mut denied_resume_config = harness.config.clone();
+    apply_file_mutation_mode_to_config(&mut denied_resume_config, SubagentFileMutationMode::Deny)
+        .expect("deny mode should apply");
+    let resumed_thread_id = harness
+        .control
+        .resume_agent_from_rollout(denied_resume_config, child_thread_id, SessionSource::Exec)
+        .await
+        .expect("direct child resume should succeed");
+    assert_eq!(resumed_thread_id, child_thread_id);
+
+    let resumed_child_snapshot = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("resumed child thread should exist")
+        .config_snapshot()
+        .await;
+    assert_eq!(
+        resumed_child_snapshot.subagent_file_mutation_mode,
+        SubagentFileMutationMode::Inherit
+    );
+    assert_eq!(
+        resumed_child_snapshot.sandbox_policy,
+        expected_sandbox_policy
+    );
+
+    let _ = harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("resumed child shutdown should succeed");
 }
 
 #[tokio::test]

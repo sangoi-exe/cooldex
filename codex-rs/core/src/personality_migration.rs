@@ -14,6 +14,8 @@ use std::path::Path;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
+// Merge-safety anchor: personality migration must keep rollout/session followers aligned with persisted subagent file-mutation mode.
+
 pub const PERSONALITY_MIGRATION_FILENAME: &str = ".personality_migration";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +178,7 @@ mod tests {
                 agent_nickname: None,
                 agent_role: None,
                 agent_path: None,
+                subagent_file_mutation_mode: Default::default(),
                 model_provider: None,
                 base_instructions: None,
                 dynamic_tools: None,

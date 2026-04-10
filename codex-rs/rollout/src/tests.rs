@@ -18,6 +18,8 @@ use time::format_description::FormatItem;
 use time::macros::format_description;
 use uuid::Uuid;
 
+// Merge-safety anchor: rollout persistence tests must keep SessionMeta fixtures aligned with persisted subagent file-mutation mode.
+
 use crate::INTERACTIVE_SESSION_SOURCES;
 use crate::find_thread_path_by_id_str;
 use crate::list::Cursor;
@@ -1142,6 +1144,7 @@ async fn test_updated_at_uses_file_mtime() -> Result<()> {
                 agent_path: None,
                 agent_nickname: None,
                 agent_role: None,
+                subagent_file_mutation_mode: Default::default(),
                 model_provider: Some("test-provider".into()),
                 base_instructions: None,
                 dynamic_tools: None,

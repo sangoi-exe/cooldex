@@ -136,6 +136,61 @@ fn with_accessible_connectors_cache_cleared<R>(f: impl FnOnce() -> R) -> R {
     result
 }
 
+// Merge-safety anchor: these follower tests lock the bounded connector-error summary contract so
+// HTML bodies stay omitted and plain-text previews stay collapsed, single-line, and truncated.
+#[test]
+fn html_connector_error_body_is_omitted_from_summary() {
+    let header_summary = summarize_connector_http_error_body(
+        Some("text/html; charset=utf-8"),
+        "<html>\n  <body>Enable JavaScript and cookies to continue</body>\n</html>",
+    );
+    assert_eq!(
+        header_summary,
+        Some(CONNECTOR_HTML_ERROR_BODY_OMITTED.to_string())
+    );
+
+    let sniffed_summary = summarize_connector_http_error_body(
+        None,
+        "  <!DOCTYPE html>\n<html><body>Cloudflare challenge</body></html>",
+    );
+    assert_eq!(
+        sniffed_summary,
+        Some(CONNECTOR_HTML_ERROR_BODY_OMITTED.to_string())
+    );
+}
+
+#[test]
+fn plain_text_connector_error_body_is_collapsed_and_truncated() {
+    let summary = summarize_connector_http_error_body(
+        Some("text/plain; charset=utf-8"),
+        "connector directory temporarily unavailable\n\nretry after refreshing the workspace session because upstream returned a verbose plain-text diagnostic that should stay concise in the warning log output",
+    )
+    .expect("plain-text summary");
+
+    assert_eq!(
+        summary.chars().count(),
+        CONNECTOR_HTTP_ERROR_PREVIEW_LIMIT + 3
+    );
+    assert!(
+        summary.starts_with(
+            "connector directory temporarily unavailable retry after refreshing the workspace session"
+        ),
+        "expected collapsed preview prefix, got {summary:?}"
+    );
+    assert!(
+        summary.ends_with("..."),
+        "expected truncation suffix, got {summary:?}"
+    );
+    assert!(
+        !summary.contains('\n'),
+        "expected single-line preview, got {summary:?}"
+    );
+    assert!(
+        !summary.contains("  "),
+        "expected collapsed whitespace preview, got {summary:?}"
+    );
+}
+
 #[test]
 fn merge_connectors_replaces_plugin_placeholder_name_with_accessible_name() {
     let plugin = plugin_app_to_app_info(AppConnectorId("calendar".to_string()));

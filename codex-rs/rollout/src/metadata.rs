@@ -29,6 +29,8 @@ use std::path::PathBuf;
 use tracing::info;
 use tracing::warn;
 
+// Merge-safety anchor: rollout metadata extraction must preserve persisted subagent file-mutation mode from SessionMeta into follower state views.
+
 const ROLLOUT_PREFIX: &str = "rollout-";
 const ROLLOUT_SUFFIX: &str = ".jsonl";
 const BACKFILL_BATCH_SIZE: usize = 200;
@@ -472,6 +474,7 @@ mod tests {
             codex_home,
             model_provider_id: "test-provider".to_string(),
             generate_memories: true,
+            subagent_file_mutation_mode: Default::default(),
         }
     }
 
@@ -496,6 +499,7 @@ mod tests {
             agent_nickname: None,
             agent_role: None,
             agent_path: None,
+            subagent_file_mutation_mode: Default::default(),
             model_provider: Some("openai".to_string()),
             base_instructions: None,
             dynamic_tools: None,
@@ -549,6 +553,7 @@ mod tests {
             agent_nickname: None,
             agent_role: None,
             agent_path: None,
+            subagent_file_mutation_mode: Default::default(),
             model_provider: Some("openai".to_string()),
             base_instructions: None,
             dynamic_tools: None,
@@ -823,6 +828,7 @@ mod tests {
             agent_nickname: None,
             agent_role: None,
             agent_path: None,
+            subagent_file_mutation_mode: Default::default(),
             model_provider: Some("test-provider".to_string()),
             base_instructions: None,
             dynamic_tools: None,

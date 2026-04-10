@@ -3,6 +3,9 @@ use crate::maybe_emit_implicit_skill_invocation;
 use crate::sandboxing::SandboxPermissions;
 use crate::shell::Shell;
 use crate::shell::get_shell_by_model_provided_path;
+use crate::subagent_file_mutation::denied_action_message;
+use crate::subagent_file_mutation::file_mutation_is_denied;
+use crate::subagent_file_mutation::shell_request_widens_file_mutation;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -37,6 +40,8 @@ use std::sync::Arc;
 
 pub struct UnifiedExecHandler;
 pub(crate) const UNIFIED_EXEC_FUNCTION_TOOL_NAME: &str = "exec_command";
+
+// Merge-safety anchor: spawn-only file-mutation denial must block write-widening unified-exec requests before approval or sandbox fallback paths run.
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ExecCommandArgs {
@@ -235,6 +240,19 @@ impl ToolHandler for UnifiedExecHandler {
                 let additional_permissions_allowed = exec_permission_approvals_enabled
                     || (session.features().enabled(Feature::RequestPermissionsTool)
                         && effective_additional_permissions.permissions_preapproved);
+                if file_mutation_is_denied(context.turn.config.as_ref())
+                    && shell_request_widens_file_mutation(
+                        effective_additional_permissions.sandbox_permissions,
+                        effective_additional_permissions
+                            .additional_permissions
+                            .as_ref(),
+                    )
+                {
+                    manager.release_process_id(process_id).await;
+                    return Err(FunctionCallError::RespondToModel(denied_action_message(
+                        "this subagent cannot request unsandboxed execution or extra filesystem write access",
+                    )));
+                }
 
                 // Sticky turn permissions have already been approved, so they should
                 // continue through the normal exec approval flow for the command.

@@ -8,9 +8,12 @@ use crate::config::DEFAULT_AGENT_MAX_DEPTH;
 use crate::function_tool::FunctionCallError;
 use crate::session_prefix::format_subagent_notification_message;
 use crate::state::TaskKind;
+use crate::subagent_file_mutation::apply_file_mutation_mode_to_config;
+use crate::subagent_file_mutation::denied_action_message;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::context::ToolOutput;
+use crate::tools::handlers::ApplyPatchHandler;
 use crate::tools::handlers::multi_agents_v2::CloseAgentHandler as CloseAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
@@ -26,6 +29,7 @@ use codex_login::CodexAuth;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::SubagentFileMutationMode;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseInputItem;
@@ -88,6 +92,49 @@ fn function_payload(args: serde_json::Value) -> ToolPayload {
 
 fn parse_agent_id(id: &str) -> ThreadId {
     ThreadId::from_string(id).expect("agent id should be valid")
+}
+
+async fn assert_child_file_mutation_denied(child_thread: &CodexThread) {
+    let snapshot = child_thread.config_snapshot().await;
+    assert_eq!(
+        snapshot.subagent_file_mutation_mode,
+        SubagentFileMutationMode::Deny
+    );
+    assert!(matches!(
+        snapshot.sandbox_policy,
+        SandboxPolicy::ReadOnly { .. }
+    ));
+    assert!(
+        !child_thread
+            .codex
+            .session
+            .new_default_turn()
+            .await
+            .file_system_sandbox_policy
+            .has_full_disk_write_access()
+    );
+
+    let child_turn = child_thread.codex.session.new_default_turn().await;
+    let err = match ApplyPatchHandler
+        .handle(invocation(
+            child_thread.codex.session.clone(),
+            child_turn,
+            "apply_patch",
+            function_payload(json!({
+                "input": "*** Begin Patch\n*** End Patch\n",
+            })),
+        ))
+        .await
+    {
+        Ok(_) => panic!("apply_patch should be rejected"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(denied_action_message(
+            "this subagent cannot apply patches",
+        ))
+    );
 }
 
 fn thread_manager() -> ThreadManager {
@@ -1795,6 +1842,531 @@ async fn spawn_agent_profile_overrides_inherited_model_and_reasoning() {
         .await;
     assert_eq!(snapshot.model, profile_model);
     assert_eq!(snapshot.reasoning_effort, Some(profile_reasoning_effort));
+}
+
+#[tokio::test]
+async fn spawn_agent_profile_can_deny_child_file_mutation() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+
+    let mut config = (*turn.config).clone();
+    let user_config_path =
+        AbsolutePathBuf::from_absolute_path(config.codex_home.join(CONFIG_TOML_FILE))
+            .expect("absolute user config path");
+    config.config_layer_stack = config.config_layer_stack.with_user_config(
+        &user_config_path,
+        toml! {
+            profiles = { recon = {
+                subagent = { file_mutation = "deny" },
+            } }
+        }
+        .into(),
+    );
+    turn.config = Arc::new(config);
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect only",
+            "profile": "recon",
+        })),
+    );
+    let output = SpawnAgentHandler
+        .handle(invocation)
+        .await
+        .expect("spawn_agent should succeed");
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let agent_id = parse_agent_id(&result.agent_id);
+    let child_thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("spawned agent thread should exist");
+    assert_child_file_mutation_denied(&child_thread).await;
+}
+
+#[tokio::test]
+async fn spawn_agent_without_profile_preserves_denied_parent_file_mutation() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+
+    let mut denied_parent_config = (*turn.config).clone();
+    apply_file_mutation_mode_to_config(&mut denied_parent_config, SubagentFileMutationMode::Deny)
+        .expect("deny mode should apply");
+    turn.sandbox_policy
+        .set(
+            denied_parent_config
+                .permissions
+                .sandbox_policy
+                .get()
+                .clone(),
+        )
+        .expect("sandbox policy set");
+    turn.file_system_sandbox_policy = denied_parent_config
+        .permissions
+        .file_system_sandbox_policy
+        .clone();
+    turn.network_sandbox_policy = denied_parent_config.permissions.network_sandbox_policy;
+    turn.config = Arc::new(denied_parent_config);
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect only",
+        })),
+    );
+    let output = SpawnAgentHandler
+        .handle(invocation)
+        .await
+        .expect("spawn_agent should succeed");
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let agent_id = parse_agent_id(&result.agent_id);
+    let child_thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("spawned agent thread should exist");
+    assert_child_file_mutation_denied(&child_thread).await;
+}
+
+#[tokio::test]
+async fn spawn_agent_profile_inherit_preserves_denied_parent_file_mutation() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+
+    let mut denied_parent_config = (*turn.config).clone();
+    let user_config_path =
+        AbsolutePathBuf::from_absolute_path(denied_parent_config.codex_home.join(CONFIG_TOML_FILE))
+            .expect("absolute user config path");
+    denied_parent_config.config_layer_stack =
+        denied_parent_config.config_layer_stack.with_user_config(
+            &user_config_path,
+            toml! {
+                profiles = { inherit-test = {
+                    subagent = { file_mutation = "inherit" },
+                } }
+            }
+            .into(),
+        );
+    apply_file_mutation_mode_to_config(&mut denied_parent_config, SubagentFileMutationMode::Deny)
+        .expect("deny mode should apply");
+    turn.sandbox_policy
+        .set(
+            denied_parent_config
+                .permissions
+                .sandbox_policy
+                .get()
+                .clone(),
+        )
+        .expect("sandbox policy set");
+    turn.file_system_sandbox_policy = denied_parent_config
+        .permissions
+        .file_system_sandbox_policy
+        .clone();
+    turn.network_sandbox_policy = denied_parent_config.permissions.network_sandbox_policy;
+    turn.config = Arc::new(denied_parent_config);
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect only",
+            "profile": "inherit-test",
+        })),
+    );
+    let output = SpawnAgentHandler
+        .handle(invocation)
+        .await
+        .expect("spawn_agent should succeed");
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let agent_id = parse_agent_id(&result.agent_id);
+    let child_thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("spawned agent thread should exist");
+    assert_child_file_mutation_denied(&child_thread).await;
+}
+
+#[tokio::test]
+async fn spawn_agent_explorer_role_preserves_denied_parent_file_mutation_without_profile() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+
+    let mut denied_parent_config = (*turn.config).clone();
+    apply_file_mutation_mode_to_config(&mut denied_parent_config, SubagentFileMutationMode::Deny)
+        .expect("deny mode should apply");
+    turn.sandbox_policy
+        .set(
+            denied_parent_config
+                .permissions
+                .sandbox_policy
+                .get()
+                .clone(),
+        )
+        .expect("sandbox policy set");
+    turn.file_system_sandbox_policy = denied_parent_config
+        .permissions
+        .file_system_sandbox_policy
+        .clone();
+    turn.network_sandbox_policy = denied_parent_config.permissions.network_sandbox_policy;
+    turn.config = Arc::new(denied_parent_config);
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect only",
+            "agent_type": "explorer",
+        })),
+    );
+    let output = SpawnAgentHandler
+        .handle(invocation)
+        .await
+        .expect("spawn_agent should succeed");
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let agent_id = parse_agent_id(&result.agent_id);
+    let child_thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("spawned agent thread should exist");
+    assert_child_file_mutation_denied(&child_thread).await;
+}
+
+#[tokio::test]
+async fn spawn_agent_explorer_role_profile_inherit_preserves_denied_parent_file_mutation() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+
+    let mut denied_parent_config = (*turn.config).clone();
+    let user_config_path =
+        AbsolutePathBuf::from_absolute_path(denied_parent_config.codex_home.join(CONFIG_TOML_FILE))
+            .expect("absolute user config path");
+    denied_parent_config.config_layer_stack =
+        denied_parent_config.config_layer_stack.with_user_config(
+            &user_config_path,
+            toml! {
+                profiles = { inherit-test = {
+                    subagent = { file_mutation = "inherit" },
+                } }
+            }
+            .into(),
+        );
+    apply_file_mutation_mode_to_config(&mut denied_parent_config, SubagentFileMutationMode::Deny)
+        .expect("deny mode should apply");
+    turn.sandbox_policy
+        .set(
+            denied_parent_config
+                .permissions
+                .sandbox_policy
+                .get()
+                .clone(),
+        )
+        .expect("sandbox policy set");
+    turn.file_system_sandbox_policy = denied_parent_config
+        .permissions
+        .file_system_sandbox_policy
+        .clone();
+    turn.network_sandbox_policy = denied_parent_config.permissions.network_sandbox_policy;
+    turn.config = Arc::new(denied_parent_config);
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect only",
+            "agent_type": "explorer",
+            "profile": "inherit-test",
+        })),
+    );
+    let output = SpawnAgentHandler
+        .handle(invocation)
+        .await
+        .expect("spawn_agent should succeed");
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let agent_id = parse_agent_id(&result.agent_id);
+    let child_thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("spawned agent thread should exist");
+    assert_child_file_mutation_denied(&child_thread).await;
+}
+
+#[tokio::test]
+async fn spawn_agent_custom_role_preserves_denied_parent_file_mutation_without_profile() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+
+    let mut denied_parent_config = (*turn.config).clone();
+    std::fs::create_dir_all(&denied_parent_config.codex_home).expect("create codex home");
+    let role_path = denied_parent_config
+        .codex_home
+        .join("custom-deny-role.toml");
+    std::fs::write(&role_path, "developer_instructions = \"role-dev\"\n")
+        .expect("write role config");
+    denied_parent_config.agent_roles.insert(
+        "custom".to_string(),
+        crate::config::AgentRoleConfig {
+            description: Some("Custom role".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    apply_file_mutation_mode_to_config(&mut denied_parent_config, SubagentFileMutationMode::Deny)
+        .expect("deny mode should apply");
+    turn.sandbox_policy
+        .set(
+            denied_parent_config
+                .permissions
+                .sandbox_policy
+                .get()
+                .clone(),
+        )
+        .expect("sandbox policy set");
+    turn.file_system_sandbox_policy = denied_parent_config
+        .permissions
+        .file_system_sandbox_policy
+        .clone();
+    turn.network_sandbox_policy = denied_parent_config.permissions.network_sandbox_policy;
+    turn.config = Arc::new(denied_parent_config);
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect only",
+            "agent_type": "custom",
+        })),
+    );
+    let output = SpawnAgentHandler
+        .handle(invocation)
+        .await
+        .expect("spawn_agent should succeed");
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let agent_id = parse_agent_id(&result.agent_id);
+    let child_thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("spawned agent thread should exist");
+    assert_child_file_mutation_denied(&child_thread).await;
+}
+
+#[tokio::test]
+async fn spawn_agent_custom_role_profile_inherit_preserves_denied_parent_file_mutation() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+
+    let mut denied_parent_config = (*turn.config).clone();
+    std::fs::create_dir_all(&denied_parent_config.codex_home).expect("create codex home");
+    let role_path = denied_parent_config
+        .codex_home
+        .join("custom-inherit-role.toml");
+    std::fs::write(&role_path, "developer_instructions = \"role-dev\"\n")
+        .expect("write role config");
+    let role_path_str = role_path.to_string_lossy().to_string();
+    let user_config_path =
+        AbsolutePathBuf::from_absolute_path(denied_parent_config.codex_home.join(CONFIG_TOML_FILE))
+            .expect("absolute user config path");
+    denied_parent_config.config_layer_stack =
+        denied_parent_config.config_layer_stack.with_user_config(
+            &user_config_path,
+            toml! {
+                profiles = { inherit-test = {
+                    subagent = { file_mutation = "inherit" },
+                } }
+                agents = { custom = {
+                    description = "Custom role",
+                    config_file = role_path_str,
+                } }
+            }
+            .into(),
+        );
+    apply_file_mutation_mode_to_config(&mut denied_parent_config, SubagentFileMutationMode::Deny)
+        .expect("deny mode should apply");
+    turn.sandbox_policy
+        .set(
+            denied_parent_config
+                .permissions
+                .sandbox_policy
+                .get()
+                .clone(),
+        )
+        .expect("sandbox policy set");
+    turn.file_system_sandbox_policy = denied_parent_config
+        .permissions
+        .file_system_sandbox_policy
+        .clone();
+    turn.network_sandbox_policy = denied_parent_config.permissions.network_sandbox_policy;
+    turn.config = Arc::new(denied_parent_config);
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect only",
+            "agent_type": "custom",
+            "profile": "inherit-test",
+        })),
+    );
+    let output = SpawnAgentHandler
+        .handle(invocation)
+        .await
+        .expect("spawn_agent should succeed");
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let agent_id = parse_agent_id(&result.agent_id);
+    let child_thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("spawned agent thread should exist");
+    assert_child_file_mutation_denied(&child_thread).await;
+}
+
+#[tokio::test]
+async fn spawn_agent_v2_custom_role_preserves_denied_parent_file_mutation() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        task_name: String,
+        nickname: String,
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.conversation_id = root.thread_id;
+
+    let mut denied_parent_config = (*turn.config).clone();
+    std::fs::create_dir_all(&denied_parent_config.codex_home).expect("create codex home");
+    let role_path = denied_parent_config.codex_home.join("custom-v2-role.toml");
+    std::fs::write(&role_path, "developer_instructions = \"role-dev\"\n")
+        .expect("write role config");
+    denied_parent_config.agent_roles.insert(
+        "custom".to_string(),
+        crate::config::AgentRoleConfig {
+            description: Some("Custom role".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    apply_file_mutation_mode_to_config(&mut denied_parent_config, SubagentFileMutationMode::Deny)
+        .expect("deny mode should apply");
+    turn.sandbox_policy
+        .set(
+            denied_parent_config
+                .permissions
+                .sandbox_policy
+                .get()
+                .clone(),
+        )
+        .expect("sandbox policy set");
+    turn.file_system_sandbox_policy = denied_parent_config
+        .permissions
+        .file_system_sandbox_policy
+        .clone();
+    turn.network_sandbox_policy = denied_parent_config.permissions.network_sandbox_policy;
+    denied_parent_config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    turn.config = Arc::new(denied_parent_config);
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let output = SpawnAgentHandlerV2
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect only",
+                "task_name": "deny_task",
+                "agent_type": "custom",
+            })),
+        ))
+        .await
+        .expect("spawn_agent v2 should succeed");
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    assert_eq!(result.task_name, "/root/deny_task");
+    let _nickname = result.nickname;
+
+    let agent_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.conversation_id, &turn.session_source, "deny_task")
+        .await
+        .expect("spawned v2 agent should be discoverable by task name");
+    let child_thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("spawned agent thread should exist");
+    assert_child_file_mutation_denied(&child_thread).await;
 }
 
 #[tokio::test]

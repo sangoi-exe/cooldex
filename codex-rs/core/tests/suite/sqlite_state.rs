@@ -36,6 +36,8 @@ use tokio::time::Duration;
 use tracing_subscriber::prelude::*;
 use uuid::Uuid;
 
+// Merge-safety anchor: sqlite/rollout followers must keep SessionMeta fixtures aligned with persisted subagent file-mutation mode.
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_thread_is_recorded_in_state_db() -> Result<()> {
     let server = start_mock_server().await;
@@ -145,6 +147,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                     agent_path: None,
                     agent_nickname: None,
                     agent_role: None,
+                    subagent_file_mutation_mode: Default::default(),
                     model_provider: None,
                     base_instructions: None,
                     dynamic_tools: Some(dynamic_tools_for_hook),

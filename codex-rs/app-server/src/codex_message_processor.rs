@@ -9482,6 +9482,8 @@ mod tests {
             model: "gpt-5".to_string(),
             model_provider_id: "openai".to_string(),
             service_tier: Some(codex_protocol::config_types::ServiceTier::Flex),
+            subagent_file_mutation_mode:
+                codex_protocol::config_types::SubagentFileMutationMode::Inherit,
             approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
             approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
             sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,

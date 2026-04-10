@@ -70,6 +70,18 @@ pub enum SandboxMode {
 }
 
 #[derive(
+    Debug, Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+// Merge-safety anchor: this spawn-only enum is the canonical persisted contract for child file-mutation denial across profile, rollout, and resume seams.
+pub enum SubagentFileMutationMode {
+    #[default]
+    Inherit,
+    Deny,
+}
+
+#[derive(
     Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Display, JsonSchema, TS,
 )]
 #[serde(rename_all = "snake_case")]

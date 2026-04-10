@@ -12,6 +12,7 @@ use crate::agent::role::apply_role_to_config;
 use crate::tools::handlers::multi_agents::collab_spawn_error;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_overrides;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_runtime_overrides;
+use crate::tools::handlers::multi_agents_common::apply_spawn_agent_subagent_overrides;
 use crate::tools::handlers::multi_agents_common::build_agent_spawn_config;
 use crate::tools::handlers::multi_agents_common::finalize_spawn_agent_prompt_config;
 use crate::tools::handlers::multi_agents_common::parse_collab_input;
@@ -69,6 +70,7 @@ impl ToolHandler for Handler {
             ));
         }
         let mut config = build_agent_spawn_config(turn.as_ref())?;
+        let subagent_file_mutation_mode = config.subagent_file_mutation_mode;
         apply_requested_spawn_agent_model_overrides(
             &session,
             turn.as_ref(),
@@ -81,6 +83,7 @@ impl ToolHandler for Handler {
             .await
             .map_err(FunctionCallError::RespondToModel)?;
         apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+        apply_spawn_agent_subagent_overrides(&mut config, subagent_file_mutation_mode)?;
         finalize_spawn_agent_prompt_config(
             &mut config,
             turn.as_ref(),

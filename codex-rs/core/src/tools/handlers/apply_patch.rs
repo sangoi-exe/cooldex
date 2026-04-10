@@ -6,6 +6,8 @@ use crate::apply_patch::convert_apply_patch_to_protocol;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
+use crate::subagent_file_mutation::denied_action_message;
+use crate::subagent_file_mutation::file_mutation_is_denied;
 use crate::tools::context::ApplyPatchToolOutput;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -168,6 +170,11 @@ impl ToolHandler for ApplyPatchHandler {
                 ));
             }
         };
+        if file_mutation_is_denied(turn.config.as_ref()) {
+            return Err(FunctionCallError::RespondToModel(denied_action_message(
+                "this subagent cannot apply patches",
+            )));
+        }
 
         // Re-parse and verify the patch so we can compute changes and approval.
         // Avoid building temporary ExecParams/command vectors; derive directly from inputs.
@@ -276,6 +283,11 @@ pub(crate) async fn intercept_apply_patch(
     call_id: &str,
     tool_name: &str,
 ) -> Result<Option<FunctionToolOutput>, FunctionCallError> {
+    if file_mutation_is_denied(turn.config.as_ref()) {
+        return Err(FunctionCallError::RespondToModel(denied_action_message(
+            "this subagent cannot apply patches",
+        )));
+    }
     match codex_apply_patch::maybe_parse_apply_patch_verified(command, cwd, fs).await {
         codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
             session
