@@ -2544,13 +2544,14 @@ impl AuthManager {
                         switched_to_store_account_id,
                     } => {
                         let auth_after_removal = self.auth_cached();
+                        let active_store_account_id_after_removal = auth_after_removal
+                            .as_ref()
+                            .and_then(CodexAuth::active_chatgpt_account_summary)
+                            .map(|summary| summary.store_account_id);
                         if let Some(switched_to_store_account_id) =
                             switched_to_store_account_id.as_deref()
                             && Some(switched_to_store_account_id)
-                                == auth_after_removal
-                                    .as_ref()
-                                    .and_then(CodexAuth::get_account_id)
-                                    .as_deref()
+                                == active_store_account_id_after_removal.as_deref()
                         {
                             tracing::info!(
                                 removed_store_account_id = chatgpt_auth.store_account_id(),

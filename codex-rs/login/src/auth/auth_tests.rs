@@ -597,6 +597,60 @@ async fn unauthorized_recovery_drops_invalidated_active_account_and_switches_to_
 }
 
 #[tokio::test]
+async fn refresh_token_from_authority_succeeds_when_terminal_failure_switches_to_fallback_store_account()
+ {
+    let codex_home = tempdir().unwrap();
+    let active_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-primary", "org-fallback"], 0);
+    let fallback_store_account_id =
+        test_store_account_id("org-fallback").expect("fallback store account id");
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let auth = manager.auth_cached().expect("auth should be cached");
+    let error = RefreshTokenFailedError::new(
+        RefreshTokenFailedReason::Revoked,
+        "refresh token invalidated",
+    );
+    manager.record_permanent_refresh_failure_if_unchanged(&auth, &error);
+
+    manager
+        .refresh_token_from_authority()
+        .await
+        .expect("refresh should succeed by switching to fallback");
+
+    let cached_auth = manager
+        .auth_cached()
+        .expect("fallback auth should be cached");
+    let active_account = cached_auth
+        .active_chatgpt_account_summary()
+        .expect("fallback account should be active");
+    assert_eq!(active_account.store_account_id, fallback_store_account_id);
+    assert_eq!(
+        cached_auth.get_account_id().as_deref(),
+        Some("org-fallback")
+    );
+    assert_ne!(
+        cached_auth.get_account_id().as_deref(),
+        Some(fallback_store_account_id.as_str())
+    );
+
+    let accounts = manager.list_accounts();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].id, fallback_store_account_id);
+    assert!(accounts[0].is_active);
+    assert!(
+        accounts
+            .iter()
+            .all(|account| account.id != active_store_account_id),
+        "the invalidated account should be removed from the saved store"
+    );
+    assert_eq!(manager.refresh_failure_for_auth(&cached_auth), None);
+}
+
+#[tokio::test]
 async fn auth_does_not_revive_removed_auth_after_terminal_refresh_failure() {
     let codex_home = tempdir().unwrap();
     persist_test_chatgpt_accounts_with_last_refresh(
