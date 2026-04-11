@@ -5,6 +5,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use ts_rs::TS;
 
+use crate::ThreadId;
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct RequestUserInputQuestionOption {
     pub label: String,
@@ -51,5 +53,8 @@ pub struct RequestUserInputEvent {
     /// Uses `#[serde(default)]` for backwards compatibility.
     #[serde(default)]
     pub turn_id: String,
+    /// Thread owner for app-server-backed requests. Direct-core requests omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<ThreadId>,
     pub questions: Vec<RequestUserInputQuestion>,
 }

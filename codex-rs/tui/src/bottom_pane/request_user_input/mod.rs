@@ -748,6 +748,7 @@ impl RequestUserInputOverlay {
         }
         self.app_event_tx.user_input_answer(
             self.request.turn_id.clone(),
+            self.request.thread_id,
             RequestUserInputResponse {
                 answers: answers.clone(),
             },
@@ -1281,6 +1282,7 @@ mod tests {
     use crate::app_event::AppEvent;
     use crate::bottom_pane::selection_popup_common::menu_surface_inset;
     use crate::render::renderable::Renderable;
+    use codex_protocol::ThreadId;
     use codex_protocol::request_user_input::RequestUserInputQuestion;
     use codex_protocol::request_user_input::RequestUserInputQuestionOption;
     use pretty_assertions::assert_eq;
@@ -1457,6 +1459,7 @@ mod tests {
         RequestUserInputEvent {
             call_id: "call-1".to_string(),
             turn_id: turn_id.to_string(),
+            thread_id: None,
             questions,
         }
     }
@@ -1518,11 +1521,13 @@ mod tests {
         overlay.try_consume_user_input_request(RequestUserInputEvent {
             call_id: "call-2".to_string(),
             turn_id: "turn-2".to_string(),
+            thread_id: None,
             questions: vec![question_with_options("q2", "Second")],
         });
         overlay.try_consume_user_input_request(RequestUserInputEvent {
             call_id: "call-3".to_string(),
             turn_id: "turn-3".to_string(),
+            thread_id: None,
             questions: vec![question_with_options("q3", "Third")],
         });
 
@@ -1549,6 +1554,42 @@ mod tests {
         let AppEvent::CodexOp(Op::UserInputAnswer { id, response, .. }) = event else {
             panic!("expected UserInputAnswer");
         };
+        assert_eq!(id, "turn-1");
+        let answer = response.answers.get("q1").expect("answer missing");
+        assert_eq!(answer.answers, Vec::<String>::new());
+    }
+
+    #[test]
+    fn app_server_request_answers_route_back_to_origin_thread() {
+        let (tx, mut rx) = test_sender();
+        let thread_id = ThreadId::new();
+        let mut overlay = RequestUserInputOverlay::new(
+            RequestUserInputEvent {
+                call_id: "call-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                thread_id: Some(thread_id),
+                questions: vec![question_with_options("q1", "Pick one")],
+            },
+            tx,
+            /*has_input_focus*/ true,
+            /*enhanced_keys_supported*/ false,
+            /*disable_paste_burst*/ false,
+        );
+
+        overlay.submit_answers();
+
+        let event = rx.try_recv().expect("expected AppEvent");
+        let AppEvent::SubmitThreadOp {
+            thread_id: routed_thread_id,
+            op,
+        } = event
+        else {
+            panic!("expected SubmitThreadOp");
+        };
+        let Op::UserInputAnswer { id, response } = op else {
+            panic!("expected UserInputAnswer");
+        };
+        assert_eq!(routed_thread_id, thread_id);
         assert_eq!(id, "turn-1");
         let answer = response.answers.get("q1").expect("answer missing");
         assert_eq!(answer.answers, Vec::<String>::new());

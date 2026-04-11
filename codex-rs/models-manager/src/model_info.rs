@@ -119,14 +119,16 @@ fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::test_config;
+    use crate::ModelsManagerConfig;
     use pretty_assertions::assert_eq;
 
     #[test]
     fn reasoning_summaries_override_true_enables_support() {
         let model = model_info_from_slug("unknown-model");
-        let mut config = test_config();
-        config.model_supports_reasoning_summaries = Some(true);
+        let config = ModelsManagerConfig {
+            model_supports_reasoning_summaries: Some(true),
+            ..Default::default()
+        };
 
         let updated = with_config_overrides(model.clone(), &config);
         let mut expected = model;
@@ -139,8 +141,10 @@ mod tests {
     fn reasoning_summaries_override_false_does_not_disable_support() {
         let mut model = model_info_from_slug("unknown-model");
         model.supports_reasoning_summaries = true;
-        let mut config = test_config();
-        config.model_supports_reasoning_summaries = Some(false);
+        let config = ModelsManagerConfig {
+            model_supports_reasoning_summaries: Some(false),
+            ..Default::default()
+        };
 
         let updated = with_config_overrides(model.clone(), &config);
 
@@ -150,8 +154,10 @@ mod tests {
     #[test]
     fn reasoning_summaries_override_false_is_noop_when_model_is_false() {
         let model = model_info_from_slug("unknown-model");
-        let mut config = test_config();
-        config.model_supports_reasoning_summaries = Some(false);
+        let config = ModelsManagerConfig {
+            model_supports_reasoning_summaries: Some(false),
+            ..Default::default()
+        };
 
         let updated = with_config_overrides(model.clone(), &config);
 
@@ -163,8 +169,10 @@ mod tests {
         let mut model = model_info_from_slug("gpt-5.3-codex");
         model.used_fallback_model_metadata = false;
         model.context_window = Some(272_000);
-        let mut config = test_config();
-        config.model_context_window = Some(1_000_000);
+        let config = ModelsManagerConfig {
+            model_context_window: Some(1_000_000),
+            ..Default::default()
+        };
 
         let updated = with_config_overrides(model, &config);
 
@@ -176,8 +184,10 @@ mod tests {
         let mut model = model_info_from_slug("gpt-5.3-codex");
         model.used_fallback_model_metadata = false;
         model.context_window = Some(272_000);
-        let mut config = test_config();
-        config.model_context_window = Some(200_000);
+        let config = ModelsManagerConfig {
+            model_context_window: Some(200_000),
+            ..Default::default()
+        };
 
         let updated = with_config_overrides(model, &config);
 
@@ -187,8 +197,10 @@ mod tests {
     #[test]
     fn context_window_override_is_used_for_fallback_metadata() {
         let model = model_info_from_slug("unknown-model");
-        let mut config = test_config();
-        config.model_context_window = Some(1_000_000);
+        let config = ModelsManagerConfig {
+            model_context_window: Some(1_000_000),
+            ..Default::default()
+        };
 
         let updated = with_config_overrides(model, &config);
 

@@ -338,6 +338,7 @@ async fn user_input_notification_overrides_pending_agent_turn_complete_notificat
     chat.handle_request_user_input_now(RequestUserInputEvent {
         call_id: "call-1".to_string(),
         turn_id: "turn-1".to_string(),
+        thread_id: None,
         questions: vec![RequestUserInputQuestion {
             id: "reasoning_scope".to_string(),
             header: "Reasoning scope".to_string(),
@@ -368,6 +369,7 @@ async fn handle_request_user_input_sets_pending_notification() {
     chat.handle_request_user_input_now(RequestUserInputEvent {
         call_id: "call-1".to_string(),
         turn_id: "turn-1".to_string(),
+        thread_id: None,
         questions: vec![RequestUserInputQuestion {
             id: "reasoning_scope".to_string(),
             header: "Reasoning scope".to_string(),

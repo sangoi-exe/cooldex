@@ -3421,6 +3421,7 @@ impl Session {
         let event = EventMsg::RequestUserInput(RequestUserInputEvent {
             call_id,
             turn_id: turn_context.sub_id.clone(),
+            thread_id: None,
             questions: args.questions,
         });
         self.send_event(turn_context, event).await;

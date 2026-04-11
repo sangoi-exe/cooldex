@@ -104,7 +104,6 @@ pub struct ReasoningEffortPreset {
 pub struct ModelUpgrade {
     pub id: String,
     pub reasoning_effort_mapping: Option<HashMap<ReasoningEffort, ReasoningEffort>>,
-    pub migration_config_key: String,
     pub model_link: Option<String>,
     pub upgrade_copy: Option<String>,
     pub migration_markdown: Option<String>,
@@ -441,7 +440,6 @@ impl From<ModelInfo> for ModelPreset {
                 reasoning_effort_mapping: reasoning_effort_mapping_from_presets(
                     &info.supported_reasoning_levels,
                 ),
-                migration_config_key: info.slug.clone(),
                 // todo(aibrahim): add the model link here.
                 model_link: None,
                 upgrade_copy: None,

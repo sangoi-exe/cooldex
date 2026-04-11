@@ -1110,14 +1110,6 @@
           "description": "Tracks whether the user has acknowledged the full access warning prompt.",
           "type": "boolean"
         },
-        "hide_gpt-5.1-codex-max_migration_prompt": {
-          "description": "Tracks whether the user has seen the gpt-5.1-codex-max migration prompt",
-          "type": "boolean"
-        },
-        "hide_gpt5_1_migration_prompt": {
-          "description": "Tracks whether the user has seen the model migration prompt",
-          "type": "boolean"
-        },
         "hide_rate_limit_model_nudge": {
           "description": "Tracks whether the user opted out of the rate limit model switch reminder.",
           "type": "boolean"

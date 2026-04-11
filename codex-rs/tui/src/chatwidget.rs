@@ -1880,9 +1880,14 @@ fn request_permissions_from_params(
 }
 
 fn request_user_input_from_params(params: ToolRequestUserInputParams) -> RequestUserInputEvent {
+    let thread_id = match ThreadId::from_string(&params.thread_id) {
+        Ok(thread_id) => thread_id,
+        Err(err) => panic!("app-server request_user_input thread_id should be valid: {err}"),
+    };
     RequestUserInputEvent {
         turn_id: params.turn_id,
         call_id: params.item_id,
+        thread_id: Some(thread_id),
         questions: params
             .questions
             .into_iter()

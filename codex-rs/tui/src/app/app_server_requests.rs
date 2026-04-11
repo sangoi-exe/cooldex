@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 
 use crate::app_command::AppCommand;
 use crate::app_command::AppCommandView;
@@ -32,7 +33,7 @@ pub(super) struct PendingAppServerRequests {
     exec_approvals: HashMap<String, AppServerRequestId>,
     file_change_approvals: HashMap<String, AppServerRequestId>,
     permissions_approvals: HashMap<String, AppServerRequestId>,
-    user_inputs: HashMap<String, AppServerRequestId>,
+    user_inputs: HashMap<ThreadTurnKey, VecDeque<AppServerRequestId>>,
     mcp_requests: HashMap<McpLegacyRequestKey, AppServerRequestId>,
 }
 
@@ -70,7 +71,12 @@ impl PendingAppServerRequests {
             }
             ServerRequest::ToolRequestUserInput { request_id, params } => {
                 self.user_inputs
-                    .insert(params.turn_id.clone(), request_id.clone());
+                    .entry(ThreadTurnKey {
+                        thread_id: params.thread_id.clone(),
+                        turn_id: params.turn_id.clone(),
+                    })
+                    .or_default()
+                    .push_back(request_id.clone());
                 None
             }
             ServerRequest::McpServerElicitationRequest { request_id, params } => {
@@ -109,6 +115,7 @@ impl PendingAppServerRequests {
 
     pub(super) fn take_resolution<T>(
         &mut self,
+        thread_id: &str,
         op: T,
     ) -> Result<Option<AppServerRequestResolution>, String>
     where
@@ -126,7 +133,9 @@ impl PendingAppServerRequests {
                             decision: decision.clone().into(),
                         })
                         .map_err(|err| {
-                            format!("failed to serialize command execution approval response: {err}")
+                            format!(
+                                "failed to serialize command execution approval response: {err}"
+                            )
                         })?,
                     })
                 })
@@ -164,30 +173,47 @@ impl PendingAppServerRequests {
                     })
                 })
                 .transpose()?,
-            AppCommandView::UserInputAnswer { id, response } => self
-                .user_inputs
-                .remove(id)
-                .map(|request_id| {
-                    Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
-                        request_id,
-                        result: serde_json::to_value(
-                            serde_json::from_value::<ToolRequestUserInputResponse>(
-                                serde_json::to_value(response).map_err(|err| {
-                                    format!("failed to encode request_user_input response: {err}")
+            AppCommandView::UserInputAnswer { id, response } => {
+                let user_input_key = ThreadTurnKey {
+                    thread_id: thread_id.to_string(),
+                    turn_id: id.to_string(),
+                };
+                let resolution = self
+                    .user_inputs
+                    .get_mut(&user_input_key)
+                    .and_then(VecDeque::pop_front)
+                    .map(|request_id| {
+                        Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
+                            request_id,
+                            result: serde_json::to_value(
+                                serde_json::from_value::<ToolRequestUserInputResponse>(
+                                    serde_json::to_value(response).map_err(|err| {
+                                        format!(
+                                            "failed to encode request_user_input response: {err}"
+                                        )
+                                    })?,
+                                )
+                                .map_err(|err| {
+                                    format!(
+                                        "failed to decode request_user_input response for app-server: {err}"
+                                    )
                                 })?,
                             )
                             .map_err(|err| {
-                                format!(
-                                    "failed to decode request_user_input response for app-server: {err}"
-                                )
+                                format!("failed to serialize request_user_input response: {err}")
                             })?,
-                        )
-                        .map_err(|err| {
-                            format!("failed to serialize request_user_input response: {err}")
-                        })?,
+                        })
                     })
-                })
-                .transpose()?,
+                    .transpose()?;
+                if self
+                    .user_inputs
+                    .get(&user_input_key)
+                    .is_some_and(VecDeque::is_empty)
+                {
+                    self.user_inputs.remove(&user_input_key);
+                }
+                resolution
+            }
             AppCommandView::ResolveElicitation {
                 server_name,
                 request_id,
@@ -235,7 +261,10 @@ impl PendingAppServerRequests {
             .retain(|_, value| value != request_id);
         self.permissions_approvals
             .retain(|_, value| value != request_id);
-        self.user_inputs.retain(|_, value| value != request_id);
+        self.user_inputs.retain(|_, request_ids| {
+            request_ids.retain(|value| value != request_id);
+            !request_ids.is_empty()
+        });
         self.mcp_requests.retain(|_, value| value != request_id);
     }
 }
@@ -244,6 +273,12 @@ impl PendingAppServerRequests {
 struct McpLegacyRequestKey {
     server_name: String,
     request_id: McpRequestId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ThreadTurnKey {
+    thread_id: String,
+    turn_id: String,
 }
 
 fn app_server_request_id_to_mcp_request_id(request_id: &AppServerRequestId) -> McpRequestId {
@@ -326,7 +361,7 @@ mod tests {
         assert_eq!(pending.note_server_request(&request), None);
 
         let resolution = pending
-            .take_resolution(&Op::ExecApproval {
+            .take_resolution("thread-1", &Op::ExecApproval {
                 id: "approval-1".to_string(),
                 turn_id: None,
                 decision: ReviewDecision::Approved,
@@ -385,7 +420,7 @@ mod tests {
         );
 
         let permissions = pending
-            .take_resolution(&Op::RequestPermissionsResponse {
+            .take_resolution("thread-1", &Op::RequestPermissionsResponse {
                 id: "perm-1".to_string(),
                 response: codex_protocol::request_permissions::RequestPermissionsResponse {
                     permissions: RequestPermissionProfile {
@@ -421,7 +456,7 @@ mod tests {
         );
 
         let user_input = pending
-            .take_resolution(&Op::UserInputAnswer {
+            .take_resolution("thread-1", &Op::UserInputAnswer {
                 id: "turn-2".to_string(),
                 response: codex_protocol::request_user_input::RequestUserInputResponse {
                     answers: std::iter::once((
@@ -452,6 +487,88 @@ mod tests {
     }
 
     #[test]
+    fn resolves_same_turn_user_input_requests_in_fifo_order() {
+        let mut pending = PendingAppServerRequests::default();
+        for request_id in [8, 9] {
+            assert_eq!(
+                pending.note_server_request(&ServerRequest::ToolRequestUserInput {
+                    request_id: AppServerRequestId::Integer(request_id),
+                    params: ToolRequestUserInputParams {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-2".to_string(),
+                        item_id: format!("tool-{request_id}"),
+                        questions: Vec::new(),
+                    },
+                }),
+                None
+            );
+        }
+
+        let first = pending
+            .take_resolution("thread-1", &Op::UserInputAnswer {
+                id: "turn-2".to_string(),
+                response: codex_protocol::request_user_input::RequestUserInputResponse {
+                    answers: std::collections::HashMap::new(),
+                },
+            })
+            .expect("first response should serialize")
+            .expect("first request should be pending");
+        assert_eq!(first.request_id, AppServerRequestId::Integer(8));
+
+        let second = pending
+            .take_resolution("thread-1", &Op::UserInputAnswer {
+                id: "turn-2".to_string(),
+                response: codex_protocol::request_user_input::RequestUserInputResponse {
+                    answers: std::collections::HashMap::new(),
+                },
+            })
+            .expect("second response should serialize")
+            .expect("second request should be pending");
+        assert_eq!(second.request_id, AppServerRequestId::Integer(9));
+    }
+
+    #[test]
+    fn resolves_same_turn_user_input_requests_per_thread() {
+        let mut pending = PendingAppServerRequests::default();
+        for (request_id, thread_id) in [(8, "thread-1"), (9, "thread-2")] {
+            assert_eq!(
+                pending.note_server_request(&ServerRequest::ToolRequestUserInput {
+                    request_id: AppServerRequestId::Integer(request_id),
+                    params: ToolRequestUserInputParams {
+                        thread_id: thread_id.to_string(),
+                        turn_id: "turn-2".to_string(),
+                        item_id: format!("tool-{request_id}"),
+                        questions: Vec::new(),
+                    },
+                }),
+                None
+            );
+        }
+
+        let second_thread = pending
+            .take_resolution("thread-2", &Op::UserInputAnswer {
+                id: "turn-2".to_string(),
+                response: codex_protocol::request_user_input::RequestUserInputResponse {
+                    answers: std::collections::HashMap::new(),
+                },
+            })
+            .expect("second-thread response should serialize")
+            .expect("second-thread request should be pending");
+        assert_eq!(second_thread.request_id, AppServerRequestId::Integer(9));
+
+        let first_thread = pending
+            .take_resolution("thread-1", &Op::UserInputAnswer {
+                id: "turn-2".to_string(),
+                response: codex_protocol::request_user_input::RequestUserInputResponse {
+                    answers: std::collections::HashMap::new(),
+                },
+            })
+            .expect("first-thread response should serialize")
+            .expect("first-thread request should be pending");
+        assert_eq!(first_thread.request_id, AppServerRequestId::Integer(8));
+    }
+
+    #[test]
     fn correlates_mcp_elicitation_server_request_with_resolution() {
         let mut pending = PendingAppServerRequests::default();
 
@@ -478,7 +595,7 @@ mod tests {
         );
 
         let resolution = pending
-            .take_resolution(&Op::ResolveElicitation {
+            .take_resolution("thread-1", &Op::ResolveElicitation {
                 server_name: "example".to_string(),
                 request_id: McpRequestId::Integer(12),
                 decision: ElicitationAction::Accept,
@@ -556,7 +673,7 @@ mod tests {
         );
 
         let error = pending
-            .take_resolution(&Op::PatchApproval {
+            .take_resolution("thread-1", &Op::PatchApproval {
                 id: "patch-1".to_string(),
                 decision: ReviewDecision::ApprovedExecpolicyAmendment {
                     proposed_execpolicy_amendment: ExecPolicyAmendment::new(vec![

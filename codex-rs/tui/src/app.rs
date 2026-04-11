@@ -113,8 +113,6 @@ use codex_login::ChatgptAccountRefreshMode;
 use codex_login::ServerOptions;
 use codex_login::run_login_server;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
-use codex_models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
-use codex_models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
@@ -141,6 +139,9 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillErrorInfo;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
+use codex_protocol::request_user_input::RequestUserInputEvent;
+use codex_protocol::request_user_input::RequestUserInputQuestion;
+use codex_protocol::request_user_input::RequestUserInputQuestionOption;
 use codex_terminal_detection::user_agent;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use color_eyre::eyre::Result;
@@ -228,6 +229,7 @@ const ACCOUNTS_RATE_LIMIT_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 enum ThreadInteractiveRequest {
     Approval(ApprovalRequest),
     McpServerElicitation(McpServerElicitationFormRequest),
+    UserInput(RequestUserInputEvent),
 }
 
 fn app_server_request_id_to_mcp_request_id(
@@ -993,19 +995,6 @@ fn should_show_model_migration_prompt(
     false
 }
 
-fn migration_prompt_hidden(config: &Config, migration_config_key: &str) -> bool {
-    match migration_config_key {
-        HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG => config
-            .notices
-            .hide_gpt_5_1_codex_max_migration_prompt
-            .unwrap_or(false),
-        HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG => {
-            config.notices.hide_gpt5_1_migration_prompt.unwrap_or(false)
-        }
-        _ => false,
-    }
-}
-
 fn target_preset_for_upgrade<'a>(
     available_models: &'a [ModelPreset],
     target_model: &str,
@@ -1095,16 +1084,11 @@ async fn handle_model_migration_prompt_if_needed(
     if let Some(ModelUpgrade {
         id: target_model,
         reasoning_effort_mapping,
-        migration_config_key,
         model_link,
         upgrade_copy,
         migration_markdown,
     }) = upgrade
     {
-        if migration_prompt_hidden(config, migration_config_key.as_str()) {
-            return None;
-        }
-
         let target_model = target_model.to_string();
         if !should_show_model_migration_prompt(
             model,
@@ -2376,6 +2360,34 @@ impl App {
                     ))
                 }
             }
+            ServerRequest::ToolRequestUserInput { params, .. } => {
+                Some(ThreadInteractiveRequest::UserInput(RequestUserInputEvent {
+                    call_id: params.item_id.clone(),
+                    turn_id: params.turn_id.clone(),
+                    thread_id: Some(thread_id),
+                    questions: params
+                        .questions
+                        .clone()
+                        .into_iter()
+                        .map(|question| RequestUserInputQuestion {
+                            id: question.id,
+                            header: question.header,
+                            question: question.question,
+                            is_other: question.is_other,
+                            is_secret: question.is_secret,
+                            options: question.options.map(|options| {
+                                options
+                                    .into_iter()
+                                    .map(|option| RequestUserInputQuestionOption {
+                                        label: option.label,
+                                        description: option.description,
+                                    })
+                                    .collect()
+                            }),
+                        })
+                        .collect(),
+                }))
+            }
             ServerRequest::PermissionsRequestApproval { params, .. } => Some(
                 ThreadInteractiveRequest::Approval(ApprovalRequest::Permissions {
                     thread_id,
@@ -3036,7 +3048,7 @@ impl App {
     ) -> Result<bool> {
         let Some(resolution) = self
             .pending_app_server_requests
-            .take_resolution(op)
+            .take_resolution(&thread_id.to_string(), op)
             .map_err(|err| color_eyre::eyre::eyre!(err))?
         else {
             return Ok(false);
@@ -3271,6 +3283,9 @@ impl App {
                 ThreadInteractiveRequest::McpServerElicitation(request) => {
                     self.chat_widget
                         .push_mcp_server_elicitation_request(request);
+                }
+                ThreadInteractiveRequest::UserInput(request) => {
+                    self.chat_widget.handle_request_user_input_now(request);
                 }
             }
         }
@@ -10759,6 +10774,49 @@ guardian_approval = true
     }
 
     #[tokio::test]
+    async fn inactive_thread_request_user_input_bubbles_into_active_view() -> Result<()> {
+        let mut app = make_test_app().await;
+        let main_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000011").expect("valid thread");
+        let agent_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000022").expect("valid thread");
+
+        app.primary_thread_id = Some(main_thread_id);
+        app.active_thread_id = Some(main_thread_id);
+        app.thread_event_channels
+            .insert(main_thread_id, ThreadEventChannel::new(/*capacity*/ 1));
+        app.thread_event_channels.insert(
+            agent_thread_id,
+            ThreadEventChannel::new_with_session(
+                /*capacity*/ 1,
+                ThreadSessionState {
+                    approval_policy: AskForApproval::OnRequest,
+                    sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+                    rollout_path: Some(PathBuf::from("/tmp/agent-rollout.jsonl")),
+                    ..test_thread_session(agent_thread_id, PathBuf::from("/tmp/agent"))
+                },
+                Vec::new(),
+            ),
+        );
+        app.agent_navigation.upsert(
+            agent_thread_id,
+            Some("Robie".to_string()),
+            Some("explorer".to_string()),
+            /*is_closed*/ false,
+        );
+
+        app.enqueue_thread_request(
+            agent_thread_id,
+            request_user_input_request(agent_thread_id, "turn-input", "call-input"),
+        )
+        .await?;
+
+        assert!(app.chat_widget.has_active_view());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn inactive_thread_exec_approval_preserves_context() {
         let app = make_test_app().await;
         let thread_id = ThreadId::new();
@@ -11894,6 +11952,34 @@ guardian_approval = true
         }
     }
 
+    fn request_user_input_request(
+        thread_id: ThreadId,
+        turn_id: &str,
+        item_id: &str,
+    ) -> ServerRequest {
+        ServerRequest::ToolRequestUserInput {
+            request_id: AppServerRequestId::Integer(99),
+            params: codex_app_server_protocol::ToolRequestUserInputParams {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                item_id: item_id.to_string(),
+                questions: vec![codex_app_server_protocol::ToolRequestUserInputQuestion {
+                    id: "question-1".to_string(),
+                    header: "Confirm".to_string(),
+                    question: "Continue?".to_string(),
+                    is_other: false,
+                    is_secret: false,
+                    options: Some(vec![
+                        codex_app_server_protocol::ToolRequestUserInputOption {
+                            label: "Yes".to_string(),
+                            description: "Continue the current plan.".to_string(),
+                        },
+                    ]),
+                }],
+            },
+        }
+    }
+
     #[test]
     fn thread_event_store_tracks_active_turn_lifecycle() {
         let mut store = ThreadEventStore::new(/*capacity*/ 8);
@@ -12427,7 +12513,7 @@ guardian_approval = true
     }
 
     #[tokio::test]
-    async fn model_migration_prompt_respects_hide_flag_and_self_target() {
+    async fn model_migration_prompt_respects_seen_mapping_and_self_target() {
         let mut seen = BTreeMap::new();
         seen.insert("gpt-5".to_string(), "gpt-5.1".to_string());
         assert!(!should_show_model_migration_prompt(
@@ -12455,7 +12541,6 @@ guardian_approval = true
         current.upgrade = Some(ModelUpgrade {
             id: "missing-target".to_string(),
             reasoning_effort_mapping: None,
-            migration_config_key: HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG.to_string(),
             model_link: None,
             upgrade_copy: None,
             migration_markdown: None,
