@@ -11,10 +11,12 @@ use crate::render::Insets;
 use crate::render::RectExt;
 use crate::slash_command::SlashCommand;
 
+// Merge-safety anchor: popup filtering and ordering must preserve the shipped
+// `/permissions`, `/subagents`, and `/stop` canon while keeping removed peers
+// out of the default command list.
 // Hide alias commands in the default popup list so each unique action appears once.
 // `quit` is an alias of `exit`, so we skip `quit` here.
-// `approvals` is an alias of `permissions`.
-const ALIAS_COMMANDS: &[SlashCommand] = &[SlashCommand::Quit, SlashCommand::Approvals];
+const ALIAS_COMMANDS: &[SlashCommand] = &[SlashCommand::Quit];
 
 /// A selectable item in the popup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,7 +294,35 @@ mod tests {
                 CommandItem::Builtin(cmd) => cmd.command(),
             })
             .collect();
-        assert_eq!(cmds, vec!["model", "mention", "mcp", "subagents"]);
+        assert_eq!(cmds, vec!["model", "mention", "mcp"]);
+    }
+
+    #[test]
+    fn subagents_keeps_the_old_picker_slot_in_default_popup_order() {
+        let popup = CommandPopup::new(CommandPopupFlags::default());
+        let cmds: Vec<&str> = popup
+            .filtered_items()
+            .into_iter()
+            .map(|item| match item {
+                CommandItem::Builtin(cmd) => cmd.command(),
+            })
+            .collect();
+
+        let sanitize_idx = cmds
+            .iter()
+            .position(|cmd| *cmd == "sanitize")
+            .expect("expected /sanitize in default popup order");
+        let subagents_idx = cmds
+            .iter()
+            .position(|cmd| *cmd == "subagents")
+            .expect("expected /subagents in default popup order");
+        let diff_idx = cmds
+            .iter()
+            .position(|cmd| *cmd == "diff")
+            .expect("expected /diff in default popup order");
+
+        assert_eq!(subagents_idx, sanitize_idx + 1);
+        assert_eq!(diff_idx, subagents_idx + 1);
     }
 
     #[test]

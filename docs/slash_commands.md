@@ -1,3 +1,4 @@
+<!-- Merge-safety anchor: slash-command docs must stay aligned with the shipped `/permissions`, `/subagents`, and `/stop` canon; do not reintroduce `/approvals`, `/agent`, or `/clean` as active commands. -->
 ## Slash Commands
 
 ### What are slash commands?
@@ -13,7 +14,7 @@ Control Codex’s behavior during an interactive session with slash commands.
 | Command         | Purpose                                                                    |
 | --------------- | -------------------------------------------------------------------------- |
 | `/model`        | choose what model and reasoning effort to use                              |
-| `/approvals`    | choose what Codex can do without approval                                  |
+| `/permissions`  | choose what Codex can do without approval                                  |
 | `/review`       | review my current changes and find issues                                  |
 | `/new`          | start a new chat during a conversation                                     |
 | `/resume`       | resume an old chat                                                         |
@@ -24,6 +25,8 @@ Control Codex’s behavior during an interactive session with slash commands.
 | `/debug`        | show the latest raw API response item captured by the TUI                  |
 | `/mention`      | mention a file                                                             |
 | `/status`       | show current session configuration and token usage                         |
+| `/subagents`    | switch the active subagent thread                                          |
+| `/stop`         | stop all background terminals                                              |
 | `/accounts`     | manage ChatGPT accounts (switch active / add account)                      |
 | `/mcp`          | list configured MCP tools                                                  |
 | `/experimental` | open the experimental menu to enable features from our beta program        |

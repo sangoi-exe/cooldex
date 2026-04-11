@@ -1,7 +1,7 @@
 //! Multi-agent picker navigation and labeling state for the TUI app.
 //!
 //! This module exists to keep the pure parts of multi-agent navigation out of [`crate::app::App`].
-//! It owns the stable spawn-order cache used by the `/agent` picker, keyboard next/previous
+//! It owns the stable spawn-order cache used by the `/subagents` picker, keyboard next/previous
 //! navigation, and the contextual footer label for the thread currently being watched.
 //!
 //! Responsibilities here are intentionally narrow:
@@ -13,6 +13,9 @@
 //! - discovering threads from the backend
 //! - deciding which thread is currently displayed
 //! - mutating UI state such as switching threads or updating the footer widget
+//!
+//! Merge-safety anchor: picker navigation copy and traversal must stay aligned
+//! with the shipped `/subagents` canon instead of stale `/agent` wording.
 //!
 //! The key invariant is that traversal follows first-seen spawn order rather than thread-id sort
 //! order. Once a thread id is observed it keeps its place in the cycle even if the entry is later
@@ -126,7 +129,7 @@ impl AgentNavigationState {
     ///
     /// This is reserved for entries that were only discovered opportunistically and never became
     /// replayable local threads. Keeping those around after the backend confirms they are gone
-    /// would leave ghost rows in `/agent`.
+    /// would leave ghost rows in `/subagents`.
     pub(crate) fn remove(&mut self, thread_id: ThreadId) {
         self.threads.remove(&thread_id);
         self.order.retain(|candidate| *candidate != thread_id);
@@ -231,7 +234,7 @@ impl AgentNavigationState {
         )
     }
 
-    /// Builds the `/agent` picker subtitle from the same canonical bindings used by key handling.
+    /// Builds the `/subagents` picker subtitle from the same canonical bindings used by key handling.
     ///
     /// Keeping this text derived from the actual shortcut helpers prevents the picker copy from
     /// drifting if the bindings ever change on one platform.

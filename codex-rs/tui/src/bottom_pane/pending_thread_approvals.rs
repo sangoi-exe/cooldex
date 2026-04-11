@@ -57,10 +57,12 @@ impl PendingThreadApprovals {
             lines.push(Line::from("    ...".dim().italic()));
         }
 
+        // Merge-safety anchor: pending-approval guidance must name the shipped
+        // `/subagents` picker canon instead of stale `/agent` wording.
         lines.push(
             Line::from(vec![
                 "    ".into(),
-                "/agent".cyan().bold(),
+                "/subagents".cyan().bold(),
                 " to switch threads".dim(),
             ])
             .dim(),
@@ -120,7 +122,7 @@ mod tests {
             snapshot_rows(&widget, /*width*/ 40).replace(' ', "."),
             @r"
         ..!.Approval.needed.in.Robie.[explorer].
-        ..../agent.to.switch.threads............
+        ..../subagents.to.switch.threads........
         "
         );
     }
@@ -142,7 +144,7 @@ mod tests {
         ..!.Approval.needed.in.Robie.[explorer].....
         ..!.Approval.needed.in.Inspector............
         ............................................
-        ..../agent.to.switch.threads................
+        ..../subagents.to.switch.threads............
         "
         );
     }

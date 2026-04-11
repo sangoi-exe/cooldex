@@ -811,12 +811,14 @@ async fn esc_with_pending_steers_overrides_agent_command_interrupt_behavior() {
         other => panic!("expected Op::UserTurn, got {other:?}"),
     }
 
+    // Merge-safety anchor: interrupt suppression tests must follow the shipped
+    // `/subagents` command instead of stale `/agent` text.
     chat.bottom_pane
-        .set_composer_text("/agent ".to_string(), Vec::new(), Vec::new());
+        .set_composer_text("/subagents ".to_string(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
     next_interrupt_op(&mut op_rx);
-    assert_eq!(chat.bottom_pane.composer_text(), "/agent ");
+    assert_eq!(chat.bottom_pane.composer_text(), "/subagents ");
 }
 
 #[tokio::test]

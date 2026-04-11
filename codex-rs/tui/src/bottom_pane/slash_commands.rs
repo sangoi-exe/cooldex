@@ -110,11 +110,8 @@ mod tests {
     }
 
     #[test]
-    fn clean_command_alias_resolves_for_dispatch() {
-        assert_eq!(
-            find_builtin_command("clean", all_enabled_flags()),
-            Some(SlashCommand::Stop)
-        );
+    fn clean_alias_is_rejected_for_dispatch() {
+        assert_eq!(find_builtin_command("clean", all_enabled_flags()), None);
     }
 
     #[test]

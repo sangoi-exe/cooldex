@@ -14,7 +14,9 @@ pub enum SlashCommand {
     // more frequently used commands should be listed first.
     Model,
     Fast,
-    Approvals,
+    // Merge-safety anchor: keep `/permissions`, `/stop`, and `/subagents` as the
+    // only active local legacy slash-command canon; do not reintroduce
+    // `/approvals`, `/clean`, or `/agent` peers.
     Permissions,
     #[strum(serialize = "setup-default-sandbox")]
     ElevateSandbox,
@@ -32,7 +34,8 @@ pub enum SlashCommand {
     Sanitize,
     Plan,
     Collab,
-    Agent,
+    #[strum(to_string = "subagents")]
+    MultiAgents,
     // Undo,
     Diff,
     Copy,
@@ -53,15 +56,12 @@ pub enum SlashCommand {
     Feedback,
     Rollout,
     Ps,
-    #[strum(to_string = "stop", serialize = "clean")]
     Stop,
     Clear,
     Personality,
     Realtime,
     Settings,
     TestApproval,
-    #[strum(to_string = "subagents")]
-    MultiAgents,
     // Debugging commands.
     #[strum(serialize = "debug-m-drop")]
     MemoryDrop,
@@ -106,8 +106,7 @@ impl SlashCommand {
             SlashCommand::Settings => "configure realtime microphone/speaker",
             SlashCommand::Plan => "switch to Plan mode",
             SlashCommand::Collab => "change collaboration mode (experimental)",
-            SlashCommand::Agent | SlashCommand::MultiAgents => "switch the active agent thread",
-            SlashCommand::Approvals => "choose what Codex is allowed to do",
+            SlashCommand::MultiAgents => "switch the active subagent thread",
             SlashCommand::Permissions => "choose what Codex is allowed to do",
             SlashCommand::ElevateSandbox => "set up elevated agent sandbox",
             SlashCommand::SandboxReadRoot => {
@@ -157,7 +156,6 @@ impl SlashCommand {
             | SlashCommand::Model
             | SlashCommand::Fast
             | SlashCommand::Personality
-            | SlashCommand::Approvals
             | SlashCommand::Permissions
             | SlashCommand::ElevateSandbox
             | SlashCommand::SandboxReadRoot
@@ -193,7 +191,7 @@ impl SlashCommand {
             SlashCommand::Realtime => true,
             SlashCommand::Settings => true,
             SlashCommand::Collab => true,
-            SlashCommand::Agent | SlashCommand::MultiAgents => true,
+            SlashCommand::MultiAgents => true,
         }
     }
 
@@ -238,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_alias_parses_to_stop_command() {
-        assert_eq!(SlashCommand::from_str("clean"), Ok(SlashCommand::Stop));
+    fn clean_is_rejected_as_removed_alias() {
+        assert!(SlashCommand::from_str("clean").is_err());
     }
 }

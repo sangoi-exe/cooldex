@@ -433,12 +433,15 @@ impl BottomPane {
             self.request_redraw();
             InputResult::None
         } else {
-            let is_agent_command = self
+            // Merge-safety anchor: Esc suppression while editing slash commands
+            // must follow the shipped `/subagents` canon, not stale `/agent`
+            // wording.
+            let is_subagents_command = self
                 .composer_text()
                 .lines()
                 .next()
                 .and_then(parse_slash_name)
-                .is_some_and(|(name, _, _)| name == "agent");
+                .is_some_and(|(name, _, _)| name == "subagents");
 
             // If a task is running and a status line is visible, allow Esc to
             // send an interrupt even while the composer has focus.
@@ -446,7 +449,7 @@ impl BottomPane {
             if key_event.code == KeyCode::Esc
                 && matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
                 && self.is_task_running
-                && !is_agent_command
+                && !is_subagents_command
                 && !self.composer.popup_active()
                 && let Some(status) = &self.status
             {
@@ -2031,12 +2034,12 @@ mod tests {
 
         pane.set_task_running(/*running*/ true);
 
-        // Repro: `/agent ` hides the popup (cursor past command name). Esc should
+        // Repro: `/subagents ` hides the popup (cursor past command name). Esc should
         // keep editing command text instead of interrupting the running task.
-        pane.insert_str("/agent ");
+        pane.insert_str("/subagents ");
         assert!(
             !pane.composer.popup_active(),
-            "expected command popup to be hidden after entering `/agent `"
+            "expected command popup to be hidden after entering `/subagents `"
         );
 
         pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -2044,10 +2047,10 @@ mod tests {
         while let Ok(ev) = rx.try_recv() {
             assert!(
                 !matches!(ev, AppEvent::CodexOp(Op::Interrupt)),
-                "expected Esc to not send Op::Interrupt while typing `/agent`"
+                "expected Esc to not send Op::Interrupt while typing `/subagents`"
             );
         }
-        assert_eq!(pane.composer_text(), "/agent ");
+        assert_eq!(pane.composer_text(), "/subagents ");
     }
 
     #[test]

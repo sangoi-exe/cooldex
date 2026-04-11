@@ -320,8 +320,8 @@ struct GuardianApprovalsMode {
 }
 
 /// Enabling the Guardian Approvals experiment in the TUI should also switch the
-/// current `/approvals` settings to the matching Guardian Approvals mode. Users
-/// can still change `/approvals` afterward; this just assumes that opting into
+/// current `/permissions` settings to the matching Guardian Approvals mode. Users
+/// can still change `/permissions` afterward; this just assumes that opting into
 /// the experiment means they want guardian review enabled immediately.
 fn guardian_approvals_mode() -> GuardianApprovalsMode {
     GuardianApprovalsMode {
@@ -1571,7 +1571,7 @@ impl App {
                 let previous_approvals_reviewer = feature_config.approvals_reviewer;
                 if effective_enabled {
                     // Persist the reviewer setting so future sessions keep the
-                    // experiment's matching `/approvals` mode until the user
+                    // experiment's matching `/permissions` mode until the user
                     // changes it explicitly.
                     feature_config.approvals_reviewer =
                         guardian_approvals_preset.approvals_reviewer;
@@ -1680,7 +1680,7 @@ impl App {
         {
             // This uses `OverrideTurnContext` intentionally: toggling the
             // experiment should update the active thread's effective approval
-            // settings immediately, just like a `/approvals` selection. Without
+            // settings immediately, just like a `/permissions` selection. Without
             // this runtime patch, the config edit would only affect future
             // sessions or turns recreated from disk.
             let op = AppCommand::override_turn_context(
@@ -1971,7 +1971,7 @@ impl App {
         has_chatgpt_account: bool,
     ) {
         let next_status_account_display = status_account_display.clone();
-        let next_plan_type = plan_type.clone();
+        let next_plan_type = plan_type;
         self.chat_widget.update_account_state(
             next_status_account_display,
             next_plan_type,
@@ -3484,7 +3484,7 @@ impl App {
             .retain(ThreadEventStore::event_survives_session_refresh);
     }
 
-    /// Opens the `/agent` picker after refreshing cached labels for known threads.
+    /// Opens the `/subagents` picker after refreshing cached labels for known threads.
     ///
     /// The picker state is derived from long-lived thread channels plus best-effort metadata
     /// refreshes from the backend. Refresh failures are treated as "thread is only inspectable by
@@ -3718,7 +3718,7 @@ impl App {
     /// TUI has not cached a local event channel yet.
     ///
     /// Resume-time backfill intentionally avoids creating empty placeholder channels, because those
-    /// placeholders make stale `/agent` entries open blank transcripts. When a user later selects a
+    /// placeholders make stale `/subagents` entries open blank transcripts. When a user later selects a
     /// still-live discovered thread, attach it on demand with a real resumed snapshot.
     async fn attach_live_thread_for_selection(
         &mut self,
@@ -4016,7 +4016,7 @@ impl App {
     /// thread in the navigation cache and chat widget metadata.
     ///
     /// Called after `replace_chat_widget_with_app_server_thread` during resume, fork, and new
-    /// thread creation so that the `/agent` picker and keyboard navigation are pre-populated even
+    /// thread creation so that the `/subagents` picker and keyboard navigation are pre-populated even
     /// if the TUI did not witness the original spawn events.
     ///
     /// The loaded-thread list is fetched in full (no pagination) and the spawn tree is walked
