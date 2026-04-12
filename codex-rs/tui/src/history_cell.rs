@@ -49,6 +49,7 @@ use codex_core::web_search_detail;
 use codex_otel::RuntimeMetricsSummary;
 use codex_protocol::account::PlanType;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceTemplate;
 use codex_protocol::models::WebSearchAction;
@@ -1604,6 +1605,177 @@ pub(crate) fn new_active_mcp_tool_call(
     animations_enabled: bool,
 ) -> McpToolCallCell {
     McpToolCallCell::new(call_id, invocation, animations_enabled)
+}
+
+// Merge-safety anchor: dynamic-tool live/replay parity must render through the
+// same compact cell contract for direct events and app-server thread items.
+
+#[derive(Debug)]
+pub(crate) struct DynamicToolCallCell {
+    call_id: String,
+    tool: String,
+    arguments: serde_json::Value,
+    start_time: Instant,
+    duration: Option<Duration>,
+    content_items: Vec<DynamicToolCallOutputContentItem>,
+    success: Option<bool>,
+    error_text: Option<String>,
+    animations_enabled: bool,
+}
+
+impl DynamicToolCallCell {
+    pub(crate) fn new(
+        call_id: String,
+        tool: String,
+        arguments: serde_json::Value,
+        animations_enabled: bool,
+    ) -> Self {
+        Self {
+            call_id,
+            tool,
+            arguments,
+            start_time: Instant::now(),
+            duration: None,
+            content_items: Vec::new(),
+            success: None,
+            error_text: None,
+            animations_enabled,
+        }
+    }
+
+    pub(crate) fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    pub(crate) fn complete(
+        &mut self,
+        duration: Duration,
+        content_items: Vec<DynamicToolCallOutputContentItem>,
+        success: bool,
+        error_text: Option<String>,
+    ) {
+        self.duration = Some(duration);
+        self.content_items = content_items;
+        self.success = Some(success);
+        self.error_text = error_text;
+    }
+
+    pub(crate) fn mark_failed(&mut self) {
+        self.duration = Some(self.start_time.elapsed());
+        self.success = Some(false);
+        self.error_text = Some("interrupted".to_string());
+    }
+}
+
+impl HistoryCell for DynamicToolCallCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let status = self.success;
+        let bullet = match status {
+            Some(true) => "•".green().bold(),
+            Some(false) => "•".red().bold(),
+            None => spinner(Some(self.start_time), self.animations_enabled),
+        };
+        let header = if status.is_some() {
+            "Called dynamic tool"
+        } else {
+            "Calling dynamic tool"
+        };
+
+        let mut header_line = Line::from(vec![
+            bullet,
+            " ".into(),
+            header.bold(),
+            " ".into(),
+            self.tool.clone().cyan(),
+        ]);
+        if let Some(duration) = self.duration {
+            let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+            header_line.spans.push(" ".into());
+            header_line
+                .spans
+                .push(format!("({})", format_duration_ms(duration_ms)).dim());
+        }
+
+        let mut lines = vec![line_to_static(&header_line)];
+        let wrap_width = width as usize;
+        let mut detail_lines = Vec::new();
+
+        let arguments = format_and_truncate_tool_result(
+            &format!("args: {}", self.arguments),
+            TOOL_CALL_MAX_LINES,
+            wrap_width,
+        );
+        let arguments_line = Line::from(arguments.dim());
+        let wrapped_arguments = adaptive_wrap_line(
+            &arguments_line,
+            RtOptions::new(wrap_width)
+                .initial_indent("".into())
+                .subsequent_indent("    ".into()),
+        );
+        detail_lines.extend(wrapped_arguments.iter().map(line_to_static));
+
+        if let Some(error_text) = &self.error_text {
+            let error_line = Line::from(
+                format_and_truncate_tool_result(
+                    &format!("error: {error_text}"),
+                    TOOL_CALL_MAX_LINES,
+                    wrap_width,
+                )
+                .red(),
+            );
+            let wrapped_error = adaptive_wrap_line(
+                &error_line,
+                RtOptions::new(wrap_width)
+                    .initial_indent("".into())
+                    .subsequent_indent("    ".into()),
+            );
+            detail_lines.extend(wrapped_error.iter().map(line_to_static));
+        }
+
+        for item in &self.content_items {
+            let content_text = match item {
+                DynamicToolCallOutputContentItem::InputText { text } => {
+                    format!("result: {text}")
+                }
+                DynamicToolCallOutputContentItem::InputImage { image_url } => {
+                    format!("result image: {image_url}")
+                }
+            };
+            let content_line = Line::from(
+                format_and_truncate_tool_result(&content_text, TOOL_CALL_MAX_LINES, wrap_width)
+                    .dim(),
+            );
+            let wrapped_content = adaptive_wrap_line(
+                &content_line,
+                RtOptions::new(wrap_width)
+                    .initial_indent("".into())
+                    .subsequent_indent("    ".into()),
+            );
+            detail_lines.extend(wrapped_content.iter().map(line_to_static));
+        }
+
+        if !detail_lines.is_empty() {
+            lines.extend(prefix_lines(detail_lines, "  └ ".dim(), "    ".into()));
+        }
+
+        lines
+    }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        if !self.animations_enabled || self.success.is_some() {
+            return None;
+        }
+        Some((self.start_time.elapsed().as_millis() / 50) as u64)
+    }
+}
+
+pub(crate) fn new_active_dynamic_tool_call(
+    call_id: String,
+    tool: String,
+    arguments: serde_json::Value,
+    animations_enabled: bool,
+) -> DynamicToolCallCell {
+    DynamicToolCallCell::new(call_id, tool, arguments, animations_enabled)
 }
 
 fn web_search_header(completed: bool) -> &'static str {

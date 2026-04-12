@@ -40,6 +40,8 @@ use codex_app_server_protocol::CommandAction as AppServerCommandAction;
 use codex_app_server_protocol::CommandExecutionRequestApprovalParams as AppServerCommandExecutionRequestApprovalParams;
 use codex_app_server_protocol::CommandExecutionSource as AppServerCommandExecutionSource;
 use codex_app_server_protocol::CommandExecutionStatus as AppServerCommandExecutionStatus;
+use codex_app_server_protocol::DynamicToolCallOutputContentItem as AppServerDynamicToolCallOutputContentItem;
+use codex_app_server_protocol::DynamicToolCallStatus as AppServerDynamicToolCallStatus;
 use codex_app_server_protocol::ErrorNotification;
 use codex_app_server_protocol::FileUpdateChange as AppServerFileUpdateChange;
 use codex_app_server_protocol::FileUpdateChange;
@@ -217,6 +219,7 @@ use crossterm::event::KeyModifiers;
 use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
 use ratatui::style::Modifier;
+use serde_json::json;
 #[cfg(target_os = "windows")]
 use serial_test::serial;
 use std::collections::BTreeMap;
@@ -6552,6 +6555,101 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
 
     assert!(drain_insert_history(&mut rx).is_empty());
     assert!(!chat.bottom_pane.is_task_running());
+}
+
+#[tokio::test]
+async fn live_app_server_dynamic_tool_in_progress_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.animations = false;
+
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: AppServerThreadItem::DynamicToolCall {
+                id: "tool-1".to_string(),
+                tool: "lookup_ticket".to_string(),
+                arguments: json!({ "id": "123" }),
+                status: AppServerDynamicToolCallStatus::InProgress,
+                content_items: None,
+                success: None,
+                duration_ms: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let width: u16 = 80;
+    let height = chat.desired_height(width);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("create terminal");
+    terminal.set_viewport_area(Rect::new(0, 0, width, height));
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw chatwidget");
+
+    assert_snapshot!(
+        "live_app_server_dynamic_tool_in_progress",
+        normalized_backend_snapshot(terminal.backend())
+    );
+}
+
+#[tokio::test]
+async fn replayed_dynamic_tool_items_render_history_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.animations = false;
+
+    chat.replay_thread_turns(
+        vec![AppServerTurn {
+            id: "turn-1".to_string(),
+            items: vec![
+                AppServerThreadItem::DynamicToolCall {
+                    id: "tool-1".to_string(),
+                    tool: "lookup_ticket".to_string(),
+                    arguments: json!({ "id": "123" }),
+                    status: AppServerDynamicToolCallStatus::Completed,
+                    content_items: Some(vec![
+                        AppServerDynamicToolCallOutputContentItem::InputText {
+                            text: "Ticket 123 is open.".to_string(),
+                        },
+                        AppServerDynamicToolCallOutputContentItem::InputImage {
+                            image_url: "https://example.com/ticket-123.png".to_string(),
+                        },
+                    ]),
+                    success: Some(true),
+                    duration_ms: Some(120),
+                },
+                AppServerThreadItem::DynamicToolCall {
+                    id: "tool-2".to_string(),
+                    tool: "lookup_ticket".to_string(),
+                    arguments: json!({ "id": "999" }),
+                    status: AppServerDynamicToolCallStatus::Failed,
+                    content_items: Some(vec![
+                        AppServerDynamicToolCallOutputContentItem::InputText {
+                            text: "Dynamic tool `lookup_ticket` is not available in the TUI client yet."
+                                .to_string(),
+                        },
+                    ]),
+                    success: Some(false),
+                    duration_ms: Some(15),
+                },
+            ],
+            status: AppServerTurnStatus::Completed,
+            error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+        }],
+        ReplayKind::ThreadSnapshot,
+    );
+
+    let combined = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_snapshot!("replayed_dynamic_tool_items_render_history", combined);
 }
 
 #[tokio::test]

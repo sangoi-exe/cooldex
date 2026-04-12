@@ -7,6 +7,7 @@ use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::mcp::RequestId as McpRequestId;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::AskForApproval;
@@ -88,6 +89,10 @@ pub(crate) enum AppCommandView<'a> {
         id: &'a str,
         request_item_id: &'a Option<String>,
         response: &'a RequestUserInputResponse,
+    },
+    DynamicToolResponse {
+        id: &'a str,
+        response: &'a DynamicToolResponse,
     },
     RequestPermissionsResponse {
         id: &'a str,
@@ -402,6 +407,9 @@ impl AppCommand {
                 request_item_id,
                 response,
             },
+            Op::DynamicToolResponse { id, response } => {
+                AppCommandView::DynamicToolResponse { id, response }
+            }
             Op::RequestPermissionsResponse { id, response } => {
                 AppCommandView::RequestPermissionsResponse { id, response }
             }

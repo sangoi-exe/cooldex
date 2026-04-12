@@ -132,6 +132,7 @@ use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 #[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::dynamic_tools::DynamicToolCallRequest;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
 use codex_protocol::models::MessagePhase;
@@ -159,6 +160,7 @@ use codex_protocol::protocol::CollabWaitReturnWhen;
 use codex_protocol::protocol::CollabWaitState;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::DeprecationNoticeEvent;
+use codex_protocol::protocol::DynamicToolCallResponseEvent;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -470,6 +472,7 @@ use crate::exec_command::strip_bash_lc_and_escape;
 use crate::get_git_diff::get_git_diff;
 use crate::history_cell;
 use crate::history_cell::AgentMessageCell;
+use crate::history_cell::DynamicToolCallCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::McpToolCallCell;
 use crate::history_cell::PlainHistoryCell;
@@ -4290,6 +4293,22 @@ impl ChatWidget {
         self.defer_or_handle(|q| q.push_mcp_end(ev), |s| s.handle_mcp_end_now(ev2));
     }
 
+    fn on_dynamic_tool_call_request(&mut self, ev: DynamicToolCallRequest) {
+        let ev2 = ev.clone();
+        self.defer_or_handle(
+            |q| q.push_dynamic_tool_begin(ev),
+            |s| s.handle_dynamic_tool_begin_now(ev2),
+        );
+    }
+
+    fn on_dynamic_tool_call_response(&mut self, ev: DynamicToolCallResponseEvent) {
+        let ev2 = ev.clone();
+        self.defer_or_handle(
+            |q| q.push_dynamic_tool_end(ev),
+            |s| s.handle_dynamic_tool_end_now(ev2),
+        );
+    }
+
     fn on_web_search_begin(&mut self, ev: WebSearchBeginEvent) {
         self.flush_answer_stream_with_separator();
         self.flush_active_cell();
@@ -5281,6 +5300,59 @@ impl ChatWidget {
             self.add_boxed_history(extra);
         }
         // Mark that actual work was done (MCP tool call)
+        self.had_work_activity = true;
+    }
+
+    pub(crate) fn handle_dynamic_tool_begin_now(&mut self, ev: DynamicToolCallRequest) {
+        self.flush_answer_stream_with_separator();
+        self.flush_active_cell();
+        self.active_cell = Some(Box::new(history_cell::new_active_dynamic_tool_call(
+            ev.call_id,
+            ev.tool,
+            ev.arguments,
+            self.config.animations,
+        )));
+        self.bump_active_cell_revision();
+        self.request_redraw();
+    }
+
+    pub(crate) fn handle_dynamic_tool_end_now(&mut self, ev: DynamicToolCallResponseEvent) {
+        self.flush_answer_stream_with_separator();
+
+        let DynamicToolCallResponseEvent {
+            call_id,
+            tool,
+            arguments,
+            content_items,
+            success,
+            error,
+            duration,
+            ..
+        } = ev;
+
+        match self
+            .active_cell
+            .as_mut()
+            .and_then(|cell| cell.as_any_mut().downcast_mut::<DynamicToolCallCell>())
+        {
+            Some(cell) if cell.call_id() == call_id => {
+                cell.complete(duration, content_items, success, error);
+            }
+            _ => {
+                self.flush_active_cell();
+                let mut cell = history_cell::new_active_dynamic_tool_call(
+                    call_id,
+                    tool,
+                    arguments,
+                    self.config.animations,
+                );
+                cell.complete(duration, content_items, success, error);
+                self.active_cell = Some(Box::new(cell));
+            }
+        }
+
+        self.bump_active_cell_revision();
+        self.flush_active_cell();
         self.had_work_activity = true;
     }
 
@@ -7282,7 +7354,48 @@ impl ChatWidget {
                 agents_states,
                 wait_state,
             }),
-            ThreadItem::DynamicToolCall { .. } => {}
+            ThreadItem::DynamicToolCall {
+                id,
+                tool,
+                arguments,
+                status,
+                content_items,
+                success,
+                duration_ms,
+            } => match status {
+                codex_app_server_protocol::DynamicToolCallStatus::InProgress => {
+                    self.on_dynamic_tool_call_request(DynamicToolCallRequest {
+                        call_id: id,
+                        turn_id: turn_id.clone(),
+                        tool,
+                        arguments,
+                    });
+                }
+                codex_app_server_protocol::DynamicToolCallStatus::Completed
+                | codex_app_server_protocol::DynamicToolCallStatus::Failed => {
+                    self.on_dynamic_tool_call_response(DynamicToolCallResponseEvent {
+                        call_id: id,
+                        turn_id: turn_id.clone(),
+                        tool,
+                        arguments,
+                        content_items: content_items
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(Into::into)
+                            .collect(),
+                        success: success.unwrap_or(matches!(
+                            status,
+                            codex_app_server_protocol::DynamicToolCallStatus::Completed
+                        )),
+                        error: None,
+                        duration: Duration::from_millis(
+                            duration_ms
+                                .and_then(|value| u64::try_from(value).ok())
+                                .unwrap_or_default(),
+                        ),
+                    });
+                }
+            },
         }
 
         if matches!(replay_kind, Some(ReplayKind::ThreadSnapshot)) && turn_id.is_empty() {
@@ -7318,8 +7431,15 @@ impl ChatWidget {
             ServerRequest::ToolRequestUserInput { params, .. } => {
                 self.on_request_user_input(request_user_input_from_params(params));
             }
-            ServerRequest::DynamicToolCall { .. }
-            | ServerRequest::ChatgptAuthTokensRefresh { .. }
+            ServerRequest::DynamicToolCall { .. } => {
+                if replay_kind.is_none() {
+                    self.add_error_message(
+                        "Dynamic tool requests must be resolved before they reach the chat widget."
+                            .to_string(),
+                    );
+                }
+            }
+            ServerRequest::ChatgptAuthTokensRefresh { .. }
             | ServerRequest::ApplyPatchApproval { .. }
             | ServerRequest::ExecCommandApproval { .. } => {
                 if replay_kind.is_none() {
@@ -7712,6 +7832,19 @@ impl ChatWidget {
                     },
                 });
             }
+            ThreadItem::DynamicToolCall {
+                id,
+                tool,
+                arguments,
+                ..
+            } => {
+                self.on_dynamic_tool_call_request(DynamicToolCallRequest {
+                    call_id: id,
+                    turn_id: notification.turn_id,
+                    tool,
+                    arguments,
+                });
+            }
             ThreadItem::WebSearch { id, .. } => {
                 self.on_web_search_begin(WebSearchBeginEvent { call_id: id });
             }
@@ -8056,9 +8189,9 @@ impl ChatWidget {
             EventMsg::ItemStarted(_)
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
-            | EventMsg::ReasoningRawContentDelta(_)
-            | EventMsg::DynamicToolCallRequest(_)
-            | EventMsg::DynamicToolCallResponse(_) => {}
+            | EventMsg::ReasoningRawContentDelta(_) => {}
+            EventMsg::DynamicToolCallRequest(ev) => self.on_dynamic_tool_call_request(ev),
+            EventMsg::DynamicToolCallResponse(ev) => self.on_dynamic_tool_call_response(ev),
             EventMsg::HookStarted(event) => self.on_hook_started(event),
             EventMsg::HookCompleted(event) => self.on_hook_completed(event),
             EventMsg::RealtimeConversationStarted(ev) => {
@@ -8264,6 +8397,8 @@ impl ChatWidget {
             if let Some(exec) = cell.as_any_mut().downcast_mut::<ExecCell>() {
                 exec.mark_failed();
             } else if let Some(tool) = cell.as_any_mut().downcast_mut::<McpToolCallCell>() {
+                tool.mark_failed();
+            } else if let Some(tool) = cell.as_any_mut().downcast_mut::<DynamicToolCallCell>() {
                 tool.mark_failed();
             }
             self.add_boxed_history(cell);

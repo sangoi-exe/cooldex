@@ -1,0 +1,12 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: normalized_backend_snapshot(terminal.backend())
+---
+"                                                                                "
+"• Calling dynamic tool lookup_ticket                                            "
+"  └ args: {"id":"123"}                                                          "
+"                                                                                "
+"                                                                                "
+"› Ask Codex to do anything                                                      "
+"                                                                                "
+"  gpt-5.3-codex default · 100% left · /tmp/project                              "

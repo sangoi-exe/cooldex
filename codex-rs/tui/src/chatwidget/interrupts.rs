@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 
 use codex_protocol::approvals::ElicitationRequestEvent;
+use codex_protocol::dynamic_tools::DynamicToolCallRequest;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
+use codex_protocol::protocol::DynamicToolCallResponseEvent;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
@@ -12,6 +14,9 @@ use codex_protocol::request_permissions::RequestPermissionsEvent;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 
 use super::ChatWidget;
+
+// Merge-safety anchor: deferred interrupt ordering here must keep the live TUI
+// transcript in the same causal order as the underlying runtime/app-server events.
 
 #[derive(Debug)]
 pub(crate) enum QueuedInterrupt {
@@ -24,6 +29,8 @@ pub(crate) enum QueuedInterrupt {
     ExecEnd(ExecCommandEndEvent),
     McpBegin(McpToolCallBeginEvent),
     McpEnd(McpToolCallEndEvent),
+    DynamicToolBegin(DynamicToolCallRequest),
+    DynamicToolEnd(DynamicToolCallResponseEvent),
     PatchEnd(PatchApplyEndEvent),
 }
 
@@ -82,6 +89,14 @@ impl InterruptManager {
         self.queue.push_back(QueuedInterrupt::McpEnd(ev));
     }
 
+    pub(crate) fn push_dynamic_tool_begin(&mut self, ev: DynamicToolCallRequest) {
+        self.queue.push_back(QueuedInterrupt::DynamicToolBegin(ev));
+    }
+
+    pub(crate) fn push_dynamic_tool_end(&mut self, ev: DynamicToolCallResponseEvent) {
+        self.queue.push_back(QueuedInterrupt::DynamicToolEnd(ev));
+    }
+
     pub(crate) fn push_patch_end(&mut self, ev: PatchApplyEndEvent) {
         self.queue.push_back(QueuedInterrupt::PatchEnd(ev));
     }
@@ -98,6 +113,8 @@ impl InterruptManager {
                 QueuedInterrupt::ExecEnd(ev) => chat.handle_exec_end_now(ev),
                 QueuedInterrupt::McpBegin(ev) => chat.handle_mcp_begin_now(ev),
                 QueuedInterrupt::McpEnd(ev) => chat.handle_mcp_end_now(ev),
+                QueuedInterrupt::DynamicToolBegin(ev) => chat.handle_dynamic_tool_begin_now(ev),
+                QueuedInterrupt::DynamicToolEnd(ev) => chat.handle_dynamic_tool_end_now(ev),
                 QueuedInterrupt::PatchEnd(ev) => chat.handle_patch_apply_end_now(ev),
             }
         }

@@ -4,6 +4,9 @@ use crate::app_command::AppCommand;
 use crate::app_command::AppCommandView;
 use crate::app_server_approval_conversions::granted_permission_profile_from_request;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
+use codex_app_server_protocol::DynamicToolCallOutputContentItem;
+use codex_app_server_protocol::DynamicToolCallParams;
+use codex_app_server_protocol::DynamicToolCallResponse;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
 use codex_app_server_protocol::McpServerElicitationAction;
@@ -14,6 +17,9 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ToolRequestUserInputResponse;
 use codex_protocol::mcp::RequestId as McpRequestId;
 use codex_protocol::protocol::ReviewDecision;
+
+// Merge-safety anchor: app-server request ownership in this adapter layer must keep
+// direct response correlation aligned with the shipped TUI/app-server canon.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AppServerRequestResolution {
@@ -33,6 +39,7 @@ pub(super) struct PendingAppServerRequests {
     file_change_approvals: HashMap<String, AppServerRequestId>,
     permissions_approvals: HashMap<String, AppServerRequestId>,
     user_inputs: HashMap<String, AppServerRequestId>,
+    dynamic_tools: HashMap<ThreadScopedDynamicToolCallKey, AppServerRequestId>,
     mcp_requests: HashMap<McpLegacyRequestKey, AppServerRequestId>,
 }
 
@@ -42,6 +49,7 @@ impl PendingAppServerRequests {
         self.file_change_approvals.clear();
         self.permissions_approvals.clear();
         self.user_inputs.clear();
+        self.dynamic_tools.clear();
         self.mcp_requests.clear();
     }
 
@@ -92,11 +100,19 @@ impl PendingAppServerRequests {
                 );
                 None
             }
-            ServerRequest::DynamicToolCall { request_id, .. } => {
-                Some(UnsupportedAppServerRequest {
-                    request_id: request_id.clone(),
-                    message: "Dynamic tool calls are not available in TUI yet.".to_string(),
-                })
+            ServerRequest::DynamicToolCall { request_id, params } => {
+                let key = ThreadScopedDynamicToolCallKey::from_params(params);
+                if self.dynamic_tools.contains_key(&key) {
+                    return Some(UnsupportedAppServerRequest {
+                        request_id: request_id.clone(),
+                        message: format!(
+                            "duplicate pending dynamic tool call_id `{}` for thread `{}`",
+                            params.call_id, params.thread_id
+                        ),
+                    });
+                }
+                self.dynamic_tools.insert(key, request_id.clone());
+                None
             }
             ServerRequest::ChatgptAuthTokensRefresh { .. } => None,
             ServerRequest::ApplyPatchApproval { request_id, .. } => {
@@ -118,7 +134,7 @@ impl PendingAppServerRequests {
 
     pub(super) fn take_resolution<T>(
         &mut self,
-        _thread_id: &str,
+        thread_id: &str,
         op: T,
     ) -> Result<Option<AppServerRequestResolution>, String>
     where
@@ -210,6 +226,26 @@ impl PendingAppServerRequests {
                     })?,
                 })
             }
+            AppCommandView::DynamicToolResponse { id, response } => {
+                let key = ThreadScopedDynamicToolCallKey {
+                    thread_id: thread_id.to_string(),
+                    call_id: id.to_string(),
+                };
+                let Some(request_id) = self.dynamic_tools.remove(&key) else {
+                    return Err(format!(
+                        "app-server dynamic tool response for thread `{thread_id}` has unknown call_id `{id}`"
+                    ));
+                };
+                Some(AppServerRequestResolution {
+                    request_id,
+                    result: serde_json::to_value(app_server_dynamic_tool_response_from_core(
+                        response,
+                    ))
+                    .map_err(|err| {
+                        format!("failed to serialize dynamic tool response for app-server: {err}")
+                    })?,
+                })
+            }
             AppCommandView::ResolveElicitation {
                 server_name,
                 request_id,
@@ -258,6 +294,7 @@ impl PendingAppServerRequests {
         self.permissions_approvals
             .retain(|_, value| value != request_id);
         self.user_inputs.retain(|_, value| value != request_id);
+        self.dynamic_tools.retain(|_, value| value != request_id);
         self.mcp_requests.retain(|_, value| value != request_id);
     }
 }
@@ -268,10 +305,46 @@ struct McpLegacyRequestKey {
     request_id: McpRequestId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ThreadScopedDynamicToolCallKey {
+    thread_id: String,
+    call_id: String,
+}
+
+impl ThreadScopedDynamicToolCallKey {
+    fn from_params(params: &DynamicToolCallParams) -> Self {
+        Self {
+            thread_id: params.thread_id.clone(),
+            call_id: params.call_id.clone(),
+        }
+    }
+}
+
 fn app_server_request_id_to_mcp_request_id(request_id: &AppServerRequestId) -> McpRequestId {
     match request_id {
         AppServerRequestId::String(value) => McpRequestId::String(value.clone()),
         AppServerRequestId::Integer(value) => McpRequestId::Integer(*value),
+    }
+}
+
+fn app_server_dynamic_tool_response_from_core(
+    response: &codex_protocol::dynamic_tools::DynamicToolResponse,
+) -> DynamicToolCallResponse {
+    DynamicToolCallResponse {
+        content_items: response
+            .content_items
+            .iter()
+            .cloned()
+            .map(|item| match item {
+                codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputText {
+                    text,
+                } => DynamicToolCallOutputContentItem::InputText { text },
+                codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputImage {
+                    image_url,
+                } => DynamicToolCallOutputContentItem::InputImage { image_url },
+            })
+            .collect(),
+        success: response.success,
     }
 }
 
@@ -311,6 +384,8 @@ mod tests {
     use codex_app_server_protocol::ToolRequestUserInputResponse;
     use codex_protocol::approvals::ElicitationAction;
     use codex_protocol::approvals::ExecPolicyAmendment;
+    use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+    use codex_protocol::dynamic_tools::DynamicToolResponse;
     use codex_protocol::mcp::RequestId as McpRequestId;
     use codex_protocol::models::FileSystemPermissions;
     use codex_protocol::models::NetworkPermissions;
@@ -733,10 +808,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dynamic_tool_calls_as_unsupported() {
+    fn resolves_dynamic_tool_calls_through_thread_scoped_request_ids() {
         let mut pending = PendingAppServerRequests::default();
-        let unsupported = pending
-            .note_server_request(&ServerRequest::DynamicToolCall {
+        assert_eq!(
+            pending.note_server_request(&ServerRequest::DynamicToolCall {
                 request_id: AppServerRequestId::Integer(99),
                 params: codex_app_server_protocol::DynamicToolCallParams {
                     thread_id: "thread-1".to_string(),
@@ -745,13 +820,154 @@ mod tests {
                     tool: "tool".to_string(),
                     arguments: json!({}),
                 },
-            })
-            .expect("dynamic tool calls should be rejected");
+            }),
+            None
+        );
 
-        assert_eq!(unsupported.request_id, AppServerRequestId::Integer(99));
+        let resolution = pending
+            .take_resolution(
+                "thread-1",
+                &Op::DynamicToolResponse {
+                    id: "tool-1".to_string(),
+                    response: DynamicToolResponse {
+                        content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                            text: "Dynamic tool `tool` is not available in the TUI client yet."
+                                .to_string(),
+                        }],
+                        success: false,
+                    },
+                },
+            )
+            .expect("dynamic tool response should serialize")
+            .expect("request should be pending");
+
+        assert_eq!(resolution.request_id, AppServerRequestId::Integer(99));
         assert_eq!(
-            unsupported.message,
-            "Dynamic tool calls are not available in TUI yet."
+            resolution.result,
+            json!({
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": "Dynamic tool `tool` is not available in the TUI client yet."
+                    }
+                ],
+                "success": false
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_pending_dynamic_tool_call_ids_per_thread() {
+        let mut pending = PendingAppServerRequests::default();
+        assert_eq!(
+            pending.note_server_request(&ServerRequest::DynamicToolCall {
+                request_id: AppServerRequestId::Integer(99),
+                params: codex_app_server_protocol::DynamicToolCallParams {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    call_id: "tool-1".to_string(),
+                    tool: "tool".to_string(),
+                    arguments: json!({}),
+                },
+            }),
+            None
+        );
+
+        let duplicate = pending
+            .note_server_request(&ServerRequest::DynamicToolCall {
+                request_id: AppServerRequestId::Integer(100),
+                params: codex_app_server_protocol::DynamicToolCallParams {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-2".to_string(),
+                    call_id: "tool-1".to_string(),
+                    tool: "tool".to_string(),
+                    arguments: json!({ "retry": true }),
+                },
+            })
+            .expect("duplicate dynamic tool call should fail loud");
+
+        assert_eq!(duplicate.request_id, AppServerRequestId::Integer(100));
+        assert_eq!(
+            duplicate.message,
+            "duplicate pending dynamic tool call_id `tool-1` for thread `thread-1`"
+        );
+    }
+
+    #[test]
+    fn resolves_same_dynamic_tool_call_id_per_thread() {
+        let mut pending = PendingAppServerRequests::default();
+        for (request_id, thread_id) in [(99, "thread-1"), (100, "thread-2")] {
+            assert_eq!(
+                pending.note_server_request(&ServerRequest::DynamicToolCall {
+                    request_id: AppServerRequestId::Integer(request_id),
+                    params: codex_app_server_protocol::DynamicToolCallParams {
+                        thread_id: thread_id.to_string(),
+                        turn_id: format!("turn-{request_id}"),
+                        call_id: "tool-1".to_string(),
+                        tool: "tool".to_string(),
+                        arguments: json!({ "thread": thread_id }),
+                    },
+                }),
+                None
+            );
+        }
+
+        for (request_id, thread_id) in [(99, "thread-1"), (100, "thread-2")] {
+            let resolution = pending
+                .take_resolution(
+                    thread_id,
+                    &Op::DynamicToolResponse {
+                        id: "tool-1".to_string(),
+                        response: DynamicToolResponse {
+                            content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                                text: format!("resolved {thread_id}"),
+                            }],
+                            success: false,
+                        },
+                    },
+                )
+                .expect("dynamic tool response should serialize")
+                .expect("request should be pending");
+            assert_eq!(
+                resolution.request_id,
+                AppServerRequestId::Integer(request_id)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_dynamic_tool_call_id_for_thread() {
+        let mut pending = PendingAppServerRequests::default();
+        assert_eq!(
+            pending.note_server_request(&ServerRequest::DynamicToolCall {
+                request_id: AppServerRequestId::Integer(99),
+                params: codex_app_server_protocol::DynamicToolCallParams {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    call_id: "tool-1".to_string(),
+                    tool: "tool".to_string(),
+                    arguments: json!({}),
+                },
+            }),
+            None
+        );
+
+        let error = pending
+            .take_resolution(
+                "thread-2",
+                &Op::DynamicToolResponse {
+                    id: "tool-1".to_string(),
+                    response: DynamicToolResponse {
+                        content_items: Vec::new(),
+                        success: false,
+                    },
+                },
+            )
+            .expect_err("unknown dynamic tool call should fail loud");
+
+        assert_eq!(
+            error,
+            "app-server dynamic tool response for thread `thread-2` has unknown call_id `tool-1`"
         );
     }
 

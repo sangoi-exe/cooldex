@@ -1,0 +1,13 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: combined
+---
+• Called dynamic tool lookup_ticket (120ms)
+  └ args: {"id":"123"}
+    result: Ticket 123 is open.
+    result image: https://example.com/ticket-123.png
+
+
+• Called dynamic tool lookup_ticket (15ms)
+  └ args: {"id":"999"}
+    result: Dynamic tool `lookup_ticket` is not available in the TUI client yet.

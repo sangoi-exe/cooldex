@@ -16,6 +16,7 @@ should shrink and eventually disappear.
 */
 
 use super::App;
+use crate::app_command::AppCommand;
 use crate::app_event::AppEvent;
 use crate::app_server_session::AppServerSession;
 use crate::app_server_session::app_server_rate_limit_snapshot_to_core;
@@ -38,6 +39,8 @@ use codex_app_server_protocol::TurnStatus;
 use codex_protocol::ThreadId;
 #[cfg(test)]
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+use codex_protocol::dynamic_tools::DynamicToolResponse;
 #[cfg(test)]
 use codex_protocol::items::AgentMessageContent;
 #[cfg(test)]
@@ -256,6 +259,27 @@ impl App {
             return;
         };
 
+        if let Some(op) = immediate_app_server_request_command(&request) {
+            crate::session_log::log_outbound_op(&op);
+            match self
+                .try_resolve_app_server_request(app_server_client, thread_id, &op)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        thread_id = %thread_id,
+                        request_id = ?request.id(),
+                        "failed to resolve app-server request immediately"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!("failed to resolve app-server request immediately: {err}");
+                }
+            }
+            return;
+        }
+
         let result =
             if self.primary_thread_id == Some(thread_id) || self.primary_thread_id.is_none() {
                 self.enqueue_primary_thread_request(request).await
@@ -309,6 +333,28 @@ fn server_request_thread_id(request: &ServerRequest) -> Option<ThreadId> {
         ServerRequest::ChatgptAuthTokensRefresh { .. }
         | ServerRequest::ApplyPatchApproval { .. }
         | ServerRequest::ExecCommandApproval { .. } => None,
+    }
+}
+
+fn immediate_app_server_request_command(request: &ServerRequest) -> Option<AppCommand> {
+    let ServerRequest::DynamicToolCall { params, .. } = request else {
+        return None;
+    };
+    Some(
+        codex_protocol::protocol::Op::DynamicToolResponse {
+            id: params.call_id.clone(),
+            response: unsupported_dynamic_tool_response(&params.tool),
+        }
+        .into(),
+    )
+}
+
+fn unsupported_dynamic_tool_response(tool: &str) -> DynamicToolResponse {
+    DynamicToolResponse {
+        content_items: vec![DynamicToolCallOutputContentItem::InputText {
+            text: format!("Dynamic tool `{tool}` is not available in the TUI client yet."),
+        }],
+        success: false,
     }
 }
 
@@ -1033,19 +1079,24 @@ fn app_server_codex_error_info_to_core(
 #[cfg(test)]
 mod tests {
     use super::command_execution_started_event;
+    use super::immediate_app_server_request_command;
     use super::server_notification_thread_events;
     use super::thread_snapshot_events;
     use super::turn_snapshot_events;
+    use crate::app_command::AppCommandView;
     use codex_app_server_protocol::AgentMessageDeltaNotification;
     use codex_app_server_protocol::CodexErrorInfo;
     use codex_app_server_protocol::CommandAction;
     use codex_app_server_protocol::CommandExecutionOutputDeltaNotification;
     use codex_app_server_protocol::CommandExecutionSource;
     use codex_app_server_protocol::CommandExecutionStatus;
+    use codex_app_server_protocol::DynamicToolCallParams;
     use codex_app_server_protocol::ItemCompletedNotification;
     use codex_app_server_protocol::ItemStartedNotification;
     use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
+    use codex_app_server_protocol::RequestId as AppServerRequestId;
     use codex_app_server_protocol::ServerNotification;
+    use codex_app_server_protocol::ServerRequest;
     use codex_app_server_protocol::Thread;
     use codex_app_server_protocol::ThreadItem;
     use codex_app_server_protocol::ThreadStatus;
@@ -1064,6 +1115,7 @@ mod tests {
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
     use std::path::PathBuf;
 
     #[test]
@@ -1115,6 +1167,53 @@ mod tests {
             }
             _ => panic!("expected bridged agent message item"),
         }
+    }
+
+    #[test]
+    fn dynamic_tool_requests_build_immediate_unsupported_response_commands() {
+        let command = immediate_app_server_request_command(&ServerRequest::DynamicToolCall {
+            request_id: AppServerRequestId::Integer(77),
+            params: DynamicToolCallParams {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                call_id: "tool-1".to_string(),
+                tool: "lookup_ticket".to_string(),
+                arguments: json!({ "id": "123" }),
+            },
+        })
+        .expect("dynamic tool request should build an immediate response");
+
+        let AppCommandView::DynamicToolResponse { id, response } = command.view() else {
+            panic!("expected dynamic tool response command");
+        };
+        assert_eq!(id, "tool-1");
+        assert_eq!(
+            response,
+            &codex_protocol::dynamic_tools::DynamicToolResponse {
+                content_items: vec![
+                    codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputText {
+                        text:
+                            "Dynamic tool `lookup_ticket` is not available in the TUI client yet."
+                                .to_string(),
+                    },
+                ],
+                success: false,
+            }
+        );
+    }
+
+    #[test]
+    fn non_dynamic_tool_requests_do_not_build_immediate_response_commands() {
+        let command =
+            immediate_app_server_request_command(&ServerRequest::ChatgptAuthTokensRefresh {
+                request_id: AppServerRequestId::Integer(88),
+                params: codex_app_server_protocol::ChatgptAuthTokensRefreshParams {
+                    reason: codex_app_server_protocol::ChatgptAuthTokensRefreshReason::Unauthorized,
+                    previous_account_id: None,
+                },
+            });
+
+        assert_eq!(command, None);
     }
 
     #[test]
