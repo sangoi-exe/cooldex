@@ -147,6 +147,7 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tracing::error;
 use tracing::warn;
+use uuid::Uuid;
 
 type JsonValue = serde_json::Value;
 
@@ -261,7 +262,35 @@ pub(crate) async fn apply_bespoke_event_handling(
                     .await;
             }
         }
-        EventMsg::Warning(_warning_event) => {}
+        // Merge-safety anchor: live warning notifications must emit the same
+        // `ThreadItem::Warning` surface that replay/thread-read materialize,
+        // and they must attach to a truthful turn owner instead of inventing ids.
+        EventMsg::Warning(warning_event) => {
+            if let ApiVersion::V2 = api_version {
+                let turn_id = {
+                    let state = thread_state.lock().await;
+                    state.warning_turn_id()
+                };
+                let Some(turn_id) = turn_id else {
+                    warn!(
+                        thread_id = %conversation_id,
+                        "dropping warning because no truthful turn is available"
+                    );
+                    return;
+                };
+                let notification = ItemCompletedNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id,
+                    item: ThreadItem::Warning {
+                        id: format!("warning-{}", Uuid::now_v7()),
+                        message: warning_event.message,
+                    },
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::ItemCompleted(notification))
+                    .await;
+            }
+        }
         EventMsg::GuardianAssessment(assessment) => {
             if let ApiVersion::V2 = api_version {
                 let pending_command_execution = match build_item_from_guardian_event(
@@ -4767,6 +4796,435 @@ mod tests {
             other => bail!("unexpected message: {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "no extra messages expected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn warning_events_emit_item_completed_notification_for_active_truthful_turn() -> Result<()>
+    {
+        let codex_home = TempDir::new()?;
+        let config = load_default_config_for_test(&codex_home).await;
+        let thread_manager = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                config.model_provider.clone(),
+                config.codex_home.clone(),
+                Arc::new(codex_exec_server::EnvironmentManager::new(
+                    /*exec_server_url*/ None,
+                )),
+            ),
+        );
+        let codex_core::NewThread {
+            thread_id: conversation_id,
+            thread: conversation,
+            ..
+        } = thread_manager.start_thread(config).await?;
+        let thread_state = new_thread_state();
+        {
+            let mut state = thread_state.lock().await;
+            state.track_current_turn_event(&EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: "turn-active".to_string(),
+                    started_at: None,
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                },
+            ));
+        }
+        let thread_watch_manager = ThreadWatchManager::new();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "warning-event".to_string(),
+                msg: EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                    message: "active warning".to_string(),
+                }),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            thread_state,
+            thread_watch_manager,
+            ApiVersion::V2,
+            "test-provider".to_string(),
+            codex_home.path(),
+        )
+        .await;
+
+        let msg = recv_broadcast_message(&mut rx).await?;
+        match msg {
+            OutgoingMessage::AppServerNotification(ServerNotification::ItemCompleted(payload)) => {
+                assert_eq!(payload.thread_id, conversation_id.to_string());
+                assert_eq!(payload.turn_id, "turn-active");
+                let ThreadItem::Warning { id, message } = payload.item else {
+                    bail!("expected warning item");
+                };
+                assert!(id.starts_with("warning-"));
+                assert_eq!(message, "active warning");
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no extra messages expected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn warning_events_emit_item_completed_notification_for_retained_truthful_turn()
+    -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = load_default_config_for_test(&codex_home).await;
+        let thread_manager = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                config.model_provider.clone(),
+                config.codex_home.clone(),
+                Arc::new(codex_exec_server::EnvironmentManager::new(
+                    /*exec_server_url*/ None,
+                )),
+            ),
+        );
+        let codex_core::NewThread {
+            thread_id: conversation_id,
+            thread: conversation,
+            ..
+        } = thread_manager.start_thread(config).await?;
+        let thread_state = new_thread_state();
+        {
+            let mut state = thread_state.lock().await;
+            state.track_current_turn_event(&EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: "turn-1".to_string(),
+                    started_at: None,
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                },
+            ));
+            state.track_current_turn_event(&EventMsg::TurnComplete(turn_complete_event("turn-1")));
+        }
+        let thread_watch_manager = ThreadWatchManager::new();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "warning-event".to_string(),
+                msg: EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                    message: "retained warning".to_string(),
+                }),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            thread_state,
+            thread_watch_manager,
+            ApiVersion::V2,
+            "test-provider".to_string(),
+            codex_home.path(),
+        )
+        .await;
+
+        let msg = recv_broadcast_message(&mut rx).await?;
+        match msg {
+            OutgoingMessage::AppServerNotification(ServerNotification::ItemCompleted(payload)) => {
+                assert_eq!(payload.thread_id, conversation_id.to_string());
+                assert_eq!(payload.turn_id, "turn-1");
+                let ThreadItem::Warning { id, message } = payload.item else {
+                    bail!("expected warning item");
+                };
+                assert!(id.starts_with("warning-"));
+                assert_eq!(message, "retained warning");
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no extra messages expected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn warning_events_emit_item_completed_notification_after_mismatched_turn_complete()
+    -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = load_default_config_for_test(&codex_home).await;
+        let thread_manager = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                config.model_provider.clone(),
+                config.codex_home.clone(),
+                Arc::new(codex_exec_server::EnvironmentManager::new(
+                    /*exec_server_url*/ None,
+                )),
+            ),
+        );
+        let codex_core::NewThread {
+            thread_id: conversation_id,
+            thread: conversation,
+            ..
+        } = thread_manager.start_thread(config).await?;
+        let thread_state = new_thread_state();
+        {
+            let mut state = thread_state.lock().await;
+            state.track_current_turn_event(&EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: "turn-1".to_string(),
+                    started_at: None,
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                },
+            ));
+            state.track_current_turn_event(&EventMsg::TurnComplete(turn_complete_event(
+                "wrong-turn",
+            )));
+        }
+        let thread_watch_manager = ThreadWatchManager::new();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "warning-event".to_string(),
+                msg: EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                    message: "retained warning".to_string(),
+                }),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            thread_state,
+            thread_watch_manager,
+            ApiVersion::V2,
+            "test-provider".to_string(),
+            codex_home.path(),
+        )
+        .await;
+
+        let msg = recv_broadcast_message(&mut rx).await?;
+        match msg {
+            OutgoingMessage::AppServerNotification(ServerNotification::ItemCompleted(payload)) => {
+                assert_eq!(payload.thread_id, conversation_id.to_string());
+                assert_eq!(payload.turn_id, "turn-1");
+                let ThreadItem::Warning { id, message } = payload.item else {
+                    bail!("expected warning item");
+                };
+                assert!(id.starts_with("warning-"));
+                assert_eq!(message, "retained warning");
+            }
+            other => bail!("unexpected message: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no extra messages expected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn warning_events_without_truthful_turn_emit_no_notification() -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = load_default_config_for_test(&codex_home).await;
+        let thread_manager = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                config.model_provider.clone(),
+                config.codex_home.clone(),
+                Arc::new(codex_exec_server::EnvironmentManager::new(
+                    /*exec_server_url*/ None,
+                )),
+            ),
+        );
+        let codex_core::NewThread {
+            thread_id: conversation_id,
+            thread: conversation,
+            ..
+        } = thread_manager.start_thread(config).await?;
+        let thread_state = new_thread_state();
+        {
+            let mut state = thread_state.lock().await;
+            state.track_current_turn_event(&EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: "hello".to_string(),
+                    images: None,
+                    text_elements: Vec::new(),
+                    local_images: Vec::new(),
+                },
+            ));
+        }
+        let thread_watch_manager = ThreadWatchManager::new();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "warning-event".to_string(),
+                msg: EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                    message: "implicit warning".to_string(),
+                }),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            thread_state,
+            thread_watch_manager,
+            ApiVersion::V2,
+            "test-provider".to_string(),
+            codex_home.path(),
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err(), "no warning notification expected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn warning_events_after_implicit_turn_complete_emit_no_notification() -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = load_default_config_for_test(&codex_home).await;
+        let thread_manager = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                config.model_provider.clone(),
+                config.codex_home.clone(),
+                Arc::new(codex_exec_server::EnvironmentManager::new(
+                    /*exec_server_url*/ None,
+                )),
+            ),
+        );
+        let codex_core::NewThread {
+            thread_id: conversation_id,
+            thread: conversation,
+            ..
+        } = thread_manager.start_thread(config).await?;
+        let thread_state = new_thread_state();
+        {
+            let mut state = thread_state.lock().await;
+            state.track_current_turn_event(&EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: "hello".to_string(),
+                    images: None,
+                    text_elements: Vec::new(),
+                    local_images: Vec::new(),
+                },
+            ));
+            state.track_current_turn_event(&EventMsg::TurnComplete(turn_complete_event(
+                "wrong-turn",
+            )));
+        }
+        let thread_watch_manager = ThreadWatchManager::new();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "warning-event".to_string(),
+                msg: EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                    message: "implicit warning".to_string(),
+                }),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            thread_state,
+            thread_watch_manager,
+            ApiVersion::V2,
+            "test-provider".to_string(),
+            codex_home.path(),
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err(), "no warning notification expected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn warning_events_after_implicit_turn_aborted_emit_no_notification() -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = load_default_config_for_test(&codex_home).await;
+        let thread_manager = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                config.model_provider.clone(),
+                config.codex_home.clone(),
+                Arc::new(codex_exec_server::EnvironmentManager::new(
+                    /*exec_server_url*/ None,
+                )),
+            ),
+        );
+        let codex_core::NewThread {
+            thread_id: conversation_id,
+            thread: conversation,
+            ..
+        } = thread_manager.start_thread(config).await?;
+        let thread_state = new_thread_state();
+        {
+            let mut state = thread_state.lock().await;
+            state.track_current_turn_event(&EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: "hello".to_string(),
+                    images: None,
+                    text_elements: Vec::new(),
+                    local_images: Vec::new(),
+                },
+            ));
+            state
+                .track_current_turn_event(&EventMsg::TurnAborted(turn_aborted_event("wrong-turn")));
+        }
+        let thread_watch_manager = ThreadWatchManager::new();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "warning-event".to_string(),
+                msg: EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                    message: "implicit warning".to_string(),
+                }),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            thread_state,
+            thread_watch_manager,
+            ApiVersion::V2,
+            "test-provider".to_string(),
+            codex_home.path(),
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err(), "no warning notification expected");
         Ok(())
     }
 }

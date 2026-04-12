@@ -152,6 +152,18 @@ impl ThreadWatchManager {
         .await;
     }
 
+    // Merge-safety anchor: response-path hydration may only mutate
+    // `ThreadWatchManager` state before a read, never compute a second status
+    // owner outside the manager.
+    pub(crate) async fn note_observed_live_running_turn(&self, thread_id: &str) {
+        self.update_runtime_for_thread(thread_id, |runtime| {
+            runtime.is_loaded = true;
+            runtime.running = true;
+            runtime.has_system_error = false;
+        })
+        .await;
+    }
+
     pub(crate) async fn note_turn_completed(&self, thread_id: &str, _failed: bool) {
         self.clear_active_state(thread_id).await;
     }
@@ -274,22 +286,6 @@ impl ThreadWatchManager {
             ThreadWatchActiveGuardType::UserInput => &mut runtime.pending_user_input_requests,
         }
     }
-}
-
-pub(crate) fn resolve_thread_status(
-    status: ThreadStatus,
-    has_in_progress_turn: bool,
-) -> ThreadStatus {
-    // Running-turn events can arrive before the watch runtime state is observed by
-    // the listener loop. In that window we prefer to reflect a real active turn as
-    // `Active` instead of `Idle`/`NotLoaded`.
-    if has_in_progress_turn && matches!(status, ThreadStatus::Idle | ThreadStatus::NotLoaded) {
-        return ThreadStatus::Active {
-            active_flags: Vec::new(),
-        };
-    }
-
-    status
 }
 
 #[derive(Default)]
@@ -528,41 +524,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolves_in_progress_turn_to_active_status() {
-        let status = resolve_thread_status(ThreadStatus::Idle, /*has_in_progress_turn*/ true);
-        assert_eq!(
-            status,
-            ThreadStatus::Active {
-                active_flags: Vec::new(),
-            }
-        );
-
-        let status =
-            resolve_thread_status(ThreadStatus::NotLoaded, /*has_in_progress_turn*/ true);
-        assert_eq!(
-            status,
-            ThreadStatus::Active {
-                active_flags: Vec::new(),
-            }
-        );
-    }
-
-    #[test]
-    fn keeps_status_when_no_in_progress_turn() {
-        assert_eq!(
-            resolve_thread_status(ThreadStatus::Idle, /*has_in_progress_turn*/ false),
-            ThreadStatus::Idle
-        );
-        assert_eq!(
-            resolve_thread_status(
-                ThreadStatus::SystemError,
-                /*has_in_progress_turn*/ false
-            ),
-            ThreadStatus::SystemError
-        );
-    }
-
     #[tokio::test]
     async fn system_error_sets_idle_flag_until_next_turn() {
         let manager = ThreadWatchManager::new();
@@ -749,6 +710,81 @@ mod tests {
                     active_flags: vec![],
                 },
             },
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_live_running_turn_promotes_idle_status_without_local_repair() {
+        let manager = ThreadWatchManager::new();
+        manager
+            .upsert_thread_silently(test_thread(
+                INTERACTIVE_THREAD_ID,
+                codex_app_server_protocol::SessionSource::Cli,
+            ))
+            .await;
+
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Idle
+        );
+
+        manager
+            .note_observed_live_running_turn(INTERACTIVE_THREAD_ID)
+            .await;
+
+        assert_eq!(
+            manager
+                .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                .await,
+            ThreadStatus::Active {
+                active_flags: vec![],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_live_running_turn_is_idempotent_when_status_is_already_active() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
+        let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
+            outgoing_tx,
+        )));
+        manager
+            .upsert_thread(test_thread(
+                INTERACTIVE_THREAD_ID,
+                codex_app_server_protocol::SessionSource::Cli,
+            ))
+            .await;
+        assert_eq!(
+            recv_status_changed_notification(&mut outgoing_rx).await,
+            ThreadStatusChangedNotification {
+                thread_id: INTERACTIVE_THREAD_ID.to_string(),
+                status: ThreadStatus::Idle,
+            }
+        );
+
+        manager
+            .note_observed_live_running_turn(INTERACTIVE_THREAD_ID)
+            .await;
+        assert_eq!(
+            recv_status_changed_notification(&mut outgoing_rx).await,
+            ThreadStatusChangedNotification {
+                thread_id: INTERACTIVE_THREAD_ID.to_string(),
+                status: ThreadStatus::Active {
+                    active_flags: vec![],
+                },
+            }
+        );
+
+        manager
+            .note_observed_live_running_turn(INTERACTIVE_THREAD_ID)
+            .await;
+        assert!(
+            timeout(Duration::from_millis(100), outgoing_rx.recv())
+                .await
+                .is_err(),
+            "repeating observed-live-running hydration should not emit duplicate status churn"
         );
     }
 

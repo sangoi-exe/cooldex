@@ -61,6 +61,10 @@ pub(crate) struct ThreadState {
     pub(crate) listener_generation: u64,
     listener_command_tx: Option<mpsc::UnboundedSender<ThreadListenerCommand>>,
     current_turn_history: ThreadHistoryBuilder,
+    // Merge-safety anchor: retained warning turn ids stay a bounded follower of
+    // listener-tracked truthful turn boundaries so live warning translation does
+    // not widen `active_turn_snapshot()` into a replay-style last-turn owner.
+    retained_warning_turn_id: Option<String>,
     listener_thread: Option<Weak<CodexThread>>,
 }
 
@@ -93,6 +97,7 @@ impl ThreadState {
         }
         self.listener_command_tx = None;
         self.current_turn_history.reset();
+        self.retained_warning_turn_id = None;
         self.listener_thread = None;
     }
 
@@ -110,16 +115,190 @@ impl ThreadState {
         self.current_turn_history.active_turn_snapshot()
     }
 
+    pub(crate) fn warning_turn_id(&self) -> Option<String> {
+        self.current_turn_history
+            .truthful_warning_turn_id()
+            .or_else(|| self.retained_warning_turn_id.clone())
+    }
+
     pub(crate) fn track_current_turn_event(&mut self, event: &EventMsg) {
+        let retained_warning_turn_id_before_event = self.retained_warning_turn_id.clone();
         if let EventMsg::TurnStarted(payload) = event {
             self.turn_summary.started_at = payload.started_at;
         }
         self.current_turn_history.handle_event(event);
+        let truthful_warning_turn_id_after_event = self
+            .current_turn_history
+            .truthful_warning_turn_id()
+            .or(retained_warning_turn_id_before_event);
+        match event {
+            EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) => {
+                self.retained_warning_turn_id = truthful_warning_turn_id_after_event;
+            }
+            EventMsg::ThreadRolledBack(_) => {
+                self.retained_warning_turn_id = None;
+            }
+            _ => {}
+        }
         if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_))
             && !self.current_turn_history.has_active_turn()
         {
             self.current_turn_history.reset();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::protocol::TurnAbortReason;
+    use codex_protocol::protocol::TurnAbortedEvent;
+    use codex_protocol::protocol::TurnCompleteEvent;
+    use codex_protocol::protocol::TurnStartedEvent;
+    use codex_protocol::protocol::UserMessageEvent;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn warning_turn_id_retains_last_truthful_turn_without_widening_active_snapshot() {
+        let mut state = ThreadState::default();
+
+        state.track_current_turn_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".into(),
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+        assert_eq!(
+            state.active_turn_snapshot().map(|turn| turn.id),
+            Some("turn-1".into())
+        );
+        assert_eq!(state.warning_turn_id(), Some("turn-1".into()));
+
+        state.track_current_turn_event(&EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".into(),
+            last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
+        }));
+        assert_eq!(state.active_turn_snapshot(), None);
+        assert_eq!(state.warning_turn_id(), Some("turn-1".into()));
+
+        state.track_current_turn_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-2".into(),
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+        assert_eq!(
+            state.active_turn_snapshot().map(|turn| turn.id),
+            Some("turn-2".into())
+        );
+        assert_eq!(state.warning_turn_id(), Some("turn-2".into()));
+    }
+
+    #[test]
+    fn clear_listener_clears_retained_warning_turn_id() {
+        let mut state = ThreadState::default();
+        state.track_current_turn_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".into(),
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+        state.track_current_turn_event(&EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".into(),
+            last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
+        }));
+
+        state.clear_listener();
+
+        assert_eq!(state.warning_turn_id(), None);
+    }
+
+    #[test]
+    fn warning_turn_id_preserves_truthful_turn_across_mismatched_turn_complete() {
+        let mut state = ThreadState::default();
+        state.track_current_turn_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".into(),
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+        state.track_current_turn_event(&EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "wrong-turn".into(),
+            last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
+        }));
+
+        assert_eq!(state.active_turn_snapshot(), None);
+        assert_eq!(state.warning_turn_id(), Some("turn-1".into()));
+    }
+
+    #[test]
+    fn warning_turn_id_preserves_truthful_turn_across_mismatched_turn_aborted() {
+        let mut state = ThreadState::default();
+        state.track_current_turn_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".into(),
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+        state.track_current_turn_event(&EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".into(),
+            last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
+        }));
+        state.track_current_turn_event(&EventMsg::TurnAborted(TurnAbortedEvent {
+            turn_id: Some("wrong-turn".into()),
+            reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
+        }));
+
+        assert_eq!(state.active_turn_snapshot(), None);
+        assert_eq!(state.warning_turn_id(), Some("turn-1".into()));
+    }
+
+    #[test]
+    fn warning_turn_id_drops_implicit_turn_complete() {
+        let mut state = ThreadState::default();
+        state.track_current_turn_event(&EventMsg::UserMessage(UserMessageEvent {
+            message: "hello".into(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+        }));
+        state.track_current_turn_event(&EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "wrong-turn".into(),
+            last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
+        }));
+
+        assert_eq!(state.warning_turn_id(), None);
+    }
+
+    #[test]
+    fn warning_turn_id_drops_implicit_turn_aborted() {
+        let mut state = ThreadState::default();
+        state.track_current_turn_event(&EventMsg::UserMessage(UserMessageEvent {
+            message: "hello".into(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+        }));
+        state.track_current_turn_event(&EventMsg::TurnAborted(TurnAbortedEvent {
+            turn_id: Some("wrong-turn".into()),
+            reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
+        }));
+
+        assert_eq!(state.warning_turn_id(), None);
     }
 }
 

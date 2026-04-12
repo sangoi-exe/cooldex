@@ -62,6 +62,7 @@ use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::ViewImageToolCallEvent;
+use codex_protocol::protocol::WarningEvent;
 use codex_protocol::protocol::WebSearchBeginEvent;
 use codex_protocol::protocol::WebSearchEndEvent;
 use codex_shell_command::parse_command::parse_command;
@@ -241,6 +242,7 @@ fn shell_command_execution_item(
 pub struct ThreadHistoryBuilder {
     turns: Vec<Turn>,
     current_turn: Option<PendingTurn>,
+    truthful_turn_ids: Vec<String>,
     next_item_index: i64,
     current_rollout_index: usize,
     next_rollout_index: usize,
@@ -257,6 +259,7 @@ impl ThreadHistoryBuilder {
         Self {
             turns: Vec::new(),
             current_turn: None,
+            truthful_turn_ids: Vec::new(),
             next_item_index: 1,
             current_rollout_index: 0,
             next_rollout_index: 0,
@@ -290,6 +293,11 @@ impl ThreadHistoryBuilder {
             .map(|turn| turn.id.clone())
     }
 
+    pub fn truthful_warning_turn_id(&self) -> Option<String> {
+        self.active_turn_id_if_explicit()
+            .or_else(|| self.truthful_turn_ids.last().cloned())
+    }
+
     pub fn active_turn_start_index(&self) -> Option<usize> {
         self.current_turn
             .as_ref()
@@ -317,6 +325,10 @@ impl ThreadHistoryBuilder {
             EventMsg::WebSearchEnd(payload) => self.handle_web_search_end(payload),
             EventMsg::ExecCommandBegin(payload) => self.handle_exec_command_begin(payload),
             EventMsg::ExecCommandEnd(payload) => self.handle_exec_command_end(payload),
+            // Merge-safety anchor: replayed warning events must materialize into
+            // the same app-server `ThreadItem::Warning` surface that live
+            // notifications emit, or thread/read and reconstructed replay diverge.
+            EventMsg::Warning(payload) => self.handle_warning(payload),
             EventMsg::GuardianAssessment(payload) => self.handle_guardian_assessment(payload),
             EventMsg::ApplyPatchApprovalRequest(payload) => {
                 self.handle_apply_patch_approval_request(payload)
@@ -1352,6 +1364,9 @@ impl ThreadHistoryBuilder {
                 .with_started_at(payload.started_at)
                 .opened_explicitly(),
         );
+        if self.truthful_turn_ids.last() != Some(&payload.turn_id) {
+            self.truthful_turn_ids.push(payload.turn_id.clone());
+        }
     }
 
     fn handle_turn_complete(&mut self, payload: &TurnCompleteEvent) {
@@ -1394,6 +1409,20 @@ impl ThreadHistoryBuilder {
         }
     }
 
+    fn handle_warning(&mut self, payload: &WarningEvent) {
+        let item = ThreadItem::Warning {
+            id: self.next_item_id(),
+            message: payload.message.clone(),
+        };
+
+        if let Some(turn_id) = self.truthful_warning_turn_id() {
+            self.upsert_item_in_turn_id(&turn_id, item);
+            return;
+        }
+
+        warn!("dropping warning item because no truthful turn is available");
+    }
+
     /// Marks the current turn as containing a persisted compaction marker.
     ///
     /// This keeps compaction-only legacy turns from being dropped by
@@ -1433,6 +1462,8 @@ impl ThreadHistoryBuilder {
 
         let item_count: usize = self.turns.iter().map(|t| t.items.len()).sum();
         self.next_item_index = i64::try_from(item_count.saturating_add(1)).unwrap_or(i64::MAX);
+        self.truthful_turn_ids
+            .retain(|turn_id| self.turns.iter().any(|turn| turn.id == *turn_id));
     }
 
     fn finish_current_turn(&mut self) {
@@ -1732,6 +1763,7 @@ mod tests {
     use codex_protocol::protocol::TurnCompleteEvent;
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
+    use codex_protocol::protocol::WarningEvent;
     use codex_protocol::protocol::WebSearchEndEvent;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
@@ -1838,6 +1870,166 @@ mod tests {
                 memory_citation: None,
             }
         );
+    }
+
+    #[test]
+    fn warning_event_attaches_to_active_turn() {
+        let mut builder = ThreadHistoryBuilder::new();
+        builder.handle_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".into(),
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+        builder.handle_event(&EventMsg::Warning(WarningEvent {
+            message: "warning".into(),
+        }));
+        builder.handle_event(&EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".into(),
+            last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
+        }));
+
+        let turns = builder.finish();
+        assert_eq!(turns.len(), 1);
+        let [ThreadItem::Warning { message, .. }] = turns[0].items.as_slice() else {
+            panic!("expected warning item on the active turn");
+        };
+        assert_eq!(message, "warning");
+    }
+
+    #[test]
+    fn warning_event_after_turn_complete_reuses_last_truthful_turn() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-1".into(),
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-1".into(),
+                last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::Warning(WarningEvent {
+                message: "post-turn warning".into(),
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        let [ThreadItem::Warning { message, .. }] = turns[0].items.as_slice() else {
+            panic!("expected warning item on the last truthful turn");
+        };
+        assert_eq!(message, "post-turn warning");
+    }
+
+    #[test]
+    fn warning_event_after_mismatched_turn_complete_reuses_last_truthful_turn() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-1".into(),
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "wrong-turn".into(),
+                last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::Warning(WarningEvent {
+                message: "post-turn warning".into(),
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].id, "turn-1");
+        let [ThreadItem::Warning { message, .. }] = turns[0].items.as_slice() else {
+            panic!("expected warning item on the last truthful turn");
+        };
+        assert_eq!(message, "post-turn warning");
+    }
+
+    #[test]
+    fn warning_event_after_implicit_user_message_is_dropped() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "hello".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::EventMsg(EventMsg::Warning(WarningEvent {
+                message: "implicit warning".into(),
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 1);
+        let [ThreadItem::UserMessage { .. }] = turns[0].items.as_slice() else {
+            panic!("expected only the implicit user message to remain");
+        };
+    }
+
+    #[test]
+    fn warning_event_after_implicit_turn_complete_is_dropped() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "hello".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "wrong-turn".into(),
+                last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::Warning(WarningEvent {
+                message: "implicit warning".into(),
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        let [ThreadItem::UserMessage { .. }] = turns[0].items.as_slice() else {
+            panic!("expected only the implicit user message to remain");
+        };
+    }
+
+    #[test]
+    fn warning_event_after_implicit_turn_aborted_is_dropped() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "hello".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: Some("wrong-turn".into()),
+                reason: TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::Warning(WarningEvent {
+                message: "implicit warning".into(),
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        let [ThreadItem::UserMessage { .. }] = turns[0].items.as_slice() else {
+            panic!("expected only the implicit user message to remain");
+        };
     }
 
     #[test]

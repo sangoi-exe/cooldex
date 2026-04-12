@@ -129,9 +129,12 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
         | EventMsg::CollabCloseEnd(_)
         | EventMsg::CollabResumeEnd(_)
         | EventMsg::DynamicToolCallRequest(_)
-        | EventMsg::DynamicToolCallResponse(_) => Some(EventPersistenceMode::Extended),
-        EventMsg::Warning(_)
-        | EventMsg::RealtimeConversationStarted(_)
+        | EventMsg::DynamicToolCallResponse(_)
+        // Merge-safety anchor: warning persistence keeps app-server thread/read
+        // replay and plain-TUI reconstructed replay on the same generic-warning
+        // evidence instead of splitting live-only vs replay-only owners.
+        | EventMsg::Warning(_) => Some(EventPersistenceMode::Extended),
+        EventMsg::RealtimeConversationStarted(_)
         | EventMsg::RealtimeConversationSdp(_)
         | EventMsg::RealtimeConversationRealtime(_)
         | EventMsg::RealtimeConversationClosed(_)
@@ -189,6 +192,7 @@ mod tests {
     use super::should_persist_event_msg;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::ImageGenerationEndEvent;
+    use codex_protocol::protocol::WarningEvent;
 
     #[test]
     fn persists_image_generation_end_events_in_limited_mode() {
@@ -203,6 +207,18 @@ mod tests {
         assert!(should_persist_event_msg(
             &event,
             EventPersistenceMode::Limited
+        ));
+    }
+
+    #[test]
+    fn persists_warning_events_in_extended_mode() {
+        let event = EventMsg::Warning(WarningEvent {
+            message: "warning".into(),
+        });
+
+        assert!(should_persist_event_msg(
+            &event,
+            EventPersistenceMode::Extended
         ));
     }
 }

@@ -112,6 +112,8 @@ use codex_protocol::protocol::TurnCompleteEvent;
 #[cfg(test)]
 use codex_protocol::protocol::TurnStartedEvent;
 #[cfg(test)]
+use codex_protocol::protocol::WarningEvent;
+#[cfg(test)]
 use std::time::Duration;
 
 impl App {
@@ -589,15 +591,21 @@ fn server_notification_thread_events(
         ServerNotification::ItemCompleted(notification) => Some((
             ThreadId::from_string(&notification.thread_id).ok()?,
             command_execution_completed_event(&notification.turn_id, &notification.item).or_else(
-                || {
-                    Some(vec![Event {
+                || match &notification.item {
+                    ThreadItem::Warning { message, .. } => Some(vec![Event {
+                        id: String::new(),
+                        msg: EventMsg::Warning(WarningEvent {
+                            message: message.clone(),
+                        }),
+                    }]),
+                    _ => Some(vec![Event {
                         id: String::new(),
                         msg: EventMsg::ItemCompleted(ItemCompletedEvent {
                             thread_id: ThreadId::from_string(&notification.thread_id).ok()?,
                             turn_id: notification.turn_id.clone(),
                             item: thread_item_to_core(&notification.item)?,
                         }),
-                    }])
+                    }]),
                 },
             )?,
         )),
@@ -751,6 +759,15 @@ fn turn_snapshot_events(
     for item in &turn.items {
         if let Some(command_events) = command_execution_snapshot_events(&turn.id, item) {
             events.extend(command_events);
+            continue;
+        }
+        if let ThreadItem::Warning { message, .. } = item {
+            events.push(Event {
+                id: String::new(),
+                msg: EventMsg::Warning(WarningEvent {
+                    message: message.clone(),
+                }),
+            });
             continue;
         }
 
@@ -926,6 +943,10 @@ fn thread_item_to_core(item: &ThreadItem) -> Option<TurnItem> {
         }
         ThreadItem::CommandExecution { .. }
         | ThreadItem::FileChange { .. }
+        // Merge-safety anchor: warning items intentionally bypass the generic
+        // TurnItem adapter and replay through core `EventMsg::Warning` so the
+        // adapter does not invent a second runtime owner for warnings.
+        | ThreadItem::Warning { .. }
         | ThreadItem::McpToolCall { .. }
         | ThreadItem::DynamicToolCall { .. }
         | ThreadItem::CollabAgentToolCall { .. }
@@ -1550,6 +1571,81 @@ mod tests {
             panic!("expected bridged reasoning delta");
         };
         assert_eq!(delta.delta, "Thinking");
+    }
+
+    #[test]
+    fn bridges_warning_items_from_server_notifications() {
+        let thread_id = "019cee8c-b993-7e33-88c0-014d4e62612d".to_string();
+
+        let (actual_thread_id, events) = server_notification_thread_events(
+            ServerNotification::ItemCompleted(ItemCompletedNotification {
+                thread_id: thread_id.clone(),
+                turn_id: "turn-warning".to_string(),
+                item: ThreadItem::Warning {
+                    id: "warning-1".to_string(),
+                    message: "watch out".to_string(),
+                },
+            }),
+        )
+        .expect("notification should bridge");
+
+        assert_eq!(
+            actual_thread_id,
+            ThreadId::from_string(&thread_id).expect("valid thread id")
+        );
+        let [event] = events.as_slice() else {
+            panic!("expected one bridged warning event");
+        };
+        assert_eq!(event.id, String::new());
+        let EventMsg::Warning(payload) = &event.msg else {
+            panic!("expected bridged warning event");
+        };
+        assert_eq!(payload.message, "watch out");
+    }
+
+    #[test]
+    fn bridges_warning_items_during_thread_snapshot_replay() {
+        let thread_id = ThreadId::new();
+        let events = thread_snapshot_events(
+            &Thread {
+                id: thread_id.to_string(),
+                forked_from_id: None,
+                preview: "warning".to_string(),
+                ephemeral: false,
+                model_provider: "openai".to_string(),
+                created_at: 0,
+                updated_at: 0,
+                status: ThreadStatus::Idle,
+                path: None,
+                cwd: PathBuf::from("/tmp/project"),
+                cli_version: "test".to_string(),
+                source: SessionSource::Cli.into(),
+                agent_nickname: None,
+                agent_role: None,
+                git_info: None,
+                name: Some("warning".to_string()),
+                turns: vec![Turn {
+                    id: "turn-warning".to_string(),
+                    items: vec![ThreadItem::Warning {
+                        id: "warning-1".to_string(),
+                        message: "snapshot warning".to_string(),
+                    }],
+                    status: TurnStatus::Completed,
+                    error: None,
+                    started_at: None,
+                    completed_at: None,
+                    duration_ms: None,
+                }],
+            },
+            /*show_raw_agent_reasoning*/ false,
+        );
+
+        assert!(matches!(events[0].msg, EventMsg::TurnStarted(_)));
+        let EventMsg::Warning(payload) = &events[1].msg else {
+            panic!("expected warning replay event");
+        };
+        assert_eq!(payload.message, "snapshot warning");
+        assert!(matches!(events[2].msg, EventMsg::TurnComplete(_)));
     }
 
     #[test]

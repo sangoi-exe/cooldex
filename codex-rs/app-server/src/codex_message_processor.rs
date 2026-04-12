@@ -16,7 +16,6 @@ use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::RequestContext;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::thread_status::ThreadWatchManager;
-use crate::thread_status::resolve_thread_status;
 use chrono::DateTime;
 use chrono::SecondsFormat;
 use chrono::Utc;
@@ -2445,17 +2444,14 @@ impl CodexMessageProcessor {
                     ))
                     .await;
 
-                thread.status = resolve_thread_status(
-                    listener_task_context
-                        .thread_watch_manager
-                        .loaded_status_for_thread(&thread.id)
-                        .instrument(tracing::info_span!(
-                            "app_server.thread_start.resolve_status",
-                            otel.name = "app_server.thread_start.resolve_status",
-                        ))
-                        .await,
-                    /*has_in_progress_turn*/ false,
-                );
+                thread.status = listener_task_context
+                    .thread_watch_manager
+                    .loaded_status_for_thread(&thread.id)
+                    .instrument(tracing::info_span!(
+                        "app_server.thread_start.resolve_status",
+                        otel.name = "app_server.thread_start.resolve_status",
+                    ))
+                    .await;
 
                 let response = ThreadStartResponse {
                     thread: thread.clone(),
@@ -2911,12 +2907,10 @@ impl CodexMessageProcessor {
 
         let mut thread = summary_to_thread(summary);
         self.attach_thread_name(thread_uuid, &mut thread).await;
-        thread.status = resolve_thread_status(
-            self.thread_watch_manager
-                .loaded_status_for_thread(&thread.id)
-                .await,
-            /*has_in_progress_turn*/ false,
-        );
+        thread.status = self
+            .thread_watch_manager
+            .loaded_status_for_thread(&thread.id)
+            .await;
 
         self.outgoing
             .send_response(request_id, ThreadMetadataUpdateResponse { thread })
@@ -3223,12 +3217,10 @@ impl CodexMessageProcessor {
 
         match result {
             Ok(mut thread) => {
-                thread.status = resolve_thread_status(
-                    self.thread_watch_manager
-                        .loaded_status_for_thread(&thread.id)
-                        .await,
-                    /*has_in_progress_turn*/ false,
-                );
+                thread.status = self
+                    .thread_watch_manager
+                    .loaded_status_for_thread(&thread.id)
+                    .await;
                 self.attach_thread_name(thread_id, &mut thread).await;
                 let thread_id = thread.id.clone();
                 let response = ThreadUnarchiveResponse { thread };
@@ -3712,17 +3704,18 @@ impl CodexMessageProcessor {
         } else {
             false
         };
+        if has_live_in_progress_turn {
+            self.thread_watch_manager
+                .note_observed_live_running_turn(&thread.id)
+                .await;
+        }
 
         let thread_status = self
             .thread_watch_manager
             .loaded_status_for_thread(&thread.id)
             .await;
 
-        set_thread_status_and_interrupt_stale_turns(
-            &mut thread,
-            thread_status,
-            has_live_in_progress_turn,
-        );
+        set_thread_status_and_interrupt_stale_turns(&mut thread, thread_status);
         let response = ThreadReadResponse { thread };
         self.outgoing.send_response(request_id, response).await;
     }
@@ -3967,11 +3960,7 @@ impl CodexMessageProcessor {
                     .loaded_status_for_thread(&thread.id)
                     .await;
 
-                set_thread_status_and_interrupt_stale_turns(
-                    &mut thread,
-                    thread_status,
-                    /*has_live_in_progress_turn*/ false,
-                );
+                set_thread_status_and_interrupt_stale_turns(&mut thread, thread_status);
 
                 let response = ThreadResumeResponse {
                     thread,
@@ -4632,12 +4621,10 @@ impl CodexMessageProcessor {
             .upsert_thread_silently(thread.clone())
             .await;
 
-        thread.status = resolve_thread_status(
-            self.thread_watch_manager
-                .loaded_status_for_thread(&thread.id)
-                .await,
-            /*has_in_progress_turn*/ false,
-        );
+        thread.status = self
+            .thread_watch_manager
+            .loaded_status_for_thread(&thread.id)
+            .await;
 
         let response = ThreadForkResponse {
             thread: thread.clone(),
@@ -7248,12 +7235,10 @@ impl CodexMessageProcessor {
                     self.thread_watch_manager
                         .upsert_thread_silently(thread.clone())
                         .await;
-                    thread.status = resolve_thread_status(
-                        self.thread_watch_manager
-                            .loaded_status_for_thread(&thread.id)
-                            .await,
-                        /*has_in_progress_turn*/ false,
-                    );
+                    thread.status = self
+                        .thread_watch_manager
+                        .loaded_status_for_thread(&thread.id)
+                        .await;
                     let notif = ThreadStartedNotification { thread };
                     self.outgoing
                         .send_server_notification(ServerNotification::ThreadStarted(notif))
@@ -8176,15 +8161,17 @@ async fn handle_pending_thread_resume_request(
         return;
     }
 
+    if has_live_in_progress_turn {
+        thread_watch_manager
+            .note_observed_live_running_turn(&thread.id)
+            .await;
+    }
+
     let thread_status = thread_watch_manager
         .loaded_status_for_thread(&thread.id)
         .await;
 
-    set_thread_status_and_interrupt_stale_turns(
-        &mut thread,
-        thread_status,
-        has_live_in_progress_turn,
-    );
+    set_thread_status_and_interrupt_stale_turns(&mut thread, thread_status);
 
     match find_thread_name_by_id(codex_home, &conversation_id).await {
         Ok(thread_name) => thread.name = thread_name,
@@ -8286,20 +8273,18 @@ fn merge_turn_history_with_active_turn(turns: &mut Vec<Turn>, active_turn: Turn)
     turns.push(active_turn);
 }
 
-fn set_thread_status_and_interrupt_stale_turns(
-    thread: &mut Thread,
-    loaded_status: ThreadStatus,
-    has_live_in_progress_turn: bool,
-) {
-    let status = resolve_thread_status(loaded_status, has_live_in_progress_turn);
-    if !matches!(status, ThreadStatus::Active { .. }) {
+fn set_thread_status_and_interrupt_stale_turns(thread: &mut Thread, loaded_status: ThreadStatus) {
+    // Merge-safety anchor: this helper consumes the manager-owned loaded status
+    // only; live-running hydration belongs in ThreadWatchManager before any
+    // thread/read or thread/resume projection path mutates visible thread data.
+    if !matches!(loaded_status, ThreadStatus::Active { .. }) {
         for turn in &mut thread.turns {
             if matches!(turn.status, TurnStatus::InProgress) {
                 turn.status = TurnStatus::Interrupted;
             }
         }
     }
-    thread.status = status;
+    thread.status = loaded_status;
 }
 
 fn collect_resume_override_mismatches(

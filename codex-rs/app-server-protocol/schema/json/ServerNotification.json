@@ -2779,6 +2779,30 @@
           "type": "object"
         },
         {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "warning"
+              ],
+              "title": "WarningThreadItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "message",
+            "type"
+          ],
+          "title": "WarningThreadItem",
+          "type": "object"
+        },
+        {
           "description": "EXPERIMENTAL - proposed plan item content. The completed plan item is authoritative and may not match the concatenation of `PlanDelta` text.",
           "properties": {
             "id": {

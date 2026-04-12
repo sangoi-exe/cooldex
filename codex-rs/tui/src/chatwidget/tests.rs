@@ -14427,6 +14427,56 @@ async fn app_server_mcp_startup_failure_renders_warning_history() {
 }
 
 #[tokio::test]
+async fn app_server_warning_item_live_renders_warning_history() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.show_welcome_banner = false;
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: ThreadId::new().to_string(),
+            turn_id: "turn-warning-live".to_string(),
+            item: AppServerThreadItem::Warning {
+                id: "warning-live".to_string(),
+                message: "live warning".to_string(),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let cells = drain_insert_history(&mut rx);
+    let text = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert!(text.contains("live warning"));
+}
+
+#[tokio::test]
+async fn app_server_warning_item_replay_renders_warning_history() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.show_welcome_banner = false;
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: ThreadId::new().to_string(),
+            turn_id: "turn-warning-replay".to_string(),
+            item: AppServerThreadItem::Warning {
+                id: "warning-replay".to_string(),
+                message: "replay warning".to_string(),
+            },
+        }),
+        Some(ReplayKind::ThreadSnapshot),
+    );
+
+    let cells = drain_insert_history(&mut rx);
+    let text = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert!(text.contains("replay warning"));
+}
+
+#[tokio::test]
 async fn app_server_mcp_startup_lag_settles_startup_and_ignores_late_updates() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.show_welcome_banner = false;

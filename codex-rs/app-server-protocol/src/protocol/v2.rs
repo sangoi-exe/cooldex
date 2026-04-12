@@ -4390,6 +4390,12 @@ pub enum ThreadItem {
         #[serde(default)]
         memory_citation: Option<MemoryCitation>,
     },
+    // Merge-safety anchor: app-server warning items are the sole generic-warning
+    // owner for live notifications and replayed thread history, so protocol,
+    // thread-history, and TUI warning rendering must stay aligned.
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    Warning { id: String, message: String },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     /// EXPERIMENTAL - proposed plan item content. The completed plan item is
@@ -4547,6 +4553,7 @@ impl ThreadItem {
             ThreadItem::UserMessage { id, .. }
             | ThreadItem::HookPrompt { id, .. }
             | ThreadItem::AgentMessage { id, .. }
+            | ThreadItem::Warning { id, .. }
             | ThreadItem::Plan { id, .. }
             | ThreadItem::Reasoning { id, .. }
             | ThreadItem::CommandExecution { id, .. }

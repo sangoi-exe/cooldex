@@ -7111,6 +7111,10 @@ impl ChatWidget {
                 });
             }
             ThreadItem::Plan { text, .. } => self.on_plan_item_completed(text),
+            // Merge-safety anchor: app-server warning items must reuse the same
+            // generic warning renderer as direct-core `EventMsg::Warning` so
+            // live notifications and replay land in one visible surface.
+            ThreadItem::Warning { message, .. } => self.on_warning(message),
             ThreadItem::Reasoning {
                 summary, content, ..
             } => {
