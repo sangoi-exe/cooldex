@@ -15,7 +15,9 @@ use codex_features::FeatureConfigSource;
 use codex_features::FeatureOverrides;
 use codex_features::Features;
 use codex_features::canonical_feature_for_key;
-use codex_features::feature_for_key;
+use codex_features::canonical_user_toggle_feature_for_key;
+use codex_features::legacy_feature_for_key;
+use codex_features::user_toggle_feature_for_key;
 
 /// Wrapper around [`Features`] which enforces constraints defined in
 /// `FeatureRequirementsToml` and provides normalization to ensure constraints
@@ -174,18 +176,28 @@ fn parse_feature_requirements(
 ) -> std::io::Result<BTreeMap<Feature, bool>> {
     let mut pinned_features = BTreeMap::new();
     for (key, enabled) in feature_requirements.entries {
-        if let Some(feature) = canonical_feature_for_key(&key) {
+        // Merge-safety anchor: managed feature requirements must only pin the
+        // active user-facing feature canon; legacy aliases may still map to a
+        // canonical suggestion, but removed/internal keys must fail loud.
+        if let Some(feature) = canonical_user_toggle_feature_for_key(&key) {
             pinned_features.insert(feature, enabled);
             continue;
         }
 
-        if let Some(feature) = feature_for_key(&key) {
+        if let Some(feature) = legacy_feature_for_key(&key) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "invalid `features` requirement `{key}` from {source}: use canonical feature key `{}`",
                     feature.key()
                 ),
+            ));
+        }
+
+        if canonical_feature_for_key(&key).is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid `features` requirement `{key}` from {source}"),
             ));
         }
 
@@ -203,7 +215,7 @@ fn explicit_feature_settings_in_config(cfg: &ConfigToml) -> Vec<(String, Feature
 
     if let Some(features) = cfg.features.as_ref() {
         for (key, enabled) in &features.entries {
-            if let Some(feature) = feature_for_key(key) {
+            if let Some(feature) = user_toggle_feature_for_key(key) {
                 explicit_settings.push((format!("features.{key}"), feature, *enabled));
             }
         }
@@ -225,7 +237,7 @@ fn explicit_feature_settings_in_config(cfg: &ConfigToml) -> Vec<(String, Feature
     for (profile_name, profile) in &cfg.profiles {
         if let Some(features) = profile.features.as_ref() {
             for (key, enabled) in &features.entries {
-                if let Some(feature) = feature_for_key(key) {
+                if let Some(feature) = user_toggle_feature_for_key(key) {
                     explicit_settings.push((
                         format!("profiles.{profile_name}.features.{key}"),
                         feature,

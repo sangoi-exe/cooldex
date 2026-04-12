@@ -4,14 +4,22 @@ use crate::FeatureOverrides;
 use crate::Features;
 use crate::FeaturesToml;
 use crate::Stage;
+use crate::canonical_user_toggle_feature_for_key;
 use crate::feature_for_key;
+use crate::is_user_toggle_feature_key;
+use crate::legacy_feature_for_key;
 use crate::unstable_features_warning_event;
+use crate::user_toggle_feature_for_key;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use toml::Table;
 use toml::Value as TomlValue;
+
+// Merge-safety anchor: feature-key tests must keep the shipped user-facing
+// toggle canon (`multi_agent`) separate from diagnostic-only legacy aliases and
+// removed internal keys such as `collaboration_modes`.
 
 #[test]
 fn under_development_features_are_disabled_by_default() {
@@ -163,9 +171,25 @@ fn remote_control_is_under_development() {
 }
 
 #[test]
-fn collab_is_legacy_alias_for_multi_agent() {
+fn collab_is_known_for_diagnostics_but_not_user_toggle_surfaces() {
     assert_eq!(feature_for_key("multi_agent"), Some(Feature::Collab));
-    assert_eq!(feature_for_key("collab"), Some(Feature::Collab));
+    assert_eq!(legacy_feature_for_key("collab"), Some(Feature::Collab));
+    assert_eq!(user_toggle_feature_for_key("collab"), None);
+    assert!(!is_user_toggle_feature_key("collab"));
+}
+
+#[test]
+fn collaboration_modes_is_known_canon_but_not_user_toggleable() {
+    assert_eq!(
+        feature_for_key("collaboration_modes"),
+        Some(Feature::CollaborationModes)
+    );
+    assert_eq!(
+        canonical_user_toggle_feature_for_key("collaboration_modes"),
+        None
+    );
+    assert_eq!(user_toggle_feature_for_key("collaboration_modes"), None);
+    assert!(!is_user_toggle_feature_key("collaboration_modes"));
 }
 
 #[test]

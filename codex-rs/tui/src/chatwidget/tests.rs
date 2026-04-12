@@ -8808,10 +8808,6 @@ async fn collaboration_modes_defaults_to_code_on_startup() {
     let codex_home = tempdir().expect("tempdir");
     let cfg = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
-        .cli_overrides(vec![(
-            "features.collaboration_modes".to_string(),
-            TomlValue::Boolean(true),
-        )])
         .build()
         .await
         .expect("config");
@@ -8851,16 +8847,10 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
     let codex_home = tempdir().expect("tempdir");
     let cfg = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
-        .cli_overrides(vec![
-            (
-                "features.collaboration_modes".to_string(),
-                TomlValue::Boolean(true),
-            ),
-            (
-                "tui.experimental_mode".to_string(),
-                TomlValue::String("plan".to_string()),
-            ),
-        ])
+        .cli_overrides(vec![(
+            "tui.experimental_mode".to_string(),
+            TomlValue::String("plan".to_string()),
+        )])
         .build()
         .await
         .expect("config");
@@ -9454,18 +9444,18 @@ async fn slash_logout_single_account_does_not_exit_when_logout_fails() {
 }
 
 #[tokio::test]
-async fn slash_stop_submits_background_terminal_cleanup() {
+async fn slash_stop_submits_background_terminal_stop_request() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.dispatch_command(SlashCommand::Stop);
 
-    assert_matches!(op_rx.try_recv(), Ok(Op::CleanBackgroundTerminals));
+    assert_matches!(op_rx.try_recv(), Ok(Op::StopBackgroundTerminals));
     let cells = drain_insert_history(&mut rx);
-    assert_eq!(cells.len(), 1, "expected cleanup confirmation message");
+    assert_eq!(cells.len(), 1, "expected stop confirmation message");
     let rendered = lines_to_single_string(&cells[0]);
     assert!(
         rendered.contains("Stopping all background terminals."),
-        "expected cleanup confirmation, got {rendered:?}"
+        "expected stop confirmation, got {rendered:?}"
     );
 }
 

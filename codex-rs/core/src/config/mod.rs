@@ -55,6 +55,10 @@ use codex_features::Feature;
 use codex_features::FeatureConfigSource;
 use codex_features::FeatureOverrides;
 use codex_features::Features;
+use codex_features::FeaturesToml;
+use codex_features::canonical_feature_for_key;
+use codex_features::legacy_feature_for_key;
+use codex_features::user_toggle_feature_for_key;
 use codex_login::AuthManagerConfig;
 use codex_mcp::McpConfig;
 use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
@@ -697,6 +701,11 @@ impl ConfigBuilder {
         .await?;
         let merged_toml = config_layer_stack.effective_config();
 
+        // Merge-safety anchor: the merged config load path is the shipped owner
+        // for fail-loud `[features]` / `[profiles.*.features]` canon enforcement;
+        // keep it aligned with the generated schema and the active `multi_agent`
+        // user-toggle surface instead of silently accepting stale keys after the
+        // layer merge.
         // Note that each layer in ConfigLayerStack should have resolved
         // relative paths to absolute paths based on the parent folder of the
         // respective config file, so we should be safe to deserialize without
@@ -716,6 +725,7 @@ impl ConfigBuilder {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));
             }
         };
+        validate_user_toggle_feature_keys_in_config_toml(&config_toml)?;
         Config::load_config_with_layer_stack(
             config_toml,
             harness_overrides,
@@ -864,16 +874,72 @@ pub(crate) fn deserialize_config_toml_with_base(
     // prompt_gc fields because `ConfigToml` denies unknown fields, while the
     // base-dir guard still normalizes relative path inputs during deserialization.
     let _guard = AbsolutePathBufGuard::new(config_base_dir);
-    root_value
+    let cfg: ConfigToml = root_value
         .try_into()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    validate_user_toggle_feature_keys_in_config_toml(&cfg)?;
+    Ok(cfg)
 }
 
 #[cfg(test)]
 pub(crate) fn deserialize_strict_config_toml(root_value: TomlValue) -> std::io::Result<ConfigToml> {
-    root_value
+    let cfg: ConfigToml = root_value
         .try_into()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    validate_user_toggle_feature_keys_in_config_toml(&cfg)?;
+    Ok(cfg)
+}
+
+fn validate_user_toggle_feature_keys_in_config_toml(cfg: &ConfigToml) -> std::io::Result<()> {
+    if let Some(features) = cfg.features.as_ref() {
+        validate_user_toggle_feature_table("features", features)?;
+    }
+
+    for (profile_name, profile) in &cfg.profiles {
+        if let Some(features) = profile.features.as_ref() {
+            validate_user_toggle_feature_table(
+                &format!("profiles.{profile_name}.features"),
+                features,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_user_toggle_feature_table(
+    path_prefix: &str,
+    features: &FeaturesToml,
+) -> std::io::Result<()> {
+    for key in features.entries.keys() {
+        if user_toggle_feature_for_key(key).is_some() {
+            continue;
+        }
+
+        if let Some(feature) = legacy_feature_for_key(key) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "invalid feature key `{path_prefix}.{key}`: use canonical feature key `{}`",
+                    feature.key()
+                ),
+            ));
+        }
+
+        if canonical_feature_for_key(key).is_some() {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("feature flag is not user-configurable: {path_prefix}.{key}"),
+            ));
+        }
+
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("unknown feature key `{path_prefix}.{key}`"),
+        ));
+    }
+
+    Ok(())
 }
 
 fn load_catalog_json(path: &AbsolutePathBuf) -> std::io::Result<ModelsResponse> {

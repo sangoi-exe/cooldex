@@ -17,6 +17,7 @@ use toml::Table;
 mod legacy;
 use legacy::LegacyFeatureToggles;
 pub use legacy::legacy_feature_keys;
+pub use legacy::user_toggle_legacy_feature_keys;
 
 /// High-level lifecycle stage for a feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,8 +164,8 @@ pub enum Feature {
     DefaultModeRequestUserInput,
     /// Enable automatic review for approval prompts.
     GuardianApproval,
-    /// Enable collaboration modes (Plan, Default).
-    /// Kept for config backward compatibility; behavior is always collaboration-modes-enabled.
+    /// Legacy internal collaboration-mode feature marker.
+    /// The shipped runtime now treats collaboration modes as always enabled.
     CollaborationModes,
     /// Route MCP tool approval prompts through the MCP elicitation request path.
     ToolCallMcpElicitation,
@@ -361,7 +362,7 @@ impl Features {
                 }
                 _ => {}
             }
-            match feature_for_key(k) {
+            match user_toggle_feature_for_key(k) {
                 Some(feat) => {
                     if matches!(feat, Feature::TuiAppServer) {
                         continue;
@@ -467,7 +468,11 @@ fn web_search_details() -> &'static str {
     "Set `web_search` to `\"live\"`, `\"cached\"`, or `\"disabled\"` at the top level (or under a profile) in config.toml if you want to override it."
 }
 
-/// Keys accepted in `[features]` tables.
+pub(crate) fn feature_accepts_user_toggle(feature: Feature) -> bool {
+    !matches!(feature, Feature::Artifact | Feature::CollaborationModes)
+}
+
+/// Known feature keys, including removed/internal canon and legacy aliases.
 pub fn feature_for_key(key: &str) -> Option<Feature> {
     for spec in FEATURES {
         if spec.key == key {
@@ -477,11 +482,38 @@ pub fn feature_for_key(key: &str) -> Option<Feature> {
     legacy::feature_for_key(key)
 }
 
+/// Legacy alias lookup without side effects for diagnostics-only paths.
+pub fn legacy_feature_for_key(key: &str) -> Option<Feature> {
+    legacy::diagnostic_feature_for_key(key)
+}
+
 pub fn canonical_feature_for_key(key: &str) -> Option<Feature> {
     FEATURES
         .iter()
         .find(|spec| spec.key == key)
         .map(|spec| spec.id)
+}
+
+/// Keys accepted on user-facing feature toggle/config surfaces.
+pub fn user_toggle_feature_for_key(key: &str) -> Option<Feature> {
+    canonical_user_toggle_feature_for_key(key).or_else(|| legacy::user_toggle_feature_for_key(key))
+}
+
+pub fn canonical_user_toggle_feature_for_key(key: &str) -> Option<Feature> {
+    FEATURES
+        .iter()
+        .find(|spec| spec.key == key && feature_accepts_user_toggle(spec.id))
+        .map(|spec| spec.id)
+}
+
+pub fn user_toggle_feature_specs() -> impl Iterator<Item = &'static FeatureSpec> {
+    FEATURES
+        .iter()
+        .filter(|spec| feature_accepts_user_toggle(spec.id))
+}
+
+pub fn is_user_toggle_feature_key(key: &str) -> bool {
+    user_toggle_feature_for_key(key).is_some()
 }
 
 /// Returns `true` if the provided string matches a known feature toggle key.

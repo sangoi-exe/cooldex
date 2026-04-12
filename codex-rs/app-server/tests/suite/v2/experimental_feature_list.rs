@@ -12,11 +12,12 @@ use codex_app_server_protocol::ExperimentalFeatureListParams;
 use codex_app_server_protocol::ExperimentalFeatureListResponse;
 use codex_app_server_protocol::ExperimentalFeatureStage;
 use codex_app_server_protocol::JSONRPCError;
+use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_core::config::ConfigBuilder;
-use codex_features::FEATURES;
 use codex_features::Stage;
+use codex_features::user_toggle_feature_specs;
 use pretty_assertions::assert_eq;
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -43,8 +44,10 @@ async fn experimental_feature_list_returns_feature_metadata_with_stage() -> Resu
         .await?;
 
     let actual = read_response::<ExperimentalFeatureListResponse>(&mut mcp, request_id).await?;
-    let expected_data = FEATURES
-        .iter()
+    // Merge-safety anchor: experimental feature list tests must follow the
+    // accepted user-facing toggle canon so removed/internal keys are not
+    // treated as listed-and-settable after the owner contract changes.
+    let expected_data = user_toggle_feature_specs()
         .map(|spec| {
             let (stage, display_name, description, announcement) = match spec.stage {
                 Stage::Experimental {
@@ -291,6 +294,57 @@ async fn experimental_feature_enablement_set_rejects_non_allowlisted_feature() -
     Ok(())
 }
 
+#[tokio::test]
+async fn experimental_feature_enablement_set_rejects_collab_alias() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_experimental_feature_enablement_set_request(ExperimentalFeatureEnablementSetParams {
+            enablement: BTreeMap::from([("collab".to_string(), true)]),
+        })
+        .await?;
+
+    let error = read_error(&mut mcp, request_id).await?;
+    assert_eq!(
+        error,
+        JSONRPCErrorError {
+            code: -32600,
+            message: "invalid feature enablement `collab`: use canonical feature key `multi_agent`"
+                .to_string(),
+            data: None,
+        },
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn experimental_feature_enablement_set_rejects_collaboration_modes_key() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_experimental_feature_enablement_set_request(ExperimentalFeatureEnablementSetParams {
+            enablement: BTreeMap::from([("collaboration_modes".to_string(), true)]),
+        })
+        .await?;
+
+    let error = read_error(&mut mcp, request_id).await?;
+    assert_eq!(
+        error,
+        JSONRPCErrorError {
+            code: -32600,
+            message: "invalid feature enablement `collaboration_modes`".to_string(),
+            data: None,
+        },
+    );
+
+    Ok(())
+}
+
 async fn set_experimental_feature_enablement(
     mcp: &mut McpProcess,
     enablement: BTreeMap<String, bool>,
@@ -320,4 +374,13 @@ async fn read_response<T: DeserializeOwned>(mcp: &mut McpProcess, request_id: i6
     )
     .await??;
     to_response(response)
+}
+
+async fn read_error(mcp: &mut McpProcess, request_id: i64) -> Result<JSONRPCErrorError> {
+    let JSONRPCError { error, .. } = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    Ok(error)
 }

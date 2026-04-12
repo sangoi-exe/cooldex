@@ -21,6 +21,10 @@ use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+// Merge-safety anchor: thread-status app-server fixtures here must follow the
+// active user-facing feature canon and must not keep removed config keys alive
+// just to unlock the always-on collaboration-mode runtime.
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn thread_status_changed_emits_runtime_updates() -> Result<()> {
     let codex_home = TempDir::new()?;
@@ -224,9 +228,6 @@ approval_policy = "untrusted"
 sandbox_mode = "read-only"
 
 model_provider = "mock_provider"
-
-[features]
-collaboration_modes = true
 
 [model_providers.mock_provider]
 name = "Mock provider for test"

@@ -29,8 +29,8 @@ use codex_app_server_protocol::ReviewStartResponse;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::Thread;
-use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
-use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
+use codex_app_server_protocol::ThreadBackgroundTerminalsStopParams;
+use codex_app_server_protocol::ThreadBackgroundTerminalsStopResponse;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
 use codex_app_server_protocol::ThreadForkParams;
@@ -558,21 +558,21 @@ impl AppServerSession {
         Ok(())
     }
 
-    pub(crate) async fn thread_background_terminals_clean(
+    pub(crate) async fn thread_background_terminals_stop(
         &mut self,
         thread_id: ThreadId,
     ) -> Result<()> {
         let request_id = self.next_request_id();
-        let _: ThreadBackgroundTerminalsCleanResponse = self
+        let _: ThreadBackgroundTerminalsStopResponse = self
             .client
-            .request_typed(ClientRequest::ThreadBackgroundTerminalsClean {
+            .request_typed(ClientRequest::ThreadBackgroundTerminalsStop {
                 request_id,
-                params: ThreadBackgroundTerminalsCleanParams {
+                params: ThreadBackgroundTerminalsStopParams {
                     thread_id: thread_id.to_string(),
                 },
             })
             .await
-            .wrap_err("thread/backgroundTerminals/clean failed in TUI")?;
+            .wrap_err("thread/backgroundTerminals/stop failed in TUI")?;
         Ok(())
     }
 

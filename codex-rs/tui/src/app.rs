@@ -2997,9 +2997,9 @@ impl App {
                     .await?;
                 Ok(true)
             }
-            AppCommandView::CleanBackgroundTerminals => {
+            AppCommandView::StopBackgroundTerminals => {
                 app_server
-                    .thread_background_terminals_clean(thread_id)
+                    .thread_background_terminals_stop(thread_id)
                     .await?;
                 Ok(true)
             }

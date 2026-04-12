@@ -47,14 +47,46 @@ const ALIASES: &[Alias] = &[
     },
 ];
 
+// Merge-safety anchor: legacy feature aliases here are the only place that may
+// translate stale user-facing keys into active canon; removed keys must not stay
+// accepted on config/CLI/app-server surfaces once the shipped owner moves on.
 pub fn legacy_feature_keys() -> impl Iterator<Item = &'static str> {
     ALIASES.iter().map(|alias| alias.legacy_key)
 }
 
-pub(crate) fn feature_for_key(key: &str) -> Option<Feature> {
+pub fn user_toggle_legacy_feature_keys() -> impl Iterator<Item = &'static str> {
     ALIASES
         .iter()
+        .copied()
+        .filter(|alias| alias_accepts_user_toggle(*alias))
+        .map(|alias| alias.legacy_key)
+}
+
+fn alias_for_key(key: &str) -> Option<Alias> {
+    ALIASES
+        .iter()
+        .copied()
         .find(|alias| alias.legacy_key == key)
+}
+
+fn alias_accepts_user_toggle(alias: Alias) -> bool {
+    alias.legacy_key != "collab" && crate::feature_accepts_user_toggle(alias.feature)
+}
+
+pub(crate) fn diagnostic_feature_for_key(key: &str) -> Option<Feature> {
+    alias_for_key(key).map(|alias| alias.feature)
+}
+
+pub(crate) fn feature_for_key(key: &str) -> Option<Feature> {
+    alias_for_key(key).map(|alias| {
+        log_alias(alias.legacy_key, alias.feature);
+        alias.feature
+    })
+}
+
+pub(crate) fn user_toggle_feature_for_key(key: &str) -> Option<Feature> {
+    alias_for_key(key)
+        .filter(|alias| alias_accepts_user_toggle(*alias))
         .map(|alias| {
             log_alias(alias.legacy_key, alias.feature);
             alias.feature

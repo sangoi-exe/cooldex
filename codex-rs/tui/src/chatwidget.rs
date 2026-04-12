@@ -6299,7 +6299,7 @@ impl ChatWidget {
                 self.add_ps_output();
             }
             SlashCommand::Stop => {
-                self.clean_background_terminals();
+                self.stop_background_terminals();
             }
             SlashCommand::MemoryDrop => {
                 self.add_app_server_stub_message("Memory maintenance");
@@ -8597,8 +8597,8 @@ impl ChatWidget {
         self.add_to_history(history_cell::new_unified_exec_processes_output(processes));
     }
 
-    fn clean_background_terminals(&mut self) {
-        self.submit_op(AppCommand::clean_background_terminals());
+    fn stop_background_terminals(&mut self) {
+        self.submit_op(AppCommand::stop_background_terminals());
         self.add_info_message(
             "Stopping all background terminals.".to_string(),
             /*hint*/ None,

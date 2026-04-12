@@ -361,11 +361,14 @@ mod tests {
         assert_eq!(pending.note_server_request(&request), None);
 
         let resolution = pending
-            .take_resolution("thread-1", &Op::ExecApproval {
-                id: "approval-1".to_string(),
-                turn_id: None,
-                decision: ReviewDecision::Approved,
-            })
+            .take_resolution(
+                "thread-1",
+                &Op::ExecApproval {
+                    id: "approval-1".to_string(),
+                    turn_id: None,
+                    decision: ReviewDecision::Approved,
+                },
+            )
             .expect("resolution should serialize")
             .expect("request should be pending");
 
@@ -420,21 +423,24 @@ mod tests {
         );
 
         let permissions = pending
-            .take_resolution("thread-1", &Op::RequestPermissionsResponse {
-                id: "perm-1".to_string(),
-                response: codex_protocol::request_permissions::RequestPermissionsResponse {
-                    permissions: RequestPermissionProfile {
-                        network: Some(NetworkPermissions {
-                            enabled: Some(true),
-                        }),
-                        file_system: Some(FileSystemPermissions {
-                            read: Some(vec![absolute_path(read_path)]),
-                            write: Some(vec![absolute_path(write_path)]),
-                        }),
+            .take_resolution(
+                "thread-1",
+                &Op::RequestPermissionsResponse {
+                    id: "perm-1".to_string(),
+                    response: codex_protocol::request_permissions::RequestPermissionsResponse {
+                        permissions: RequestPermissionProfile {
+                            network: Some(NetworkPermissions {
+                                enabled: Some(true),
+                            }),
+                            file_system: Some(FileSystemPermissions {
+                                read: Some(vec![absolute_path(read_path)]),
+                                write: Some(vec![absolute_path(write_path)]),
+                            }),
+                        },
+                        scope: codex_protocol::request_permissions::PermissionGrantScope::Session,
                     },
-                    scope: codex_protocol::request_permissions::PermissionGrantScope::Session,
                 },
-            })
+            )
             .expect("permissions response should serialize")
             .expect("permissions request should be pending");
         assert_eq!(permissions.request_id, AppServerRequestId::Integer(7));
@@ -456,18 +462,21 @@ mod tests {
         );
 
         let user_input = pending
-            .take_resolution("thread-1", &Op::UserInputAnswer {
-                id: "turn-2".to_string(),
-                response: codex_protocol::request_user_input::RequestUserInputResponse {
-                    answers: std::iter::once((
-                        "question".to_string(),
-                        codex_protocol::request_user_input::RequestUserInputAnswer {
-                            answers: vec!["yes".to_string()],
-                        },
-                    ))
-                    .collect(),
+            .take_resolution(
+                "thread-1",
+                &Op::UserInputAnswer {
+                    id: "turn-2".to_string(),
+                    response: codex_protocol::request_user_input::RequestUserInputResponse {
+                        answers: std::iter::once((
+                            "question".to_string(),
+                            codex_protocol::request_user_input::RequestUserInputAnswer {
+                                answers: vec!["yes".to_string()],
+                            },
+                        ))
+                        .collect(),
+                    },
                 },
-            })
+            )
             .expect("user input response should serialize")
             .expect("user input request should be pending");
         assert_eq!(user_input.request_id, AppServerRequestId::Integer(8));
@@ -505,23 +514,29 @@ mod tests {
         }
 
         let first = pending
-            .take_resolution("thread-1", &Op::UserInputAnswer {
-                id: "turn-2".to_string(),
-                response: codex_protocol::request_user_input::RequestUserInputResponse {
-                    answers: std::collections::HashMap::new(),
+            .take_resolution(
+                "thread-1",
+                &Op::UserInputAnswer {
+                    id: "turn-2".to_string(),
+                    response: codex_protocol::request_user_input::RequestUserInputResponse {
+                        answers: std::collections::HashMap::new(),
+                    },
                 },
-            })
+            )
             .expect("first response should serialize")
             .expect("first request should be pending");
         assert_eq!(first.request_id, AppServerRequestId::Integer(8));
 
         let second = pending
-            .take_resolution("thread-1", &Op::UserInputAnswer {
-                id: "turn-2".to_string(),
-                response: codex_protocol::request_user_input::RequestUserInputResponse {
-                    answers: std::collections::HashMap::new(),
+            .take_resolution(
+                "thread-1",
+                &Op::UserInputAnswer {
+                    id: "turn-2".to_string(),
+                    response: codex_protocol::request_user_input::RequestUserInputResponse {
+                        answers: std::collections::HashMap::new(),
+                    },
                 },
-            })
+            )
             .expect("second response should serialize")
             .expect("second request should be pending");
         assert_eq!(second.request_id, AppServerRequestId::Integer(9));
@@ -546,23 +561,29 @@ mod tests {
         }
 
         let second_thread = pending
-            .take_resolution("thread-2", &Op::UserInputAnswer {
-                id: "turn-2".to_string(),
-                response: codex_protocol::request_user_input::RequestUserInputResponse {
-                    answers: std::collections::HashMap::new(),
+            .take_resolution(
+                "thread-2",
+                &Op::UserInputAnswer {
+                    id: "turn-2".to_string(),
+                    response: codex_protocol::request_user_input::RequestUserInputResponse {
+                        answers: std::collections::HashMap::new(),
+                    },
                 },
-            })
+            )
             .expect("second-thread response should serialize")
             .expect("second-thread request should be pending");
         assert_eq!(second_thread.request_id, AppServerRequestId::Integer(9));
 
         let first_thread = pending
-            .take_resolution("thread-1", &Op::UserInputAnswer {
-                id: "turn-2".to_string(),
-                response: codex_protocol::request_user_input::RequestUserInputResponse {
-                    answers: std::collections::HashMap::new(),
+            .take_resolution(
+                "thread-1",
+                &Op::UserInputAnswer {
+                    id: "turn-2".to_string(),
+                    response: codex_protocol::request_user_input::RequestUserInputResponse {
+                        answers: std::collections::HashMap::new(),
+                    },
                 },
-            })
+            )
             .expect("first-thread response should serialize")
             .expect("first-thread request should be pending");
         assert_eq!(first_thread.request_id, AppServerRequestId::Integer(8));
@@ -595,13 +616,16 @@ mod tests {
         );
 
         let resolution = pending
-            .take_resolution("thread-1", &Op::ResolveElicitation {
-                server_name: "example".to_string(),
-                request_id: McpRequestId::Integer(12),
-                decision: ElicitationAction::Accept,
-                content: Some(json!({ "answer": "yes" })),
-                meta: Some(json!({ "source": "tui" })),
-            })
+            .take_resolution(
+                "thread-1",
+                &Op::ResolveElicitation {
+                    server_name: "example".to_string(),
+                    request_id: McpRequestId::Integer(12),
+                    decision: ElicitationAction::Accept,
+                    content: Some(json!({ "answer": "yes" })),
+                    meta: Some(json!({ "source": "tui" })),
+                },
+            )
             .expect("elicitation response should serialize")
             .expect("elicitation request should be pending");
 
@@ -673,15 +697,18 @@ mod tests {
         );
 
         let error = pending
-            .take_resolution("thread-1", &Op::PatchApproval {
-                id: "patch-1".to_string(),
-                decision: ReviewDecision::ApprovedExecpolicyAmendment {
-                    proposed_execpolicy_amendment: ExecPolicyAmendment::new(vec![
-                        "echo".to_string(),
-                        "hi".to_string(),
-                    ]),
+            .take_resolution(
+                "thread-1",
+                &Op::PatchApproval {
+                    id: "patch-1".to_string(),
+                    decision: ReviewDecision::ApprovedExecpolicyAmendment {
+                        proposed_execpolicy_amendment: ExecPolicyAmendment::new(vec![
+                            "echo".to_string(),
+                            "hi".to_string(),
+                        ]),
+                    },
                 },
-            })
+            )
             .expect_err("invalid patch decision should fail");
 
         assert_eq!(

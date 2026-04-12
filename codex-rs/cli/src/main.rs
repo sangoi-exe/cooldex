@@ -48,9 +48,11 @@ use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::find_codex_home;
-use codex_features::FEATURES;
 use codex_features::Stage;
-use codex_features::is_known_feature_key;
+use codex_features::canonical_feature_for_key;
+use codex_features::is_user_toggle_feature_key;
+use codex_features::legacy_feature_for_key;
+use codex_features::user_toggle_feature_specs;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::user_input::UserInput;
 use codex_terminal_detection::TerminalName;
@@ -569,8 +571,15 @@ impl FeatureToggles {
     }
 
     fn validate_feature(feature: &str) -> anyhow::Result<()> {
-        if is_known_feature_key(feature) {
+        if is_user_toggle_feature_key(feature) {
             Ok(())
+        } else if let Some(canonical_feature) = legacy_feature_for_key(feature) {
+            anyhow::bail!(
+                "Invalid feature flag: {feature}. Use canonical feature flag: {}",
+                canonical_feature.key()
+            )
+        } else if canonical_feature_for_key(feature).is_some() {
+            anyhow::bail!("Feature flag is not user-configurable: {feature}")
         } else {
             anyhow::bail!("Unknown feature flag: {feature}")
         }
@@ -1025,10 +1034,13 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                     overrides,
                 )
                 .await?;
-                let mut rows = Vec::with_capacity(FEATURES.len());
+                // Merge-safety anchor: CLI feature listing must stay aligned
+                // with the accepted user-facing toggle canon so removed or
+                // internal-only keys are not advertised as live toggles.
+                let mut rows = Vec::new();
                 let mut name_width = 0;
                 let mut stage_width = 0;
-                for def in FEATURES {
+                for def in user_toggle_feature_specs() {
                     let name = def.key;
                     let stage = stage_str(def.stage);
                     let enabled = config.features.enabled(def.id);
@@ -1098,7 +1110,7 @@ fn maybe_print_under_development_feature_warning(
         return;
     }
 
-    let Some(spec) = FEATURES.iter().find(|spec| spec.key == feature) else {
+    let Some(spec) = user_toggle_feature_specs().find(|spec| spec.key == feature) else {
         return;
     };
     if !matches!(spec.stage, Stage::UnderDevelopment) {
@@ -2122,6 +2134,36 @@ mod tests {
         assert_eq!(
             overrides,
             vec!["features.use_linux_sandbox_bwrap=true".to_string(),]
+        );
+    }
+
+    #[test]
+    fn feature_toggles_reject_collab_alias_with_canonical_message() {
+        let toggles = FeatureToggles {
+            enable: vec!["collab".to_string()],
+            disable: Vec::new(),
+        };
+        let err = toggles
+            .to_overrides()
+            .expect_err("legacy alias should be rejected");
+        assert_eq!(
+            err.to_string(),
+            "Invalid feature flag: collab. Use canonical feature flag: multi_agent"
+        );
+    }
+
+    #[test]
+    fn feature_toggles_reject_non_user_configurable_feature() {
+        let toggles = FeatureToggles {
+            enable: vec!["collaboration_modes".to_string()],
+            disable: Vec::new(),
+        };
+        let err = toggles
+            .to_overrides()
+            .expect_err("removed internal feature should be rejected");
+        assert_eq!(
+            err.to_string(),
+            "Feature flag is not user-configurable: collaboration_modes"
         );
     }
 

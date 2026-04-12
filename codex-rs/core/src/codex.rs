@@ -5000,8 +5000,8 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                     handlers::interrupt(&sess).await;
                     false
                 }
-                Op::CleanBackgroundTerminals => {
-                    handlers::clean_background_terminals(&sess).await;
+                Op::StopBackgroundTerminals => {
+                    handlers::stop_background_terminals(&sess).await;
                     false
                 }
                 Op::RealtimeConversationStart(params) => {
@@ -5320,7 +5320,7 @@ mod handlers {
         sess.interrupt_task().await;
     }
 
-    pub async fn clean_background_terminals(sess: &Arc<Session>) {
+    pub async fn stop_background_terminals(sess: &Arc<Session>) {
         sess.close_unified_exec_processes().await;
     }
 

@@ -299,10 +299,10 @@ client_request_definitions! {
         params: v2::ThreadShellCommandParams,
         response: v2::ThreadShellCommandResponse,
     },
-    #[experimental("thread/backgroundTerminals/clean")]
-    ThreadBackgroundTerminalsClean => "thread/backgroundTerminals/clean" {
-        params: v2::ThreadBackgroundTerminalsCleanParams,
-        response: v2::ThreadBackgroundTerminalsCleanResponse,
+    #[experimental("thread/backgroundTerminals/stop")]
+    ThreadBackgroundTerminalsStop => "thread/backgroundTerminals/stop" {
+        params: v2::ThreadBackgroundTerminalsStopParams,
+        response: v2::ThreadBackgroundTerminalsStopResponse,
     },
     ThreadRollback => "thread/rollback" {
         params: v2::ThreadRollbackParams,
@@ -1742,16 +1742,16 @@ mod tests {
     }
 
     #[test]
-    fn serialize_thread_background_terminals_clean() -> Result<()> {
-        let request = ClientRequest::ThreadBackgroundTerminalsClean {
+    fn serialize_thread_background_terminals_stop() -> Result<()> {
+        let request = ClientRequest::ThreadBackgroundTerminalsStop {
             request_id: RequestId::Integer(8),
-            params: v2::ThreadBackgroundTerminalsCleanParams {
+            params: v2::ThreadBackgroundTerminalsStopParams {
                 thread_id: "thr_123".to_string(),
             },
         };
         assert_eq!(
             json!({
-                "method": "thread/backgroundTerminals/clean",
+                "method": "thread/backgroundTerminals/stop",
                 "id": 8,
                 "params": {
                     "threadId": "thr_123"

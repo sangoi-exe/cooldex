@@ -39,6 +39,9 @@ use serde_json::Value;
 use serde_json::json;
 use tokio::time::Duration;
 
+// Merge-safety anchor: unified-exec interrupt and stop-background-terminal tests
+// must stay aligned with the workspace-local legacy `/stop` operator contract.
+
 fn extract_output_text(item: &Value) -> Option<&str> {
     item.get("output").and_then(|value| match value {
         Value::String(text) => Some(text.as_str()),
@@ -1861,7 +1864,7 @@ async fn unified_exec_interrupt_preserves_long_running_session() -> Result<()> {
         "expected unified exec process to remain alive after interrupt"
     );
 
-    codex.submit(Op::CleanBackgroundTerminals).await?;
+    codex.submit(Op::StopBackgroundTerminals).await?;
     wait_for_process_exit(&pid).await?;
 
     Ok(())

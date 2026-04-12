@@ -23,6 +23,9 @@ use codex_protocol::user_input::UserInput;
 use serde::Serialize;
 use serde_json::Value;
 
+// Merge-safety anchor: AppCommand canon here must stay aligned with the
+// workspace-local legacy slash-command and app-server stop-terminal surfaces.
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct AppCommand(Op);
 
@@ -30,7 +33,7 @@ pub(crate) struct AppCommand(Op);
 #[allow(dead_code)]
 pub(crate) enum AppCommandView<'a> {
     Interrupt,
-    CleanBackgroundTerminals,
+    StopBackgroundTerminals,
     RealtimeConversationStart(&'a ConversationStartParams),
     RealtimeConversationAudio(&'a ConversationAudioParams),
     RealtimeConversationText(&'a ConversationTextParams),
@@ -113,8 +116,8 @@ impl AppCommand {
         Self(Op::Interrupt)
     }
 
-    pub(crate) fn clean_background_terminals() -> Self {
-        Self(Op::CleanBackgroundTerminals)
+    pub(crate) fn stop_background_terminals() -> Self {
+        Self(Op::StopBackgroundTerminals)
     }
 
     pub(crate) fn realtime_conversation_start(params: ConversationStartParams) -> Self {
@@ -286,7 +289,7 @@ impl AppCommand {
     pub(crate) fn view(&self) -> AppCommandView<'_> {
         match &self.0 {
             Op::Interrupt => AppCommandView::Interrupt,
-            Op::CleanBackgroundTerminals => AppCommandView::CleanBackgroundTerminals,
+            Op::StopBackgroundTerminals => AppCommandView::StopBackgroundTerminals,
             Op::RealtimeConversationStart(params) => {
                 AppCommandView::RealtimeConversationStart(params)
             }

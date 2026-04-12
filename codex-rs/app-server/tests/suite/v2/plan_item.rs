@@ -18,15 +18,12 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
-use codex_features::FEATURES;
-use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
-use std::collections::BTreeMap;
 use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::sleep;
@@ -34,6 +31,10 @@ use tokio::time::timeout;
 use wiremock::MockServer;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+// Merge-safety anchor: plan-item app-server fixtures here must not preserve the
+// removed `collaboration_modes` config key; the runtime already treats
+// collaboration modes as enabled without that config surface.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn plan_mode_uses_proposed_plan_block_for_plan_item() -> Result<()> {
@@ -250,19 +251,6 @@ async fn wait_for_responses_request_count(
 }
 
 fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
-    let features = BTreeMap::from([(Feature::CollaborationModes, true)]);
-    let feature_entries = features
-        .into_iter()
-        .map(|(feature, enabled)| {
-            let key = FEATURES
-                .iter()
-                .find(|spec| spec.id == feature)
-                .map(|spec| spec.key)
-                .unwrap_or_else(|| panic!("missing feature key for {feature:?}"));
-            format!("{key} = {enabled}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
     let config_toml = codex_home.join("config.toml");
     std::fs::write(
         config_toml,
@@ -273,9 +261,6 @@ approval_policy = "never"
 sandbox_mode = "read-only"
 
 model_provider = "mock_provider"
-
-[features]
-{feature_entries}
 
 [model_providers.mock_provider]
 name = "Mock provider for test"

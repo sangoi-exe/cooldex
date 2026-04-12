@@ -1,6 +1,10 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+// Merge-safety anchor: popup/settings startup tests here must follow the active
+// collaboration-mode runtime contract and must not depend on the removed
+// `features.collaboration_modes` config key.
+
 #[tokio::test]
 async fn realtime_error_closes_without_followup_closed_info() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -45,16 +49,10 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
     let codex_home = tempdir().expect("tempdir");
     let cfg = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
-        .cli_overrides(vec![
-            (
-                "features.collaboration_modes".to_string(),
-                TomlValue::Boolean(true),
-            ),
-            (
-                "tui.experimental_mode".to_string(),
-                TomlValue::String("plan".to_string()),
-            ),
-        ])
+        .cli_overrides(vec![(
+            "tui.experimental_mode".to_string(),
+            TomlValue::String("plan".to_string()),
+        )])
         .build()
         .await
         .expect("config");

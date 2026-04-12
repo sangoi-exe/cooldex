@@ -6203,61 +6203,178 @@ async fn approvals_reviewer_preserves_valid_user_choice_when_allowed_by_requirem
     Ok(())
 }
 
-#[tokio::test]
-async fn smart_approvals_alias_is_ignored() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
-        r#"[features]
-smart_approvals = true
-"#,
-    )?;
+async fn config_load_error_for_user_config(contents: &str) -> std::io::Error {
+    let codex_home = TempDir::new().expect("tempdir");
+    std::fs::write(codex_home.path().join(CONFIG_TOML_FILE), contents).expect("write config");
 
-    let config = ConfigBuilder::without_managed_config_for_tests()
+    ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
-        .await?;
+        .await
+        .expect_err("invalid feature key should fail config load")
+}
 
-    assert!(!config.features.enabled(Feature::GuardianApproval));
-    assert_eq!(config.approvals_reviewer, ApprovalsReviewer::User);
-
-    let serialized = tokio::fs::read_to_string(codex_home.path().join(CONFIG_TOML_FILE)).await?;
-    assert!(serialized.contains("smart_approvals = true"));
-    assert!(!serialized.contains("guardian_approval"));
-    assert!(!serialized.contains("approvals_reviewer"));
-
-    Ok(())
+async fn config_load_error_for_cli_feature_override(path: &str) -> std::io::Error {
+    let codex_home = TempDir::new().expect("tempdir");
+    ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .cli_overrides(vec![(path.to_string(), toml::Value::Boolean(true))])
+        .build()
+        .await
+        .expect_err("invalid CLI feature override should fail config load")
 }
 
 #[tokio::test]
-async fn smart_approvals_alias_is_ignored_in_profiles() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    std::fs::write(
-        codex_home.path().join(CONFIG_TOML_FILE),
+async fn unknown_feature_key_is_rejected_from_user_config() {
+    // Merge-safety anchor: user-facing `[features]` load paths must fail loud
+    // for removed or unknown keys so runtime acceptance stays aligned with the
+    // generated config schema and the shipped CLI feature canon.
+    let err = config_load_error_for_user_config(
+        r#"[features]
+smart_approvals = true
+"#,
+    )
+    .await;
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string()
+            .contains("unknown feature key `features.smart_approvals`"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_feature_key_is_rejected_from_profile_features() {
+    let err = config_load_error_for_user_config(
         r#"profile = "guardian"
 
 [profiles.guardian.features]
 smart_approvals = true
 "#,
-    )?;
+    )
+    .await;
 
-    let config = ConfigBuilder::without_managed_config_for_tests()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .build()
-        .await?;
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string()
+            .contains("unknown feature key `profiles.guardian.features.smart_approvals`"),
+        "{err}"
+    );
+}
 
-    assert!(!config.features.enabled(Feature::GuardianApproval));
-    assert_eq!(config.approvals_reviewer, ApprovalsReviewer::User);
+#[tokio::test]
+async fn collab_alias_is_rejected_from_user_config() {
+    let err = config_load_error_for_user_config(
+        r#"[features]
+collab = true
+"#,
+    )
+    .await;
 
-    let serialized = tokio::fs::read_to_string(codex_home.path().join(CONFIG_TOML_FILE)).await?;
-    assert!(serialized.contains("[profiles.guardian.features]"));
-    assert!(serialized.contains("smart_approvals = true"));
-    assert!(!serialized.contains("guardian_approval"));
-    assert!(!serialized.contains("approvals_reviewer"));
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains(
+            "invalid feature key `features.collab`: use canonical feature key `multi_agent`"
+        ),
+        "{err}"
+    );
+}
 
-    Ok(())
+#[tokio::test]
+async fn collab_alias_is_rejected_from_profile_features() {
+    let err = config_load_error_for_user_config(
+        r#"profile = "guardian"
+
+[profiles.guardian.features]
+collab = true
+"#,
+    )
+    .await;
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains(
+            "invalid feature key `profiles.guardian.features.collab`: use canonical feature key `multi_agent`"
+        ),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn collaboration_modes_is_rejected_from_user_config() {
+    let err = config_load_error_for_user_config(
+        r#"[features]
+collaboration_modes = true
+"#,
+    )
+    .await;
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string()
+            .contains("feature flag is not user-configurable: features.collaboration_modes"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn collaboration_modes_is_rejected_from_profile_features() {
+    let err = config_load_error_for_user_config(
+        r#"profile = "guardian"
+
+[profiles.guardian.features]
+collaboration_modes = true
+"#,
+    )
+    .await;
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains(
+            "feature flag is not user-configurable: profiles.guardian.features.collaboration_modes"
+        ),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_feature_key_is_rejected_from_cli_feature_override() {
+    let err = config_load_error_for_cli_feature_override("features.smart_approvals").await;
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string()
+            .contains("unknown feature key `features.smart_approvals`"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn collab_alias_is_rejected_from_cli_feature_override() {
+    let err = config_load_error_for_cli_feature_override("features.collab").await;
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains(
+            "invalid feature key `features.collab`: use canonical feature key `multi_agent`"
+        ),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn collaboration_modes_is_rejected_from_cli_feature_override() {
+    let err = config_load_error_for_cli_feature_override("features.collaboration_modes").await;
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string()
+            .contains("feature flag is not user-configurable: features.collaboration_modes"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -6318,6 +6435,32 @@ async fn feature_requirements_reject_collab_legacy_alias() {
     assert!(
         err.to_string()
             .contains("use canonical feature key `multi_agent`"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn feature_requirements_reject_removed_collaboration_modes_key() {
+    let codex_home = TempDir::new().expect("tempdir");
+
+    let err = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .cloud_requirements(CloudRequirementsLoader::new(async {
+            Ok(Some(crate::config_loader::ConfigRequirementsToml {
+                feature_requirements: Some(crate::config_loader::FeatureRequirementsToml {
+                    entries: BTreeMap::from([("collaboration_modes".to_string(), true)]),
+                }),
+                ..Default::default()
+            }))
+        }))
+        .build()
+        .await
+        .expect_err("removed keys should be rejected");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string()
+            .contains("invalid `features` requirement `collaboration_modes`"),
         "{err}"
     );
 }

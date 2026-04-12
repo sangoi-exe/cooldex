@@ -1,7 +1,7 @@
 use crate::config_toml::ConfigToml;
 use crate::types::RawMcpServerConfig;
-use codex_features::FEATURES;
-use codex_features::legacy_feature_keys;
+use codex_features::user_toggle_feature_specs;
+use codex_features::user_toggle_legacy_feature_keys;
 use schemars::r#gen::SchemaGenerator;
 use schemars::r#gen::SchemaSettings;
 use schemars::schema::InstanceType;
@@ -13,7 +13,10 @@ use serde_json::Map;
 use serde_json::Value;
 use std::path::Path;
 
-/// Schema for the `[features]` map with known + legacy keys only.
+// Merge-safety anchor: the user-facing `[features]` schema must stay aligned
+// with the accepted feature-toggle canon so removed/internal keys do not stay
+// settable through config files or CLI overrides after the runtime owner moves on.
+/// Schema for the `[features]` map with accepted user-facing keys only.
 pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
     let mut object = SchemaObject {
         instance_type: Some(InstanceType::Object.into()),
@@ -21,15 +24,12 @@ pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
     };
 
     let mut validation = ObjectValidation::default();
-    for feature in FEATURES {
-        if feature.id == codex_features::Feature::Artifact {
-            continue;
-        }
+    for feature in user_toggle_feature_specs() {
         validation
             .properties
             .insert(feature.key.to_string(), schema_gen.subschema_for::<bool>());
     }
-    for legacy_key in legacy_feature_keys() {
+    for legacy_key in user_toggle_legacy_feature_keys() {
         validation
             .properties
             .insert(legacy_key.to_string(), schema_gen.subschema_for::<bool>());

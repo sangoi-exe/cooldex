@@ -181,23 +181,6 @@ async fn returns_config_error_for_schema_error_in_user_config() {
     assert_eq!(config_error, &expected_config_error);
 }
 
-#[test]
-fn schema_error_points_to_feature_value() {
-    let tmp = tempdir().expect("tempdir");
-    let contents = "[features]\ncollaboration_modes = \"true\"";
-    let config_path = tmp.path().join(CONFIG_TOML_FILE);
-    std::fs::write(&config_path, contents).expect("write config");
-
-    let _guard = codex_utils_absolute_path::AbsolutePathBufGuard::new(tmp.path());
-    let error = codex_config::config_error_from_typed_toml::<ConfigToml>(&config_path, contents)
-        .expect("schema error");
-
-    let value_line = contents.lines().nth(1).expect("value line");
-    let value_column = value_line.find("\"true\"").expect("value") + 1;
-    assert_eq!(error.range.start.line, 2);
-    assert_eq!(error.range.start.column, value_column);
-}
-
 #[tokio::test]
 async fn merges_managed_config_layer_on_top() {
     let tmp = tempdir().expect("tempdir");

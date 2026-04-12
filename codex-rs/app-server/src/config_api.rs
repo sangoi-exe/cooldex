@@ -29,8 +29,9 @@ use codex_core::config_loader::SandboxModeRequirement as CoreSandboxModeRequirem
 use codex_core::plugins::PluginId;
 use codex_core::plugins::collect_plugin_enabled_candidates;
 use codex_core::plugins::installed_plugin_telemetry_metadata;
-use codex_features::canonical_feature_for_key;
-use codex_features::feature_for_key;
+use codex_features::canonical_user_toggle_feature_for_key;
+use codex_features::legacy_feature_for_key;
+use codex_features::user_toggle_feature_for_key;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::protocol::Op;
 use serde_json::json;
@@ -165,7 +166,7 @@ impl ConfigApi {
             .map_err(map_error)?;
         let config = self.load_latest_config(fallback_cwd).await?;
         for feature_key in SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT {
-            let Some(feature) = feature_for_key(feature_key) else {
+            let Some(feature) = canonical_user_toggle_feature_for_key(feature_key) else {
                 continue;
             };
             let features = response
@@ -243,7 +244,11 @@ impl ConfigApi {
     ) -> Result<ExperimentalFeatureEnablementSetResponse, JSONRPCErrorError> {
         let ExperimentalFeatureEnablementSetParams { enablement } = params;
         for key in enablement.keys() {
-            if canonical_feature_for_key(key).is_some() {
+            // Merge-safety anchor: app-server experimental feature enablement
+            // must follow the same accepted feature-toggle canon as config and
+            // CLI surfaces; removed/internal keys cannot survive here as
+            // canonical-but-unsupported pseudo-features.
+            if canonical_user_toggle_feature_for_key(key).is_some() {
                 if SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT.contains(&key.as_str()) {
                     continue;
                 }
@@ -258,7 +263,7 @@ impl ConfigApi {
                 });
             }
 
-            let message = if let Some(feature) = feature_for_key(key) {
+            let message = if let Some(feature) = legacy_feature_for_key(key) {
                 format!(
                     "invalid feature enablement `{key}`: use canonical feature key `{}`",
                     feature.key()
@@ -345,7 +350,7 @@ pub(crate) fn apply_runtime_feature_enablement(
         if protected_features.contains(name) {
             continue;
         }
-        let Some(feature) = feature_for_key(name) else {
+        let Some(feature) = user_toggle_feature_for_key(name) else {
             continue;
         };
         if let Err(err) = config.features.set_enabled(feature, *enabled) {

@@ -1,6 +1,10 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+// Merge-safety anchor: plan-mode startup tests here must stay aligned with the
+// always-on collaboration-mode runtime and must not reintroduce the removed
+// `features.collaboration_modes` config key as a test-only owner.
+
 #[tokio::test]
 async fn plan_implementation_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
@@ -1224,10 +1228,6 @@ async fn collaboration_modes_defaults_to_code_on_startup() {
     let codex_home = tempdir().expect("tempdir");
     let cfg = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
-        .cli_overrides(vec![(
-            "features.collaboration_modes".to_string(),
-            TomlValue::Boolean(true),
-        )])
         .build()
         .await
         .expect("config");

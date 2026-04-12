@@ -118,8 +118,8 @@ use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadArchivedNotification;
-use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
-use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
+use codex_app_server_protocol::ThreadBackgroundTerminalsStopParams;
+use codex_app_server_protocol::ThreadBackgroundTerminalsStopResponse;
 use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
@@ -232,9 +232,9 @@ use codex_core::sandboxing::SandboxPermissions;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_core::windows_sandbox::WindowsSandboxSetupMode as CoreWindowsSandboxSetupMode;
 use codex_core::windows_sandbox::WindowsSandboxSetupRequest;
-use codex_features::FEATURES;
 use codex_features::Feature;
 use codex_features::Stage;
+use codex_features::user_toggle_feature_specs;
 use codex_feedback::CodexFeedback;
 use codex_git_utils::git_diff_to_remote;
 use codex_git_utils::resolve_root_git_project_for_trust;
@@ -762,12 +762,9 @@ impl CodexMessageProcessor {
                 self.thread_compact_start(to_connection_request_id(request_id), params)
                     .await;
             }
-            ClientRequest::ThreadBackgroundTerminalsClean { request_id, params } => {
-                self.thread_background_terminals_clean(
-                    to_connection_request_id(request_id),
-                    params,
-                )
-                .await;
+            ClientRequest::ThreadBackgroundTerminalsStop { request_id, params } => {
+                self.thread_background_terminals_stop(to_connection_request_id(request_id), params)
+                    .await;
             }
             ClientRequest::ThreadRollback { request_id, params } => {
                 self.thread_rollback(to_connection_request_id(request_id), params)
@@ -3343,12 +3340,12 @@ impl CodexMessageProcessor {
         }
     }
 
-    async fn thread_background_terminals_clean(
+    async fn thread_background_terminals_stop(
         &self,
         request_id: ConnectionRequestId,
-        params: ThreadBackgroundTerminalsCleanParams,
+        params: ThreadBackgroundTerminalsStopParams,
     ) {
-        let ThreadBackgroundTerminalsCleanParams { thread_id } = params;
+        let ThreadBackgroundTerminalsStopParams { thread_id } = params;
 
         let (_, thread) = match self.load_thread(&thread_id).await {
             Ok(v) => v,
@@ -3359,18 +3356,18 @@ impl CodexMessageProcessor {
         };
 
         match self
-            .submit_core_op(&request_id, thread.as_ref(), Op::CleanBackgroundTerminals)
+            .submit_core_op(&request_id, thread.as_ref(), Op::StopBackgroundTerminals)
             .await
         {
             Ok(_) => {
                 self.outgoing
-                    .send_response(request_id, ThreadBackgroundTerminalsCleanResponse {})
+                    .send_response(request_id, ThreadBackgroundTerminalsStopResponse {})
                     .await;
             }
             Err(err) => {
                 self.send_internal_error(
                     request_id,
-                    format!("failed to clean background terminals: {err}"),
+                    stop_background_terminals_internal_error_message(err),
                 )
                 .await;
             }
@@ -4970,8 +4967,10 @@ impl CodexMessageProcessor {
             }
         };
 
-        let data = FEATURES
-            .iter()
+        // Merge-safety anchor: the app-server experimental feature list must
+        // advertise only the accepted user-facing toggle canon so list/read
+        // surfaces do not drift from config/CLI acceptance rules.
+        let data = user_toggle_feature_specs()
             .map(|spec| {
                 let (stage, display_name, description, announcement) = match spec.stage {
                     Stage::Experimental {
@@ -9336,6 +9335,10 @@ pub(crate) fn summary_to_thread(summary: ConversationSummary) -> Thread {
     }
 }
 
+fn stop_background_terminals_internal_error_message(err: impl std::fmt::Display) -> String {
+    format!("failed to stop background terminals: {err}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9455,6 +9458,14 @@ mod tests {
                 "errorCode": "RequestFailed",
                 "detail": "failed to load your workspace-managed config",
             }))
+        );
+    }
+
+    #[test]
+    fn stop_background_terminals_internal_error_uses_stop_canon() {
+        assert_eq!(
+            stop_background_terminals_internal_error_message("boom"),
+            "failed to stop background terminals: boom"
         );
     }
 

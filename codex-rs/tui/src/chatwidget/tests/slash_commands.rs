@@ -1,6 +1,9 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+// Merge-safety anchor: slash-command tests here must stay aligned with the
+// workspace-local legacy `/stop` operator and its stop-terminal confirmation.
+
 #[tokio::test]
 async fn slash_compact_eagerly_queues_follow_up_before_turn_start() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -342,18 +345,18 @@ async fn slash_exit_requests_exit() {
 }
 
 #[tokio::test]
-async fn slash_stop_submits_background_terminal_cleanup() {
+async fn slash_stop_submits_background_terminal_stop_request() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.dispatch_command(SlashCommand::Stop);
 
-    assert_matches!(op_rx.try_recv(), Ok(Op::CleanBackgroundTerminals));
+    assert_matches!(op_rx.try_recv(), Ok(Op::StopBackgroundTerminals));
     let cells = drain_insert_history(&mut rx);
-    assert_eq!(cells.len(), 1, "expected cleanup confirmation message");
+    assert_eq!(cells.len(), 1, "expected stop confirmation message");
     let rendered = lines_to_single_string(&cells[0]);
     assert!(
         rendered.contains("Stopping all background terminals."),
-        "expected cleanup confirmation, got {rendered:?}"
+        "expected stop confirmation, got {rendered:?}"
     );
 }
 
