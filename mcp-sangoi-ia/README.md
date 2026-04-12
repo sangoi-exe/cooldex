@@ -43,10 +43,21 @@ Important knobs:
 
 Runtime modes:
 
-- `dev`: current local test path; the service expects `codex` on `PATH`, typically from the operator's Rust-built local Codex checkout.
-- `prod`: placeholder only for now; the intended future path is a production-owned Codex runtime plus CLI-native auth retrieval from backend/JWT-backed state.
+- `dev`: current local test path; the service expects `codex` on `PATH`, typically from the operator's Rust-built local Codex checkout. This mode is local-operator-only and is not a silent fallback for non-local/containerized/shared launches.
+- `prod`: placeholder only for now; the intended future path is a production-owned Codex runtime plus CLI-native auth retrieval from backend/JWT-backed state. The current service fails loud at startup if `prod` is selected.
+
+`SANGOI_CODEX_RUNTIME_MODE` must always be set explicitly. Copying `.env.example` into a local `.env` is the supported local convenience path. Launches that do not set runtime mode must fail closed instead of silently inheriting local `dev`.
 
 `CODEX_API_KEY` and other Codex auth/config are inherited from the host environment in `dev`. Do not treat that as the final production auth model.
+
+Even in future `prod`, `CODEX_HOME` remains writable and owns sessions, logs, skills, caches, and rollout state. It is not the final source of truth for provider auth, and file-backed `auth.json` is not the intended production truth.
+
+Planned production placeholders:
+- `SANGOI_CODEX_PROD_AUTH_MODE`
+- `SANGOI_CODEX_PROD_AUTH_BACKEND_URL`
+- `SANGOI_CODEX_PROD_RUNTIME_JWT`
+
+In that future production path, the runtime JWT authenticates the Codex runtime to the auth backend; provider tokens stay in the backend store rather than inside the JWT.
 
 ## Request example
 

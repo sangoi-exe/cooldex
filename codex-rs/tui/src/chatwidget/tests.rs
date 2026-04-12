@@ -213,6 +213,8 @@ use codex_terminal_detection::TerminalInfo;
 use codex_terminal_detection::TerminalName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::builtin_approval_presets;
+#[cfg(target_os = "windows")]
+use codex_utils_approval_presets::guardian_approval_preset;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -12241,6 +12243,7 @@ async fn server_overloaded_error_does_not_switch_models() {
 async fn approvals_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
+    chat.set_feature_enabled(Feature::GuardianApproval, /*enabled*/ false);
     chat.config.notices.hide_full_access_warning = None;
     chat.open_approvals_popup();
 
@@ -12251,6 +12254,40 @@ async fn approvals_selection_popup_snapshot() {
     });
     #[cfg(not(target_os = "windows"))]
     assert_snapshot!("approvals_selection_popup", popup);
+}
+
+#[tokio::test]
+async fn approvals_selection_popup_snapshot_guardian_current_when_feature_disabled() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.set_feature_enabled(Feature::GuardianApproval, /*enabled*/ false);
+    chat.config.notices.hide_full_access_warning = None;
+    chat.set_approvals_reviewer(ApprovalsReviewer::GuardianSubagent);
+    chat.config
+        .permissions
+        .approval_policy
+        .set(AskForApproval::OnRequest)
+        .expect("set approval policy");
+    chat.config
+        .permissions
+        .sandbox_policy
+        .set(SandboxPolicy::new_workspace_write_policy())
+        .expect("set sandbox policy");
+    chat.open_approvals_popup();
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    #[cfg(target_os = "windows")]
+    insta::with_settings!({ snapshot_suffix => "windows" }, {
+        assert_snapshot!(
+            "approvals_selection_popup_guardian_current_when_feature_disabled",
+            popup
+        );
+    });
+    #[cfg(not(target_os = "windows"))]
+    assert_snapshot!(
+        "approvals_selection_popup_guardian_current_when_feature_disabled",
+        popup
+    );
 }
 
 #[cfg(target_os = "windows")]
@@ -12295,12 +12332,31 @@ async fn preset_matching_accepts_workspace_write_with_extra_roots() {
     };
 
     assert!(
-        ChatWidget::preset_matches_current(AskForApproval::OnRequest, &current_sandbox, &preset),
+        ChatWidget::preset_matches_current(
+            AskForApproval::OnRequest,
+            ApprovalsReviewer::User,
+            &current_sandbox,
+            &preset,
+        ),
         "WorkspaceWrite with extra roots should still match the Default preset"
     );
     assert!(
-        !ChatWidget::preset_matches_current(AskForApproval::Never, &current_sandbox, &preset),
+        !ChatWidget::preset_matches_current(
+            AskForApproval::Never,
+            ApprovalsReviewer::User,
+            &current_sandbox,
+            &preset,
+        ),
         "approval mismatch should prevent matching the preset"
+    );
+    assert!(
+        !ChatWidget::preset_matches_current(
+            AskForApproval::OnRequest,
+            ApprovalsReviewer::GuardianSubagent,
+            &current_sandbox,
+            &preset,
+        ),
+        "reviewer mismatch should prevent matching the preset"
     );
 }
 
@@ -12381,6 +12437,80 @@ async fn startup_does_not_prompt_for_windows_sandbox_when_not_requested() {
     assert!(
         chat.bottom_pane.no_modal_or_popup_active(),
         "expected no startup sandbox NUX popup when startup trigger is false"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn world_writable_confirmation_continue_preserves_guardian_reviewer() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.open_world_writable_warning_confirmation(
+        Some(guardian_approval_preset()),
+        vec!["C:\\temp\\shared".to_string()],
+        /*extra_count*/ 0,
+        /*failed_scan*/ false,
+    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AppEvent::UpdateApprovalsReviewer(ApprovalsReviewer::GuardianSubagent)
+        )),
+        "expected Continue to preserve Guardian reviewer ownership: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AppEvent::CodexOp(Op::OverrideTurnContext {
+                approvals_reviewer: Some(ApprovalsReviewer::GuardianSubagent),
+                ..
+            })
+        )),
+        "expected Continue to emit Guardian reviewer in OverrideTurnContext: {events:?}"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn world_writable_confirmation_continue_and_remember_preserves_guardian_reviewer() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.open_world_writable_warning_confirmation(
+        Some(guardian_approval_preset()),
+        vec!["C:\\temp\\shared".to_string()],
+        /*extra_count*/ 0,
+        /*failed_scan*/ false,
+    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AppEvent::UpdateWorldWritableWarningAcknowledged(true)
+        )),
+        "expected Continue and don't warn again to acknowledge the warning: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AppEvent::UpdateApprovalsReviewer(ApprovalsReviewer::GuardianSubagent)
+        )),
+        "expected Continue and don't warn again to preserve Guardian reviewer ownership: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AppEvent::CodexOp(Op::OverrideTurnContext {
+                approvals_reviewer: Some(ApprovalsReviewer::GuardianSubagent),
+                ..
+            })
+        )),
+        "expected Continue and don't warn again to emit Guardian reviewer in OverrideTurnContext: {events:?}"
     );
 }
 
@@ -13018,7 +13148,7 @@ async fn permissions_selection_hides_guardian_approvals_when_feature_disabled() 
 }
 
 #[tokio::test]
-async fn permissions_selection_hides_guardian_approvals_when_feature_disabled_even_if_auto_review_is_active()
+async fn permissions_selection_keeps_guardian_approvals_visible_when_feature_disabled_but_guardian_is_active()
  {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     #[cfg(target_os = "windows")]
@@ -13043,8 +13173,8 @@ async fn permissions_selection_hides_guardian_approvals_when_feature_disabled_ev
     let popup = render_bottom_popup(&chat, /*width*/ 120);
 
     assert!(
-        !popup.contains("Guardian Approvals"),
-        "expected Guardian Approvals to stay hidden when the experimental feature is disabled: {popup}"
+        popup.contains("Guardian Approvals (current)"),
+        "expected Guardian Approvals to remain visible when it is the active reviewer-owned mode: {popup}"
     );
 }
 

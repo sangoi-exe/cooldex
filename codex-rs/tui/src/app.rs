@@ -144,6 +144,7 @@ use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::request_user_input::RequestUserInputQuestionOption;
 use codex_terminal_detection::user_agent;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_approval_presets::guardian_approval_preset;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
 use crossterm::event::KeyCode;
@@ -314,24 +315,6 @@ fn default_exec_approval_decisions(
     )
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct GuardianApprovalsMode {
-    approval_policy: AskForApproval,
-    approvals_reviewer: ApprovalsReviewer,
-    sandbox_policy: SandboxPolicy,
-}
-
-/// Enabling the Guardian Approvals experiment in the TUI should also switch the
-/// current `/permissions` settings to the matching Guardian Approvals mode. Users
-/// can still change `/permissions` afterward; this just assumes that opting into
-/// the experiment means they want guardian review enabled immediately.
-fn guardian_approvals_mode() -> GuardianApprovalsMode {
-    GuardianApprovalsMode {
-        approval_policy: AskForApproval::OnRequest,
-        approvals_reviewer: ApprovalsReviewer::GuardianSubagent,
-        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
-    }
-}
 /// Baseline cadence for periodic stream commit animation ticks.
 ///
 /// Smooth-mode streaming drains one line per tick, so this interval controls
@@ -1481,7 +1464,7 @@ impl App {
             return;
         }
 
-        let guardian_approvals_preset = guardian_approvals_mode();
+        let guardian_approvals_preset = guardian_approval_preset();
         let mut next_config = self.config.clone();
         let active_profile = self.active_profile.clone();
         let scoped_segments = |key: &str| {
@@ -1501,26 +1484,6 @@ impl App {
         let mut approvals_reviewer_override = None;
         let mut sandbox_policy_override = None;
         let mut feature_updates_to_apply = Vec::with_capacity(updates.len());
-        // Guardian Approvals owns `approvals_reviewer`, but disabling the feature
-        // from inside a profile should not silently clear a value configured at
-        // the root scope.
-        let (root_approvals_reviewer_blocks_profile_disable, profile_approvals_reviewer_configured) = {
-            let effective_config = next_config.config_layer_stack.effective_config();
-            let root_blocks_disable = effective_config
-                .as_table()
-                .and_then(|table| table.get("approvals_reviewer"))
-                .is_some_and(|value| value != &TomlValue::String("user".to_string()));
-            let profile_configured = active_profile.as_deref().is_some_and(|profile| {
-                effective_config
-                    .as_table()
-                    .and_then(|table| table.get("profiles"))
-                    .and_then(TomlValue::as_table)
-                    .and_then(|profiles| profiles.get(profile))
-                    .and_then(TomlValue::as_table)
-                    .is_some_and(|profile_config| profile_config.contains_key("approvals_reviewer"))
-            });
-            (root_blocks_disable, profile_configured)
-        };
         let mut permissions_history_label: Option<&'static str> = None;
         let mut builder = ConfigEditsBuilder::new(&self.config.codex_home)
             .with_profile(self.active_profile.as_deref());
@@ -1528,16 +1491,6 @@ impl App {
         for (feature, enabled) in updates {
             let feature_key = feature.key();
             let mut feature_edits = Vec::new();
-            if feature == Feature::GuardianApproval
-                && !enabled
-                && self.active_profile.is_some()
-                && root_approvals_reviewer_blocks_profile_disable
-            {
-                self.chat_widget.add_error_message(
-                        "Cannot disable Guardian Approvals in this profile because `approvals_reviewer` is configured outside the active profile.".to_string(),
-                    );
-                continue;
-            }
             let mut feature_config = next_config.clone();
             if let Err(err) = feature_config.features.set_enabled(feature, enabled) {
                 tracing::error!(
@@ -1552,11 +1505,14 @@ impl App {
             }
             let effective_enabled = feature_config.features.enabled(feature);
             if feature == Feature::GuardianApproval {
+                // Merge-safety anchor: the feature flag is only Guardian preset discoverability/convenience;
+                // reviewer + approval + sandbox remain the live routing owner.
                 let previous_approvals_reviewer = feature_config.approvals_reviewer;
                 if effective_enabled {
-                    // Persist the reviewer setting so future sessions keep the
-                    // experiment's matching `/permissions` mode until the user
-                    // changes it explicitly.
+                    // Guardian Approvals routing is owned by the effective
+                    // reviewer + approval policy, not by the experimental
+                    // feature flag. Enabling the feature opts into the shared
+                    // Guardian preset as a convenience.
                     feature_config.approvals_reviewer =
                         guardian_approvals_preset.approvals_reviewer;
                     feature_edits.push(ConfigEdit::SetPath {
@@ -1569,18 +1525,8 @@ impl App {
                     if previous_approvals_reviewer != guardian_approvals_preset.approvals_reviewer {
                         permissions_history_label = Some("Guardian Approvals");
                     }
-                } else if !effective_enabled {
-                    if profile_approvals_reviewer_configured || self.active_profile.is_none() {
-                        feature_edits.push(ConfigEdit::ClearPath {
-                            segments: scoped_segments("approvals_reviewer"),
-                        });
-                    }
-                    feature_config.approvals_reviewer = ApprovalsReviewer::User;
-                    if previous_approvals_reviewer != ApprovalsReviewer::User {
-                        permissions_history_label = Some("Default");
-                    }
+                    approvals_reviewer_override = Some(feature_config.approvals_reviewer);
                 }
-                approvals_reviewer_override = Some(feature_config.approvals_reviewer);
             }
             if feature == Feature::GuardianApproval && effective_enabled {
                 // The feature flag alone is not enough for the live session.
@@ -1589,7 +1535,7 @@ impl App {
                 // makes guardian review observable in the current thread.
                 if !self.try_set_approval_policy_on_config(
                     &mut feature_config,
-                    guardian_approvals_preset.approval_policy,
+                    guardian_approvals_preset.approval,
                     "Failed to enable Guardian Approvals",
                     "failed to set guardian approvals approval policy on staged config",
                 ) {
@@ -1597,7 +1543,7 @@ impl App {
                 }
                 if !self.try_set_sandbox_policy_on_config(
                     &mut feature_config,
-                    guardian_approvals_preset.sandbox_policy.clone(),
+                    guardian_approvals_preset.sandbox.clone(),
                     "Failed to enable Guardian Approvals",
                     "failed to set guardian approvals sandbox policy on staged config",
                 ) {
@@ -1613,8 +1559,8 @@ impl App {
                         value: "workspace-write".into(),
                     },
                 ]);
-                approval_policy_override = Some(guardian_approvals_preset.approval_policy);
-                sandbox_policy_override = Some(guardian_approvals_preset.sandbox_policy.clone());
+                approval_policy_override = Some(guardian_approvals_preset.approval);
+                sandbox_policy_override = Some(guardian_approvals_preset.sandbox.clone());
             }
             next_config = feature_config;
             feature_updates_to_apply.push((feature, effective_enabled));
@@ -6000,7 +5946,7 @@ impl App {
                                     AppCommand::override_turn_context(
                                         /*cwd*/ None,
                                         Some(preset.approval),
-                                        Some(self.config.approvals_reviewer),
+                                        Some(preset.approvals_reviewer),
                                         Some(preset.sandbox.clone()),
                                         #[cfg(target_os = "windows")]
                                         Some(windows_sandbox_level),
@@ -6015,6 +5961,9 @@ impl App {
                                 ));
                                 self.app_event_tx
                                     .send(AppEvent::UpdateAskForApprovalPolicy(preset.approval));
+                                self.app_event_tx.send(AppEvent::UpdateApprovalsReviewer(
+                                    preset.approvals_reviewer,
+                                ));
                                 self.app_event_tx
                                     .send(AppEvent::UpdateSandboxPolicy(preset.sandbox.clone()));
                                 let _ = mode;
@@ -10131,7 +10080,7 @@ mod tests {
         let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
         let codex_home = tempdir()?;
         app.config.codex_home = codex_home.path().to_path_buf();
-        let guardian_approvals = guardian_approvals_mode();
+        let guardian_approvals = guardian_approval_preset();
 
         app.update_feature_flags(vec![(Feature::GuardianApproval, true)])
             .await;
@@ -10149,7 +10098,7 @@ mod tests {
         );
         assert_eq!(
             app.config.permissions.approval_policy.value(),
-            guardian_approvals.approval_policy
+            guardian_approvals.approval
         );
         assert_eq!(
             app.chat_widget
@@ -10157,7 +10106,7 @@ mod tests {
                 .permissions
                 .approval_policy
                 .value(),
-            guardian_approvals.approval_policy
+            guardian_approvals.approval
         );
         assert_eq!(
             app.chat_widget
@@ -10165,7 +10114,7 @@ mod tests {
                 .permissions
                 .sandbox_policy
                 .get(),
-            &guardian_approvals.sandbox_policy
+            &guardian_approvals.sandbox
         );
         assert_eq!(
             app.chat_widget.config_ref().approvals_reviewer,
@@ -10177,9 +10126,9 @@ mod tests {
             op_rx.try_recv(),
             Ok(Op::OverrideTurnContext {
                 cwd: None,
-                approval_policy: Some(guardian_approvals.approval_policy),
+                approval_policy: Some(guardian_approvals.approval),
                 approvals_reviewer: Some(guardian_approvals.approvals_reviewer),
-                sandbox_policy: Some(guardian_approvals.sandbox_policy.clone()),
+                sandbox_policy: Some(guardian_approvals.sandbox.clone()),
                 windows_sandbox_level: None,
                 model: None,
                 effort: None,
@@ -10210,7 +10159,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_feature_flags_disabling_guardian_clears_review_policy_and_restores_default()
+    async fn update_feature_flags_disabling_guardian_preserves_active_guardian_review_policy()
     -> Result<()> {
         let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
         let codex_home = tempdir()?;
@@ -10254,47 +10203,32 @@ mod tests {
                 .features
                 .enabled(Feature::GuardianApproval)
         );
-        assert_eq!(app.config.approvals_reviewer, ApprovalsReviewer::User);
+        assert_eq!(
+            app.config.approvals_reviewer,
+            ApprovalsReviewer::GuardianSubagent
+        );
         assert_eq!(
             app.config.permissions.approval_policy.value(),
             AskForApproval::OnRequest
         );
         assert_eq!(
             app.chat_widget.config_ref().approvals_reviewer,
-            ApprovalsReviewer::User
+            ApprovalsReviewer::GuardianSubagent
         );
         assert_eq!(app.runtime_approval_policy_override, None);
-        assert_eq!(
-            op_rx.try_recv(),
-            Ok(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                approvals_reviewer: Some(ApprovalsReviewer::User),
-                sandbox_policy: None,
-                windows_sandbox_level: None,
-                model: None,
-                effort: None,
-                summary: None,
-                service_tier: None,
-                collaboration_mode: None,
-                personality: None,
-            })
+        assert_eq!(app.runtime_sandbox_policy_override, None);
+        assert!(
+            op_rx.try_recv().is_err(),
+            "disabling Guardian Approval should not rewrite the live reviewer-owned mode"
         );
-        let cell = match app_event_rx.try_recv() {
-            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
-            other => panic!("expected InsertHistoryCell event, got {other:?}"),
-        };
-        let rendered = cell
-            .display_lines(/*width*/ 120)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains("Permissions updated to Default"));
+        assert!(
+            app_event_rx.try_recv().is_err(),
+            "disabling Guardian Approval should not emit a permissions history rewrite"
+        );
 
         let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
         assert!(!config.contains("guardian_approval = true"));
-        assert!(!config.contains("approvals_reviewer ="));
+        assert!(config.contains("approvals_reviewer = \"guardian_subagent\""));
         assert!(config.contains("approval_policy = \"on-request\""));
         assert!(config.contains("sandbox_mode = \"workspace-write\""));
         Ok(())
@@ -10306,7 +10240,7 @@ mod tests {
         let (mut app, _app_event_rx, mut op_rx) = make_test_app_with_channels().await;
         let codex_home = tempdir()?;
         app.config.codex_home = codex_home.path().to_path_buf();
-        let guardian_approvals = guardian_approvals_mode();
+        let guardian_approvals = guardian_approval_preset();
         let config_toml_path = codex_home.path().join("config.toml").abs();
         let config_toml = "approvals_reviewer = \"user\"\n";
         std::fs::write(config_toml_path.as_path(), config_toml)?;
@@ -10333,7 +10267,7 @@ mod tests {
         );
         assert_eq!(
             app.config.permissions.approval_policy.value(),
-            guardian_approvals.approval_policy
+            guardian_approvals.approval
         );
         assert_eq!(
             app.chat_widget
@@ -10341,15 +10275,15 @@ mod tests {
                 .permissions
                 .sandbox_policy
                 .get(),
-            &guardian_approvals.sandbox_policy
+            &guardian_approvals.sandbox
         );
         assert_eq!(
             op_rx.try_recv(),
             Ok(Op::OverrideTurnContext {
                 cwd: None,
-                approval_policy: Some(guardian_approvals.approval_policy),
+                approval_policy: Some(guardian_approvals.approval),
                 approvals_reviewer: Some(guardian_approvals.approvals_reviewer),
-                sandbox_policy: Some(guardian_approvals.sandbox_policy.clone()),
+                sandbox_policy: Some(guardian_approvals.sandbox.clone()),
                 windows_sandbox_level: None,
                 model: None,
                 effort: None,
@@ -10369,7 +10303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_feature_flags_disabling_guardian_clears_manual_review_policy_without_history()
+    async fn update_feature_flags_disabling_guardian_leaves_manual_review_policy_unchanged()
     -> Result<()> {
         let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
         let codex_home = tempdir()?;
@@ -10400,21 +10334,9 @@ mod tests {
             app.chat_widget.config_ref().approvals_reviewer,
             ApprovalsReviewer::User
         );
-        assert_eq!(
-            op_rx.try_recv(),
-            Ok(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                approvals_reviewer: Some(ApprovalsReviewer::User),
-                sandbox_policy: None,
-                windows_sandbox_level: None,
-                model: None,
-                effort: None,
-                summary: None,
-                service_tier: None,
-                collaboration_mode: None,
-                personality: None,
-            })
+        assert!(
+            op_rx.try_recv().is_err(),
+            "manual review should stay untouched when disabling Guardian Approval"
         );
         assert!(
             app_event_rx.try_recv().is_err(),
@@ -10423,7 +10345,7 @@ mod tests {
 
         let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
         assert!(!config.contains("guardian_approval = true"));
-        assert!(!config.contains("approvals_reviewer ="));
+        assert!(config.contains("approvals_reviewer = \"user\""));
         Ok(())
     }
 
@@ -10433,7 +10355,7 @@ mod tests {
         let (mut app, _app_event_rx, mut op_rx) = make_test_app_with_channels().await;
         let codex_home = tempdir()?;
         app.config.codex_home = codex_home.path().to_path_buf();
-        let guardian_approvals = guardian_approvals_mode();
+        let guardian_approvals = guardian_approval_preset();
         app.active_profile = Some("guardian".to_string());
         let config_toml_path = codex_home.path().join("config.toml").abs();
         let config_toml = "profile = \"guardian\"\napprovals_reviewer = \"user\"\n";
@@ -10463,9 +10385,9 @@ mod tests {
             op_rx.try_recv(),
             Ok(Op::OverrideTurnContext {
                 cwd: None,
-                approval_policy: Some(guardian_approvals.approval_policy),
+                approval_policy: Some(guardian_approvals.approval),
                 approvals_reviewer: Some(guardian_approvals.approvals_reviewer),
-                sandbox_policy: Some(guardian_approvals.sandbox_policy.clone()),
+                sandbox_policy: Some(guardian_approvals.sandbox.clone()),
                 windows_sandbox_level: None,
                 model: None,
                 effort: None,
@@ -10499,7 +10421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_feature_flags_disabling_guardian_in_profile_allows_inherited_user_reviewer()
+    async fn update_feature_flags_disabling_guardian_in_profile_preserves_profile_owned_reviewer()
     -> Result<()> {
         let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
         let codex_home = tempdir()?;
@@ -10541,53 +10463,48 @@ guardian_approval = true
                 .features
                 .enabled(Feature::GuardianApproval)
         );
-        assert_eq!(app.config.approvals_reviewer, ApprovalsReviewer::User);
+        assert_eq!(
+            app.config.approvals_reviewer,
+            ApprovalsReviewer::GuardianSubagent
+        );
         assert_eq!(
             app.chat_widget.config_ref().approvals_reviewer,
-            ApprovalsReviewer::User
+            ApprovalsReviewer::GuardianSubagent
         );
-        assert_eq!(
-            op_rx.try_recv(),
-            Ok(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                approvals_reviewer: Some(ApprovalsReviewer::User),
-                sandbox_policy: None,
-                windows_sandbox_level: None,
-                model: None,
-                effort: None,
-                summary: None,
-                service_tier: None,
-                collaboration_mode: None,
-                personality: None,
-            })
+        assert!(
+            op_rx.try_recv().is_err(),
+            "disabling the feature should not rewrite a profile-owned guardian reviewer"
         );
-        let cell = match app_event_rx.try_recv() {
-            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
-            other => panic!("expected InsertHistoryCell event, got {other:?}"),
-        };
-        let rendered = cell
-            .display_lines(/*width*/ 120)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains("Permissions updated to Default"));
+        assert!(
+            app_event_rx.try_recv().is_err(),
+            "disabling the feature should not emit a permissions history rewrite for a profile-owned guardian reviewer"
+        );
 
         let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
         assert!(!config.contains("guardian_approval = true"));
-        assert!(!config.contains("guardian_subagent"));
+        let config_value = toml::from_str::<TomlValue>(&config)?;
+        let profile_config = config_value
+            .as_table()
+            .and_then(|table| table.get("profiles"))
+            .and_then(TomlValue::as_table)
+            .and_then(|profiles| profiles.get("guardian"))
+            .and_then(TomlValue::as_table)
+            .expect("guardian profile should exist");
         assert_eq!(
-            toml::from_str::<TomlValue>(&config)?
+            config_value
                 .as_table()
                 .and_then(|table| table.get("approvals_reviewer")),
             Some(&TomlValue::String("user".to_string()))
+        );
+        assert_eq!(
+            profile_config.get("approvals_reviewer"),
+            Some(&TomlValue::String("guardian_subagent".to_string()))
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn update_feature_flags_disabling_guardian_in_profile_keeps_inherited_non_user_reviewer_enabled()
+    async fn update_feature_flags_disabling_guardian_in_profile_preserves_inherited_non_user_reviewer()
     -> Result<()> {
         let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
         let codex_home = tempdir()?;
@@ -10613,9 +10530,9 @@ guardian_approval = true
         app.update_feature_flags(vec![(Feature::GuardianApproval, false)])
             .await;
 
-        assert!(app.config.features.enabled(Feature::GuardianApproval));
+        assert!(!app.config.features.enabled(Feature::GuardianApproval));
         assert!(
-            app.chat_widget
+            !app.chat_widget
                 .config_ref()
                 .features
                 .enabled(Feature::GuardianApproval)
@@ -10645,12 +10562,78 @@ guardian_approval = true
         );
 
         let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
-        assert!(config.contains("guardian_approval = true"));
+        let config_value = toml::from_str::<TomlValue>(&config)?;
         assert_eq!(
-            toml::from_str::<TomlValue>(&config)?
+            config_value
                 .as_table()
                 .and_then(|table| table.get("approvals_reviewer")),
             Some(&TomlValue::String("guardian_subagent".to_string()))
+        );
+        let profile_config = config_value
+            .as_table()
+            .and_then(|table| table.get("profiles"))
+            .and_then(TomlValue::as_table)
+            .and_then(|profiles| profiles.get("guardian"))
+            .and_then(TomlValue::as_table)
+            .expect("guardian profile should exist");
+        let profile_features = profile_config
+            .get("features")
+            .and_then(TomlValue::as_table)
+            .expect("guardian profile features should exist");
+        assert_eq!(
+            profile_features.get("guardian_approval"),
+            Some(&TomlValue::Boolean(false))
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn enable_windows_sandbox_for_guardian_preserves_reviewer_in_queued_events() -> Result<()>
+    {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf();
+        app.chat_widget
+            .set_world_writable_warning_acknowledged(true);
+
+        let backend = crate::test_backend::VT100Backend::new(/*width*/ 80, /*height*/ 24);
+        let terminal = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        let mut tui = crate::tui::Tui::new(terminal);
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+                .await
+                .expect("embedded app server");
+
+        let control = app
+            .handle_event(
+                &mut tui,
+                &mut app_server,
+                AppEvent::EnableWindowsSandboxForAgentMode {
+                    preset: guardian_approval_preset(),
+                    mode: WindowsSandboxEnableMode::Legacy,
+                },
+            )
+            .await?;
+
+        assert_eq!(control, AppRunControl::Continue);
+        let events = std::iter::from_fn(|| app_event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AppEvent::UpdateApprovalsReviewer(ApprovalsReviewer::GuardianSubagent)
+            )),
+            "expected sandbox-enable success to queue Guardian reviewer update: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AppEvent::CodexOp(Op::OverrideTurnContext {
+                    approvals_reviewer: Some(ApprovalsReviewer::GuardianSubagent),
+                    ..
+                })
+            )),
+            "expected sandbox-enable success to queue Guardian reviewer in OverrideTurnContext: {events:?}"
         );
         Ok(())
     }

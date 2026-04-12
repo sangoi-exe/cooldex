@@ -9783,18 +9783,16 @@ impl ChatWidget {
             && windows_degraded_sandbox_enabled
             && presets.iter().any(|preset| preset.id == "auto");
 
-        let guardian_disabled_reason = |enabled: bool| {
-            let mut next_features = self.config.features.get().clone();
-            next_features.set_enabled(Feature::GuardianApproval, enabled);
-            self.config
-                .features
-                .can_set(&next_features)
-                .err()
-                .map(|err| err.to_string())
-        };
-
         for preset in presets.into_iter() {
             if !include_read_only && preset.id == "read-only" {
+                continue;
+            }
+            // Merge-safety anchor: `/permissions` must follow the shared Guardian preset owner and
+            // only gate discoverability here; a currently active guardian reviewer mode must stay visible.
+            if preset.approvals_reviewer == ApprovalsReviewer::GuardianSubagent
+                && !guardian_approval_enabled
+                && current_review_policy != ApprovalsReviewer::GuardianSubagent
+            {
                 continue;
             }
             let base_name = if preset.id == "auto" && windows_degraded_sandbox_enabled {
@@ -9813,15 +9811,14 @@ impl ChatWidget {
                 Ok(()) => None,
                 Err(err) => Some(err.to_string()),
             };
-            let default_disabled_reason = approval_disabled_reason
-                .clone()
-                .or_else(|| guardian_disabled_reason(false));
             let requires_confirmation = preset.id == "full-access"
                 && !self
                     .config
                     .notices
                     .hide_full_access_warning
                     .unwrap_or(false);
+            let uses_workspace_write_on_request = preset.approval == AskForApproval::OnRequest
+                && matches!(&preset.sandbox, SandboxPolicy::WorkspaceWrite { .. });
             let default_actions: Vec<SelectionAction> = if requires_confirmation {
                 let preset_clone = preset.clone();
                 vec![Box::new(move |tx| {
@@ -9830,7 +9827,7 @@ impl ChatWidget {
                         return_to_permissions: !include_read_only,
                     });
                 })]
-            } else if preset.id == "auto" {
+            } else if uses_workspace_write_on_request {
                 #[cfg(target_os = "windows")]
                 {
                     if WindowsSandboxLevel::from_config(&self.config)
@@ -9872,7 +9869,7 @@ impl ChatWidget {
                             preset.approval,
                             preset.sandbox.clone(),
                             base_name.clone(),
-                            ApprovalsReviewer::User,
+                            preset.approvals_reviewer,
                         )
                     }
                 }
@@ -9882,7 +9879,7 @@ impl ChatWidget {
                         preset.approval,
                         preset.sandbox.clone(),
                         base_name.clone(),
-                        ApprovalsReviewer::User,
+                        preset.approvals_reviewer,
                     )
                 }
             } else {
@@ -9890,61 +9887,23 @@ impl ChatWidget {
                     preset.approval,
                     preset.sandbox.clone(),
                     base_name.clone(),
-                    ApprovalsReviewer::User,
+                    preset.approvals_reviewer,
                 )
             };
-            if preset.id == "auto" {
-                items.push(SelectionItem {
-                    name: base_name.clone(),
-                    description: base_description.clone(),
-                    is_current: current_review_policy == ApprovalsReviewer::User
-                        && Self::preset_matches_current(current_approval, current_sandbox, &preset),
-                    actions: default_actions,
-                    dismiss_on_select: true,
-                    disabled_reason: default_disabled_reason,
-                    ..Default::default()
-                });
-
-                if guardian_approval_enabled {
-                    items.push(SelectionItem {
-                        name: "Guardian Approvals".to_string(),
-                        description: Some(
-                            "Same workspace-write permissions as Default, but eligible `on-request` approvals are routed through the guardian reviewer subagent."
-                                .to_string(),
-                        ),
-                        is_current: current_review_policy == ApprovalsReviewer::GuardianSubagent
-                            && Self::preset_matches_current(
-                                current_approval,
-                                current_sandbox,
-                                &preset,
-                            ),
-                        actions: Self::approval_preset_actions(
-                            preset.approval,
-                            preset.sandbox.clone(),
-                            "Guardian Approvals".to_string(),
-                            ApprovalsReviewer::GuardianSubagent,
-                        ),
-                        dismiss_on_select: true,
-                        disabled_reason: approval_disabled_reason
-                            .or_else(|| guardian_disabled_reason(true)),
-                        ..Default::default()
-                    });
-                }
-            } else {
-                items.push(SelectionItem {
-                    name: base_name,
-                    description: base_description,
-                    is_current: Self::preset_matches_current(
-                        current_approval,
-                        current_sandbox,
-                        &preset,
-                    ),
-                    actions: default_actions,
-                    dismiss_on_select: true,
-                    disabled_reason: default_disabled_reason,
-                    ..Default::default()
-                });
-            }
+            items.push(SelectionItem {
+                name: base_name,
+                description: base_description,
+                is_current: Self::preset_matches_current(
+                    current_approval,
+                    current_review_policy,
+                    current_sandbox,
+                    &preset,
+                ),
+                actions: default_actions,
+                dismiss_on_select: true,
+                disabled_reason: approval_disabled_reason,
+                ..Default::default()
+            });
         }
 
         let footer_note = show_elevate_sandbox_hint.then(|| {
@@ -10462,10 +10421,14 @@ impl ChatWidget {
 
     fn preset_matches_current(
         current_approval: AskForApproval,
+        current_review_policy: ApprovalsReviewer,
         current_sandbox: &SandboxPolicy,
         preset: &ApprovalPreset,
     ) -> bool {
         if current_approval != preset.approval {
+            return false;
+        }
+        if current_review_policy != preset.approvals_reviewer {
             return false;
         }
 
@@ -10616,9 +10579,13 @@ impl ChatWidget {
         extra_count: usize,
         failed_scan: bool,
     ) {
-        let (approval, sandbox) = match &preset {
-            Some(p) => (Some(p.approval), Some(p.sandbox.clone())),
-            None => (None, None),
+        let (approval, approvals_reviewer, sandbox) = match &preset {
+            Some(p) => (
+                Some(p.approval),
+                Some(p.approvals_reviewer),
+                Some(p.sandbox.clone()),
+            ),
+            None => (None, None, None),
         };
         let mut header_children: Vec<Box<dyn Renderable>> = Vec::new();
         let describe_policy = |policy: &SandboxPolicy| match policy {
@@ -10672,12 +10639,14 @@ impl ChatWidget {
                 tx.send(AppEvent::SkipNextWorldWritableScan);
             }));
         }
-        if let (Some(approval), Some(sandbox)) = (approval, sandbox.clone()) {
+        if let (Some(approval), Some(approvals_reviewer), Some(sandbox)) =
+            (approval, approvals_reviewer, sandbox.clone())
+        {
             accept_actions.extend(Self::approval_preset_actions(
                 approval,
                 sandbox,
                 mode_label.to_string(),
-                ApprovalsReviewer::User,
+                approvals_reviewer,
             ));
         }
 
@@ -10686,12 +10655,14 @@ impl ChatWidget {
             tx.send(AppEvent::UpdateWorldWritableWarningAcknowledged(true));
             tx.send(AppEvent::PersistWorldWritableWarningAcknowledged);
         }));
-        if let (Some(approval), Some(sandbox)) = (approval, sandbox) {
+        if let (Some(approval), Some(approvals_reviewer), Some(sandbox)) =
+            (approval, approvals_reviewer, sandbox)
+        {
             accept_and_remember_actions.extend(Self::approval_preset_actions(
                 approval,
                 sandbox,
                 mode_label.to_string(),
-                ApprovalsReviewer::User,
+                approvals_reviewer,
             ));
         }
 

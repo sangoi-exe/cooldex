@@ -83,6 +83,11 @@ export function createApp() {
 
 async function main() {
   const { app, config } = createApp();
+  if (config.SANGOI_CODEX_RUNTIME_MODE === 'prod') {
+    throw new Error(
+      'SANGOI_CODEX_RUNTIME_MODE=prod is not implemented yet. Expected future path: production-owned Codex runtime plus CLI-native backend/JWT auth retrieval.',
+    );
+  }
   await app.listen({
     host: config.SANGOI_CODEX_MCP_HOST,
     port: config.SANGOI_CODEX_MCP_PORT,
