@@ -217,7 +217,8 @@ async fn run_remote_compact_task_inner_impl(
         prompt_gc: None,
     };
     sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
-        .await;
+        .await
+        .map_err(CodexErr::Fatal)?;
     sess.recompute_token_usage(turn_context).await;
 
     sess.emit_turn_item_completed(turn_context, compaction_item)

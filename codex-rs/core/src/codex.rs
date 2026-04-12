@@ -3797,23 +3797,24 @@ impl Session {
         items: Vec<ResponseItem>,
         reference_context_item: Option<TurnContextItem>,
         compacted_item: CompactedItem,
-    ) {
-        self.replace_history(items, reference_context_item.clone())
-            .await;
-
-        self.persist_rollout_items_required(
-            &[RolloutItem::Compacted(compacted_item)],
-            "persist compacted history",
-        )
-        .await;
-        if let Some(turn_context_item) = reference_context_item {
-            self.persist_rollout_items_required(
-                &[RolloutItem::TurnContext(turn_context_item)],
-                "persist compacted reference context",
-            )
-            .await;
+    ) -> Result<(), String> {
+        let recorder = {
+            let guard = self.services.rollout.lock().await;
+            guard.clone()
+        };
+        let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
+        if let Some(turn_context_item) = reference_context_item.clone() {
+            rollout_items.push(RolloutItem::TurnContext(turn_context_item));
         }
+        // Merge-safety anchor: compaction rewrites must durably persist the
+        // replacement boundary before mutating live history, or recorder
+        // shutdown races can leave the TUI with rewritten in-memory history and
+        // no canonical rollout evidence for resume/recall recovery.
+        persist_compacted_rollout_items(recorder.as_ref(), &rollout_items).await?;
+
+        self.replace_history(items, reference_context_item).await;
         self.services.model_client.advance_window_generation();
+        Ok(())
     }
 
     pub(crate) async fn persist_prompt_gc_replacement_history(
@@ -4889,6 +4890,21 @@ async fn persist_prompt_gc_rollout_items(
     if let Err(error) = recorder.persist_items_atomically(rollout_items).await {
         return Err(format!(
             "failed to persist prompt_gc replacement_history atomically: {error}"
+        ));
+    }
+    Ok(())
+}
+
+async fn persist_compacted_rollout_items(
+    recorder: Option<&crate::rollout::RolloutRecorder>,
+    rollout_items: &[RolloutItem],
+) -> Result<(), String> {
+    let Some(recorder) = recorder else {
+        return Ok(());
+    };
+    if let Err(error) = recorder.persist_items_atomically(rollout_items).await {
+        return Err(format!(
+            "failed to persist compacted history atomically: {error}"
         ));
     }
     Ok(())

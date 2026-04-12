@@ -1532,6 +1532,180 @@ async fn prompt_gc_persist_replacement_history_flush_failure_keeps_live_history_
 }
 
 #[tokio::test]
+async fn replace_compacted_history_queue_failure_keeps_live_history_unchanged() {
+    let (session, turn_context) = make_session_and_context().await;
+    let history_before = {
+        let mut state = session.state.lock().await;
+        state.record_items(
+            [user_message("before"), assistant_message("still here")].iter(),
+            turn_context.truncation_policy,
+        );
+        state.history_snapshot_lenient()
+    };
+
+    let config = session.get_config().await;
+    let recorder = RolloutRecorder::new(
+        config.as_ref(),
+        RolloutRecorderParams::new(
+            ThreadId::default(),
+            /*forked_from_id*/ None,
+            SessionSource::Exec,
+            BaseInstructions::default(),
+            Vec::new(),
+            EventPersistenceMode::Limited,
+        ),
+        /*state_db_ctx*/ None,
+        /*state_builder*/ None,
+    )
+    .await
+    .expect("create rollout recorder");
+    {
+        let mut rollout = session.services.rollout.lock().await;
+        *rollout = Some(recorder.clone());
+    }
+    recorder
+        .shutdown()
+        .await
+        .expect("shutting down recorder should close the writer channel");
+
+    let replacement_history = vec![assistant_message("replacement history")];
+    let error = session
+        .replace_compacted_history(
+            replacement_history.clone(),
+            Some(turn_context.to_turn_context_item()),
+            CompactedItem {
+                message: "summary".to_string(),
+                replacement_history: Some(replacement_history),
+                prompt_gc: None,
+            },
+        )
+        .await
+        .expect_err("closed recorder should fail compaction persistence");
+    assert!(
+        error.contains("failed to persist compacted history atomically"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains("channel closed"),
+        "unexpected error: {error}"
+    );
+
+    let history_after = {
+        let state = session.state.lock().await;
+        state.history_snapshot_lenient()
+    };
+    assert_eq!(history_after, history_before);
+    assert!(
+        session.reference_context_item().await.is_none(),
+        "failed compaction must not replace the reference context item"
+    );
+}
+
+#[tokio::test]
+async fn replace_compacted_history_persists_atomically_before_live_rewrite() {
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    let replacement_history = vec![assistant_message("replacement history")];
+    let reference_context_item = Some(turn_context.to_turn_context_item());
+
+    session
+        .replace_compacted_history(
+            replacement_history.clone(),
+            reference_context_item.clone(),
+            CompactedItem {
+                message: "summary".to_string(),
+                replacement_history: Some(replacement_history.clone()),
+                prompt_gc: None,
+            },
+        )
+        .await
+        .expect("persist compacted history");
+    session.flush_rollout().await;
+
+    let history_after = {
+        let state = session.state.lock().await;
+        state.history_snapshot_lenient()
+    };
+    assert_eq!(history_after, replacement_history);
+    assert_eq!(
+        serde_json::to_value(session.reference_context_item().await)
+            .expect("serialize persisted reference context"),
+        serde_json::to_value(reference_context_item.clone())
+            .expect("serialize expected reference context")
+    );
+
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    assert!(
+        resumed.history.iter().any(|item| matches!(
+            item,
+            RolloutItem::Compacted(CompactedItem {
+                message,
+                replacement_history: Some(history),
+                prompt_gc: None,
+            }) if message == "summary" && history == &replacement_history
+        )),
+        "rollout should contain the compacted replacement history"
+    );
+    assert!(
+        resumed.history.iter().any(|item| matches!(
+            item,
+            RolloutItem::TurnContext(turn_context_item)
+                if serde_json::to_value(Some(turn_context_item.clone()))
+                    .expect("serialize rollout turn context")
+                    == serde_json::to_value(reference_context_item.clone())
+                        .expect("serialize expected turn context")
+        )),
+        "rollout should contain the compacted reference context"
+    );
+}
+
+#[tokio::test]
+async fn finalize_local_compact_result_emits_error_for_fatal_failure() {
+    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+
+    let error = crate::compact::finalize_local_compact_result(
+        &session,
+        &turn_context,
+        Err(codex_protocol::error::CodexErr::Fatal(
+            "channel closed".to_string(),
+        )),
+    )
+    .await
+    .expect_err("fatal compaction failures should still bubble");
+
+    let deadline = StdDuration::from_secs(2);
+    let start = std::time::Instant::now();
+    let error_event = loop {
+        let remaining = deadline.saturating_sub(start.elapsed());
+        let evt = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .expect("timeout waiting for error event")
+            .expect("event");
+        match evt.msg {
+            EventMsg::Error(payload) => break payload,
+            _ => continue,
+        }
+    };
+
+    assert!(
+        error_event
+            .message
+            .contains("Error running local compact task"),
+        "unexpected error message: {}",
+        error_event.message
+    );
+    assert!(
+        error.to_string().contains("channel closed"),
+        "unexpected bubbled error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn prompt_gc_persist_replacement_history_records_apply_succeeded_marker() {
     let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
     let rollout_path = attach_rollout_recorder(&session).await;

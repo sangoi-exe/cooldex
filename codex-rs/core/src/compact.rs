@@ -59,8 +59,14 @@ pub(crate) async fn run_inline_auto_compact_task(
         text_elements: Vec::new(),
     }];
 
-    run_compact_task_inner(sess, turn_context, input, initial_context_placement).await?;
-    Ok(())
+    let result = run_compact_task_inner(
+        sess.clone(),
+        turn_context.clone(),
+        input,
+        initial_context_placement,
+    )
+    .await;
+    finalize_local_compact_result(&sess, &turn_context, result).await
 }
 
 pub(crate) async fn run_compact_task(
@@ -75,13 +81,31 @@ pub(crate) async fn run_compact_task(
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, start_event).await;
-    run_compact_task_inner(
+    let result = run_compact_task_inner(
         sess.clone(),
-        turn_context,
+        turn_context.clone(),
         input,
         CompactionInitialContextPlacement::PromptTop,
     )
-    .await
+    .await;
+    finalize_local_compact_result(&sess, &turn_context, result).await
+}
+
+pub(crate) async fn finalize_local_compact_result(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    result: CodexResult<()>,
+) -> CodexResult<()> {
+    match result {
+        Err(error @ CodexErr::Fatal(_)) => {
+            let event = EventMsg::Error(
+                error.to_error_event(Some("Error running local compact task".to_string())),
+            );
+            sess.send_event(turn_context, event).await;
+            Err(error)
+        }
+        other => other,
+    }
 }
 
 async fn run_compact_task_inner(
@@ -223,7 +247,8 @@ async fn run_compact_task_inner(
         prompt_gc: None,
     };
     sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
-        .await;
+        .await
+        .map_err(CodexErr::Fatal)?;
     client_session.reset_websocket_session();
     sess.recompute_token_usage(&turn_context).await;
 
