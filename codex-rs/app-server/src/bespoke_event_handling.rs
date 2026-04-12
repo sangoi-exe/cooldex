@@ -771,6 +771,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 if let Err(err) = conversation
                     .submit(Op::UserInputAnswer {
                         id: event_turn_id,
+                        request_item_id: None,
                         response: empty,
                     })
                     .await
@@ -2368,6 +2369,7 @@ async fn on_request_user_input_response(
             if let Err(err) = conversation
                 .submit(Op::UserInputAnswer {
                     id: event_turn_id,
+                    request_item_id: None,
                     response: empty,
                 })
                 .await
@@ -2384,6 +2386,7 @@ async fn on_request_user_input_response(
             if let Err(err) = conversation
                 .submit(Op::UserInputAnswer {
                     id: event_turn_id,
+                    request_item_id: None,
                     response: empty,
                 })
                 .await
@@ -2419,6 +2422,7 @@ async fn on_request_user_input_response(
     if let Err(err) = conversation
         .submit(Op::UserInputAnswer {
             id: event_turn_id,
+            request_item_id: None,
             response,
         })
         .await

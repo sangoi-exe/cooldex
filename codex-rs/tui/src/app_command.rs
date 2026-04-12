@@ -86,6 +86,7 @@ pub(crate) enum AppCommandView<'a> {
     },
     UserInputAnswer {
         id: &'a str,
+        request_item_id: &'a Option<String>,
         response: &'a RequestUserInputResponse,
     },
     RequestPermissionsResponse {
@@ -234,7 +235,23 @@ impl AppCommand {
     }
 
     pub(crate) fn user_input_answer(id: String, response: RequestUserInputResponse) -> Self {
-        Self(Op::UserInputAnswer { id, response })
+        Self(Op::UserInputAnswer {
+            id,
+            request_item_id: None,
+            response,
+        })
+    }
+
+    pub(crate) fn user_input_answer_with_request_item_id(
+        id: String,
+        request_item_id: String,
+        response: RequestUserInputResponse,
+    ) -> Self {
+        Self(Op::UserInputAnswer {
+            id,
+            request_item_id: Some(request_item_id),
+            response,
+        })
     }
 
     pub(crate) fn request_permissions_response(
@@ -376,9 +393,15 @@ impl AppCommand {
                 content,
                 meta,
             },
-            Op::UserInputAnswer { id, response } => {
-                AppCommandView::UserInputAnswer { id, response }
-            }
+            Op::UserInputAnswer {
+                id,
+                request_item_id,
+                response,
+            } => AppCommandView::UserInputAnswer {
+                id,
+                request_item_id,
+                response,
+            },
             Op::RequestPermissionsResponse { id, response } => {
                 AppCommandView::RequestPermissionsResponse { id, response }
             }

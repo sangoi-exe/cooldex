@@ -176,6 +176,7 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
     codex
         .submit(Op::UserInputAnswer {
             id: request.turn_id.clone(),
+            request_item_id: None,
             response,
         })
         .await?;

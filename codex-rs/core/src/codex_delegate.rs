@@ -636,7 +636,13 @@ async fn handle_request_user_input(
         )
         .await
     {
-        let _ = codex.submit(Op::UserInputAnswer { id, response }).await;
+        let _ = codex
+            .submit(Op::UserInputAnswer {
+                id,
+                request_item_id: None,
+                response,
+            })
+            .await;
         return;
     }
 
@@ -652,7 +658,13 @@ async fn handle_request_user_input(
         cancel_token,
     )
     .await;
-    let _ = codex.submit(Op::UserInputAnswer { id, response }).await;
+    let _ = codex
+        .submit(Op::UserInputAnswer {
+            id,
+            request_item_id: None,
+            response,
+        })
+        .await;
 }
 
 /// Intercepts delegated legacy MCP approval prompts on the RequestUserInput

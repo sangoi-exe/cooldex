@@ -34,8 +34,8 @@ impl ElicitationRequestKey {
 //
 // We keep both fast lookup sets (for snapshot filtering by call_id/request key) and
 // turn-indexed queues/vectors so `TurnComplete`/`TurnAborted` can clear stale prompts tied
-// to a turn. `request_user_input` removal is FIFO because the overlay answers queued prompts
-// in FIFO order for a shared `turn_id`.
+// to a turn. For app-server-backed `request_user_input`, outbound removal should prefer the
+// explicit `item_id`; turn-local FIFO is only the direct-core fallback when no follower exists.
 pub(super) struct PendingInteractiveReplayState {
     exec_approval_call_ids: HashSet<String>,
     exec_approval_call_ids_by_turn_id: HashMap<String, Vec<String>>,
@@ -142,27 +142,43 @@ impl PendingInteractiveReplayState {
                     },
                 );
             }
-            // `Op::UserInputAnswer` identifies the turn, not the prompt call_id. The UI
-            // answers queued prompts for the same turn in FIFO order, so remove the oldest
-            // queued call_id for that turn.
-            AppCommandView::UserInputAnswer { id, .. } => {
-                let mut remove_turn_entry = false;
-                if let Some(call_ids) = self.request_user_input_call_ids_by_turn_id.get_mut(id) {
-                    if !call_ids.is_empty() {
-                        let call_id = call_ids.remove(0);
-                        self.request_user_input_call_ids.remove(&call_id);
-                        self.pending_requests_by_request_id.retain(
-                            |_, pending| {
-                                !matches!(pending, PendingInteractiveRequest::RequestUserInput { item_id, .. } if *item_id == call_id)
-                            },
-                        );
+            AppCommandView::UserInputAnswer {
+                id,
+                request_item_id,
+                ..
+            } => {
+                if let Some(request_item_id) = request_item_id {
+                    self.request_user_input_call_ids.remove(request_item_id);
+                    Self::remove_call_id_from_turn_map_entry(
+                        &mut self.request_user_input_call_ids_by_turn_id,
+                        id,
+                        request_item_id,
+                    );
+                    self.pending_requests_by_request_id.retain(
+                        |_, pending| {
+                            !matches!(pending, PendingInteractiveRequest::RequestUserInput { item_id, .. } if item_id == request_item_id)
+                        },
+                    );
+                } else {
+                    let mut remove_turn_entry = false;
+                    if let Some(call_ids) = self.request_user_input_call_ids_by_turn_id.get_mut(id)
+                    {
+                        if !call_ids.is_empty() {
+                            let call_id = call_ids.remove(0);
+                            self.request_user_input_call_ids.remove(&call_id);
+                            self.pending_requests_by_request_id.retain(
+                                |_, pending| {
+                                    !matches!(pending, PendingInteractiveRequest::RequestUserInput { item_id, .. } if *item_id == call_id)
+                                },
+                            );
+                        }
+                        if call_ids.is_empty() {
+                            remove_turn_entry = true;
+                        }
                     }
-                    if call_ids.is_empty() {
-                        remove_turn_entry = true;
+                    if remove_turn_entry {
+                        self.request_user_input_call_ids_by_turn_id.remove(id);
                     }
-                }
-                if remove_turn_entry {
-                    self.request_user_input_call_ids_by_turn_id.remove(id);
                 }
             }
             AppCommandView::Shutdown => self.clear(),
@@ -719,6 +735,7 @@ mod tests {
 
         store.note_outbound_op(&Op::UserInputAnswer {
             id: "turn-1".to_string(),
+            request_item_id: Some("call-1".to_string()),
             response: codex_protocol::request_user_input::RequestUserInputResponse {
                 answers: HashMap::new(),
             },
@@ -804,6 +821,7 @@ mod tests {
 
         store.note_outbound_op(&Op::UserInputAnswer {
             id: "turn-1".to_string(),
+            request_item_id: Some("call-1".to_string()),
             response: codex_protocol::request_user_input::RequestUserInputResponse {
                 answers: HashMap::new(),
             },
@@ -828,6 +846,30 @@ mod tests {
 
         store.note_outbound_op(&Op::UserInputAnswer {
             id: "turn-1".to_string(),
+            request_item_id: Some("call-1".to_string()),
+            response: codex_protocol::request_user_input::RequestUserInputResponse {
+                answers: HashMap::new(),
+            },
+        });
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.events.len(), 1);
+        assert!(matches!(
+            snapshot.events.first(),
+            Some(ThreadBufferedEvent::Request(ServerRequest::ToolRequestUserInput { params, .. }))
+                if params.item_id == "call-2"
+        ));
+    }
+
+    #[test]
+    fn thread_event_snapshot_uses_turn_fifo_only_without_request_item_id() {
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
+        store.push_request(request_user_input_request("call-1", "turn-1"));
+        store.push_request(request_user_input_request("call-2", "turn-1"));
+
+        store.note_outbound_op(&Op::UserInputAnswer {
+            id: "turn-1".to_string(),
+            request_item_id: None,
             response: codex_protocol::request_user_input::RequestUserInputResponse {
                 answers: HashMap::new(),
             },

@@ -5093,7 +5093,11 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                     handlers::patch_approval(&sess, id, decision).await;
                     false
                 }
-                Op::UserInputAnswer { id, response } => {
+                Op::UserInputAnswer {
+                    id,
+                    request_item_id: _,
+                    response,
+                } => {
                     handlers::request_user_input_response(&sess, id, response).await;
                     false
                 }

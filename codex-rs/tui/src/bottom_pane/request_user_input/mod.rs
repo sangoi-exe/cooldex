@@ -746,13 +746,20 @@ impl RequestUserInputOverlay {
                 },
             );
         }
-        self.app_event_tx.user_input_answer(
-            self.request.turn_id.clone(),
-            self.request.thread_id,
-            RequestUserInputResponse {
-                answers: answers.clone(),
-            },
-        );
+        let response = RequestUserInputResponse {
+            answers: answers.clone(),
+        };
+        if let Some(thread_id) = self.request.thread_id {
+            self.app_event_tx.thread_user_input_answer(
+                thread_id,
+                self.request.turn_id.clone(),
+                self.request.call_id.clone(),
+                response,
+            );
+        } else {
+            self.app_event_tx
+                .user_input_answer(self.request.turn_id.clone(), response);
+        }
         self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
             history_cell::RequestUserInputResultCell {
                 questions: self.request.questions.clone(),
@@ -1586,11 +1593,17 @@ mod tests {
         else {
             panic!("expected SubmitThreadOp");
         };
-        let Op::UserInputAnswer { id, response } = op else {
+        let Op::UserInputAnswer {
+            id,
+            request_item_id,
+            response,
+        } = op
+        else {
             panic!("expected UserInputAnswer");
         };
         assert_eq!(routed_thread_id, thread_id);
         assert_eq!(id, "turn-1");
+        assert_eq!(request_item_id, Some("call-1".to_string()));
         let answer = response.answers.get("q1").expect("answer missing");
         assert_eq!(answer.answers, Vec::<String>::new());
     }

@@ -70,17 +70,24 @@ impl AppEventSender {
         ));
     }
 
-    pub(crate) fn user_input_answer(
+    pub(crate) fn user_input_answer(&self, id: String, response: RequestUserInputResponse) {
+        self.send(AppEvent::CodexOp(
+            AppCommand::user_input_answer(id, response).into_core(),
+        ));
+    }
+
+    pub(crate) fn thread_user_input_answer(
         &self,
+        thread_id: ThreadId,
         id: String,
-        thread_id: Option<ThreadId>,
+        request_item_id: String,
         response: RequestUserInputResponse,
     ) {
-        let op = AppCommand::user_input_answer(id, response).into_core();
-        match thread_id {
-            Some(thread_id) => self.send(AppEvent::SubmitThreadOp { thread_id, op }),
-            None => self.send(AppEvent::CodexOp(op)),
-        }
+        self.send(AppEvent::SubmitThreadOp {
+            thread_id,
+            op: AppCommand::user_input_answer_with_request_item_id(id, request_item_id, response)
+                .into_core(),
+        });
     }
 
     pub(crate) fn exec_approval(&self, thread_id: ThreadId, id: String, decision: ReviewDecision) {

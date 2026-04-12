@@ -423,6 +423,10 @@ pub enum Op {
     UserInputAnswer {
         /// Turn id for the in-flight request.
         id: String,
+        /// App-server `ToolRequestUserInputParams.item_id` when this answer is
+        /// resolving an app-server-backed prompt. Direct-core flows omit this.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_item_id: Option<String>,
         /// User-provided answers.
         response: RequestUserInputResponse,
     },
@@ -3951,6 +3955,48 @@ mod tests {
         assert_eq!(
             SessionSource::from_startup_arg(" Atlas ").unwrap(),
             SessionSource::Custom("atlas".to_string())
+        );
+    }
+
+    #[test]
+    fn user_input_answer_deserializes_without_request_item_id() {
+        let op: Op = serde_json::from_value(json!({
+            "type": "user_input_answer",
+            "id": "turn-1",
+            "response": { "answers": {} }
+        }))
+        .expect("user_input_answer should deserialize");
+
+        assert_eq!(
+            op,
+            Op::UserInputAnswer {
+                id: "turn-1".to_string(),
+                request_item_id: None,
+                response: RequestUserInputResponse {
+                    answers: HashMap::new(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn user_input_answer_serializes_request_item_id_when_present() {
+        let op = Op::UserInputAnswer {
+            id: "turn-1".to_string(),
+            request_item_id: Some("call-1".to_string()),
+            response: RequestUserInputResponse {
+                answers: HashMap::new(),
+            },
+        };
+
+        assert_eq!(
+            serde_json::to_value(op).expect("user_input_answer should serialize"),
+            json!({
+                "type": "user_input_answer",
+                "id": "turn-1",
+                "request_item_id": "call-1",
+                "response": { "answers": {} }
+            })
         );
     }
 
