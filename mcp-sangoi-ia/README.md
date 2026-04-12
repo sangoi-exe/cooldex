@@ -34,13 +34,19 @@ npm run dev
 See `.env.example`.
 
 Important knobs:
+- `SANGOI_CODEX_RUNTIME_MODE`
 - `SANGOI_CODEX_MCP_HOST`
 - `SANGOI_CODEX_MCP_PORT`
 - `SANGOI_CODEX_MODEL`
 - `SANGOI_CODEX_TIMEOUT_MS`
 - `SANGOI_CODEX_WORKDIR`
 
-`CODEX_API_KEY` and other Codex auth/config are inherited from the host environment.
+Runtime modes:
+
+- `dev`: current local test path; the service expects `codex` on `PATH`, typically from the operator's Rust-built local Codex checkout.
+- `prod`: placeholder only for now; the intended future path is a production-owned Codex runtime plus CLI-native auth retrieval from backend/JWT-backed state.
+
+`CODEX_API_KEY` and other Codex auth/config are inherited from the host environment in `dev`. Do not treat that as the final production auth model.
 
 ## Request example
 
