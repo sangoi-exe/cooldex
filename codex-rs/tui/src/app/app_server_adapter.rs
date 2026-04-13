@@ -186,7 +186,10 @@ impl App {
                             error = %err,
                             "failed to refresh app-server account projection after account update"
                         );
-                        self.report_app_server_account_projection_refresh_error(err.to_string());
+                        self.report_app_server_account_projection_refresh_error(
+                            "account update",
+                            err.to_string(),
+                        );
                     }
                 }
                 return;
@@ -253,18 +256,46 @@ impl App {
             return;
         }
 
-        if let Some((request_id, reason)) = direct_threadless_app_server_request_rejection(&request)
-        {
-            tracing::warn!(
-                request_id = ?request_id,
-                message = reason,
-                "rejecting threadless app-server request"
-            );
-            if let Err(err) = self
-                .reject_app_server_request(app_server_client, request_id, reason)
+        // Merge-safety anchor: threadless `account/chatgptAuthTokens/refresh` stays TUI-owned,
+        // must honor the app-server `previous_account_id` workspace hint before refresh, and may
+        // only refresh visible followers through the existing app-server projection path after a
+        // successful response send.
+        if let ServerRequest::ChatgptAuthTokensRefresh { request_id, params } = request {
+            match self
+                .build_threadless_chatgpt_auth_refresh_response(
+                    params.previous_account_id.as_deref(),
+                )
                 .await
             {
-                tracing::warn!("{err}");
+                Ok(response) => {
+                    let response_send_result = match serde_json::to_value(response) {
+                        Ok(result) => app_server_client
+                            .resolve_server_request(request_id.clone(), result)
+                            .await
+                            .map_err(|err| format!("failed to resolve app-server request: {err}")),
+                        Err(err) => Err(format!(
+                            "failed to serialize refreshed ChatGPT auth for the app-server: {err}"
+                        )),
+                    };
+                    self.complete_threadless_chatgpt_auth_refresh_request_after_response_send(
+                        response_send_result,
+                        app_server_client,
+                    )
+                    .await;
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        request_id = ?request_id,
+                        message = reason,
+                        "rejecting threadless app-server request"
+                    );
+                    if let Err(err) = self
+                        .reject_app_server_request(app_server_client, request_id, reason)
+                        .await
+                    {
+                        tracing::warn!("{err}");
+                    }
+                }
             }
             return;
         }
@@ -322,19 +353,6 @@ impl App {
             )
             .await
             .map_err(|err| format!("failed to reject app-server request: {err}"))
-    }
-}
-
-fn direct_threadless_app_server_request_rejection(
-    request: &ServerRequest,
-) -> Option<(codex_app_server_protocol::RequestId, String)> {
-    match request {
-        ServerRequest::ChatgptAuthTokensRefresh { request_id, .. } => Some((
-            request_id.clone(),
-            "threadless app-server request `account/chatgptAuthTokens/refresh` is not owned by the TUI runtime"
-                .to_string(),
-        )),
-        _ => None,
     }
 }
 
@@ -1126,9 +1144,9 @@ fn app_server_codex_error_info_to_core(
 #[cfg(test)]
 mod tests {
     use super::command_execution_started_event;
-    use super::direct_threadless_app_server_request_rejection;
     use super::immediate_app_server_request_command;
     use super::server_notification_thread_events;
+    use super::server_request_thread_id;
     use super::thread_snapshot_events;
     use super::turn_snapshot_events;
     use crate::app_command::AppCommandView;
@@ -1265,42 +1283,33 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_auth_refresh_requests_build_direct_threadless_rejects() {
-        let rejection = direct_threadless_app_server_request_rejection(
-            &ServerRequest::ChatgptAuthTokensRefresh {
-                request_id: AppServerRequestId::Integer(89),
-                params: codex_app_server_protocol::ChatgptAuthTokensRefreshParams {
-                    reason: codex_app_server_protocol::ChatgptAuthTokensRefreshReason::Unauthorized,
-                    previous_account_id: Some("workspace-1".to_string()),
-                },
+    fn chatgpt_auth_refresh_requests_still_have_no_thread_id() {
+        let thread_id = server_request_thread_id(&ServerRequest::ChatgptAuthTokensRefresh {
+            request_id: AppServerRequestId::Integer(89),
+            params: codex_app_server_protocol::ChatgptAuthTokensRefreshParams {
+                reason: codex_app_server_protocol::ChatgptAuthTokensRefreshReason::Unauthorized,
+                previous_account_id: Some("workspace-1".to_string()),
             },
-        );
+        });
 
-        assert_eq!(
-            rejection,
-            Some((
-                AppServerRequestId::Integer(89),
-                "threadless app-server request `account/chatgptAuthTokens/refresh` is not owned by the TUI runtime"
-                    .to_string(),
-            ))
-        );
+        assert_eq!(thread_id, None);
     }
 
     #[test]
-    fn non_refresh_requests_do_not_build_direct_threadless_rejects() {
-        let rejection =
-            direct_threadless_app_server_request_rejection(&ServerRequest::DynamicToolCall {
-                request_id: AppServerRequestId::Integer(90),
-                params: DynamicToolCallParams {
-                    thread_id: "thread-1".to_string(),
-                    turn_id: "turn-1".to_string(),
-                    call_id: "tool-1".to_string(),
-                    tool: "lookup_ticket".to_string(),
-                    arguments: json!({ "id": "123" }),
-                },
-            });
+    fn dynamic_tool_requests_still_keep_their_thread_id() {
+        let expected_thread_id = ThreadId::new();
+        let thread_id = server_request_thread_id(&ServerRequest::DynamicToolCall {
+            request_id: AppServerRequestId::Integer(90),
+            params: DynamicToolCallParams {
+                thread_id: expected_thread_id.to_string(),
+                turn_id: "turn-1".to_string(),
+                call_id: "tool-1".to_string(),
+                tool: "lookup_ticket".to_string(),
+                arguments: json!({ "id": "123" }),
+            },
+        });
 
-        assert_eq!(rejection, None);
+        assert_eq!(thread_id, Some(expected_thread_id));
     }
 
     #[test]

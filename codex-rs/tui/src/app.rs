@@ -36,6 +36,8 @@ use crate::history_cell;
 use crate::history_cell::HistoryCell;
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
+use crate::local_chatgpt_auth::load_local_chatgpt_auth;
+use crate::local_chatgpt_auth::load_local_chatgpt_auth_for_chatgpt_account_id;
 use crate::model_catalog::ModelCatalog;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
@@ -63,6 +65,7 @@ use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::AuthMode;
+use codex_app_server_protocol::ChatgptAuthTokensRefreshResponse;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
 use codex_app_server_protocol::ConfigLayerSource;
@@ -111,6 +114,7 @@ use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::ChatgptAccountAuthResolution;
 use codex_login::ChatgptAccountRefreshMode;
+use codex_login::CodexAuth;
 use codex_login::ServerOptions;
 use codex_login::run_login_server;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
@@ -193,6 +197,31 @@ fn format_account_display(label: Option<&str>, email: Option<&str>, fallback: &s
         (Some(label), None) => label.to_string(),
         (None, Some(email)) => email.to_string(),
         (None, None) => fallback.to_string(),
+    }
+}
+
+fn status_account_displays_match(
+    current: Option<&StatusAccountDisplay>,
+    next: Option<&StatusAccountDisplay>,
+) -> bool {
+    match (current, next) {
+        (None, None) => true,
+        (Some(StatusAccountDisplay::ApiKey), Some(StatusAccountDisplay::ApiKey)) => true,
+        (
+            Some(StatusAccountDisplay::ChatGpt {
+                label: current_label,
+                email: current_email,
+                plan: current_plan,
+            }),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: next_label,
+                email: next_email,
+                plan: next_plan,
+            }),
+        ) => {
+            current_label == next_label && current_email == next_email && current_plan == next_plan
+        }
+        _ => false,
     }
 }
 
@@ -1957,9 +1986,248 @@ impl App {
         self.recompute_accounts_status_cache_expiry(Utc::now());
     }
 
-    fn report_app_server_account_projection_refresh_error(&mut self, error_message: String) {
+    fn select_local_chatgpt_account_for_threadless_refresh(
+        &mut self,
+        previous_account_id: Option<&str>,
+    ) -> std::result::Result<(), String> {
+        let Some(previous_account_id) = previous_account_id else {
+            return Ok(());
+        };
+
+        let current_account_id = self
+            .auth_manager
+            .auth_cached()
+            .as_ref()
+            .and_then(CodexAuth::get_account_id);
+        if current_account_id.as_deref() == Some(previous_account_id) {
+            return Ok(());
+        }
+
+        let requested_auth = load_local_chatgpt_auth_for_chatgpt_account_id(
+            &self.config.codex_home,
+            self.config.cli_auth_credentials_store_mode,
+            previous_account_id,
+            self.config.forced_chatgpt_workspace_id.as_deref(),
+        )
+        .map_err(|err| {
+            format!(
+                "failed to resolve local ChatGPT auth for workspace {previous_account_id:?}: {err}"
+            )
+        })?;
+        self.auth_manager
+            .set_active_account(&requested_auth.store_account_id)
+            .map_err(|err| {
+                format!(
+                    "failed to select local ChatGPT account for workspace {previous_account_id:?}: {err}"
+                )
+            })?;
+        self.maybe_reconcile_active_account_from_auth_manager();
+        Ok(())
+    }
+
+    async fn build_threadless_chatgpt_auth_refresh_response(
+        &mut self,
+        previous_account_id: Option<&str>,
+    ) -> std::result::Result<ChatgptAuthTokensRefreshResponse, String> {
+        self.select_local_chatgpt_account_for_threadless_refresh(previous_account_id)?;
+        let refresh_result = self.auth_manager.refresh_token().await;
+        self.maybe_reconcile_active_account_from_auth_manager();
+        refresh_result.map_err(|err| format!("failed to refresh local ChatGPT auth: {err}"))?;
+
+        let local_auth = match previous_account_id {
+            Some(previous_account_id) => load_local_chatgpt_auth_for_chatgpt_account_id(
+                &self.config.codex_home,
+                self.config.cli_auth_credentials_store_mode,
+                previous_account_id,
+                self.config.forced_chatgpt_workspace_id.as_deref(),
+            ),
+            None => load_local_chatgpt_auth(
+                &self.config.codex_home,
+                self.config.cli_auth_credentials_store_mode,
+                self.config.forced_chatgpt_workspace_id.as_deref(),
+            ),
+        }
+        .map_err(|err| format!("failed to load refreshed local ChatGPT auth: {err}"))?;
+
+        Ok(ChatgptAuthTokensRefreshResponse {
+            access_token: local_auth.access_token,
+            chatgpt_account_id: local_auth.chatgpt_account_id,
+            chatgpt_plan_type: local_auth.chatgpt_plan_type,
+        })
+    }
+
+    async fn complete_threadless_chatgpt_auth_refresh_request_after_response_send(
+        &mut self,
+        response_send_result: std::result::Result<(), String>,
+        app_server_client: &mut AppServerSession,
+    ) {
+        if self.report_threadless_chatgpt_auth_refresh_response_send_result(response_send_result) {
+            return;
+        }
+
+        self.refresh_app_server_account_projection_after_auth_refresh(app_server_client)
+            .await;
+    }
+
+    async fn refresh_app_server_account_projection_after_auth_refresh(
+        &mut self,
+        app_server_client: &mut AppServerSession,
+    ) {
+        let mut last_successful_projection = None;
+        let mut last_error_message = None;
+
+        for delay in [
+            None,
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(200)),
+            Some(Duration::from_millis(400)),
+        ] {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+
+            match app_server_client.load_account_projection().await {
+                Ok(projection) => {
+                    if self.app_server_projection_changes_visible_followers(&projection) {
+                        self.finish_app_server_account_projection_refresh(projection);
+                        return;
+                    }
+                    last_successful_projection = Some(projection);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to refresh app-server account projection after auth token refresh"
+                    );
+                    last_error_message = Some(err.to_string());
+                }
+            }
+        }
+
+        if let Some(projection) = last_successful_projection {
+            self.finish_app_server_account_projection_refresh(projection);
+            return;
+        }
+
+        if let Some(error_message) = last_error_message {
+            self.report_app_server_account_projection_refresh_error(
+                "auth token refresh",
+                error_message,
+            );
+        }
+    }
+
+    #[cfg(test)]
+    async fn complete_threadless_chatgpt_auth_refresh_request_after_response_send_with<F, Fut>(
+        &mut self,
+        response_send_result: std::result::Result<(), String>,
+        load_projection: F,
+    ) where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<AppServerAccountProjection>>,
+    {
+        if self.report_threadless_chatgpt_auth_refresh_response_send_result(response_send_result) {
+            return;
+        }
+
+        self.refresh_app_server_account_projection_after_auth_refresh_with(load_projection)
+            .await;
+    }
+
+    #[cfg(test)]
+    async fn refresh_app_server_account_projection_after_auth_refresh_with<F, Fut>(
+        &mut self,
+        mut load_projection: F,
+    ) where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<AppServerAccountProjection>>,
+    {
+        let mut last_successful_projection = None;
+        let mut last_error_message = None;
+
+        for delay in [
+            None,
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(200)),
+            Some(Duration::from_millis(400)),
+        ] {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+
+            match load_projection().await {
+                Ok(projection) => {
+                    if self.app_server_projection_changes_visible_followers(&projection) {
+                        self.finish_app_server_account_projection_refresh(projection);
+                        return;
+                    }
+                    last_successful_projection = Some(projection);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to refresh app-server account projection after auth token refresh"
+                    );
+                    last_error_message = Some(err.to_string());
+                }
+            }
+        }
+
+        if let Some(projection) = last_successful_projection {
+            self.finish_app_server_account_projection_refresh(projection);
+            return;
+        }
+
+        if let Some(error_message) = last_error_message {
+            self.report_app_server_account_projection_refresh_error(
+                "auth token refresh",
+                error_message,
+            );
+        }
+    }
+
+    fn report_threadless_chatgpt_auth_refresh_response_send_result(
+        &mut self,
+        response_send_result: std::result::Result<(), String>,
+    ) -> bool {
+        if let Err(err) = response_send_result {
+            tracing::warn!(
+                error = %err,
+                "failed to return refreshed ChatGPT auth to the app-server"
+            );
+            self.chat_widget.add_error_message(format!(
+                "Failed to return refreshed ChatGPT auth to the app-server: {err}"
+            ));
+            return true;
+        }
+        false
+    }
+
+    fn app_server_projection_changes_visible_followers(
+        &self,
+        projection: &AppServerAccountProjection,
+    ) -> bool {
+        !status_account_displays_match(
+            self.chat_widget.status_account_display(),
+            projection.status_account_display.as_ref(),
+        ) || self.chat_widget.current_plan_type() != projection.plan_type
+            || self.chat_widget.has_chatgpt_account() != projection.has_chatgpt_account
+            || self.feedback_audience != projection.feedback_audience
+            || self.chat_widget.current_model() != projection.default_model
+            || self
+                .model_catalog
+                .try_list_models()
+                .expect("model catalog listing is infallible")
+                != projection.available_models
+    }
+
+    fn report_app_server_account_projection_refresh_error(
+        &mut self,
+        trigger: &str,
+        error_message: String,
+    ) {
         self.chat_widget.add_error_message(format!(
-            "Failed to refresh account state after account update: {error_message}"
+            "Failed to refresh account state after {trigger}: {error_message}"
         ));
     }
 
@@ -8074,7 +8342,10 @@ mod tests {
         let original_model_catalog = app.model_catalog.clone();
         let original_model = app.chat_widget.current_model().to_string();
 
-        app.report_app_server_account_projection_refresh_error("model/list failed".to_string());
+        app.report_app_server_account_projection_refresh_error(
+            "account update",
+            "model/list failed".to_string(),
+        );
 
         assert!(matches!(
             app.chat_widget.status_account_display(),
@@ -8097,6 +8368,312 @@ mod tests {
         }
         assert!(rendered_cells.iter().any(|cell| {
             cell.contains("Failed to refresh account state after account update: model/list failed")
+        }));
+    }
+
+    #[tokio::test]
+    async fn build_threadless_chatgpt_auth_refresh_response_uses_reloaded_local_auth() {
+        let mut app = make_test_app().await;
+        let (primary_store_account_id, _secondary_store_account_id) =
+            seed_canonical_chatgpt_accounts(&mut app, "account-a");
+
+        let mut refreshed_primary =
+            canonical_chatgpt_account("account-a", "primary@example.com", Some("Primary"));
+        refreshed_primary.tokens.access_token = "Refreshed Access Token".to_string();
+        refreshed_primary.tokens.id_token = parse_chatgpt_jwt_claims(&fake_chatgpt_jwt(
+            "primary@example.com",
+            "account-a",
+            "business",
+        ))
+        .expect("valid refreshed jwt");
+        let refreshed_store = AuthStore {
+            active_account_id: Some(primary_store_account_id.clone()),
+            accounts: vec![
+                refreshed_primary,
+                canonical_chatgpt_account("account-b", "secondary@example.com", Some("Secondary")),
+            ],
+            ..AuthStore::default()
+        };
+        save_auth(
+            &app.config.codex_home,
+            &refreshed_store,
+            app.config.cli_auth_credentials_store_mode,
+        )
+        .expect("save refreshed auth store");
+
+        let response = app
+            .build_threadless_chatgpt_auth_refresh_response(Some("account-a"))
+            .await
+            .expect("threadless auth refresh response should build");
+
+        assert_eq!(response.access_token, "Refreshed Access Token");
+        assert_eq!(response.chatgpt_account_id, "account-a");
+        assert_eq!(response.chatgpt_plan_type.as_deref(), Some("business"));
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(primary_store_account_id.clone())
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            app.auth_manager
+                .active_chatgpt_account_summary()
+                .map(|summary| summary.store_account_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn build_threadless_chatgpt_auth_refresh_response_surfaces_refresh_failure_when_local_auth_is_missing()
+     {
+        let mut app = make_test_app().await;
+
+        let err = app
+            .build_threadless_chatgpt_auth_refresh_response(None)
+            .await
+            .expect_err("missing local auth should fail loud");
+
+        assert_eq!(
+            err,
+            "failed to refresh local ChatGPT auth: Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again."
+        );
+    }
+
+    #[tokio::test]
+    async fn select_local_chatgpt_account_for_threadless_refresh_switches_to_requested_workspace() {
+        let mut app = make_test_app().await;
+        let (primary_store_account_id, _secondary_store_account_id) =
+            seed_canonical_chatgpt_accounts(&mut app, "account-b");
+
+        app.select_local_chatgpt_account_for_threadless_refresh(Some("account-a"))
+            .expect("requested workspace should select the matching saved account");
+
+        assert_eq!(
+            app.auth_manager
+                .auth_cached()
+                .as_ref()
+                .and_then(CodexAuth::get_account_id),
+            Some("account-a".to_string())
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(primary_store_account_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn select_local_chatgpt_account_for_threadless_refresh_fails_for_missing_workspace() {
+        let mut app = make_test_app().await;
+        let (_primary_store_account_id, secondary_store_account_id) =
+            seed_canonical_chatgpt_accounts(&mut app, "account-b");
+
+        let err = app
+            .select_local_chatgpt_account_for_threadless_refresh(Some("missing-workspace"))
+            .expect_err("missing workspace should fail loud");
+
+        assert_eq!(
+            err,
+            "failed to resolve local ChatGPT auth for workspace \"missing-workspace\": no saved ChatGPT account matches workspace \"missing-workspace\""
+        );
+        assert_eq!(
+            app.auth_manager
+                .auth_cached()
+                .as_ref()
+                .and_then(CodexAuth::get_account_id),
+            Some("account-b".to_string())
+        );
+        assert_eq!(
+            app.auth_manager
+                .active_chatgpt_account_summary()
+                .map(|summary| summary.store_account_id),
+            Some(secondary_store_account_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_threadless_chatgpt_auth_refresh_request_after_response_send_stops_before_projection_poll_on_send_failure()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let available_models = all_model_presets();
+        let default_model = available_models
+            .iter()
+            .find(|model| model.is_default)
+            .unwrap_or(&available_models[0])
+            .model
+            .clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@openai.com",
+            PlanType::Plus,
+            available_models,
+            default_model.clone(),
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        let projection_polled = Arc::new(AtomicBool::new(false));
+        let projection_polled_clone = Arc::clone(&projection_polled);
+
+        app.complete_threadless_chatgpt_auth_refresh_request_after_response_send_with(
+            Err("connection closed".to_string()),
+            move || {
+                let projection_polled = Arc::clone(&projection_polled_clone);
+                async move {
+                    projection_polled.store(true, Ordering::SeqCst);
+                    Ok(test_chatgpt_account_projection(
+                        "Should Not Load",
+                        "ignore@example.com",
+                        PlanType::Pro,
+                        vec![all_model_presets()[0].clone()],
+                        all_model_presets()[0].model.clone(),
+                    ))
+                }
+            },
+        )
+        .await;
+
+        assert!(!projection_polled.load(Ordering::SeqCst));
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == "Server Account" && email == "server@openai.com" && plan == "Plus"
+        ));
+
+        let mut rendered_cells = Vec::new();
+        while let Ok(event) = app_event_rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                rendered_cells.push(lines_to_single_string(&cell.display_lines(/*width*/ 120)));
+            }
+        }
+        assert!(rendered_cells.iter().any(|cell| {
+            cell.contains(
+                "Failed to return refreshed ChatGPT auth to the app-server: connection closed",
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn refresh_app_server_account_projection_after_auth_refresh_retries_until_followers_change()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let initial_models = vec![all_model_presets()[0].clone()];
+        let initial_default_model = initial_models[0].model.clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@example.com",
+            PlanType::Plus,
+            initial_models,
+            initial_default_model,
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        let refreshed_models = vec![all_model_presets()[1].clone()];
+        let refreshed_default_model = refreshed_models[0].model.clone();
+        let attempts = Arc::new(Mutex::new(VecDeque::from(vec![
+            Err(color_eyre::eyre::eyre!("model/list failed")),
+            Ok(test_chatgpt_account_projection(
+                "Refreshed Account",
+                "refreshed@openai.com",
+                PlanType::Pro,
+                refreshed_models,
+                refreshed_default_model.clone(),
+            )),
+        ])));
+        let attempts_clone = Arc::clone(&attempts);
+
+        app.refresh_app_server_account_projection_after_auth_refresh_with(move || {
+            let attempts = Arc::clone(&attempts_clone);
+            async move {
+                attempts
+                    .lock()
+                    .await
+                    .pop_front()
+                    .expect("projection attempt should exist")
+            }
+        })
+        .await;
+
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == "Refreshed Account" && email == "refreshed@openai.com" && plan == "Pro"
+        ));
+        assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Pro));
+        assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
+        assert_eq!(app.chat_widget.current_model(), refreshed_default_model);
+    }
+
+    #[tokio::test]
+    async fn refresh_app_server_account_projection_after_auth_refresh_keeps_last_good_state_when_all_attempts_fail()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let initial_models = vec![all_model_presets()[0].clone()];
+        let initial_default_model = initial_models[0].model.clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@example.com",
+            PlanType::Plus,
+            initial_models,
+            initial_default_model.clone(),
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        let attempts = Arc::new(Mutex::new(VecDeque::from(vec![
+            Err(color_eyre::eyre::eyre!("model/list failed")),
+            Err(color_eyre::eyre::eyre!("model/list failed")),
+            Err(color_eyre::eyre::eyre!("model/list failed")),
+            Err(color_eyre::eyre::eyre!("model/list failed")),
+        ])));
+        let attempts_clone = Arc::clone(&attempts);
+
+        app.refresh_app_server_account_projection_after_auth_refresh_with(move || {
+            let attempts = Arc::clone(&attempts_clone);
+            async move {
+                attempts
+                    .lock()
+                    .await
+                    .pop_front()
+                    .expect("projection attempt should exist")
+            }
+        })
+        .await;
+
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == "Server Account" && email == "server@example.com" && plan == "Plus"
+        ));
+        assert_eq!(app.chat_widget.current_model(), initial_default_model);
+
+        let mut rendered_cells = Vec::new();
+        while let Ok(event) = app_event_rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                rendered_cells.push(lines_to_single_string(&cell.display_lines(/*width*/ 120)));
+            }
+        }
+        assert!(rendered_cells.iter().any(|cell| {
+            cell.contains(
+                "Failed to refresh account state after auth token refresh: model/list failed",
+            )
         }));
     }
 
@@ -11914,20 +12491,46 @@ guardian_approval = true
         )
     }
 
-    fn chatgpt_account(id: &str, email: &str, label: Option<&str>) -> StoredAccount {
+    fn canonical_chatgpt_store_account_id(account_id: &str) -> String {
+        format!("chatgpt-user:user-{account_id}:workspace:{account_id}")
+    }
+
+    fn chatgpt_account_with_store_id(
+        store_account_id: &str,
+        account_id: &str,
+        email: &str,
+        label: Option<&str>,
+    ) -> StoredAccount {
         StoredAccount {
-            id: id.to_string(),
+            id: store_account_id.to_string(),
             label: label.map(str::to_string),
             tokens: TokenData {
-                id_token: parse_chatgpt_jwt_claims(&fake_chatgpt_jwt(email, id, "pro"))
+                id_token: parse_chatgpt_jwt_claims(&fake_chatgpt_jwt(email, account_id, "pro"))
                     .expect("valid jwt"),
                 access_token: "Access Token".to_string(),
                 refresh_token: "test".to_string(),
-                account_id: Some(id.to_string()),
+                account_id: Some(account_id.to_string()),
             },
             last_refresh: Some(Utc::now()),
             usage: None,
         }
+    }
+
+    fn chatgpt_account(id: &str, email: &str, label: Option<&str>) -> StoredAccount {
+        chatgpt_account_with_store_id(id, id, email, label)
+    }
+
+    fn canonical_chatgpt_account(
+        account_id: &str,
+        email: &str,
+        label: Option<&str>,
+    ) -> StoredAccount {
+        chatgpt_account_with_store_id(
+            &canonical_chatgpt_store_account_id(account_id),
+            account_id,
+            email,
+            label,
+        )
     }
 
     fn seed_chatgpt_accounts(app: &mut App, active_account_id: &str) {
@@ -11949,6 +12552,35 @@ guardian_approval = true
         app.auth_manager
             .reload_strict()
             .expect("reload seeded auth store");
+    }
+
+    fn seed_canonical_chatgpt_accounts(app: &mut App, active_account_id: &str) -> (String, String) {
+        let primary_store_account_id = canonical_chatgpt_store_account_id("account-a");
+        let secondary_store_account_id = canonical_chatgpt_store_account_id("account-b");
+        let active_store_account_id = match active_account_id {
+            "account-a" => primary_store_account_id.clone(),
+            "account-b" => secondary_store_account_id.clone(),
+            other => panic!("unexpected canonical active account {other}"),
+        };
+        let store = AuthStore {
+            active_account_id: Some(active_store_account_id),
+            accounts: vec![
+                canonical_chatgpt_account("account-a", "primary@example.com", Some("Primary")),
+                canonical_chatgpt_account("account-b", "secondary@example.com", Some("Secondary")),
+            ],
+            ..AuthStore::default()
+        };
+        save_auth(
+            &app.config.codex_home,
+            &store,
+            app.config.cli_auth_credentials_store_mode,
+        )
+        .expect("save canonical auth store");
+        app.auth_manager = auth_manager_from_config(&app.config);
+        app.auth_manager
+            .reload_strict()
+            .expect("reload canonical auth store");
+        (primary_store_account_id, secondary_store_account_id)
     }
 
     #[tokio::test]
