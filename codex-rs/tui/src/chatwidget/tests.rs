@@ -12258,6 +12258,9 @@ async fn approvals_selection_popup_snapshot() {
 
 #[tokio::test]
 async fn approvals_selection_popup_snapshot_guardian_current_when_feature_disabled() {
+    // Merge-safety anchor: Guardian approvals popup coverage here and the companion snapshot must
+    // keep the shared preset owner visible/current even when the feature flag only gates
+    // discoverability.
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.set_feature_enabled(Feature::GuardianApproval, /*enabled*/ false);
@@ -12443,6 +12446,8 @@ async fn startup_does_not_prompt_for_windows_sandbox_when_not_requested() {
 #[cfg(target_os = "windows")]
 #[tokio::test]
 async fn world_writable_confirmation_continue_preserves_guardian_reviewer() {
+    // Merge-safety anchor: world-writable confirmation flows must preserve Guardian reviewer
+    // ownership when they reuse the shared preset path instead of the legacy User-only override.
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.open_world_writable_warning_confirmation(
@@ -12451,9 +12456,31 @@ async fn world_writable_confirmation_continue_preserves_guardian_reviewer() {
         /*extra_count*/ 0,
         /*failed_scan*/ false,
     );
+    let popup = render_bottom_popup(&chat, /*width*/ 120);
+    assert!(
+        popup.contains("Apply Guardian Approvals for this session"),
+        "expected Guardian-specific Continue copy, got: {popup}"
+    );
+    assert!(
+        popup.contains("Enable Guardian Approvals and remember this choice"),
+        "expected Guardian-specific remember copy, got: {popup}"
+    );
+    assert!(
+        !popup.contains("Apply Agent mode for this session"),
+        "did not expect Guardian confirmation copy to degrade to Agent mode: {popup}"
+    );
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
     let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    let rendered_history = events
+        .iter()
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => {
+                Some(lines_to_single_string(&cell.display_lines(/*width*/ 120)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     assert!(
         events.iter().any(|event| matches!(
             event,
@@ -12470,6 +12497,12 @@ async fn world_writable_confirmation_continue_preserves_guardian_reviewer() {
             })
         )),
         "expected Continue to emit Guardian reviewer in OverrideTurnContext: {events:?}"
+    );
+    assert!(
+        rendered_history
+            .iter()
+            .any(|rendered| rendered.contains("Permissions updated to Guardian Approvals")),
+        "expected Continue history message to keep Guardian label: {rendered_history:?}"
     );
 }
 
@@ -12488,6 +12521,15 @@ async fn world_writable_confirmation_continue_and_remember_preserves_guardian_re
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
     let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    let rendered_history = events
+        .iter()
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => {
+                Some(lines_to_single_string(&cell.display_lines(/*width*/ 120)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     assert!(
         events.iter().any(|event| matches!(
             event,
@@ -12511,6 +12553,12 @@ async fn world_writable_confirmation_continue_and_remember_preserves_guardian_re
             })
         )),
         "expected Continue and don't warn again to emit Guardian reviewer in OverrideTurnContext: {events:?}"
+    );
+    assert!(
+        rendered_history
+            .iter()
+            .any(|rendered| rendered.contains("Permissions updated to Guardian Approvals")),
+        "expected Continue and remember history message to keep Guardian label: {rendered_history:?}"
     );
 }
 

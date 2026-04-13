@@ -10593,15 +10593,15 @@ impl ChatWidget {
             SandboxPolicy::ReadOnly { .. } => "Read-Only mode",
             _ => "Agent mode",
         };
-        let mode_label = preset
+        let selection_label = preset
             .as_ref()
-            .map(|p| describe_policy(&p.sandbox))
+            .map(|p| p.label)
             .unwrap_or_else(|| describe_policy(self.config.permissions.sandbox_policy.get()));
         let info_line = if failed_scan {
             Line::from(vec![
                 "We couldn't complete the world-writable scan, so protections cannot be verified. "
                     .into(),
-                format!("The Windows sandbox cannot guarantee protection in {mode_label}.")
+                format!("The Windows sandbox cannot guarantee protection when applying {selection_label}.")
                     .fg(Color::Red),
             ])
         } else {
@@ -10645,7 +10645,7 @@ impl ChatWidget {
             accept_actions.extend(Self::approval_preset_actions(
                 approval,
                 sandbox,
-                mode_label.to_string(),
+                selection_label.to_string(),
                 approvals_reviewer,
             ));
         }
@@ -10661,7 +10661,7 @@ impl ChatWidget {
             accept_and_remember_actions.extend(Self::approval_preset_actions(
                 approval,
                 sandbox,
-                mode_label.to_string(),
+                selection_label.to_string(),
                 approvals_reviewer,
             ));
         }
@@ -10669,14 +10669,14 @@ impl ChatWidget {
         let items = vec![
             SelectionItem {
                 name: "Continue".to_string(),
-                description: Some(format!("Apply {mode_label} for this session")),
+                description: Some(format!("Apply {selection_label} for this session")),
                 actions: accept_actions,
                 dismiss_on_select: true,
                 ..Default::default()
             },
             SelectionItem {
                 name: "Continue and don't warn again".to_string(),
-                description: Some(format!("Enable {mode_label} and remember this choice")),
+                description: Some(format!("Enable {selection_label} and remember this choice")),
                 actions: accept_and_remember_actions,
                 dismiss_on_select: true,
                 ..Default::default()
