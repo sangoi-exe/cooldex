@@ -95,16 +95,6 @@ impl ChatWidget {
         self.bottom_pane.show_view(Box::new(view));
     }
 
-    pub(crate) fn update_skill_enabled(&mut self, path: PathBuf, enabled: bool) {
-        let target = normalize_skill_config_path(&path);
-        for skill in &mut self.skills_all {
-            if normalize_skill_config_path(&skill.path) == target {
-                skill.enabled = enabled;
-            }
-        }
-        self.set_skills(Some(enabled_skills_for_mentions(&self.skills_all)));
-    }
-
     pub(crate) fn handle_manage_skills_closed(&mut self) {
         let Some(initial_state) = self.skills_initial_state.take() else {
             return;
@@ -138,10 +128,24 @@ impl ChatWidget {
         );
     }
 
+    // Merge-safety anchor: WS1-B keeps `skills/list` as the only visible skill-state owner outside
+    // popup-local optimistic rows; closing or refreshing the Manage Skills surface must not leave a
+    // second chat-widget-owned enabled/disabled truth path alive.
     pub(crate) fn set_skills_from_response(&mut self, response: &ListSkillsResponseEvent) {
         let skills = skills_for_cwd(&self.config.cwd, &response.skills);
         self.skills_all = skills;
         self.set_skills(Some(enabled_skills_for_mentions(&self.skills_all)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enabled_skill_names_for_test(&self) -> Vec<String> {
+        self.bottom_pane
+            .skills()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect()
     }
 
     pub(crate) fn annotate_skill_reads_in_parsed_cmd(

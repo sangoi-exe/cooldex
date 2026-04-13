@@ -26,6 +26,8 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewDelivery;
 use codex_app_server_protocol::ReviewStartParams;
 use codex_app_server_protocol::ReviewStartResponse;
+use codex_app_server_protocol::SkillsConfigWriteParams;
+use codex_app_server_protocol::SkillsConfigWriteResponse;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::Thread;
@@ -91,6 +93,7 @@ use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget as CoreReviewTarget;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionNetworkProxyRuntime;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use color_eyre::eyre::ContextCompat;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
@@ -591,6 +594,25 @@ impl AppServerSession {
             .request_typed(ClientRequest::SkillsList { request_id, params })
             .await
             .wrap_err("skills/list failed in TUI")
+    }
+
+    pub(crate) async fn skills_config_write(
+        &mut self,
+        path: AbsolutePathBuf,
+        enabled: bool,
+    ) -> Result<SkillsConfigWriteResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::SkillsConfigWrite {
+                request_id,
+                params: SkillsConfigWriteParams {
+                    path: Some(path),
+                    name: None,
+                    enabled,
+                },
+            })
+            .await
+            .wrap_err("skills/config/write failed in TUI")
     }
 
     pub(crate) async fn reload_user_config(&mut self) -> Result<()> {

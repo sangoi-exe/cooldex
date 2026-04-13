@@ -1352,6 +1352,54 @@ impl App {
         self.apply_runtime_policy_overrides(&mut config);
         self.config = config;
         self.chat_widget.sync_plugin_mentions_config(&self.config);
+        self.chat_widget.refresh_plugin_mentions();
+        Ok(())
+    }
+
+    // Merge-safety anchor: WS1-B live config reload must keep app-server runtime reload,
+    // local config rebuild, plugin mentions, and canonical `skills/list` follower refresh in
+    // one ordered flow so TUI-visible skill/config state cannot split owners again.
+    async fn reload_live_user_config_and_followers(
+        &mut self,
+        app_server: &mut AppServerSession,
+    ) -> Result<()> {
+        app_server
+            .reload_user_config()
+            .await
+            .wrap_err("failed to reload live config in app-server-backed TUI")?;
+        self.refresh_in_memory_config_from_disk()
+            .await
+            .wrap_err("failed to rebuild local TUI config after live config reload")?;
+        let response = app_server
+            .skills_list(codex_app_server_protocol::SkillsListParams {
+                cwds: Vec::new(),
+                force_reload: true,
+                per_cwd_extra_user_roots: None,
+            })
+            .await
+            .wrap_err("skills/list failed while refreshing live config followers in TUI")?;
+        self.handle_skills_list_response(response);
+        Ok(())
+    }
+
+    async fn set_skill_enabled_via_app_server(
+        &mut self,
+        app_server: &mut AppServerSession,
+        path: PathBuf,
+        enabled: bool,
+    ) -> Result<()> {
+        let path_display = path.display().to_string();
+        let absolute_path = AbsolutePathBuf::try_from(path)
+            .wrap_err_with(|| format!("skill path `{path_display}` must be absolute"))?;
+        app_server
+            .skills_config_write(absolute_path, enabled)
+            .await
+            .wrap_err_with(|| format!("skills/config/write failed for {path_display}"))?;
+        self.reload_live_user_config_and_followers(app_server)
+            .await
+            .wrap_err_with(|| {
+                format!("updated skill config for {path_display}, but failed to reload live config")
+            })?;
         Ok(())
     }
 
@@ -2993,7 +3041,8 @@ impl App {
                 Ok(true)
             }
             AppCommandView::ReloadUserConfig => {
-                app_server.reload_user_config().await?;
+                self.reload_live_user_config_and_followers(app_server)
+                    .await?;
                 Ok(true)
             }
             AppCommandView::OverrideTurnContext { .. } => Ok(true),
@@ -5288,7 +5337,6 @@ impl App {
                     if let Err(err) = self.refresh_in_memory_config_from_disk().await {
                         tracing::warn!(error = %err, "failed to refresh config after plugin install");
                     }
-                    self.chat_widget.refresh_plugin_mentions();
                     self.chat_widget.submit_op(AppCommand::reload_user_config());
                 }
                 let should_refresh_plugin_detail = self.chat_widget.on_plugin_install_loaded(
@@ -6042,7 +6090,6 @@ impl App {
                             "failed to refresh config after plugin uninstall"
                         );
                     }
-                    self.chat_widget.refresh_plugin_mentions();
                     self.chat_widget.submit_op(AppCommand::reload_user_config());
                 }
                 self.chat_widget.on_plugin_uninstall_loaded(
@@ -6416,30 +6463,11 @@ impl App {
                 self.chat_widget.open_manage_skills_popup();
             }
             AppEvent::SetSkillEnabled { path, enabled } => {
-                let edits = [ConfigEdit::SetSkillConfig {
-                    path: path.clone(),
-                    enabled,
-                }];
-                match ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_edits(edits)
-                    .apply()
+                if let Err(err) = self
+                    .set_skill_enabled_via_app_server(app_server, path.clone(), enabled)
                     .await
                 {
-                    Ok(()) => {
-                        self.chat_widget.update_skill_enabled(path.clone(), enabled);
-                        if let Err(err) = self.refresh_in_memory_config_from_disk().await {
-                            tracing::warn!(
-                                error = %err,
-                                "failed to refresh config after skill toggle"
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        let path_display = path.display();
-                        self.chat_widget.add_error_message(format!(
-                            "Failed to update skill config for {path_display}: {err}"
-                        ));
-                    }
+                    self.chat_widget.add_error_message(err.to_string());
                 }
             }
             AppEvent::SetAppEnabled { id, enabled } => {
@@ -7503,6 +7531,16 @@ mod tests {
 
     fn test_absolute_path(path: &str) -> AbsolutePathBuf {
         AbsolutePathBuf::try_from(PathBuf::from(path)).expect("absolute test path")
+    }
+
+    fn write_test_skill(codex_home: &Path, name: &str) -> Result<PathBuf> {
+        let skill_dir = codex_home.join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir)?;
+        let skill_body =
+            format!("---\nname: {name}\ndescription: {name} description\n---\n\n# Body\n");
+        let skill_path = skill_dir.join("SKILL.md");
+        std::fs::write(&skill_path, skill_body)?;
+        Ok(skill_path)
     }
 
     #[test]
@@ -12926,6 +12964,64 @@ guardian_approval = true
         app.refresh_in_memory_config_from_disk().await?;
 
         assert_eq!(app.config.cwd, app.chat_widget.config_ref().cwd);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_live_user_config_and_followers_refreshes_enabled_skills() -> Result<()> {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let skill_path = write_test_skill(&app.config.codex_home, "demo-skill")?;
+        std::fs::write(app.config.codex_home.join("config.toml"), "")?;
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+                .await
+                .expect("embedded app server");
+
+        app.reload_live_user_config_and_followers(&mut app_server)
+            .await?;
+        let enabled_skills = app.chat_widget.enabled_skill_names_for_test();
+        assert!(enabled_skills.contains(&"demo-skill".to_string()));
+
+        std::fs::write(
+            app.config.codex_home.join("config.toml"),
+            format!(
+                "[[skills.config]]\npath = \"{}\"\nenabled = false\n",
+                skill_path.display()
+            ),
+        )?;
+
+        app.reload_live_user_config_and_followers(&mut app_server)
+            .await?;
+        let enabled_skills = app.chat_widget.enabled_skill_names_for_test();
+        assert!(!enabled_skills.contains(&"demo-skill".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_skill_enabled_via_app_server_disables_skill_and_refreshes_live_state() -> Result<()>
+    {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let skill_path = write_test_skill(&app.config.codex_home, "demo-skill")?;
+        std::fs::write(app.config.codex_home.join("config.toml"), "")?;
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+                .await
+                .expect("embedded app server");
+
+        app.reload_live_user_config_and_followers(&mut app_server)
+            .await?;
+        let enabled_skills = app.chat_widget.enabled_skill_names_for_test();
+        assert!(enabled_skills.contains(&"demo-skill".to_string()));
+
+        app.set_skill_enabled_via_app_server(&mut app_server, skill_path.clone(), false)
+            .await?;
+        let enabled_skills = app.chat_widget.enabled_skill_names_for_test();
+        assert!(!enabled_skills.contains(&"demo-skill".to_string()));
+
+        let config = std::fs::read_to_string(app.config.codex_home.join("config.toml"))?;
+        assert!(config.contains("[[skills.config]]"));
+        assert!(config.contains("enabled = false"));
+        assert!(config.contains(&skill_path.display().to_string()));
         Ok(())
     }
 

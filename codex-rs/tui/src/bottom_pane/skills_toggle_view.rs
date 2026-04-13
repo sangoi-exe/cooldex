@@ -185,9 +185,10 @@ impl SkillsToggleView {
             return;
         }
         self.complete = true;
+        // Merge-safety anchor: WS1-B runs canonical skill reload after each successful toggle via
+        // the app-level live reload flow, so closing the popup must not trigger a second forced
+        // `skills/list` owner path.
         self.app_event_tx.send(AppEvent::ManageSkillsClosed);
-        self.app_event_tx
-            .list_skills(Vec::new(), /*force_reload*/ true);
     }
 
     fn rows_width(total_width: u16) -> u16 {
@@ -430,5 +431,24 @@ mod tests {
         ];
         let view = SkillsToggleView::new(items, tx);
         assert_snapshot!("skills_toggle_basic", render_lines(&view, /*width*/ 72));
+    }
+
+    #[test]
+    fn close_only_emits_manage_skills_closed() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let items = vec![SkillsToggleItem {
+            name: "Repo Scout".to_string(),
+            skill_name: "repo_scout".to_string(),
+            description: "Summarize the repo layout".to_string(),
+            enabled: true,
+            path: PathBuf::from("/tmp/skills/repo_scout/SKILL.md"),
+        }];
+        let mut view = SkillsToggleView::new(items, tx);
+
+        view.close();
+
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::ManageSkillsClosed)));
+        assert!(rx.try_recv().is_err());
     }
 }
