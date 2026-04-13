@@ -9497,6 +9497,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn collect_resume_override_mismatches_includes_approval_owner_fields() {
+        let request = ThreadResumeParams {
+            thread_id: "thread-1".to_string(),
+            history: None,
+            path: None,
+            model: None,
+            model_provider: None,
+            service_tier: None,
+            cwd: None,
+            config_path: None,
+            approval_policy: Some(TurnContextApprovalPolicy::Never.into()),
+            approvals_reviewer: Some(
+                codex_app_server_protocol::ApprovalsReviewer::GuardianSubagent,
+            ),
+            sandbox: None,
+            config: None,
+            base_instructions: None,
+            developer_instructions: None,
+            personality: None,
+            persist_extended_history: false,
+        };
+        let config_snapshot = ThreadConfigSnapshot {
+            model: "gpt-5".to_string(),
+            model_provider_id: "openai".to_string(),
+            service_tier: None,
+            subagent_file_mutation_mode:
+                codex_protocol::config_types::SubagentFileMutationMode::Inherit,
+            approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
+            approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
+            sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+            cwd: PathBuf::from("/tmp"),
+            config_path: PathBuf::from("/tmp/config.toml"),
+            ephemeral: false,
+            reasoning_effort: None,
+            personality: None,
+            session_source: SessionSource::Cli,
+        };
+
+        assert_eq!(
+            collect_resume_override_mismatches(&request, &config_snapshot),
+            vec![
+                "approval_policy requested=Never active=OnRequest".to_string(),
+                "approvals_reviewer requested=GuardianSubagent active=User".to_string(),
+            ]
+        );
+    }
+
     fn test_thread_metadata(
         model: Option<&str>,
         reasoning_effort: Option<ReasoningEffort>,

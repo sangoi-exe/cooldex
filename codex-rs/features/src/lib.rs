@@ -811,7 +811,7 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "guardian_approval",
         stage: Stage::Experimental {
             name: "Guardian Approvals",
-            menu_description: "When Codex needs approval for higher-risk actions (e.g. sandbox escapes or blocked network access), route eligible approval requests to a carefully-prompted security reviewer subagent rather than blocking the agent on your input. This can consume significantly more tokens because it runs a subagent on every approval request.",
+            menu_description: "When Codex needs approval for higher-risk actions (e.g. sandbox escapes or blocked network access), this experimental toggle adds a Guardian Approvals preset so you can opt eligible on-request approvals into a carefully-prompted security reviewer subagent. Runtime routing still follows the current approval policy and approvals reviewer config. This can consume significantly more tokens because it runs a subagent on eligible approval requests.",
             announcement: "",
         },
         default_enabled: false,

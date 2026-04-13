@@ -1512,6 +1512,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_lifecycle_params_project_effective_approval_owner_fields() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&temp_dir).await;
+        let thread_id = ThreadId::new();
+        config
+            .permissions
+            .approval_policy
+            .set(AskForApproval::Never)
+            .expect("set approval policy");
+        config.approvals_reviewer =
+            codex_protocol::config_types::ApprovalsReviewer::GuardianSubagent;
+
+        let start = thread_start_params_from_config(
+            &config,
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+        );
+        let resume = thread_resume_params_from_config(
+            config.clone(),
+            thread_id,
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+        );
+        let fork = thread_fork_params_from_config(
+            config,
+            thread_id,
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+        );
+
+        assert_eq!(start.approval_policy, Some(AskForApproval::Never.into()));
+        assert_eq!(
+            start.approvals_reviewer,
+            Some(codex_app_server_protocol::ApprovalsReviewer::GuardianSubagent)
+        );
+        assert_eq!(resume.approval_policy, Some(AskForApproval::Never.into()));
+        assert_eq!(
+            resume.approvals_reviewer,
+            Some(codex_app_server_protocol::ApprovalsReviewer::GuardianSubagent)
+        );
+        assert_eq!(fork.approval_policy, Some(AskForApproval::Never.into()));
+        assert_eq!(
+            fork.approvals_reviewer,
+            Some(codex_app_server_protocol::ApprovalsReviewer::GuardianSubagent)
+        );
+    }
+
+    #[tokio::test]
     async fn thread_lifecycle_params_forward_explicit_remote_cwd_override_for_remote_sessions() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = build_config(&temp_dir).await;
@@ -1706,6 +1754,57 @@ mod tests {
 
         assert_eq!(started.turns, response.thread.turns);
         assert_eq!(started.session.config_path, Some(response.config_path));
+    }
+
+    #[tokio::test]
+    async fn resume_response_restores_effective_approval_owner_fields() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let thread_id = ThreadId::new();
+        let response = ThreadResumeResponse {
+            thread: codex_app_server_protocol::Thread {
+                id: thread_id.to_string(),
+                forked_from_id: None,
+                preview: "hello".to_string(),
+                ephemeral: false,
+                model_provider: "openai".to_string(),
+                created_at: 1,
+                updated_at: 2,
+                status: ThreadStatus::Idle,
+                path: None,
+                cwd: PathBuf::from("/tmp/project"),
+                cli_version: "0.0.0".to_string(),
+                source: codex_protocol::protocol::SessionSource::Cli.into(),
+                agent_nickname: None,
+                agent_role: None,
+                git_info: None,
+                name: None,
+                turns: vec![],
+            },
+            model: "gpt-5.4".to_string(),
+            model_provider: "openai".to_string(),
+            service_tier: None,
+            cwd: PathBuf::from("/tmp/project"),
+            config_path: PathBuf::from("/tmp/project/config.toml"),
+            approval_policy: codex_protocol::protocol::AskForApproval::OnRequest.into(),
+            approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::GuardianSubagent,
+            sandbox: codex_protocol::protocol::SandboxPolicy::new_workspace_write_policy().into(),
+            reasoning_effort: None,
+        };
+
+        let started = started_thread_from_resume_response(response, &config)
+            .await
+            .expect("resume response should map");
+
+        assert_eq!(started.session.approval_policy, AskForApproval::OnRequest);
+        assert_eq!(
+            started.session.approvals_reviewer,
+            codex_protocol::config_types::ApprovalsReviewer::GuardianSubagent
+        );
+        assert_eq!(
+            started.session.sandbox_policy,
+            SandboxPolicy::new_workspace_write_policy()
+        );
     }
 
     #[tokio::test]
