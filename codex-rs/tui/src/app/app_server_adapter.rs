@@ -177,6 +177,7 @@ impl App {
                 self.chat_widget.on_rate_limit_snapshot(Some(
                     app_server_rate_limit_snapshot_to_core(notification.rate_limits.clone()),
                 ));
+                self.maybe_sync_active_account_state_from_auth_manager();
                 return;
             }
             ServerNotification::AccountUpdated(notification) => {
@@ -192,6 +193,7 @@ impl App {
                         Some(AuthMode::Chatgpt) | Some(AuthMode::ChatgptAuthTokens)
                     ),
                 );
+                self.maybe_sync_active_account_state_from_auth_manager();
                 return;
             }
             _ => {}

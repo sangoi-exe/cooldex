@@ -224,7 +224,6 @@ async fn best_effort_resume_history_turns(
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
 const ACCOUNTS_CACHE_POLL_INTERVAL: Duration = Duration::from_secs(30);
-const ACCOUNTS_CACHE_FALLBACK_TTL_SECS: i64 = 300;
 const ACCOUNTS_RATE_LIMIT_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 enum ThreadInteractiveRequest {
@@ -320,21 +319,6 @@ fn default_exec_approval_decisions(
 /// Smooth-mode streaming drains one line per tick, so this interval controls
 /// perceived typing speed for non-backlogged output.
 const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
-
-fn accounts_cache_fallback_expires_at(
-    last_updated_at: &mut Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-    allow_timestamp_initialization: bool,
-) -> Option<DateTime<Utc>> {
-    if allow_timestamp_initialization {
-        let fallback_base = last_updated_at.get_or_insert(now);
-        return Some(*fallback_base + chrono::Duration::seconds(ACCOUNTS_CACHE_FALLBACK_TTL_SECS));
-    }
-
-    last_updated_at.as_ref().map(|fallback_base| {
-        *fallback_base + chrono::Duration::seconds(ACCOUNTS_CACHE_FALLBACK_TTL_SECS)
-    })
-}
 
 fn spawn_next_accounts_rate_limit_fetch(
     join_set: &mut tokio::task::JoinSet<AccountsRateLimitFetchOutcome>,
@@ -1222,10 +1206,10 @@ pub(crate) struct App {
     primary_prompt_gc_private_usage_closed: bool,
     pending_primary_events: VecDeque<ThreadBufferedEvent>,
     accounts_status_cache_expires_at: Option<DateTime<Utc>>,
-    accounts_status_cache_last_updated_at: Option<DateTime<Utc>>,
     accounts_status_refresh_in_flight: bool,
     pending_forced_accounts_status_refresh: bool,
     open_accounts_popup_when_cache_ready: bool,
+    observed_active_store_account_id: Option<String>,
     pending_app_server_requests: PendingAppServerRequests,
 }
 
@@ -1688,31 +1672,9 @@ impl App {
         });
     }
 
-    fn recompute_accounts_status_cache_expiry(
-        &mut self,
-        now: DateTime<Utc>,
-        allow_fallback_timestamp_initialization: bool,
-    ) {
-        let accounts = self.auth_manager.list_accounts();
-        let has_cached_usage = accounts
-            .iter()
-            .any(|account| account.last_rate_limits.is_some() || account.exhausted_until.is_some());
-        if let Some(expires_at) = self.auth_manager.accounts_rate_limits_cache_expires_at(now) {
-            self.accounts_status_cache_expires_at = Some(expires_at);
-            return;
-        }
-
-        if has_cached_usage {
-            self.accounts_status_cache_expires_at = accounts_cache_fallback_expires_at(
-                &mut self.accounts_status_cache_last_updated_at,
-                now,
-                allow_fallback_timestamp_initialization,
-            );
-            return;
-        }
-
-        self.accounts_status_cache_last_updated_at = None;
-        self.accounts_status_cache_expires_at = None;
+    fn recompute_accounts_status_cache_expiry(&mut self, now: DateTime<Utc>) {
+        self.accounts_status_cache_expires_at =
+            self.auth_manager.accounts_rate_limits_cache_expires_at(now);
     }
 
     fn accounts_status_cache_is_active(&self, now: DateTime<Utc>) -> bool {
@@ -1734,7 +1696,6 @@ impl App {
         // usage data before `chat_widget.open_accounts_popup()`.
         if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
             self.pending_forced_accounts_status_refresh = false;
-            self.accounts_status_cache_last_updated_at = None;
             self.accounts_status_cache_expires_at = None;
             if self.open_accounts_popup_when_cache_ready {
                 self.open_accounts_popup_when_cache_ready = false;
@@ -1744,9 +1705,7 @@ impl App {
         }
 
         let now = Utc::now();
-        self.recompute_accounts_status_cache_expiry(
-            now, /*allow_fallback_timestamp_initialization*/ true,
-        );
+        self.recompute_accounts_status_cache_expiry(now);
         if !force && self.accounts_status_cache_is_active(now) {
             if self.open_accounts_popup_when_cache_ready {
                 self.open_accounts_popup_when_cache_ready = false;
@@ -1815,9 +1774,6 @@ impl App {
         now: DateTime<Utc>,
     ) {
         self.accounts_status_refresh_in_flight = false;
-        if cache_fully_refreshed {
-            self.accounts_status_cache_last_updated_at = Some(now);
-        }
         if updated_accounts > 0 {
             tracing::debug!(updated_accounts, "refreshed account rate limits");
         } else if !cache_fully_refreshed {
@@ -1825,7 +1781,7 @@ impl App {
                 "account status refresh did not fully refresh all attempted accounts; preserving prior cache freshness state"
             );
         }
-        self.recompute_accounts_status_cache_expiry(now, cache_fully_refreshed);
+        self.recompute_accounts_status_cache_expiry(now);
         if self.pending_forced_accounts_status_refresh {
             self.pending_forced_accounts_status_refresh = false;
             let show_loading_popup = self.open_accounts_popup_when_cache_ready;
@@ -1874,11 +1830,33 @@ impl App {
         }
     }
 
+    fn active_store_account_id_from_auth_manager(&self) -> Option<String> {
+        self.auth_manager
+            .active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id)
+    }
+
+    fn refresh_observed_active_store_account_id(&mut self) -> bool {
+        let next_active_store_account_id = self.active_store_account_id_from_auth_manager();
+        let changed = next_active_store_account_id != self.observed_active_store_account_id;
+        self.observed_active_store_account_id = next_active_store_account_id;
+        changed
+    }
+
     // Merge-safety anchor: account-switch handling must keep chat-widget account identity and
     // rate-limit generation state in sync so stale refresh results never repopulate the next
     // account's `/status` cache or suppress its warnings.
     fn handle_active_account_changed(&mut self) {
+        self.refresh_observed_active_store_account_id();
+        self.recompute_accounts_status_cache_expiry(Utc::now());
         self.sync_chat_widget_account_state_from_auth_manager();
+    }
+
+    fn maybe_sync_active_account_state_from_auth_manager(&mut self) {
+        if self.refresh_observed_active_store_account_id() {
+            self.recompute_accounts_status_cache_expiry(Utc::now());
+            self.sync_chat_widget_account_state_from_auth_manager();
+        }
     }
 
     fn handle_app_server_account_updated(
@@ -4577,6 +4555,9 @@ impl App {
         let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
+        let observed_active_store_account_id = auth_manager
+            .active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id);
 
         let mut app = Self {
             model_catalog,
@@ -4620,10 +4601,10 @@ impl App {
             primary_prompt_gc_private_usage_closed: false,
             pending_primary_events: VecDeque::new(),
             accounts_status_cache_expires_at: None,
-            accounts_status_cache_last_updated_at: None,
             accounts_status_refresh_in_flight: false,
             pending_forced_accounts_status_refresh: false,
             open_accounts_popup_when_cache_ready: false,
+            observed_active_store_account_id,
             pending_app_server_requests: PendingAppServerRequests::default(),
         };
         if let Some(started) = initial_started_thread {
@@ -4631,10 +4612,7 @@ impl App {
                 .await?;
         }
 
-        app.recompute_accounts_status_cache_expiry(
-            Utc::now(),
-            /*allow_fallback_timestamp_initialization*/ true,
-        );
+        app.recompute_accounts_status_cache_expiry(Utc::now());
         app.maybe_start_accounts_status_refresh(
             /*force*/ true, /*open_popup_when_ready*/ false,
             /*show_loading_popup*/ false,
@@ -5352,10 +5330,7 @@ impl App {
                         .add_error_message(format!("Failed to reload auth store: {err}"));
                     return Ok(AppRunControl::Continue);
                 }
-                self.recompute_accounts_status_cache_expiry(
-                    Utc::now(),
-                    /*allow_fallback_timestamp_initialization*/ true,
-                );
+                self.recompute_accounts_status_cache_expiry(Utc::now());
                 self.maybe_start_accounts_status_refresh(
                     /*force*/ false, /*open_popup_when_ready*/ true,
                     /*show_loading_popup*/ true,
@@ -5392,10 +5367,7 @@ impl App {
                                 )
                             })
                             .unwrap_or_else(|| account_id.clone());
-                        self.recompute_accounts_status_cache_expiry(
-                            Utc::now(),
-                            /*allow_fallback_timestamp_initialization*/ true,
-                        );
+                        self.recompute_accounts_status_cache_expiry(Utc::now());
                         self.handle_active_account_changed();
                         self.chat_widget.add_info_message(
                             format!("Active account: {display}"),
@@ -5429,10 +5401,7 @@ impl App {
 
                 match self.auth_manager.remove_account(&account_id) {
                     Ok(true) => {
-                        self.recompute_accounts_status_cache_expiry(
-                            Utc::now(),
-                            /*allow_fallback_timestamp_initialization*/ true,
-                        );
+                        self.recompute_accounts_status_cache_expiry(Utc::now());
                         if exit_after {
                             self.app_event_tx
                                 .send(AppEvent::Exit(ExitMode::ShutdownFirst));
@@ -5486,10 +5455,7 @@ impl App {
             }
             AppEvent::LogoutAllAccounts => match self.auth_manager.logout() {
                 Ok(true) => {
-                    self.recompute_accounts_status_cache_expiry(
-                        Utc::now(),
-                        /*allow_fallback_timestamp_initialization*/ true,
-                    );
+                    self.recompute_accounts_status_cache_expiry(Utc::now());
                     self.app_event_tx
                         .send(AppEvent::Exit(ExitMode::ShutdownFirst));
                 }
@@ -5577,10 +5543,7 @@ impl App {
                 ChatGptAddAccountOutcome::Success {
                     active_account_display,
                 } => {
-                    self.recompute_accounts_status_cache_expiry(
-                        Utc::now(),
-                        /*allow_fallback_timestamp_initialization*/ true,
-                    );
+                    self.recompute_accounts_status_cache_expiry(Utc::now());
                     self.maybe_start_accounts_status_refresh(
                         /*force*/ true, /*open_popup_when_ready*/ false,
                         /*show_loading_popup*/ false,
@@ -6722,6 +6685,7 @@ impl App {
         }
         self.handle_backtrack_event(&event.msg);
         self.chat_widget.handle_codex_event(event);
+        self.maybe_sync_active_account_state_from_auth_manager();
 
         if needs_refresh {
             self.refresh_status_line();
@@ -6793,6 +6757,7 @@ impl App {
                 self.handle_feedback_thread_event(event);
             }
         }
+        self.maybe_sync_active_account_state_from_auth_manager();
         if needs_refresh {
             self.refresh_status_line();
         }
@@ -7695,21 +7660,6 @@ mod tests {
     }
 
     #[test]
-    fn accounts_cache_fallback_expiry_is_anchored_to_last_update() {
-        let now = Utc::now();
-        let mut last_updated_at = None;
-
-        let first_expiry = accounts_cache_fallback_expires_at(&mut last_updated_at, now, true);
-        let second_expiry = accounts_cache_fallback_expires_at(
-            &mut last_updated_at,
-            now + chrono::Duration::seconds(30),
-            true,
-        );
-
-        assert_eq!(first_expiry, second_expiry);
-    }
-
-    #[test]
     fn accounts_status_cache_fully_refreshed_requires_complete_success() {
         assert!(accounts_status_cache_fully_refreshed(0, 0, true));
         assert!(accounts_status_cache_fully_refreshed(2, 2, true));
@@ -7719,62 +7669,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_accounts_refresh_preserves_previous_cache_freshness() {
+    async fn accounts_cache_stays_inactive_without_persisted_reset_time() {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
         seed_chatgpt_account_cache(&mut app);
-        assert!(
-            app.auth_manager
-                .list_accounts()
-                .into_iter()
-                .any(|account| account.last_rate_limits.is_some()),
-            "expected cached rate limits in auth manager"
-        );
-        let previous_update = Utc::now() - chrono::Duration::seconds(120);
-        app.accounts_status_cache_last_updated_at = Some(previous_update);
-        app.accounts_status_refresh_in_flight = true;
+        app.recompute_accounts_status_cache_expiry(Utc::now());
 
-        app.handle_accounts_status_cache_fetched(0, false, Utc::now());
-
-        assert_eq!(
-            app.accounts_status_cache_last_updated_at,
-            Some(previous_update)
-        );
-    }
-
-    #[tokio::test]
-    async fn partial_accounts_refresh_without_prior_freshness_keeps_cache_inactive() {
-        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        seed_chatgpt_account_cache(&mut app);
-        app.accounts_status_refresh_in_flight = true;
-
-        app.handle_accounts_status_cache_fetched(0, false, Utc::now());
-
-        assert_eq!(app.accounts_status_cache_last_updated_at, None);
         assert_eq!(app.accounts_status_cache_expires_at, None);
     }
 
     #[tokio::test]
-    async fn fully_refreshed_accounts_cache_updates_last_updated_at() {
+    async fn accounts_cache_uses_persisted_reset_time_when_available() {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
         seed_chatgpt_account_cache(&mut app);
-        assert!(
-            app.auth_manager
-                .list_accounts()
-                .into_iter()
-                .any(|account| account.last_rate_limits.is_some()),
-            "expected cached rate limits in auth manager"
-        );
-        let refreshed_at = Utc::now();
-        app.accounts_status_cache_last_updated_at =
-            Some(refreshed_at - chrono::Duration::seconds(120));
-        app.accounts_status_refresh_in_flight = true;
-
-        app.handle_accounts_status_cache_fetched(1, true, refreshed_at);
+        let reset_at = Utc::now() + chrono::Duration::minutes(45);
+        let store_account_id = app
+            .auth_manager
+            .list_accounts()
+            .into_iter()
+            .map(|account| account.id)
+            .next()
+            .expect("cached account should exist");
+        app.auth_manager
+            .update_rate_limits_for_accounts(vec![(
+                store_account_id,
+                RateLimitSnapshot {
+                    limit_id: Some("codex".to_string()),
+                    limit_name: None,
+                    primary: Some(RateLimitWindow {
+                        used_percent: 42.0,
+                        window_minutes: Some(60),
+                        resets_at: Some(reset_at.timestamp()),
+                    }),
+                    secondary: None,
+                    credits: None,
+                    plan_type: None,
+                },
+            )])
+            .expect("persist rate-limit snapshot");
+        app.recompute_accounts_status_cache_expiry(Utc::now());
 
         assert_eq!(
-            app.accounts_status_cache_last_updated_at,
-            Some(refreshed_at)
+            app.accounts_status_cache_expires_at,
+            DateTime::from_timestamp(reset_at.timestamp(), 0)
         );
+    }
+
+    #[tokio::test]
+    async fn partial_accounts_refresh_without_persisted_time_keeps_cache_inactive() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_account_cache(&mut app);
+        app.accounts_status_refresh_in_flight = true;
+
+        app.handle_accounts_status_cache_fetched(0, false, Utc::now());
+
+        assert_eq!(app.accounts_status_cache_expires_at, None);
     }
 
     #[tokio::test]
@@ -7838,6 +7786,51 @@ mod tests {
             Ok(AppEvent::RefreshRateLimits {
                 origin: RateLimitRefreshOrigin::StartupPrefetch,
                 account_generation: 1,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_thread_event_now_syncs_ui_after_auth_manager_auto_switch() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+
+        app.handle_active_account_changed();
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Ok(AppEvent::RefreshRateLimits {
+                origin: RateLimitRefreshOrigin::StartupPrefetch,
+                account_generation: 1,
+            })
+        );
+
+        let switched_account_id = app
+            .auth_manager
+            .list_accounts()
+            .into_iter()
+            .find(|account| account.label.as_deref() == Some("Secondary"))
+            .map(|account| account.id)
+            .expect("secondary account should exist");
+        app.auth_manager
+            .set_active_account(&switched_account_id)
+            .expect("switch active account");
+        app.handle_thread_event_now(ThreadBufferedEvent::Notification(
+            turn_started_notification(ThreadId::new(), "turn-1"),
+        ));
+
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: None,
+            }) if label == "Secondary" && email == "secondary@example.com"
+        ));
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Ok(AppEvent::RefreshRateLimits {
+                origin: RateLimitRefreshOrigin::StartupPrefetch,
+                account_generation: 2,
             })
         );
     }
@@ -11549,10 +11542,10 @@ guardian_approval = true
             primary_prompt_gc_private_usage_closed: false,
             pending_primary_events: VecDeque::new(),
             accounts_status_cache_expires_at: None,
-            accounts_status_cache_last_updated_at: None,
             accounts_status_refresh_in_flight: false,
             pending_forced_accounts_status_refresh: false,
             open_accounts_popup_when_cache_ready: false,
+            observed_active_store_account_id: None,
             pending_app_server_requests: PendingAppServerRequests::default(),
         }
     }
@@ -11615,10 +11608,10 @@ guardian_approval = true
                 primary_prompt_gc_private_usage_closed: false,
                 pending_primary_events: VecDeque::new(),
                 accounts_status_cache_expires_at: None,
-                accounts_status_cache_last_updated_at: None,
                 accounts_status_refresh_in_flight: false,
                 pending_forced_accounts_status_refresh: false,
                 open_accounts_popup_when_cache_ready: false,
+                observed_active_store_account_id: None,
                 pending_app_server_requests: PendingAppServerRequests::default(),
             },
             rx,

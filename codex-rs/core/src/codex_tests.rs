@@ -1817,27 +1817,48 @@ async fn prompt_gc_hidden_usage_limit_updates_rate_limits_without_visible_events
 async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_own_turn() {
     let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
     let auth_home = tempfile::tempdir().expect("create auth tempdir");
+    let mut acc_0_tokens = test_chatgpt_token_data("acc-0");
+    acc_0_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_0_tokens.id_token.raw_jwt)
+            .expect("parse acc-0 id token");
+    let acc_0_store_account_id = acc_0_tokens
+        .preferred_store_account_id()
+        .expect("acc-0 store account id");
+    let mut acc_1_tokens = test_chatgpt_token_data("acc-1");
+    acc_1_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_1_tokens.id_token.raw_jwt)
+            .expect("parse acc-1 id token");
+    let acc_1_store_account_id = acc_1_tokens
+        .preferred_store_account_id()
+        .expect("acc-1 store account id");
+    let mut acc_2_tokens = test_chatgpt_token_data("acc-2");
+    acc_2_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_2_tokens.id_token.raw_jwt)
+            .expect("parse acc-2 id token");
+    let acc_2_store_account_id = acc_2_tokens
+        .preferred_store_account_id()
+        .expect("acc-2 store account id");
     let auth_store = crate::auth::AuthStore {
-        active_account_id: Some("acc-2".to_string()),
+        active_account_id: Some(acc_2_store_account_id.clone()),
         accounts: vec![
             crate::auth::StoredAccount {
-                id: "acc-0".to_string(),
+                id: acc_0_store_account_id.clone(),
                 label: None,
-                tokens: test_chatgpt_token_data("acc-0"),
+                tokens: acc_0_tokens,
                 last_refresh: Some(Utc::now()),
                 usage: None,
             },
             crate::auth::StoredAccount {
-                id: "acc-1".to_string(),
+                id: acc_1_store_account_id.clone(),
                 label: None,
-                tokens: test_chatgpt_token_data("acc-1"),
+                tokens: acc_1_tokens,
                 last_refresh: Some(Utc::now()),
                 usage: None,
             },
             crate::auth::StoredAccount {
-                id: "acc-2".to_string(),
+                id: acc_2_store_account_id.clone(),
                 label: None,
-                tokens: test_chatgpt_token_data("acc-2"),
+                tokens: acc_2_tokens,
                 last_refresh: Some(Utc::now()),
                 usage: None,
             },
@@ -1866,10 +1887,12 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
             .iter()
             .find(|account| account.is_active)
             .map(|account| account.id.as_str()),
-        Some("acc-2")
+        Some(acc_2_store_account_id.as_str())
     );
     assert!(
-        accounts.iter().any(|account| account.id == "acc-1"),
+        accounts
+            .iter()
+            .any(|account| account.id == acc_1_store_account_id),
         "the failing account must still exist before the stale-request retry call"
     );
 
@@ -1897,13 +1920,13 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
         promo_message: None,
     };
     let freshly_unsupported_store_account_ids =
-        std::collections::HashSet::from([String::from("acc-2")]);
+        std::collections::HashSet::from([acc_2_store_account_id.clone()]);
 
     let should_retry = maybe_auto_switch_account_on_usage_limit_with_freshly_unsupported_ids(
         &session,
         &turn_context,
         &usage_limit,
-        Some("acc-1"),
+        Some(acc_1_store_account_id.as_str()),
         &freshly_unsupported_store_account_ids,
         UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch,
     )
@@ -1920,10 +1943,12 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
             .iter()
             .find(|account| account.is_active)
             .map(|account| account.id.as_str()),
-        Some("acc-2")
+        Some(acc_2_store_account_id.as_str())
     );
     assert!(
-        accounts.iter().any(|account| account.id == "acc-2"),
+        accounts
+            .iter()
+            .any(|account| account.id == acc_2_store_account_id),
         "the already-active account must not be pruned during stale-request recovery"
     );
     assert!(

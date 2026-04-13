@@ -133,7 +133,8 @@ async fn run_remote_compact_task_inner_impl(
             .auth_manager
             .auth_cached()
             .as_ref()
-            .and_then(super::auth::CodexAuth::get_account_id);
+            .and_then(super::auth::CodexAuth::active_chatgpt_account_summary)
+            .map(|summary| summary.store_account_id);
         match sess
             .services
             .model_client

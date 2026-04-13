@@ -13,6 +13,7 @@ use codex_protocol::config_types::ModelProviderAuthInfo;
 use pretty_assertions::assert_eq;
 use serde::Serialize;
 use serde_json::json;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tempfile::tempdir;
@@ -217,7 +218,7 @@ fn unauthorized_recovery_reports_mode_and_step_names() {
     let managed = UnauthorizedRecovery {
         manager: Arc::clone(&manager),
         step: UnauthorizedRecoveryStep::Reload,
-        expected_account_id: None,
+        expected_store_account_id: None,
         mode: UnauthorizedRecoveryMode::Managed,
     };
     assert_eq!(managed.mode_name(), "managed");
@@ -226,7 +227,7 @@ fn unauthorized_recovery_reports_mode_and_step_names() {
     let external = UnauthorizedRecovery {
         manager,
         step: UnauthorizedRecoveryStep::ExternalRefresh,
-        expected_account_id: None,
+        expected_store_account_id: None,
         mode: UnauthorizedRecoveryMode::External,
     };
     assert_eq!(external.mode_name(), "external");
@@ -235,7 +236,7 @@ fn unauthorized_recovery_reports_mode_and_step_names() {
 
 #[test]
 #[serial(codex_api_key)]
-fn reload_if_account_id_matches_prefers_chatgpt_when_store_also_has_api_key() {
+fn reload_if_store_account_id_matches_prefers_chatgpt_when_store_also_has_api_key() {
     let codex_home = tempdir().unwrap();
     write_auth_file(
         AuthFileParams {
@@ -252,16 +253,47 @@ fn reload_if_account_id_matches_prefers_chatgpt_when_store_also_has_api_key() {
         false,
         AuthCredentialsStoreMode::File,
     );
-    let outcome = manager.reload_if_account_id_matches(Some("org_workspace"));
+    let expected_store_account_id = manager
+        .active_chatgpt_account_summary()
+        .expect("ChatGPT auth summary should exist")
+        .store_account_id;
+    let outcome = manager.reload_if_store_account_id_matches(Some(&expected_store_account_id));
     assert!(
         matches!(
             outcome,
             ReloadOutcome::ReloadedChanged | ReloadOutcome::ReloadedNoChange
         ),
-        "reload should not be skipped when account ids match"
+        "reload should not be skipped when saved account ids match"
     );
     let auth = manager.auth_cached().expect("auth should be cached");
     assert_eq!(auth.internal_auth_mode(), crate::AuthMode::Chatgpt);
+}
+
+#[test]
+fn unauthorized_recovery_tracks_expected_store_account_id() {
+    let codex_home = tempdir().unwrap();
+    let active_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-primary"], 0);
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    let recovery = manager.unauthorized_recovery();
+    let cached_account_id = manager
+        .auth_cached()
+        .and_then(|auth| auth.get_account_id())
+        .expect("workspace account id should exist");
+
+    assert_eq!(
+        recovery.expected_store_account_id.as_deref(),
+        Some(active_store_account_id.as_str())
+    );
+    assert_ne!(
+        recovery.expected_store_account_id.as_deref(),
+        Some(cached_account_id.as_str())
+    );
 }
 
 #[test]
@@ -436,6 +468,120 @@ fn usage_limit_auto_switch_removes_only_free_and_unknown_plans() {
         &AccountPlanType::Edu
     )));
     assert!(!super::usage_limit_auto_switch_removes_plan_type(None));
+}
+
+#[test]
+fn mark_usage_limit_reached_prefers_blocked_primary_reset_when_error_reset_is_missing() {
+    let codex_home = tempdir().unwrap();
+    persist_test_chatgpt_accounts(codex_home.path(), &["org-primary"], 0);
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let primary_reset_at = Utc::now() + chrono::Duration::minutes(15);
+    let secondary_reset_at = Utc::now() + chrono::Duration::days(7);
+
+    manager
+        .mark_usage_limit_reached(
+            None,
+            Some(RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 100.0,
+                    window_minutes: Some(15),
+                    resets_at: Some(primary_reset_at.timestamp()),
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: 10.0,
+                    window_minutes: None,
+                    resets_at: Some(secondary_reset_at.timestamp()),
+                }),
+                credits: None,
+                plan_type: Some(AccountPlanType::Pro),
+            }),
+        )
+        .expect("mark usage limit reached");
+
+    let active_account = manager
+        .list_accounts()
+        .into_iter()
+        .find(|account| account.is_active)
+        .expect("active account should exist");
+    assert_eq!(
+        active_account
+            .exhausted_until
+            .map(|until| until.timestamp()),
+        Some(primary_reset_at.timestamp())
+    );
+}
+
+#[test]
+fn cooldown_still_purges_freshly_unsupported_fallbacks_and_marks_failing_account() {
+    let codex_home = tempdir().unwrap();
+    let active_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-primary", "org-fallback"], 0);
+    let fallback_store_account_id =
+        test_store_account_id("org-fallback").expect("fallback store account id");
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    *manager
+        .usage_limit_auto_switch_cooldown_until
+        .lock()
+        .expect("cooldown lock") = Some(Utc::now() + chrono::Duration::seconds(30));
+
+    let switched_to = manager
+        .switch_account_on_usage_limit(
+            None,
+            Some(active_store_account_id.as_str()),
+            None,
+            Some(RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 100.0,
+                    window_minutes: Some(15),
+                    resets_at: Some((Utc::now() + chrono::Duration::minutes(15)).timestamp()),
+                }),
+                secondary: None,
+                credits: None,
+                plan_type: Some(AccountPlanType::Pro),
+            }),
+            &HashSet::from([fallback_store_account_id.clone()]),
+            None,
+        )
+        .expect("cooldown path should succeed");
+
+    assert_eq!(
+        switched_to, None,
+        "cooldown should still suppress switching"
+    );
+    let accounts = manager.list_accounts();
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id.as_str()),
+        Some(active_store_account_id.as_str())
+    );
+    assert!(
+        accounts
+            .iter()
+            .all(|account| account.id != fallback_store_account_id),
+        "freshly unsupported fallback should be purged even during cooldown"
+    );
+    assert!(
+        accounts
+            .iter()
+            .find(|account| account.id == active_store_account_id)
+            .and_then(|account| account.exhausted_until)
+            .is_some(),
+        "failing account should still be marked exhausted during cooldown"
+    );
 }
 
 #[test]

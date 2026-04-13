@@ -1149,7 +1149,8 @@ enum UnauthorizedRecoveryMode {
 // For API key based authentication, we don't do anything and let the error bubble to the user.
 //
 // For ChatGPT based authentication, we:
-// 1. Attempt to reload the auth data from disk. We only reload if the account id matches the one the current process is running as.
+// 1. Attempt to reload the auth data from disk. We only reload if the saved-account id matches
+//    the one the current process is running as.
 // 2. Attempt to refresh the token using OAuth token refresh flow.
 // If after both steps the server still responds with 401 we let the error bubble to the user.
 //
@@ -1164,7 +1165,7 @@ enum UnauthorizedRecoveryMode {
 pub struct UnauthorizedRecovery {
     manager: Arc<AuthManager>,
     step: UnauthorizedRecoveryStep,
-    expected_account_id: Option<String>,
+    expected_store_account_id: Option<String>,
     mode: UnauthorizedRecoveryMode,
 }
 
@@ -1182,7 +1183,10 @@ impl UnauthorizedRecoveryStepResult {
 impl UnauthorizedRecovery {
     fn new(manager: Arc<AuthManager>) -> Self {
         let cached_auth = manager.auth_cached();
-        let expected_account_id = cached_auth.as_ref().and_then(CodexAuth::get_account_id);
+        let expected_store_account_id = cached_auth
+            .as_ref()
+            .and_then(CodexAuth::active_chatgpt_account_summary)
+            .map(|summary| summary.store_account_id);
         let mode = if manager.has_external_api_key_auth()
             || cached_auth
                 .as_ref()
@@ -1199,7 +1203,7 @@ impl UnauthorizedRecovery {
         Self {
             manager,
             step,
-            expected_account_id,
+            expected_store_account_id,
             mode,
         }
     }
@@ -1282,7 +1286,7 @@ impl UnauthorizedRecovery {
             UnauthorizedRecoveryStep::Reload => {
                 match self
                     .manager
-                    .reload_if_account_id_matches(self.expected_account_id.as_deref())
+                    .reload_if_store_account_id_matches(self.expected_store_account_id.as_deref())
                 {
                     ReloadOutcome::ReloadedChanged => {
                         self.step = UnauthorizedRecoveryStep::RefreshToken;
@@ -1835,12 +1839,12 @@ impl AuthManager {
             .usage_limit_auto_switch_cooldown_until
             .lock()
             .map_err(|_| std::io::Error::other("auto-switch cooldown lock poisoned"))?;
-        if cooldown_until.is_some_and(|until| until > cooldown_check_now) {
+        let cooldown_active = cooldown_until.is_some_and(|until| until > cooldown_check_now);
+        if cooldown_active {
             tracing::debug!(
                 cooldown_until = ?*cooldown_until,
                 "skipping usage-limit auto-switch during cooldown"
             );
-            return Ok(None);
         }
 
         let switched_to = self.update_store(|store| {
@@ -1930,6 +1934,10 @@ impl AuthManager {
                     removed_account_ids = ?removed_fallback_account_ids,
                     "removed freshly unsupported fallback accounts during usage-limit auto-switch"
                 );
+            }
+
+            if cooldown_active {
+                return Ok(None);
             }
 
             if let Some(protected_store_account_id) = protected_store_account_id
@@ -2092,11 +2100,14 @@ impl AuthManager {
         Ok(self.set_cached(store))
     }
 
-    fn reload_if_account_id_matches(&self, expected_account_id: Option<&str>) -> ReloadOutcome {
-        let expected_account_id = match expected_account_id {
-            Some(account_id) => account_id,
+    fn reload_if_store_account_id_matches(
+        &self,
+        expected_store_account_id: Option<&str>,
+    ) -> ReloadOutcome {
+        let expected_store_account_id = match expected_store_account_id {
+            Some(store_account_id) => store_account_id,
             None => {
-                tracing::info!("Skipping auth reload because no account id is available.");
+                tracing::info!("Skipping auth reload because no saved account id is available.");
                 return ReloadOutcome::Skipped;
             }
         };
@@ -2136,28 +2147,31 @@ impl AuthManager {
             Arc::clone(&self.storage),
             self.enable_codex_api_key_env,
         );
-        let new_account_id = new_auth.as_ref().and_then(CodexAuth::get_account_id);
+        let new_store_account_id = new_auth
+            .as_ref()
+            .and_then(CodexAuth::active_chatgpt_account_summary)
+            .map(|summary| summary.store_account_id);
 
-        if new_account_id.as_deref() != Some(expected_account_id) {
+        if new_store_account_id.as_deref() != Some(expected_store_account_id) {
             if removed_account_ids
                 .iter()
-                .any(|id| id == expected_account_id)
+                .any(|id| id == expected_store_account_id)
             {
                 tracing::info!(
-                    expected_account_id,
-                    "Reloading auth after expected account was removed by supported-plan policy"
+                    expected_store_account_id,
+                    "Reloading auth after expected saved account was removed by supported-plan policy"
                 );
                 self.set_cached(store);
                 return ReloadOutcome::ReloadedChanged;
             }
-            let found_account_id = new_account_id.as_deref().unwrap_or("unknown");
+            let found_store_account_id = new_store_account_id.as_deref().unwrap_or("unknown");
             tracing::info!(
-                "Skipping auth reload due to account id mismatch (expected: {expected_account_id}, found: {found_account_id})"
+                "Skipping auth reload due to saved account id mismatch (expected: {expected_store_account_id}, found: {found_store_account_id})"
             );
             return ReloadOutcome::Skipped;
         }
 
-        tracing::info!("Reloading auth for account {expected_account_id}");
+        tracing::info!("Reloading auth for saved account {expected_store_account_id}");
         let cached_before_reload = self.auth_cached();
         let auth_changed =
             !Self::auths_equal_for_refresh(cached_before_reload.as_ref(), new_auth.as_ref());
@@ -2488,11 +2502,12 @@ impl AuthManager {
         {
             return Ok(());
         }
-        let expected_account_id = auth_before_reload
+        let expected_store_account_id = auth_before_reload
             .as_ref()
-            .and_then(CodexAuth::get_account_id);
+            .and_then(CodexAuth::active_chatgpt_account_summary)
+            .map(|summary| summary.store_account_id);
 
-        match self.reload_if_account_id_matches(expected_account_id.as_deref()) {
+        match self.reload_if_store_account_id_matches(expected_store_account_id.as_deref()) {
             ReloadOutcome::ReloadedChanged => {
                 tracing::info!("Skipping token refresh because auth changed after guarded reload.");
                 Ok(())
@@ -2962,12 +2977,8 @@ fn exhausted_until(
     now: DateTime<Utc>,
 ) -> DateTime<Utc> {
     let from_snapshot = snapshot.and_then(|snapshot| {
-        snapshot
-            .secondary
-            .as_ref()
-            .and_then(|w| w.resets_at)
-            .or_else(|| snapshot.primary.as_ref().and_then(|w| w.resets_at))
-            .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
+        exhausted_until_from_snapshot(snapshot, now)
+            .or_else(|| snapshot_next_reset_at(snapshot, now))
     });
     resets_at
         .or(from_snapshot)
@@ -2981,13 +2992,13 @@ fn exhausted_until_from_snapshot(
     if rate_limit_window_blocked(snapshot.secondary.as_ref(), now) {
         return Some(
             rate_limit_window_reset_at(snapshot.secondary.as_ref())
-                .unwrap_or_else(|| exhausted_until(/*resets_at*/ None, Some(snapshot), now)),
+                .unwrap_or_else(|| now + chrono::Duration::minutes(15)),
         );
     }
     if rate_limit_window_blocked(snapshot.primary.as_ref(), now) {
         return Some(
             rate_limit_window_reset_at(snapshot.primary.as_ref())
-                .unwrap_or_else(|| exhausted_until(/*resets_at*/ None, Some(snapshot), now)),
+                .unwrap_or_else(|| now + chrono::Duration::minutes(15)),
         );
     }
     None

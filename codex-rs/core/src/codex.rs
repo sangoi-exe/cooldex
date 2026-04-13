@@ -7705,7 +7705,8 @@ async fn run_sampling_request_with_router_and_prompt(
             .auth_manager
             .auth_cached()
             .as_ref()
-            .and_then(CodexAuth::get_account_id);
+            .and_then(CodexAuth::active_chatgpt_account_summary)
+            .map(|summary| summary.store_account_id);
         let err = match try_run_sampling_request(SamplingRequestArgs {
             router: Arc::clone(&router),
             sess: Arc::clone(&sess),
