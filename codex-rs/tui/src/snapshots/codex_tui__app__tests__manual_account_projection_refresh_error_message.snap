@@ -1,0 +1,5 @@
+---
+source: tui/src/app.rs
+expression: rendered
+---
+■ Failed to refresh account state after manual account selection: model/list failed

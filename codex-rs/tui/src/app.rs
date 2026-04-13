@@ -200,6 +200,36 @@ fn format_account_display(label: Option<&str>, email: Option<&str>, fallback: &s
     }
 }
 
+fn build_chatgpt_add_account_success_outcome(
+    auth_manager: &AuthManager,
+    shared_state: &crate::bottom_pane::ChatGptAddAccountSharedState,
+) -> ChatGptAddAccountOutcome {
+    match auth_manager.reload_strict() {
+        Ok(_) => {
+            let active_account_display = auth_manager
+                .list_accounts()
+                .iter()
+                .find(|account| account.is_active)
+                .map(|account| {
+                    format_account_display(
+                        account.label.as_deref(),
+                        account.email.as_deref(),
+                        &account.id,
+                    )
+                });
+            shared_state.set_success(active_account_display.clone());
+            ChatGptAddAccountOutcome::Success {
+                active_account_display,
+            }
+        }
+        Err(err) => {
+            let message = format!("failed to reload auth store after ChatGPT login: {err}");
+            shared_state.set_failed(message.clone());
+            ChatGptAddAccountOutcome::Failed { message }
+        }
+    }
+}
+
 fn status_account_displays_match(
     current: Option<&StatusAccountDisplay>,
     next: Option<&StatusAccountDisplay>,
@@ -1254,6 +1284,27 @@ enum LiveAccountStateOwner {
     AuthManager,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccountProjectionRefreshTrigger {
+    AuthTokenRefresh,
+    ManualSetActiveAccount,
+    ManualAddAccount,
+    ManualRemoveActiveAccount,
+    ManualRemoveLastAccount,
+}
+
+impl AccountProjectionRefreshTrigger {
+    fn description(self) -> &'static str {
+        match self {
+            Self::AuthTokenRefresh => "auth token refresh",
+            Self::ManualSetActiveAccount => "manual account selection",
+            Self::ManualAddAccount => "adding ChatGPT account",
+            Self::ManualRemoveActiveAccount => "removing the active account",
+            Self::ManualRemoveLastAccount => "removing the last account",
+        }
+    }
+}
+
 #[derive(Default)]
 struct WindowsSandboxState {
     setup_started_at: Option<Instant>,
@@ -1937,6 +1988,7 @@ impl App {
     // Merge-safety anchor: account-switch handling must keep chat-widget account identity and
     // rate-limit generation state in sync so stale refresh results never repopulate the next
     // account's `/status` cache or suppress its warnings.
+    #[cfg(test)]
     fn handle_active_account_changed(&mut self) {
         self.live_account_state_owner = LiveAccountStateOwner::AuthManager;
         self.refresh_observed_active_store_account_id();
@@ -1951,6 +2003,11 @@ impl App {
                 self.sync_chat_widget_account_state_from_auth_manager();
             }
         }
+    }
+
+    fn refresh_account_mutation_bookkeeping(&mut self) {
+        self.refresh_observed_active_store_account_id();
+        self.recompute_accounts_status_cache_expiry(Utc::now());
     }
 
     fn build_model_catalog(
@@ -2065,13 +2122,20 @@ impl App {
             return;
         }
 
-        self.refresh_app_server_account_projection_after_auth_refresh(app_server_client)
-            .await;
+        self.refresh_app_server_account_projection_after_local_auth_change(
+            app_server_client,
+            AccountProjectionRefreshTrigger::AuthTokenRefresh,
+        )
+        .await;
     }
 
-    async fn refresh_app_server_account_projection_after_auth_refresh(
+    // Merge-safety anchor: WS1 account-success flows must share one bounded app-server projection
+    // convergence owner after local auth mutation/refresh instead of drifting into separate local
+    // UI refresh paths.
+    async fn refresh_app_server_account_projection_after_local_auth_change(
         &mut self,
         app_server_client: &mut AppServerSession,
+        trigger: AccountProjectionRefreshTrigger,
     ) {
         let mut last_successful_projection = None;
         let mut last_error_message = None;
@@ -2097,7 +2161,8 @@ impl App {
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
-                        "failed to refresh app-server account projection after auth token refresh"
+                        trigger = trigger.description(),
+                        "failed to refresh app-server account projection after local auth change"
                     );
                     last_error_message = Some(err.to_string());
                 }
@@ -2111,7 +2176,7 @@ impl App {
 
         if let Some(error_message) = last_error_message {
             self.report_app_server_account_projection_refresh_error(
-                "auth token refresh",
+                trigger.description(),
                 error_message,
             );
         }
@@ -2130,13 +2195,17 @@ impl App {
             return;
         }
 
-        self.refresh_app_server_account_projection_after_auth_refresh_with(load_projection)
-            .await;
+        self.refresh_app_server_account_projection_after_local_auth_change_with(
+            AccountProjectionRefreshTrigger::AuthTokenRefresh,
+            load_projection,
+        )
+        .await;
     }
 
     #[cfg(test)]
-    async fn refresh_app_server_account_projection_after_auth_refresh_with<F, Fut>(
+    async fn refresh_app_server_account_projection_after_local_auth_change_with<F, Fut>(
         &mut self,
+        trigger: AccountProjectionRefreshTrigger,
         mut load_projection: F,
     ) where
         F: FnMut() -> Fut,
@@ -2166,7 +2235,8 @@ impl App {
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
-                        "failed to refresh app-server account projection after auth token refresh"
+                        trigger = trigger.description(),
+                        "failed to refresh app-server account projection after local auth change"
                     );
                     last_error_message = Some(err.to_string());
                 }
@@ -2180,7 +2250,7 @@ impl App {
 
         if let Some(error_message) = last_error_message {
             self.report_app_server_account_projection_refresh_error(
-                "auth token refresh",
+                trigger.description(),
                 error_message,
             );
         }
@@ -5716,8 +5786,12 @@ impl App {
                                 )
                             })
                             .unwrap_or_else(|| account_id.clone());
-                        self.recompute_accounts_status_cache_expiry(Utc::now());
-                        self.handle_active_account_changed();
+                        self.refresh_account_mutation_bookkeeping();
+                        self.refresh_app_server_account_projection_after_local_auth_change(
+                            app_server,
+                            AccountProjectionRefreshTrigger::ManualSetActiveAccount,
+                        )
+                        .await;
                         self.chat_widget.add_info_message(
                             format!("Active account: {display}"),
                             /*hint*/ None,
@@ -5750,14 +5824,18 @@ impl App {
 
                 match self.auth_manager.remove_account(&account_id) {
                     Ok(true) => {
-                        self.recompute_accounts_status_cache_expiry(Utc::now());
+                        self.refresh_account_mutation_bookkeeping();
                         if exit_after {
                             self.app_event_tx
                                 .send(AppEvent::Exit(ExitMode::ShutdownFirst));
                         } else {
                             let accounts_after = self.auth_manager.list_accounts();
                             if accounts_after.is_empty() {
-                                self.handle_active_account_changed();
+                                self.refresh_app_server_account_projection_after_local_auth_change(
+                                    app_server,
+                                    AccountProjectionRefreshTrigger::ManualRemoveLastAccount,
+                                )
+                                .await;
                                 self.chat_widget.add_info_message(
                                     format!(
                                         "Removed account: {removed_display}. You are now logged out."
@@ -5776,7 +5854,11 @@ impl App {
                                         )
                                     })
                                     .unwrap_or_else(|| "<unknown>".to_string());
-                                self.handle_active_account_changed();
+                                self.refresh_app_server_account_projection_after_local_auth_change(
+                                    app_server,
+                                    AccountProjectionRefreshTrigger::ManualRemoveActiveAccount,
+                                )
+                                .await;
                                 self.chat_widget.add_info_message(
                                     format!(
                                         "Removed account: {removed_display}. Active account: {active_display}"
@@ -5856,22 +5938,7 @@ impl App {
                     let result = child.block_until_done().await;
                     let outcome = match result {
                         Ok(()) => {
-                            auth_manager.reload();
-                            let active_account_display = auth_manager
-                                .list_accounts()
-                                .iter()
-                                .find(|account| account.is_active)
-                                .map(|account| {
-                                    format_account_display(
-                                        account.label.as_deref(),
-                                        account.email.as_deref(),
-                                        &account.id,
-                                    )
-                                });
-                            shared_state.set_success(active_account_display.clone());
-                            ChatGptAddAccountOutcome::Success {
-                                active_account_display,
-                            }
+                            build_chatgpt_add_account_success_outcome(&auth_manager, &shared_state)
                         }
                         Err(err) => {
                             if shared_state.cancelled_by_user() {
@@ -5892,12 +5959,16 @@ impl App {
                 ChatGptAddAccountOutcome::Success {
                     active_account_display,
                 } => {
-                    self.recompute_accounts_status_cache_expiry(Utc::now());
+                    self.refresh_account_mutation_bookkeeping();
                     self.maybe_start_accounts_status_refresh(
                         /*force*/ true, /*open_popup_when_ready*/ false,
                         /*show_loading_popup*/ false,
                     );
-                    self.handle_active_account_changed();
+                    self.refresh_app_server_account_projection_after_local_auth_change(
+                        app_server,
+                        AccountProjectionRefreshTrigger::ManualAddAccount,
+                    )
+                    .await;
                     if let Some(display) = active_account_display {
                         self.chat_widget.add_info_message(
                             format!("Active account: {display}"),
@@ -8236,7 +8307,7 @@ mod tests {
             }) if label == "Server Account" && email == "server@openai.com" && plan == "Plus"
         ));
         assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
-        assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
+        assert_eq!(app.feedback_audience, FeedbackAudience::External);
         assert_eq!(app.chat_widget.rate_limit_account_generation(), 1);
     }
 
@@ -8283,7 +8354,7 @@ mod tests {
             }) if label == "Server Account" && email == "server@openai.com" && plan == "Plus"
         ));
         assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
-        assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
+        assert_eq!(app.feedback_audience, FeedbackAudience::External);
         assert_eq!(app.chat_widget.rate_limit_snapshot_count(), 0);
         assert_matches!(
             app_event_rx.try_recv(),
@@ -8369,6 +8440,486 @@ mod tests {
         assert!(rendered_cells.iter().any(|cell| {
             cell.contains("Failed to refresh account state after account update: model/list failed")
         }));
+    }
+
+    #[tokio::test]
+    async fn refresh_app_server_account_projection_after_manual_set_active_account_converges_followers()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let initial_models = vec![all_model_presets()[0].clone()];
+        let initial_default_model = initial_models[0].model.clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@example.com",
+            PlanType::Plus,
+            initial_models,
+            initial_default_model,
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        let secondary_store_account_id = app
+            .auth_manager
+            .list_accounts()
+            .into_iter()
+            .find(|account| account.label.as_deref() == Some("Secondary"))
+            .map(|account| account.id)
+            .expect("secondary account should exist");
+        app.auth_manager
+            .set_active_account(&secondary_store_account_id)
+            .expect("switch active account");
+        app.refresh_account_mutation_bookkeeping();
+
+        let refreshed_models = vec![all_model_presets()[1].clone()];
+        let refreshed_default_model = refreshed_models[0].model.clone();
+        let attempts = Arc::new(Mutex::new(VecDeque::from(vec![Ok(
+            test_chatgpt_account_projection(
+                "Switched Account",
+                "switched@openai.com",
+                PlanType::Pro,
+                refreshed_models,
+                refreshed_default_model.clone(),
+            ),
+        )])));
+        let attempts_clone = Arc::clone(&attempts);
+
+        app.refresh_app_server_account_projection_after_local_auth_change_with(
+            AccountProjectionRefreshTrigger::ManualSetActiveAccount,
+            move || {
+                let attempts = Arc::clone(&attempts_clone);
+                async move {
+                    attempts
+                        .lock()
+                        .await
+                        .pop_front()
+                        .expect("projection attempt should exist")
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(secondary_store_account_id)
+        );
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == "Switched Account" && email == "switched@openai.com" && plan == "Pro"
+        ));
+        assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Pro));
+        assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
+        assert_eq!(app.chat_widget.current_model(), refreshed_default_model);
+    }
+
+    #[tokio::test]
+    async fn refresh_app_server_account_projection_after_manual_remove_active_account_converges_followers()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let initial_models = vec![all_model_presets()[0].clone()];
+        let initial_default_model = initial_models[0].model.clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@example.com",
+            PlanType::Plus,
+            initial_models,
+            initial_default_model,
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        let accounts = app.auth_manager.list_accounts();
+        let active_store_account_id = accounts
+            .iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id.clone())
+            .expect("active account should exist");
+        let secondary_store_account_id = accounts
+            .iter()
+            .find(|account| !account.is_active)
+            .map(|account| account.id.clone())
+            .expect("secondary account should exist");
+        assert!(
+            app.auth_manager
+                .remove_account(&active_store_account_id)
+                .expect("remove active account"),
+            "active account should be removed",
+        );
+        app.refresh_account_mutation_bookkeeping();
+
+        let refreshed_models = vec![all_model_presets()[1].clone()];
+        let refreshed_default_model = refreshed_models[0].model.clone();
+        let attempts = Arc::new(Mutex::new(VecDeque::from(vec![Ok(
+            test_chatgpt_account_projection(
+                "Fallback Account",
+                "fallback@openai.com",
+                PlanType::Business,
+                refreshed_models,
+                refreshed_default_model.clone(),
+            ),
+        )])));
+        let attempts_clone = Arc::clone(&attempts);
+
+        app.refresh_app_server_account_projection_after_local_auth_change_with(
+            AccountProjectionRefreshTrigger::ManualRemoveActiveAccount,
+            move || {
+                let attempts = Arc::clone(&attempts_clone);
+                async move {
+                    attempts
+                        .lock()
+                        .await
+                        .pop_front()
+                        .expect("projection attempt should exist")
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(secondary_store_account_id)
+        );
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == "Fallback Account" && email == "fallback@openai.com" && plan == "Enterprise"
+        ));
+        assert_eq!(
+            app.chat_widget.current_plan_type(),
+            Some(PlanType::Business)
+        );
+        assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
+        assert_eq!(app.chat_widget.current_model(), refreshed_default_model);
+    }
+
+    #[tokio::test]
+    async fn refresh_app_server_account_projection_after_manual_remove_last_account_converges_to_logged_out_projection()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let store = AuthStore {
+            active_account_id: Some("account-a".to_string()),
+            accounts: vec![chatgpt_account(
+                "account-a",
+                "primary@example.com",
+                Some("Primary"),
+            )],
+            ..AuthStore::default()
+        };
+        save_auth(
+            &app.config.codex_home,
+            &store,
+            app.config.cli_auth_credentials_store_mode,
+        )
+        .expect("save auth store");
+        app.auth_manager = auth_manager_from_config(&app.config);
+        app.auth_manager
+            .reload_strict()
+            .expect("reload seeded auth store");
+        let accounts = app.auth_manager.list_accounts();
+        let active_store_account_id = accounts
+            .iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id.clone())
+            .expect("active store account id");
+
+        let initial_models = vec![all_model_presets()[0].clone()];
+        let initial_default_model = initial_models[0].model.clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@example.com",
+            PlanType::Plus,
+            initial_models,
+            initial_default_model,
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        assert!(
+            app.auth_manager
+                .remove_account(&active_store_account_id)
+                .expect("remove last account"),
+            "last account should be removed",
+        );
+        app.refresh_account_mutation_bookkeeping();
+
+        let available_models = all_model_presets();
+        let default_model = available_models[0].model.clone();
+        let attempts = Arc::new(Mutex::new(VecDeque::from(vec![Ok(
+            AppServerAccountProjection {
+                account_email: None,
+                auth_mode: None,
+                status_account_display: None,
+                plan_type: None,
+                requires_openai_auth: false,
+                default_model: default_model.clone(),
+                feedback_audience: FeedbackAudience::External,
+                has_chatgpt_account: false,
+                available_models,
+            },
+        )])));
+        let attempts_clone = Arc::clone(&attempts);
+
+        app.refresh_app_server_account_projection_after_local_auth_change_with(
+            AccountProjectionRefreshTrigger::ManualRemoveLastAccount,
+            move || {
+                let attempts = Arc::clone(&attempts_clone);
+                async move {
+                    attempts
+                        .lock()
+                        .await
+                        .pop_front()
+                        .expect("projection attempt should exist")
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert_eq!(app.observed_active_store_account_id, None);
+        assert!(app.chat_widget.status_account_display().is_none());
+        assert_eq!(app.chat_widget.current_plan_type(), None);
+        assert!(!app.chat_widget.has_chatgpt_account());
+        assert_eq!(app.feedback_audience, FeedbackAudience::External);
+        assert_eq!(app.chat_widget.current_model(), default_model);
+    }
+
+    #[tokio::test]
+    async fn build_chatgpt_add_account_success_outcome_reloads_strictly_and_manual_add_converges_followers()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let initial_models = vec![all_model_presets()[0].clone()];
+        let initial_default_model = initial_models[0].model.clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@example.com",
+            PlanType::Plus,
+            initial_models,
+            initial_default_model,
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        let updated_store = AuthStore {
+            active_account_id: Some("account-c".to_string()),
+            accounts: vec![
+                chatgpt_account("account-a", "primary@example.com", Some("Primary")),
+                chatgpt_account("account-b", "secondary@example.com", Some("Secondary")),
+                chatgpt_account("account-c", "new@example.com", Some("New")),
+            ],
+            ..AuthStore::default()
+        };
+        save_auth(
+            &app.config.codex_home,
+            &updated_store,
+            app.config.cli_auth_credentials_store_mode,
+        )
+        .expect("save updated auth store");
+
+        let shared_state = Arc::new(crate::bottom_pane::ChatGptAddAccountSharedState::new());
+        let outcome = build_chatgpt_add_account_success_outcome(&app.auth_manager, &shared_state);
+        let active_account_display = match outcome {
+            ChatGptAddAccountOutcome::Success {
+                active_account_display,
+            } => active_account_display,
+            other => panic!("expected add-account success outcome, saw {other:?}"),
+        };
+        assert_eq!(
+            active_account_display.as_deref(),
+            Some("New — new@example.com")
+        );
+        let active_store_account_id = app
+            .auth_manager
+            .active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id)
+            .expect("active store account id after add-account reload");
+
+        app.refresh_account_mutation_bookkeeping();
+        let refreshed_models = vec![all_model_presets()[1].clone()];
+        let refreshed_default_model = refreshed_models[0].model.clone();
+        let attempts = Arc::new(Mutex::new(VecDeque::from(vec![Ok(
+            test_chatgpt_account_projection(
+                "New",
+                "new@openai.com",
+                PlanType::Business,
+                refreshed_models,
+                refreshed_default_model.clone(),
+            ),
+        )])));
+        let attempts_clone = Arc::clone(&attempts);
+
+        app.refresh_app_server_account_projection_after_local_auth_change_with(
+            AccountProjectionRefreshTrigger::ManualAddAccount,
+            move || {
+                let attempts = Arc::clone(&attempts_clone);
+                async move {
+                    attempts
+                        .lock()
+                        .await
+                        .pop_front()
+                        .expect("projection attempt should exist")
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(active_store_account_id)
+        );
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == "New" && email == "new@openai.com" && plan == "Enterprise"
+        ));
+        assert_eq!(
+            app.chat_widget.current_plan_type(),
+            Some(PlanType::Business)
+        );
+        assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
+        assert_eq!(app.chat_widget.current_model(), refreshed_default_model);
+    }
+
+    #[tokio::test]
+    async fn build_chatgpt_add_account_success_outcome_fails_when_reload_strict_fails_and_preserves_state()
+    -> Result<()> {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let available_models = all_model_presets();
+        let default_model = available_models
+            .iter()
+            .find(|model| model.is_default)
+            .unwrap_or(&available_models[0])
+            .model
+            .clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@example.com",
+            PlanType::Plus,
+            available_models,
+            default_model.clone(),
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        let broken_home = tempdir()?;
+        let broken_path = broken_home.path().join("not-a-directory");
+        std::fs::write(&broken_path, "broken codex home")?;
+        let mut broken_config = app.config.clone();
+        broken_config.codex_home = broken_path;
+        let broken_auth_manager = auth_manager_from_config(&broken_config);
+        let shared_state = Arc::new(crate::bottom_pane::ChatGptAddAccountSharedState::new());
+
+        let outcome =
+            build_chatgpt_add_account_success_outcome(&broken_auth_manager, shared_state.as_ref());
+
+        assert!(matches!(
+            outcome,
+            ChatGptAddAccountOutcome::Failed { ref message }
+                if message.contains("failed to reload auth store after ChatGPT login")
+        ));
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == "Server Account" && email == "server@example.com" && plan == "Plus"
+        ));
+        assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
+        assert_eq!(app.feedback_audience, FeedbackAudience::External);
+        assert_eq!(app.chat_widget.current_model(), default_model);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_app_server_account_projection_after_manual_account_change_keeps_last_good_state_and_emits_error()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let original_model_catalog = app.model_catalog.clone();
+        let original_model = app.chat_widget.current_model().to_string();
+        app.chat_widget.update_account_state(
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some("Original".to_string()),
+                email: Some("original@example.com".to_string()),
+                plan: Some("Plus".to_string()),
+            }),
+            Some(PlanType::Plus),
+            true,
+        );
+        app.feedback_audience = FeedbackAudience::OpenAiEmployee;
+
+        let attempts = Arc::new(Mutex::new(VecDeque::from(vec![
+            Err(color_eyre::eyre::eyre!("model/list failed")),
+            Err(color_eyre::eyre::eyre!("model/list failed")),
+            Err(color_eyre::eyre::eyre!("model/list failed")),
+            Err(color_eyre::eyre::eyre!("model/list failed")),
+        ])));
+        let attempts_clone = Arc::clone(&attempts);
+
+        app.refresh_app_server_account_projection_after_local_auth_change_with(
+            AccountProjectionRefreshTrigger::ManualSetActiveAccount,
+            move || {
+                let attempts = Arc::clone(&attempts_clone);
+                async move {
+                    attempts
+                        .lock()
+                        .await
+                        .pop_front()
+                        .expect("projection attempt should exist")
+                }
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == "Original" && email == "original@example.com" && plan == "Plus"
+        ));
+        assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
+        assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
+        assert!(Arc::ptr_eq(&app.model_catalog, &original_model_catalog));
+        assert_eq!(app.chat_widget.current_model(), original_model);
+
+        let mut rendered_cells = Vec::new();
+        while let Ok(event) = app_event_rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                rendered_cells.push(lines_to_single_string(&cell.display_lines(/*width*/ 120)));
+            }
+        }
+        let rendered = rendered_cells
+            .into_iter()
+            .find(|cell| {
+                cell.contains(
+                    "Failed to refresh account state after manual account selection: model/list failed",
+                )
+            })
+            .expect("manual projection-refresh failure should emit an error history cell");
+        assert_snapshot!("manual_account_projection_refresh_error_message", rendered);
     }
 
     #[tokio::test]
@@ -8586,16 +9137,19 @@ mod tests {
         ])));
         let attempts_clone = Arc::clone(&attempts);
 
-        app.refresh_app_server_account_projection_after_auth_refresh_with(move || {
-            let attempts = Arc::clone(&attempts_clone);
-            async move {
-                attempts
-                    .lock()
-                    .await
-                    .pop_front()
-                    .expect("projection attempt should exist")
-            }
-        })
+        app.refresh_app_server_account_projection_after_local_auth_change_with(
+            AccountProjectionRefreshTrigger::AuthTokenRefresh,
+            move || {
+                let attempts = Arc::clone(&attempts_clone);
+                async move {
+                    attempts
+                        .lock()
+                        .await
+                        .pop_front()
+                        .expect("projection attempt should exist")
+                }
+            },
+        )
         .await;
 
         assert_eq!(
@@ -8638,16 +9192,19 @@ mod tests {
         ])));
         let attempts_clone = Arc::clone(&attempts);
 
-        app.refresh_app_server_account_projection_after_auth_refresh_with(move || {
-            let attempts = Arc::clone(&attempts_clone);
-            async move {
-                attempts
-                    .lock()
-                    .await
-                    .pop_front()
-                    .expect("projection attempt should exist")
-            }
-        })
+        app.refresh_app_server_account_projection_after_local_auth_change_with(
+            AccountProjectionRefreshTrigger::AuthTokenRefresh,
+            move || {
+                let attempts = Arc::clone(&attempts_clone);
+                async move {
+                    attempts
+                        .lock()
+                        .await
+                        .pop_front()
+                        .expect("projection attempt should exist")
+                }
+            },
+        )
         .await;
 
         assert_eq!(
