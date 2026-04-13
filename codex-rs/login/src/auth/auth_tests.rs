@@ -969,6 +969,35 @@ async fn terminal_refresh_failure_does_not_switch_to_wrong_workspace_fallback() 
 }
 
 #[test]
+fn set_active_account_rejects_mismatched_forced_workspace() {
+    let codex_home = tempdir().unwrap();
+    let active_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-primary", "org-fallback"], 0);
+    let fallback_store_account_id =
+        test_store_account_id("org-fallback").expect("fallback store account id");
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    manager.set_forced_chatgpt_workspace_id(Some("org-primary".to_string()));
+
+    let err = manager
+        .set_active_account(&fallback_store_account_id)
+        .expect_err("workspace-mismatched account should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("does not match required workspace \"org-primary\""),
+        "unexpected error: {err}"
+    );
+    let active_summary = manager
+        .active_chatgpt_account_summary()
+        .expect("active account should remain available");
+    assert_eq!(active_summary.store_account_id, active_store_account_id);
+}
+
+#[test]
 fn external_auth_tokens_without_chatgpt_metadata_cannot_seed_chatgpt_auth() {
     let err = AuthDotJson::from_external_tokens(
         &ExternalAuthTokens::access_token_only("test-access-token"),

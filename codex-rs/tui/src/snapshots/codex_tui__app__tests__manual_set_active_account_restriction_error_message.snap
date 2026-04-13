@@ -1,0 +1,5 @@
+---
+source: tui/src/app.rs
+expression: rendered
+---
+■ Failed to set active account: account 'chatgpt-user:user-account-b:workspace:account-b' does not match required workspace "account-a"

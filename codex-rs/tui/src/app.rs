@@ -196,6 +196,10 @@ fn format_account_display(label: Option<&str>, email: Option<&str>, fallback: &s
     }
 }
 
+fn auth_manager_from_config(config: &Config) -> Arc<AuthManager> {
+    AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
+}
+
 async fn best_effort_resume_history_turns(
     config: &Config,
     rollout_path: &Path,
@@ -1351,6 +1355,8 @@ impl App {
             .await?;
         self.apply_runtime_policy_overrides(&mut config);
         self.config = config;
+        self.auth_manager
+            .set_forced_chatgpt_workspace_id(self.config.forced_chatgpt_workspace_id.clone());
         self.chat_widget.sync_plugin_mentions_config(&self.config);
         self.chat_widget.refresh_plugin_mentions();
         Ok(())
@@ -4509,11 +4515,7 @@ impl App {
 
         let status_line_invalid_items_warned = Arc::new(AtomicBool::new(false));
         let terminal_title_invalid_items_warned = Arc::new(AtomicBool::new(false));
-        let auth_manager = Arc::new(AuthManager::new(
-            config.codex_home.clone(),
-            /*enable_codex_api_key_env*/ false,
-            config.cli_auth_credentials_store_mode,
-        ));
+        let auth_manager = auth_manager_from_config(&config);
 
         let enhanced_keys_supported = tui.enhanced_keys_supported();
         let wait_for_initial_session_configured =
@@ -7472,7 +7474,6 @@ mod tests {
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
     use codex_login::AccountUsageCache;
-    use codex_login::AuthManager;
     use codex_login::AuthStore;
     use codex_login::StoredAccount;
     use codex_login::save_auth;
@@ -11719,11 +11720,7 @@ guardian_approval = true
             session_telemetry,
             app_event_tx,
             chat_widget,
-            auth_manager: Arc::new(AuthManager::new(
-                config.codex_home.clone(),
-                false,
-                config.cli_auth_credentials_store_mode,
-            )),
+            auth_manager: auth_manager_from_config(&config),
             config,
             active_profile: None,
             cli_kv_overrides: Vec::new(),
@@ -11786,11 +11783,7 @@ guardian_approval = true
                 session_telemetry,
                 app_event_tx,
                 chat_widget,
-                auth_manager: Arc::new(AuthManager::new(
-                    config.codex_home.clone(),
-                    false,
-                    config.cli_auth_credentials_store_mode,
-                )),
+                auth_manager: auth_manager_from_config(&config),
                 config,
                 active_profile: None,
                 cli_kv_overrides: Vec::new(),
@@ -11895,11 +11888,7 @@ guardian_approval = true
             app.config.cli_auth_credentials_store_mode,
         )
         .expect("save auth store");
-        app.auth_manager = Arc::new(AuthManager::new(
-            app.config.codex_home.clone(),
-            false,
-            app.config.cli_auth_credentials_store_mode,
-        ));
+        app.auth_manager = auth_manager_from_config(&app.config);
         app.auth_manager
             .reload_strict()
             .expect("reload seeded auth store");
@@ -11956,11 +11945,93 @@ guardian_approval = true
             app.config.cli_auth_credentials_store_mode,
         )
         .expect("save auth store");
-        app.auth_manager = Arc::new(AuthManager::new(
-            app.config.codex_home.clone(),
-            false,
-            app.config.cli_auth_credentials_store_mode,
-        ));
+        app.auth_manager = auth_manager_from_config(&app.config);
+        app.auth_manager
+            .reload_strict()
+            .expect("reload seeded auth store");
+    }
+
+    #[tokio::test]
+    async fn refresh_in_memory_config_from_disk_reapplies_forced_workspace_to_auth_manager()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let config_path = app.config.active_user_config_path()?;
+        app.auth_manager
+            .set_forced_chatgpt_workspace_id(Some("stale-workspace".to_string()));
+        std::fs::write(
+            config_path,
+            "forced_chatgpt_workspace_id = \"fresh-workspace\"\n",
+        )?;
+
+        app.refresh_in_memory_config_from_disk().await?;
+
+        assert_eq!(
+            app.auth_manager.forced_chatgpt_workspace_id(),
+            Some("fresh-workspace".to_string())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_set_active_account_rejects_wrong_workspace_and_preserves_state() -> Result<()> {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let config_path = app.config.active_user_config_path()?;
+        std::fs::write(config_path, "forced_chatgpt_workspace_id = \"account-a\"\n")?;
+        app.refresh_in_memory_config_from_disk().await?;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let active_store_account_id_before_switch = app
+            .auth_manager
+            .active_chatgpt_account_summary()
+            .expect("active account should be seeded")
+            .store_account_id;
+        let blocked_account_id = app
+            .auth_manager
+            .list_accounts()
+            .into_iter()
+            .find(|account| !account.is_active)
+            .map(|account| account.id)
+            .expect("seeded fallback account should exist");
+        while app_event_rx.try_recv().is_ok() {}
+
+        let err = app
+            .auth_manager
+            .set_active_account(&blocked_account_id)
+            .expect_err("workspace-mismatched account should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("does not match required workspace \"account-a\""),
+            "unexpected error: {err}"
+        );
+        let active_summary = app
+            .auth_manager
+            .active_chatgpt_account_summary()
+            .expect("active account should remain available");
+        assert_eq!(
+            active_summary.store_account_id,
+            active_store_account_id_before_switch
+        );
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+        app.chat_widget
+            .add_error_message(format!("Failed to set active account: {err}"));
+        let cell = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected set-active-account error history cell, saw {other:?}"),
+        };
+        let rendered = cell
+            .display_lines(/*width*/ 120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_snapshot!(
+            "manual_set_active_account_restriction_error_message",
+            rendered
+        );
+        Ok(())
     }
 
     fn test_thread_session(thread_id: ThreadId, cwd: PathBuf) -> ThreadSessionState {

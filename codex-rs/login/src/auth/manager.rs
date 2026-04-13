@@ -1633,9 +1633,17 @@ impl AuthManager {
     }
 
     pub fn set_active_account(&self, id: &str) -> std::io::Result<()> {
+        let required_workspace_id = self.forced_chatgpt_workspace_id();
         self.update_store(|store| {
-            if !store.accounts.iter().any(|account| account.id == id) {
+            let Some(account) = store.accounts.iter().find(|account| account.id == id) else {
                 return Err(std::io::Error::other(format!("account '{id}' not found")));
+            };
+            if !account_matches_required_workspace(account, required_workspace_id.as_deref())
+                && let Some(required_workspace_id) = required_workspace_id.as_deref()
+            {
+                return Err(std::io::Error::other(format!(
+                    "account '{id}' does not match required workspace {required_workspace_id:?}"
+                )));
             }
             store.active_account_id = Some(id.to_string());
             if let Some(account) = store.accounts.iter_mut().find(|account| account.id == id) {
