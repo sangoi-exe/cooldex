@@ -118,6 +118,19 @@ pub(crate) struct AppServerBootstrap {
     pub(crate) available_models: Vec<ModelPreset>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AppServerAccountProjection {
+    pub(crate) account_email: Option<String>,
+    pub(crate) auth_mode: Option<TelemetryAuthMode>,
+    pub(crate) status_account_display: Option<StatusAccountDisplay>,
+    pub(crate) plan_type: Option<codex_protocol::account::PlanType>,
+    pub(crate) requires_openai_auth: bool,
+    pub(crate) default_model: String,
+    pub(crate) feedback_audience: FeedbackAudience,
+    pub(crate) has_chatgpt_account: bool,
+    pub(crate) available_models: Vec<ModelPreset>,
+}
+
 pub(crate) struct AppServerSession {
     client: AppServerClient,
     next_request_id: i64,
@@ -186,7 +199,7 @@ impl AppServerSession {
         matches!(self.client, AppServerClient::Remote(_))
     }
 
-    pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
+    pub(crate) async fn load_account_projection(&mut self) -> Result<AppServerAccountProjection> {
         let account = self.read_account().await?;
         let model_request_id = self.next_request_id();
         let models: ModelListResponse = self
@@ -200,82 +213,38 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("model/list failed during TUI bootstrap")?;
+            .wrap_err("model/list failed while loading TUI account projection")?;
         let available_models = models
             .data
             .into_iter()
             .map(model_preset_from_api_model)
             .collect::<Vec<_>>();
+        build_account_projection(account, available_models)
+    }
+
+    pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
+        let projection = self.load_account_projection().await?;
         let default_model = config
             .model
             .clone()
-            .or_else(|| {
-                available_models
-                    .iter()
-                    .find(|model| model.is_default)
-                    .map(|model| model.model.clone())
-            })
-            .or_else(|| available_models.first().map(|model| model.model.clone()))
-            .wrap_err("model/list returned no models for TUI bootstrap")?;
-
-        let (
-            account_email,
-            auth_mode,
-            status_account_display,
-            plan_type,
-            feedback_audience,
-            has_chatgpt_account,
-        ) = match account.account {
-            Some(Account::ApiKey {}) => (
-                None,
-                Some(TelemetryAuthMode::ApiKey),
-                Some(StatusAccountDisplay::ApiKey),
-                None,
-                FeedbackAudience::External,
-                false,
-            ),
-            Some(Account::Chatgpt {
-                label,
-                email,
-                plan_type,
-            }) => {
-                let feedback_audience = if email.ends_with("@openai.com") {
-                    FeedbackAudience::OpenAiEmployee
-                } else {
-                    FeedbackAudience::External
-                };
-                (
-                    Some(email.clone()),
-                    Some(TelemetryAuthMode::Chatgpt),
-                    Some(StatusAccountDisplay::ChatGpt {
-                        label,
-                        email: Some(email),
-                        plan: Some(plan_type_display_name(plan_type)),
-                    }),
-                    Some(plan_type),
-                    feedback_audience,
-                    true,
-                )
-            }
-            None => (None, None, None, None, FeedbackAudience::External, false),
-        };
+            .unwrap_or_else(|| projection.default_model.clone());
         Ok(AppServerBootstrap {
-            account_email,
-            auth_mode,
-            status_account_display,
-            plan_type,
-            requires_openai_auth: account.requires_openai_auth,
+            account_email: projection.account_email,
+            auth_mode: projection.auth_mode,
+            status_account_display: projection.status_account_display,
+            plan_type: projection.plan_type,
+            requires_openai_auth: projection.requires_openai_auth,
             default_model,
-            feedback_audience,
-            has_chatgpt_account,
-            available_models,
+            feedback_audience: projection.feedback_audience,
+            has_chatgpt_account: projection.has_chatgpt_account,
+            available_models: projection.available_models,
         })
     }
 
     /// Fetches the current account info without refreshing the auth token.
     ///
-    /// Used by both `bootstrap` (to populate the initial UI) and `get_login_status`
-    /// (to check auth mode without the overhead of a full bootstrap).
+    /// Used by bootstrap, live account-projection refresh, and `get_login_status`
+    /// without the overhead of a token refresh.
     pub(crate) async fn read_account(&mut self) -> Result<GetAccountResponse> {
         let account_request_id = self.next_request_id();
         self.client
@@ -286,7 +255,7 @@ impl AppServerSession {
                 },
             })
             .await
-            .wrap_err("account/read failed during TUI bootstrap")
+            .wrap_err("account/read failed while loading TUI account state")
     }
 
     pub(crate) async fn next_event(&mut self) -> Option<AppServerEvent> {
@@ -757,6 +726,64 @@ impl AppServerSession {
     }
 }
 
+fn build_account_projection(
+    account: GetAccountResponse,
+    available_models: Vec<ModelPreset>,
+) -> Result<AppServerAccountProjection> {
+    let default_model = available_models
+        .iter()
+        .find(|model| model.is_default)
+        .map(|model| model.model.clone())
+        .or_else(|| available_models.first().map(|model| model.model.clone()))
+        .wrap_err("model/list returned no models while loading TUI account projection")?;
+    let (
+        account_email,
+        auth_mode,
+        status_account_display,
+        plan_type,
+        feedback_audience,
+        has_chatgpt_account,
+    ) = match account.account {
+        Some(Account::ApiKey {}) => (
+            None,
+            Some(TelemetryAuthMode::ApiKey),
+            Some(StatusAccountDisplay::ApiKey),
+            None,
+            FeedbackAudience::External,
+            false,
+        ),
+        Some(Account::Chatgpt {
+            label,
+            email,
+            plan_type,
+        }) => (
+            Some(email.clone()),
+            Some(TelemetryAuthMode::Chatgpt),
+            Some(StatusAccountDisplay::ChatGpt {
+                label,
+                email: Some(email.clone()),
+                plan: Some(plan_type_display_name(plan_type)),
+            }),
+            Some(plan_type),
+            feedback_audience_from_account_email(Some(email.as_str())),
+            true,
+        ),
+        None => (None, None, None, None, FeedbackAudience::External, false),
+    };
+    Ok(AppServerAccountProjection {
+        account_email,
+        auth_mode,
+        status_account_display,
+        plan_type,
+        requires_openai_auth: account.requires_openai_auth,
+        default_model,
+        feedback_audience,
+        has_chatgpt_account,
+        available_models,
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn status_account_display_from_auth_mode(
     auth_mode: Option<AuthMode>,
     label: Option<String>,
@@ -1901,5 +1928,68 @@ mod tests {
                 plan: Some(ref plan),
             }) if plan == "Business"
         ));
+    }
+
+    #[test]
+    fn build_account_projection_preserves_chatgpt_identity_fields() {
+        let projection = build_account_projection(
+            GetAccountResponse {
+                account: Some(Account::Chatgpt {
+                    label: Some("Alice".to_string()),
+                    email: "alice@openai.com".to_string(),
+                    plan_type: codex_protocol::account::PlanType::Pro,
+                }),
+                requires_openai_auth: true,
+            },
+            codex_core::test_support::all_model_presets().clone(),
+        )
+        .expect("projection should build");
+
+        assert_eq!(
+            projection.account_email,
+            Some("alice@openai.com".to_string())
+        );
+        assert_eq!(projection.auth_mode, Some(TelemetryAuthMode::Chatgpt));
+        assert_eq!(
+            projection.plan_type,
+            Some(codex_protocol::account::PlanType::Pro)
+        );
+        assert_eq!(
+            projection.feedback_audience,
+            FeedbackAudience::OpenAiEmployee
+        );
+        assert!(projection.has_chatgpt_account);
+        assert!(projection.requires_openai_auth);
+        assert!(
+            projection
+                .available_models
+                .iter()
+                .any(|model| model.model == projection.default_model)
+        );
+        assert!(matches!(
+            projection.status_account_display,
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(ref label),
+                email: Some(ref email),
+                plan: Some(ref plan),
+            }) if label == "Alice" && email == "alice@openai.com" && plan == "Pro"
+        ));
+    }
+
+    #[test]
+    fn build_account_projection_rejects_empty_models() {
+        let err = build_account_projection(
+            GetAccountResponse {
+                account: Some(Account::ApiKey {}),
+                requires_openai_auth: false,
+            },
+            Vec::new(),
+        )
+        .expect_err("empty models should fail loud");
+
+        assert!(
+            err.to_string()
+                .contains("model/list returned no models while loading TUI account projection")
+        );
     }
 }

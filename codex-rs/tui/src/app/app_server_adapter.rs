@@ -20,11 +20,9 @@ use crate::app_command::AppCommand;
 use crate::app_event::AppEvent;
 use crate::app_server_session::AppServerSession;
 use crate::app_server_session::app_server_rate_limit_snapshot_to_core;
-use crate::app_server_session::status_account_display_from_auth_mode;
 #[cfg(test)]
 use crate::exec_command::split_command_string;
 use codex_app_server_client::AppServerEvent;
-use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
@@ -132,7 +130,7 @@ impl App {
 
     pub(super) async fn handle_app_server_event(
         &mut self,
-        app_server_client: &AppServerSession,
+        app_server_client: &mut AppServerSession,
         event: AppServerEvent,
     ) {
         match event {
@@ -162,7 +160,7 @@ impl App {
 
     async fn handle_server_notification_event(
         &mut self,
-        _app_server_client: &AppServerSession,
+        app_server_client: &mut AppServerSession,
         notification: ServerNotification,
     ) {
         match &notification {
@@ -177,23 +175,20 @@ impl App {
                 self.chat_widget.on_rate_limit_snapshot(Some(
                     app_server_rate_limit_snapshot_to_core(notification.rate_limits.clone()),
                 ));
-                self.maybe_sync_active_account_state_from_auth_manager();
+                self.maybe_reconcile_active_account_from_auth_manager();
                 return;
             }
-            ServerNotification::AccountUpdated(notification) => {
-                self.handle_app_server_account_updated(
-                    status_account_display_from_auth_mode(
-                        notification.auth_mode,
-                        notification.label.clone(),
-                        notification.plan_type,
-                    ),
-                    notification.plan_type,
-                    matches!(
-                        notification.auth_mode,
-                        Some(AuthMode::Chatgpt) | Some(AuthMode::ChatgptAuthTokens)
-                    ),
-                );
-                self.maybe_sync_active_account_state_from_auth_manager();
+            ServerNotification::AccountUpdated(_) => {
+                match app_server_client.load_account_projection().await {
+                    Ok(projection) => self.finish_app_server_account_projection_refresh(projection),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to refresh app-server account projection after account update"
+                        );
+                        self.report_app_server_account_projection_refresh_error(err.to_string());
+                    }
+                }
                 return;
             }
             _ => {}
@@ -231,7 +226,7 @@ impl App {
 
     async fn handle_server_request_event(
         &mut self,
-        app_server_client: &AppServerSession,
+        app_server_client: &mut AppServerSession,
         request: ServerRequest,
     ) {
         if let Some(unsupported) = self

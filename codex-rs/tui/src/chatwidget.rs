@@ -11145,6 +11145,25 @@ impl ChatWidget {
         self.model_catalog.clone()
     }
 
+    pub(crate) fn apply_model_catalog_refresh(
+        &mut self,
+        model_catalog: Arc<ModelCatalog>,
+        default_model: &str,
+    ) {
+        let current_model = self.current_model().to_string();
+        let current_model_missing = model_catalog.try_list_models().ok().is_none_or(|models| {
+            models
+                .into_iter()
+                .all(|preset| preset.model != current_model)
+        });
+        self.model_catalog = model_catalog;
+        if current_model_missing {
+            self.set_model(default_model);
+        } else {
+            self.refresh_model_dependent_surfaces();
+        }
+    }
+
     pub(crate) fn current_plan_type(&self) -> Option<PlanType> {
         self.plan_type
     }

@@ -11,6 +11,7 @@ use crate::app_event::RealtimeAudioDeviceKind;
 use crate::app_event::WindowsSandboxEnableMode;
 use crate::app_event_sender::AppEventSender;
 use crate::app_server_approval_conversions::network_approval_context_to_core;
+use crate::app_server_session::AppServerAccountProjection;
 use crate::app_server_session::AppServerSession;
 use crate::app_server_session::AppServerStartedThread;
 use crate::app_server_session::ThreadSessionState;
@@ -1210,7 +1211,14 @@ pub(crate) struct App {
     pending_forced_accounts_status_refresh: bool,
     open_accounts_popup_when_cache_ready: bool,
     observed_active_store_account_id: Option<String>,
+    live_account_state_owner: LiveAccountStateOwner,
     pending_app_server_requests: PendingAppServerRequests,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveAccountStateOwner {
+    AppServerProjection,
+    AuthManager,
 }
 
 #[derive(Default)]
@@ -1847,29 +1855,58 @@ impl App {
     // rate-limit generation state in sync so stale refresh results never repopulate the next
     // account's `/status` cache or suppress its warnings.
     fn handle_active_account_changed(&mut self) {
+        self.live_account_state_owner = LiveAccountStateOwner::AuthManager;
         self.refresh_observed_active_store_account_id();
         self.recompute_accounts_status_cache_expiry(Utc::now());
         self.sync_chat_widget_account_state_from_auth_manager();
     }
 
-    fn maybe_sync_active_account_state_from_auth_manager(&mut self) {
+    fn maybe_reconcile_active_account_from_auth_manager(&mut self) {
         if self.refresh_observed_active_store_account_id() {
             self.recompute_accounts_status_cache_expiry(Utc::now());
-            self.sync_chat_widget_account_state_from_auth_manager();
+            if self.live_account_state_owner == LiveAccountStateOwner::AuthManager {
+                self.sync_chat_widget_account_state_from_auth_manager();
+            }
         }
     }
 
-    fn handle_app_server_account_updated(
+    fn build_model_catalog(
+        config: &Config,
+        available_models: Vec<ModelPreset>,
+    ) -> Arc<ModelCatalog> {
+        Arc::new(ModelCatalog::new(
+            available_models,
+            CollaborationModesConfig {
+                default_mode_request_user_input: config
+                    .features
+                    .enabled(Feature::DefaultModeRequestUserInput),
+            },
+        ))
+    }
+
+    fn finish_app_server_account_projection_refresh(
         &mut self,
-        status_account_display: Option<StatusAccountDisplay>,
-        plan_type: Option<PlanType>,
-        has_chatgpt_account: bool,
+        projection: AppServerAccountProjection,
     ) {
+        let model_catalog = Self::build_model_catalog(&self.config, projection.available_models);
+        self.feedback_audience = projection.feedback_audience;
+        self.model_catalog = model_catalog.clone();
+        self.chat_widget
+            .apply_model_catalog_refresh(model_catalog, &projection.default_model);
         self.apply_chat_widget_account_state(
-            status_account_display,
-            plan_type,
-            has_chatgpt_account,
+            projection.status_account_display,
+            projection.plan_type,
+            projection.has_chatgpt_account,
         );
+        self.live_account_state_owner = LiveAccountStateOwner::AppServerProjection;
+        self.refresh_observed_active_store_account_id();
+        self.recompute_accounts_status_cache_expiry(Utc::now());
+    }
+
+    fn report_app_server_account_projection_refresh_error(&mut self, error_message: String) {
+        self.chat_widget.add_error_message(format!(
+            "Failed to refresh account state after account update: {error_message}"
+        ));
     }
 
     fn apply_chat_widget_account_state(
@@ -4394,14 +4431,7 @@ impl App {
         if let Some(updated_model) = config.model.clone() {
             model = updated_model;
         }
-        let model_catalog = Arc::new(ModelCatalog::new(
-            available_models.clone(),
-            CollaborationModesConfig {
-                default_mode_request_user_input: config
-                    .features
-                    .enabled(Feature::DefaultModeRequestUserInput),
-            },
-        ));
+        let model_catalog = Self::build_model_catalog(&config, available_models.clone());
         let feedback_audience = bootstrap.feedback_audience;
         let auth_mode = bootstrap.auth_mode;
         let has_chatgpt_account = bootstrap.has_chatgpt_account;
@@ -4605,6 +4635,7 @@ impl App {
             pending_forced_accounts_status_refresh: false,
             open_accounts_popup_when_cache_ready: false,
             observed_active_store_account_id,
+            live_account_state_owner: LiveAccountStateOwner::AppServerProjection,
             pending_app_server_requests: PendingAppServerRequests::default(),
         };
         if let Some(started) = initial_started_thread {
@@ -4727,7 +4758,7 @@ impl App {
                     }
                     app_server_event = app_server.next_event(), if listen_for_app_server_events => {
                         match app_server_event {
-                            Some(event) => app.handle_app_server_event(&app_server, event).await,
+                            Some(event) => app.handle_app_server_event(&mut app_server, event).await,
                             None => {
                                 listen_for_app_server_events = false;
                                 tracing::warn!("app-server event stream closed");
@@ -6685,7 +6716,7 @@ impl App {
         }
         self.handle_backtrack_event(&event.msg);
         self.chat_widget.handle_codex_event(event);
-        self.maybe_sync_active_account_state_from_auth_manager();
+        self.maybe_reconcile_active_account_from_auth_manager();
 
         if needs_refresh {
             self.refresh_status_line();
@@ -6757,7 +6788,7 @@ impl App {
                 self.handle_feedback_thread_event(event);
             }
         }
-        self.maybe_sync_active_account_state_from_auth_manager();
+        self.maybe_reconcile_active_account_from_auth_manager();
         if needs_refresh {
             self.refresh_status_line();
         }
@@ -7836,8 +7867,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_app_server_account_updated_invalidates_rate_limit_state() {
+    async fn handle_thread_event_now_preserves_app_server_projection_after_auth_manager_account_change()
+     {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let available_models = all_model_presets();
+        let default_model = available_models
+            .iter()
+            .find(|model| model.is_default)
+            .unwrap_or(&available_models[0])
+            .model
+            .clone();
+
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@openai.com",
+            PlanType::Plus,
+            available_models,
+            default_model,
+        ));
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Ok(AppEvent::RefreshRateLimits {
+                origin: RateLimitRefreshOrigin::StartupPrefetch,
+                account_generation: 1,
+            })
+        );
+
+        let switched_account_id = app
+            .auth_manager
+            .list_accounts()
+            .into_iter()
+            .find(|account| account.label.as_deref() == Some("Secondary"))
+            .map(|account| account.id)
+            .expect("secondary account should exist");
+        app.auth_manager
+            .set_active_account(&switched_account_id)
+            .expect("switch active account");
+        app.handle_thread_event_now(ThreadBufferedEvent::Notification(
+            turn_started_notification(ThreadId::new(), "turn-1"),
+        ));
+
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(switched_account_id)
+        );
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == "Server Account" && email == "server@openai.com" && plan == "Plus"
+        ));
+        assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
+        assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
+        assert_eq!(app.chat_widget.rate_limit_account_generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn finish_app_server_account_projection_refresh_preserves_email_and_invalidates_rate_limit_state()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
         app.chat_widget
             .on_rate_limit_snapshot(Some(RateLimitSnapshot {
                 limit_id: Some("codex".to_string()),
@@ -7851,26 +7951,32 @@ mod tests {
                 credits: None,
                 plan_type: None,
             }));
+        let available_models = all_model_presets();
+        let default_model = available_models
+            .iter()
+            .find(|model| model.is_default)
+            .unwrap_or(&available_models[0])
+            .model
+            .clone();
 
-        app.handle_app_server_account_updated(
-            Some(StatusAccountDisplay::ChatGpt {
-                label: Some("Server Account".to_string()),
-                email: None,
-                plan: Some("Plus".to_string()),
-            }),
-            Some(PlanType::Plus),
-            true,
-        );
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@openai.com",
+            PlanType::Plus,
+            available_models,
+            default_model,
+        ));
 
         assert!(matches!(
             app.chat_widget.status_account_display(),
             Some(StatusAccountDisplay::ChatGpt {
                 label: Some(label),
-                email: None,
+                email: Some(email),
                 plan: Some(plan),
-            }) if label == "Server Account" && plan == "Plus"
+            }) if label == "Server Account" && email == "server@openai.com" && plan == "Plus"
         ));
         assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
+        assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
         assert_eq!(app.chat_widget.rate_limit_snapshot_count(), 0);
         assert_matches!(
             app_event_rx.try_recv(),
@@ -7879,6 +7985,80 @@ mod tests {
                 account_generation: 1,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn finish_app_server_account_projection_refresh_replaces_catalog_atomically_and_falls_back_to_default_model()
+     {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let available_models = all_model_presets();
+        let default_model = available_models
+            .iter()
+            .find(|model| model.is_default)
+            .unwrap_or(&available_models[0])
+            .model
+            .clone();
+        app.chat_widget.set_model("missing-after-refresh");
+
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@example.com",
+            PlanType::Plus,
+            available_models,
+            default_model.clone(),
+        ));
+
+        assert_eq!(app.chat_widget.current_model(), default_model);
+        assert!(Arc::ptr_eq(
+            &app.model_catalog,
+            &app.chat_widget.model_catalog()
+        ));
+    }
+
+    #[tokio::test]
+    async fn report_app_server_account_projection_refresh_error_keeps_last_good_state_and_emits_error()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let original_label = "Original".to_string();
+        let original_email = "original@example.com".to_string();
+        let original_plan = "Plus".to_string();
+        app.chat_widget.update_account_state(
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(original_label.clone()),
+                email: Some(original_email.clone()),
+                plan: Some(original_plan.clone()),
+            }),
+            Some(PlanType::Plus),
+            true,
+        );
+        app.feedback_audience = FeedbackAudience::OpenAiEmployee;
+        let original_model_catalog = app.model_catalog.clone();
+        let original_model = app.chat_widget.current_model().to_string();
+
+        app.report_app_server_account_projection_refresh_error("model/list failed".to_string());
+
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == &original_label && email == &original_email && plan == &original_plan
+        ));
+        assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
+        assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
+        assert!(Arc::ptr_eq(&app.model_catalog, &original_model_catalog));
+        assert_eq!(app.chat_widget.current_model(), original_model);
+
+        let mut rendered_cells = Vec::new();
+        while let Ok(event) = app_event_rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                rendered_cells.push(lines_to_single_string(&cell.display_lines(/*width*/ 120)));
+            }
+        }
+        assert!(rendered_cells.iter().any(|cell| {
+            cell.contains("Failed to refresh account state after account update: model/list failed")
+        }));
     }
 
     #[tokio::test]
@@ -11546,6 +11726,7 @@ guardian_approval = true
             pending_forced_accounts_status_refresh: false,
             open_accounts_popup_when_cache_ready: false,
             observed_active_store_account_id: None,
+            live_account_state_owner: LiveAccountStateOwner::AppServerProjection,
             pending_app_server_requests: PendingAppServerRequests::default(),
         }
     }
@@ -11612,6 +11793,7 @@ guardian_approval = true
                 pending_forced_accounts_status_refresh: false,
                 open_accounts_popup_when_cache_ready: false,
                 observed_active_store_account_id: None,
+                live_account_state_owner: LiveAccountStateOwner::AppServerProjection,
                 pending_app_server_requests: PendingAppServerRequests::default(),
             },
             rx,
@@ -12245,6 +12427,32 @@ guardian_approval = true
 
     fn all_model_presets() -> Vec<ModelPreset> {
         codex_core::test_support::all_model_presets().clone()
+    }
+
+    fn test_chatgpt_account_projection(
+        label: &str,
+        email: &str,
+        plan_type: PlanType,
+        available_models: Vec<ModelPreset>,
+        default_model: String,
+    ) -> AppServerAccountProjection {
+        AppServerAccountProjection {
+            account_email: Some(email.to_string()),
+            auth_mode: Some(codex_otel::TelemetryAuthMode::Chatgpt),
+            status_account_display: Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label.to_string()),
+                email: Some(email.to_string()),
+                plan: Some(crate::status::plan_type_display_name(plan_type)),
+            }),
+            plan_type: Some(plan_type),
+            requires_openai_auth: true,
+            default_model,
+            feedback_audience: crate::app_server_session::feedback_audience_from_account_email(
+                Some(email),
+            ),
+            has_chatgpt_account: true,
+            available_models,
+        }
     }
 
     fn model_availability_nux_config(shown_count: &[(&str, u32)]) -> ModelAvailabilityNuxConfig {
