@@ -253,6 +253,22 @@ impl App {
             return;
         }
 
+        if let Some((request_id, reason)) = direct_threadless_app_server_request_rejection(&request)
+        {
+            tracing::warn!(
+                request_id = ?request_id,
+                message = reason,
+                "rejecting threadless app-server request"
+            );
+            if let Err(err) = self
+                .reject_app_server_request(app_server_client, request_id, reason)
+                .await
+            {
+                tracing::warn!("{err}");
+            }
+            return;
+        }
+
         let Some(thread_id) = server_request_thread_id(&request) else {
             tracing::warn!("ignoring threadless app-server request");
             return;
@@ -306,6 +322,19 @@ impl App {
             )
             .await
             .map_err(|err| format!("failed to reject app-server request: {err}"))
+    }
+}
+
+fn direct_threadless_app_server_request_rejection(
+    request: &ServerRequest,
+) -> Option<(codex_app_server_protocol::RequestId, String)> {
+    match request {
+        ServerRequest::ChatgptAuthTokensRefresh { request_id, .. } => Some((
+            request_id.clone(),
+            "threadless app-server request `account/chatgptAuthTokens/refresh` is not owned by the TUI runtime"
+                .to_string(),
+        )),
+        _ => None,
     }
 }
 
@@ -1097,6 +1126,7 @@ fn app_server_codex_error_info_to_core(
 #[cfg(test)]
 mod tests {
     use super::command_execution_started_event;
+    use super::direct_threadless_app_server_request_rejection;
     use super::immediate_app_server_request_command;
     use super::server_notification_thread_events;
     use super::thread_snapshot_events;
@@ -1232,6 +1262,45 @@ mod tests {
             });
 
         assert_eq!(command, None);
+    }
+
+    #[test]
+    fn chatgpt_auth_refresh_requests_build_direct_threadless_rejects() {
+        let rejection = direct_threadless_app_server_request_rejection(
+            &ServerRequest::ChatgptAuthTokensRefresh {
+                request_id: AppServerRequestId::Integer(89),
+                params: codex_app_server_protocol::ChatgptAuthTokensRefreshParams {
+                    reason: codex_app_server_protocol::ChatgptAuthTokensRefreshReason::Unauthorized,
+                    previous_account_id: Some("workspace-1".to_string()),
+                },
+            },
+        );
+
+        assert_eq!(
+            rejection,
+            Some((
+                AppServerRequestId::Integer(89),
+                "threadless app-server request `account/chatgptAuthTokens/refresh` is not owned by the TUI runtime"
+                    .to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn non_refresh_requests_do_not_build_direct_threadless_rejects() {
+        let rejection =
+            direct_threadless_app_server_request_rejection(&ServerRequest::DynamicToolCall {
+                request_id: AppServerRequestId::Integer(90),
+                params: DynamicToolCallParams {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    call_id: "tool-1".to_string(),
+                    tool: "lookup_ticket".to_string(),
+                    arguments: json!({ "id": "123" }),
+                },
+            });
+
+        assert_eq!(rejection, None);
     }
 
     #[test]
