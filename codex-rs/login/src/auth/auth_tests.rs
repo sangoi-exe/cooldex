@@ -585,6 +585,63 @@ fn cooldown_still_purges_freshly_unsupported_fallbacks_and_marks_failing_account
 }
 
 #[test]
+fn select_account_for_auto_switch_prefers_lower_primary_usage_when_weekly_ties() {
+    let now = Utc::now();
+    let stronger_store_account_id =
+        test_store_account_id("org-stronger").expect("stronger store account id");
+    let store = AuthStore {
+        accounts: vec![
+            stored_test_chatgpt_account_with_usage("org-weaker", 80.0, 20.0, now),
+            stored_test_chatgpt_account_with_usage("org-stronger", 20.0, 20.0, now),
+        ],
+        ..AuthStore::default()
+    };
+
+    assert_eq!(
+        super::select_account_for_auto_switch_from_store(&store, None, None, now).as_deref(),
+        Some(stronger_store_account_id.as_str())
+    );
+}
+
+#[test]
+fn select_account_for_auto_switch_prefers_lower_weekly_usage_when_primary_ties() {
+    let now = Utc::now();
+    let stronger_store_account_id =
+        test_store_account_id("org-stronger").expect("stronger store account id");
+    let store = AuthStore {
+        accounts: vec![
+            stored_test_chatgpt_account_with_usage("org-weaker", 20.0, 80.0, now),
+            stored_test_chatgpt_account_with_usage("org-stronger", 20.0, 20.0, now),
+        ],
+        ..AuthStore::default()
+    };
+
+    assert_eq!(
+        super::select_account_for_auto_switch_from_store(&store, None, None, now).as_deref(),
+        Some(stronger_store_account_id.as_str())
+    );
+}
+
+#[test]
+fn select_account_for_auto_switch_prefers_primary_headroom_before_weekly_headroom() {
+    let now = Utc::now();
+    let stronger_store_account_id =
+        test_store_account_id("org-primary-favored").expect("stronger store account id");
+    let store = AuthStore {
+        accounts: vec![
+            stored_test_chatgpt_account_with_usage("org-weekly-favored", 95.0, 90.0, now),
+            stored_test_chatgpt_account_with_usage("org-primary-favored", 10.0, 20.0, now),
+        ],
+        ..AuthStore::default()
+    };
+
+    assert_eq!(
+        super::select_account_for_auto_switch_from_store(&store, None, None, now).as_deref(),
+        Some(stronger_store_account_id.as_str())
+    );
+}
+
+#[test]
 fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
     let codex_home = tempdir().unwrap();
     write_auth_file(
@@ -1234,6 +1291,48 @@ fn stored_test_chatgpt_account(
         tokens,
         last_refresh,
         usage: None,
+    }
+}
+
+fn stored_test_chatgpt_account_with_usage(
+    chatgpt_account_id: &str,
+    primary_used_percent: f64,
+    weekly_used_percent: f64,
+    captured_at: DateTime<Utc>,
+) -> StoredAccount {
+    let mut account = stored_test_chatgpt_account(chatgpt_account_id, Some(captured_at));
+    account.usage = Some(AccountUsageCache {
+        last_rate_limits: Some(test_rate_limit_snapshot(
+            primary_used_percent,
+            weekly_used_percent,
+            captured_at,
+        )),
+        exhausted_until: None,
+        last_seen_at: Some(captured_at),
+    });
+    account
+}
+
+fn test_rate_limit_snapshot(
+    primary_used_percent: f64,
+    weekly_used_percent: f64,
+    captured_at: DateTime<Utc>,
+) -> RateLimitSnapshot {
+    RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent: primary_used_percent,
+            window_minutes: Some(300),
+            resets_at: Some((captured_at + chrono::Duration::hours(5)).timestamp()),
+        }),
+        secondary: Some(RateLimitWindow {
+            used_percent: weekly_used_percent,
+            window_minutes: None,
+            resets_at: Some((captured_at + chrono::Duration::days(7)).timestamp()),
+        }),
+        credits: None,
+        plan_type: Some(AccountPlanType::Pro),
     }
 }
 

@@ -1037,7 +1037,6 @@ fn validate_external_access_token_claims(
     Ok(token_info)
 }
 
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -3096,18 +3095,21 @@ fn select_account_for_auto_switch_from_store(
     candidates.first().map(|account| account.id.clone())
 }
 
+// Merge-safety anchor: saved-account usage-limit auto-switch ranking must prefer the fallback
+// most likely to survive the immediate retry: primary-window headroom first, then weekly
+// headroom, then bounded tie-breakers.
 fn compare_auto_switch_candidates(a: &StoredAccount, b: &StoredAccount) -> std::cmp::Ordering {
     let a_snapshot = a.usage.as_ref().and_then(|u| u.last_rate_limits.as_ref());
     let b_snapshot = b.usage.as_ref().and_then(|u| u.last_rate_limits.as_ref());
+
+    let (a_primary_kind, a_primary_used) = primary_used_percent_rank(a_snapshot);
+    let (b_primary_kind, b_primary_used) = primary_used_percent_rank(b_snapshot);
 
     let (a_weekly_kind, a_weekly_used) = weekly_used_percent_rank(a_snapshot);
     let (b_weekly_kind, b_weekly_used) = weekly_used_percent_rank(b_snapshot);
 
     let (a_credit_kind, a_balance) = credits_balance_rank(a_snapshot);
     let (b_credit_kind, b_balance) = credits_balance_rank(b_snapshot);
-
-    let (a_primary_kind, a_primary_used) = primary_used_percent_rank(a_snapshot);
-    let (b_primary_kind, b_primary_used) = primary_used_percent_rank(b_snapshot);
 
     let a_last_seen = a
         .usage
@@ -3121,22 +3123,22 @@ fn compare_auto_switch_candidates(a: &StoredAccount, b: &StoredAccount) -> std::
         .map_or(i64::MIN, |dt| dt.timestamp());
 
     (
+        a_primary_kind,
+        a_primary_used,
         a_weekly_kind,
-        Reverse(a_weekly_used),
+        a_weekly_used,
         a_credit_kind,
         a_balance,
-        a_primary_kind,
-        Reverse(a_primary_used),
         a_last_seen,
         a.id.as_str(),
     )
         .cmp(&(
+            b_primary_kind,
+            b_primary_used,
             b_weekly_kind,
-            Reverse(b_weekly_used),
+            b_weekly_used,
             b_credit_kind,
             b_balance,
-            b_primary_kind,
-            Reverse(b_primary_used),
             b_last_seen,
             b.id.as_str(),
         ))

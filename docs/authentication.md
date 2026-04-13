@@ -48,6 +48,6 @@ Missing snapshot plan data does not trigger account removal.
 
 Selection heuristic (best-effort, based on the last cached usage snapshot for each account):
 
-1) Prefer the account closer to the weekly limit (when the secondary window represents “weekly”).
-2) Then prefer lower credits balance when available.
-3) Then prefer the account closer to the primary limit.
+1) Prefer the account with more primary-window headroom.
+2) Then prefer the account with more weekly/secondary headroom (when the secondary window represents “weekly”).
+3) Then use the remaining cached tie-breakers to keep selection deterministic.
