@@ -23,6 +23,13 @@ During any sync/merge with `main` and/or `upstream`, these rules are mandatory:
 - If an upstream delta touches non-CLI surfaces, prefer leaving those files identical to upstream instead of carrying local edits there.
 - If a non-CLI file must change only because it is a generated follower or contract artifact of a CLI-owned owner, keep it as a follower of that CLI-owned owner and do not let it become a second home for local behavior.
 
+## Native Windows Execution Scope
+
+- The operator runs Codex CLI under WSL, not as a native Windows binary.
+- Unless the user explicitly asks for native Windows work, do not start implementation, review, or validation work that is isolated to native-Windows-only Codex CLI behavior.
+- If a finding is confined to native-Windows-only seams and does not affect WSL-visible behavior, shared cross-platform owners, serialization/contracts, or Linux-visible behavior, record it and defer it instead of widening the current batch.
+- If a shared owner change necessarily touches a Windows follower to keep the shipped CLI honest, keep that follower coherent, but do not turn that into a dedicated native-Windows remediation lane.
+
 ## Legacy / Feature-Gate Surface Discipline
 
 - Do not rename an active shipped surface just because a gated or newer surface uses a different name. Public tool/function/command renames require explicit user intent or a separately locked migration plan; additive functionality belongs under the existing active name until that migration is actually adopted.
