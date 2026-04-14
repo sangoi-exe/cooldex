@@ -382,14 +382,11 @@ fn threadless_chatgpt_auth_refresh_request_error(
         ThreadlessChatgptAuthRefreshError::RefreshFailed(error) => JSONRPCErrorError {
             code: -32000,
             message: format!("failed to refresh local ChatGPT auth: {error}"),
-            data: Some(
-                serde_json::to_value(ChatgptAuthTokensRefreshErrorData {
-                    refresh_token_failed_reason: threadless_chatgpt_auth_refresh_failure_reason(
-                        error.reason,
-                    ),
-                })
-                .expect("threadless auth refresh error data must serialize"),
-            ),
+            data: Some(serde_json::json!(ChatgptAuthTokensRefreshErrorData {
+                refresh_token_failed_reason: threadless_chatgpt_auth_refresh_failure_reason(
+                    error.reason,
+                ),
+            })),
         },
         ThreadlessChatgptAuthRefreshError::Other(message) => JSONRPCErrorError {
             code: -32000,

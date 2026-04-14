@@ -12284,6 +12284,18 @@ impl ChatWidget {
         self.bottom_pane.set_connectors_snapshot(Some(snapshot));
     }
 
+    #[cfg(test)]
+    pub(crate) fn connector_enabled_for_test(&self, connector_id: &str) -> Option<bool> {
+        let ConnectorsCacheState::Ready(snapshot) = &self.connectors_cache else {
+            return None;
+        };
+        snapshot
+            .connectors
+            .iter()
+            .find(|connector| connector.id == connector_id)
+            .map(|connector| connector.is_enabled)
+    }
+
     pub(crate) fn refresh_plugin_mentions(&mut self) {
         if !self.config.features.enabled(Feature::Plugins) {
             self.bottom_pane.set_plugin_mentions(/*plugins*/ None);

@@ -4,6 +4,9 @@ mod jsonrpc_lite;
 mod protocol;
 mod schema_fixtures;
 
+// Merge-safety anchor: lib-level reexports must keep config keyPath helpers
+// available to both app-server callers and config-service owners.
+
 pub use codex_git_utils::GitSha;
 pub use experimental_api::*;
 pub use export::GenerateTsOptions;
@@ -15,6 +18,7 @@ pub use export::generate_ts_with_options;
 pub use export::generate_types;
 pub use jsonrpc_lite::*;
 pub use protocol::common::*;
+pub use protocol::config_key_path::*;
 pub use protocol::item_builders::*;
 pub use protocol::thread_history::*;
 pub use protocol::v1::ApplyPatchApprovalParams;

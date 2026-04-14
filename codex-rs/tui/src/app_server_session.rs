@@ -14,6 +14,7 @@ use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigBatchWriteParams;
+use codex_app_server_protocol::ConfigEdit;
 use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
@@ -615,14 +616,17 @@ impl AppServerSession {
             .wrap_err("skills/config/write failed in TUI")
     }
 
-    pub(crate) async fn reload_user_config(&mut self) -> Result<()> {
+    pub(crate) async fn config_batch_write_and_reload_user_config(
+        &mut self,
+        edits: Vec<ConfigEdit>,
+    ) -> Result<()> {
         let request_id = self.next_request_id();
         let _: ConfigWriteResponse = self
             .client
             .request_typed(ClientRequest::ConfigBatchWrite {
                 request_id,
                 params: ConfigBatchWriteParams {
-                    edits: Vec::new(),
+                    edits,
                     file_path: None,
                     expected_version: None,
                     reload_user_config: true,
@@ -631,6 +635,11 @@ impl AppServerSession {
             .await
             .wrap_err("config/batchWrite failed while reloading user config in TUI")?;
         Ok(())
+    }
+
+    pub(crate) async fn reload_user_config(&mut self) -> Result<()> {
+        self.config_batch_write_and_reload_user_config(Vec::new())
+            .await
     }
 
     pub(crate) async fn thread_realtime_start(

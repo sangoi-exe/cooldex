@@ -27,6 +27,7 @@ use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::OverriddenMetadata;
 use codex_app_server_protocol::WriteStatus;
+use codex_app_server_protocol::parse_config_key_path;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::config_toml::ConfigToml;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -38,6 +39,10 @@ use thiserror::Error;
 use tokio::task;
 use toml::Value as TomlValue;
 use toml_edit::Item as TomlItem;
+
+// Merge-safety anchor: config-service write parsing must preserve literal
+// keyPath segments from app-server callers so dotted ids do not retarget nested
+// tables during user-config edits.
 
 #[derive(Debug, Error)]
 pub enum ConfigServiceError {
@@ -306,7 +311,7 @@ impl ConfigService {
         let mut config_edits = Vec::new();
 
         for (key_path, value, strategy) in edits.into_iter() {
-            let segments = parse_key_path(&key_path).map_err(|message| {
+            let segments = parse_config_key_path(&key_path).map_err(|message| {
                 ConfigServiceError::write(ConfigWriteErrorCode::ConfigValidationError, message)
             })?;
             let original_value = value_at_path(&user_config, &segments).cloned();
@@ -494,16 +499,6 @@ fn parse_value(value: JsonValue) -> Result<Option<TomlValue>, String> {
     serde_json::from_value::<TomlValue>(value)
         .map(Some)
         .map_err(|err| format!("invalid value: {err}"))
-}
-
-fn parse_key_path(path: &str) -> Result<Vec<String>, String> {
-    if path.trim().is_empty() {
-        return Err("keyPath must not be empty".to_string());
-    }
-    Ok(path
-        .split('.')
-        .map(std::string::ToString::to_string)
-        .collect())
 }
 
 #[derive(Debug)]

@@ -68,6 +68,7 @@ use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ChatgptAuthTokensRefreshResponse;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
+use codex_app_server_protocol::ConfigEdit as AppServerConfigEdit;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_app_server_protocol::FeedbackUploadParams;
 use codex_app_server_protocol::FeedbackUploadResponse;
@@ -76,6 +77,7 @@ use codex_app_server_protocol::ListMcpServerStatusParams;
 use codex_app_server_protocol::ListMcpServerStatusResponse;
 use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::McpServerStatusDetail;
+use codex_app_server_protocol::MergeStrategy as AppServerMergeStrategy;
 use codex_app_server_protocol::PluginInstallParams;
 use codex_app_server_protocol::PluginInstallResponse;
 use codex_app_server_protocol::PluginListParams;
@@ -95,6 +97,7 @@ use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError as AppServerTurnError;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::build_turns_from_rollout_items;
+use codex_app_server_protocol::join_config_key_path_segments;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::ModelAvailabilityNuxConfig;
 use codex_core::PromptGcActivityEdge;
@@ -1507,6 +1510,76 @@ impl App {
             .wrap_err_with(|| {
                 format!("updated skill config for {path_display}, but failed to reload live config")
             })?;
+        Ok(())
+    }
+
+    async fn set_app_enabled_via_app_server(
+        &mut self,
+        app_server: &mut AppServerSession,
+        id: String,
+        enabled: bool,
+    ) -> Result<()> {
+        let enabled_key_path = join_config_key_path_segments(["apps", id.as_str(), "enabled"]);
+        let disabled_reason_key_path =
+            join_config_key_path_segments(["apps", id.as_str(), "disabled_reason"]);
+        let edits = if enabled {
+            vec![
+                AppServerConfigEdit {
+                    key_path: enabled_key_path.clone(),
+                    value: serde_json::Value::Null,
+                    merge_strategy: AppServerMergeStrategy::Replace,
+                },
+                AppServerConfigEdit {
+                    key_path: disabled_reason_key_path.clone(),
+                    value: serde_json::Value::Null,
+                    merge_strategy: AppServerMergeStrategy::Replace,
+                },
+            ]
+        } else {
+            vec![
+                AppServerConfigEdit {
+                    key_path: enabled_key_path,
+                    value: false.into(),
+                    merge_strategy: AppServerMergeStrategy::Replace,
+                },
+                AppServerConfigEdit {
+                    key_path: disabled_reason_key_path,
+                    value: "user".into(),
+                    merge_strategy: AppServerMergeStrategy::Replace,
+                },
+            ]
+        };
+        let write_result = app_server
+            .config_batch_write_and_reload_user_config(edits)
+            .await
+            .wrap_err_with(|| format!("failed to update app config for {id}"));
+        let refresh_result = if write_result.is_ok() {
+            self.refresh_in_memory_config_from_disk()
+                .await
+                .wrap_err_with(|| {
+                    format!("updated app config for {id}, but failed to rebuild local TUI config")
+                })
+        } else {
+            Ok(())
+        };
+        self.finish_set_app_enabled_after_canonical_write(
+            &id,
+            enabled,
+            write_result,
+            refresh_result,
+        )
+    }
+
+    fn finish_set_app_enabled_after_canonical_write(
+        &mut self,
+        id: &str,
+        enabled: bool,
+        write_result: Result<()>,
+        refresh_result: Result<()>,
+    ) -> Result<()> {
+        write_result?;
+        refresh_result?;
+        self.chat_widget.update_connector_enabled(id, enabled);
         Ok(())
     }
 
@@ -6854,52 +6927,11 @@ impl App {
                 }
             }
             AppEvent::SetAppEnabled { id, enabled } => {
-                let edits = if enabled {
-                    vec![
-                        ConfigEdit::ClearPath {
-                            segments: vec!["apps".to_string(), id.clone(), "enabled".to_string()],
-                        },
-                        ConfigEdit::ClearPath {
-                            segments: vec![
-                                "apps".to_string(),
-                                id.clone(),
-                                "disabled_reason".to_string(),
-                            ],
-                        },
-                    ]
-                } else {
-                    vec![
-                        ConfigEdit::SetPath {
-                            segments: vec!["apps".to_string(), id.clone(), "enabled".to_string()],
-                            value: false.into(),
-                        },
-                        ConfigEdit::SetPath {
-                            segments: vec![
-                                "apps".to_string(),
-                                id.clone(),
-                                "disabled_reason".to_string(),
-                            ],
-                            value: "user".into(),
-                        },
-                    ]
-                };
-                match ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_edits(edits)
-                    .apply()
+                if let Err(err) = self
+                    .set_app_enabled_via_app_server(app_server, id.clone(), enabled)
                     .await
                 {
-                    Ok(()) => {
-                        self.chat_widget.update_connector_enabled(&id, enabled);
-                        if let Err(err) = self.refresh_in_memory_config_from_disk().await {
-                            tracing::warn!(error = %err, "failed to refresh config after app toggle");
-                        }
-                        self.chat_widget.submit_op(AppCommand::reload_user_config());
-                    }
-                    Err(err) => {
-                        self.chat_widget.add_error_message(format!(
-                            "Failed to update app config for {id}: {err}"
-                        ));
-                    }
+                    self.chat_widget.add_error_message(err.to_string());
                 }
             }
             AppEvent::OpenPermissionsPopup => {
@@ -13765,6 +13797,29 @@ guardian_approval = true
             .and_then(TomlValue::as_bool)
     }
 
+    fn test_connectors_snapshot(
+        app_id: &str,
+        enabled: bool,
+    ) -> crate::app_event::ConnectorsSnapshot {
+        crate::app_event::ConnectorsSnapshot {
+            connectors: vec![codex_chatgpt::connectors::AppInfo {
+                id: app_id.to_string(),
+                name: "Demo App".to_string(),
+                description: Some("Demo connector".to_string()),
+                logo_url: None,
+                logo_url_dark: None,
+                distribution_channel: None,
+                branding: None,
+                app_metadata: None,
+                labels: None,
+                install_url: Some("https://example.test/demo-app".to_string()),
+                is_accessible: true,
+                is_enabled: enabled,
+                plugin_display_names: Vec::new(),
+            }],
+        }
+    }
+
     fn all_model_presets() -> Vec<ModelPreset> {
         codex_core::test_support::all_model_presets().clone()
     }
@@ -14324,6 +14379,213 @@ guardian_approval = true
         assert!(config.contains("[[skills.config]]"));
         assert!(config.contains("enabled = false"));
         assert!(config.contains(&skill_path.display().to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_app_enabled_via_app_server_disables_app_and_refreshes_live_state() -> Result<()> {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let app_id = "demo_app".to_string();
+        let config_path = app.config.active_user_config_path()?;
+        std::fs::write(&config_path, "")?;
+        app.chat_widget.on_connectors_loaded(
+            Ok(test_connectors_snapshot(&app_id, /*enabled*/ true)),
+            true,
+        );
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+                .await
+                .expect("embedded app server");
+
+        assert_eq!(app_enabled_in_effective_config(&app.config, &app_id), None);
+        assert_eq!(
+            app.chat_widget.connector_enabled_for_test(&app_id),
+            Some(true)
+        );
+
+        app.set_app_enabled_via_app_server(&mut app_server, app_id.clone(), false)
+            .await?;
+
+        assert_eq!(
+            app_enabled_in_effective_config(&app.config, &app_id),
+            Some(false)
+        );
+        assert_eq!(
+            app.chat_widget.connector_enabled_for_test(&app_id),
+            Some(false)
+        );
+        let config = std::fs::read_to_string(config_path)?;
+        assert!(config.contains("[apps.demo_app]"));
+        assert!(config.contains("enabled = false"));
+        assert!(config.contains("disabled_reason = \"user\""));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_app_enabled_via_app_server_supports_dotted_app_ids() -> Result<()> {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let app_id = "demo.app".to_string();
+        let config_path = app.config.active_user_config_path()?;
+        std::fs::write(&config_path, "")?;
+        app.chat_widget.on_connectors_loaded(
+            Ok(test_connectors_snapshot(&app_id, /*enabled*/ true)),
+            true,
+        );
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+                .await
+                .expect("embedded app server");
+
+        app.set_app_enabled_via_app_server(&mut app_server, app_id.clone(), false)
+            .await?;
+
+        assert_eq!(
+            app_enabled_in_effective_config(&app.config, &app_id),
+            Some(false)
+        );
+        assert_eq!(
+            app.chat_widget.connector_enabled_for_test(&app_id),
+            Some(false)
+        );
+
+        let config = std::fs::read_to_string(config_path)?;
+        assert!(config.contains("[apps.\"demo.app\"]"));
+        assert!(config.contains("enabled = false"));
+        assert!(config.contains("disabled_reason = \"user\""));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_app_enabled_via_app_server_enables_app_and_refreshes_live_state() -> Result<()> {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let app_id = "demo_app".to_string();
+        let config_path = app.config.active_user_config_path()?;
+        std::fs::write(
+            &config_path,
+            "[apps.demo_app]\nenabled = false\ndisabled_reason = \"user\"\n",
+        )?;
+        app.refresh_in_memory_config_from_disk().await?;
+        app.chat_widget.on_connectors_loaded(
+            Ok(test_connectors_snapshot(&app_id, /*enabled*/ false)),
+            true,
+        );
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+                .await
+                .expect("embedded app server");
+
+        assert_eq!(
+            app_enabled_in_effective_config(&app.config, &app_id),
+            Some(false)
+        );
+        assert_eq!(
+            app.chat_widget.connector_enabled_for_test(&app_id),
+            Some(false)
+        );
+
+        app.set_app_enabled_via_app_server(&mut app_server, app_id.clone(), true)
+            .await?;
+
+        assert_eq!(app_enabled_in_effective_config(&app.config, &app_id), None);
+        assert_eq!(
+            app.chat_widget.connector_enabled_for_test(&app_id),
+            Some(true)
+        );
+        let config = std::fs::read_to_string(config_path)?;
+        assert!(!config.contains("enabled = false"));
+        assert!(!config.contains("disabled_reason = \"user\""));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_app_enabled_keeps_previous_visible_state_when_canonical_write_fails() -> Result<()>
+    {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let app_id = "demo_app";
+        while app_event_rx.try_recv().is_ok() {}
+        app.chat_widget
+            .on_connectors_loaded(Ok(test_connectors_snapshot(app_id, /*enabled*/ true)), true);
+
+        let err = app
+            .finish_set_app_enabled_after_canonical_write(
+                app_id,
+                /*enabled*/ false,
+                Err(color_eyre::eyre::eyre!(
+                    "config/batchWrite failed while reloading user config in TUI"
+                ))
+                .wrap_err_with(|| format!("failed to update app config for {app_id}")),
+                Ok(()),
+            )
+            .expect_err("canonical write failure should surface");
+
+        assert_eq!(app_enabled_in_effective_config(&app.config, app_id), None);
+        assert_eq!(
+            app.chat_widget.connector_enabled_for_test(app_id),
+            Some(true)
+        );
+        app.chat_widget.add_error_message(err.to_string());
+        let cell = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => {
+                panic!("expected set-app-enabled batch-write error history cell, saw {other:?}")
+            }
+        };
+        let rendered = cell
+            .display_lines(/*width*/ 120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_snapshot!("set_app_enabled_batch_write_error_message", rendered);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_app_enabled_keeps_previous_visible_state_when_local_refresh_fails() -> Result<()> {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let app_id = "demo_app";
+        let config_path = app.config.active_user_config_path()?;
+        while app_event_rx.try_recv().is_ok() {}
+        app.chat_widget
+            .on_connectors_loaded(Ok(test_connectors_snapshot(app_id, /*enabled*/ true)), true);
+        std::fs::write(
+            &config_path,
+            "[apps.demo_app]\nenabled = false\ndisabled_reason = \"user\"\n",
+        )?;
+
+        let err = app
+            .finish_set_app_enabled_after_canonical_write(
+                app_id,
+                /*enabled*/ false,
+                Ok(()),
+                Err(color_eyre::eyre::eyre!("failed to read config from disk")).wrap_err_with(
+                    || format!("updated app config for {app_id}, but failed to rebuild local TUI config"),
+                ),
+            )
+            .expect_err("local refresh failure should surface");
+
+        assert_eq!(app_enabled_in_effective_config(&app.config, app_id), None);
+        assert_eq!(
+            app.chat_widget.connector_enabled_for_test(app_id),
+            Some(true)
+        );
+        let config = std::fs::read_to_string(config_path)?;
+        assert!(config.contains("enabled = false"));
+        assert!(config.contains("disabled_reason = \"user\""));
+        app.chat_widget.add_error_message(err.to_string());
+        let cell = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => {
+                panic!("expected set-app-enabled local-refresh error history cell, saw {other:?}")
+            }
+        };
+        let rendered = cell
+            .display_lines(/*width*/ 120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_snapshot!("set_app_enabled_local_refresh_error_message", rendered);
         Ok(())
     }
 

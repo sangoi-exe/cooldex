@@ -194,8 +194,9 @@ Example with notification opt-out:
 - `config/read` — fetch the effective config on disk after resolving config layering.
 - `externalAgentConfig/detect` — detect migratable external-agent artifacts with `includeHome` and optional `cwds`; each detected item includes `cwd` (`null` for home).
 - `externalAgentConfig/import` — apply selected external-agent migration items by passing explicit `migrationItems` with `cwd` (`null` for home).
-- `config/value/write` — write a single config key/value to the active user config.toml path on disk.
-- `config/batchWrite` — apply multiple config edits atomically to the active user config.toml path on disk, with optional `reloadUserConfig: true` to hot-reload loaded threads.
+<!-- Merge-safety anchor: config write API docs must stay aligned with the escaped keyPath segment contract so dotted app ids do not retarget nested keys across app-server and core parsing. -->
+- `config/value/write` — write a single config key/value to the active user config.toml path on disk. `keyPath` uses `.`-separated segments; escape literal `.` or `\` inside a segment with `\`.
+- `config/batchWrite` — apply multiple config edits atomically to the active user config.toml path on disk, with optional `reloadUserConfig: true` to hot-reload loaded threads. Each edit uses the same escaped `keyPath` segment contract as `config/value/write`.
 - `configRequirements/read` — fetch loaded requirements constraints from `requirements.toml` and/or MDM (or `null` if none are configured), including allow-lists (`allowedApprovalPolicies`, `allowedSandboxModes`, `allowedWebSearchModes`), pinned feature values (`featureRequirements`), `enforceResidency`, and `network` constraints such as canonical domain/socket permissions plus `managedAllowedDomainsOnly` and `dangerFullAccessDenylistOnly`.
 
 ### Example: Start or resume a thread

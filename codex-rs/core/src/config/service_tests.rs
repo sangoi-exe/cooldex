@@ -4,6 +4,7 @@ use codex_app_server_protocol::AppConfig;
 use codex_app_server_protocol::AppToolApproval;
 use codex_app_server_protocol::AppsConfig;
 use codex_app_server_protocol::AskForApproval;
+use codex_app_server_protocol::join_config_key_path_segments;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
@@ -164,6 +165,65 @@ async fn write_value_supports_nested_app_paths() -> Result<()> {
         })
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn write_value_supports_escaped_dotted_app_keys() -> Result<()> {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "")?;
+
+    let service = ConfigService::without_managed_config_for_tests(tmp.path().to_path_buf());
+    service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
+            key_path: join_config_key_path_segments(["apps", "demo.app", "enabled"]),
+            value: serde_json::json!(false),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await
+        .expect("write dotted app enabled succeeds");
+
+    service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
+            key_path: join_config_key_path_segments(["apps", "demo.app", "disabled_reason"]),
+            value: serde_json::json!("user"),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await
+        .expect("write dotted app disabled_reason succeeds");
+
+    let read = service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await
+        .expect("config read succeeds");
+
+    assert_eq!(
+        read.config.apps,
+        Some(AppsConfig {
+            default: None,
+            apps: std::collections::HashMap::from([(
+                "demo.app".to_string(),
+                AppConfig {
+                    enabled: false,
+                    destructive_enabled: None,
+                    open_world_enabled: None,
+                    default_tools_approval_mode: None,
+                    default_tools_enabled: None,
+                    tools: None,
+                },
+            )]),
+        })
+    );
+    let config = std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE))?;
+    assert!(config.contains("[apps.\"demo.app\"]"));
+    assert!(config.contains("disabled_reason = \"user\""));
     Ok(())
 }
 

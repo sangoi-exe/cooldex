@@ -993,7 +993,11 @@ pub struct ExternalAgentConfigImportResponse {}
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+// Merge-safety anchor: config keyPath docs here must stay aligned with the
+// shared escaped-segment helpers so app-server writers and core parsing keep
+// literal dotted ids on one contract.
 pub struct ConfigValueWriteParams {
+    /// Dotted config path. Escape literal `.` or `\` inside a segment with `\`.
     pub key_path: String,
     pub value: JsonValue,
     pub merge_strategy: MergeStrategy,
@@ -1023,6 +1027,7 @@ pub struct ConfigBatchWriteParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ConfigEdit {
+    /// Dotted config path. Escape literal `.` or `\` inside a segment with `\`.
     pub key_path: String,
     pub value: JsonValue,
     pub merge_strategy: MergeStrategy,
