@@ -7,11 +7,11 @@ use codex_app_server_protocol::AuthMode;
 use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::auth::KnownPlan as InternalKnownPlan;
 use codex_protocol::auth::PlanType as InternalPlanType;
+use pretty_assertions::assert_eq;
 
 use base64::Engine;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ModelProviderAuthInfo;
-use pretty_assertions::assert_eq;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashSet;
@@ -566,11 +566,11 @@ fn cooldown_still_purges_freshly_unsupported_fallbacks_and_marks_failing_account
         .expect("cooldown lock") = Some(Utc::now() + chrono::Duration::seconds(30));
 
     let switched_to = manager
-        .switch_account_on_usage_limit(
-            None,
-            Some(active_store_account_id.as_str()),
-            None,
-            Some(RateLimitSnapshot {
+        .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
+            required_workspace_id: None,
+            failing_store_account_id: Some(active_store_account_id.as_str()),
+            resets_at: None,
+            snapshot: Some(RateLimitSnapshot {
                 limit_id: Some("codex".to_string()),
                 limit_name: None,
                 primary: Some(RateLimitWindow {
@@ -582,9 +582,12 @@ fn cooldown_still_purges_freshly_unsupported_fallbacks_and_marks_failing_account
                 credits: None,
                 plan_type: Some(AccountPlanType::Pro),
             }),
-            &HashSet::from([fallback_store_account_id.clone()]),
-            None,
-        )
+            freshly_unsupported_store_account_ids: &HashSet::from([
+                fallback_store_account_id.clone()
+            ]),
+            protected_store_account_id: None,
+            selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+        })
         .expect("cooldown path should succeed");
 
     assert_eq!(
@@ -629,7 +632,14 @@ fn select_account_for_auto_switch_prefers_lower_primary_usage_when_weekly_ties()
     };
 
     assert_eq!(
-        super::select_account_for_auto_switch_from_store(&store, None, None, now).as_deref(),
+        super::select_account_for_auto_switch_from_store(
+            &store,
+            None,
+            None,
+            now,
+            UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+        )
+        .as_deref(),
         Some(stronger_store_account_id.as_str())
     );
 }
@@ -648,7 +658,14 @@ fn select_account_for_auto_switch_prefers_lower_weekly_usage_when_primary_ties()
     };
 
     assert_eq!(
-        super::select_account_for_auto_switch_from_store(&store, None, None, now).as_deref(),
+        super::select_account_for_auto_switch_from_store(
+            &store,
+            None,
+            None,
+            now,
+            UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+        )
+        .as_deref(),
         Some(stronger_store_account_id.as_str())
     );
 }
@@ -667,9 +684,48 @@ fn select_account_for_auto_switch_prefers_primary_headroom_before_weekly_headroo
     };
 
     assert_eq!(
-        super::select_account_for_auto_switch_from_store(&store, None, None, now).as_deref(),
+        super::select_account_for_auto_switch_from_store(
+            &store,
+            None,
+            None,
+            now,
+            UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+        )
+        .as_deref(),
         Some(stronger_store_account_id.as_str())
     );
+}
+
+#[test]
+fn select_account_for_auto_switch_respects_freshly_selectable_scope() {
+    let now = Utc::now();
+    let stronger_store_account_id =
+        test_store_account_id("org-stronger").expect("stronger store account id");
+    let weaker_store_account_id =
+        test_store_account_id("org-weaker").expect("weaker store account id");
+    let store = AuthStore {
+        accounts: vec![
+            stored_test_chatgpt_account_with_usage("org-weaker", 80.0, 20.0, now),
+            stored_test_chatgpt_account_with_usage("org-stronger", 20.0, 20.0, now),
+        ],
+        ..AuthStore::default()
+    };
+    let freshly_selectable_store_account_ids = HashSet::from([weaker_store_account_id.clone()]);
+
+    assert_eq!(
+        super::select_account_for_auto_switch_from_store(
+            &store,
+            None,
+            None,
+            now,
+            UsageLimitAutoSwitchSelectionScope::FreshlySelectable(
+                &freshly_selectable_store_account_ids,
+            ),
+        )
+        .as_deref(),
+        Some(weaker_store_account_id.as_str())
+    );
+    assert_ne!(weaker_store_account_id, stronger_store_account_id);
 }
 
 #[test]
@@ -709,6 +765,45 @@ fn update_rate_limits_for_accounts_clears_stale_exhaustion_for_unblocked_saved_a
             .and_then(|account| account.exhausted_until),
         None
     );
+}
+
+#[test]
+fn reconcile_account_rate_limit_refresh_outcomes_clears_stale_usage_for_attempted_account_without_snapshot()
+ {
+    let now = Utc::now();
+    let codex_home = tempdir().unwrap();
+    let store_account_id =
+        test_store_account_id("org-stale-refresh").expect("stale-refresh store account id");
+    let mut account = stored_test_chatgpt_account_with_usage("org-stale-refresh", 92.0, 44.0, now);
+    account.usage.as_mut().expect("usage cache").exhausted_until =
+        Some(now + chrono::Duration::minutes(30));
+    let store = AuthStore {
+        active_account_id: Some(store_account_id.clone()),
+        accounts: vec![account],
+        ..AuthStore::default()
+    };
+    save_auth(codex_home.path(), &store, AuthCredentialsStoreMode::File).expect("save auth store");
+
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let updated = manager
+        .reconcile_account_rate_limit_refresh_outcomes([(
+            store_account_id.clone(),
+            AccountRateLimitRefreshOutcome::NoUsableSnapshot,
+        )])
+        .expect("reconcile refresh outcomes");
+
+    assert_eq!(updated, 1);
+    let refreshed_account = manager
+        .list_accounts()
+        .into_iter()
+        .find(|account| account.id == store_account_id)
+        .expect("refreshed account should exist");
+    assert_eq!(refreshed_account.last_rate_limits, None);
+    assert_eq!(refreshed_account.exhausted_until, None);
 }
 
 #[test]

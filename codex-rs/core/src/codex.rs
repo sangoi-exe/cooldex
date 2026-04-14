@@ -56,6 +56,7 @@ use crate::util::error_or_panic;
 use async_channel::Receiver;
 use async_channel::Sender;
 use async_trait::async_trait;
+use chrono::DateTime;
 use chrono::Local;
 use chrono::Utc;
 use codex_analytics::AnalyticsEventsClient;
@@ -77,10 +78,13 @@ use codex_hooks::HookPayload;
 use codex_hooks::HookResult;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
+use codex_login::AccountRateLimitRefreshOutcome;
 use codex_login::AuthManager;
 use codex_login::ChatgptAccountAuthResolution;
 use codex_login::ChatgptAccountRefreshMode;
 use codex_login::CodexAuth;
+use codex_login::UsageLimitAutoSwitchRequest;
+use codex_login::UsageLimitAutoSwitchSelectionScope;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
 use codex_login::default_client::originator;
 use codex_mcp::McpConnectionManager;
@@ -8555,25 +8559,30 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit(
         return Ok(false);
     }
 
-    let freshly_unsupported_store_account_ids =
-        refresh_accounts_rate_limits_before_auto_switch(sess, turn_context).await;
-    maybe_auto_switch_account_on_usage_limit_with_freshly_unsupported_ids(
+    let refresh_state = refresh_accounts_rate_limits_before_auto_switch(sess, turn_context).await;
+    maybe_auto_switch_account_on_usage_limit_with_refreshed_account_state(
         sess,
         turn_context,
         usage_limit,
         request_store_account_id,
-        &freshly_unsupported_store_account_ids,
+        &refresh_state,
         usage_limit_handling_policy,
     )
     .await
 }
 
-async fn maybe_auto_switch_account_on_usage_limit_with_freshly_unsupported_ids(
+#[derive(Default)]
+struct AutoSwitchRefreshState {
+    freshly_selectable_store_account_ids: HashSet<String>,
+    freshly_unsupported_store_account_ids: HashSet<String>,
+}
+
+async fn maybe_auto_switch_account_on_usage_limit_with_refreshed_account_state(
     sess: &Session,
     turn_context: &TurnContext,
     usage_limit: &UsageLimitReachedError,
     request_store_account_id: Option<&str>,
-    freshly_unsupported_store_account_ids: &HashSet<String>,
+    refresh_state: &AutoSwitchRefreshState,
     usage_limit_handling_policy: UsageLimitHandlingPolicy,
 ) -> CodexResult<bool> {
     let accounts_before = sess.services.auth_manager.list_accounts();
@@ -8611,14 +8620,21 @@ async fn maybe_auto_switch_account_on_usage_limit_with_freshly_unsupported_ids(
             });
 
     let required_workspace_id = turn_context.config.forced_chatgpt_workspace_id.as_deref();
-    let switch_result = sess.services.auth_manager.switch_account_on_usage_limit(
-        required_workspace_id,
-        failing_store_account_id.as_deref(),
-        usage_limit.resets_at,
-        usage_limit.rate_limits.as_deref().cloned(),
-        freshly_unsupported_store_account_ids,
-        protected_store_account_id,
-    )?;
+    let switch_result =
+        sess.services
+            .auth_manager
+            .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
+                required_workspace_id,
+                failing_store_account_id: failing_store_account_id.as_deref(),
+                resets_at: usage_limit.resets_at,
+                snapshot: usage_limit.rate_limits.as_deref().cloned(),
+                freshly_unsupported_store_account_ids: &refresh_state
+                    .freshly_unsupported_store_account_ids,
+                protected_store_account_id,
+                selection_scope: UsageLimitAutoSwitchSelectionScope::FreshlySelectable(
+                    &refresh_state.freshly_selectable_store_account_ids,
+                ),
+            })?;
     let Some(next_store_account_id) = switch_result else {
         let current_active_store_account_id = sess
             .services
@@ -8627,12 +8643,12 @@ async fn maybe_auto_switch_account_on_usage_limit_with_freshly_unsupported_ids(
             .into_iter()
             .find(|account| account.is_active)
             .map(|account| account.id);
-        let should_retry_without_switch = request_store_account_id
-            .zip(failing_store_account_id.as_deref())
-            .is_some_and(|(request_store_account_id, failing_store_account_id)| {
-                request_store_account_id == failing_store_account_id
-            })
-            && failing_store_account_id.as_deref() != current_active_store_account_id.as_deref();
+        let should_retry_without_switch = stale_request_should_retry_without_switch(
+            request_store_account_id,
+            failing_store_account_id.as_deref(),
+            current_active_store_account_id.as_deref(),
+            refresh_state,
+        );
         if should_retry_without_switch {
             debug!(
                 active_store_account_id = ?active_store_account_id,
@@ -8732,6 +8748,25 @@ pub(crate) async fn handle_usage_limit_for_execution_mode(
     Ok(false)
 }
 
+fn stale_request_should_retry_without_switch(
+    request_store_account_id: Option<&str>,
+    failing_store_account_id: Option<&str>,
+    current_active_store_account_id: Option<&str>,
+    refresh_state: &AutoSwitchRefreshState,
+) -> bool {
+    request_store_account_id
+        .zip(failing_store_account_id)
+        .is_some_and(|(request_store_account_id, failing_store_account_id)| {
+            request_store_account_id == failing_store_account_id
+        })
+        && failing_store_account_id != current_active_store_account_id
+        && current_active_store_account_id.is_some_and(|store_account_id| {
+            refresh_state
+                .freshly_selectable_store_account_ids
+                .contains(store_account_id)
+        })
+}
+
 pub(crate) async fn maybe_emit_transport_fallback_warning_for_execution_mode(
     sess: &Session,
     turn_context: &TurnContext,
@@ -8756,9 +8791,9 @@ pub(crate) async fn maybe_emit_transport_fallback_warning_for_execution_mode(
 async fn refresh_accounts_rate_limits_before_auto_switch(
     sess: &Session,
     turn_context: &TurnContext,
-) -> HashSet<String> {
+) -> AutoSwitchRefreshState {
     if cfg!(test) {
-        return HashSet::new();
+        return AutoSwitchRefreshState::default();
     }
 
     let account_summaries = sess.services.auth_manager.list_accounts();
@@ -8767,10 +8802,11 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
         .map(|account| account.id.clone())
         .collect::<Vec<_>>();
     if account_ids.is_empty() {
-        return HashSet::new();
+        return AutoSwitchRefreshState::default();
     }
-    let mut updates = Vec::new();
-    let mut freshly_unsupported_store_account_ids = HashSet::new();
+    let mut outcomes = Vec::new();
+    let mut refresh_state = AutoSwitchRefreshState::default();
+    let refreshed_at = Utc::now();
     for store_account_id in account_ids {
         let auth = match sess
             .services
@@ -8797,6 +8833,10 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
                     error = %err,
                     "failed to resolve ChatGPT account before usage-limit auto-switch"
                 );
+                outcomes.push((
+                    store_account_id.clone(),
+                    AccountRateLimitRefreshOutcome::NoUsableSnapshot,
+                ));
                 continue;
             }
         };
@@ -8838,6 +8878,10 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
                             error = %err,
                             "failed to force-resolve ChatGPT account after unauthorized usage refresh"
                         );
+                        outcomes.push((
+                            store_account_id.clone(),
+                            AccountRateLimitRefreshOutcome::NoUsableSnapshot,
+                        ));
                         continue;
                     }
                 };
@@ -8854,6 +8898,10 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
                             error = %err,
                             "failed to refresh account usage after unauthorized recovery before auto-switch"
                         );
+                        outcomes.push((
+                            store_account_id.clone(),
+                            AccountRateLimitRefreshOutcome::NoUsableSnapshot,
+                        ));
                         continue;
                     }
                 }
@@ -8864,25 +8912,44 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
                     error = %err,
                     "failed to refresh account usage before auto-switch"
                 );
+                outcomes.push((
+                    store_account_id.clone(),
+                    AccountRateLimitRefreshOutcome::NoUsableSnapshot,
+                ));
                 continue;
             }
         };
         if let Some(snapshot) = snapshot {
             if auto_switch_refresh_marks_account_unsupported(&snapshot) {
-                freshly_unsupported_store_account_ids.insert(store_account_id.clone());
+                refresh_state
+                    .freshly_unsupported_store_account_ids
+                    .insert(store_account_id.clone());
             }
-            updates.push((store_account_id, snapshot));
+            if auto_switch_refresh_snapshot_is_selectable(&snapshot, refreshed_at) {
+                refresh_state
+                    .freshly_selectable_store_account_ids
+                    .insert(store_account_id.clone());
+            }
+            outcomes.push((
+                store_account_id,
+                AccountRateLimitRefreshOutcome::Snapshot(snapshot),
+            ));
+        } else {
+            outcomes.push((
+                store_account_id,
+                AccountRateLimitRefreshOutcome::NoUsableSnapshot,
+            ));
         }
     }
 
-    if updates.is_empty() {
-        return freshly_unsupported_store_account_ids;
+    if outcomes.is_empty() {
+        return refresh_state;
     }
 
     match sess
         .services
         .auth_manager
-        .update_rate_limits_for_accounts(updates)
+        .reconcile_account_rate_limit_refresh_outcomes(outcomes)
     {
         Ok(updated_accounts) => {
             debug!(
@@ -8898,11 +8965,37 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
         }
     }
 
-    freshly_unsupported_store_account_ids
+    refresh_state
 }
 
 fn auto_switch_refresh_marks_account_unsupported(snapshot: &RateLimitSnapshot) -> bool {
     crate::auth::usage_limit_auto_switch_removes_plan_type(snapshot.plan_type.as_ref())
+}
+
+fn auto_switch_refresh_snapshot_is_selectable(
+    snapshot: &RateLimitSnapshot,
+    now: DateTime<Utc>,
+) -> bool {
+    !auto_switch_refresh_window_is_blocked(snapshot.primary.as_ref(), now)
+        && !auto_switch_refresh_window_is_blocked(snapshot.secondary.as_ref(), now)
+}
+
+fn auto_switch_refresh_window_is_blocked(
+    window: Option<&RateLimitWindow>,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(window) = window else {
+        return false;
+    };
+
+    if let Some(resets_at_seconds) = window.resets_at
+        && let Some(resets_at) = DateTime::<Utc>::from_timestamp(resets_at_seconds, 0)
+        && now >= resets_at
+    {
+        return false;
+    }
+
+    window.used_percent >= 100.0
 }
 
 #[derive(Debug)]

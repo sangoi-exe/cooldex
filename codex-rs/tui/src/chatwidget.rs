@@ -10111,6 +10111,80 @@ impl ChatWidget {
                 .is_some()
     }
 
+    fn rate_limit_window_status_parts(
+        now: DateTime<Local>,
+        snapshot: Option<&RateLimitSnapshot>,
+    ) -> Vec<String> {
+        let Some(snapshot) = snapshot else {
+            return Vec::new();
+        };
+
+        let mut description_parts = Vec::new();
+        if let Some(primary_window) = snapshot.primary.as_ref() {
+            description_parts.push(Self::rate_limit_format_window_status(
+                now,
+                Self::rate_limit_primary_label(Some(snapshot)).as_str(),
+                Some(primary_window),
+            ));
+        }
+        if let Some(secondary_window) = snapshot.secondary.as_ref() {
+            description_parts.push(Self::rate_limit_format_window_status(
+                now,
+                Self::rate_limit_secondary_label(Some(snapshot)).as_str(),
+                Some(secondary_window),
+            ));
+        }
+        description_parts
+    }
+
+    fn account_popup_description_parts(
+        now_local: DateTime<Local>,
+        account: &codex_login::AccountSummary,
+        include_current_marker: bool,
+    ) -> Vec<String> {
+        let now = now_local.with_timezone(&Utc);
+        let snapshot = account.last_rate_limits.as_ref();
+        let primary_label = Self::rate_limit_primary_label(snapshot);
+        let secondary_label = Self::rate_limit_secondary_label(snapshot);
+        let status = snapshot.map(|_| Self::rate_limit_account_status(now_local, snapshot));
+        let has_fresh_window_usage = Self::rate_limit_snapshot_has_fresh_usage(now_local, snapshot);
+        let is_exhausted = account.exhausted_until.is_some_and(|until| until > now);
+        let mut description_parts = Vec::new();
+
+        if include_current_marker && account.is_active {
+            description_parts.push("currently active".to_string());
+        }
+        if let Some(status) = status {
+            description_parts
+                .push(status.summary(primary_label.as_str(), secondary_label.as_str()));
+        }
+        if account.label.is_some()
+            && let Some(email) = account.email.as_ref()
+        {
+            description_parts.push(format!("email: {email}"));
+        }
+        description_parts.extend(Self::rate_limit_window_status_parts(now_local, snapshot));
+
+        if is_exhausted && !has_fresh_window_usage {
+            let exhausted_local = account
+                .exhausted_until
+                .map(|until| until.with_timezone(&Local));
+            let exhausted_str = exhausted_local
+                .map(|until| {
+                    let remaining = Self::rate_limit_format_time_remaining(now_local, until);
+                    let time = until.format("%H:%M").to_string();
+                    match remaining {
+                        Some(remaining) => format!("blocked until {time} (in {remaining})"),
+                        None => format!("blocked until {time}"),
+                    }
+                })
+                .unwrap_or_else(|| "blocked".to_string());
+            description_parts.push(exhausted_str);
+        }
+
+        description_parts
+    }
+
     pub(crate) fn open_accounts_popup_at(&mut self, now_local: DateTime<Local>) {
         if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
             self.add_error_message(
@@ -10127,7 +10201,6 @@ impl ChatWidget {
             return;
         }
 
-        let now = now_local.with_timezone(&Utc);
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Accounts".bold()));
         header.push(Line::from(
@@ -10144,56 +10217,13 @@ impl ChatWidget {
                     .unwrap_or_else(|| account.id.clone());
 
                 let snapshot = account.last_rate_limits.as_ref();
-                let primary_label = Self::rate_limit_primary_label(snapshot);
-                let secondary_label = Self::rate_limit_secondary_label(snapshot);
                 let status: Option<AccountAvailabilityStatus> =
                     snapshot.map(|_| Self::rate_limit_account_status(now_local, snapshot));
-                let has_fresh_window_usage =
-                    Self::rate_limit_snapshot_has_fresh_usage(now_local, snapshot);
-                let is_exhausted = account.exhausted_until.is_some_and(|until| until > now);
                 let display_name = status
                     .map(|status| format!("{} {name}", status.marker()))
                     .unwrap_or(name);
-
-                let mut description_parts = Vec::new();
-                if let Some(status) = status {
-                    description_parts
-                        .push(status.summary(primary_label.as_str(), secondary_label.as_str()));
-                }
-                if account.label.is_some()
-                    && let Some(email) = account.email.as_ref()
-                {
-                    description_parts.push(format!("email: {email}"));
-                }
-
-                description_parts.push(Self::rate_limit_format_window_status(
-                    now_local,
-                    primary_label.as_str(),
-                    snapshot.and_then(|snapshot| snapshot.primary.as_ref()),
-                ));
-                description_parts.push(Self::rate_limit_format_window_status(
-                    now_local,
-                    secondary_label.as_str(),
-                    snapshot.and_then(|snapshot| snapshot.secondary.as_ref()),
-                ));
-
-                if is_exhausted && !has_fresh_window_usage {
-                    let exhausted_local: Option<DateTime<Local>> = account
-                        .exhausted_until
-                        .map(|until| until.with_timezone(&Local));
-                    let exhausted_str = exhausted_local
-                        .map(|until| {
-                            let remaining =
-                                Self::rate_limit_format_time_remaining(now_local, until);
-                            let time = until.format("%H:%M").to_string();
-                            match remaining {
-                                Some(remaining) => format!("blocked until {time} (in {remaining})"),
-                                None => format!("blocked until {time}"),
-                            }
-                        })
-                        .unwrap_or_else(|| "blocked".to_string());
-                    description_parts.push(exhausted_str);
-                }
+                let description_parts =
+                    Self::account_popup_description_parts(now_local, &account, false);
                 let description =
                     (!description_parts.is_empty()).then(|| description_parts.join(" • "));
 
@@ -10256,8 +10286,6 @@ impl ChatWidget {
         }
 
         accounts.sort_by_key(|account| !account.is_active);
-        let now = now_local.with_timezone(&Utc);
-
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Logout".bold()));
         header.push(Line::from("Codex will exit after logging out.".dim()));
@@ -10279,61 +10307,16 @@ impl ChatWidget {
         for account in accounts {
             let label = account.label.clone();
             let email = account.email.clone();
-            let is_exhausted = account.exhausted_until.is_some_and(|until| until > now);
             let name = label
                 .clone()
                 .or_else(|| email.clone())
                 .unwrap_or_else(|| account.id.clone());
 
             let snapshot = account.last_rate_limits.as_ref();
-            let primary_label = Self::rate_limit_primary_label(snapshot);
-            let secondary_label = Self::rate_limit_secondary_label(snapshot);
             let status: Option<AccountAvailabilityStatus> =
                 snapshot.map(|_| Self::rate_limit_account_status(now_local, snapshot));
-            let has_fresh_window_usage =
-                Self::rate_limit_snapshot_has_fresh_usage(now_local, snapshot);
-
-            let mut description_parts = Vec::new();
-            if account.is_active {
-                description_parts.push("currently active".to_string());
-            }
-            if let Some(status) = status {
-                description_parts
-                    .push(status.summary(primary_label.as_str(), secondary_label.as_str()));
-            }
-            if label.is_some()
-                && let Some(email) = email.as_ref()
-            {
-                description_parts.push(format!("email: {email}"));
-            }
-
-            description_parts.push(Self::rate_limit_format_window_status(
-                now_local,
-                primary_label.as_str(),
-                snapshot.and_then(|snapshot| snapshot.primary.as_ref()),
-            ));
-            description_parts.push(Self::rate_limit_format_window_status(
-                now_local,
-                secondary_label.as_str(),
-                snapshot.and_then(|snapshot| snapshot.secondary.as_ref()),
-            ));
-
-            if is_exhausted && !has_fresh_window_usage {
-                let exhausted_local: Option<DateTime<Local>> = account
-                    .exhausted_until
-                    .map(|until| until.with_timezone(&Local));
-                let exhausted_str = exhausted_local
-                    .map(|until| {
-                        let remaining = Self::rate_limit_format_time_remaining(now_local, until);
-                        let time = until.format("%H:%M").to_string();
-                        match remaining {
-                            Some(remaining) => format!("blocked until {time} (in {remaining})"),
-                            None => format!("blocked until {time}"),
-                        }
-                    })
-                    .unwrap_or_else(|| "blocked".to_string());
-                description_parts.push(exhausted_str);
-            }
+            let description_parts =
+                Self::account_popup_description_parts(now_local, &account, true);
             let description =
                 (!description_parts.is_empty()).then(|| description_parts.join(" • "));
 

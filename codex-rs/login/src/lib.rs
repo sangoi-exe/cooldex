@@ -22,6 +22,7 @@ pub use server::run_login_server;
 // Merge-safety anchor: codex-login re-exports define the split auth surface
 // consumed by login flows and tests after the auth crate extraction.
 pub use api_bridge::auth_provider_from_auth;
+pub use auth::AccountRateLimitRefreshOutcome;
 pub use auth::AccountSummary;
 pub use auth::AccountUsageCache;
 pub use auth::AuthConfig;
@@ -48,6 +49,8 @@ pub use auth::RefreshTokenError;
 pub use auth::StoredAccount;
 pub use auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
 pub use auth::UnauthorizedRecovery;
+pub use auth::UsageLimitAutoSwitchRequest;
+pub use auth::UsageLimitAutoSwitchSelectionScope;
 pub use auth::default_client;
 pub use auth::enforce_login_restrictions;
 pub use auth::load_auth_store;

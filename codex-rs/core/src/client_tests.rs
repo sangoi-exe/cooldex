@@ -20,6 +20,8 @@ use chrono::Utc;
 use codex_api::CoreAuthProvider;
 use codex_app_server_protocol::AuthMode;
 use codex_login::AuthManager;
+use codex_login::UsageLimitAutoSwitchRequest;
+use codex_login::UsageLimitAutoSwitchSelectionScope;
 use codex_login::token_data::IdTokenInfo;
 use codex_login::token_data::TokenData;
 use codex_model_provider_info::ModelProviderInfo;
@@ -446,14 +448,15 @@ async fn subagent_websocket_reconnects_when_auth_account_changes_mid_session() {
         .expect("active account should be present");
     let freshly_unsupported_store_account_ids = HashSet::new();
     let switched_to = auth_manager
-        .switch_account_on_usage_limit(
-            None,
-            Some(failing_store_account_id.as_str()),
-            None,
-            None,
-            &freshly_unsupported_store_account_ids,
-            None,
-        )
+        .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
+            required_workspace_id: None,
+            failing_store_account_id: Some(failing_store_account_id.as_str()),
+            resets_at: None,
+            snapshot: None,
+            freshly_unsupported_store_account_ids: &freshly_unsupported_store_account_ids,
+            protected_store_account_id: None,
+            selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+        })
         .expect("account switch should succeed");
     assert!(
         switched_to.is_some(),
@@ -580,14 +583,15 @@ async fn subagent_preconnect_reconnects_when_auth_account_changes_mid_session() 
         .expect("active account should be present");
     let freshly_unsupported_store_account_ids = HashSet::new();
     let switched_to = auth_manager
-        .switch_account_on_usage_limit(
-            None,
-            Some(failing_store_account_id.as_str()),
-            None,
-            None,
-            &freshly_unsupported_store_account_ids,
-            None,
-        )
+        .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
+            required_workspace_id: None,
+            failing_store_account_id: Some(failing_store_account_id.as_str()),
+            resets_at: None,
+            snapshot: None,
+            freshly_unsupported_store_account_ids: &freshly_unsupported_store_account_ids,
+            protected_store_account_id: None,
+            selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+        })
         .expect("account switch should succeed");
     assert!(
         switched_to.is_some(),

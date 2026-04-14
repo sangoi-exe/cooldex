@@ -111,6 +111,7 @@ use codex_core::skills::model::SkillMetadata;
 use codex_features::FEATURES;
 use codex_features::Feature;
 use codex_git_utils::CommitLogEntry;
+use codex_login::AccountRateLimitRefreshOutcome;
 use codex_login::AuthManager;
 use codex_login::AuthStore;
 use codex_login::StoredAccount;
@@ -11927,6 +11928,51 @@ async fn accounts_popup() {
 }
 
 #[tokio::test]
+async fn accounts_popup_omits_stale_rows_after_attempted_refresh_without_usable_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+    chat.auth_manager
+        .update_rate_limits_for_accounts([(
+            "work-account".to_string(),
+            RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 73.0,
+                    window_minutes: Some(300),
+                    resets_at: Some((chrono::Utc::now() + chrono::Duration::hours(3)).timestamp()),
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: 12.0,
+                    window_minutes: Some(7 * 24 * 60),
+                    resets_at: Some((chrono::Utc::now() + chrono::Duration::days(1)).timestamp()),
+                }),
+                credits: None,
+                plan_type: None,
+            },
+        )])
+        .expect("seed stale popup rate limits");
+    chat.auth_manager
+        .reconcile_account_rate_limit_refresh_outcomes([(
+            "work-account".to_string(),
+            AccountRateLimitRefreshOutcome::NoUsableSnapshot,
+        )])
+        .expect("clear stale popup rate limits");
+
+    chat.open_accounts_popup_at(chrono::Local::now());
+    let popup = render_bottom_popup(&chat, 100);
+    assert!(
+        !popup.contains("5h:"),
+        "expected attempted refresh without a usable snapshot to clear stale 5h rows:\n{popup}"
+    );
+    assert!(
+        !popup.contains("weekly:"),
+        "expected attempted refresh without a usable snapshot to clear stale weekly rows:\n{popup}"
+    );
+}
+
+#[tokio::test]
 async fn accounts_popup_loading() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
     chat.thread_id = Some(ThreadId::new());
@@ -11996,6 +12042,40 @@ async fn accounts_popup_status_marker_prioritizes_weekly_over_5h() {
     assert!(
         popup.contains("🟡  Personal"),
         "expected 5h marker for personal account:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn accounts_popup_single_weekly_window_does_not_duplicate_labels() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+    let weekly_reset_at = (chrono::Utc::now() + chrono::Duration::days(2)).timestamp();
+
+    chat.auth_manager
+        .update_rate_limits_for_accounts([(
+            "work-account".to_string(),
+            RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 0.0,
+                    window_minutes: Some(7 * 24 * 60),
+                    resets_at: Some(weekly_reset_at),
+                }),
+                secondary: None,
+                credits: None,
+                plan_type: None,
+            },
+        )])
+        .expect("seed single-window weekly rate limits");
+
+    chat.open_accounts_popup_at(chrono::Local::now());
+    let popup = render_bottom_popup(&chat, 100);
+    assert_snapshot!("accounts_popup_single_weekly_window", popup);
+    assert!(
+        !popup.contains("weekly: —"),
+        "expected missing secondary weekly row to stay hidden:\n{popup}"
     );
 }
 

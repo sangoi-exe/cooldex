@@ -114,6 +114,7 @@ use codex_core::lookup_message_history_entry;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_features::Feature;
+use codex_login::AccountRateLimitRefreshOutcome;
 use codex_login::AuthManager;
 use codex_login::ChatgptAccountAuthResolution;
 use codex_login::ChatgptAccountRefreshMode;
@@ -444,7 +445,12 @@ fn spawn_next_accounts_rate_limit_fetch(
                     };
                     AccountsRateLimitFetchOutcome {
                         store_account_id,
-                        snapshot: crate::chatwidget::preferred_rate_limit_snapshot(snapshots),
+                        refresh_outcome: Some(
+                            crate::chatwidget::preferred_rate_limit_snapshot(snapshots).map_or(
+                                AccountRateLimitRefreshOutcome::NoUsableSnapshot,
+                                AccountRateLimitRefreshOutcome::Snapshot,
+                            ),
+                        ),
                         fetch_attempted: true,
                     }
                 }
@@ -456,13 +462,13 @@ fn spawn_next_accounts_rate_limit_fetch(
                     );
                     AccountsRateLimitFetchOutcome {
                         store_account_id,
-                        snapshot: None,
+                        refresh_outcome: None,
                         fetch_attempted: false,
                     }
                 }
                 Ok(ChatgptAccountAuthResolution::Missing) => AccountsRateLimitFetchOutcome {
                     store_account_id,
-                    snapshot: None,
+                    refresh_outcome: None,
                     fetch_attempted: false,
                 },
                 Err(err) => {
@@ -473,7 +479,7 @@ fn spawn_next_accounts_rate_limit_fetch(
                     );
                     AccountsRateLimitFetchOutcome {
                         store_account_id,
-                        snapshot: None,
+                        refresh_outcome: Some(AccountRateLimitRefreshOutcome::NoUsableSnapshot),
                         fetch_attempted: true,
                     }
                 }
@@ -489,7 +495,7 @@ async fn fetch_accounts_rate_limit_updates(
     auth_manager: Arc<AuthManager>,
 ) -> AccountsRateLimitRefreshResult {
     const MAX_IN_FLIGHT: usize = 4;
-    let mut updates = Vec::new();
+    let mut outcomes = Vec::new();
     let mut join_set = tokio::task::JoinSet::new();
     let mut attempted_fetches = 0usize;
     let mut successful_fetches = 0usize;
@@ -514,9 +520,11 @@ async fn fetch_accounts_rate_limit_updates(
             if outcome.fetch_attempted {
                 attempted_fetches += 1;
             }
-            if let Some(snapshot) = outcome.snapshot {
-                updates.push((outcome.store_account_id, snapshot));
-                successful_fetches += 1;
+            if let Some(refresh_outcome) = outcome.refresh_outcome {
+                if matches!(refresh_outcome, AccountRateLimitRefreshOutcome::Snapshot(_)) {
+                    successful_fetches += 1;
+                }
+                outcomes.push((outcome.store_account_id, refresh_outcome));
             }
         }
 
@@ -529,7 +537,7 @@ async fn fetch_accounts_rate_limit_updates(
     }
 
     AccountsRateLimitRefreshResult {
-        updates,
+        outcomes,
         attempted_fetches,
         successful_fetches,
     }
@@ -537,12 +545,12 @@ async fn fetch_accounts_rate_limit_updates(
 
 struct AccountsRateLimitFetchOutcome {
     store_account_id: String,
-    snapshot: Option<RateLimitSnapshot>,
+    refresh_outcome: Option<AccountRateLimitRefreshOutcome>,
     fetch_attempted: bool,
 }
 
 struct AccountsRateLimitRefreshResult {
-    updates: Vec<(String, RateLimitSnapshot)>,
+    outcomes: Vec<(String, AccountRateLimitRefreshOutcome)>,
     attempted_fetches: usize,
     successful_fetches: usize,
 }
@@ -1299,6 +1307,7 @@ pub(crate) struct App {
     open_accounts_popup_when_cache_ready: bool,
     observed_active_store_account_id: Option<String>,
     live_account_state_owner: LiveAccountStateOwner,
+    suppress_ambiguous_rate_limit_notifications_generation: Option<u64>,
     pending_app_server_requests: PendingAppServerRequests,
 }
 
@@ -1971,7 +1980,7 @@ impl App {
         tokio::spawn(async move {
             let refresh_result =
                 fetch_accounts_rate_limit_updates(base_url, Arc::clone(&auth_manager)).await;
-            let (updated_accounts, cache_fully_refreshed) = if refresh_result.updates.is_empty() {
+            let (updated_accounts, cache_fully_refreshed) = if refresh_result.outcomes.is_empty() {
                 (
                     0,
                     accounts_status_cache_fully_refreshed(
@@ -1981,7 +1990,9 @@ impl App {
                     ),
                 )
             } else {
-                match auth_manager.update_rate_limits_for_accounts(refresh_result.updates) {
+                match auth_manager
+                    .reconcile_account_rate_limit_refresh_outcomes(refresh_result.outcomes)
+                {
                     Ok(updated_accounts) => (
                         updated_accounts,
                         accounts_status_cache_fully_refreshed(
@@ -2090,13 +2101,17 @@ impl App {
         self.sync_chat_widget_account_state_from_auth_manager();
     }
 
-    fn maybe_reconcile_active_account_from_auth_manager(&mut self) {
+    fn maybe_reconcile_active_account_from_auth_manager(&mut self) -> bool {
         if self.refresh_observed_active_store_account_id() {
             self.recompute_accounts_status_cache_expiry(Utc::now());
             if self.live_account_state_owner == LiveAccountStateOwner::AuthManager {
                 self.sync_chat_widget_account_state_from_auth_manager();
+            } else {
+                self.invalidate_rate_limit_state_for_account_change();
             }
+            return true;
         }
+        false
     }
 
     fn refresh_account_mutation_bookkeeping(&mut self) {
@@ -2123,6 +2138,7 @@ impl App {
         projection: AppServerAccountProjection,
     ) {
         let model_catalog = Self::build_model_catalog(&self.config, projection.available_models);
+        self.live_account_state_owner = LiveAccountStateOwner::AppServerProjection;
         self.feedback_audience = projection.feedback_audience;
         self.model_catalog = model_catalog.clone();
         self.chat_widget
@@ -2132,7 +2148,6 @@ impl App {
             projection.plan_type,
             projection.has_chatgpt_account,
         );
-        self.live_account_state_owner = LiveAccountStateOwner::AppServerProjection;
         self.refresh_observed_active_store_account_id();
         self.recompute_accounts_status_cache_expiry(Utc::now());
     }
@@ -2429,12 +2444,44 @@ impl App {
             next_plan_type,
             has_chatgpt_account,
         );
-        self.chat_widget.on_active_account_changed();
+        self.invalidate_rate_limit_state_for_account_change();
         self.chat_widget.update_account_state(
             status_account_display,
             plan_type,
             has_chatgpt_account,
         );
+    }
+
+    fn invalidate_rate_limit_state_for_account_change(&mut self) {
+        self.chat_widget.on_active_account_changed();
+        self.suppress_ambiguous_rate_limit_notifications_generation =
+            if self.live_account_state_owner == LiveAccountStateOwner::AppServerProjection {
+                Some(self.chat_widget.rate_limit_account_generation())
+            } else {
+                None
+            };
+    }
+
+    fn handle_account_rate_limits_updated_notification(
+        &mut self,
+        snapshot: RateLimitSnapshot,
+    ) -> bool {
+        if self.maybe_reconcile_active_account_from_auth_manager() {
+            return false;
+        }
+
+        if self.suppress_ambiguous_rate_limit_notifications_generation
+            == Some(self.chat_widget.rate_limit_account_generation())
+        {
+            tracing::debug!(
+                account_generation = self.chat_widget.rate_limit_account_generation(),
+                "suppressing ambiguous account/rateLimits/update during active-account convergence"
+            );
+            return false;
+        }
+
+        self.chat_widget.on_rate_limit_snapshot(Some(snapshot));
+        true
     }
 
     fn clear_ui_header_lines_with_version(
@@ -2977,6 +3024,10 @@ impl App {
                     .finish_status_rate_limit_refresh_without_change(request_id);
             }
             return matches!(origin, RateLimitRefreshOrigin::StartupPrefetch);
+        }
+
+        if self.suppress_ambiguous_rate_limit_notifications_generation == Some(account_generation) {
+            self.suppress_ambiguous_rate_limit_notifications_generation = None;
         }
 
         match result {
@@ -5140,6 +5191,7 @@ impl App {
             open_accounts_popup_when_cache_ready: false,
             observed_active_store_account_id,
             live_account_state_owner: LiveAccountStateOwner::AppServerProjection,
+            suppress_ambiguous_rate_limit_notifications_generation: None,
             pending_app_server_requests: PendingAppServerRequests::default(),
         };
         if let Some(started) = initial_started_thread {
@@ -8286,6 +8338,20 @@ mod tests {
                 account_generation: 1,
             })
         );
+        app.chat_widget
+            .on_rate_limit_snapshot(Some(RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 95.0,
+                    window_minutes: Some(300),
+                    resets_at: None,
+                }),
+                secondary: None,
+                credits: None,
+                plan_type: None,
+            }));
+        assert_eq!(app.chat_widget.rate_limit_snapshot_count(), 1);
 
         let switched_account_id = app
             .auth_manager
@@ -8319,7 +8385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_thread_event_now_preserves_app_server_projection_after_auth_manager_account_change()
+    async fn handle_thread_event_now_invalidates_rate_limit_state_after_auth_manager_account_change()
      {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
         seed_chatgpt_accounts(&mut app, "account-a");
@@ -8382,7 +8448,156 @@ mod tests {
         ));
         assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
         assert_eq!(app.feedback_audience, FeedbackAudience::External);
-        assert_eq!(app.chat_widget.rate_limit_account_generation(), 1);
+        assert_eq!(app.chat_widget.rate_limit_account_generation(), 2);
+        assert_eq!(app.chat_widget.rate_limit_snapshot_count(), 0);
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Ok(AppEvent::RefreshRateLimits {
+                origin: RateLimitRefreshOrigin::StartupPrefetch,
+                account_generation: 2,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn account_rate_limit_notifications_are_suppressed_during_app_server_projection_account_change()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let available_models = all_model_presets();
+        let default_model = available_models
+            .iter()
+            .find(|model| model.is_default)
+            .unwrap_or(&available_models[0])
+            .model
+            .clone();
+
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@openai.com",
+            PlanType::Plus,
+            available_models,
+            default_model,
+        ));
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Ok(AppEvent::RefreshRateLimits {
+                origin: RateLimitRefreshOrigin::StartupPrefetch,
+                account_generation: 1,
+            })
+        );
+
+        let switched_account_id = app
+            .auth_manager
+            .list_accounts()
+            .into_iter()
+            .find(|account| account.label.as_deref() == Some("Secondary"))
+            .map(|account| account.id)
+            .expect("secondary account should exist");
+        app.auth_manager
+            .set_active_account(&switched_account_id)
+            .expect("switch active account");
+        app.handle_thread_event_now(ThreadBufferedEvent::Notification(
+            turn_started_notification(ThreadId::new(), "turn-1"),
+        ));
+
+        let suppressed_generation = app.chat_widget.rate_limit_account_generation();
+        assert_eq!(
+            app.suppress_ambiguous_rate_limit_notifications_generation,
+            Some(suppressed_generation)
+        );
+
+        app.handle_account_rate_limits_updated_notification(RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 95.0,
+                window_minutes: Some(60),
+                resets_at: None,
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: None,
+        });
+
+        assert_eq!(app.chat_widget.rate_limit_snapshot_count(), 0);
+        assert_eq!(
+            app.suppress_ambiguous_rate_limit_notifications_generation,
+            Some(suppressed_generation)
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rate_limits_loaded_clears_ambiguous_notification_suppression_for_current_generation()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let available_models = all_model_presets();
+        let default_model = available_models
+            .iter()
+            .find(|model| model.is_default)
+            .unwrap_or(&available_models[0])
+            .model
+            .clone();
+
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@openai.com",
+            PlanType::Plus,
+            available_models,
+            default_model,
+        ));
+        assert_matches!(
+            app_event_rx.try_recv(),
+            Ok(AppEvent::RefreshRateLimits {
+                origin: RateLimitRefreshOrigin::StartupPrefetch,
+                account_generation: 1,
+            })
+        );
+
+        let switched_account_id = app
+            .auth_manager
+            .list_accounts()
+            .into_iter()
+            .find(|account| account.label.as_deref() == Some("Secondary"))
+            .map(|account| account.id)
+            .expect("secondary account should exist");
+        app.auth_manager
+            .set_active_account(&switched_account_id)
+            .expect("switch active account");
+        app.handle_thread_event_now(ThreadBufferedEvent::Notification(
+            turn_started_notification(ThreadId::new(), "turn-1"),
+        ));
+
+        let refreshed_generation = app.chat_widget.rate_limit_account_generation();
+        assert_eq!(
+            app.suppress_ambiguous_rate_limit_notifications_generation,
+            Some(refreshed_generation)
+        );
+
+        let should_schedule_frame = app.handle_rate_limits_loaded(
+            RateLimitRefreshOrigin::StartupPrefetch,
+            refreshed_generation,
+            Ok(vec![RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 0.0,
+                    window_minutes: Some(60),
+                    resets_at: None,
+                }),
+                secondary: None,
+                credits: None,
+                plan_type: None,
+            }]),
+        );
+
+        assert!(should_schedule_frame);
+        assert_eq!(
+            app.suppress_ambiguous_rate_limit_notifications_generation,
+            None
+        );
+        assert_eq!(app.chat_widget.rate_limit_snapshot_count(), 1);
     }
 
     #[tokio::test]
@@ -12970,6 +13185,7 @@ guardian_approval = true
             open_accounts_popup_when_cache_ready: false,
             observed_active_store_account_id: None,
             live_account_state_owner: LiveAccountStateOwner::AppServerProjection,
+            suppress_ambiguous_rate_limit_notifications_generation: None,
             pending_app_server_requests: PendingAppServerRequests::default(),
         }
     }
@@ -13033,6 +13249,7 @@ guardian_approval = true
                 open_accounts_popup_when_cache_ready: false,
                 observed_active_store_account_id: None,
                 live_account_state_owner: LiveAccountStateOwner::AppServerProjection,
+                suppress_ambiguous_rate_limit_notifications_generation: None,
                 pending_app_server_requests: PendingAppServerRequests::default(),
             },
             rx,

@@ -218,6 +218,28 @@ pub enum ChatgptAccountAuthResolution {
     Missing,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum AccountRateLimitRefreshOutcome {
+    Snapshot(RateLimitSnapshot),
+    NoUsableSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageLimitAutoSwitchSelectionScope<'a> {
+    PersistedTruth,
+    FreshlySelectable(&'a HashSet<String>),
+}
+
+pub struct UsageLimitAutoSwitchRequest<'a> {
+    pub required_workspace_id: Option<&'a str>,
+    pub failing_store_account_id: Option<&'a str>,
+    pub resets_at: Option<DateTime<Utc>>,
+    pub snapshot: Option<RateLimitSnapshot>,
+    pub freshly_unsupported_store_account_ids: &'a HashSet<String>,
+    pub protected_store_account_id: Option<&'a str>,
+    pub selection_scope: UsageLimitAutoSwitchSelectionScope<'a>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TerminalRefreshFailureAccountRemoval {
     NotRemoved,
@@ -255,6 +277,25 @@ impl RefreshTokenError {
             Self::Transient(_) => None,
         }
     }
+}
+
+fn apply_rate_limit_refresh_outcome(
+    usage: &mut AccountUsageCache,
+    outcome: AccountRateLimitRefreshOutcome,
+    now: DateTime<Utc>,
+) {
+    match outcome {
+        AccountRateLimitRefreshOutcome::Snapshot(snapshot) => {
+            let exhausted_until = exhausted_until_from_snapshot(&snapshot, now);
+            usage.last_rate_limits = Some(snapshot);
+            usage.exhausted_until = exhausted_until;
+        }
+        AccountRateLimitRefreshOutcome::NoUsableSnapshot => {
+            usage.last_rate_limits = None;
+            usage.exhausted_until = None;
+        }
+    }
+    usage.last_seen_at = Some(now);
 }
 
 impl From<RefreshTokenError> for std::io::Error {
@@ -1758,11 +1799,12 @@ impl AuthManager {
             };
 
             let now = Utc::now();
-            let exhausted_until = exhausted_until_from_snapshot(&snapshot, now);
             let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
-            usage.last_rate_limits = Some(snapshot);
-            usage.exhausted_until = exhausted_until;
-            usage.last_seen_at = Some(now);
+            apply_rate_limit_refresh_outcome(
+                usage,
+                AccountRateLimitRefreshOutcome::Snapshot(snapshot),
+                now,
+            );
             Ok(())
         })
     }
@@ -1785,11 +1827,39 @@ impl AuthManager {
             let mut updated = 0usize;
             for account in &mut store.accounts {
                 if let Some(snapshot) = updates.remove(&account.id) {
-                    let exhausted_until = exhausted_until_from_snapshot(&snapshot, now);
                     let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
-                    usage.last_rate_limits = Some(snapshot);
-                    usage.exhausted_until = exhausted_until;
-                    usage.last_seen_at = Some(now);
+                    apply_rate_limit_refresh_outcome(
+                        usage,
+                        AccountRateLimitRefreshOutcome::Snapshot(snapshot),
+                        now,
+                    );
+                    updated = updated.saturating_add(1);
+                }
+            }
+            Ok(updated)
+        })
+    }
+
+    pub fn reconcile_account_rate_limit_refresh_outcomes(
+        &self,
+        outcomes: impl IntoIterator<Item = (String, AccountRateLimitRefreshOutcome)>,
+    ) -> std::io::Result<usize> {
+        if !self.has_saved_chatgpt_accounts() {
+            return Ok(0);
+        }
+
+        let mut outcomes = outcomes.into_iter().collect::<HashMap<_, _>>();
+        if outcomes.is_empty() {
+            return Ok(0);
+        }
+
+        self.update_store(|store| {
+            let now = Utc::now();
+            let mut updated = 0usize;
+            for account in &mut store.accounts {
+                if let Some(outcome) = outcomes.remove(&account.id) {
+                    let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
+                    apply_rate_limit_refresh_outcome(usage, outcome, now);
                     updated = updated.saturating_add(1);
                 }
             }
@@ -1832,13 +1902,17 @@ impl AuthManager {
 
     pub fn switch_account_on_usage_limit(
         &self,
-        required_workspace_id: Option<&str>,
-        failing_store_account_id: Option<&str>,
-        resets_at: Option<DateTime<Utc>>,
-        snapshot: Option<RateLimitSnapshot>,
-        freshly_unsupported_store_account_ids: &HashSet<String>,
-        protected_store_account_id: Option<&str>,
+        request: UsageLimitAutoSwitchRequest<'_>,
     ) -> std::io::Result<Option<String>> {
+        let UsageLimitAutoSwitchRequest {
+            required_workspace_id,
+            failing_store_account_id,
+            resets_at,
+            snapshot,
+            freshly_unsupported_store_account_ids,
+            protected_store_account_id,
+            selection_scope,
+        } = request;
         if !self.has_saved_chatgpt_accounts() {
             return Ok(None);
         }
@@ -1952,7 +2026,12 @@ impl AuthManager {
             if let Some(protected_store_account_id) = protected_store_account_id
                 && store.accounts.iter().any(|account| {
                     account.id == protected_store_account_id
-                        && account_selectable(account, required_workspace_id, mutation_now)
+                        && account_selectable_for_auto_switch(
+                            account,
+                            required_workspace_id,
+                            mutation_now,
+                            selection_scope,
+                        )
                 })
             {
                 store.active_account_id = Some(protected_store_account_id.to_string());
@@ -1969,17 +2048,13 @@ impl AuthManager {
                 return Ok(Some(protected_store_account_id.to_string()));
             }
 
-            let mut candidates = store
-                .accounts
-                .iter()
-                .filter(|account| {
-                    account.id != failing_store_account_id
-                        && account_selectable(account, required_workspace_id, mutation_now)
-                })
-                .collect::<Vec<_>>();
-
-            candidates.sort_by(|a, b| compare_auto_switch_candidates(a, b));
-            let Some(next_account_id) = candidates.first().map(|account| account.id.clone()) else {
+            let Some(next_account_id) = select_account_for_auto_switch_from_store(
+                store,
+                required_workspace_id,
+                Some(failing_store_account_id.as_str()),
+                mutation_now,
+                selection_scope,
+            ) else {
                 return Ok(None);
             };
 
@@ -2024,6 +2099,7 @@ impl AuthManager {
             required_workspace_id,
             exclude_store_account_id,
             Utc::now(),
+            UsageLimitAutoSwitchSelectionScope::PersistedTruth,
         )
     }
 
@@ -2656,6 +2732,7 @@ impl AuthManager {
                 required_workspace_id.as_deref(),
                 /*exclude_store_account_id*/ None,
                 Utc::now(),
+                UsageLimitAutoSwitchSelectionScope::PersistedTruth,
             );
             store.active_account_id = next_store_account_id.clone();
             next_store_account_id
@@ -3149,18 +3226,42 @@ fn account_selectable(
     true
 }
 
+fn account_selectable_for_auto_switch(
+    account: &StoredAccount,
+    required_workspace_id: Option<&str>,
+    now: DateTime<Utc>,
+    selection_scope: UsageLimitAutoSwitchSelectionScope<'_>,
+) -> bool {
+    if !account_selectable(account, required_workspace_id, now) {
+        return false;
+    }
+
+    match selection_scope {
+        UsageLimitAutoSwitchSelectionScope::PersistedTruth => true,
+        UsageLimitAutoSwitchSelectionScope::FreshlySelectable(selectable_store_account_ids) => {
+            selectable_store_account_ids.contains(&account.id)
+        }
+    }
+}
+
 fn select_account_for_auto_switch_from_store(
     store: &AuthStore,
     required_workspace_id: Option<&str>,
     exclude_store_account_id: Option<&str>,
     now: DateTime<Utc>,
+    selection_scope: UsageLimitAutoSwitchSelectionScope<'_>,
 ) -> Option<String> {
     let mut candidates = store
         .accounts
         .iter()
         .filter(|account| {
             Some(account.id.as_str()) != exclude_store_account_id
-                && account_selectable(account, required_workspace_id, now)
+                && account_selectable_for_auto_switch(
+                    account,
+                    required_workspace_id,
+                    now,
+                    selection_scope,
+                )
         })
         .collect::<Vec<_>>();
 

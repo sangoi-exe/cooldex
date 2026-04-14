@@ -1919,15 +1919,21 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
         })),
         promo_message: None,
     };
-    let freshly_unsupported_store_account_ids =
-        std::collections::HashSet::from([acc_2_store_account_id.clone()]);
+    let refresh_state = AutoSwitchRefreshState {
+        freshly_selectable_store_account_ids: std::collections::HashSet::from([
+            acc_2_store_account_id.clone(),
+        ]),
+        freshly_unsupported_store_account_ids: std::collections::HashSet::from([
+            acc_2_store_account_id.clone(),
+        ]),
+    };
 
-    let should_retry = maybe_auto_switch_account_on_usage_limit_with_freshly_unsupported_ids(
+    let should_retry = maybe_auto_switch_account_on_usage_limit_with_refreshed_account_state(
         &session,
         &turn_context,
         &usage_limit,
         Some(acc_1_store_account_id.as_str()),
-        &freshly_unsupported_store_account_ids,
+        &refresh_state,
         UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch,
     )
     .await
@@ -1954,6 +1960,28 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
     assert!(
         rx.try_recv().is_err(),
         "stale-request retry should not emit a duplicate warning event"
+    );
+}
+
+#[test]
+fn visible_usage_limit_retry_stops_when_changed_active_account_was_not_proven_selectable() {
+    let refresh_state = AutoSwitchRefreshState {
+        freshly_selectable_store_account_ids: std::collections::HashSet::new(),
+        freshly_unsupported_store_account_ids: std::collections::HashSet::from([String::from(
+            "acc-2",
+        )]),
+    };
+
+    let should_retry = stale_request_should_retry_without_switch(
+        Some("acc-1"),
+        Some("acc-1"),
+        Some("acc-2"),
+        &refresh_state,
+    );
+
+    assert!(
+        !should_retry,
+        "retry should stop once the changed active account was not freshly proven selectable"
     );
 }
 
