@@ -1957,6 +1957,118 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
     );
 }
 
+#[tokio::test]
+async fn visible_usage_limit_retry_allows_chatgpt_auth_tokens_mode_with_saved_fallbacks() {
+    let (mut session, mut turn_context, _rx) = make_session_and_context_with_rx().await;
+    let auth_home = tempfile::tempdir().expect("create auth tempdir");
+
+    let mut acc_0_tokens = test_chatgpt_token_data("acc-0");
+    acc_0_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_0_tokens.id_token.raw_jwt)
+            .expect("parse acc-0 id token");
+    let acc_0_store_account_id = acc_0_tokens
+        .preferred_store_account_id()
+        .expect("acc-0 store account id");
+    let mut acc_1_tokens = test_chatgpt_token_data("acc-1");
+    acc_1_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_1_tokens.id_token.raw_jwt)
+            .expect("parse acc-1 id token");
+    let acc_1_store_account_id = acc_1_tokens
+        .preferred_store_account_id()
+        .expect("acc-1 store account id");
+
+    let auth_store = crate::auth::AuthStore {
+        active_account_id: Some(acc_0_store_account_id.clone()),
+        accounts: vec![
+            crate::auth::StoredAccount {
+                id: acc_0_store_account_id.clone(),
+                label: None,
+                tokens: acc_0_tokens,
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+            crate::auth::StoredAccount {
+                id: acc_1_store_account_id.clone(),
+                label: None,
+                tokens: acc_1_tokens,
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+        ],
+        ..crate::auth::AuthStore::default()
+    };
+    crate::auth::save_auth(
+        auth_home.path(),
+        &auth_store,
+        crate::auth::AuthCredentialsStoreMode::File,
+    )
+    .expect("persist auth store");
+    crate::auth::save_auth(
+        auth_home.path(),
+        &crate::auth::AuthStore {
+            active_account_id: Some(acc_0_store_account_id.clone()),
+            accounts: vec![auth_store.accounts[0].clone()],
+            ..crate::auth::AuthStore::default()
+        },
+        crate::auth::AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("persist external auth store");
+
+    let auth_manager = AuthManager::shared(
+        auth_home.path().to_path_buf(),
+        false,
+        crate::auth::AuthCredentialsStoreMode::File,
+    );
+    assert_eq!(
+        auth_manager.auth_mode(),
+        Some(crate::auth::AuthMode::ChatgptAuthTokens)
+    );
+
+    let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
+    session_mut.services.auth_manager = Arc::clone(&auth_manager);
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.auth_manager = Some(Arc::clone(&auth_manager));
+
+    let usage_limit = UsageLimitReachedError {
+        plan_type: None,
+        resets_at: Some(Utc.with_ymd_and_hms(2024, 1, 1, 0, 15, 0).unwrap()),
+        rate_limits: Some(Box::new(RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(15),
+                resets_at: Some(1_700_000_123),
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: Some(codex_protocol::account::PlanType::Pro),
+        })),
+        promo_message: None,
+    };
+
+    let should_retry = maybe_auto_switch_account_on_usage_limit(
+        &session,
+        &turn_context,
+        &usage_limit,
+        Some(acc_0_store_account_id.as_str()),
+        UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch,
+    )
+    .await
+    .expect("usage-limit retry should switch when ChatgptAuthTokens auth is active");
+
+    assert!(should_retry);
+    let accounts = auth_manager.list_accounts();
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id.as_str()),
+        Some(acc_1_store_account_id.as_str())
+    );
+}
+
 #[test]
 fn auto_switch_refresh_does_not_mark_missing_plan_as_unsupported() {
     let snapshot = RateLimitSnapshot {

@@ -86,3 +86,18 @@ pub struct JSONRPCErrorError {
     pub data: Option<serde_json::Value>,
     pub message: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChatgptAuthTokensRefreshFailureReason {
+    Expired,
+    Exhausted,
+    Revoked,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatgptAuthTokensRefreshErrorData {
+    pub refresh_token_failed_reason: ChatgptAuthTokensRefreshFailureReason,
+}

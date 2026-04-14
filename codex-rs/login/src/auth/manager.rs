@@ -914,7 +914,9 @@ fn classify_refresh_token_failure(body: &str) -> RefreshTokenFailedError {
     let reason = match normalized_code.as_deref() {
         Some("refresh_token_expired") => RefreshTokenFailedReason::Expired,
         Some("refresh_token_reused") => RefreshTokenFailedReason::Exhausted,
-        Some("refresh_token_invalidated") => RefreshTokenFailedReason::Revoked,
+        Some("refresh_token_invalidated") | Some("token_revoked") => {
+            RefreshTokenFailedReason::Revoked
+        }
         _ => RefreshTokenFailedReason::Other,
     };
 
@@ -2767,6 +2769,16 @@ impl AuthManager {
         last_refresh < Utc::now() - chrono::Duration::days(TOKEN_REFRESH_INTERVAL)
     }
 
+    fn map_external_auth_refresh_error(error: std::io::Error) -> RefreshTokenError {
+        if let Some(failed) = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<RefreshTokenFailedError>())
+        {
+            return RefreshTokenError::Permanent(failed.clone());
+        }
+        RefreshTokenError::Transient(error)
+    }
+
     async fn refresh_external_auth(
         &self,
         reason: ExternalAuthRefreshReason,
@@ -2781,15 +2793,25 @@ impl AuthManager {
             .auth_cached()
             .as_ref()
             .and_then(CodexAuth::get_account_id);
+        let active_store_account_id = self
+            .auth_cached()
+            .as_ref()
+            .and_then(CodexAuth::active_chatgpt_account_summary)
+            .map(|summary| summary.store_account_id);
         let context = ExternalAuthRefreshContext {
             reason,
             previous_account_id,
         };
 
-        let refreshed = external_auth
-            .refresh(context)
-            .await
-            .map_err(RefreshTokenError::Transient)?;
+        let refreshed = match external_auth.refresh(context).await {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                return self.finish_external_auth_refresh_failure(
+                    active_store_account_id.as_deref(),
+                    Self::map_external_auth_refresh_error(error),
+                );
+            }
+        };
         if external_auth.auth_mode() == AuthMode::ApiKey {
             return Ok(());
         }
@@ -2853,6 +2875,49 @@ impl AuthManager {
             )));
         }
         Ok(())
+    }
+
+    fn finish_external_auth_refresh_failure(
+        &self,
+        active_store_account_id: Option<&str>,
+        error: RefreshTokenError,
+    ) -> Result<(), RefreshTokenError> {
+        let RefreshTokenError::Permanent(error) = error else {
+            return Err(error);
+        };
+        let Some(active_store_account_id) = active_store_account_id else {
+            return Err(RefreshTokenError::Permanent(error));
+        };
+        match self.remove_chatgpt_store_account_for_terminal_refresh_failure(
+            active_store_account_id,
+            &error,
+        )? {
+            TerminalRefreshFailureAccountRemoval::Removed {
+                switched_to_store_account_id,
+            } => {
+                let active_store_account_id_after_removal = self
+                    .auth_cached()
+                    .as_ref()
+                    .and_then(CodexAuth::active_chatgpt_account_summary)
+                    .map(|summary| summary.store_account_id);
+                if let Some(switched_to_store_account_id) = switched_to_store_account_id.as_deref()
+                    && Some(switched_to_store_account_id)
+                        == active_store_account_id_after_removal.as_deref()
+                {
+                    tracing::info!(
+                        removed_store_account_id = active_store_account_id,
+                        switched_to_store_account_id,
+                        "removed active external ChatGPT account after terminal refresh-token failure and switched to eligible ChatGPT fallback"
+                    );
+                    Ok(())
+                } else {
+                    Err(RefreshTokenError::Permanent(error))
+                }
+            }
+            TerminalRefreshFailureAccountRemoval::NotRemoved => {
+                Err(RefreshTokenError::Permanent(error))
+            }
+        }
     }
 
     // Refreshes ChatGPT OAuth tokens and persists updated auth state for the

@@ -2,6 +2,7 @@ use super::*;
 use crate::auth::storage::FileAuthStorage;
 use crate::auth::storage::get_auth_file;
 use crate::token_data::IdTokenInfo;
+use async_trait::async_trait;
 use codex_app_server_protocol::AuthMode;
 use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::auth::KnownPlan as InternalKnownPlan;
@@ -20,6 +21,24 @@ use tempfile::tempdir;
 
 // Merge-safety anchor: auth test fixtures must keep workspace account/token contracts aligned
 // with the customized ChatGPT account persistence and refresh semantics.
+
+struct FailingExternalChatgptAuth {
+    error: RefreshTokenFailedError,
+}
+
+#[async_trait]
+impl ExternalAuth for FailingExternalChatgptAuth {
+    fn auth_mode(&self) -> AuthMode {
+        AuthMode::Chatgpt
+    }
+
+    async fn refresh(
+        &self,
+        _context: ExternalAuthRefreshContext,
+    ) -> std::io::Result<ExternalAuthTokens> {
+        Err(std::io::Error::other(self.error.clone()))
+    }
+}
 
 #[tokio::test]
 async fn refresh_without_id_token() {
@@ -471,6 +490,18 @@ fn usage_limit_auto_switch_removes_only_free_and_unknown_plans() {
 }
 
 #[test]
+fn classify_refresh_token_failure_treats_token_revoked_as_revoked() {
+    let error =
+        super::classify_refresh_token_failure(r#"{ "error": { "code": "token_revoked" } }"#);
+
+    assert_eq!(error.reason, RefreshTokenFailedReason::Revoked);
+    assert_eq!(
+        error.message,
+        super::REFRESH_TOKEN_INVALIDATED_MESSAGE.to_string()
+    );
+}
+
+#[test]
 fn mark_usage_limit_reached_prefers_blocked_primary_reset_when_error_reset_is_missing() {
     let codex_home = tempdir().unwrap();
     persist_test_chatgpt_accounts(codex_home.path(), &["org-primary"], 0);
@@ -638,6 +669,45 @@ fn select_account_for_auto_switch_prefers_primary_headroom_before_weekly_headroo
     assert_eq!(
         super::select_account_for_auto_switch_from_store(&store, None, None, now).as_deref(),
         Some(stronger_store_account_id.as_str())
+    );
+}
+
+#[test]
+fn update_rate_limits_for_accounts_clears_stale_exhaustion_for_unblocked_saved_account() {
+    let now = Utc::now();
+    let codex_home = tempdir().unwrap();
+    let store_account_id = test_store_account_id("org-stale-exhausted").expect("store account id");
+    let mut account =
+        stored_test_chatgpt_account_with_usage("org-stale-exhausted", 100.0, 20.0, now);
+    account.usage.as_mut().expect("usage cache").exhausted_until =
+        Some(now + chrono::Duration::minutes(15));
+    let store = AuthStore {
+        active_account_id: Some(store_account_id.clone()),
+        accounts: vec![account],
+        ..AuthStore::default()
+    };
+    save_auth(codex_home.path(), &store, AuthCredentialsStoreMode::File).expect("save auth store");
+
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let updated = manager
+        .update_rate_limits_for_accounts([(
+            store_account_id.clone(),
+            test_rate_limit_snapshot(10.0, 20.0, now),
+        )])
+        .expect("update rate limits");
+
+    assert_eq!(updated, 1);
+    let accounts = manager.list_accounts();
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.id == store_account_id)
+            .and_then(|account| account.exhausted_until),
+        None
     );
 }
 
@@ -851,6 +921,119 @@ async fn refresh_token_from_authority_succeeds_when_terminal_failure_switches_to
         "the invalidated account should be removed from the saved store"
     );
     assert_eq!(manager.refresh_failure_for_auth(&cached_auth), None);
+}
+
+#[tokio::test]
+async fn refresh_token_from_authority_succeeds_when_external_terminal_failure_switches_to_fallback_store_account()
+ {
+    let codex_home = tempdir().unwrap();
+    let active_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-primary", "org-fallback"], 0);
+    let fallback_store_account_id =
+        test_store_account_id("org-fallback").expect("fallback store account id");
+    let external_store = AuthStore {
+        active_account_id: Some(active_store_account_id.clone()),
+        accounts: vec![stored_test_chatgpt_account("org-primary", Some(Utc::now()))],
+        ..AuthStore::default()
+    };
+    save_auth(
+        codex_home.path(),
+        &external_store,
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("save external auth store");
+
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    manager.set_external_auth(Arc::new(FailingExternalChatgptAuth {
+        error: RefreshTokenFailedError::new(
+            RefreshTokenFailedReason::Revoked,
+            "refresh token invalidated",
+        ),
+    }));
+
+    assert_eq!(manager.auth_mode(), Some(AuthMode::ChatgptAuthTokens));
+
+    manager
+        .refresh_token_from_authority()
+        .await
+        .expect("external refresh should succeed by switching to fallback");
+
+    let cached_auth = manager
+        .auth_cached()
+        .expect("fallback auth should be cached");
+    let active_account = cached_auth
+        .active_chatgpt_account_summary()
+        .expect("fallback account should be active");
+    assert_eq!(active_account.store_account_id, fallback_store_account_id);
+    assert_eq!(
+        cached_auth.get_account_id().as_deref(),
+        Some("org-fallback")
+    );
+
+    let accounts = manager.list_accounts();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].id, fallback_store_account_id);
+    assert!(accounts[0].is_active);
+    assert!(
+        accounts
+            .iter()
+            .all(|account| account.id != active_store_account_id),
+        "the invalidated account should be removed from the saved store"
+    );
+}
+
+#[tokio::test]
+async fn unauthorized_recovery_succeeds_when_external_terminal_failure_switches_to_fallback() {
+    let codex_home = tempdir().unwrap();
+    let active_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-primary", "org-fallback"], 0);
+    let fallback_store_account_id =
+        test_store_account_id("org-fallback").expect("fallback store account id");
+    let external_store = AuthStore {
+        active_account_id: Some(active_store_account_id.clone()),
+        accounts: vec![stored_test_chatgpt_account("org-primary", Some(Utc::now()))],
+        ..AuthStore::default()
+    };
+    save_auth(
+        codex_home.path(),
+        &external_store,
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("save external auth store");
+
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    manager.set_external_auth(Arc::new(FailingExternalChatgptAuth {
+        error: RefreshTokenFailedError::new(
+            RefreshTokenFailedReason::Revoked,
+            "refresh token invalidated",
+        ),
+    }));
+
+    let mut recovery = manager.unauthorized_recovery();
+    let refresh_result = recovery
+        .next()
+        .await
+        .expect("external refresh step should switch to fallback");
+    assert_eq!(refresh_result.auth_state_changed(), Some(true));
+
+    let accounts = manager.list_accounts();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].id, fallback_store_account_id);
+    assert!(accounts[0].is_active);
+    assert!(
+        accounts
+            .iter()
+            .all(|account| account.id != active_store_account_id),
+        "the invalidated account should be removed from the saved store"
+    );
 }
 
 #[tokio::test]

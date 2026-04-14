@@ -25,6 +25,8 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::AppListUpdatedNotification;
 use codex_app_server_protocol::AuthMode as LoginAuthMode;
+use codex_app_server_protocol::ChatgptAuthTokensRefreshErrorData;
+use codex_app_server_protocol::ChatgptAuthTokensRefreshFailureReason;
 use codex_app_server_protocol::ChatgptAuthTokensRefreshParams;
 use codex_app_server_protocol::ChatgptAuthTokensRefreshReason;
 use codex_app_server_protocol::ChatgptAuthTokensRefreshResponse;
@@ -78,6 +80,8 @@ use codex_login::default_client::set_default_client_residency_requirement;
 use codex_login::default_client::set_default_originator;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_protocol::ThreadId;
+use codex_protocol::auth::RefreshTokenFailedError;
+use codex_protocol::auth::RefreshTokenFailedReason;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_state::log_db::LogDbLayer;
@@ -132,12 +136,7 @@ impl ExternalAuth for ExternalAuthRefreshBridge {
                 let result = result.map_err(|err| {
                     std::io::Error::other(format!("auth refresh request canceled: {err}"))
                 })?;
-                result.map_err(|err| {
-                    std::io::Error::other(format!(
-                        "auth refresh request failed: code={} message={}",
-                        err.code, err.message
-                    ))
-                })?
+                result.map_err(threadless_chatgpt_auth_refresh_request_error)?
             }
             Err(_) => {
                 let _canceled = self.outgoing.cancel_request(&request_id).await;
@@ -156,6 +155,32 @@ impl ExternalAuth for ExternalAuthRefreshBridge {
             response.chatgpt_account_id,
             response.chatgpt_plan_type,
         ))
+    }
+}
+
+fn threadless_chatgpt_auth_refresh_request_error(error: JSONRPCErrorError) -> std::io::Error {
+    if let Some(data) = error.data.as_ref().and_then(|data| {
+        serde_json::from_value::<ChatgptAuthTokensRefreshErrorData>(data.clone()).ok()
+    }) {
+        return std::io::Error::other(RefreshTokenFailedError::new(
+            threadless_chatgpt_auth_refresh_failed_reason(data.refresh_token_failed_reason),
+            error.message,
+        ));
+    }
+    std::io::Error::other(format!(
+        "auth refresh request failed: code={} message={}",
+        error.code, error.message
+    ))
+}
+
+fn threadless_chatgpt_auth_refresh_failed_reason(
+    reason: ChatgptAuthTokensRefreshFailureReason,
+) -> RefreshTokenFailedReason {
+    match reason {
+        ChatgptAuthTokensRefreshFailureReason::Expired => RefreshTokenFailedReason::Expired,
+        ChatgptAuthTokensRefreshFailureReason::Exhausted => RefreshTokenFailedReason::Exhausted,
+        ChatgptAuthTokensRefreshFailureReason::Revoked => RefreshTokenFailedReason::Revoked,
+        ChatgptAuthTokensRefreshFailureReason::Other => RefreshTokenFailedReason::Other,
     }
 }
 
@@ -1120,6 +1145,55 @@ impl MessageProcessor {
             Ok(response) => self.outgoing.send_response(request_id, response).await,
             Err(error) => self.outgoing.send_error(request_id, error).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::threadless_chatgpt_auth_refresh_request_error;
+    use codex_app_server_protocol::ChatgptAuthTokensRefreshErrorData;
+    use codex_app_server_protocol::ChatgptAuthTokensRefreshFailureReason;
+    use codex_app_server_protocol::JSONRPCErrorError;
+    use codex_protocol::auth::RefreshTokenFailedError;
+    use codex_protocol::auth::RefreshTokenFailedReason;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn threadless_chatgpt_auth_refresh_request_error_preserves_refresh_failure_reason() {
+        let io_error = threadless_chatgpt_auth_refresh_request_error(JSONRPCErrorError {
+            code: -32000,
+            message: "failed to refresh local ChatGPT auth: refresh token invalidated".to_string(),
+            data: Some(
+                serde_json::to_value(ChatgptAuthTokensRefreshErrorData {
+                    refresh_token_failed_reason: ChatgptAuthTokensRefreshFailureReason::Revoked,
+                })
+                .expect("threadless auth refresh error data should serialize"),
+            ),
+        });
+
+        let failed = io_error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<RefreshTokenFailedError>())
+            .expect("typed refresh failure should be preserved");
+        assert_eq!(failed.reason, RefreshTokenFailedReason::Revoked);
+        assert_eq!(
+            failed.message,
+            "failed to refresh local ChatGPT auth: refresh token invalidated"
+        );
+    }
+
+    #[test]
+    fn threadless_chatgpt_auth_refresh_request_error_falls_back_to_generic_message() {
+        let io_error = threadless_chatgpt_auth_refresh_request_error(JSONRPCErrorError {
+            code: -32000,
+            message: "refresh failed".to_string(),
+            data: None,
+        });
+
+        assert_eq!(
+            io_error.to_string(),
+            "auth refresh request failed: code=-32000 message=refresh failed"
+        );
     }
 }
 

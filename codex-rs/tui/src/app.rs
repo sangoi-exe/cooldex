@@ -115,7 +115,9 @@ use codex_login::AuthManager;
 use codex_login::ChatgptAccountAuthResolution;
 use codex_login::ChatgptAccountRefreshMode;
 use codex_login::CodexAuth;
+use codex_login::RefreshTokenError;
 use codex_login::ServerOptions;
+use codex_login::auth::RefreshTokenFailedError;
 use codex_login::run_login_server;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_otel::SessionTelemetry;
@@ -284,6 +286,25 @@ async fn best_effort_resume_history_turns(
     let turns = build_turns_from_rollout_items(&rollout_items);
     Some(apply_resume_history_mode(config, turns))
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ThreadlessChatgptAuthRefreshError {
+    RefreshFailed(RefreshTokenFailedError),
+    Other(String),
+}
+
+impl std::fmt::Display for ThreadlessChatgptAuthRefreshError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RefreshFailed(error) => {
+                write!(formatter, "failed to refresh local ChatGPT auth: {error}")
+            }
+            Self::Other(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ThreadlessChatgptAuthRefreshError {}
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
@@ -2085,17 +2106,34 @@ impl App {
     async fn build_threadless_chatgpt_auth_refresh_response(
         &mut self,
         previous_account_id: Option<&str>,
-    ) -> std::result::Result<ChatgptAuthTokensRefreshResponse, String> {
-        self.select_local_chatgpt_account_for_threadless_refresh(previous_account_id)?;
+    ) -> std::result::Result<ChatgptAuthTokensRefreshResponse, ThreadlessChatgptAuthRefreshError>
+    {
+        self.select_local_chatgpt_account_for_threadless_refresh(previous_account_id)
+            .map_err(ThreadlessChatgptAuthRefreshError::Other)?;
         let refresh_result = self.auth_manager.refresh_token().await;
         self.maybe_reconcile_active_account_from_auth_manager();
-        refresh_result.map_err(|err| format!("failed to refresh local ChatGPT auth: {err}"))?;
+        match refresh_result {
+            Ok(()) => {}
+            Err(RefreshTokenError::Permanent(error)) => {
+                return Err(ThreadlessChatgptAuthRefreshError::RefreshFailed(error));
+            }
+            Err(err) => {
+                return Err(ThreadlessChatgptAuthRefreshError::Other(format!(
+                    "failed to refresh local ChatGPT auth: {err}"
+                )));
+            }
+        }
 
-        let local_auth = match previous_account_id {
-            Some(previous_account_id) => load_local_chatgpt_auth_for_chatgpt_account_id(
+        let current_account_id = self
+            .auth_manager
+            .auth_cached()
+            .as_ref()
+            .and_then(CodexAuth::get_account_id);
+        let local_auth = match current_account_id.as_deref() {
+            Some(current_account_id) => load_local_chatgpt_auth_for_chatgpt_account_id(
                 &self.config.codex_home,
                 self.config.cli_auth_credentials_store_mode,
-                previous_account_id,
+                current_account_id,
                 self.config.forced_chatgpt_workspace_id.as_deref(),
             ),
             None => load_local_chatgpt_auth(
@@ -2104,7 +2142,11 @@ impl App {
                 self.config.forced_chatgpt_workspace_id.as_deref(),
             ),
         }
-        .map_err(|err| format!("failed to load refreshed local ChatGPT auth: {err}"))?;
+        .map_err(|err| {
+            ThreadlessChatgptAuthRefreshError::Other(format!(
+                "failed to load refreshed local ChatGPT auth: {err}"
+            ))
+        })?;
 
         Ok(ChatgptAuthTokensRefreshResponse {
             access_token: local_auth.access_token,
@@ -8983,7 +9025,7 @@ mod tests {
             .expect_err("missing local auth should fail loud");
 
         assert_eq!(
-            err,
+            err.to_string(),
             "failed to refresh local ChatGPT auth: Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again."
         );
     }

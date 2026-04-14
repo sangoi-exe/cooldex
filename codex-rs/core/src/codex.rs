@@ -8548,7 +8548,10 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit(
     request_store_account_id: Option<&str>,
     usage_limit_handling_policy: UsageLimitHandlingPolicy,
 ) -> CodexResult<bool> {
-    if sess.services.auth_manager.auth_mode() != Some(crate::auth::AuthMode::Chatgpt) {
+    if !matches!(
+        sess.services.auth_manager.auth_mode(),
+        Some(crate::auth::AuthMode::Chatgpt | crate::auth::AuthMode::ChatgptAuthTokens)
+    ) {
         return Ok(false);
     }
 
@@ -8766,16 +8769,6 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
     if account_ids.is_empty() {
         return HashSet::new();
     }
-    let exhausted_until_by_account_id = account_summaries
-        .into_iter()
-        .filter_map(|account| {
-            account
-                .exhausted_until
-                .map(|exhausted_until| (account.id, exhausted_until.timestamp()))
-        })
-        .collect::<HashMap<_, _>>();
-    let now_unix_seconds = Utc::now().timestamp();
-
     let mut updates = Vec::new();
     let mut freshly_unsupported_store_account_ids = HashSet::new();
     for store_account_id in account_ids {
@@ -8807,36 +8800,78 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
                 continue;
             }
         };
-        match fetch_account_rate_limits_snapshot(&turn_context.config.chatgpt_base_url, &auth).await
+        let snapshot = match fetch_account_rate_limits_snapshot(
+            &turn_context.config.chatgpt_base_url,
+            &auth,
+        )
+        .await
         {
-            Ok(Some(snapshot)) => {
-                if auto_switch_refresh_marks_account_unsupported(&snapshot) {
-                    freshly_unsupported_store_account_ids.insert(store_account_id.clone());
-                }
-                let should_skip_update = should_skip_auto_switch_refresh_update(
-                    exhausted_until_by_account_id
-                        .get(&store_account_id)
-                        .copied(),
-                    &snapshot,
-                    now_unix_seconds,
+            Ok(snapshot) => snapshot,
+            Err(FetchAccountRateLimitsError::Unauthorized(error)) => {
+                debug!(
+                    store_account_id = %store_account_id,
+                    error = %error,
+                    "usage refresh hit unauthorized response before auto-switch; forcing per-account auth recovery"
                 );
-                if should_skip_update {
-                    debug!(
-                        store_account_id = %store_account_id,
-                        "skipping rate-limit refresh update for exhausted account because snapshot appears temporarily unblocked"
-                    );
-                    continue;
+                let recovered_auth = match sess
+                    .services
+                    .auth_manager
+                    .resolve_chatgpt_auth_for_store_account_id(
+                        &store_account_id,
+                        ChatgptAccountRefreshMode::Force,
+                    )
+                    .await
+                {
+                    Ok(ChatgptAccountAuthResolution::Auth(auth)) => auth,
+                    Ok(ChatgptAccountAuthResolution::Removed { error, .. }) => {
+                        debug!(
+                            store_account_id = %store_account_id,
+                            failed_reason = ?error.reason,
+                            "removed saved ChatGPT account after unauthorized usage refresh before auto-switch"
+                        );
+                        continue;
+                    }
+                    Ok(ChatgptAccountAuthResolution::Missing) => continue,
+                    Err(err) => {
+                        debug!(
+                            store_account_id = %store_account_id,
+                            error = %err,
+                            "failed to force-resolve ChatGPT account after unauthorized usage refresh"
+                        );
+                        continue;
+                    }
+                };
+                match fetch_account_rate_limits_snapshot(
+                    &turn_context.config.chatgpt_base_url,
+                    &recovered_auth,
+                )
+                .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        debug!(
+                            store_account_id = %store_account_id,
+                            error = %err,
+                            "failed to refresh account usage after unauthorized recovery before auto-switch"
+                        );
+                        continue;
+                    }
                 }
-                updates.push((store_account_id, snapshot));
             }
-            Ok(None) => {}
             Err(err) => {
                 debug!(
                     store_account_id = %store_account_id,
                     error = %err,
                     "failed to refresh account usage before auto-switch"
                 );
+                continue;
             }
+        };
+        if let Some(snapshot) = snapshot {
+            if auto_switch_refresh_marks_account_unsupported(&snapshot) {
+                freshly_unsupported_store_account_ids.insert(store_account_id.clone());
+            }
+            updates.push((store_account_id, snapshot));
         }
     }
 
@@ -8870,45 +8905,29 @@ fn auto_switch_refresh_marks_account_unsupported(snapshot: &RateLimitSnapshot) -
     crate::auth::usage_limit_auto_switch_removes_plan_type(snapshot.plan_type.as_ref())
 }
 
-fn should_skip_auto_switch_refresh_update(
-    exhausted_until_unix_seconds: Option<i64>,
-    snapshot: &RateLimitSnapshot,
-    now_unix_seconds: i64,
-) -> bool {
-    exhausted_until_unix_seconds.is_some_and(|exhausted_until| exhausted_until > now_unix_seconds)
-        && !rate_limit_snapshot_reports_usage_blocked(snapshot, now_unix_seconds)
+#[derive(Debug)]
+enum FetchAccountRateLimitsError {
+    Unauthorized(String),
+    Other(String),
 }
 
-fn rate_limit_snapshot_reports_usage_blocked(
-    snapshot: &RateLimitSnapshot,
-    now_unix_seconds: i64,
-) -> bool {
-    rate_limit_window_reports_usage_blocked(snapshot.secondary.as_ref(), now_unix_seconds)
-        || rate_limit_window_reports_usage_blocked(snapshot.primary.as_ref(), now_unix_seconds)
-}
-
-fn rate_limit_window_reports_usage_blocked(
-    window: Option<&RateLimitWindow>,
-    now_unix_seconds: i64,
-) -> bool {
-    let Some(window) = window else {
-        return false;
-    };
-    if let Some(resets_at_unix_seconds) = window.resets_at
-        && now_unix_seconds >= resets_at_unix_seconds
-    {
-        return false;
+impl std::fmt::Display for FetchAccountRateLimitsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unauthorized(message) | Self::Other(message) => formatter.write_str(message),
+        }
     }
-    window.used_percent >= 100.0
 }
+
+impl std::error::Error for FetchAccountRateLimitsError {}
 
 async fn fetch_account_rate_limits_snapshot(
     chatgpt_base_url: &str,
     auth: &CodexAuth,
-) -> Result<Option<RateLimitSnapshot>, String> {
-    let token = auth
-        .get_token()
-        .map_err(|err| format!("failed to read auth token: {err}"))?;
+) -> Result<Option<RateLimitSnapshot>, FetchAccountRateLimitsError> {
+    let token = auth.get_token().map_err(|err| {
+        FetchAccountRateLimitsError::Other(format!("failed to read auth token: {err}"))
+    })?;
     let base_url = chatgpt_base_url.trim_end_matches('/');
     let usage_url = if base_url.contains("/backend-api") {
         format!("{base_url}/wham/usage")
@@ -8924,19 +8943,27 @@ async fn fetch_account_rate_limits_snapshot(
         request = request.header("ChatGPT-Account-Id", account_id);
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(|err| format!("usage request failed: {err}"))?;
+    let response = request.send().await.map_err(|err| {
+        FetchAccountRateLimitsError::Other(format!("usage request failed: {err}"))
+    })?;
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("usage request failed with status {status}"));
+        let body = response.text().await.unwrap_or_default();
+        let message = if body.trim().is_empty() {
+            format!("usage request failed with status {status}")
+        } else {
+            format!("usage request failed with status {status}: {body}")
+        };
+        return Err(if status == reqwest::StatusCode::UNAUTHORIZED {
+            FetchAccountRateLimitsError::Unauthorized(message)
+        } else {
+            FetchAccountRateLimitsError::Other(message)
+        });
     }
 
-    let payload = response
-        .json::<Value>()
-        .await
-        .map_err(|err| format!("failed to decode usage payload: {err}"))?;
+    let payload = response.json::<Value>().await.map_err(|err| {
+        FetchAccountRateLimitsError::Other(format!("failed to decode usage payload: {err}"))
+    })?;
     Ok(parse_rate_limits_snapshot_from_usage_payload(&payload))
 }
 
