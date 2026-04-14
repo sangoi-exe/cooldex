@@ -193,10 +193,13 @@ pub fn create_resume_agent_tool() -> ToolSpec {
     })
 }
 
+// Merge-safety anchor: legacy wait_agent metadata must stay aligned with the runtime
+// errored-short-circuit contract so explicit any_final/all_final waits never regress into
+// unreachable blocking semantics.
 pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait on the requested agent ids. Omit return_when for the timed convenience mode, or combine disable_timeout=true with return_when=any_final|all_final for a blocking final-status wait."
+        description: "Wait on the requested agent ids. Omit return_when for the timed convenience mode, or combine disable_timeout=true with return_when=any_final|all_final for a blocking final-status wait. Explicit waits short-circuit immediately if a requested agent is already or becomes errored."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -703,7 +706,7 @@ fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema
         (
             "return_when".to_string(),
             JsonSchema::string(Some(
-                "Optional completion condition when disable_timeout=true: any_final waits for the next requested non-final agent to newly become final, while all_final waits for every requested agent to be final."
+                "Optional completion condition when disable_timeout=true: any_final waits for the next requested non-final agent to newly become final, while all_final waits for every requested agent to be final. Either explicit wait short-circuits immediately if a requested agent is already or becomes errored."
                     .to_string(),
             )),
         ),

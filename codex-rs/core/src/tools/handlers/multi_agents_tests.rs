@@ -36,6 +36,7 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileSystemSandboxPolicy;
 use codex_protocol::protocol::InitialHistory;
@@ -320,6 +321,34 @@ async fn wait_for_shutdown_status(status_rx: &mut Receiver<AgentStatus>) {
             .expect("shutdown status should arrive");
         changed.expect("status channel should stay open");
     }
+}
+
+async fn wait_for_errored_status(status_rx: &mut Receiver<AgentStatus>, expected_message: &str) {
+    let expected_status = AgentStatus::Errored(expected_message.to_string());
+    loop {
+        if status_rx.borrow().clone() == expected_status {
+            return;
+        }
+        let changed = timeout(Duration::from_secs(1), status_rx.changed())
+            .await
+            .expect("errored status should arrive");
+        changed.expect("status channel should stay open");
+    }
+}
+
+async fn mark_thread_errored(thread: &CodexThread, message: &str) {
+    let turn = thread.codex.session.new_default_turn().await;
+    thread
+        .codex
+        .session
+        .send_event(
+            turn.as_ref(),
+            EventMsg::Error(ErrorEvent {
+                message: message.to_string(),
+                codex_error_info: None,
+            }),
+        )
+        .await;
 }
 
 #[derive(Debug, Deserialize)]
@@ -3736,6 +3765,293 @@ async fn wait_all_final_waits_for_remaining_non_final_agents() {
         running_agent_id,
         AgentStatus::Shutdown,
     ));
+}
+
+// Merge-safety anchor: legacy wait_agent explicit waits must short-circuit when a requested
+// agent is already or becomes errored so the lead cannot hang forever on unreachable any/all
+// final conditions.
+#[tokio::test]
+async fn wait_any_final_returns_immediately_when_agent_is_already_errored() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let config = turn.config.as_ref().clone();
+    let errored_thread = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start errored thread");
+    let running_thread = manager
+        .start_thread(config)
+        .await
+        .expect("start running thread");
+    let errored_agent_id = errored_thread.thread_id;
+    let running_agent_id = running_thread.thread_id;
+    let mut errored_status_rx = manager
+        .agent_control()
+        .subscribe_status(errored_agent_id)
+        .await
+        .expect("subscribe should succeed");
+
+    mark_thread_errored(&errored_thread.thread, "usage limit").await;
+    wait_for_errored_status(&mut errored_status_rx, "usage limit").await;
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "wait_agent",
+        function_payload(json!({
+            "ids": [errored_agent_id.to_string(), running_agent_id.to_string()],
+            "return_when": "any_final",
+            "disable_timeout": true
+        })),
+    );
+    let output = timeout(Duration::from_secs(1), WaitAgentHandler.handle(invocation))
+        .await
+        .expect("wait should finish immediately")
+        .expect("wait should succeed");
+    assert!(!output.timed_out);
+    assert_eq!(output.agents.len(), 2);
+    assert_agent_status(
+        &output.agents,
+        errored_agent_id,
+        AgentStatus::Errored("usage limit".to_string()),
+    );
+    let running_state = output
+        .agents
+        .get(&running_agent_id)
+        .expect("running agent should be reported");
+    assert!(matches!(
+        running_state.status,
+        AgentStatus::PendingInit | AgentStatus::Running
+    ));
+
+    let _ = errored_thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
+    let _ = running_thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
+}
+
+#[tokio::test]
+async fn wait_all_final_returns_immediately_when_agent_is_already_errored() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let config = turn.config.as_ref().clone();
+    let errored_thread = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start errored thread");
+    let running_thread = manager
+        .start_thread(config)
+        .await
+        .expect("start running thread");
+    let errored_agent_id = errored_thread.thread_id;
+    let running_agent_id = running_thread.thread_id;
+    let mut errored_status_rx = manager
+        .agent_control()
+        .subscribe_status(errored_agent_id)
+        .await
+        .expect("subscribe should succeed");
+
+    mark_thread_errored(&errored_thread.thread, "usage limit").await;
+    wait_for_errored_status(&mut errored_status_rx, "usage limit").await;
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "wait_agent",
+        function_payload(json!({
+            "ids": [errored_agent_id.to_string(), running_agent_id.to_string()],
+            "return_when": "all_final",
+            "disable_timeout": true
+        })),
+    );
+    let output = timeout(Duration::from_secs(1), WaitAgentHandler.handle(invocation))
+        .await
+        .expect("wait should finish immediately")
+        .expect("wait should succeed");
+    assert!(!output.timed_out);
+    assert_eq!(output.agents.len(), 2);
+    assert_agent_status(
+        &output.agents,
+        errored_agent_id,
+        AgentStatus::Errored("usage limit".to_string()),
+    );
+    let running_state = output
+        .agents
+        .get(&running_agent_id)
+        .expect("running agent should be reported");
+    assert!(matches!(
+        running_state.status,
+        AgentStatus::PendingInit | AgentStatus::Running
+    ));
+
+    let _ = errored_thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
+    let _ = running_thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
+}
+
+#[tokio::test]
+async fn wait_any_final_returns_when_agent_errors_during_wait() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let config = turn.config.as_ref().clone();
+    let errored_thread = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start errored thread");
+    let running_thread = manager
+        .start_thread(config)
+        .await
+        .expect("start running thread");
+    let errored_agent_id = errored_thread.thread_id;
+    let running_agent_id = running_thread.thread_id;
+    let mut errored_status_rx = manager
+        .agent_control()
+        .subscribe_status(errored_agent_id)
+        .await
+        .expect("subscribe should succeed");
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "wait_agent",
+        function_payload(json!({
+            "ids": [errored_agent_id.to_string(), running_agent_id.to_string()],
+            "return_when": "any_final",
+            "disable_timeout": true
+        })),
+    );
+    let mut wait_task = tokio::spawn(async move { WaitAgentHandler.handle(invocation).await });
+    let early = timeout(Duration::from_millis(50), &mut wait_task).await;
+    assert!(
+        early.is_err(),
+        "any_final should still be waiting before an agent errors"
+    );
+
+    mark_thread_errored(&errored_thread.thread, "usage limit").await;
+    wait_for_errored_status(&mut errored_status_rx, "usage limit").await;
+
+    let output = timeout(Duration::from_secs(1), &mut wait_task)
+        .await
+        .expect("wait task should finish once the agent errors")
+        .expect("wait task should join")
+        .expect("wait should succeed");
+    assert!(!output.timed_out);
+    assert_eq!(output.agents.len(), 2);
+    assert_agent_status(
+        &output.agents,
+        errored_agent_id,
+        AgentStatus::Errored("usage limit".to_string()),
+    );
+    let running_state = output
+        .agents
+        .get(&running_agent_id)
+        .expect("running agent should be reported");
+    assert!(matches!(
+        running_state.status,
+        AgentStatus::PendingInit | AgentStatus::Running
+    ));
+
+    let _ = errored_thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
+    let _ = running_thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
+}
+
+#[tokio::test]
+async fn wait_all_final_returns_when_agent_errors_during_wait() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let config = turn.config.as_ref().clone();
+    let errored_thread = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start errored thread");
+    let running_thread = manager
+        .start_thread(config)
+        .await
+        .expect("start running thread");
+    let errored_agent_id = errored_thread.thread_id;
+    let running_agent_id = running_thread.thread_id;
+    let mut errored_status_rx = manager
+        .agent_control()
+        .subscribe_status(errored_agent_id)
+        .await
+        .expect("subscribe should succeed");
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "wait_agent",
+        function_payload(json!({
+            "ids": [errored_agent_id.to_string(), running_agent_id.to_string()],
+            "return_when": "all_final",
+            "disable_timeout": true
+        })),
+    );
+    let mut wait_task = tokio::spawn(async move { WaitAgentHandler.handle(invocation).await });
+    let early = timeout(Duration::from_millis(50), &mut wait_task).await;
+    assert!(
+        early.is_err(),
+        "all_final should still be waiting before an agent errors"
+    );
+
+    mark_thread_errored(&errored_thread.thread, "usage limit").await;
+    wait_for_errored_status(&mut errored_status_rx, "usage limit").await;
+
+    let output = timeout(Duration::from_secs(1), &mut wait_task)
+        .await
+        .expect("wait task should finish once the agent errors")
+        .expect("wait task should join")
+        .expect("wait should succeed");
+    assert!(!output.timed_out);
+    assert_eq!(output.agents.len(), 2);
+    assert_agent_status(
+        &output.agents,
+        errored_agent_id,
+        AgentStatus::Errored("usage limit".to_string()),
+    );
+    let running_state = output
+        .agents
+        .get(&running_agent_id)
+        .expect("running agent should be reported");
+    assert!(matches!(
+        running_state.status,
+        AgentStatus::PendingInit | AgentStatus::Running
+    ));
+
+    let _ = errored_thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
+    let _ = running_thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
 }
 
 #[tokio::test]

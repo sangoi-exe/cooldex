@@ -23,6 +23,10 @@ struct StatusSubscription {
     was_final_at_start: bool,
 }
 
+fn is_fatal_wait_status(status: &AgentStatus) -> bool {
+    matches!(status, AgentStatus::Errored(_))
+}
+
 impl ToolHandler for Handler {
     type Output = WaitResult;
 
@@ -129,6 +133,7 @@ impl ToolHandler for Handler {
 
         let mut status_subscriptions = Vec::with_capacity(receiver_thread_ids.len());
         let mut final_status_count = 0;
+        let mut fatal_status_count = 0;
         for id in &receiver_thread_ids {
             match session.services.agent_control.subscribe_status(*id).await {
                 Ok(rx) => {
@@ -136,6 +141,9 @@ impl ToolHandler for Handler {
                     let was_final_at_start = is_final(&status);
                     if was_final_at_start {
                         final_status_count += 1;
+                        if is_fatal_wait_status(&status) {
+                            fatal_status_count += 1;
+                        }
                     }
                     status_subscriptions.push(StatusSubscription {
                         thread_id: *id,
@@ -180,6 +188,7 @@ impl ToolHandler for Handler {
             condition_enabled,
             return_when,
             final_status_count,
+            fatal_status_count,
             receiver_thread_ids.len(),
         );
         if !condition_met {
@@ -282,10 +291,14 @@ fn wait_condition_already_met(
     condition_enabled: bool,
     return_when: CollabWaitReturnWhen,
     final_status_count: usize,
+    fatal_status_count: usize,
     total_status_count: usize,
 ) -> bool {
     if !condition_enabled {
         return final_status_count > 0;
+    }
+    if fatal_status_count > 0 {
+        return true;
     }
     match return_when {
         CollabWaitReturnWhen::AnyFinal => final_status_count == total_status_count,
@@ -377,7 +390,11 @@ async fn wait_for_all_final(
 ) -> Result<bool, FunctionCallError> {
     let mut futures = FuturesUnordered::new();
     for subscription in status_subscriptions {
-        if subscription.was_final_at_start || is_final(&subscription.status_rx.borrow().clone()) {
+        let current_status = subscription.status_rx.borrow().clone();
+        if is_fatal_wait_status(&current_status) {
+            return Ok(true);
+        }
+        if subscription.was_final_at_start || is_final(&current_status) {
             continue;
         }
         let session = session.clone();
@@ -396,7 +413,10 @@ async fn wait_for_all_final(
     if let Some(deadline) = deadline {
         loop {
             match timeout_at(deadline, futures.next()).await {
-                Ok(Some(Some(_result))) => {
+                Ok(Some(Some((_thread_id, status)))) => {
+                    if is_fatal_wait_status(&status) {
+                        return Ok(true);
+                    }
                     remaining -= 1;
                     if remaining == 0 {
                         return Ok(true);
@@ -414,7 +434,10 @@ async fn wait_for_all_final(
 
     loop {
         match futures.next().await {
-            Some(Some(_result)) => {
+            Some(Some((_thread_id, status))) => {
+                if is_fatal_wait_status(&status) {
+                    return Ok(true);
+                }
                 remaining -= 1;
                 if remaining == 0 {
                     return Ok(true);

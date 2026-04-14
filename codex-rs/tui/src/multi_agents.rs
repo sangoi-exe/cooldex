@@ -294,7 +294,7 @@ pub(crate) fn waiting_end(ev: CollabWaitingEndEvent) -> PlainHistoryCell {
         wait_state,
     } = ev;
     let details = wait_complete_lines(&statuses, &agent_statuses);
-    collab_event(wait_end_title(&wait_state), details)
+    collab_event(wait_end_title(&wait_state, &statuses), details)
 }
 
 pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
@@ -542,12 +542,36 @@ fn wait_begin_title(
     }
 }
 
-fn wait_end_title(wait_state: &CollabWaitState) -> Line<'static> {
+fn wait_finished_with_agent_errors(
+    wait_state: &CollabWaitState,
+    statuses: &HashMap<ThreadId, AgentStatus>,
+) -> bool {
+    wait_state.uses_explicit_condition()
+        && wait_state.timed_out == Some(false)
+        && statuses
+            .values()
+            .any(|status| matches!(status, AgentStatus::Errored(_)))
+}
+
+fn wait_end_title(
+    wait_state: &CollabWaitState,
+    statuses: &HashMap<ThreadId, AgentStatus>,
+) -> Line<'static> {
     if !wait_state.uses_explicit_condition() {
         return match wait_state.timed_out {
             Some(true) => title_text("Wait timed out"),
             Some(false) => title_text("Wait finished"),
             None => title_text("Finished waiting"),
+        };
+    }
+    if wait_finished_with_agent_errors(wait_state, statuses) {
+        return match wait_state.return_when {
+            CollabWaitReturnWhen::AnyFinal => {
+                title_text("Wait finished with agent errors (any final)")
+            }
+            CollabWaitReturnWhen::AllFinal => {
+                title_text("Wait finished with agent errors (all final)")
+            }
         };
     }
     match (wait_state.timed_out, wait_state.return_when) {
@@ -1012,6 +1036,98 @@ mod tests {
         }));
         assert!(text.contains("Wait timed out"));
         assert!(!text.contains("Wait timed out (any final)"));
+    }
+
+    #[test]
+    fn waiting_end_renders_fatal_short_circuit_truthfully() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
+            .expect("valid robie thread id");
+        let bob_id = ThreadId::from_string("00000000-0000-0000-0000-000000000003")
+            .expect("valid bob thread id");
+        let text = cell_to_text(&waiting_end(CollabWaitingEndEvent {
+            sender_thread_id,
+            call_id: "call-wait".to_string(),
+            agent_statuses: vec![
+                CollabAgentStatusEntry {
+                    thread_id: robie_id,
+                    agent_nickname: Some("Robie".to_string()),
+                    agent_role: Some("explorer".to_string()),
+                    task_name: None,
+                    status: AgentStatus::Errored("usage limit".to_string()),
+                    last_activity: None,
+                },
+                CollabAgentStatusEntry {
+                    thread_id: bob_id,
+                    agent_nickname: Some("Bob".to_string()),
+                    agent_role: Some("worker".to_string()),
+                    task_name: None,
+                    status: AgentStatus::Running,
+                    last_activity: None,
+                },
+            ],
+            statuses: HashMap::from([
+                (robie_id, AgentStatus::Errored("usage limit".to_string())),
+                (bob_id, AgentStatus::Running),
+            ]),
+            wait_state: CollabWaitState {
+                return_when: CollabWaitReturnWhen::AllFinal,
+                disable_timeout: true,
+                condition_enabled: true,
+                timed_out: Some(false),
+            },
+        }));
+        assert!(text.contains("Wait finished with agent errors (all final)"));
+        assert!(!text.contains("Wait condition met (all final)"));
+        assert!(text.contains("Bob [worker]: Running"));
+        assert_snapshot!("collab_waiting_end_all_final_with_agent_errors", text);
+    }
+
+    #[test]
+    fn waiting_end_does_not_claim_error_causality_for_any_final() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
+            .expect("valid robie thread id");
+        let bob_id = ThreadId::from_string("00000000-0000-0000-0000-000000000003")
+            .expect("valid bob thread id");
+        let text = cell_to_text(&waiting_end(CollabWaitingEndEvent {
+            sender_thread_id,
+            call_id: "call-wait".to_string(),
+            agent_statuses: vec![
+                CollabAgentStatusEntry {
+                    thread_id: robie_id,
+                    agent_nickname: Some("Robie".to_string()),
+                    agent_role: Some("explorer".to_string()),
+                    task_name: None,
+                    status: AgentStatus::Completed(Some("done".to_string())),
+                    last_activity: None,
+                },
+                CollabAgentStatusEntry {
+                    thread_id: bob_id,
+                    agent_nickname: Some("Bob".to_string()),
+                    agent_role: Some("worker".to_string()),
+                    task_name: None,
+                    status: AgentStatus::Errored("usage limit".to_string()),
+                    last_activity: None,
+                },
+            ],
+            statuses: HashMap::from([
+                (robie_id, AgentStatus::Completed(Some("done".to_string()))),
+                (bob_id, AgentStatus::Errored("usage limit".to_string())),
+            ]),
+            wait_state: CollabWaitState {
+                return_when: CollabWaitReturnWhen::AnyFinal,
+                disable_timeout: true,
+                condition_enabled: true,
+                timed_out: Some(false),
+            },
+        }));
+        assert!(text.contains("Wait finished with agent errors (any final)"));
+        assert!(!text.contains("Wait stopped on agent error"));
+        assert!(!text.contains("Wait condition met (any final)"));
+        assert_snapshot!("collab_waiting_end_any_final_with_agent_errors", text);
     }
 
     #[test]

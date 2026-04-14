@@ -1,0 +1,7 @@
+---
+source: tui/src/multi_agents.rs
+expression: text
+---
+• Wait finished with agent errors (all final)
+  └ Robie [explorer]: Error - usage limit
+    Bob [worker]: Running
