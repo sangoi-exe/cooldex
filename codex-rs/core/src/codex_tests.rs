@@ -1923,9 +1923,7 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
         freshly_selectable_store_account_ids: std::collections::HashSet::from([
             acc_2_store_account_id.clone(),
         ]),
-        freshly_unsupported_store_account_ids: std::collections::HashSet::from([
-            acc_2_store_account_id.clone(),
-        ]),
+        freshly_unsupported_store_account_ids: std::collections::HashSet::new(),
     };
 
     let should_retry = maybe_auto_switch_account_on_usage_limit_with_refreshed_account_state(
@@ -1963,8 +1961,120 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn visible_usage_limit_retry_marks_failing_account_exhausted_even_when_stale_autoswitch_is_canceled()
+ {
+    let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let auth_home = tempfile::tempdir().expect("create auth tempdir");
+    let mut acc_0_tokens = test_chatgpt_token_data("acc-0");
+    acc_0_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_0_tokens.id_token.raw_jwt)
+            .expect("parse acc-0 id token");
+    let acc_0_store_account_id = acc_0_tokens
+        .preferred_store_account_id()
+        .expect("acc-0 store account id");
+    let mut acc_1_tokens = test_chatgpt_token_data("acc-1");
+    acc_1_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_1_tokens.id_token.raw_jwt)
+            .expect("parse acc-1 id token");
+    let acc_1_store_account_id = acc_1_tokens
+        .preferred_store_account_id()
+        .expect("acc-1 store account id");
+    let auth_store = crate::auth::AuthStore {
+        active_account_id: Some(acc_1_store_account_id.clone()),
+        accounts: vec![
+            crate::auth::StoredAccount {
+                id: acc_0_store_account_id.clone(),
+                label: None,
+                tokens: acc_0_tokens,
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+            crate::auth::StoredAccount {
+                id: acc_1_store_account_id.clone(),
+                label: None,
+                tokens: acc_1_tokens,
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+        ],
+        ..crate::auth::AuthStore::default()
+    };
+    crate::auth::save_auth(
+        auth_home.path(),
+        &auth_store,
+        crate::auth::AuthCredentialsStoreMode::File,
+    )
+    .expect("persist auth store");
+    let auth_manager = AuthManager::shared(
+        auth_home.path().to_path_buf(),
+        false,
+        crate::auth::AuthCredentialsStoreMode::File,
+    );
+    let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
+    session_mut.services.auth_manager = Arc::clone(&auth_manager);
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.auth_manager = Some(Arc::clone(&auth_manager));
+
+    let usage_limit = UsageLimitReachedError {
+        plan_type: None,
+        resets_at: Some(Utc::now() + chrono::Duration::minutes(15)),
+        rate_limits: Some(Box::new(RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(15),
+                resets_at: Some((Utc::now() + chrono::Duration::minutes(15)).timestamp()),
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: None,
+        })),
+        promo_message: None,
+    };
+    let refresh_state = AutoSwitchRefreshState {
+        freshly_selectable_store_account_ids: std::collections::HashSet::new(),
+        freshly_unsupported_store_account_ids: std::collections::HashSet::new(),
+    };
+
+    let should_retry = maybe_auto_switch_account_on_usage_limit_with_refreshed_account_state(
+        &session,
+        &turn_context,
+        &usage_limit,
+        Some(acc_0_store_account_id.as_str()),
+        &refresh_state,
+        UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch,
+    )
+    .await
+    .expect("stale request should still retry under the later active account");
+
+    assert!(should_retry);
+    let accounts = auth_manager.list_accounts();
+    let failing_account = accounts
+        .iter()
+        .find(|account| account.id == acc_0_store_account_id)
+        .expect("failing account should still exist");
+    assert!(
+        failing_account.exhausted_until.is_some(),
+        "failing account should still be marked exhausted"
+    );
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id.as_str()),
+        Some(acc_1_store_account_id.as_str())
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "stale-request cancellation should not emit a duplicate warning event"
+    );
+}
+
 #[test]
-fn visible_usage_limit_retry_stops_when_changed_active_account_was_not_proven_selectable() {
+fn visible_usage_limit_retry_stops_when_changed_active_account_was_freshly_proven_unsupported() {
     let refresh_state = AutoSwitchRefreshState {
         freshly_selectable_store_account_ids: std::collections::HashSet::new(),
         freshly_unsupported_store_account_ids: std::collections::HashSet::from([String::from(
@@ -1981,7 +2091,7 @@ fn visible_usage_limit_retry_stops_when_changed_active_account_was_not_proven_se
 
     assert!(
         !should_retry,
-        "retry should stop once the changed active account was not freshly proven selectable"
+        "retry should stop once the changed active account was freshly proven unsupported"
     );
 }
 

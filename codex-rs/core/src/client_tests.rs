@@ -20,6 +20,7 @@ use chrono::Utc;
 use codex_api::CoreAuthProvider;
 use codex_app_server_protocol::AuthMode;
 use codex_login::AuthManager;
+use codex_login::UsageLimitAutoSwitchFallbackSelectionMode;
 use codex_login::UsageLimitAutoSwitchRequest;
 use codex_login::UsageLimitAutoSwitchSelectionScope;
 use codex_login::token_data::IdTokenInfo;
@@ -456,6 +457,8 @@ async fn subagent_websocket_reconnects_when_auth_account_changes_mid_session() {
             freshly_unsupported_store_account_ids: &freshly_unsupported_store_account_ids,
             protected_store_account_id: None,
             selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+            fallback_selection_mode:
+                UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
         })
         .expect("account switch should succeed");
     assert!(
@@ -591,6 +594,8 @@ async fn subagent_preconnect_reconnects_when_auth_account_changes_mid_session() 
             freshly_unsupported_store_account_ids: &freshly_unsupported_store_account_ids,
             protected_store_account_id: None,
             selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+            fallback_selection_mode:
+                UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
         })
         .expect("account switch should succeed");
     assert!(

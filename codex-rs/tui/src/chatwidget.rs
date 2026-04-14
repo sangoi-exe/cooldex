@@ -10008,8 +10008,7 @@ impl ChatWidget {
         if Self::rate_limit_is_cache_expired(now, resets_at) {
             return None;
         }
-        let clamped = window.used_percent.clamp(0.0, 100.0);
-        Some(clamped.round() as i64)
+        Some(window.display_used_percent())
     }
 
     fn rate_limit_window_blocked(now: DateTime<Local>, window: Option<&RateLimitWindow>) -> bool {
@@ -10017,11 +10016,7 @@ impl ChatWidget {
             return false;
         };
 
-        let resets_at = Self::rate_limit_window_reset_at_local(window);
-        if Self::rate_limit_is_cache_expired(now, resets_at) {
-            return false;
-        }
-        window.used_percent >= 100.0
+        window.is_effectively_saturated_at(now.timestamp())
     }
 
     fn rate_limit_format_window_status(

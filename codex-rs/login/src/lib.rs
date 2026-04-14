@@ -49,6 +49,7 @@ pub use auth::RefreshTokenError;
 pub use auth::StoredAccount;
 pub use auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
 pub use auth::UnauthorizedRecovery;
+pub use auth::UsageLimitAutoSwitchFallbackSelectionMode;
 pub use auth::UsageLimitAutoSwitchRequest;
 pub use auth::UsageLimitAutoSwitchSelectionScope;
 pub use auth::default_client;

@@ -230,6 +230,12 @@ pub enum UsageLimitAutoSwitchSelectionScope<'a> {
     FreshlySelectable(&'a HashSet<String>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageLimitAutoSwitchFallbackSelectionMode {
+    AllowFallbackSelection,
+    CancelStaleRequestFallbackSelection,
+}
+
 pub struct UsageLimitAutoSwitchRequest<'a> {
     pub required_workspace_id: Option<&'a str>,
     pub failing_store_account_id: Option<&'a str>,
@@ -238,6 +244,7 @@ pub struct UsageLimitAutoSwitchRequest<'a> {
     pub freshly_unsupported_store_account_ids: &'a HashSet<String>,
     pub protected_store_account_id: Option<&'a str>,
     pub selection_scope: UsageLimitAutoSwitchSelectionScope<'a>,
+    pub fallback_selection_mode: UsageLimitAutoSwitchFallbackSelectionMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1912,6 +1919,7 @@ impl AuthManager {
             freshly_unsupported_store_account_ids,
             protected_store_account_id,
             selection_scope,
+            fallback_selection_mode,
         } = request;
         if !self.has_saved_chatgpt_accounts() {
             return Ok(None);
@@ -2046,6 +2054,12 @@ impl AuthManager {
                     usage.last_seen_at = Some(mutation_now);
                 }
                 return Ok(Some(protected_store_account_id.to_string()));
+            }
+
+            if fallback_selection_mode
+                == UsageLimitAutoSwitchFallbackSelectionMode::CancelStaleRequestFallbackSelection
+            {
+                return Ok(None);
             }
 
             let Some(next_account_id) = select_account_for_auto_switch_from_store(
@@ -3158,14 +3172,7 @@ fn rate_limit_window_blocked(window: Option<&RateLimitWindow>, now: DateTime<Utc
         return false;
     };
 
-    if let Some(resets_at_seconds) = window.resets_at
-        && let Some(resets_at) = DateTime::<Utc>::from_timestamp(resets_at_seconds, 0)
-        && now >= resets_at
-    {
-        return false;
-    }
-
-    window.used_percent >= 100.0
+    window.is_effectively_saturated_at(now.timestamp())
 }
 
 fn rate_limit_window_reset_at(window: Option<&RateLimitWindow>) -> Option<DateTime<Utc>> {

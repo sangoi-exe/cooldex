@@ -12046,6 +12046,56 @@ async fn accounts_popup_status_marker_prioritizes_weekly_over_5h() {
 }
 
 #[tokio::test]
+async fn accounts_popup_marks_near_limit_display_99_window_as_blocked() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+
+    let now = chrono::DateTime::parse_from_rfc3339("2026-04-14T23:02:00Z")
+        .expect("valid fixed timestamp")
+        .with_timezone(&chrono::Utc);
+    let popup_now = now.with_timezone(&chrono::Local);
+    let five_hour_resets_at = (now + chrono::Duration::hours(2)).timestamp();
+    let weekly_resets_at = (now + chrono::Duration::days(2)).timestamp();
+
+    chat.auth_manager
+        .update_rate_limits_for_accounts([(
+            "personal-account".to_string(),
+            RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 98.6,
+                    window_minutes: Some(300),
+                    resets_at: Some(five_hour_resets_at),
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: 20.0,
+                    window_minutes: Some(7 * 24 * 60),
+                    resets_at: Some(weekly_resets_at),
+                }),
+                credits: None,
+                plan_type: None,
+            },
+        )])
+        .expect("update account rate limits");
+
+    chat.open_accounts_popup_at(popup_now);
+    let popup = render_bottom_popup(&chat, 100);
+    let local_reset = chrono::DateTime::<chrono::Utc>::from_timestamp(five_hour_resets_at, 0)
+        .expect("valid fixed reset timestamp")
+        .with_timezone(&chrono::Local)
+        .format("%H:%M")
+        .to_string();
+    let snapshot_popup = popup.replace(&local_reset, "<local-reset>");
+    assert_snapshot!("accounts_popup_near_limit_display_99_window", snapshot_popup);
+    assert!(
+        popup.contains("🟡  Personal"),
+        "expected near-limit 99 display window to use the blocked 5h marker:\n{popup}"
+    );
+}
+
+#[tokio::test]
 async fn accounts_popup_single_weekly_window_does_not_duplicate_labels() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
     chat.thread_id = Some(ThreadId::new());
@@ -12186,6 +12236,56 @@ async fn logout_popup_status_marker_prioritizes_weekly_over_5h() {
     assert!(
         popup.contains("Remove: 🟡  Personal"),
         "expected 5h marker for personal account in logout popup:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn logout_popup_marks_near_limit_display_99_window_as_blocked() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+
+    let now = chrono::DateTime::parse_from_rfc3339("2026-04-14T23:02:00Z")
+        .expect("valid fixed timestamp")
+        .with_timezone(&chrono::Utc);
+    let popup_now = now.with_timezone(&chrono::Local);
+    let five_hour_resets_at = (now + chrono::Duration::hours(2)).timestamp();
+    let weekly_resets_at = (now + chrono::Duration::days(2)).timestamp();
+
+    chat.auth_manager
+        .update_rate_limits_for_accounts([(
+            "personal-account".to_string(),
+            RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 98.6,
+                    window_minutes: Some(300),
+                    resets_at: Some(five_hour_resets_at),
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: 20.0,
+                    window_minutes: Some(7 * 24 * 60),
+                    resets_at: Some(weekly_resets_at),
+                }),
+                credits: None,
+                plan_type: None,
+            },
+        )])
+        .expect("update account rate limits");
+
+    chat.open_logout_popup_at(popup_now);
+    let popup = render_bottom_popup(&chat, 100);
+    let local_reset = chrono::DateTime::<chrono::Utc>::from_timestamp(five_hour_resets_at, 0)
+        .expect("valid fixed reset timestamp")
+        .with_timezone(&chrono::Local)
+        .format("%H:%M")
+        .to_string();
+    let snapshot_popup = popup.replace(&local_reset, "<local-reset>");
+    assert_snapshot!("logout_popup_near_limit_display_99_window", snapshot_popup);
+    assert!(
+        popup.contains("Remove: 🟡  Personal"),
+        "expected near-limit 99 display window to use the blocked 5h marker in logout popup:\n{popup}"
     );
 }
 

@@ -587,6 +587,8 @@ fn cooldown_still_purges_freshly_unsupported_fallbacks_and_marks_failing_account
             ]),
             protected_store_account_id: None,
             selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+            fallback_selection_mode:
+                UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
         })
         .expect("cooldown path should succeed");
 
@@ -726,6 +728,23 @@ fn select_account_for_auto_switch_respects_freshly_selectable_scope() {
         Some(weaker_store_account_id.as_str())
     );
     assert_ne!(weaker_store_account_id, stronger_store_account_id);
+}
+
+#[test]
+fn exhausted_until_from_snapshot_treats_display_99_window_as_blocked() {
+    let now = Utc::now();
+    let snapshot = test_rate_limit_snapshot(98.6, 10.0, now);
+
+    let expected_reset_at = snapshot
+        .primary
+        .as_ref()
+        .and_then(|window| window.resets_at)
+        .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
+
+    assert_eq!(
+        super::exhausted_until_from_snapshot(&snapshot, now),
+        expected_reset_at
+    );
 }
 
 #[test]

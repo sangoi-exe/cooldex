@@ -2015,6 +2015,30 @@ pub struct RateLimitWindow {
     pub resets_at: Option<i64>,
 }
 
+impl RateLimitWindow {
+    /// Returns the clamped rounded percentage shown in operator-facing UI.
+    pub fn display_used_percent(&self) -> i64 {
+        self.used_percent.clamp(0.0, 100.0).round() as i64
+    }
+
+    /// Returns whether the window is effectively saturated until its reset time.
+    ///
+    /// Workspace-local autoswitch and `/accounts` truth must stay conservative here:
+    /// once a saved-account window still displays as `99%` with a future reset,
+    /// it is treated as saturated so runtime selection and UI do not keep routing
+    /// into an account that can still hard-fail with a usage-limit response.
+    pub fn is_effectively_saturated_at(&self, now_unix_seconds: i64) -> bool {
+        if self
+            .resets_at
+            .is_some_and(|resets_at| now_unix_seconds >= resets_at)
+        {
+            return false;
+        }
+
+        self.display_used_percent() >= 99
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]
 pub struct CreditsSnapshot {
     pub has_credits: bool,

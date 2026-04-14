@@ -1,0 +1,14 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: snapshot_popup
+---
+  Logout
+  Codex will exit after logging out.
+  Select an option below.
+
+› 1. Logout all accounts  Remove all stored credentials.
+  2. Remove: Work         currently active • email: work@example.com
+  3. Remove: 🟡  Personal  status: 5h limit reached • email: personal@example.com • 5h: 99% (resets
+                          <local-reset>, in 2h) • weekly: 20%
+
+  Press enter to confirm or esc to go back

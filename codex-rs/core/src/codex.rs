@@ -83,6 +83,7 @@ use codex_login::AuthManager;
 use codex_login::ChatgptAccountAuthResolution;
 use codex_login::ChatgptAccountRefreshMode;
 use codex_login::CodexAuth;
+use codex_login::UsageLimitAutoSwitchFallbackSelectionMode;
 use codex_login::UsageLimitAutoSwitchRequest;
 use codex_login::UsageLimitAutoSwitchSelectionScope;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
@@ -8618,6 +8619,11 @@ async fn maybe_auto_switch_account_on_usage_limit_with_refreshed_account_state(
             .filter(|active_store_account_id| {
                 Some(*active_store_account_id) != failing_store_account_id.as_deref()
             });
+    let fallback_selection_mode = if protected_store_account_id.is_some() {
+        UsageLimitAutoSwitchFallbackSelectionMode::CancelStaleRequestFallbackSelection
+    } else {
+        UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection
+    };
 
     let required_workspace_id = turn_context.config.forced_chatgpt_workspace_id.as_deref();
     let switch_result =
@@ -8634,6 +8640,7 @@ async fn maybe_auto_switch_account_on_usage_limit_with_refreshed_account_state(
                 selection_scope: UsageLimitAutoSwitchSelectionScope::FreshlySelectable(
                     &refresh_state.freshly_selectable_store_account_ids,
                 ),
+                fallback_selection_mode,
             })?;
     let Some(next_store_account_id) = switch_result else {
         let current_active_store_account_id = sess
@@ -8761,8 +8768,8 @@ fn stale_request_should_retry_without_switch(
         })
         && failing_store_account_id != current_active_store_account_id
         && current_active_store_account_id.is_some_and(|store_account_id| {
-            refresh_state
-                .freshly_selectable_store_account_ids
+            !refresh_state
+                .freshly_unsupported_store_account_ids
                 .contains(store_account_id)
         })
 }
@@ -8988,14 +8995,7 @@ fn auto_switch_refresh_window_is_blocked(
         return false;
     };
 
-    if let Some(resets_at_seconds) = window.resets_at
-        && let Some(resets_at) = DateTime::<Utc>::from_timestamp(resets_at_seconds, 0)
-        && now >= resets_at
-    {
-        return false;
-    }
-
-    window.used_percent >= 100.0
+    window.is_effectively_saturated_at(now.timestamp())
 }
 
 #[derive(Debug)]
