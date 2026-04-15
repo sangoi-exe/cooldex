@@ -954,6 +954,7 @@ pub(crate) struct ChatWidget {
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
     rate_limit_empty_state: RateLimitEmptyState,
     rate_limit_account_generation: u64,
+    ignore_token_count_rate_limits_until_next_turn_start: bool,
     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
     next_status_refresh_request_id: u64,
     plan_type: Option<PlanType>,
@@ -2746,6 +2747,7 @@ impl ChatWidget {
 
     fn on_task_started(&mut self) {
         self.agent_turn_running = true;
+        self.ignore_token_count_rate_limits_until_next_turn_start = false;
         self.turn_sleep_inhibitor
             .set_turn_running(/*turn_running*/ true);
         self.saw_plan_update_this_turn = false;
@@ -3254,11 +3256,15 @@ impl ChatWidget {
         }
     }
 
+    // Merge-safety anchor: active-account changes must invalidate popup/warning truth for the
+    // direct `TokenCount.rate_limits` path until the next real turn start; app-server generation
+    // guards only cover refreshed rate-limit notifications, not live token-count payloads.
     pub(crate) fn on_active_account_changed(&mut self) {
         self.plan_type = None;
         self.rate_limit_warnings = RateLimitWarningState::default();
         self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
         self.rate_limit_account_generation = self.rate_limit_account_generation.wrapping_add(1);
+        self.ignore_token_count_rate_limits_until_next_turn_start = true;
         self.prefetch_rate_limits();
         self.request_redraw();
         self.refresh_status_surfaces();
@@ -5455,6 +5461,7 @@ impl ChatWidget {
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             rate_limit_empty_state: RateLimitEmptyState::Missing,
             rate_limit_account_generation: 0,
+            ignore_token_count_rate_limits_until_next_turn_start: false,
             refreshing_status_outputs: Vec::new(),
             next_status_refresh_request_id: 0,
             plan_type: initial_plan_type,
@@ -5676,6 +5683,7 @@ impl ChatWidget {
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             rate_limit_empty_state: RateLimitEmptyState::Missing,
             rate_limit_account_generation: 0,
+            ignore_token_count_rate_limits_until_next_turn_start: false,
             plan_type: initial_plan_type,
             rate_limit_warnings: RateLimitWarningState::default(),
             rate_limit_switch_prompt: RateLimitSwitchPromptState::default(),
@@ -8049,7 +8057,9 @@ impl ChatWidget {
             }
             EventMsg::TokenCount(ev) => {
                 self.set_token_info(ev.info);
-                self.on_rate_limit_snapshot(ev.rate_limits);
+                if !self.ignore_token_count_rate_limits_until_next_turn_start {
+                    self.on_rate_limit_snapshot(ev.rate_limits);
+                }
             }
             EventMsg::Warning(WarningEvent { message }) => self.on_warning(message),
             EventMsg::GuardianAssessment(ev) => self.on_guardian_assessment(ev),
@@ -10106,6 +10116,9 @@ impl ChatWidget {
                 .is_some()
     }
 
+    // Merge-safety anchor: `/accounts` and `/logout` share this popup-description owner; duplicate
+    // duration labels and stale placeholder suppression must stay centralized here so both surfaces
+    // remain aligned with the saved-account `last_rate_limits` cache semantics.
     fn rate_limit_window_status_parts(
         now: DateTime<Local>,
         snapshot: Option<&RateLimitSnapshot>,
@@ -10114,22 +10127,38 @@ impl ChatWidget {
             return Vec::new();
         };
 
-        let mut description_parts = Vec::new();
+        let mut description_parts: Vec<(String, bool, String)> = Vec::new();
+        let mut push_window_status = |label: String, window: &RateLimitWindow| {
+            let has_fresh_usage =
+                Self::rate_limit_window_used_percent_display(now, Some(window)).is_some();
+            let status = Self::rate_limit_format_window_status(now, label.as_str(), Some(window));
+            if let Some(existing) = description_parts
+                .iter_mut()
+                .find(|(existing_label, _, _)| existing_label == &label)
+            {
+                if !existing.1 && has_fresh_usage {
+                    *existing = (label, has_fresh_usage, status);
+                }
+                return;
+            }
+            description_parts.push((label, has_fresh_usage, status));
+        };
         if let Some(primary_window) = snapshot.primary.as_ref() {
-            description_parts.push(Self::rate_limit_format_window_status(
-                now,
-                Self::rate_limit_primary_label(Some(snapshot)).as_str(),
-                Some(primary_window),
-            ));
+            push_window_status(
+                Self::rate_limit_primary_label(Some(snapshot)),
+                primary_window,
+            );
         }
         if let Some(secondary_window) = snapshot.secondary.as_ref() {
-            description_parts.push(Self::rate_limit_format_window_status(
-                now,
-                Self::rate_limit_secondary_label(Some(snapshot)).as_str(),
-                Some(secondary_window),
-            ));
+            push_window_status(
+                Self::rate_limit_secondary_label(Some(snapshot)),
+                secondary_window,
+            );
         }
         description_parts
+            .into_iter()
+            .map(|(_, _, status)| status)
+            .collect()
     }
 
     fn account_popup_description_parts(

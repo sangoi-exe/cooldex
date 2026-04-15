@@ -3190,6 +3190,7 @@ async fn make_chatwidget_manual(
         rate_limit_snapshots_by_limit_id: BTreeMap::new(),
         rate_limit_empty_state: RateLimitEmptyState::Missing,
         rate_limit_account_generation: 0,
+        ignore_token_count_rate_limits_until_next_turn_start: false,
         refreshing_status_outputs: Vec::new(),
         next_status_refresh_request_id: 0,
         plan_type: None,
@@ -3616,6 +3617,120 @@ async fn rate_limit_warning_history_inserts_visible_gap_after_icon() {
     }));
 
     let inserted = drain_insert_history(&mut rx);
+    assert_eq!(
+        lines_to_single_string(&inserted[0]),
+        "⚠  Heads up, you have less than 5% of your 5h limit left. Run /status for a\n  breakdown.\n",
+    );
+}
+
+// Merge-safety anchor: post-account-change TokenCount coverage must keep the widget-side stale
+// guard aligned with the app-side generation invalidation so old-account warnings never leak.
+#[tokio::test]
+async fn active_account_change_ignores_stale_token_count_rate_limits_until_turn_started() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    let context_window = 13_000;
+    let stale_snapshot = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 95.0,
+            window_minutes: Some(300),
+            resets_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
+        }),
+        secondary: None,
+        credits: None,
+        plan_type: None,
+    };
+
+    chat.handle_codex_event(Event {
+        id: "turn-start-before-account-change".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: Some(context_window),
+            collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
+        }),
+    });
+    let _ = drain_insert_history(&mut rx);
+
+    chat.on_active_account_changed();
+    assert_eq!(chat.rate_limit_snapshot_count(), 0);
+
+    chat.handle_codex_event(Event {
+        id: "stale-token-count".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(make_token_info(12_700, context_window)),
+            rate_limits: Some(stale_snapshot),
+        }),
+    });
+
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert_eq!(chat.rate_limit_snapshot_count(), 0);
+    assert!(drain_insert_history(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn active_account_change_reaccepts_token_count_rate_limits_after_turn_started() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    let context_window = 13_000;
+    let stale_snapshot = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 95.0,
+            window_minutes: Some(300),
+            resets_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
+        }),
+        secondary: None,
+        credits: None,
+        plan_type: None,
+    };
+
+    chat.handle_codex_event(Event {
+        id: "turn-start-before-account-change".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: Some(context_window),
+            collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
+        }),
+    });
+    let _ = drain_insert_history(&mut rx);
+
+    chat.on_active_account_changed();
+    chat.handle_codex_event(Event {
+        id: "stale-token-count".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(make_token_info(12_700, context_window)),
+            rate_limits: Some(stale_snapshot.clone()),
+        }),
+    });
+    assert_eq!(chat.rate_limit_snapshot_count(), 0);
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.handle_codex_event(Event {
+        id: "turn-start-after-account-change".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-2".to_string(),
+            model_context_window: Some(context_window),
+            collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
+        }),
+    });
+    let _ = drain_insert_history(&mut rx);
+
+    chat.handle_codex_event(Event {
+        id: "fresh-token-count".into(),
+        msg: EventMsg::TokenCount(TokenCountEvent {
+            info: Some(make_token_info(12_700, context_window)),
+            rate_limits: Some(stale_snapshot),
+        }),
+    });
+
+    assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert_eq!(chat.rate_limit_snapshot_count(), 1);
+    let inserted = drain_insert_history(&mut rx);
+    assert_eq!(inserted.len(), 1);
     assert_eq!(
         lines_to_single_string(&inserted[0]),
         "⚠  Heads up, you have less than 5% of your 5h limit left. Run /status for a\n  breakdown.\n",
@@ -12088,7 +12203,10 @@ async fn accounts_popup_marks_near_limit_display_99_window_as_blocked() {
         .format("%H:%M")
         .to_string();
     let snapshot_popup = popup.replace(&local_reset, "<local-reset>");
-    assert_snapshot!("accounts_popup_near_limit_display_99_window", snapshot_popup);
+    assert_snapshot!(
+        "accounts_popup_near_limit_display_99_window",
+        snapshot_popup
+    );
     assert!(
         popup.contains("🟡  Personal"),
         "expected near-limit 99 display window to use the blocked 5h marker:\n{popup}"
@@ -12126,6 +12244,83 @@ async fn accounts_popup_single_weekly_window_does_not_duplicate_labels() {
     assert!(
         !popup.contains("weekly: —"),
         "expected missing secondary weekly row to stay hidden:\n{popup}"
+    );
+}
+
+// Merge-safety anchor: `/accounts` and `/logout` must keep sharing the same deduplicated
+// popup-description owner so duplicate duration labels never diverge between the two surfaces.
+#[tokio::test]
+async fn accounts_popup_duplicate_weekly_labels_collapse_to_one_row() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+    let weekly_reset_at = (chrono::Utc::now() + chrono::Duration::days(2)).timestamp();
+    let stale_weekly_reset_at = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp();
+
+    chat.auth_manager
+        .update_rate_limits_for_accounts([(
+            "work-account".to_string(),
+            RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 0.0,
+                    window_minutes: Some(7 * 24 * 60),
+                    resets_at: Some(weekly_reset_at),
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: 0.0,
+                    window_minutes: Some(7 * 24 * 60),
+                    resets_at: Some(stale_weekly_reset_at),
+                }),
+                credits: None,
+                plan_type: None,
+            },
+        )])
+        .expect("seed duplicate weekly popup rate limits");
+
+    let work_account = chat
+        .auth_manager
+        .list_accounts()
+        .into_iter()
+        .find(|account| account.id == "work-account")
+        .expect("work account should exist");
+    let description = ChatWidget::account_popup_description_parts(
+        chrono::Local::now(),
+        &work_account,
+        /*include_current_marker*/ false,
+    );
+    assert_eq!(
+        description
+            .iter()
+            .filter(|part| part.starts_with("weekly:"))
+            .count(),
+        1,
+        "expected shared popup-description owner to keep one weekly row, got {description:?}"
+    );
+    assert!(
+        description.iter().any(|part| part == "weekly: 0%"),
+        "expected shared popup-description owner to keep the fresh weekly row, got {description:?}"
+    );
+    assert!(
+        description.iter().all(|part| part != "weekly: —"),
+        "expected shared popup-description owner to drop the stale duplicate row, got {description:?}"
+    );
+
+    chat.open_accounts_popup_at(chrono::Local::now());
+    let accounts_popup = render_bottom_popup(&chat, 100);
+    assert_eq!(accounts_popup.match_indices("weekly:").count(), 1);
+    assert!(
+        !accounts_popup.contains("weekly: —"),
+        "expected /accounts popup to hide the stale duplicate row:\n{accounts_popup}"
+    );
+
+    chat.open_logout_popup_at(chrono::Local::now());
+    let logout_popup = render_bottom_popup(&chat, 100);
+    assert_eq!(logout_popup.match_indices("weekly:").count(), 1);
+    assert!(
+        !logout_popup.contains("weekly: —"),
+        "expected /logout popup to hide the stale duplicate row:\n{logout_popup}"
     );
 }
 
