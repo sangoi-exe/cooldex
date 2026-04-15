@@ -34,8 +34,8 @@ pub(crate) struct StatusRateLimitRow {
 pub(crate) enum StatusRateLimitValue {
     /// Percent-based usage window with optional reset timestamp text.
     Window {
-        /// Percent of the window that has been consumed.
-        percent_used: f64,
+        /// Percent of the window that remains available.
+        percent_remaining: f64,
         /// Localized reset string, or `None` when unknown.
         resets_at: Option<String>,
     },
@@ -65,8 +65,8 @@ pub(crate) const RATE_LIMIT_STALE_THRESHOLD_MINUTES: i64 = 15;
 /// Display-friendly representation of one usage window from a snapshot.
 #[derive(Debug, Clone)]
 pub(crate) struct RateLimitWindowDisplay {
-    /// Percent used for the window.
-    pub used_percent: f64,
+    /// Percent remaining for the window.
+    pub remaining_percent: f64,
     /// Human-readable local reset time.
     pub resets_at: Option<String>,
     /// Window length in minutes when provided by the server.
@@ -82,7 +82,7 @@ impl RateLimitWindowDisplay {
         let resets_at = resets_at_utc.map(|dt| format_reset_timestamp(dt, captured_at));
 
         Self {
-            used_percent: window.used_percent,
+            remaining_percent: window.remaining_percent,
             resets_at,
             window_minutes: window.window_minutes,
         }
@@ -234,7 +234,7 @@ pub(crate) fn compose_rate_limit_data_many(
             rows.push(StatusRateLimitRow {
                 label,
                 value: StatusRateLimitValue::Window {
-                    percent_used: primary.used_percent,
+                    percent_remaining: primary.remaining_percent,
                     resets_at: primary.resets_at.clone(),
                 },
             });
@@ -260,7 +260,7 @@ pub(crate) fn compose_rate_limit_data_many(
             rows.push(StatusRateLimitRow {
                 label,
                 value: StatusRateLimitValue::Window {
-                    percent_used: secondary.used_percent,
+                    percent_remaining: secondary.remaining_percent,
                     resets_at: secondary.resets_at.clone(),
                 },
             });
@@ -357,9 +357,9 @@ mod tests {
     use chrono::Local;
     use pretty_assertions::assert_eq;
 
-    fn window(used_percent: f64) -> RateLimitWindowDisplay {
+    fn window(remaining_percent: f64) -> RateLimitWindowDisplay {
         RateLimitWindowDisplay {
-            used_percent,
+            remaining_percent,
             resets_at: Some("soon".to_string()),
             window_minutes: Some(300),
         }
@@ -371,7 +371,7 @@ mod tests {
         let codex = RateLimitSnapshotDisplay {
             limit_name: "codex".to_string(),
             captured_at: now,
-            primary: Some(window(/*used_percent*/ 10.0)),
+            primary: Some(window(/*remaining_percent*/ 10.0)),
             secondary: None,
             credits: Some(CreditsSnapshotDisplay {
                 has_credits: true,
@@ -382,7 +382,7 @@ mod tests {
         let other = RateLimitSnapshotDisplay {
             limit_name: "codex-other".to_string(),
             captured_at: now,
-            primary: Some(window(/*used_percent*/ 20.0)),
+            primary: Some(window(/*remaining_percent*/ 20.0)),
             secondary: None,
             credits: Some(CreditsSnapshotDisplay {
                 has_credits: true,
@@ -416,12 +416,12 @@ mod tests {
             limit_name: "codex-other".to_string(),
             captured_at: now,
             primary: Some(RateLimitWindowDisplay {
-                used_percent: 20.0,
+                remaining_percent: 20.0,
                 resets_at: Some("soon".to_string()),
                 window_minutes: Some(60),
             }),
             secondary: Some(RateLimitWindowDisplay {
-                used_percent: 40.0,
+                remaining_percent: 40.0,
                 resets_at: Some("later".to_string()),
                 window_minutes: None,
             }),

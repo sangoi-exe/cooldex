@@ -98,6 +98,7 @@ pub fn parse_rate_limit_for_limit(
 
 #[derive(Debug, Deserialize)]
 struct RateLimitEventWindow {
+    #[serde(rename = "used_percent")]
     used_percent: f64,
     window_minutes: Option<i64>,
     reset_at: Option<i64>,
@@ -162,7 +163,7 @@ pub fn parse_rate_limit_event(payload: &str) -> Option<RateLimitSnapshot> {
 fn map_event_window(window: Option<&RateLimitEventWindow>) -> Option<RateLimitWindow> {
     let window = window?;
     Some(RateLimitWindow {
-        used_percent: window.used_percent,
+        remaining_percent: remaining_percent_from_used(window.used_percent),
         window_minutes: window.window_minutes,
         resets_at: window.reset_at,
     })
@@ -182,7 +183,7 @@ fn parse_rate_limit_window(
     window_minutes_header: &str,
     resets_at_header: &str,
 ) -> Option<RateLimitWindow> {
-    let used_percent: Option<f64> = parse_header_f64(headers, used_percent_header);
+    let used_percent = parse_header_f64(headers, used_percent_header);
 
     used_percent.and_then(|used_percent| {
         let window_minutes = parse_header_i64(headers, window_minutes_header);
@@ -193,11 +194,15 @@ fn parse_rate_limit_window(
             || resets_at.is_some();
 
         has_data.then_some(RateLimitWindow {
-            used_percent,
+            remaining_percent: remaining_percent_from_used(used_percent),
             window_minutes,
             resets_at,
         })
     })
+}
+
+fn remaining_percent_from_used(used_percent: f64) -> f64 {
+    (100.0 - used_percent).clamp(0.0, 100.0)
 }
 
 fn parse_credits_snapshot(headers: &HeaderMap) -> Option<CreditsSnapshot> {
@@ -281,7 +286,7 @@ mod tests {
         assert_eq!(snapshot.limit_id.as_deref(), Some("codex"));
         assert_eq!(snapshot.limit_name, None);
         let primary = snapshot.primary.expect("primary");
-        assert_eq!(primary.used_percent, 12.5);
+        assert_eq!(primary.remaining_percent, 87.5);
         assert_eq!(primary.window_minutes, Some(60));
         assert_eq!(primary.resets_at, Some(1704069000));
     }
@@ -307,7 +312,7 @@ mod tests {
         assert_eq!(snapshot.limit_id.as_deref(), Some("codex_secondary"));
         assert_eq!(snapshot.limit_name, None);
         let primary = snapshot.primary.expect("primary");
-        assert_eq!(primary.used_percent, 80.0);
+        assert_eq!(primary.remaining_percent, 20.0);
         assert_eq!(primary.window_minutes, Some(1440));
         assert_eq!(primary.resets_at, Some(1704074400));
         assert_eq!(snapshot.secondary, None);

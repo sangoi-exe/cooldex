@@ -1477,15 +1477,15 @@ Field notes:
 
 ```json
 { "method": "account/rateLimits/read", "id": 6 }
-{ "id": 6, "result": { "rateLimits": { "limitId": "codex", "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "credits": null, "planType": "plus" }, "rateLimitsByLimitId": { "codex": { "limitId": "codex", "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "credits": null, "planType": "plus" } } } }
-{ "method": "account/rateLimits/updated", "params": { "rateLimits": { "limitId": "codex", "primary": { "usedPercent": 26, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "credits": null, "planType": "plus" } } }
+{ "id": 6, "result": { "rateLimits": { "limitId": "codex", "primary": { "remainingPercent": 75, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "credits": null, "planType": "plus" }, "rateLimitsByLimitId": { "codex": { "limitId": "codex", "primary": { "remainingPercent": 75, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "credits": null, "planType": "plus" } } } }
+{ "method": "account/rateLimits/updated", "params": { "rateLimits": { "limitId": "codex", "primary": { "remainingPercent": 74, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "credits": null, "planType": "plus" } } }
 ```
 
 Field notes:
 
 - `account/rateLimits/read` returns both `rateLimits` and `rateLimitsByLimitId`.
 - `account/rateLimits/updated` includes only `rateLimits`; call `account/rateLimits/read` to refresh `rateLimitsByLimitId`.
-- `usedPercent` is current usage within the OpenAI quota window.
+- `remainingPercent` is remaining capacity within the OpenAI quota window (`100` = full, `0` = empty).
 - `windowDurationMins` is the quota window length.
 - `resetsAt` is a Unix timestamp (seconds) for the next reset.
 

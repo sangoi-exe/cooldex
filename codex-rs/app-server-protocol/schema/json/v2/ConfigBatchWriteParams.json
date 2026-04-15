@@ -4,6 +4,7 @@
     "ConfigEdit": {
       "properties": {
         "keyPath": {
+          "description": "Dotted config path. Escape literal `.` or `\\` inside a segment with `\\`.",
           "type": "string"
         },
         "mergeStrategy": {

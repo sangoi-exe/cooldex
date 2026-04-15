@@ -254,14 +254,35 @@ impl Client {
         Ok(preferred.unwrap_or_else(|| snapshots[0].clone()))
     }
 
+    pub async fn get_rate_limits_detailed(
+        &self,
+    ) -> std::result::Result<RateLimitSnapshot, RequestError> {
+        let snapshots = self.get_rate_limits_many_detailed().await?;
+        let preferred = snapshots
+            .iter()
+            .find(|snapshot| snapshot.limit_id.as_deref() == Some("codex"))
+            .cloned();
+        Ok(preferred.unwrap_or_else(|| snapshots[0].clone()))
+    }
+
     pub async fn get_rate_limits_many(&self) -> Result<Vec<RateLimitSnapshot>> {
+        self.get_rate_limits_many_detailed()
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
+    pub async fn get_rate_limits_many_detailed(
+        &self,
+    ) -> std::result::Result<Vec<RateLimitSnapshot>, RequestError> {
         let url = match self.path_style {
             PathStyle::CodexApi => format!("{}/api/codex/usage", self.base_url),
             PathStyle::ChatGptApi => format!("{}/wham/usage", self.base_url),
         };
         let req = self.http.get(&url).headers(self.headers());
-        let (body, ct) = self.exec_request(req, "GET", &url).await?;
-        let payload: RateLimitStatusPayload = self.decode_json(&url, &ct, &body)?;
+        let (body, ct) = self.exec_request_detailed(req, "GET", &url).await?;
+        let payload: RateLimitStatusPayload = self
+            .decode_json(&url, &ct, &body)
+            .map_err(RequestError::from)?;
         Ok(Self::rate_limit_snapshots_from_payload(payload))
     }
 
@@ -447,11 +468,11 @@ impl Client {
     ) -> Option<RateLimitWindow> {
         let snapshot = window.flatten().map(|details| *details)?;
 
-        let used_percent = f64::from(snapshot.used_percent);
+        let remaining_percent = (100.0 - f64::from(snapshot.used_percent)).clamp(0.0, 100.0);
         let window_minutes = Self::window_minutes_from_seconds(snapshot.limit_window_seconds);
         let resets_at = Some(i64::from(snapshot.reset_at));
         Some(RateLimitWindow {
-            used_percent,
+            remaining_percent,
             window_minutes,
             resets_at,
         })
@@ -565,12 +586,12 @@ mod tests {
         assert_eq!(snapshots[0].limit_id.as_deref(), Some("codex"));
         assert_eq!(snapshots[0].limit_name, None);
         assert_eq!(
-            snapshots[0].primary.as_ref().map(|w| w.used_percent),
-            Some(42.0)
+            snapshots[0].primary.as_ref().map(|w| w.remaining_percent),
+            Some(58.0)
         );
         assert_eq!(
-            snapshots[0].secondary.as_ref().map(|w| w.used_percent),
-            Some(84.0)
+            snapshots[0].secondary.as_ref().map(|w| w.remaining_percent),
+            Some(16.0)
         );
         assert_eq!(
             snapshots[0].credits,
@@ -585,8 +606,8 @@ mod tests {
         assert_eq!(snapshots[1].limit_id.as_deref(), Some("codex_other"));
         assert_eq!(snapshots[1].limit_name.as_deref(), Some("codex_other"));
         assert_eq!(
-            snapshots[1].primary.as_ref().map(|w| w.used_percent),
-            Some(70.0)
+            snapshots[1].primary.as_ref().map(|w| w.remaining_percent),
+            Some(30.0)
         );
         assert_eq!(snapshots[1].credits, None);
         assert_eq!(snapshots[1].plan_type, Some(AccountPlanType::Pro));
@@ -621,7 +642,7 @@ mod tests {
                 limit_id: Some("codex_other".to_string()),
                 limit_name: Some("codex_other".to_string()),
                 primary: Some(RateLimitWindow {
-                    used_percent: 90.0,
+                    remaining_percent: 90.0,
                     window_minutes: Some(60),
                     resets_at: Some(1),
                 }),
@@ -633,7 +654,7 @@ mod tests {
                 limit_id: Some("codex".to_string()),
                 limit_name: Some("codex".to_string()),
                 primary: Some(RateLimitWindow {
-                    used_percent: 10.0,
+                    remaining_percent: 10.0,
                     window_minutes: Some(60),
                     resets_at: Some(2),
                 }),

@@ -111,7 +111,7 @@ impl ExternalAuthRefreshBridge {
 #[async_trait]
 impl ExternalAuth for ExternalAuthRefreshBridge {
     fn auth_mode(&self) -> LoginAuthMode {
-        LoginAuthMode::Chatgpt
+        LoginAuthMode::ChatgptAuthTokens
     }
 
     async fn refresh(

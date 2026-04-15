@@ -70,15 +70,6 @@
             "null"
           ]
         },
-        "allowedApprovalsReviewers": {
-          "items": {
-            "$ref": "#/definitions/ApprovalsReviewer"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
         "allowedSandboxModes": {
           "items": {
             "$ref": "#/definitions/SandboxMode"
@@ -114,16 +105,6 @@
           "type": [
             "object",
             "null"
-          ]
-        },
-        "network": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/NetworkRequirements"
-            },
-            {
-              "type": "null"
-            }
           ]
         }
       },

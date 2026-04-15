@@ -366,7 +366,6 @@ use codex_protocol::protocol::BackgroundEventEvent;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CollabAgentActivity;
 use codex_protocol::protocol::CompactedItem;
-use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::DeprecationNoticeEvent;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
@@ -8995,7 +8994,7 @@ fn auto_switch_refresh_window_is_blocked(
         return false;
     };
 
-    window.is_effectively_saturated_at(now.timestamp())
+    window.is_depleted_at(now.timestamp())
 }
 
 #[derive(Debug)]
@@ -9018,124 +9017,18 @@ async fn fetch_account_rate_limits_snapshot(
     chatgpt_base_url: &str,
     auth: &CodexAuth,
 ) -> Result<Option<RateLimitSnapshot>, FetchAccountRateLimitsError> {
-    let token = auth.get_token().map_err(|err| {
-        FetchAccountRateLimitsError::Other(format!("failed to read auth token: {err}"))
-    })?;
-    let base_url = chatgpt_base_url.trim_end_matches('/');
-    let usage_url = if base_url.contains("/backend-api") {
-        format!("{base_url}/wham/usage")
-    } else {
-        format!("{base_url}/api/codex/usage")
-    };
-
-    let mut request = codex_login::default_client::build_reqwest_client()
-        .get(usage_url.as_str())
-        .timeout(std::time::Duration::from_secs(5))
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
-    if let Some(account_id) = auth.get_account_id() {
-        request = request.header("ChatGPT-Account-Id", account_id);
-    }
-
-    let response = request.send().await.map_err(|err| {
-        FetchAccountRateLimitsError::Other(format!("usage request failed: {err}"))
-    })?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let message = if body.trim().is_empty() {
-            format!("usage request failed with status {status}")
+    let client = codex_backend_client::Client::from_auth(chatgpt_base_url.to_string(), auth)
+        .map_err(|err| {
+            FetchAccountRateLimitsError::Other(format!("usage client init failed: {err}"))
+        })?;
+    match client.get_rate_limits_detailed().await {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(err) => Err(if err.is_unauthorized() {
+            FetchAccountRateLimitsError::Unauthorized(format!("usage request failed: {err}"))
         } else {
-            format!("usage request failed with status {status}: {body}")
-        };
-        return Err(if status == reqwest::StatusCode::UNAUTHORIZED {
-            FetchAccountRateLimitsError::Unauthorized(message)
-        } else {
-            FetchAccountRateLimitsError::Other(message)
-        });
+            FetchAccountRateLimitsError::Other(format!("usage request failed: {err}"))
+        }),
     }
-
-    let payload = response.json::<Value>().await.map_err(|err| {
-        FetchAccountRateLimitsError::Other(format!("failed to decode usage payload: {err}"))
-    })?;
-    Ok(parse_rate_limits_snapshot_from_usage_payload(&payload))
-}
-
-fn parse_rate_limits_snapshot_from_usage_payload(payload: &Value) -> Option<RateLimitSnapshot> {
-    let parse_i64 = |value: Option<&Value>| {
-        value
-            .and_then(Value::as_i64)
-            .or_else(|| value.and_then(Value::as_u64).map(|v| v as i64))
-    };
-    let parse_f64 = |value: Option<&Value>| {
-        value
-            .and_then(Value::as_f64)
-            .or_else(|| value.and_then(Value::as_i64).map(|v| v as f64))
-            .or_else(|| value.and_then(Value::as_u64).map(|v| v as f64))
-    };
-    let parse_window = |value: Option<&Value>| {
-        let window = value.and_then(Value::as_object)?;
-        let used_percent = parse_f64(window.get("used_percent"))?;
-        let window_minutes = parse_i64(window.get("limit_window_seconds"))
-            .filter(|seconds| *seconds > 0)
-            .map(|seconds| (seconds + 59) / 60);
-        let resets_at = parse_i64(window.get("reset_at"));
-        Some(RateLimitWindow {
-            used_percent,
-            window_minutes,
-            resets_at,
-        })
-    };
-    let parse_plan_type = |value: Option<&Value>| {
-        let raw = value.and_then(Value::as_str)?;
-        Some(match raw.to_ascii_lowercase().as_str() {
-            "free" => codex_protocol::account::PlanType::Free,
-            "go" => codex_protocol::account::PlanType::Go,
-            "plus" => codex_protocol::account::PlanType::Plus,
-            "pro" => codex_protocol::account::PlanType::Pro,
-            "team" => codex_protocol::account::PlanType::Team,
-            "business" => codex_protocol::account::PlanType::Business,
-            "enterprise" => codex_protocol::account::PlanType::Enterprise,
-            "edu" | "education" => codex_protocol::account::PlanType::Edu,
-            _ => codex_protocol::account::PlanType::Unknown,
-        })
-    };
-    let parse_credits = |value: Option<&Value>| {
-        let credits = value.and_then(Value::as_object)?;
-        let has_credits = credits.get("has_credits").and_then(Value::as_bool);
-        let unlimited = credits.get("unlimited").and_then(Value::as_bool);
-        let balance = credits.get("balance").and_then(|value| match value {
-            Value::String(text) => Some(text.clone()),
-            Value::Number(number) => Some(number.to_string()),
-            _ => None,
-        });
-        if has_credits.is_none() && unlimited.is_none() && balance.is_none() {
-            return None;
-        }
-        Some(CreditsSnapshot {
-            has_credits: has_credits.unwrap_or(false),
-            unlimited: unlimited.unwrap_or(false),
-            balance,
-        })
-    };
-
-    let rate_limit = payload.get("rate_limit");
-    let primary = parse_window(rate_limit.and_then(|limit| limit.get("primary_window")));
-    let secondary = parse_window(rate_limit.and_then(|limit| limit.get("secondary_window")));
-    let credits = parse_credits(payload.get("credits"));
-    let plan_type = parse_plan_type(payload.get("plan_type"));
-
-    if primary.is_none() && secondary.is_none() && credits.is_none() && plan_type.is_none() {
-        return None;
-    }
-
-    Some(RateLimitSnapshot {
-        limit_id: Some("codex".to_string()),
-        limit_name: None,
-        primary,
-        secondary,
-        credits,
-        plan_type,
-    })
 }
 
 struct SamplingRequestArgs<'a> {

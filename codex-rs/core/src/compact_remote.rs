@@ -530,12 +530,12 @@ mod tests {
             limit_id: Some("codex".to_string()),
             limit_name: None,
             primary: Some(RateLimitWindow {
-                used_percent: 100.0,
+                remaining_percent: 100.0,
                 window_minutes: Some(15),
                 resets_at: None,
             }),
             secondary: Some(RateLimitWindow {
-                used_percent: 87.5,
+                remaining_percent: 87.5,
                 window_minutes: Some(60),
                 resets_at: None,
             }),

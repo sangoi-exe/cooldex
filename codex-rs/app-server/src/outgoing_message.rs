@@ -730,7 +730,7 @@ mod tests {
                     limit_id: Some("codex".to_string()),
                     limit_name: None,
                     primary: Some(RateLimitWindow {
-                        used_percent: 25,
+                        remaining_percent: 25,
                         window_duration_mins: Some(15),
                         resets_at: Some(123),
                     }),
@@ -749,7 +749,7 @@ mod tests {
                         "limitId": "codex",
                         "limitName": null,
                         "primary": {
-                            "usedPercent": 25,
+                            "remainingPercent": 25,
                             "windowDurationMins": 15,
                             "resetsAt": 123
                         },

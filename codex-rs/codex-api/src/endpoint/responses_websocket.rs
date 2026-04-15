@@ -700,7 +700,7 @@ mod tests {
             client_metadata: None,
         });
         let mut stream = connection
-            .stream_request(request)
+            .stream_request(request, /*connection_reused*/ false)
             .await
             .expect("stream request should be created");
 

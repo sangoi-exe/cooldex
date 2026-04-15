@@ -25,12 +25,12 @@ fn rate_limit_snapshot() -> RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 50.0,
+            remaining_percent: 50.0,
             window_minutes: Some(60),
             resets_at: Some(primary_reset_at),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 30.0,
+            remaining_percent: 30.0,
             window_minutes: Some(120),
             resets_at: Some(secondary_reset_at),
         }),
@@ -46,6 +46,22 @@ fn with_now_override<T>(now: DateTime<Utc>, f: impl FnOnce() -> T) -> T {
         *cell.borrow_mut() = None;
         result
     })
+}
+
+#[test]
+fn rate_limit_window_fractional_remaining_is_not_depleted_before_reset() {
+    let resets_at = Utc
+        .with_ymd_and_hms(2024, 1, 1, 1, 0, 0)
+        .unwrap()
+        .timestamp();
+    let window = RateLimitWindow {
+        remaining_percent: 0.4,
+        window_minutes: Some(60),
+        resets_at: Some(resets_at),
+    };
+
+    assert_eq!(window.display_remaining_percent(), 0);
+    assert!(!window.is_depleted_at(0));
 }
 
 #[test]

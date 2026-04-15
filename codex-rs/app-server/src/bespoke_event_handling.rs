@@ -4299,7 +4299,7 @@ mod tests {
             limit_id: Some("codex".to_string()),
             limit_name: None,
             primary: Some(RateLimitWindow {
-                used_percent: 42.5,
+                remaining_percent: 42.5,
                 window_minutes: Some(15),
                 resets_at: Some(1700000000),
             }),

@@ -1,8 +1,9 @@
 use anyhow::Result;
-use app_test_support::ChatGptAuthFixture;
+use app_test_support::ChatGptIdTokenClaims;
 use app_test_support::McpProcess;
+use app_test_support::encode_id_token;
 use app_test_support::to_response;
-use app_test_support::write_chatgpt_auth;
+use app_test_support::write_models_cache;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -10,7 +11,6 @@ use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::RateLimitSnapshot;
 use codex_app_server_protocol::RateLimitWindow;
 use codex_app_server_protocol::RequestId;
-use codex_config::types::AuthCredentialsStoreMode;
 use codex_protocol::account::PlanType as AccountPlanType;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -82,17 +82,17 @@ async fn get_account_rate_limits_requires_chatgpt_auth() -> Result<()> {
 #[tokio::test]
 async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("chatgpt-token")
-            .account_id("account-123")
-            .plan_type("pro"),
-        AuthCredentialsStoreMode::File,
-    )?;
 
     let server = MockServer::start().await;
     let server_url = server.uri();
     write_chatgpt_base_url(codex_home.path(), &server_url)?;
+    write_models_cache(codex_home.path())?;
+    let access_token = encode_id_token(
+        &ChatGptIdTokenClaims::new()
+            .email("rate-limits@example.com")
+            .plan_type("pro")
+            .chatgpt_account_id("account-123"),
+    )?;
 
     let primary_reset_timestamp = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:02:00Z")
         .expect("parse primary reset timestamp")
@@ -106,13 +106,13 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
             "allowed": true,
             "limit_reached": false,
             "primary_window": {
-                "used_percent": 42,
+                "used_percent": 58,
                 "limit_window_seconds": 3600,
                 "reset_after_seconds": 120,
                 "reset_at": primary_reset_timestamp,
             },
             "secondary_window": {
-                "used_percent": 5,
+                "used_percent": 95,
                 "limit_window_seconds": 86400,
                 "reset_after_seconds": 43200,
                 "reset_at": secondary_reset_timestamp,
@@ -126,7 +126,7 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
                     "allowed": true,
                     "limit_reached": false,
                     "primary_window": {
-                        "used_percent": 88,
+                        "used_percent": 12,
                         "limit_window_seconds": 1800,
                         "reset_after_seconds": 600,
                         "reset_at": 1735693200
@@ -138,14 +138,39 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
 
     Mock::given(method("GET"))
         .and(path("/api/codex/usage"))
-        .and(header("authorization", "Bearer chatgpt-token"))
+        .and(header("authorization", format!("Bearer {access_token}")))
         .and(header("chatgpt-account-id", "account-123"))
         .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
         .mount(&server)
         .await;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
+
+    let login_id = mcp
+        .send_chatgpt_auth_tokens_login_request(
+            access_token,
+            "account-123".to_string(),
+            Some("pro".to_string()),
+        )
+        .await?;
+    let login_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(login_id)),
+    )
+    .await??;
+    let login: LoginAccountResponse = to_response(login_response)?;
+    assert_eq!(login, LoginAccountResponse::ChatgptAuthTokens {});
+    let _completed = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("account/login/completed"),
+    )
+    .await??;
+    let _updated = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("account/updated"),
+    )
+    .await??;
 
     let request_id = mcp.send_get_account_rate_limits_request().await?;
 
@@ -162,12 +187,12 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
             limit_id: Some("codex".to_string()),
             limit_name: None,
             primary: Some(RateLimitWindow {
-                used_percent: 42,
+                remaining_percent: 42,
                 window_duration_mins: Some(60),
                 resets_at: Some(primary_reset_timestamp),
             }),
             secondary: Some(RateLimitWindow {
-                used_percent: 5,
+                remaining_percent: 5,
                 window_duration_mins: Some(1440),
                 resets_at: Some(secondary_reset_timestamp),
             }),
@@ -182,12 +207,12 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
                         limit_id: Some("codex".to_string()),
                         limit_name: None,
                         primary: Some(RateLimitWindow {
-                            used_percent: 42,
+                            remaining_percent: 42,
                             window_duration_mins: Some(60),
                             resets_at: Some(primary_reset_timestamp),
                         }),
                         secondary: Some(RateLimitWindow {
-                            used_percent: 5,
+                            remaining_percent: 5,
                             window_duration_mins: Some(1440),
                             resets_at: Some(secondary_reset_timestamp),
                         }),
@@ -201,7 +226,7 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
                         limit_id: Some("codex_other".to_string()),
                         limit_name: Some("codex_other".to_string()),
                         primary: Some(RateLimitWindow {
-                            used_percent: 88,
+                            remaining_percent: 88,
                             window_duration_mins: Some(30),
                             resets_at: Some(1735693200),
                         }),

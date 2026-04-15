@@ -130,12 +130,12 @@ async fn status_snapshot_includes_reasoning_details() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 72.5,
+            remaining_percent: 72.5,
             window_minutes: Some(300),
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 600)),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 45.0,
+            remaining_percent: 45.0,
             window_minutes: Some(10080),
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 1_200)),
         }),
@@ -317,7 +317,7 @@ async fn status_snapshot_includes_monthly_limit() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 12.0,
+            remaining_percent: 12.0,
             window_minutes: Some(43_200),
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 86_400)),
         }),
@@ -618,7 +618,7 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 72.5,
+            remaining_percent: 72.5,
             window_minutes: Some(300),
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 600)),
         }),
@@ -727,12 +727,12 @@ async fn status_snapshot_shows_refreshing_limits_notice() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 45.0,
+            remaining_percent: 45.0,
             window_minutes: Some(300),
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 900)),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 30.0,
+            remaining_percent: 30.0,
             window_minutes: Some(10_080),
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 2_700)),
         }),
@@ -793,12 +793,12 @@ async fn status_snapshot_includes_credits_and_limits() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 45.0,
+            remaining_percent: 45.0,
             window_minutes: Some(300),
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 900)),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 30.0,
+            remaining_percent: 30.0,
             window_minutes: Some(10_080),
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 2_700)),
         }),
@@ -976,12 +976,12 @@ async fn status_snapshot_shows_stale_limits_message() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 72.5,
+            remaining_percent: 72.5,
             window_minutes: Some(300),
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 600)),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 40.0,
+            remaining_percent: 40.0,
             window_minutes: Some(10_080),
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 1_800)),
         }),
@@ -1042,12 +1042,12 @@ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 60.0,
+            remaining_percent: 60.0,
             window_minutes: Some(300),
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 1_200)),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 35.0,
+            remaining_percent: 35.0,
             window_minutes: Some(10_080),
             resets_at: Some(reset_at_from(&captured_at, /*seconds*/ 2_400)),
         }),

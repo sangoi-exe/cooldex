@@ -2005,8 +2005,8 @@ pub struct RateLimitSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]
 pub struct RateLimitWindow {
-    /// Percentage (0-100) of the window that has been consumed.
-    pub used_percent: f64,
+    /// Percentage (0-100) of the window that remains available.
+    pub remaining_percent: f64,
     /// Rolling window duration, in minutes.
     #[ts(type = "number | null")]
     pub window_minutes: Option<i64>,
@@ -2017,17 +2017,15 @@ pub struct RateLimitWindow {
 
 impl RateLimitWindow {
     /// Returns the clamped rounded percentage shown in operator-facing UI.
-    pub fn display_used_percent(&self) -> i64 {
-        self.used_percent.clamp(0.0, 100.0).round() as i64
+    pub fn display_remaining_percent(&self) -> i64 {
+        self.remaining_percent.clamp(0.0, 100.0).round() as i64
     }
 
-    /// Returns whether the window is effectively saturated until its reset time.
+    /// Returns whether the window is effectively empty until its reset time.
     ///
-    /// Workspace-local autoswitch and `/accounts` truth must stay conservative here:
-    /// once a saved-account window still displays as `99%` with a future reset,
-    /// it is treated as saturated so runtime selection and UI do not keep routing
-    /// into an account that can still hard-fail with a usage-limit response.
-    pub fn is_effectively_saturated_at(&self, now_unix_seconds: i64) -> bool {
+    /// WS12 remaining-capacity canon treats a window as blocked only when it is
+    /// actually empty and the reset is still in the future.
+    pub fn is_depleted_at(&self, now_unix_seconds: i64) -> bool {
         if self
             .resets_at
             .is_some_and(|resets_at| now_unix_seconds >= resets_at)
@@ -2035,7 +2033,7 @@ impl RateLimitWindow {
             return false;
         }
 
-        self.display_used_percent() >= 99
+        self.remaining_percent <= 0.0
     }
 }
 

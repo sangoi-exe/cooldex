@@ -2169,16 +2169,16 @@
     },
     "RateLimitWindow": {
       "properties": {
+        "remainingPercent": {
+          "format": "int32",
+          "type": "integer"
+        },
         "resetsAt": {
           "format": "int64",
           "type": [
             "integer",
             "null"
           ]
-        },
-        "usedPercent": {
-          "format": "int32",
-          "type": "integer"
         },
         "windowDurationMins": {
           "format": "int64",
@@ -2189,7 +2189,7 @@
         }
       },
       "required": [
-        "usedPercent"
+        "remainingPercent"
       ],
       "type": "object"
     },

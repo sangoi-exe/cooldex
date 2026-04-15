@@ -1235,7 +1235,7 @@ fn app_server_rate_limit_window_to_core(
     window: codex_app_server_protocol::RateLimitWindow,
 ) -> RateLimitWindow {
     RateLimitWindow {
-        used_percent: window.used_percent as f64,
+        remaining_percent: window.remaining_percent as f64,
         window_minutes: window.window_duration_mins,
         resets_at: window.resets_at,
     }

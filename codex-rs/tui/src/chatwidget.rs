@@ -605,9 +605,9 @@ fn is_standard_tool_call(parsed_cmd: &[ParsedCommand]) -> bool {
             .all(|parsed| !matches!(parsed, ParsedCommand::Unknown { .. }))
 }
 
-const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [75.0, 90.0, 95.0];
+const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [25.0, 10.0, 5.0];
 const NUDGE_MODEL_SLUG: &str = "gpt-5.1-codex-mini";
-const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 90.0;
+const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 10.0;
 
 #[derive(Default)]
 struct RateLimitWarningState {
@@ -618,24 +618,26 @@ struct RateLimitWarningState {
 impl RateLimitWarningState {
     fn take_warnings(
         &mut self,
-        secondary_used_percent: Option<f64>,
+        secondary_remaining_percent: Option<f64>,
         secondary_window_minutes: Option<i64>,
-        primary_used_percent: Option<f64>,
+        primary_remaining_percent: Option<f64>,
         primary_window_minutes: Option<i64>,
     ) -> Vec<String> {
         let reached_secondary_cap =
-            matches!(secondary_used_percent, Some(percent) if percent == 100.0);
-        let reached_primary_cap = matches!(primary_used_percent, Some(percent) if percent == 100.0);
+            matches!(secondary_remaining_percent, Some(percent) if percent == 0.0);
+        let reached_primary_cap =
+            matches!(primary_remaining_percent, Some(percent) if percent == 0.0);
         if reached_secondary_cap || reached_primary_cap {
             return Vec::new();
         }
 
         let mut warnings = Vec::new();
 
-        if let Some(secondary_used_percent) = secondary_used_percent {
+        if let Some(secondary_remaining_percent) = secondary_remaining_percent {
             let mut highest_secondary: Option<f64> = None;
             while self.secondary_index < RATE_LIMIT_WARNING_THRESHOLDS.len()
-                && secondary_used_percent >= RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index]
+                && secondary_remaining_percent
+                    <= RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index]
             {
                 highest_secondary = Some(RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index]);
                 self.secondary_index += 1;
@@ -644,17 +646,16 @@ impl RateLimitWarningState {
                 let limit_label = secondary_window_minutes
                     .map(get_limits_duration)
                     .unwrap_or_else(|| "weekly".to_string());
-                let remaining_percent = 100.0 - threshold;
                 warnings.push(format!(
-                    "Heads up, you have less than {remaining_percent:.0}% of your {limit_label} limit left. Run /status for a breakdown."
+                    "Heads up, you have less than {threshold:.0}% of your {limit_label} limit left. Run /status for a breakdown."
                 ));
             }
         }
 
-        if let Some(primary_used_percent) = primary_used_percent {
+        if let Some(primary_remaining_percent) = primary_remaining_percent {
             let mut highest_primary: Option<f64> = None;
             while self.primary_index < RATE_LIMIT_WARNING_THRESHOLDS.len()
-                && primary_used_percent >= RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index]
+                && primary_remaining_percent <= RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index]
             {
                 highest_primary = Some(RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index]);
                 self.primary_index += 1;
@@ -663,9 +664,8 @@ impl RateLimitWarningState {
                 let limit_label = primary_window_minutes
                     .map(get_limits_duration)
                     .unwrap_or_else(|| "5h".to_string());
-                let remaining_percent = 100.0 - threshold;
                 warnings.push(format!(
-                    "Heads up, you have less than {remaining_percent:.0}% of your {limit_label} limit left. Run /status for a breakdown."
+                    "Heads up, you have less than {threshold:.0}% of your {limit_label} limit left. Run /status for a breakdown."
                 ));
             }
         }
@@ -3185,12 +3185,15 @@ impl ChatWidget {
                     snapshot
                         .secondary
                         .as_ref()
-                        .map(|window| window.used_percent),
+                        .map(|window| window.remaining_percent),
                     snapshot
                         .secondary
                         .as_ref()
                         .and_then(|window| window.window_minutes),
-                    snapshot.primary.as_ref().map(|window| window.used_percent),
+                    snapshot
+                        .primary
+                        .as_ref()
+                        .map(|window| window.remaining_percent),
                     snapshot
                         .primary
                         .as_ref()
@@ -3204,12 +3207,12 @@ impl ChatWidget {
                 && (snapshot
                     .secondary
                     .as_ref()
-                    .map(|w| w.used_percent >= RATE_LIMIT_SWITCH_PROMPT_THRESHOLD)
+                    .map(|w| w.remaining_percent <= RATE_LIMIT_SWITCH_PROMPT_THRESHOLD)
                     .unwrap_or(false)
                     || snapshot
                         .primary
                         .as_ref()
-                        .map(|w| w.used_percent >= RATE_LIMIT_SWITCH_PROMPT_THRESHOLD)
+                        .map(|w| w.remaining_percent <= RATE_LIMIT_SWITCH_PROMPT_THRESHOLD)
                         .unwrap_or(false));
 
             let has_workspace_credits = snapshot
@@ -8719,7 +8722,7 @@ impl ChatWidget {
         label: &str,
     ) -> Option<String> {
         let window = window?;
-        let remaining = (100.0f64 - window.used_percent).clamp(0.0f64, 100.0f64);
+        let remaining = window.remaining_percent.clamp(0.0f64, 100.0f64);
         Some(format!("{label} {remaining:.0}%"))
     }
 
@@ -10009,7 +10012,7 @@ impl ChatWidget {
         })
     }
 
-    fn rate_limit_window_used_percent_display(
+    fn rate_limit_window_remaining_percent_display(
         now: DateTime<Local>,
         window: Option<&RateLimitWindow>,
     ) -> Option<i64> {
@@ -10018,7 +10021,7 @@ impl ChatWidget {
         if Self::rate_limit_is_cache_expired(now, resets_at) {
             return None;
         }
-        Some(window.display_used_percent())
+        Some(window.display_remaining_percent())
     }
 
     fn rate_limit_window_blocked(now: DateTime<Local>, window: Option<&RateLimitWindow>) -> bool {
@@ -10026,7 +10029,7 @@ impl ChatWidget {
             return false;
         };
 
-        window.is_effectively_saturated_at(now.timestamp())
+        window.is_depleted_at(now.timestamp())
     }
 
     fn rate_limit_format_window_status(
@@ -10034,27 +10037,27 @@ impl ChatWidget {
         label: &str,
         window: Option<&RateLimitWindow>,
     ) -> String {
-        let used = Self::rate_limit_window_used_percent_display(now, window);
+        let remaining = Self::rate_limit_window_remaining_percent_display(now, window);
         let blocked = Self::rate_limit_window_blocked(now, window);
 
-        let Some(used) = used else {
+        let Some(remaining) = remaining else {
             return format!("{label}: —");
         };
 
         if blocked
             && let Some(window) = window
             && let Some(resets_at) = Self::rate_limit_window_reset_at_local(window)
-            && let Some(remaining) = Self::rate_limit_format_time_remaining(now, resets_at)
+            && let Some(remaining_time) = Self::rate_limit_format_time_remaining(now, resets_at)
         {
             let resets_str = if label == "weekly" {
                 resets_at.format("%a %H:%M").to_string()
             } else {
                 resets_at.format("%H:%M").to_string()
             };
-            return format!("{label}: {used}% (resets {resets_str}, in {remaining})");
+            return format!("{label}: {remaining}% (resets {resets_str}, in {remaining_time})");
         }
 
-        format!("{label}: {used}%")
+        format!("{label}: {remaining}%")
     }
 
     fn rate_limit_primary_label(snapshot: Option<&RateLimitSnapshot>) -> String {
@@ -10111,8 +10114,8 @@ impl ChatWidget {
             return false;
         };
 
-        Self::rate_limit_window_used_percent_display(now, snapshot.primary.as_ref()).is_some()
-            || Self::rate_limit_window_used_percent_display(now, snapshot.secondary.as_ref())
+        Self::rate_limit_window_remaining_percent_display(now, snapshot.primary.as_ref()).is_some()
+            || Self::rate_limit_window_remaining_percent_display(now, snapshot.secondary.as_ref())
                 .is_some()
     }
 
@@ -10130,7 +10133,7 @@ impl ChatWidget {
         let mut description_parts: Vec<(String, bool, String)> = Vec::new();
         let mut push_window_status = |label: String, window: &RateLimitWindow| {
             let has_fresh_usage =
-                Self::rate_limit_window_used_percent_display(now, Some(window)).is_some();
+                Self::rate_limit_window_remaining_percent_display(now, Some(window)).is_some();
             let status = Self::rate_limit_format_window_status(now, label.as_str(), Some(window));
             if let Some(existing) = description_parts
                 .iter_mut()

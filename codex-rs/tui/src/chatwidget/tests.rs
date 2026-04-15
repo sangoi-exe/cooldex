@@ -357,7 +357,7 @@ fn snapshot(percent: f64) -> RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: percent,
+            remaining_percent: percent,
             window_minutes: Some(60),
             resets_at: None,
         }),
@@ -373,7 +373,7 @@ fn preferred_rate_limit_snapshot_prefers_codex_limit_id() {
         limit_id: Some("gpt-image-1".to_string()),
         limit_name: Some("image generation".to_string()),
         primary: Some(RateLimitWindow {
-            used_percent: 12.0,
+            remaining_percent: 12.0,
             window_minutes: Some(300),
             resets_at: Some(1_900_000_000),
         }),
@@ -385,7 +385,7 @@ fn preferred_rate_limit_snapshot_prefers_codex_limit_id() {
         limit_id: Some("Codex".to_string()),
         limit_name: Some("codex".to_string()),
         primary: Some(RateLimitWindow {
-            used_percent: 55.0,
+            remaining_percent: 55.0,
             window_minutes: Some(300),
             resets_at: Some(1_900_000_000),
         }),
@@ -3587,7 +3587,7 @@ async fn test_rate_limit_warnings_monthly() {
     warnings.extend(state.take_warnings(
         Some(75.0),
         Some(43199),
-        /*primary_used_percent*/ None,
+        /*primary_remaining_percent*/ None,
         /*primary_window_minutes*/ None,
     ));
     assert_eq!(
@@ -3608,7 +3608,7 @@ async fn rate_limit_warning_history_inserts_visible_gap_after_icon() {
         limit_name: Some("Codex".to_string()),
         plan_type: None,
         primary: Some(RateLimitWindow {
-            used_percent: 95.0,
+            remaining_percent: 95.0,
             window_minutes: Some(299),
             resets_at: None,
         }),
@@ -3633,7 +3633,7 @@ async fn active_account_change_ignores_stale_token_count_rate_limits_until_turn_
         limit_id: Some("codex".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 95.0,
+            remaining_percent: 95.0,
             window_minutes: Some(300),
             resets_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
         }),
@@ -3677,7 +3677,7 @@ async fn active_account_change_reaccepts_token_count_rate_limits_after_turn_star
         limit_id: Some("codex".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 95.0,
+            remaining_percent: 95.0,
             window_minutes: Some(300),
             resets_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).timestamp()),
         }),
@@ -3764,7 +3764,7 @@ async fn rate_limit_snapshot_keeps_prior_credits_when_missing_from_headers() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 80.0,
+            remaining_percent: 80.0,
             window_minutes: Some(60),
             resets_at: Some(123),
         }),
@@ -3785,7 +3785,10 @@ async fn rate_limit_snapshot_keeps_prior_credits_when_missing_from_headers() {
     assert_eq!(credits.balance.as_deref(), Some("17.5"));
     assert!(!credits.unlimited);
     assert_eq!(
-        display.primary.as_ref().map(|window| window.used_percent),
+        display
+            .primary
+            .as_ref()
+            .map(|window| window.remaining_percent),
         Some(80.0)
     );
 }
@@ -3798,12 +3801,12 @@ async fn rate_limit_snapshot_updates_and_retains_plan_type() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 10.0,
+            remaining_percent: 10.0,
             window_minutes: Some(60),
             resets_at: None,
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 5.0,
+            remaining_percent: 5.0,
             window_minutes: Some(300),
             resets_at: None,
         }),
@@ -3816,12 +3819,12 @@ async fn rate_limit_snapshot_updates_and_retains_plan_type() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 25.0,
+            remaining_percent: 25.0,
             window_minutes: Some(30),
             resets_at: Some(123),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 15.0,
+            remaining_percent: 15.0,
             window_minutes: Some(300),
             resets_at: Some(234),
         }),
@@ -3834,12 +3837,12 @@ async fn rate_limit_snapshot_updates_and_retains_plan_type() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 30.0,
+            remaining_percent: 30.0,
             window_minutes: Some(60),
             resets_at: Some(456),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 18.0,
+            remaining_percent: 18.0,
             window_minutes: Some(300),
             resets_at: Some(567),
         }),
@@ -3857,7 +3860,7 @@ async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
         limit_id: Some("codex".to_string()),
         limit_name: Some("codex".to_string()),
         primary: Some(RateLimitWindow {
-            used_percent: 20.0,
+            remaining_percent: 20.0,
             window_minutes: Some(300),
             resets_at: Some(100),
         }),
@@ -3874,7 +3877,7 @@ async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
         limit_id: Some("codex_other".to_string()),
         limit_name: Some("codex_other".to_string()),
         primary: Some(RateLimitWindow {
-            used_percent: 90.0,
+            remaining_percent: 90.0,
             window_minutes: Some(60),
             resets_at: Some(200),
         }),
@@ -3892,7 +3895,10 @@ async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
         .get("codex_other")
         .expect("codex_other snapshot should exist");
 
-    assert_eq!(codex.primary.as_ref().map(|w| w.used_percent), Some(20.0));
+    assert_eq!(
+        codex.primary.as_ref().map(|w| w.remaining_percent),
+        Some(20.0)
+    );
     assert_eq!(
         codex
             .credits
@@ -3900,7 +3906,10 @@ async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
             .and_then(|credits| credits.balance.as_deref()),
         Some("5.00")
     );
-    assert_eq!(other.primary.as_ref().map(|w| w.used_percent), Some(90.0));
+    assert_eq!(
+        other.primary.as_ref().map(|w| w.remaining_percent),
+        Some(90.0)
+    );
     assert!(other.credits.is_none());
 }
 
@@ -3926,7 +3935,7 @@ async fn rate_limit_switch_prompt_skips_non_codex_limit() {
         limit_id: Some("codex_other".to_string()),
         limit_name: Some("codex_other".to_string()),
         primary: Some(RateLimitWindow {
-            used_percent: 95.0,
+            remaining_percent: 95.0,
             window_minutes: Some(60),
             resets_at: None,
         }),
@@ -12054,12 +12063,12 @@ async fn accounts_popup_omits_stale_rows_after_attempted_refresh_without_usable_
                 limit_id: Some("codex".to_string()),
                 limit_name: None,
                 primary: Some(RateLimitWindow {
-                    used_percent: 73.0,
+                    remaining_percent: 73.0,
                     window_minutes: Some(300),
                     resets_at: Some((chrono::Utc::now() + chrono::Duration::hours(3)).timestamp()),
                 }),
                 secondary: Some(RateLimitWindow {
-                    used_percent: 12.0,
+                    remaining_percent: 12.0,
                     window_minutes: Some(7 * 24 * 60),
                     resets_at: Some((chrono::Utc::now() + chrono::Duration::days(1)).timestamp()),
                 }),
@@ -12112,12 +12121,12 @@ async fn accounts_popup_status_marker_prioritizes_weekly_over_5h() {
         limit_id: Some("codex".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 100.0,
+            remaining_percent: 100.0,
             window_minutes: Some(300),
             resets_at: Some(five_hour_resets_at),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 100.0,
+            remaining_percent: 100.0,
             window_minutes: Some(7 * 24 * 60),
             resets_at: Some(weekly_resets_at),
         }),
@@ -12128,12 +12137,12 @@ async fn accounts_popup_status_marker_prioritizes_weekly_over_5h() {
         limit_id: Some("codex".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 100.0,
+            remaining_percent: 100.0,
             window_minutes: Some(300),
             resets_at: Some(five_hour_resets_at),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 20.0,
+            remaining_percent: 20.0,
             window_minutes: Some(7 * 24 * 60),
             resets_at: Some(weekly_resets_at),
         }),
@@ -12180,12 +12189,12 @@ async fn accounts_popup_marks_near_limit_display_99_window_as_blocked() {
                 limit_id: Some("codex".to_string()),
                 limit_name: None,
                 primary: Some(RateLimitWindow {
-                    used_percent: 98.6,
+                    remaining_percent: 98.6,
                     window_minutes: Some(300),
                     resets_at: Some(five_hour_resets_at),
                 }),
                 secondary: Some(RateLimitWindow {
-                    used_percent: 20.0,
+                    remaining_percent: 20.0,
                     window_minutes: Some(7 * 24 * 60),
                     resets_at: Some(weekly_resets_at),
                 }),
@@ -12227,7 +12236,7 @@ async fn accounts_popup_single_weekly_window_does_not_duplicate_labels() {
                 limit_id: Some("codex".to_string()),
                 limit_name: None,
                 primary: Some(RateLimitWindow {
-                    used_percent: 0.0,
+                    remaining_percent: 0.0,
                     window_minutes: Some(7 * 24 * 60),
                     resets_at: Some(weekly_reset_at),
                 }),
@@ -12264,12 +12273,12 @@ async fn accounts_popup_duplicate_weekly_labels_collapse_to_one_row() {
                 limit_id: Some("codex".to_string()),
                 limit_name: None,
                 primary: Some(RateLimitWindow {
-                    used_percent: 0.0,
+                    remaining_percent: 0.0,
                     window_minutes: Some(7 * 24 * 60),
                     resets_at: Some(weekly_reset_at),
                 }),
                 secondary: Some(RateLimitWindow {
-                    used_percent: 0.0,
+                    remaining_percent: 0.0,
                     window_minutes: Some(7 * 24 * 60),
                     resets_at: Some(stale_weekly_reset_at),
                 }),
@@ -12340,12 +12349,12 @@ async fn accounts_popup_hides_stale_blocked_until_when_usage_shows_available() {
         limit_id: Some("codex".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 42.0,
+            remaining_percent: 42.0,
             window_minutes: Some(300),
             resets_at: Some(resets_at),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 10.0,
+            remaining_percent: 10.0,
             window_minutes: Some(7 * 24 * 60),
             resets_at: Some((chrono::Utc::now() + chrono::Duration::days(1)).timestamp()),
         }),
@@ -12386,12 +12395,12 @@ async fn logout_popup_status_marker_prioritizes_weekly_over_5h() {
         limit_id: Some("codex".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 100.0,
+            remaining_percent: 100.0,
             window_minutes: Some(300),
             resets_at: Some(five_hour_resets_at),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 100.0,
+            remaining_percent: 100.0,
             window_minutes: Some(7 * 24 * 60),
             resets_at: Some(weekly_resets_at),
         }),
@@ -12402,12 +12411,12 @@ async fn logout_popup_status_marker_prioritizes_weekly_over_5h() {
         limit_id: Some("codex".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 100.0,
+            remaining_percent: 100.0,
             window_minutes: Some(300),
             resets_at: Some(five_hour_resets_at),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 20.0,
+            remaining_percent: 20.0,
             window_minutes: Some(7 * 24 * 60),
             resets_at: Some(weekly_resets_at),
         }),
@@ -12454,12 +12463,12 @@ async fn logout_popup_marks_near_limit_display_99_window_as_blocked() {
                 limit_id: Some("codex".to_string()),
                 limit_name: None,
                 primary: Some(RateLimitWindow {
-                    used_percent: 98.6,
+                    remaining_percent: 98.6,
                     window_minutes: Some(300),
                     resets_at: Some(five_hour_resets_at),
                 }),
                 secondary: Some(RateLimitWindow {
-                    used_percent: 20.0,
+                    remaining_percent: 20.0,
                     window_minutes: Some(7 * 24 * 60),
                     resets_at: Some(weekly_resets_at),
                 }),
@@ -12500,12 +12509,12 @@ async fn logout_popup_hides_stale_blocked_until_when_usage_shows_available() {
         limit_id: Some("codex".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 30.0,
+            remaining_percent: 30.0,
             window_minutes: Some(300),
             resets_at: Some(resets_at),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 15.0,
+            remaining_percent: 15.0,
             window_minutes: Some(7 * 24 * 60),
             resets_at: Some((chrono::Utc::now() + chrono::Duration::days(1)).timestamp()),
         }),

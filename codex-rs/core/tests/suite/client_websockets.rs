@@ -941,7 +941,7 @@ async fn responses_websocket_emits_rate_limit_events() {
 
     let rate_limits = saw_rate_limits.expect("missing rate limits");
     let primary = rate_limits.primary.expect("missing primary window");
-    assert_eq!(primary.used_percent, 42.0);
+    assert_eq!(primary.remaining_percent, 58.0);
     assert_eq!(primary.window_minutes, Some(60));
     assert_eq!(primary.resets_at, Some(1_700_000_000));
     assert_eq!(rate_limits.plan_type, Some(PlanType::Plus));
@@ -1022,12 +1022,12 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
                 "limit_id": "codex",
                 "limit_name": null,
                 "primary": {
-                    "used_percent": 100.0,
+                    "remaining_percent": 0.0,
                     "window_minutes": 15,
                     "resets_at": null
                 },
                 "secondary": {
-                    "used_percent": 87.5,
+                    "remaining_percent": 12.5,
                     "window_minutes": 60,
                     "resets_at": null
                 },

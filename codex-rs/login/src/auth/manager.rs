@@ -313,6 +313,105 @@ fn apply_rate_limit_refresh_outcome(
     usage.last_seen_at = Some(now);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageLimitWindowSlot {
+    Primary,
+    Secondary,
+}
+
+fn clamp_usage_limit_snapshot(
+    mut snapshot: RateLimitSnapshot,
+    resets_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> RateLimitSnapshot {
+    if clamp_matched_usage_limit_window(&mut snapshot, resets_at) {
+        return snapshot;
+    }
+
+    if clamp_depleted_usage_limit_windows(&mut snapshot, now) {
+        return snapshot;
+    }
+
+    match usage_limit_default_window_slot(&snapshot) {
+        Some(UsageLimitWindowSlot::Primary) => clamp_rate_limit_window(snapshot.primary.as_mut()),
+        Some(UsageLimitWindowSlot::Secondary) => {
+            clamp_rate_limit_window(snapshot.secondary.as_mut());
+        }
+        None => {}
+    }
+
+    snapshot
+}
+
+fn clamp_matched_usage_limit_window(
+    snapshot: &mut RateLimitSnapshot,
+    resets_at: Option<DateTime<Utc>>,
+) -> bool {
+    let Some(resets_at) = resets_at else {
+        return false;
+    };
+
+    let resets_at = resets_at.timestamp();
+    let primary_matches = snapshot
+        .primary
+        .as_ref()
+        .is_some_and(|window| window.resets_at == Some(resets_at));
+    let secondary_matches = snapshot
+        .secondary
+        .as_ref()
+        .is_some_and(|window| window.resets_at == Some(resets_at));
+
+    if primary_matches {
+        clamp_rate_limit_window(snapshot.primary.as_mut());
+    }
+    if secondary_matches {
+        clamp_rate_limit_window(snapshot.secondary.as_mut());
+    }
+
+    primary_matches || secondary_matches
+}
+
+fn clamp_depleted_usage_limit_windows(
+    snapshot: &mut RateLimitSnapshot,
+    now: DateTime<Utc>,
+) -> bool {
+    let mut clamped = false;
+    if snapshot
+        .primary
+        .as_ref()
+        .is_some_and(|window| window.is_depleted_at(now.timestamp()))
+    {
+        clamp_rate_limit_window(snapshot.primary.as_mut());
+        clamped = true;
+    }
+    if snapshot
+        .secondary
+        .as_ref()
+        .is_some_and(|window| window.is_depleted_at(now.timestamp()))
+    {
+        clamp_rate_limit_window(snapshot.secondary.as_mut());
+        clamped = true;
+    }
+    clamped
+}
+
+fn usage_limit_default_window_slot(snapshot: &RateLimitSnapshot) -> Option<UsageLimitWindowSlot> {
+    if snapshot.primary.is_some() {
+        return Some(UsageLimitWindowSlot::Primary);
+    }
+
+    snapshot
+        .secondary
+        .as_ref()
+        .map(|_| UsageLimitWindowSlot::Secondary)
+}
+
+fn clamp_rate_limit_window(window: Option<&mut RateLimitWindow>) {
+    if let Some(window) = window {
+        window.remaining_percent = 0.0;
+    }
+}
+
 fn account_usage_state_from_cache(cache: &AccountUsageCache) -> AccountUsageState {
     AccountUsageState {
         last_rate_limits: cache.last_rate_limits.clone(),
@@ -416,20 +515,11 @@ fn synchronize_store_usage_from_legacy_and_sqlite(
 ) -> std::io::Result<UsageStateSyncOutcome> {
     let legacy_usage_by_account = legacy_usage_states_from_store(store);
     let strip_persisted_auth_store = !legacy_usage_by_account.is_empty();
-    if !legacy_usage_by_account.is_empty() {
-        let legacy_account_ids = legacy_usage_by_account.keys().cloned().collect::<Vec<_>>();
-        let sqlite_usage_by_account = account_state_store
-            .load_usage_states_for_accounts(legacy_account_ids.as_slice())
-            .map_err(std::io::Error::other)?;
-        let missing_legacy_usage = legacy_usage_by_account
-            .into_iter()
-            .filter(|(account_id, _)| !sqlite_usage_by_account.contains_key(account_id))
-            .collect::<HashMap<_, _>>();
-        if !missing_legacy_usage.is_empty() {
-            account_state_store
-                .upsert_usage_states(&missing_legacy_usage)
-                .map_err(std::io::Error::other)?;
-        }
+    if strip_persisted_auth_store {
+        tracing::info!(
+            legacy_usage_accounts = legacy_usage_by_account.len(),
+            "skipping legacy auth-store usage backfill during sqlite usage-truth cutover"
+        );
     }
     hydrate_store_usage_from_sqlite(account_state_store, store)?;
     Ok(UsageStateSyncOutcome {
@@ -1347,10 +1437,23 @@ impl AuthDotJson {
 #[derive(Clone)]
 struct CachedAuth {
     store: AuthStore,
+    store_origin: CachedStoreOrigin,
     auth: Option<CodexAuth>,
     /// Permanent refresh failure cached for the current auth snapshot so
     /// later refresh attempts for the same credentials fail fast without network.
     permanent_refresh_failure: Option<AuthScopedRefreshFailure>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CachedStoreOrigin {
+    Persistent,
+    ExternalEphemeral,
+}
+
+#[derive(Clone)]
+struct LoadedCachedStore {
+    store: AuthStore,
+    store_origin: CachedStoreOrigin,
 }
 
 #[derive(Clone)]
@@ -1362,6 +1465,7 @@ struct AuthScopedRefreshFailure {
 impl Debug for CachedAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedAuth")
+            .field("store_origin", &self.store_origin)
             .field(
                 "auth_mode",
                 &self.auth.as_ref().map(CodexAuth::api_auth_mode),
@@ -1848,53 +1952,22 @@ impl AuthManager {
         let storage = create_auth_storage(codex_home.clone(), auth_credentials_store_mode);
         let account_state_store = open_account_state_store(sqlite_home.as_path());
         let runtime_session_id = uuid::Uuid::new_v4().to_string();
-        let mut store = storage.load().ok().flatten().unwrap_or_default();
-        let loaded_had_persisted_active_account = store.active_account_id.is_some();
-        let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
-        let mut sync_outcome = UsageStateSyncOutcome::default();
-        if let Some(account_state_store) = account_state_store.as_ref() {
-            match synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store) {
-                Ok(outcome) => {
-                    sync_outcome = outcome;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "failed to synchronize saved-account usage truth during auth manager initialization"
-                    );
-                }
-            }
-        }
-        if !removed_account_ids.is_empty() {
-            tracing::info!(
-                removed_account_ids = ?removed_account_ids,
-                "removed accounts with unsupported ChatGPT plans during auth manager initialization"
-            );
-        }
-        if let Err(error) = Self::hydrate_runtime_active_account(
+        let loaded = Self::load_store_from_storage_impl(
+            &codex_home,
+            &storage,
+            auth_credentials_store_mode,
             account_state_store.as_ref(),
             runtime_session_id.as_str(),
             None,
-            &mut store,
-        ) {
-            tracing::warn!(
-                error = %error,
-                "failed to hydrate runtime active-account state during auth manager initialization"
-            );
-        }
-        if (sync_outcome.strip_persisted_auth_store
-            || !removed_account_ids.is_empty()
-            || (account_state_store.is_some() && loaded_had_persisted_active_account))
-            && let Err(error) =
-                persist_auth_store(&*storage, &store, sync_outcome.strip_persisted_auth_store)
-        {
-            tracing::warn!(
-                error = %error,
-                "failed to persist auth store during auth manager initialization"
-            );
-        }
-        let auth =
-            Self::derive_auth_from_store(&store, Arc::clone(&storage), enable_codex_api_key_env);
+        );
+        let store = loaded.store;
+        let store_origin = loaded.store_origin;
+        let auth = Self::derive_auth_from_store(
+            &store,
+            Arc::clone(&storage),
+            enable_codex_api_key_env,
+            store_origin,
+        );
         Self {
             codex_home,
             storage,
@@ -1902,6 +1975,7 @@ impl AuthManager {
             runtime_session_id,
             inner: RwLock::new(CachedAuth {
                 store,
+                store_origin,
                 auth,
                 permanent_refresh_failure: None,
             }),
@@ -1924,6 +1998,7 @@ impl AuthManager {
         let store = store_from_auth_for_testing(&auth);
         let cached = CachedAuth {
             store,
+            store_origin: CachedStoreOrigin::Persistent,
             auth: Some(auth),
             permanent_refresh_failure: None,
         };
@@ -1951,6 +2026,7 @@ impl AuthManager {
         let store = store_from_auth_for_testing(&auth);
         let cached = CachedAuth {
             store,
+            store_origin: CachedStoreOrigin::Persistent,
             auth: Some(auth),
             permanent_refresh_failure: None,
         };
@@ -1980,6 +2056,7 @@ impl AuthManager {
             runtime_session_id: uuid::Uuid::new_v4().to_string(),
             inner: RwLock::new(CachedAuth {
                 store: AuthStore::default(),
+                store_origin: CachedStoreOrigin::Persistent,
                 auth: None,
                 permanent_refresh_failure: None,
             }),
@@ -1997,7 +2074,10 @@ impl AuthManager {
 
     /// Current cached auth (clone) without attempting a refresh.
     pub fn auth_cached(&self) -> Option<CodexAuth> {
-        let mut store = self.inner.read().ok()?.store.clone();
+        let (mut store, store_origin) = {
+            let guard = self.inner.read().ok()?;
+            (guard.store.clone(), guard.store_origin)
+        };
         if let Err(error) = Self::hydrate_runtime_active_account(
             self.account_state_store.as_ref(),
             self.runtime_session_id.as_str(),
@@ -2014,8 +2094,9 @@ impl AuthManager {
             &store,
             Arc::clone(&self.storage),
             self.enable_codex_api_key_env,
+            store_origin,
         );
-        self.set_cached_with_auth(store, auth.clone());
+        self.set_cached_with_auth(store, auth.clone(), store_origin);
         auth
     }
 
@@ -2379,8 +2460,8 @@ impl AuthManager {
             let now = Utc::now();
             let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
             usage.last_seen_at = Some(now);
-            if let Some(snapshot) = snapshot {
-                usage.last_rate_limits = Some(snapshot);
+            if let Some(snapshot) = snapshot.or_else(|| usage.last_rate_limits.clone()) {
+                usage.last_rate_limits = Some(clamp_usage_limit_snapshot(snapshot, resets_at, now));
             }
 
             let exhausted_until = exhausted_until(resets_at, usage.last_rate_limits.as_ref(), now);
@@ -2709,8 +2790,14 @@ impl AuthManager {
     /// whether the auth value changed.
     pub fn reload(&self) -> bool {
         tracing::info!("Reloading auth");
-        let store = self.load_store_from_storage();
-        self.set_cached(store)
+        let loaded = self.load_store_from_storage();
+        let auth = Self::derive_auth_from_store(
+            &loaded.store,
+            Arc::clone(&self.storage),
+            self.enable_codex_api_key_env,
+            loaded.store_origin,
+        );
+        self.set_cached_with_auth(loaded.store, auth, loaded.store_origin)
     }
 
     /// Like `reload()`, but fails loudly if the auth store cannot be loaded.
@@ -2814,6 +2901,7 @@ impl AuthManager {
             &store,
             Arc::clone(&self.storage),
             self.enable_codex_api_key_env,
+            CachedStoreOrigin::Persistent,
         );
         let new_store_account_id = new_auth
             .as_ref()
@@ -2885,22 +2973,29 @@ impl AuthManager {
         store: &AuthStore,
         storage: Arc<dyn AuthStorageBackend>,
         enable_codex_api_key_env: bool,
+        store_origin: CachedStoreOrigin,
     ) -> Option<CodexAuth> {
         if enable_codex_api_key_env && let Some(api_key) = read_codex_api_key_from_env() {
             return Some(CodexAuth::from_api_key(&api_key));
         }
 
         if let Some(active_account) = store.active_account() {
+            let (auth_mode, storage) = match store_origin {
+                CachedStoreOrigin::Persistent => (ApiAuthMode::Chatgpt, Some(storage)),
+                CachedStoreOrigin::ExternalEphemeral => (ApiAuthMode::ChatgptAuthTokens, None),
+            };
             return Some(
                 CodexAuth::from_chatgpt_active_account_snapshot(
-                    ActiveChatgptAccountSnapshot::from_stored_account(
-                        active_account,
-                        ApiAuthMode::Chatgpt,
-                    ),
-                    Some(storage),
+                    ActiveChatgptAccountSnapshot::from_stored_account(active_account, auth_mode),
+                    storage,
                 )
-                .unwrap_or_else(|error| {
-                    panic!("persisted ChatGPT auth should always have a backing store: {error}")
+                .unwrap_or_else(|error| match store_origin {
+                    CachedStoreOrigin::Persistent => {
+                        panic!("persisted ChatGPT auth should always have a backing store: {error}")
+                    }
+                    CachedStoreOrigin::ExternalEphemeral => {
+                        panic!("external ChatGPT token auth should be constructible: {error}")
+                    }
                 }),
             );
         }
@@ -2916,7 +3011,12 @@ impl AuthManager {
         None
     }
 
-    fn set_cached_with_auth(&self, store: AuthStore, new_auth: Option<CodexAuth>) -> bool {
+    fn set_cached_with_auth(
+        &self,
+        store: AuthStore,
+        new_auth: Option<CodexAuth>,
+        store_origin: CachedStoreOrigin,
+    ) -> bool {
         if let Ok(mut guard) = self.inner.write() {
             let previous = guard.auth.as_ref();
             let changed = !AuthManager::auths_equal(previous, new_auth.as_ref());
@@ -2927,6 +3027,7 @@ impl AuthManager {
             }
             tracing::info!("Reloaded auth, changed: {changed}");
             guard.store = store;
+            guard.store_origin = store_origin;
             guard.auth = new_auth;
             changed
         } else {
@@ -2934,67 +3035,158 @@ impl AuthManager {
         }
     }
 
-    fn load_store_from_storage(&self) -> AuthStore {
-        match self.storage.load() {
-            Ok(Some(mut store)) => {
-                let loaded_had_persisted_active_account = store.active_account_id.is_some();
-                let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
-                let mut sync_outcome = UsageStateSyncOutcome::default();
-                if let Some(account_state_store) = self.account_state_store.as_ref() {
-                    match synchronize_store_usage_from_legacy_and_sqlite(
-                        account_state_store,
-                        &mut store,
-                    ) {
-                        Ok(outcome) => {
-                            sync_outcome = outcome;
+    fn load_store_from_storage(&self) -> LoadedCachedStore {
+        Self::load_store_from_storage_impl(
+            &self.codex_home,
+            &self.storage,
+            self.auth_credentials_store_mode,
+            self.account_state_store.as_ref(),
+            self.runtime_session_id.as_str(),
+            self.forced_chatgpt_workspace_id().as_deref(),
+        )
+    }
+
+    fn load_store_from_storage_impl(
+        codex_home: &Path,
+        storage: &Arc<dyn AuthStorageBackend>,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+        account_state_store: Option<&AccountStateStore>,
+        runtime_session_id: &str,
+        required_workspace_id: Option<&str>,
+    ) -> LoadedCachedStore {
+        let external_storage = (auth_credentials_store_mode != AuthCredentialsStoreMode::Ephemeral)
+            .then(|| {
+                create_auth_storage(
+                    codex_home.to_path_buf(),
+                    AuthCredentialsStoreMode::Ephemeral,
+                )
+            });
+
+        let (mut store, store_origin, persist_storage) = match external_storage.as_ref() {
+            Some(external_storage) => match external_storage.load() {
+                Ok(Some(store)) if !store.accounts.is_empty() || store.openai_api_key.is_some() => {
+                    (
+                        store,
+                        CachedStoreOrigin::ExternalEphemeral,
+                        Arc::clone(external_storage),
+                    )
+                }
+                Ok(Some(_)) | Ok(None) => match storage.load() {
+                    Ok(Some(store)) => (store, CachedStoreOrigin::Persistent, Arc::clone(storage)),
+                    Ok(None) => (
+                        AuthStore::default(),
+                        CachedStoreOrigin::Persistent,
+                        Arc::clone(storage),
+                    ),
+                    Err(err) => {
+                        tracing::warn!("Failed to load auth store: {err}");
+                        (
+                            AuthStore::default(),
+                            CachedStoreOrigin::Persistent,
+                            Arc::clone(storage),
+                        )
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!("Failed to load external auth store: {err}");
+                    match storage.load() {
+                        Ok(Some(store)) => {
+                            (store, CachedStoreOrigin::Persistent, Arc::clone(storage))
                         }
-                        Err(error) => {
-                            tracing::warn!(
-                                error = %error,
-                                "failed to synchronize saved-account usage truth while loading auth store"
-                            );
+                        Ok(None) => (
+                            AuthStore::default(),
+                            CachedStoreOrigin::Persistent,
+                            Arc::clone(storage),
+                        ),
+                        Err(err) => {
+                            tracing::warn!("Failed to load auth store: {err}");
+                            (
+                                AuthStore::default(),
+                                CachedStoreOrigin::Persistent,
+                                Arc::clone(storage),
+                            )
                         }
                     }
                 }
-                if !removed_account_ids.is_empty() {
-                    tracing::info!(
-                        removed_account_ids = ?removed_account_ids,
-                        "removed accounts with unsupported ChatGPT plans while loading auth store"
-                    );
+            },
+            None => match storage.load() {
+                Ok(Some(store)) => {
+                    let store_origin =
+                        if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
+                            CachedStoreOrigin::ExternalEphemeral
+                        } else {
+                            CachedStoreOrigin::Persistent
+                        };
+                    (store, store_origin, Arc::clone(storage))
                 }
-                if let Err(error) = Self::hydrate_runtime_active_account(
-                    self.account_state_store.as_ref(),
-                    self.runtime_session_id.as_str(),
-                    self.forced_chatgpt_workspace_id().as_deref(),
-                    &mut store,
-                ) {
-                    tracing::warn!(
-                        error = %error,
-                        "failed to hydrate runtime active-account state while loading auth store"
-                    );
-                    store.active_account_id = None;
-                }
-                if (sync_outcome.strip_persisted_auth_store
-                    || !removed_account_ids.is_empty()
-                    || (self.account_state_store.is_some() && loaded_had_persisted_active_account))
-                    && let Err(error) = persist_auth_store(
-                        &*self.storage,
-                        &store,
-                        sync_outcome.strip_persisted_auth_store,
+                Ok(None) => (
+                    AuthStore::default(),
+                    CachedStoreOrigin::Persistent,
+                    Arc::clone(storage),
+                ),
+                Err(err) => {
+                    tracing::warn!("Failed to load auth store: {err}");
+                    (
+                        AuthStore::default(),
+                        CachedStoreOrigin::Persistent,
+                        Arc::clone(storage),
                     )
-                {
+                }
+            },
+        };
+
+        let loaded_had_persisted_active_account = store.active_account_id.is_some();
+        let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
+        let mut sync_outcome = UsageStateSyncOutcome::default();
+        if let Some(account_state_store) = account_state_store {
+            match synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store) {
+                Ok(outcome) => {
+                    sync_outcome = outcome;
+                }
+                Err(error) => {
                     tracing::warn!(
                         error = %error,
-                        "failed to persist auth store while loading store"
+                        "failed to synchronize saved-account usage truth while loading auth store"
                     );
                 }
-                store
             }
-            Ok(None) => AuthStore::default(),
-            Err(err) => {
-                tracing::warn!("Failed to load auth store: {err}");
-                AuthStore::default()
-            }
+        }
+        if !removed_account_ids.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_account_ids,
+                "removed accounts with unsupported ChatGPT plans while loading auth store"
+            );
+        }
+        if let Err(error) = Self::hydrate_runtime_active_account(
+            account_state_store,
+            runtime_session_id,
+            required_workspace_id,
+            &mut store,
+        ) {
+            tracing::warn!(
+                error = %error,
+                "failed to hydrate runtime active-account state while loading auth store"
+            );
+            store.active_account_id = None;
+        }
+        if (sync_outcome.strip_persisted_auth_store
+            || !removed_account_ids.is_empty()
+            || (account_state_store.is_some() && loaded_had_persisted_active_account))
+            && let Err(error) = persist_auth_store(
+                &*persist_storage,
+                &store,
+                sync_outcome.strip_persisted_auth_store,
+            )
+        {
+            tracing::warn!(
+                error = %error,
+                "failed to persist auth store while loading store"
+            );
+        }
+
+        LoadedCachedStore {
+            store,
+            store_origin,
         }
     }
 
@@ -3018,12 +3210,19 @@ impl AuthManager {
     }
 
     fn set_cached(&self, store: AuthStore) -> bool {
+        let store_origin = self
+            .inner
+            .read()
+            .ok()
+            .map(|guard| guard.store_origin)
+            .unwrap_or(CachedStoreOrigin::Persistent);
         let new_auth = Self::derive_auth_from_store(
             &store,
             Arc::clone(&self.storage),
             self.enable_codex_api_key_env,
+            store_origin,
         );
-        self.set_cached_with_auth(store, new_auth)
+        self.set_cached_with_auth(store, new_auth, store_origin)
     }
 
     fn derive_chatgpt_auth_from_store_account(
@@ -3439,9 +3638,10 @@ impl AuthManager {
                     &store,
                     Arc::clone(&self.storage),
                     self.enable_codex_api_key_env,
+                    CachedStoreOrigin::Persistent,
                 )
             };
-        self.set_cached_with_auth(store, cached_auth);
+        self.set_cached_with_auth(store, cached_auth, CachedStoreOrigin::Persistent);
         tracing::warn!(
             store_account_id,
             failed_reason = ?error.reason,
@@ -3824,7 +4024,7 @@ fn rate_limit_window_blocked(window: Option<&RateLimitWindow>, now: DateTime<Utc
         return false;
     };
 
-    window.is_effectively_saturated_at(now.timestamp())
+    window.is_depleted_at(now.timestamp())
 }
 
 fn rate_limit_window_reset_at(window: Option<&RateLimitWindow>) -> Option<DateTime<Utc>> {
@@ -3935,11 +4135,11 @@ fn compare_auto_switch_candidates(a: &StoredAccount, b: &StoredAccount) -> std::
     let a_snapshot = a.usage.as_ref().and_then(|u| u.last_rate_limits.as_ref());
     let b_snapshot = b.usage.as_ref().and_then(|u| u.last_rate_limits.as_ref());
 
-    let (a_primary_kind, a_primary_used) = primary_used_percent_rank(a_snapshot);
-    let (b_primary_kind, b_primary_used) = primary_used_percent_rank(b_snapshot);
+    let (a_primary_kind, a_primary_remaining) = primary_remaining_percent_rank(a_snapshot);
+    let (b_primary_kind, b_primary_remaining) = primary_remaining_percent_rank(b_snapshot);
 
-    let (a_weekly_kind, a_weekly_used) = weekly_used_percent_rank(a_snapshot);
-    let (b_weekly_kind, b_weekly_used) = weekly_used_percent_rank(b_snapshot);
+    let (a_weekly_kind, a_weekly_remaining) = weekly_remaining_percent_rank(a_snapshot);
+    let (b_weekly_kind, b_weekly_remaining) = weekly_remaining_percent_rank(b_snapshot);
 
     let (a_credit_kind, a_balance) = credits_balance_rank(a_snapshot);
     let (b_credit_kind, b_balance) = credits_balance_rank(b_snapshot);
@@ -3957,9 +4157,9 @@ fn compare_auto_switch_candidates(a: &StoredAccount, b: &StoredAccount) -> std::
 
     (
         a_primary_kind,
-        a_primary_used,
+        a_primary_remaining,
         a_weekly_kind,
-        a_weekly_used,
+        a_weekly_remaining,
         a_credit_kind,
         a_balance,
         a_last_seen,
@@ -3967,9 +4167,9 @@ fn compare_auto_switch_candidates(a: &StoredAccount, b: &StoredAccount) -> std::
     )
         .cmp(&(
             b_primary_kind,
-            b_primary_used,
+            b_primary_remaining,
             b_weekly_kind,
-            b_weekly_used,
+            b_weekly_remaining,
             b_credit_kind,
             b_balance,
             b_last_seen,
@@ -3999,7 +4199,7 @@ fn credits_balance_rank(snapshot: Option<&RateLimitSnapshot>) -> (u8, i64) {
     }
 }
 
-fn weekly_used_percent_rank(snapshot: Option<&RateLimitSnapshot>) -> (u8, i64) {
+fn weekly_remaining_percent_rank(snapshot: Option<&RateLimitSnapshot>) -> (u8, i64) {
     let Some(snapshot) = snapshot else {
         return (1, 0);
     };
@@ -4009,17 +4209,17 @@ fn weekly_used_percent_rank(snapshot: Option<&RateLimitSnapshot>) -> (u8, i64) {
     if window.window_minutes.is_some() {
         return (1, 0);
     }
-    (0, percent_basis_points(window.used_percent))
+    (0, -percent_basis_points(window.remaining_percent))
 }
 
-fn primary_used_percent_rank(snapshot: Option<&RateLimitSnapshot>) -> (u8, i64) {
+fn primary_remaining_percent_rank(snapshot: Option<&RateLimitSnapshot>) -> (u8, i64) {
     let Some(snapshot) = snapshot else {
         return (1, 0);
     };
     let Some(window) = snapshot.primary.as_ref() else {
         return (1, 0);
     };
-    (0, percent_basis_points(window.used_percent))
+    (0, -percent_basis_points(window.remaining_percent))
 }
 
 fn percent_basis_points(percent: f64) -> i64 {

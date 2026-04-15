@@ -102,7 +102,7 @@ pub(super) fn snapshot(percent: f64) -> RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: percent,
+            remaining_percent: percent,
             window_minutes: Some(60),
             resets_at: None,
         }),

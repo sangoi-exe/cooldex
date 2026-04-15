@@ -42,7 +42,7 @@ async fn set_rate_limits_defaults_limit_id_to_codex_when_missing() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 12.0,
+            remaining_percent: 12.0,
             window_minutes: Some(60),
             resets_at: Some(100),
         }),
@@ -69,7 +69,7 @@ async fn set_rate_limits_defaults_to_codex_when_limit_id_missing_after_other_buc
         limit_id: Some("codex_other".to_string()),
         limit_name: Some("codex_other".to_string()),
         primary: Some(RateLimitWindow {
-            used_percent: 20.0,
+            remaining_percent: 20.0,
             window_minutes: Some(60),
             resets_at: Some(200),
         }),
@@ -81,7 +81,7 @@ async fn set_rate_limits_defaults_to_codex_when_limit_id_missing_after_other_buc
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 30.0,
+            remaining_percent: 30.0,
             window_minutes: Some(60),
             resets_at: Some(300),
         }),
@@ -108,7 +108,7 @@ async fn set_rate_limits_carries_credits_and_plan_type_from_codex_to_codex_other
         limit_id: Some("codex".to_string()),
         limit_name: Some("codex".to_string()),
         primary: Some(RateLimitWindow {
-            used_percent: 10.0,
+            remaining_percent: 10.0,
             window_minutes: Some(60),
             resets_at: Some(100),
         }),
@@ -125,7 +125,7 @@ async fn set_rate_limits_carries_credits_and_plan_type_from_codex_to_codex_other
         limit_id: Some("codex_other".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 30.0,
+            remaining_percent: 30.0,
             window_minutes: Some(120),
             resets_at: Some(200),
         }),
@@ -140,7 +140,7 @@ async fn set_rate_limits_carries_credits_and_plan_type_from_codex_to_codex_other
             limit_id: Some("codex_other".to_string()),
             limit_name: None,
             primary: Some(RateLimitWindow {
-                used_percent: 30.0,
+                remaining_percent: 30.0,
                 window_minutes: Some(120),
                 resets_at: Some(200),
             }),

@@ -498,6 +498,49 @@ fn load_auth_falls_back_to_persisted_chatgpt_auth_when_external_tokens_are_unsup
     assert_eq!(store.active_account_id, None);
 }
 
+#[tokio::test]
+#[serial(codex_api_key)]
+async fn auth_manager_reload_prefers_external_ephemeral_chatgpt_tokens() {
+    let codex_home = tempdir().unwrap();
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let access_token =
+        make_test_chatgpt_jwt(Some("pro".to_string()), Some("org-external".to_string()))
+            .expect("jwt");
+
+    assert_eq!(manager.auth_cached(), None);
+
+    super::login_with_chatgpt_auth_tokens(
+        codex_home.path(),
+        &access_token,
+        "org-external",
+        Some("pro"),
+        None,
+    )
+    .expect("external auth should save");
+
+    assert!(manager.reload(), "reload should observe external auth");
+
+    let cached = manager
+        .auth_cached()
+        .expect("external auth should be cached after reload");
+    assert_eq!(cached.api_auth_mode(), AuthMode::ChatgptAuthTokens);
+    assert_eq!(
+        cached
+            .active_chatgpt_account_summary()
+            .expect("external account summary")
+            .store_account_id,
+        test_store_account_id("org-external").expect("store account id")
+    );
+    assert_eq!(
+        manager.auth().await.map(|auth| auth.api_auth_mode()),
+        Some(AuthMode::ChatgptAuthTokens)
+    );
+}
+
 #[test]
 fn usage_limit_auto_switch_removes_only_free_and_unknown_plans() {
     assert!(super::usage_limit_auto_switch_removes_plan_type(Some(
@@ -543,7 +586,7 @@ fn classify_refresh_token_failure_treats_token_revoked_as_revoked() {
 }
 
 #[test]
-fn mark_usage_limit_reached_prefers_blocked_primary_reset_when_error_reset_is_missing() {
+fn mark_usage_limit_reached_defaults_primary_window_to_zero_when_error_reset_is_missing() {
     let codex_home = tempdir().unwrap();
     persist_test_chatgpt_accounts(codex_home.path(), &["org-primary"], 0);
     let manager = AuthManager::shared(
@@ -561,12 +604,12 @@ fn mark_usage_limit_reached_prefers_blocked_primary_reset_when_error_reset_is_mi
                 limit_id: Some("codex".to_string()),
                 limit_name: None,
                 primary: Some(RateLimitWindow {
-                    used_percent: 100.0,
+                    remaining_percent: 2.0,
                     window_minutes: Some(15),
                     resets_at: Some(primary_reset_at.timestamp()),
                 }),
                 secondary: Some(RateLimitWindow {
-                    used_percent: 10.0,
+                    remaining_percent: 69.0,
                     window_minutes: None,
                     resets_at: Some(secondary_reset_at.timestamp()),
                 }),
@@ -586,6 +629,85 @@ fn mark_usage_limit_reached_prefers_blocked_primary_reset_when_error_reset_is_mi
             .exhausted_until
             .map(|until| until.timestamp()),
         Some(primary_reset_at.timestamp())
+    );
+    assert_eq!(
+        active_account
+            .last_rate_limits
+            .as_ref()
+            .and_then(|snapshot| snapshot.primary.as_ref())
+            .map(|window| window.remaining_percent),
+        Some(0.0)
+    );
+    assert_eq!(
+        active_account
+            .last_rate_limits
+            .as_ref()
+            .and_then(|snapshot| snapshot.secondary.as_ref())
+            .map(|window| window.remaining_percent),
+        Some(69.0)
+    );
+}
+
+#[test]
+fn mark_usage_limit_reached_clamps_matched_weekly_window_to_zero() {
+    let codex_home = tempdir().unwrap();
+    persist_test_chatgpt_accounts(codex_home.path(), &["org-weekly"], 0);
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let primary_reset_at = Utc::now() + chrono::Duration::minutes(15);
+    let secondary_reset_at = Utc::now() + chrono::Duration::days(7);
+
+    manager
+        .mark_usage_limit_reached(
+            Some(secondary_reset_at),
+            Some(RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    remaining_percent: 54.0,
+                    window_minutes: Some(15),
+                    resets_at: Some(primary_reset_at.timestamp()),
+                }),
+                secondary: Some(RateLimitWindow {
+                    remaining_percent: 62.0,
+                    window_minutes: None,
+                    resets_at: Some(secondary_reset_at.timestamp()),
+                }),
+                credits: None,
+                plan_type: Some(AccountPlanType::Pro),
+            }),
+        )
+        .expect("mark weekly usage limit reached");
+
+    let active_account = manager
+        .list_accounts()
+        .into_iter()
+        .find(|account| account.is_active)
+        .expect("active account should exist");
+    assert_eq!(
+        active_account
+            .exhausted_until
+            .map(|until| until.timestamp()),
+        Some(secondary_reset_at.timestamp())
+    );
+    assert_eq!(
+        active_account
+            .last_rate_limits
+            .as_ref()
+            .and_then(|snapshot| snapshot.primary.as_ref())
+            .map(|window| window.remaining_percent),
+        Some(54.0)
+    );
+    assert_eq!(
+        active_account
+            .last_rate_limits
+            .as_ref()
+            .and_then(|snapshot| snapshot.secondary.as_ref())
+            .map(|window| window.remaining_percent),
+        Some(0.0)
     );
 }
 
@@ -615,7 +737,7 @@ fn cooldown_still_purges_freshly_unsupported_fallbacks_and_marks_failing_account
                 limit_id: Some("codex".to_string()),
                 limit_name: None,
                 primary: Some(RateLimitWindow {
-                    used_percent: 100.0,
+                    remaining_percent: 100.0,
                     window_minutes: Some(15),
                     resets_at: Some((Utc::now() + chrono::Duration::minutes(15)).timestamp()),
                 }),
@@ -662,14 +784,14 @@ fn cooldown_still_purges_freshly_unsupported_fallbacks_and_marks_failing_account
 }
 
 #[test]
-fn select_account_for_auto_switch_prefers_lower_primary_usage_when_weekly_ties() {
+fn select_account_for_auto_switch_prefers_higher_primary_headroom_when_weekly_ties() {
     let now = Utc::now();
     let stronger_store_account_id =
         test_store_account_id("org-stronger").expect("stronger store account id");
     let store = AuthStore {
         accounts: vec![
-            stored_test_chatgpt_account_with_usage("org-weaker", 80.0, 20.0, now),
-            stored_test_chatgpt_account_with_usage("org-stronger", 20.0, 20.0, now),
+            stored_test_chatgpt_account_with_usage("org-weaker", 20.0, 20.0, now),
+            stored_test_chatgpt_account_with_usage("org-stronger", 80.0, 20.0, now),
         ],
         ..AuthStore::default()
     };
@@ -688,14 +810,14 @@ fn select_account_for_auto_switch_prefers_lower_primary_usage_when_weekly_ties()
 }
 
 #[test]
-fn select_account_for_auto_switch_prefers_lower_weekly_usage_when_primary_ties() {
+fn select_account_for_auto_switch_prefers_higher_weekly_headroom_when_primary_ties() {
     let now = Utc::now();
     let stronger_store_account_id =
         test_store_account_id("org-stronger").expect("stronger store account id");
     let store = AuthStore {
         accounts: vec![
-            stored_test_chatgpt_account_with_usage("org-weaker", 20.0, 80.0, now),
-            stored_test_chatgpt_account_with_usage("org-stronger", 20.0, 20.0, now),
+            stored_test_chatgpt_account_with_usage("org-weaker", 20.0, 20.0, now),
+            stored_test_chatgpt_account_with_usage("org-stronger", 20.0, 80.0, now),
         ],
         ..AuthStore::default()
     };
@@ -720,7 +842,7 @@ fn select_account_for_auto_switch_prefers_primary_headroom_before_weekly_headroo
         test_store_account_id("org-primary-favored").expect("stronger store account id");
     let store = AuthStore {
         accounts: vec![
-            stored_test_chatgpt_account_with_usage("org-weekly-favored", 95.0, 90.0, now),
+            stored_test_chatgpt_account_with_usage("org-weekly-favored", 5.0, 90.0, now),
             stored_test_chatgpt_account_with_usage("org-primary-favored", 10.0, 20.0, now),
         ],
         ..AuthStore::default()
@@ -772,20 +894,19 @@ fn select_account_for_auto_switch_respects_freshly_selectable_scope() {
 }
 
 #[test]
-fn exhausted_until_from_snapshot_treats_display_99_window_as_blocked() {
+fn exhausted_until_from_snapshot_does_not_block_near_empty_window_without_429() {
     let now = Utc::now();
-    let snapshot = test_rate_limit_snapshot(98.6, 10.0, now);
+    let snapshot = test_rate_limit_snapshot(1.4, 69.0, now);
 
-    let expected_reset_at = snapshot
-        .primary
-        .as_ref()
-        .and_then(|window| window.resets_at)
-        .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
+    assert_eq!(super::exhausted_until_from_snapshot(&snapshot, now), None);
+}
 
-    assert_eq!(
-        super::exhausted_until_from_snapshot(&snapshot, now),
-        expected_reset_at
-    );
+#[test]
+fn exhausted_until_from_snapshot_does_not_block_fractional_window_without_429() {
+    let now = Utc::now();
+    let snapshot = test_rate_limit_snapshot(0.4, 69.0, now);
+
+    assert_eq!(super::exhausted_until_from_snapshot(&snapshot, now), None);
 }
 
 #[test]
@@ -793,8 +914,7 @@ fn update_rate_limits_for_accounts_clears_stale_exhaustion_for_unblocked_saved_a
     let now = Utc::now();
     let codex_home = tempdir().unwrap();
     let store_account_id = test_store_account_id("org-stale-exhausted").expect("store account id");
-    let mut account =
-        stored_test_chatgpt_account_with_usage("org-stale-exhausted", 100.0, 20.0, now);
+    let mut account = stored_test_chatgpt_account_with_usage("org-stale-exhausted", 0.0, 20.0, now);
     account.usage.as_mut().expect("usage cache").exhausted_until =
         Some(now + chrono::Duration::minutes(15));
     let store = AuthStore {
@@ -812,7 +932,7 @@ fn update_rate_limits_for_accounts_clears_stale_exhaustion_for_unblocked_saved_a
     let updated = manager
         .update_rate_limits_for_accounts([(
             store_account_id.clone(),
-            test_rate_limit_snapshot(10.0, 20.0, now),
+            test_rate_limit_snapshot(90.0, 20.0, now),
         )])
         .expect("update rate limits");
 
@@ -867,7 +987,7 @@ fn reconcile_account_rate_limit_refresh_outcomes_clears_stale_usage_for_attempte
 }
 
 #[test]
-fn auth_manager_migrates_legacy_usage_cache_to_sqlite_and_strips_auth_store() {
+fn auth_manager_strips_legacy_usage_cache_without_backfilling_sqlite_during_v2_cutover() {
     let now = Utc::now();
     let codex_home = tempdir().unwrap();
     let store_account_id =
@@ -876,7 +996,7 @@ fn auth_manager_migrates_legacy_usage_cache_to_sqlite_and_strips_auth_store() {
     let exhausted_until = Some(now + chrono::Duration::minutes(20));
     let account = StoredAccount {
         usage: Some(AccountUsageCache {
-            last_rate_limits: Some(snapshot.clone()),
+            last_rate_limits: Some(snapshot),
             exhausted_until,
             last_seen_at: Some(now),
         }),
@@ -899,13 +1019,8 @@ fn auth_manager_migrates_legacy_usage_cache_to_sqlite_and_strips_auth_store() {
         .into_iter()
         .find(|account| account.id == store_account_id)
         .expect("account summary should exist");
-    assert_eq!(account.last_rate_limits, Some(snapshot.clone()));
-    assert_eq!(
-        account
-            .exhausted_until
-            .map(|exhausted_until| exhausted_until.timestamp()),
-        exhausted_until.map(|exhausted_until| exhausted_until.timestamp())
-    );
+    assert_eq!(account.last_rate_limits, None);
+    assert_eq!(account.exhausted_until, None);
 
     let stripped_store = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
         .expect("load stripped auth store")
@@ -917,22 +1032,10 @@ fn auth_manager_migrates_legacy_usage_cache_to_sqlite_and_strips_auth_store() {
         AccountStateStore::open(codex_home.path().to_path_buf()).expect("open account state store");
     let usage_by_account = account_state_store
         .load_usage_states_for_accounts(std::slice::from_ref(&store_account_id))
-        .expect("load migrated usage states");
-    let migrated_usage = usage_by_account
-        .get(&store_account_id)
-        .expect("migrated usage should exist");
-    assert_eq!(migrated_usage.last_rate_limits, Some(snapshot));
-    assert_eq!(
-        migrated_usage
-            .exhausted_until
-            .map(|exhausted_until| exhausted_until.timestamp()),
-        exhausted_until.map(|exhausted_until| exhausted_until.timestamp())
-    );
-    assert_eq!(
-        migrated_usage
-            .last_seen_at
-            .map(|last_seen_at| last_seen_at.timestamp()),
-        Some(now.timestamp())
+        .expect("load sqlite usage states");
+    assert!(
+        !usage_by_account.contains_key(&store_account_id),
+        "WS12-C should stop backfilling legacy auth-store usage into sqlite"
     );
 }
 
@@ -2202,15 +2305,15 @@ fn stored_test_chatgpt_account(
 
 fn stored_test_chatgpt_account_with_usage(
     chatgpt_account_id: &str,
-    primary_used_percent: f64,
-    weekly_used_percent: f64,
+    primary_remaining_percent: f64,
+    weekly_remaining_percent: f64,
     captured_at: DateTime<Utc>,
 ) -> StoredAccount {
     let mut account = stored_test_chatgpt_account(chatgpt_account_id, Some(captured_at));
     account.usage = Some(AccountUsageCache {
         last_rate_limits: Some(test_rate_limit_snapshot(
-            primary_used_percent,
-            weekly_used_percent,
+            primary_remaining_percent,
+            weekly_remaining_percent,
             captured_at,
         )),
         exhausted_until: None,
@@ -2220,20 +2323,20 @@ fn stored_test_chatgpt_account_with_usage(
 }
 
 fn test_rate_limit_snapshot(
-    primary_used_percent: f64,
-    weekly_used_percent: f64,
+    primary_remaining_percent: f64,
+    weekly_remaining_percent: f64,
     captured_at: DateTime<Utc>,
 ) -> RateLimitSnapshot {
     RateLimitSnapshot {
         limit_id: Some("codex".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: primary_used_percent,
+            remaining_percent: primary_remaining_percent,
             window_minutes: Some(300),
             resets_at: Some((captured_at + chrono::Duration::hours(5)).timestamp()),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: weekly_used_percent,
+            remaining_percent: weekly_remaining_percent,
             window_minutes: None,
             resets_at: Some((captured_at + chrono::Duration::days(7)).timestamp()),
         }),

@@ -2338,12 +2338,12 @@ async fn token_count_includes_rate_limits_snapshot() {
                 "limit_id": "codex",
                 "limit_name": null,
                 "primary": {
-                    "used_percent": 12.5,
+                    "remaining_percent": 87.5,
                     "window_minutes": 10,
                     "resets_at": 1704069000
                 },
                 "secondary": {
-                    "used_percent": 40.0,
+                    "remaining_percent": 60.0,
                     "window_minutes": 60,
                     "resets_at": 1704074400
                 },
@@ -2389,12 +2389,12 @@ async fn token_count_includes_rate_limits_snapshot() {
                 "limit_id": "codex",
                 "limit_name": null,
                 "primary": {
-                    "used_percent": 12.5,
+                    "remaining_percent": 87.5,
                     "window_minutes": 10,
                     "resets_at": 1704069000
                 },
                 "secondary": {
-                    "used_percent": 40.0,
+                    "remaining_percent": 60.0,
                     "window_minutes": 60,
                     "resets_at": 1704074400
                 },
@@ -2414,8 +2414,8 @@ async fn token_count_includes_rate_limits_snapshot() {
         final_snapshot
             .primary
             .as_ref()
-            .map(|window| window.used_percent),
-        Some(12.5)
+            .map(|window| window.remaining_percent),
+        Some(87.5)
     );
     assert_eq!(
         final_snapshot
@@ -2463,12 +2463,12 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
         "limit_id": "codex",
         "limit_name": null,
         "primary": {
-            "used_percent": 100.0,
+            "remaining_percent": 0.0,
             "window_minutes": 15,
             "resets_at": null
         },
         "secondary": {
-            "used_percent": 87.5,
+            "remaining_percent": 12.5,
             "window_minutes": 60,
             "resets_at": null
         },

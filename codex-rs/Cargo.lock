@@ -1884,6 +1884,7 @@ dependencies = [
  "codex-apply-patch",
  "codex-arg0",
  "codex-async-utils",
+ "codex-backend-client",
  "codex-code-mode",
  "codex-config",
  "codex-connectors",

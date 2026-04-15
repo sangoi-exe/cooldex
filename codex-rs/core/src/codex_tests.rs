@@ -1775,7 +1775,7 @@ async fn prompt_gc_hidden_usage_limit_updates_rate_limits_without_visible_events
         limit_id: Some("codex".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 87.5,
+            remaining_percent: 87.5,
             window_minutes: Some(15),
             resets_at: Some(1_700_000_123),
         }),
@@ -1909,7 +1909,7 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
             limit_id: Some("codex".to_string()),
             limit_name: None,
             primary: Some(RateLimitWindow {
-                used_percent: 100.0,
+                remaining_percent: 100.0,
                 window_minutes: Some(15),
                 resets_at: Some(1_700_000_123),
             }),
@@ -2024,7 +2024,7 @@ async fn visible_usage_limit_retry_marks_failing_account_exhausted_even_when_sta
             limit_id: Some("codex".to_string()),
             limit_name: None,
             primary: Some(RateLimitWindow {
-                used_percent: 100.0,
+                remaining_percent: 100.0,
                 window_minutes: Some(15),
                 resets_at: Some((Utc::now() + chrono::Duration::minutes(15)).timestamp()),
             }),
@@ -2175,7 +2175,7 @@ async fn visible_usage_limit_retry_allows_chatgpt_auth_tokens_mode_with_saved_fa
             limit_id: Some("codex".to_string()),
             limit_name: None,
             primary: Some(RateLimitWindow {
-                used_percent: 100.0,
+                remaining_percent: 100.0,
                 window_minutes: Some(15),
                 resets_at: Some(1_700_000_123),
             }),
@@ -2186,11 +2186,19 @@ async fn visible_usage_limit_retry_allows_chatgpt_auth_tokens_mode_with_saved_fa
         promo_message: None,
     };
 
-    let should_retry = maybe_auto_switch_account_on_usage_limit(
+    let refresh_state = AutoSwitchRefreshState {
+        freshly_selectable_store_account_ids: std::collections::HashSet::from([
+            acc_1_store_account_id.clone(),
+        ]),
+        freshly_unsupported_store_account_ids: std::collections::HashSet::new(),
+    };
+
+    let should_retry = maybe_auto_switch_account_on_usage_limit_with_refreshed_account_state(
         &session,
         &turn_context,
         &usage_limit,
         Some(acc_0_store_account_id.as_str()),
+        &refresh_state,
         UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch,
     )
     .await
@@ -4906,7 +4914,7 @@ async fn set_rate_limits_retains_previous_credits() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 10.0,
+            remaining_percent: 10.0,
             window_minutes: Some(15),
             resets_at: Some(1_700),
         }),
@@ -4924,12 +4932,12 @@ async fn set_rate_limits_retains_previous_credits() {
         limit_id: Some("codex_other".to_string()),
         limit_name: Some("codex_other".to_string()),
         primary: Some(RateLimitWindow {
-            used_percent: 40.0,
+            remaining_percent: 40.0,
             window_minutes: Some(30),
             resets_at: Some(1_800),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 5.0,
+            remaining_percent: 5.0,
             window_minutes: Some(60),
             resets_at: Some(1_900),
         }),
@@ -5012,12 +5020,12 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 15.0,
+            remaining_percent: 15.0,
             window_minutes: Some(20),
             resets_at: Some(1_600),
         }),
         secondary: Some(RateLimitWindow {
-            used_percent: 5.0,
+            remaining_percent: 5.0,
             window_minutes: Some(45),
             resets_at: Some(1_650),
         }),
@@ -5034,7 +5042,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         limit_id: None,
         limit_name: None,
         primary: Some(RateLimitWindow {
-            used_percent: 35.0,
+            remaining_percent: 35.0,
             window_minutes: Some(25),
             resets_at: Some(1_700),
         }),

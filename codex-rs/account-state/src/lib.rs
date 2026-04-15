@@ -23,7 +23,7 @@ use std::time::Duration;
 // work must keep this owner aligned with login/core/TUI account-state readers.
 
 pub const ACCOUNTS_DB_FILENAME: &str = "accounts";
-pub const ACCOUNTS_DB_VERSION: u32 = 1;
+pub const ACCOUNTS_DB_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountUsageState {
@@ -474,12 +474,12 @@ mod tests {
         DateTime::from_timestamp(1_763_233_549, 0).expect("fixed timestamp")
     }
 
-    fn test_snapshot(primary_used_percent: f64) -> RateLimitSnapshot {
+    fn test_snapshot(primary_remaining_percent: f64) -> RateLimitSnapshot {
         RateLimitSnapshot {
             limit_id: Some("limit-1".to_string()),
             limit_name: Some("primary".to_string()),
             primary: Some(RateLimitWindow {
-                used_percent: primary_used_percent,
+                remaining_percent: primary_remaining_percent,
                 window_minutes: Some(300),
                 resets_at: Some((Utc::now() + chrono::Duration::hours(1)).timestamp()),
             }),

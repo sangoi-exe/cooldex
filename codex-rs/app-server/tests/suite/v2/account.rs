@@ -69,6 +69,10 @@ fn create_config_toml(codex_home: &Path, params: CreateConfigTomlParams) -> std:
     let base_url = params
         .base_url
         .unwrap_or_else(|| "http://127.0.0.1:0/v1".to_string());
+    let chatgpt_base_url = base_url
+        .strip_suffix("/v1")
+        .map(|prefix| format!("{prefix}/backend-api"))
+        .unwrap_or_else(|| base_url.clone());
     let forced_line = if let Some(method) = params.forced_method {
         format!("forced_login_method = \"{method}\"\n")
     } else {
@@ -91,11 +95,13 @@ approval_policy = "never"
 sandbox_mode = "danger-full-access"
 {forced_line}
 {forced_workspace_line}
+chatgpt_base_url = "{chatgpt_base_url}"
 
 model_provider = "mock_provider"
 
 [features]
 shell_snapshot = false
+plugins = false
 
 [model_providers.mock_provider]
 name = "Mock provider for test"
@@ -107,6 +113,26 @@ stream_max_retries = 0
 "#
     );
     std::fs::write(config_toml, contents)
+}
+
+async fn mount_background_backend_defaults(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/config/requirements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "contents": null,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/plugins/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/plugins/featured"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(server)
+        .await;
 }
 
 async fn mock_device_code_usercode(server: &MockServer, interval_seconds: u64) {
@@ -223,6 +249,7 @@ async fn logout_account_removes_auth_and_notifies() -> Result<()> {
 async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -313,6 +340,7 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
 async fn set_auth_token_updates_account_and_notifies_for_team_plan() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -403,6 +431,7 @@ async fn set_auth_token_updates_account_and_notifies_for_team_plan() -> Result<(
 async fn set_auth_token_rejects_unknown_plan() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -471,6 +500,7 @@ async fn set_auth_token_rejects_unknown_plan() -> Result<()> {
 async fn set_auth_token_rejects_workspace_claim_mismatch() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -519,6 +549,7 @@ async fn set_auth_token_rejects_workspace_claim_mismatch() -> Result<()> {
 async fn set_auth_token_rejects_unsupported_plan() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -606,6 +637,7 @@ async fn set_auth_token_rejects_unsupported_plan() -> Result<()> {
 async fn set_auth_token_rejects_malformed_token() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -746,6 +778,7 @@ async fn account_read_refresh_token_is_noop_in_external_mode() -> Result<()> {
 async fn account_read_refresh_token_failure_returns_error_in_managed_mode() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     Mock::given(method("POST"))
         .and(path("/oauth/token"))
         .respond_with(ResponseTemplate::new(500).set_body_json(json!({
@@ -841,6 +874,7 @@ async fn respond_to_refresh_request(
 async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -961,6 +995,7 @@ async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
 async fn external_auth_refresh_error_fails_turn() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -1076,6 +1111,7 @@ async fn external_auth_refresh_error_fails_turn() -> Result<()> {
 async fn external_auth_refresh_mismatched_workspace_fails_turn() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -1197,6 +1233,7 @@ async fn external_auth_refresh_mismatched_workspace_fails_turn() -> Result<()> {
 async fn external_auth_refresh_rejects_workspace_claim_mismatch() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -1315,6 +1352,7 @@ async fn external_auth_refresh_rejects_workspace_claim_mismatch() -> Result<()> 
 async fn external_auth_refresh_rejects_plan_claim_mismatch() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -1434,6 +1472,7 @@ async fn external_auth_refresh_rejects_plan_claim_mismatch() -> Result<()> {
 async fn external_auth_refresh_invalid_access_token_fails_turn() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -1548,6 +1587,7 @@ async fn external_auth_refresh_invalid_access_token_fails_turn() -> Result<()> {
 async fn external_auth_refresh_rejects_unsupported_plan() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -1772,6 +1812,7 @@ async fn login_account_chatgpt_rejected_when_forced_api() -> Result<()> {
 async fn login_account_chatgpt_device_code_returns_error_when_disabled() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -1828,6 +1869,7 @@ async fn login_account_chatgpt_device_code_returns_error_when_disabled() -> Resu
 async fn login_account_chatgpt_device_code_succeeds_and_notifies() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -1912,6 +1954,7 @@ async fn login_account_chatgpt_device_code_succeeds_and_notifies() -> Result<()>
 async fn login_account_chatgpt_device_code_failure_notifies_without_account_update() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
@@ -1987,6 +2030,7 @@ async fn login_account_chatgpt_device_code_failure_notifies_without_account_upda
 async fn login_account_chatgpt_device_code_can_be_cancelled() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;
+    mount_background_backend_defaults(&mock_server).await;
     create_config_toml(
         codex_home.path(),
         CreateConfigTomlParams {
