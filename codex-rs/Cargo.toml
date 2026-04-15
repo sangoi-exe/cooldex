@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "account-state",
     "analytics",
     "backend-client",
     "ansi-escape",
@@ -101,6 +102,9 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 # Internal
+# Merge-safety anchor: WS12 account-state workspace wiring must stay aligned
+# with login/core account usage-truth ownership and the legacy auth-store cutover.
+codex-account-state = { path = "account-state" }
 app_test_support = { path = "app-server/tests/common" }
 codex-analytics = { path = "analytics" }
 codex-ansi-escape = { path = "ansi-escape" }
@@ -277,6 +281,7 @@ regex-lite = "0.1.8"
 reqwest = "0.12"
 rmcp = { version = "0.15.0", default-features = false }
 runfiles = { git = "https://github.com/dzbarsky/rules_rust", rev = "b56cbaa8465e74127f1ea216f813cd377295ad81" }
+rusqlite = "0.32.1"
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",

@@ -615,6 +615,12 @@ impl AuthManagerConfig for Config {
         self.codex_home.clone()
     }
 
+    // Merge-safety anchor: WS12 AuthManager construction must reuse the resolved
+    // sqlite_home so account usage truth does not fall back to auth-store cache fields.
+    fn sqlite_home(&self) -> PathBuf {
+        self.sqlite_home.clone()
+    }
+
     fn cli_auth_credentials_store_mode(&self) -> AuthCredentialsStoreMode {
         self.cli_auth_credentials_store_mode
     }

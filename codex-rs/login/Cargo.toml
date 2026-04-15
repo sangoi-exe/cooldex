@@ -11,6 +11,7 @@ workspace = true
 async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+codex-account-state = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-api = { workspace = true }
 codex-client = { workspace = true }
@@ -28,6 +29,9 @@ reqwest = { workspace = true, features = ["json", "blocking"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# Merge-safety anchor: codex-login now reads/writes saved-account usage truth
+# through the WS12 SQLite account-state owner instead of persisting live usage
+# in auth.json.
 # Merge-safety anchor: codex-login auth storage uses tempfile-backed atomic writes
 # and runtime UUID account ids after the auth split from codex-core.
 tempfile = { workspace = true }
@@ -52,5 +56,6 @@ core_test_support = { workspace = true }
 keyring = { workspace = true }
 pretty_assertions = { workspace = true }
 regex-lite = { workspace = true }
+rusqlite = { workspace = true }
 serial_test = { workspace = true }
 wiremock = { workspace = true }

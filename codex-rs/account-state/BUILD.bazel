@@ -1,0 +1,8 @@
+load("//:defs.bzl", "codex_rust_crate")
+
+# Merge-safety anchor: WS12 account-state crate is the SQLite owner for saved-account
+# usage truth; keep this follower aligned with login/core account-state readers.
+codex_rust_crate(
+    name = "account-state",
+    crate_name = "codex_account_state",
+)

@@ -3,6 +3,8 @@ use crate::auth::storage::FileAuthStorage;
 use crate::auth::storage::get_auth_file;
 use crate::token_data::IdTokenInfo;
 use async_trait::async_trait;
+use codex_account_state::AccountStateStore;
+use codex_account_state::accounts_db_path;
 use codex_app_server_protocol::AuthMode;
 use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::auth::KnownPlan as InternalKnownPlan;
@@ -12,6 +14,7 @@ use pretty_assertions::assert_eq;
 use base64::Engine;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ModelProviderAuthInfo;
+use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashSet;
@@ -823,6 +826,263 @@ fn reconcile_account_rate_limit_refresh_outcomes_clears_stale_usage_for_attempte
         .expect("refreshed account should exist");
     assert_eq!(refreshed_account.last_rate_limits, None);
     assert_eq!(refreshed_account.exhausted_until, None);
+}
+
+#[test]
+fn auth_manager_migrates_legacy_usage_cache_to_sqlite_and_strips_auth_store() {
+    let now = Utc::now();
+    let codex_home = tempdir().unwrap();
+    let store_account_id =
+        test_store_account_id("org-legacy-usage").expect("legacy-usage store account id");
+    let snapshot = test_rate_limit_snapshot(42.0, 17.0, now);
+    let exhausted_until = Some(now + chrono::Duration::minutes(20));
+    let account = StoredAccount {
+        usage: Some(AccountUsageCache {
+            last_rate_limits: Some(snapshot.clone()),
+            exhausted_until,
+            last_seen_at: Some(now),
+        }),
+        ..stored_test_chatgpt_account("org-legacy-usage", Some(now))
+    };
+    let store = AuthStore {
+        active_account_id: Some(store_account_id.clone()),
+        accounts: vec![account],
+        ..AuthStore::default()
+    };
+    save_auth(codex_home.path(), &store, AuthCredentialsStoreMode::File).expect("save auth store");
+
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let account = manager
+        .list_accounts()
+        .into_iter()
+        .find(|account| account.id == store_account_id)
+        .expect("account summary should exist");
+    assert_eq!(account.last_rate_limits, Some(snapshot.clone()));
+    assert_eq!(
+        account
+            .exhausted_until
+            .map(|exhausted_until| exhausted_until.timestamp()),
+        exhausted_until.map(|exhausted_until| exhausted_until.timestamp())
+    );
+
+    let stripped_store = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("load stripped auth store")
+        .expect("auth store should exist");
+    assert_eq!(stripped_store.accounts[0].usage, None);
+
+    let account_state_store =
+        AccountStateStore::open(codex_home.path().to_path_buf()).expect("open account state store");
+    let usage_by_account = account_state_store
+        .load_usage_states_for_accounts(std::slice::from_ref(&store_account_id))
+        .expect("load migrated usage states");
+    let migrated_usage = usage_by_account
+        .get(&store_account_id)
+        .expect("migrated usage should exist");
+    assert_eq!(migrated_usage.last_rate_limits, Some(snapshot));
+    assert_eq!(
+        migrated_usage
+            .exhausted_until
+            .map(|exhausted_until| exhausted_until.timestamp()),
+        exhausted_until.map(|exhausted_until| exhausted_until.timestamp())
+    );
+    assert_eq!(
+        migrated_usage
+            .last_seen_at
+            .map(|last_seen_at| last_seen_at.timestamp()),
+        Some(now.timestamp())
+    );
+}
+
+#[test]
+fn list_accounts_reads_latest_usage_truth_from_sqlite_across_managers() {
+    let now = Utc::now();
+    let codex_home = tempdir().unwrap();
+    let active_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-a", "org-b"], 0);
+    let snapshot = test_rate_limit_snapshot(30.0, 15.0, now);
+
+    let writer = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let reader = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    writer
+        .update_rate_limits_for_account(&active_store_account_id, snapshot.clone())
+        .expect("persist usage truth");
+
+    let active_account = reader
+        .list_accounts()
+        .into_iter()
+        .find(|account| account.id == active_store_account_id)
+        .expect("active account summary should exist");
+    assert_eq!(active_account.last_rate_limits, Some(snapshot));
+
+    let stripped_store = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("load stripped auth store")
+        .expect("auth store should exist");
+    assert_eq!(
+        stripped_store
+            .accounts
+            .into_iter()
+            .find(|account| account.id == active_store_account_id)
+            .expect("stored account should exist")
+            .usage,
+        None
+    );
+}
+
+#[test]
+fn auth_manager_preserves_legacy_usage_when_sqlite_sync_fails() {
+    let now = Utc::now();
+    let codex_home = tempdir().unwrap();
+    let store_account_id =
+        test_store_account_id("org-legacy-failure").expect("legacy-failure store account id");
+    let snapshot = test_rate_limit_snapshot(42.0, 17.0, now);
+    let exhausted_until = Some(now + chrono::Duration::minutes(20));
+    let account = StoredAccount {
+        usage: Some(AccountUsageCache {
+            last_rate_limits: Some(snapshot.clone()),
+            exhausted_until,
+            last_seen_at: Some(now),
+        }),
+        ..stored_test_chatgpt_account("org-legacy-failure", Some(now))
+    };
+    let store = AuthStore {
+        active_account_id: Some(store_account_id.clone()),
+        accounts: vec![account],
+        ..AuthStore::default()
+    };
+    save_auth(codex_home.path(), &store, AuthCredentialsStoreMode::File).expect("save auth store");
+
+    let sqlite_path = accounts_db_path(codex_home.path());
+    let connection = Connection::open(sqlite_path).expect("open raw sqlite db");
+    connection
+        .execute_batch(
+            r#"
+CREATE TABLE IF NOT EXISTS account_usage_state (
+    account_id TEXT PRIMARY KEY,
+    rate_limits_json TEXT,
+    exhausted_until INTEGER,
+    last_seen_at INTEGER,
+    updated_at INTEGER NOT NULL
+);
+            "#,
+        )
+        .expect("create usage state table");
+    connection
+        .execute(
+            "INSERT INTO account_usage_state (account_id, rate_limits_json, exhausted_until, last_seen_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                store_account_id.as_str(),
+                "{not-valid-json",
+                exhausted_until.map(|value| value.timestamp()),
+                Some(now.timestamp()),
+                now.timestamp(),
+            ),
+        )
+        .expect("seed corrupted usage state row");
+
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    let account = manager
+        .list_accounts()
+        .into_iter()
+        .find(|account| account.id == store_account_id)
+        .expect("account summary should exist");
+    assert_eq!(account.last_rate_limits, Some(snapshot));
+
+    let persisted_store = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("load auth store after failed sync")
+        .expect("auth store should exist");
+    assert_eq!(
+        persisted_store.accounts[0]
+            .usage
+            .as_ref()
+            .expect("legacy usage should remain persisted on sync failure")
+            .last_rate_limits,
+        store.accounts[0]
+            .usage
+            .as_ref()
+            .expect("original legacy usage should exist")
+            .last_rate_limits
+    );
+}
+
+#[test]
+fn auth_manager_falls_back_to_legacy_usage_when_sqlite_home_is_invalid() {
+    let now = Utc::now();
+    let codex_home = tempdir().unwrap();
+    let sqlite_home_parent = tempdir().unwrap();
+    let sqlite_home = sqlite_home_parent.path().join("sqlite-home-file");
+    std::fs::write(sqlite_home.as_path(), "not a directory").expect("seed invalid sqlite home");
+    let store_account_id =
+        test_store_account_id("org-invalid-sqlite-home").expect("invalid sqlite home account id");
+    let snapshot = test_rate_limit_snapshot(22.0, 11.0, now);
+    let exhausted_until = Some(now + chrono::Duration::minutes(30));
+    let account = StoredAccount {
+        usage: Some(AccountUsageCache {
+            last_rate_limits: Some(snapshot.clone()),
+            exhausted_until,
+            last_seen_at: Some(now),
+        }),
+        ..stored_test_chatgpt_account("org-invalid-sqlite-home", Some(now))
+    };
+    let store = AuthStore {
+        active_account_id: Some(store_account_id.clone()),
+        accounts: vec![account],
+        ..AuthStore::default()
+    };
+    save_auth(codex_home.path(), &store, AuthCredentialsStoreMode::File).expect("save auth store");
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home,
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    let account = manager
+        .list_accounts()
+        .into_iter()
+        .find(|account| account.id == store_account_id)
+        .expect("account summary should exist");
+    assert_eq!(account.last_rate_limits, Some(snapshot.clone()));
+    assert_eq!(
+        account
+            .exhausted_until
+            .map(|exhausted_until| exhausted_until.timestamp()),
+        exhausted_until.map(|exhausted_until| exhausted_until.timestamp())
+    );
+
+    let persisted_store = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("load auth store after sqlite fallback")
+        .expect("auth store should exist");
+    assert_eq!(
+        persisted_store
+            .accounts
+            .into_iter()
+            .find(|account| account.id == store_account_id)
+            .expect("stored account should exist")
+            .usage
+            .as_ref()
+            .expect("legacy usage should stay persisted when sqlite is unavailable")
+            .last_rate_limits,
+        Some(snapshot)
+    );
 }
 
 #[test]

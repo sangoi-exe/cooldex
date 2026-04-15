@@ -6,6 +6,8 @@ use serde::Deserialize;
 use serde::Serialize;
 #[cfg(test)]
 use serial_test::serial;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::fmt::Debug;
 use std::path::Path;
@@ -15,6 +17,8 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 use tokio::sync::Mutex as AsyncMutex;
 
+use codex_account_state::AccountStateStore;
+use codex_account_state::AccountUsageState;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_protocol::config_types::ForcedLoginMethod;
@@ -303,6 +307,138 @@ fn apply_rate_limit_refresh_outcome(
         }
     }
     usage.last_seen_at = Some(now);
+}
+
+fn account_usage_state_from_cache(cache: &AccountUsageCache) -> AccountUsageState {
+    AccountUsageState {
+        last_rate_limits: cache.last_rate_limits.clone(),
+        exhausted_until: cache.exhausted_until,
+        last_seen_at: cache.last_seen_at,
+    }
+}
+
+fn account_usage_cache_from_state(state: &AccountUsageState) -> AccountUsageCache {
+    AccountUsageCache {
+        last_rate_limits: state.last_rate_limits.clone(),
+        exhausted_until: state.exhausted_until,
+        last_seen_at: state.last_seen_at,
+    }
+}
+
+fn legacy_usage_states_from_store(store: &AuthStore) -> HashMap<String, AccountUsageState> {
+    store
+        .accounts
+        .iter()
+        .filter_map(|account| {
+            account
+                .usage
+                .as_ref()
+                .map(|usage| (account.id.clone(), account_usage_state_from_cache(usage)))
+        })
+        .collect()
+}
+
+fn strip_usage_from_store(store: &mut AuthStore) {
+    for account in &mut store.accounts {
+        account.usage = None;
+    }
+}
+
+fn persist_stripped_auth_store(
+    storage: &dyn AuthStorageBackend,
+    store: &AuthStore,
+) -> std::io::Result<()> {
+    let mut stripped_store = store.clone();
+    strip_usage_from_store(&mut stripped_store);
+    storage.save(&stripped_store)
+}
+
+fn persist_auth_store(
+    storage: &dyn AuthStorageBackend,
+    store: &AuthStore,
+    strip_usage: bool,
+) -> std::io::Result<()> {
+    if strip_usage {
+        return persist_stripped_auth_store(storage, store);
+    }
+
+    storage.save(store)
+}
+
+fn persist_usage_state_from_store(
+    account_state_store: &AccountStateStore,
+    store: &AuthStore,
+) -> std::io::Result<()> {
+    let usage_by_account = legacy_usage_states_from_store(store);
+    account_state_store
+        .replace_usage_states(&usage_by_account)
+        .map_err(std::io::Error::other)
+}
+
+fn hydrate_store_usage_from_sqlite(
+    account_state_store: &AccountStateStore,
+    store: &mut AuthStore,
+) -> std::io::Result<()> {
+    let account_ids = store
+        .accounts
+        .iter()
+        .map(|account| account.id.clone())
+        .collect::<Vec<_>>();
+    let usage_by_account = account_state_store
+        .load_usage_states_for_accounts(account_ids.as_slice())
+        .map_err(std::io::Error::other)?;
+    for account in &mut store.accounts {
+        account.usage = usage_by_account
+            .get(&account.id)
+            .map(account_usage_cache_from_state);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UsageStateSyncOutcome {
+    strip_persisted_auth_store: bool,
+}
+
+fn synchronize_store_usage_from_legacy_and_sqlite(
+    account_state_store: &AccountStateStore,
+    store: &mut AuthStore,
+) -> std::io::Result<UsageStateSyncOutcome> {
+    let legacy_usage_by_account = legacy_usage_states_from_store(store);
+    let strip_persisted_auth_store = !legacy_usage_by_account.is_empty();
+    if !legacy_usage_by_account.is_empty() {
+        let legacy_account_ids = legacy_usage_by_account.keys().cloned().collect::<Vec<_>>();
+        let sqlite_usage_by_account = account_state_store
+            .load_usage_states_for_accounts(legacy_account_ids.as_slice())
+            .map_err(std::io::Error::other)?;
+        let missing_legacy_usage = legacy_usage_by_account
+            .into_iter()
+            .filter(|(account_id, _)| !sqlite_usage_by_account.contains_key(account_id))
+            .collect::<HashMap<_, _>>();
+        if !missing_legacy_usage.is_empty() {
+            account_state_store
+                .upsert_usage_states(&missing_legacy_usage)
+                .map_err(std::io::Error::other)?;
+        }
+    }
+    hydrate_store_usage_from_sqlite(account_state_store, store)?;
+    Ok(UsageStateSyncOutcome {
+        strip_persisted_auth_store,
+    })
+}
+
+fn open_account_state_store(sqlite_home: &Path) -> Option<AccountStateStore> {
+    match AccountStateStore::open(sqlite_home.to_path_buf()) {
+        Ok(account_state_store) => Some(account_state_store),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                sqlite_home = %sqlite_home.display(),
+                "failed to open account state store; preserving legacy auth-store usage truth"
+            );
+            None
+        }
+    }
 }
 
 impl From<RefreshTokenError> for std::io::Error {
@@ -1087,9 +1223,6 @@ fn validate_external_access_token_claims(
     Ok(token_info)
 }
 
-use std::collections::HashMap;
-use std::collections::HashSet;
-
 impl AuthDotJson {
     fn from_external_tokens(
         external: &ExternalAuthTokens,
@@ -1393,6 +1526,7 @@ impl UnauthorizedRecovery {
 pub struct AuthManager {
     codex_home: PathBuf,
     storage: Arc<dyn AuthStorageBackend>,
+    account_state_store: Option<AccountStateStore>,
     inner: RwLock<CachedAuth>,
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
@@ -1413,6 +1547,9 @@ pub trait AuthManagerConfig {
     /// Returns the Codex home directory used for auth storage.
     fn codex_home(&self) -> PathBuf;
 
+    /// Returns the SQLite home directory used for shared runtime account state.
+    fn sqlite_home(&self) -> PathBuf;
+
     /// Returns the CLI auth credential storage mode for auth loading.
     fn cli_auth_credentials_store_mode(&self) -> AuthCredentialsStoreMode;
 
@@ -1424,6 +1561,7 @@ impl Debug for AuthManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthManager")
             .field("codex_home", &self.codex_home)
+            .field("account_state_store", &self.account_state_store)
             .field("inner", &self.inner)
             .field("enable_codex_api_key_env", &self.enable_codex_api_key_env)
             .field(
@@ -1441,28 +1579,62 @@ impl Debug for AuthManager {
 
 impl AuthManager {
     /// Create a new manager loading the initial auth using the provided
-    /// preferred auth method. Errors loading auth are swallowed; `auth()` will
-    /// simply return `None` in that case so callers can treat it as an
-    /// unauthenticated state.
+    /// preferred auth method. Errors loading auth or opening the WS12
+    /// account-state store are swallowed; `auth()` will simply return `None`
+    /// in that case so callers can treat it as an unauthenticated state, and
+    /// saved-account usage truth falls back to the legacy auth-store cache
+    /// until SQLite ownership becomes available again.
     pub fn new(
         codex_home: PathBuf,
         enable_codex_api_key_env: bool,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
     ) -> Self {
+        Self::new_with_sqlite_home(
+            codex_home.clone(),
+            codex_home,
+            enable_codex_api_key_env,
+            auth_credentials_store_mode,
+        )
+    }
+
+    pub fn new_with_sqlite_home(
+        codex_home: PathBuf,
+        sqlite_home: PathBuf,
+        enable_codex_api_key_env: bool,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> Self {
         let storage = create_auth_storage(codex_home.clone(), auth_credentials_store_mode);
+        let account_state_store = open_account_state_store(sqlite_home.as_path());
         let mut store = storage.load().ok().flatten().unwrap_or_default();
         let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
+        let mut sync_outcome = UsageStateSyncOutcome::default();
+        if let Some(account_state_store) = account_state_store.as_ref() {
+            match synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store) {
+                Ok(outcome) => {
+                    sync_outcome = outcome;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to synchronize saved-account usage truth during auth manager initialization"
+                    );
+                }
+            }
+        }
         if !removed_account_ids.is_empty() {
             tracing::info!(
                 removed_account_ids = ?removed_account_ids,
                 "removed accounts with unsupported ChatGPT plans during auth manager initialization"
             );
-            if let Err(error) = save_auth(&codex_home, &store, auth_credentials_store_mode) {
-                tracing::warn!(
-                    error = %error,
-                    "failed to persist supported ChatGPT plan policy during initialization"
-                );
-            }
+        }
+        if (sync_outcome.strip_persisted_auth_store || !removed_account_ids.is_empty())
+            && let Err(error) =
+                persist_auth_store(&*storage, &store, sync_outcome.strip_persisted_auth_store)
+        {
+            tracing::warn!(
+                error = %error,
+                "failed to persist auth store during auth manager initialization"
+            );
         }
         let auth = load_auth(
             &codex_home,
@@ -1474,6 +1646,7 @@ impl AuthManager {
         Self {
             codex_home,
             storage,
+            account_state_store,
             inner: RwLock::new(CachedAuth {
                 store,
                 auth,
@@ -1494,6 +1667,7 @@ impl AuthManager {
         let temp_dir = tempfile::tempdir().unwrap_or_else(|err| panic!("temp codex home: {err}"));
         let codex_home = temp_dir.path().to_path_buf();
         let storage = create_auth_storage(codex_home.clone(), AuthCredentialsStoreMode::File);
+        let account_state_store = open_account_state_store(codex_home.as_path());
         let store = store_from_auth_for_testing(&auth);
         let cached = CachedAuth {
             store,
@@ -1504,6 +1678,7 @@ impl AuthManager {
         Arc::new(Self {
             codex_home,
             storage,
+            account_state_store,
             inner: RwLock::new(cached),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
@@ -1518,6 +1693,7 @@ impl AuthManager {
     /// Create an AuthManager with a specific CodexAuth and codex home, for testing only.
     pub fn from_auth_for_testing_with_home(auth: CodexAuth, codex_home: PathBuf) -> Arc<Self> {
         let storage = create_auth_storage(codex_home.clone(), AuthCredentialsStoreMode::File);
+        let account_state_store = open_account_state_store(codex_home.as_path());
         let store = store_from_auth_for_testing(&auth);
         let cached = CachedAuth {
             store,
@@ -1527,6 +1703,7 @@ impl AuthManager {
         Arc::new(Self {
             codex_home,
             storage,
+            account_state_store,
             inner: RwLock::new(cached),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
@@ -1544,6 +1721,7 @@ impl AuthManager {
         Arc::new(Self {
             codex_home,
             storage,
+            account_state_store: None,
             inner: RwLock::new(CachedAuth {
                 store: AuthStore::default(),
                 auth: None,
@@ -1672,13 +1850,23 @@ impl AuthManager {
             return Vec::new();
         };
 
-        guard
-            .store
+        let mut store = guard.store.clone();
+        drop(guard);
+
+        if let Some(account_state_store) = self.account_state_store.as_ref()
+            && let Err(error) = hydrate_store_usage_from_sqlite(account_state_store, &mut store)
+        {
+            tracing::warn!(
+                error = %error,
+                "failed to refresh saved-account usage truth before listing accounts"
+            );
+        }
+
+        let active_account_id = store.active_account_id.clone();
+        store
             .accounts
             .iter()
-            .map(|account| {
-                AccountSummary::from_stored(account, guard.store.active_account_id.as_deref())
-            })
+            .map(|account| AccountSummary::from_stored(account, active_account_id.as_deref()))
             .collect()
     }
 
@@ -2195,7 +2383,20 @@ impl AuthManager {
     pub fn reload_strict(&self) -> std::io::Result<bool> {
         tracing::info!("Reloading auth (strict)");
         let _lock = storage::lock_auth_store(&self.codex_home)?;
-        let store = self.storage.load()?.unwrap_or_default();
+        let mut store = self.storage.load()?.unwrap_or_default();
+        let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
+        let mut sync_outcome = UsageStateSyncOutcome::default();
+        if let Some(account_state_store) = self.account_state_store.as_ref() {
+            sync_outcome =
+                synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store)?;
+        }
+        if sync_outcome.strip_persisted_auth_store || !removed_account_ids.is_empty() {
+            persist_auth_store(
+                &*self.storage,
+                &store,
+                sync_outcome.strip_persisted_auth_store,
+            )?;
+        }
         Ok(self.set_cached(store))
     }
 
@@ -2369,19 +2570,40 @@ impl AuthManager {
         match self.storage.load() {
             Ok(Some(mut store)) => {
                 let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
+                let mut sync_outcome = UsageStateSyncOutcome::default();
+                if let Some(account_state_store) = self.account_state_store.as_ref() {
+                    match synchronize_store_usage_from_legacy_and_sqlite(
+                        account_state_store,
+                        &mut store,
+                    ) {
+                        Ok(outcome) => {
+                            sync_outcome = outcome;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "failed to synchronize saved-account usage truth while loading auth store"
+                            );
+                        }
+                    }
+                }
                 if !removed_account_ids.is_empty() {
                     tracing::info!(
                         removed_account_ids = ?removed_account_ids,
                         "removed accounts with unsupported ChatGPT plans while loading auth store"
                     );
-                    if let Err(error) =
-                        save_auth(&self.codex_home, &store, self.auth_credentials_store_mode)
-                    {
-                        tracing::warn!(
-                            error = %error,
-                            "failed to persist supported ChatGPT plan policy while loading store"
-                        );
-                    }
+                }
+                if (sync_outcome.strip_persisted_auth_store || !removed_account_ids.is_empty())
+                    && let Err(error) = persist_auth_store(
+                        &*self.storage,
+                        &store,
+                        sync_outcome.strip_persisted_auth_store,
+                    )
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to persist auth store while loading store"
+                    );
                 }
                 store
             }
@@ -2468,6 +2690,9 @@ impl AuthManager {
                 "removed accounts with unsupported ChatGPT plans before auth store mutation"
             );
         }
+        if let Some(account_state_store) = self.account_state_store.as_ref() {
+            synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store)?;
+        }
 
         let out = mutator(&mut store)?;
         let removed_after_mutation = enforce_supported_chatgpt_auth_accounts(&mut store);
@@ -2478,7 +2703,12 @@ impl AuthManager {
             );
         }
         store.validate()?;
-        self.storage.save(&store)?;
+        if let Some(account_state_store) = self.account_state_store.as_ref() {
+            persist_usage_state_from_store(account_state_store, &store)?;
+            persist_stripped_auth_store(&*self.storage, &store)?;
+        } else {
+            self.storage.save(&store)?;
+        }
         self.set_cached(store);
         Ok(out)
     }
@@ -2528,8 +2758,23 @@ impl AuthManager {
         enable_codex_api_key_env: bool,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
     ) -> Arc<Self> {
-        Arc::new(Self::new(
+        Self::shared_with_sqlite_home(
+            codex_home.clone(),
             codex_home,
+            enable_codex_api_key_env,
+            auth_credentials_store_mode,
+        )
+    }
+
+    pub fn shared_with_sqlite_home(
+        codex_home: PathBuf,
+        sqlite_home: PathBuf,
+        enable_codex_api_key_env: bool,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> Arc<Self> {
+        Arc::new(Self::new_with_sqlite_home(
+            codex_home,
+            sqlite_home,
             enable_codex_api_key_env,
             auth_credentials_store_mode,
         ))
@@ -2540,8 +2785,9 @@ impl AuthManager {
         config: &impl AuthManagerConfig,
         enable_codex_api_key_env: bool,
     ) -> Arc<Self> {
-        let auth_manager = Self::shared(
+        let auth_manager = Self::shared_with_sqlite_home(
             config.codex_home(),
+            config.sqlite_home(),
             enable_codex_api_key_env,
             config.cli_auth_credentials_store_mode(),
         );
