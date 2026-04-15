@@ -6,6 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
@@ -113,6 +114,10 @@ pub(crate) type OnCancelCallback = Option<Box<dyn Fn(&AppEventSender) + Send + S
 pub(crate) struct SelectionItem {
     pub name: String,
     pub name_prefix_spans: Vec<Span<'static>>,
+    // Merge-safety anchor: account-popup availability uses only this label
+    // foreground seam; keep description/tag/disabled styling on the generic
+    // renderer path so `/accounts` and `/logout` do not fork popup row owners.
+    pub name_foreground: Option<Color>,
     pub display_shortcut: Option<KeyBinding>,
     pub description: Option<String>,
     pub selected_description: Option<String>,
@@ -394,6 +399,7 @@ impl ListSelectionView {
                     GenericDisplayRow {
                         name: name_with_marker,
                         name_prefix_spans,
+                        name_foreground: item.name_foreground,
                         display_shortcut: item.display_shortcut,
                         match_indices: None,
                         description,

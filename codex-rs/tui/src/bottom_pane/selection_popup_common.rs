@@ -30,6 +30,7 @@ use super::scroll_state::ScrollState;
 pub(crate) struct GenericDisplayRow {
     pub name: String,
     pub name_prefix_spans: Vec<Span<'static>>,
+    pub name_foreground: Option<Color>,
     pub display_shortcut: Option<KeyBinding>,
     pub match_indices: Option<Vec<usize>>, // indices to bold (char positions)
     pub description: Option<String>,       // optional grey text after the name
@@ -242,7 +243,11 @@ fn wrap_two_column_row(row: &GenericDisplayRow, desc_col: usize, width: u16) -> 
     for idx in 0..rows {
         let mut spans: Vec<Span<'static>> = Vec::new();
         if let Some(name) = name_lines.get(idx) {
-            spans.push(name.to_string().into());
+            let mut span = Span::from(name.to_string());
+            if let Some(color) = row.name_foreground {
+                span.style = span.style.fg(color);
+            }
+            spans.push(span);
         }
 
         if let Some(desc) = desc_lines.get(idx) {
@@ -265,6 +270,17 @@ fn wrap_two_column_row(row: &GenericDisplayRow, desc_col: usize, width: u16) -> 
     }
 
     out
+}
+
+fn styled_name_span(ch: char, name_foreground: Option<Color>, bold: bool) -> Span<'static> {
+    let mut span = Span::from(ch.to_string());
+    if let Some(color) = name_foreground {
+        span.style = span.style.fg(color);
+    }
+    if bold {
+        span.style = span.style.bold();
+    }
+    span
 }
 
 fn wrap_standard_row(row: &GenericDisplayRow, desc_col: usize, width: u16) -> Vec<Line<'static>> {
@@ -293,11 +309,18 @@ fn wrap_row_lines(row: &GenericDisplayRow, desc_col: usize, width: u16) -> Vec<L
     wrap_standard_row(row, desc_col, width)
 }
 
+// Merge-safety anchor: account-popup availability highlighting must preserve
+// explicit label foreground on wrapped selection rows while keeping legacy cyan
+// selection for unstyled labels and descriptions.
 fn apply_row_state_style(lines: &mut [Line<'static>], selected: bool, is_disabled: bool) {
     if selected {
         for line in lines.iter_mut() {
             line.spans.iter_mut().for_each(|span| {
-                span.style = Style::default().fg(Color::Cyan).bold();
+                if span.style.fg.is_some() {
+                    span.style = span.style.bold();
+                } else {
+                    span.style = Style::default().fg(Color::Cyan).bold();
+                }
             });
         }
     }
@@ -445,9 +468,17 @@ fn build_full_line(row: &GenericDisplayRow, desc_col: usize) -> Line<'static> {
 
             if idx_iter.peek().is_some_and(|next| **next == char_idx) {
                 idx_iter.next();
-                name_spans.push(ch.to_string().bold());
+                name_spans.push(styled_name_span(
+                    ch,
+                    row.name_foreground,
+                    /*bold*/ true,
+                ));
             } else {
-                name_spans.push(ch.to_string().into());
+                name_spans.push(styled_name_span(
+                    ch,
+                    row.name_foreground,
+                    /*bold*/ false,
+                ));
             }
         }
     } else {
@@ -459,14 +490,22 @@ fn build_full_line(row: &GenericDisplayRow, desc_col: usize) -> Line<'static> {
                 break;
             }
             used_width = next_width;
-            name_spans.push(ch.to_string().into());
+            name_spans.push(styled_name_span(
+                ch,
+                row.name_foreground,
+                /*bold*/ false,
+            ));
         }
     }
 
     if truncated {
         // If there is at least one cell available, add an ellipsis.
         // When name_limit is 0, we still show an ellipsis to indicate truncation.
-        name_spans.push("…".into());
+        let mut ellipsis = Span::from("…");
+        if let Some(color) = row.name_foreground {
+            ellipsis.style = ellipsis.style.fg(color);
+        }
+        name_spans.push(ellipsis);
     }
 
     if row.disabled_reason.is_some() {
@@ -865,5 +904,45 @@ mod tests {
 
         let two_col = wrap_two_column_row(&row, /*desc_col*/ 0, /*width*/ 1);
         assert_eq!(two_col.len(), 0);
+    }
+
+    #[test]
+    fn selected_wrapped_row_preserves_explicit_name_foreground() {
+        let row = GenericDisplayRow {
+            name: "QAccount".to_string(),
+            name_foreground: Some(Color::Green),
+            description: Some("status: available".to_string()),
+            ..Default::default()
+        };
+        let area = Rect::new(0, 0, 48, 3);
+        let mut buf = Buffer::empty(area);
+        let state = ScrollState {
+            selected_idx: Some(0),
+            ..Default::default()
+        };
+
+        render_rows_with_col_width_mode(
+            area,
+            &mut buf,
+            &[row],
+            &state,
+            /*max_results*/ 1,
+            "empty",
+            ColumnWidthMode::AutoVisible,
+        );
+
+        let label_cell = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .find_map(|(x, y)| {
+                let cell = &buf[(x, y)];
+                (cell.symbol() == "Q").then(|| cell.style().fg)
+            })
+            .expect("expected wrapped selection row to render the account label");
+
+        assert_eq!(
+            label_cell,
+            Some(Color::Green),
+            "expected selected wrapped rows to preserve explicit account label foreground",
+        );
     }
 }

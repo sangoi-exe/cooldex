@@ -221,6 +221,7 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
+use ratatui::style::Color;
 use ratatui::style::Modifier;
 use serde_json::json;
 #[cfg(target_os = "windows")]
@@ -12048,6 +12049,10 @@ async fn accounts_popup() {
     chat.open_accounts_popup_at(chrono::Local::now());
 
     let popup = render_bottom_popup(&chat, 80);
+    assert!(
+        !popup.contains("🟢") && !popup.contains("🟡") && !popup.contains("⚫"),
+        "expected /accounts popup rows to stop using availability markers:\n{popup}"
+    );
     assert_snapshot!("accounts_popup", popup);
 }
 
@@ -12108,12 +12113,9 @@ async fn accounts_popup_loading() {
 }
 
 #[tokio::test]
-async fn accounts_popup_status_marker_prioritizes_weekly_over_5h() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
-    chat.thread_id = Some(ThreadId::new());
-    set_chatgpt_auth_with_secondary_account(&mut chat);
-
+async fn rate_limit_account_status_prioritizes_weekly_over_5h() {
     let now = chrono::Utc::now();
+    let popup_now = now.with_timezone(&chrono::Local);
     let five_hour_resets_at = (now + chrono::Duration::hours(2)).timestamp();
     let weekly_resets_at = (now + chrono::Duration::days(2)).timestamp();
 
@@ -12121,12 +12123,12 @@ async fn accounts_popup_status_marker_prioritizes_weekly_over_5h() {
         limit_id: Some("codex".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            remaining_percent: 100.0,
+            remaining_percent: 42.0,
             window_minutes: Some(300),
             resets_at: Some(five_hour_resets_at),
         }),
         secondary: Some(RateLimitWindow {
-            remaining_percent: 100.0,
+            remaining_percent: 0.0,
             window_minutes: Some(7 * 24 * 60),
             resets_at: Some(weekly_resets_at),
         }),
@@ -12137,7 +12139,7 @@ async fn accounts_popup_status_marker_prioritizes_weekly_over_5h() {
         limit_id: Some("codex".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            remaining_percent: 100.0,
+            remaining_percent: 0.0,
             window_minutes: Some(300),
             resets_at: Some(five_hour_resets_at),
         }),
@@ -12150,27 +12152,34 @@ async fn accounts_popup_status_marker_prioritizes_weekly_over_5h() {
         plan_type: None,
     };
 
-    chat.auth_manager
-        .update_rate_limits_for_accounts([
-            ("work-account".to_string(), work_snapshot),
-            ("personal-account".to_string(), personal_snapshot),
-        ])
-        .expect("update account rate limits");
-
-    chat.open_accounts_popup_at(chrono::Local::now());
-    let popup = render_bottom_popup(&chat, 100);
-    assert!(
-        popup.contains("⚫  Work (current)"),
-        "expected weekly marker for work account:\n{popup}"
+    assert_eq!(
+        ChatWidget::rate_limit_account_status(popup_now, Some(&work_snapshot)),
+        AccountAvailabilityStatus::WeeklyLimitReached
     );
-    assert!(
-        popup.contains("🟡  Personal"),
-        "expected 5h marker for personal account:\n{popup}"
+    assert_eq!(
+        ChatWidget::rate_limit_account_status(popup_now, Some(&personal_snapshot)),
+        AccountAvailabilityStatus::FiveHourLimitReached
+    );
+}
+
+#[test]
+fn account_availability_status_uses_canonical_label_colors() {
+    assert_eq!(
+        AccountAvailabilityStatus::Available.label_foreground(),
+        Color::Green
+    );
+    assert_eq!(
+        AccountAvailabilityStatus::FiveHourLimitReached.label_foreground(),
+        Color::Yellow
+    );
+    assert_eq!(
+        AccountAvailabilityStatus::WeeklyLimitReached.label_foreground(),
+        Color::DarkGray
     );
 }
 
 #[tokio::test]
-async fn accounts_popup_marks_near_limit_display_99_window_as_blocked() {
+async fn accounts_popup_fractional_remaining_window_stays_available() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
     chat.thread_id = Some(ThreadId::new());
     set_chatgpt_auth_with_secondary_account(&mut chat);
@@ -12212,13 +12221,10 @@ async fn accounts_popup_marks_near_limit_display_99_window_as_blocked() {
         .format("%H:%M")
         .to_string();
     let snapshot_popup = popup.replace(&local_reset, "<local-reset>");
-    assert_snapshot!(
-        "accounts_popup_near_limit_display_99_window",
-        snapshot_popup
-    );
+    assert_snapshot!("accounts_popup_fractional_remaining_window", snapshot_popup);
     assert!(
-        popup.contains("🟡  Personal"),
-        "expected near-limit 99 display window to use the blocked 5h marker:\n{popup}"
+        popup.contains("status: available"),
+        "expected fractional remaining capacity to keep the row available:\n{popup}"
     );
 }
 
@@ -12227,7 +12233,11 @@ async fn accounts_popup_single_weekly_window_does_not_duplicate_labels() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
     chat.thread_id = Some(ThreadId::new());
     set_chatgpt_auth_with_secondary_account(&mut chat);
-    let weekly_reset_at = (chrono::Utc::now() + chrono::Duration::days(2)).timestamp();
+    let now = chrono::DateTime::parse_from_rfc3339("2026-04-15T19:27:00Z")
+        .expect("valid fixed timestamp")
+        .with_timezone(&chrono::Utc);
+    let popup_now = now.with_timezone(&chrono::Local);
+    let weekly_reset_at = (now + chrono::Duration::days(2)).timestamp();
 
     chat.auth_manager
         .update_rate_limits_for_accounts([(
@@ -12247,9 +12257,25 @@ async fn accounts_popup_single_weekly_window_does_not_duplicate_labels() {
         )])
         .expect("seed single-window weekly rate limits");
 
-    chat.open_accounts_popup_at(chrono::Local::now());
+    chat.open_accounts_popup_at(popup_now);
     let popup = render_bottom_popup(&chat, 100);
-    assert_snapshot!("accounts_popup_single_weekly_window", popup);
+    let local_reset = chrono::DateTime::<chrono::Utc>::from_timestamp(weekly_reset_at, 0)
+        .expect("valid fixed reset timestamp")
+        .with_timezone(&chrono::Local)
+        .format("%H:%M")
+        .to_string();
+    let snapshot_popup = popup.replace(&local_reset, "<local-reset>");
+    assert_snapshot!("accounts_popup_single_weekly_window", snapshot_popup);
+    let work_account = chat
+        .auth_manager
+        .list_accounts()
+        .into_iter()
+        .find(|account| account.id == "work-account")
+        .expect("work account present");
+    assert_eq!(
+        ChatWidget::rate_limit_account_status(popup_now, work_account.last_rate_limits.as_ref()),
+        AccountAvailabilityStatus::WeeklyLimitReached
+    );
     assert!(
         !popup.contains("weekly: —"),
         "expected missing secondary weekly row to stay hidden:\n{popup}"
@@ -12308,7 +12334,9 @@ async fn accounts_popup_duplicate_weekly_labels_collapse_to_one_row() {
         "expected shared popup-description owner to keep one weekly row, got {description:?}"
     );
     assert!(
-        description.iter().any(|part| part == "weekly: 0%"),
+        description
+            .iter()
+            .any(|part| part.starts_with("weekly: 0%")),
         "expected shared popup-description owner to keep the fresh weekly row, got {description:?}"
     );
     assert!(
@@ -12382,7 +12410,7 @@ async fn accounts_popup_hides_stale_blocked_until_when_usage_shows_available() {
 }
 
 #[tokio::test]
-async fn logout_popup_status_marker_prioritizes_weekly_over_5h() {
+async fn logout_popup_uses_status_text_without_markers() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
     chat.thread_id = Some(ThreadId::new());
     set_chatgpt_auth_with_secondary_account(&mut chat);
@@ -12395,12 +12423,12 @@ async fn logout_popup_status_marker_prioritizes_weekly_over_5h() {
         limit_id: Some("codex".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            remaining_percent: 100.0,
+            remaining_percent: 42.0,
             window_minutes: Some(300),
             resets_at: Some(five_hour_resets_at),
         }),
         secondary: Some(RateLimitWindow {
-            remaining_percent: 100.0,
+            remaining_percent: 0.0,
             window_minutes: Some(7 * 24 * 60),
             resets_at: Some(weekly_resets_at),
         }),
@@ -12411,7 +12439,7 @@ async fn logout_popup_status_marker_prioritizes_weekly_over_5h() {
         limit_id: Some("codex".to_string()),
         limit_name: None,
         primary: Some(RateLimitWindow {
-            remaining_percent: 100.0,
+            remaining_percent: 0.0,
             window_minutes: Some(300),
             resets_at: Some(five_hour_resets_at),
         }),
@@ -12434,17 +12462,29 @@ async fn logout_popup_status_marker_prioritizes_weekly_over_5h() {
     chat.open_logout_popup_at(chrono::Local::now());
     let popup = render_bottom_popup(&chat, 100);
     assert!(
-        popup.contains("Remove: ⚫  Work"),
-        "expected weekly marker for work account in logout popup:\n{popup}"
+        popup.contains("Remove: Work"),
+        "expected logout popup to keep the work account label without a marker:\n{popup}"
     );
     assert!(
-        popup.contains("Remove: 🟡  Personal"),
-        "expected 5h marker for personal account in logout popup:\n{popup}"
+        popup.contains("status: weekly limit reached"),
+        "expected logout popup to keep weekly-blocked status text:\n{popup}"
+    );
+    assert!(
+        popup.contains("Remove: Personal"),
+        "expected logout popup to keep the personal account label without a marker:\n{popup}"
+    );
+    assert!(
+        popup.contains("status: 5h limit reached"),
+        "expected logout popup to keep 5h-blocked status text:\n{popup}"
+    );
+    assert!(
+        !popup.contains("🟢") && !popup.contains("🟡") && !popup.contains("⚫"),
+        "expected logout popup rows to stop using availability markers:\n{popup}"
     );
 }
 
 #[tokio::test]
-async fn logout_popup_marks_near_limit_display_99_window_as_blocked() {
+async fn logout_popup_fractional_remaining_window_stays_available() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
     chat.thread_id = Some(ThreadId::new());
     set_chatgpt_auth_with_secondary_account(&mut chat);
@@ -12486,10 +12526,10 @@ async fn logout_popup_marks_near_limit_display_99_window_as_blocked() {
         .format("%H:%M")
         .to_string();
     let snapshot_popup = popup.replace(&local_reset, "<local-reset>");
-    assert_snapshot!("logout_popup_near_limit_display_99_window", snapshot_popup);
+    assert_snapshot!("logout_popup_fractional_remaining_window", snapshot_popup);
     assert!(
-        popup.contains("Remove: 🟡  Personal"),
-        "expected near-limit 99 display window to use the blocked 5h marker in logout popup:\n{popup}"
+        popup.contains("status: available"),
+        "expected fractional remaining capacity to keep the logout row available:\n{popup}"
     );
 }
 
@@ -12546,6 +12586,10 @@ async fn logout_popup() {
     chat.open_logout_popup_at(chrono::Local::now());
 
     let popup = render_bottom_popup(&chat, 80);
+    assert!(
+        !popup.contains("🟢") && !popup.contains("🟡") && !popup.contains("⚫"),
+        "expected /logout popup rows to stop using availability markers:\n{popup}"
+    );
     assert_snapshot!("logout_popup", popup);
 }
 

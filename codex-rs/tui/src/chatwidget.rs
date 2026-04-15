@@ -770,11 +770,11 @@ enum AccountAvailabilityStatus {
 }
 
 impl AccountAvailabilityStatus {
-    fn marker(self) -> &'static str {
+    fn label_foreground(self) -> Color {
         match self {
-            Self::Available => "🟢",
-            Self::FiveHourLimitReached => "🟡",
-            Self::WeeklyLimitReached => "⚫",
+            Self::Available => Color::Green,
+            Self::FiveHourLimitReached => Color::Yellow,
+            Self::WeeklyLimitReached => Color::DarkGray,
         }
     }
 
@@ -10088,21 +10088,35 @@ impl ChatWidget {
         now: DateTime<Local>,
         snapshot: Option<&RateLimitSnapshot>,
     ) -> AccountAvailabilityStatus {
-        let five_hour_blocked = Self::rate_limit_window_blocked(
-            now,
-            snapshot.and_then(|snapshot| snapshot.primary.as_ref()),
-        );
-        let weekly_blocked = Self::rate_limit_window_blocked(
-            now,
-            snapshot.and_then(|snapshot| snapshot.secondary.as_ref()),
-        );
+        let primary_status = snapshot.and_then(|snapshot| {
+            let window = snapshot.primary.as_ref()?;
+            Self::rate_limit_window_blocked(now, Some(window)).then(|| {
+                match Self::rate_limit_primary_label(Some(snapshot)).as_str() {
+                    "weekly" => AccountAvailabilityStatus::WeeklyLimitReached,
+                    _ => AccountAvailabilityStatus::FiveHourLimitReached,
+                }
+            })
+        });
+        let secondary_status = snapshot.and_then(|snapshot| {
+            let window = snapshot.secondary.as_ref()?;
+            Self::rate_limit_window_blocked(now, Some(window)).then(|| {
+                match Self::rate_limit_secondary_label(Some(snapshot)).as_str() {
+                    "weekly" => AccountAvailabilityStatus::WeeklyLimitReached,
+                    _ => AccountAvailabilityStatus::FiveHourLimitReached,
+                }
+            })
+        });
 
-        if weekly_blocked {
-            AccountAvailabilityStatus::WeeklyLimitReached
-        } else if five_hour_blocked {
-            AccountAvailabilityStatus::FiveHourLimitReached
-        } else {
-            AccountAvailabilityStatus::Available
+        match (primary_status, secondary_status) {
+            (Some(AccountAvailabilityStatus::WeeklyLimitReached), _)
+            | (_, Some(AccountAvailabilityStatus::WeeklyLimitReached)) => {
+                AccountAvailabilityStatus::WeeklyLimitReached
+            }
+            (Some(AccountAvailabilityStatus::FiveHourLimitReached), _)
+            | (_, Some(AccountAvailabilityStatus::FiveHourLimitReached)) => {
+                AccountAvailabilityStatus::FiveHourLimitReached
+            }
+            _ => AccountAvailabilityStatus::Available,
         }
     }
 
@@ -10246,9 +10260,6 @@ impl ChatWidget {
                 let snapshot = account.last_rate_limits.as_ref();
                 let status: Option<AccountAvailabilityStatus> =
                     snapshot.map(|_| Self::rate_limit_account_status(now_local, snapshot));
-                let display_name = status
-                    .map(|status| format!("{} {name}", status.marker()))
-                    .unwrap_or(name);
                 let description_parts =
                     Self::account_popup_description_parts(now_local, &account, false);
                 let description =
@@ -10256,7 +10267,8 @@ impl ChatWidget {
 
                 let account_id = account.id;
                 SelectionItem {
-                    name: display_name,
+                    name,
+                    name_foreground: status.map(AccountAvailabilityStatus::label_foreground),
                     description,
                     is_current: account.is_active,
                     actions: vec![Box::new(move |tx| {
@@ -10348,11 +10360,9 @@ impl ChatWidget {
                 (!description_parts.is_empty()).then(|| description_parts.join(" • "));
 
             let account_id = account.id;
-            let display_name = status
-                .map(|status| format!("Remove: {} {name}", status.marker()))
-                .unwrap_or_else(|| format!("Remove: {name}"));
             items.push(SelectionItem {
-                name: display_name,
+                name: format!("Remove: {name}"),
+                name_foreground: status.map(AccountAvailabilityStatus::label_foreground),
                 description,
                 actions: vec![Box::new(move |tx| {
                     tx.send(AppEvent::RemoveAccount {

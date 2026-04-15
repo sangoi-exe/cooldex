@@ -8,7 +8,6 @@ expression: snapshot_popup
 
 › 1. Logout all accounts  Remove all stored credentials.
   2. Remove: Work         currently active • email: work@example.com
-  3. Remove: 🟡  Personal  status: 5h limit reached • email: personal@example.com • 5h: 99% (resets
-                          <local-reset>, in 2h) • weekly: 20%
+  3. Remove: Personal     status: available • email: personal@example.com • 5h: 99% • weekly: 20%
 
   Press enter to confirm or esc to go back
