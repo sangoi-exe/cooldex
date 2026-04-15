@@ -36,8 +36,8 @@ use crate::history_cell;
 use crate::history_cell::HistoryCell;
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
-use crate::local_chatgpt_auth::load_local_chatgpt_auth;
 use crate::local_chatgpt_auth::load_local_chatgpt_auth_for_chatgpt_account_id;
+use crate::local_chatgpt_auth::load_local_chatgpt_auth_for_store_account_id;
 use crate::model_catalog::ModelCatalog;
 use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
@@ -2224,11 +2224,24 @@ impl App {
                 current_account_id,
                 self.config.forced_chatgpt_workspace_id.as_deref(),
             ),
-            None => load_local_chatgpt_auth(
-                &self.config.codex_home,
-                self.config.cli_auth_credentials_store_mode,
-                self.config.forced_chatgpt_workspace_id.as_deref(),
-            ),
+            None => {
+                let Some(active_store_account_id) = self
+                    .auth_manager
+                    .active_chatgpt_account_summary()
+                    .map(|summary| summary.store_account_id)
+                else {
+                    return Err(ThreadlessChatgptAuthRefreshError::Other(
+                        "failed to load refreshed local ChatGPT auth: no session-active local ChatGPT account is available"
+                            .to_string(),
+                    ));
+                };
+                load_local_chatgpt_auth_for_store_account_id(
+                    &self.config.codex_home,
+                    self.config.cli_auth_credentials_store_mode,
+                    active_store_account_id.as_str(),
+                    self.config.forced_chatgpt_workspace_id.as_deref(),
+                )
+            }
         }
         .map_err(|err| {
             ThreadlessChatgptAuthRefreshError::Other(format!(
@@ -9274,6 +9287,46 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "failed to refresh local ChatGPT auth: Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again."
+        );
+    }
+
+    #[tokio::test]
+    async fn build_threadless_chatgpt_auth_refresh_response_default_path_ignores_stale_auth_store_active_account()
+     {
+        let mut app = make_test_app().await;
+        let (primary_store_account_id, secondary_store_account_id) =
+            seed_canonical_chatgpt_accounts(&mut app, "account-a");
+        let stale_store = AuthStore {
+            active_account_id: Some(secondary_store_account_id),
+            accounts: vec![
+                canonical_chatgpt_account("account-a", "primary@example.com", Some("Primary")),
+                canonical_chatgpt_account("account-b", "secondary@example.com", Some("Secondary")),
+            ],
+            ..AuthStore::default()
+        };
+        save_auth(
+            &app.config.codex_home,
+            &stale_store,
+            app.config.cli_auth_credentials_store_mode,
+        )
+        .expect("save stale auth store active account");
+
+        let response = app
+            .build_threadless_chatgpt_auth_refresh_response(None)
+            .await
+            .expect("threadless auth refresh should follow the session-active account");
+
+        assert_eq!(response.chatgpt_account_id, "account-a");
+        assert_eq!(
+            app.auth_manager
+                .active_chatgpt_account_summary()
+                .expect("session-active account should remain available")
+                .store_account_id,
+            primary_store_account_id
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(primary_store_account_id)
         );
     }
 

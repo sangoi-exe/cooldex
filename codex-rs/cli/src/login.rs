@@ -12,7 +12,9 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::config::Config;
 use codex_login::CLIENT_ID;
 use codex_login::CodexAuth;
+use codex_login::PreflightAuthState;
 use codex_login::ServerOptions;
+use codex_login::load_auth_preflight_state;
 use codex_login::login_with_api_key;
 use codex_login::logout;
 use codex_login::run_device_code_login;
@@ -316,24 +318,34 @@ pub async fn run_login_with_device_code_fallback_to_browser(
 pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
 
-    match CodexAuth::from_auth_storage(&config.codex_home, config.cli_auth_credentials_store_mode) {
-        Ok(Some(auth)) => match auth.auth_mode() {
-            AuthMode::ApiKey => match auth.get_token() {
-                Ok(api_key) => {
-                    eprintln!("Logged in using an API key - {}", safe_format_key(&api_key));
+    // Merge-safety anchor: `codex login status` must follow preflight credential truth and must not
+    // revive `auth.json.active_account_id` as the runtime owner after the WS12-B session-lease cutover.
+    match load_auth_preflight_state(
+        &config.codex_home,
+        /*enable_codex_api_key_env*/ true,
+        config.cli_auth_credentials_store_mode,
+        config.forced_chatgpt_workspace_id.as_deref(),
+    ) {
+        Ok(PreflightAuthState::ApiKey) => {
+            match api_key_login_status_outcome(CodexAuth::from_auth_storage(
+                &config.codex_home,
+                config.cli_auth_credentials_store_mode,
+            )) {
+                Ok(message) => {
+                    eprintln!("{message}");
                     std::process::exit(0);
                 }
-                Err(e) => {
-                    eprintln!("Unexpected error retrieving API key: {e}");
+                Err(message) => {
+                    eprintln!("{message}");
                     std::process::exit(1);
                 }
-            },
-            AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens => {
-                eprintln!("Logged in using ChatGPT");
-                std::process::exit(0);
             }
-        },
-        Ok(None) => {
+        }
+        Ok(PreflightAuthState::Chatgpt { .. }) => {
+            eprintln!("Logged in using ChatGPT");
+            std::process::exit(0);
+        }
+        Ok(PreflightAuthState::None) => {
             eprintln!("Not logged in");
             std::process::exit(1);
         }
@@ -381,6 +393,21 @@ async fn load_config_or_exit(cli_config_overrides: CliConfigOverrides) -> Config
     }
 }
 
+fn api_key_login_status_outcome(
+    auth_from_storage: std::io::Result<Option<CodexAuth>>,
+) -> Result<String, String> {
+    match auth_from_storage {
+        Ok(Some(auth)) if auth.auth_mode() == AuthMode::ApiKey => match auth.get_token() {
+            Ok(api_key) => Ok(format!(
+                "Logged in using an API key - {}",
+                safe_format_key(&api_key)
+            )),
+            Err(error) => Err(format!("Unexpected error retrieving API key: {error}")),
+        },
+        Ok(_) | Err(_) => Ok("Logged in using an API key".to_string()),
+    }
+}
+
 fn safe_format_key(key: &str) -> String {
     if key.len() <= 13 {
         return "***".to_string();
@@ -392,6 +419,7 @@ fn safe_format_key(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::api_key_login_status_outcome;
     use super::safe_format_key;
 
     #[test]
@@ -404,5 +432,12 @@ mod tests {
     fn short_key_returns_stars() {
         let key = "sk-proj-12345";
         assert_eq!(safe_format_key(key), "***");
+    }
+
+    #[test]
+    fn api_key_login_status_outcome_falls_back_to_generic_success_when_auth_store_load_fails() {
+        let outcome = api_key_login_status_outcome(Err(std::io::Error::other("broken auth store")));
+
+        assert_eq!(outcome, Ok("Logged in using an API key".to_string()));
     }
 }

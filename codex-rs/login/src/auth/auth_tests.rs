@@ -68,6 +68,7 @@ async fn refresh_without_id_token() {
         /*id_token*/ None,
         Some("new-access-token".to_string()),
         Some("new-refresh-token".to_string()),
+        super::PersistedActiveAccountWriteMode::Preserve,
     )
     .await
     .expect("update_tokens should succeed");
@@ -82,6 +83,43 @@ async fn refresh_without_id_token() {
     assert_eq!(tokens.id_token.raw_jwt, fake_jwt);
     assert_eq!(tokens.access_token, "new-access-token");
     assert_eq!(tokens.refresh_token, "new-refresh-token");
+}
+
+#[tokio::test]
+async fn update_tokens_strip_mode_keeps_persisted_active_account_cleared() {
+    let codex_home = tempdir().unwrap();
+    let store_account_id = "chatgpt-user:user-12345";
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: None,
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+
+    let storage = create_auth_storage(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+    );
+    let updated = super::update_tokens(
+        codex_home.path(),
+        &storage,
+        store_account_id,
+        /*id_token*/ None,
+        Some("new-access-token".to_string()),
+        Some("new-refresh-token".to_string()),
+        super::PersistedActiveAccountWriteMode::Strip,
+    )
+    .await
+    .expect("update_tokens should succeed");
+
+    assert_eq!(updated.active_account_id.as_deref(), Some(store_account_id));
+    let persisted_store = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("load persisted auth store")
+        .expect("auth store should exist");
+    assert_eq!(persisted_store.active_account_id, None);
 }
 
 #[test]
@@ -872,6 +910,7 @@ fn auth_manager_migrates_legacy_usage_cache_to_sqlite_and_strips_auth_store() {
     let stripped_store = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
         .expect("load stripped auth store")
         .expect("auth store should exist");
+    assert_eq!(stripped_store.active_account_id, None);
     assert_eq!(stripped_store.accounts[0].usage, None);
 
     let account_state_store =
@@ -1061,11 +1100,26 @@ fn auth_manager_falls_back_to_legacy_usage_when_sqlite_home_is_invalid() {
         .find(|account| account.id == store_account_id)
         .expect("account summary should exist");
     assert_eq!(account.last_rate_limits, Some(snapshot.clone()));
+    assert!(!account.is_active);
     assert_eq!(
         account
             .exhausted_until
             .map(|exhausted_until| exhausted_until.timestamp()),
         exhausted_until.map(|exhausted_until| exhausted_until.timestamp())
+    );
+    assert!(manager.auth_cached().is_none());
+    assert_eq!(manager.active_chatgpt_account_summary(), None);
+    assert_eq!(
+        load_auth_preflight_state(
+            codex_home.path(),
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+            None,
+        )
+        .expect("load auth preflight state"),
+        PreflightAuthState::Chatgpt {
+            has_matching_workspace: true
+        }
     );
 
     let persisted_store = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
@@ -1083,6 +1137,272 @@ fn auth_manager_falls_back_to_legacy_usage_when_sqlite_home_is_invalid() {
             .last_rate_limits,
         Some(snapshot)
     );
+}
+
+#[test]
+fn distinct_managers_bootstrap_distinct_session_active_accounts_and_ignore_stale_auth_store_active()
+{
+    let codex_home = tempdir().unwrap();
+    let primary_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-a", "org-b"], 0);
+    let secondary_store_account_id =
+        test_store_account_id("org-b").expect("secondary store account id");
+    let manager_a = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let manager_b = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    assert_eq!(
+        manager_a
+            .active_chatgpt_account_summary()
+            .expect("primary session active account")
+            .store_account_id,
+        primary_store_account_id
+    );
+    assert_eq!(
+        manager_b
+            .active_chatgpt_account_summary()
+            .expect("secondary session active account")
+            .store_account_id,
+        secondary_store_account_id
+    );
+
+    let accounts_a = manager_a.list_accounts();
+    assert!(
+        accounts_a
+            .iter()
+            .find(|account| account.id == primary_store_account_id)
+            .expect("primary account should exist")
+            .is_active
+    );
+    assert!(
+        !accounts_a
+            .iter()
+            .find(|account| account.id == secondary_store_account_id)
+            .expect("secondary account should exist")
+            .is_active
+    );
+
+    let accounts_b = manager_b.list_accounts();
+    assert!(
+        !accounts_b
+            .iter()
+            .find(|account| account.id == primary_store_account_id)
+            .expect("primary account should exist")
+            .is_active
+    );
+    assert!(
+        accounts_b
+            .iter()
+            .find(|account| account.id == secondary_store_account_id)
+            .expect("secondary account should exist")
+            .is_active
+    );
+
+    let stripped_store = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("load stripped auth store")
+        .expect("auth store should exist");
+    assert_eq!(stripped_store.active_account_id, None);
+
+    let stale_store = AuthStore {
+        active_account_id: Some(primary_store_account_id),
+        ..stripped_store
+    };
+    save_auth(
+        codex_home.path(),
+        &stale_store,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("persist stale auth store active account");
+
+    manager_b.reload_strict().expect("reload secondary manager");
+
+    assert_eq!(
+        manager_b
+            .active_chatgpt_account_summary()
+            .expect("secondary manager should keep its leased account")
+            .store_account_id,
+        secondary_store_account_id
+    );
+}
+
+#[test]
+fn set_active_account_rejects_account_leased_by_other_live_session() {
+    let codex_home = tempdir().unwrap();
+    let primary_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-a", "org-b"], 0);
+    let secondary_store_account_id =
+        test_store_account_id("org-b").expect("secondary store account id");
+    let manager_a = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let manager_b = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    assert_eq!(
+        manager_a
+            .active_chatgpt_account_summary()
+            .expect("primary session active account")
+            .store_account_id,
+        primary_store_account_id
+    );
+    assert_eq!(
+        manager_b
+            .active_chatgpt_account_summary()
+            .expect("secondary session active account")
+            .store_account_id,
+        secondary_store_account_id
+    );
+
+    let err = manager_b
+        .set_active_account(&primary_store_account_id)
+        .expect_err("leased account should fail loud");
+
+    assert!(
+        err.to_string()
+            .contains("is currently leased by another live session"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        manager_b
+            .active_chatgpt_account_summary()
+            .expect("secondary session should keep its original active account")
+            .store_account_id,
+        secondary_store_account_id
+    );
+}
+
+#[test]
+fn switching_active_account_releases_previous_lease_for_other_sessions() {
+    let codex_home = tempdir().unwrap();
+    let primary_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-a", "org-b", "org-c"], 0);
+    let secondary_store_account_id =
+        test_store_account_id("org-b").expect("secondary store account id");
+    let tertiary_store_account_id =
+        test_store_account_id("org-c").expect("tertiary store account id");
+    let manager_a = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let manager_b = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    assert_eq!(
+        manager_a
+            .active_chatgpt_account_summary()
+            .expect("primary session active account")
+            .store_account_id,
+        primary_store_account_id
+    );
+    assert_eq!(
+        manager_b
+            .active_chatgpt_account_summary()
+            .expect("secondary session active account")
+            .store_account_id,
+        secondary_store_account_id
+    );
+
+    manager_a
+        .set_active_account(&tertiary_store_account_id)
+        .expect("switch primary session to tertiary account");
+    manager_b
+        .set_active_account(&primary_store_account_id)
+        .expect("released primary account should become selectable");
+
+    assert_eq!(
+        manager_a
+            .active_chatgpt_account_summary()
+            .expect("primary session should now hold the tertiary account")
+            .store_account_id,
+        tertiary_store_account_id
+    );
+    assert_eq!(
+        manager_b
+            .active_chatgpt_account_summary()
+            .expect("secondary session should now hold the released primary account")
+            .store_account_id,
+        primary_store_account_id
+    );
+}
+
+#[test]
+fn guarded_reload_strips_persisted_active_account_after_supported_plan_prune() {
+    let codex_home = tempdir().unwrap();
+    let active_store_account_id = persist_test_chatgpt_accounts(codex_home.path(), &["org-a"], 0);
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    assert_eq!(
+        manager
+            .active_chatgpt_account_summary()
+            .expect("active account should be available")
+            .store_account_id,
+        active_store_account_id
+    );
+
+    let unsupported_access_token =
+        make_test_chatgpt_jwt(Some("free".to_string()), Some("org-free".to_string()))
+            .expect("free-plan jwt");
+    let unsupported_tokens = TokenData {
+        id_token: crate::token_data::parse_chatgpt_jwt_claims(&unsupported_access_token)
+            .expect("unsupported id token"),
+        access_token: unsupported_access_token,
+        refresh_token: "refresh-org-free".to_string(),
+        account_id: Some("org-free".to_string()),
+    };
+    let unsupported_account = StoredAccount {
+        id: unsupported_tokens
+            .preferred_store_account_id()
+            .expect("unsupported store account id"),
+        label: None,
+        tokens: unsupported_tokens,
+        last_refresh: Some(Utc::now()),
+        usage: None,
+    };
+
+    let mut reintroduced_store = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("load auth store")
+        .expect("auth store should exist");
+    reintroduced_store.active_account_id = Some(active_store_account_id.clone());
+    reintroduced_store.accounts.push(unsupported_account);
+    save_auth(
+        codex_home.path(),
+        &reintroduced_store,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("persist reintroduced unsupported account");
+
+    let outcome =
+        manager.reload_if_store_account_id_matches(Some(active_store_account_id.as_str()));
+    assert!(matches!(
+        outcome,
+        ReloadOutcome::ReloadedChanged | ReloadOutcome::ReloadedNoChange
+    ));
+
+    let persisted_store = load_auth_store(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("load persisted auth store after guarded reload")
+        .expect("auth store should exist");
+    assert_eq!(persisted_store.active_account_id, None);
+    assert_eq!(persisted_store.accounts.len(), 1);
+    assert_eq!(persisted_store.accounts[0].id, active_store_account_id);
 }
 
 #[test]

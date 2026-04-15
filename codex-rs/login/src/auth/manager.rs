@@ -17,8 +17,11 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 use tokio::sync::Mutex as AsyncMutex;
 
+use codex_account_state::AccountLeaseConflict;
 use codex_account_state::AccountStateStore;
 use codex_account_state::AccountUsageState;
+use codex_account_state::SessionActiveAccountRefresh;
+use codex_account_state::SessionActiveAccountSetOutcome;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_protocol::config_types::ForcedLoginMethod;
@@ -113,6 +116,7 @@ impl PartialEq for CodexAuth {
 
 const TOKEN_REFRESH_INTERVAL: i64 = 8;
 const USAGE_LIMIT_AUTO_SWITCH_COOLDOWN_SECONDS: i64 = 2;
+const ACTIVE_ACCOUNT_LEASE_TTL_SECONDS: i64 = 5 * 60;
 
 const REFRESH_TOKEN_EXPIRED_MESSAGE: &str = "Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.";
 const REFRESH_TOKEN_REUSED_MESSAGE: &str = "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.";
@@ -344,12 +348,17 @@ fn strip_usage_from_store(store: &mut AuthStore) {
     }
 }
 
+fn strip_runtime_active_account_from_store(store: &mut AuthStore) {
+    store.active_account_id = None;
+}
+
 fn persist_stripped_auth_store(
     storage: &dyn AuthStorageBackend,
     store: &AuthStore,
 ) -> std::io::Result<()> {
     let mut stripped_store = store.clone();
     strip_usage_from_store(&mut stripped_store);
+    strip_runtime_active_account_from_store(&mut stripped_store);
     storage.save(&stripped_store)
 }
 
@@ -358,11 +367,12 @@ fn persist_auth_store(
     store: &AuthStore,
     strip_usage: bool,
 ) -> std::io::Result<()> {
+    let mut persisted_store = store.clone();
+    strip_runtime_active_account_from_store(&mut persisted_store);
     if strip_usage {
-        return persist_stripped_auth_store(storage, store);
+        strip_usage_from_store(&mut persisted_store);
     }
-
-    storage.save(store)
+    storage.save(&persisted_store)
 }
 
 fn persist_usage_state_from_store(
@@ -439,6 +449,13 @@ fn open_account_state_store(sqlite_home: &Path) -> Option<AccountStateStore> {
             None
         }
     }
+}
+
+fn lease_conflict_error(account_id: &str, conflict: &AccountLeaseConflict) -> std::io::Error {
+    std::io::Error::other(format!(
+        "account '{account_id}' is currently leased by another live session until {}",
+        conflict.lease_until
+    ))
 }
 
 impl From<RefreshTokenError> for std::io::Error {
@@ -824,29 +841,29 @@ pub struct AuthConfig {
 }
 
 pub fn enforce_login_restrictions(config: &AuthConfig) -> std::io::Result<()> {
-    let Some(auth) = load_auth(
+    let auth_state = load_auth_preflight_state(
         &config.codex_home,
         /*enable_codex_api_key_env*/ true,
         config.auth_credentials_store_mode,
-    )?
-    else {
+        config.forced_chatgpt_workspace_id.as_deref(),
+    )?;
+    if auth_state == PreflightAuthState::None {
         return Ok(());
-    };
+    }
 
     if let Some(required_method) = config.forced_login_method {
-        let method_violation = match (required_method, auth.auth_mode()) {
-            (ForcedLoginMethod::Api, AuthMode::ApiKey) => None,
-            (ForcedLoginMethod::Chatgpt, AuthMode::Chatgpt)
-            | (ForcedLoginMethod::Chatgpt, AuthMode::ChatgptAuthTokens) => None,
-            (ForcedLoginMethod::Api, AuthMode::Chatgpt)
-            | (ForcedLoginMethod::Api, AuthMode::ChatgptAuthTokens) => Some(
+        let method_violation = match (required_method, auth_state) {
+            (ForcedLoginMethod::Api, PreflightAuthState::ApiKey) => None,
+            (ForcedLoginMethod::Chatgpt, PreflightAuthState::Chatgpt { .. }) => None,
+            (ForcedLoginMethod::Api, PreflightAuthState::Chatgpt { .. }) => Some(
                 "API key login is required, but ChatGPT is currently being used. Logging out."
                     .to_string(),
             ),
-            (ForcedLoginMethod::Chatgpt, AuthMode::ApiKey) => Some(
+            (ForcedLoginMethod::Chatgpt, PreflightAuthState::ApiKey) => Some(
                 "ChatGPT login is required, but an API key is currently being used. Logging out."
                     .to_string(),
             ),
+            (_, PreflightAuthState::None) => None,
         };
 
         if let Some(message) = method_violation {
@@ -859,37 +876,20 @@ pub fn enforce_login_restrictions(config: &AuthConfig) -> std::io::Result<()> {
     }
 
     if let Some(expected_account_id) = config.forced_chatgpt_workspace_id.as_deref() {
-        if !auth.is_chatgpt_auth() {
+        if auth_state == PreflightAuthState::ApiKey {
             return Ok(());
         }
-
-        let token_data = match auth.get_token_data() {
-            Ok(data) => data,
-            Err(err) => {
-                return logout_with_message(
-                    &config.codex_home,
-                    format!(
-                        "Failed to load ChatGPT credentials while enforcing workspace restrictions: {err}. Logging out."
-                    ),
-                    config.auth_credentials_store_mode,
-                );
+        if !matches!(
+            auth_state,
+            PreflightAuthState::Chatgpt {
+                has_matching_workspace: true
             }
-        };
-
-        // workspace is the external identifier for account id.
-        let chatgpt_account_id = token_data.id_token.chatgpt_account_id.as_deref();
-        if chatgpt_account_id != Some(expected_account_id) {
-            let message = match chatgpt_account_id {
-                Some(actual) => format!(
-                    "Login is restricted to workspace {expected_account_id}, but current credentials belong to {actual}. Logging out."
-                ),
-                None => format!(
-                    "Login is restricted to workspace {expected_account_id}, but current credentials lack a workspace identifier. Logging out."
-                ),
-            };
+        ) {
             return logout_with_message(
                 &config.codex_home,
-                message,
+                format!(
+                    "Login is restricted to workspace {expected_account_id}, but no saved ChatGPT account matches it. Logging out."
+                ),
                 config.auth_credentials_store_mode,
             );
         }
@@ -1005,6 +1005,75 @@ fn load_auth(
     Ok(None)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreflightAuthState {
+    None,
+    ApiKey,
+    Chatgpt { has_matching_workspace: bool },
+}
+
+fn preflight_state_from_store(
+    store: &mut AuthStore,
+    required_workspace_id: Option<&str>,
+) -> PreflightAuthState {
+    enforce_supported_chatgpt_auth_accounts(store);
+    if !store.accounts.is_empty() {
+        return PreflightAuthState::Chatgpt {
+            has_matching_workspace: store
+                .accounts
+                .iter()
+                .any(|account| account_matches_required_workspace(account, required_workspace_id)),
+        };
+    }
+    if store.openai_api_key.is_some() {
+        return PreflightAuthState::ApiKey;
+    }
+    PreflightAuthState::None
+}
+
+pub fn load_auth_preflight_state(
+    codex_home: &Path,
+    enable_codex_api_key_env: bool,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    required_workspace_id: Option<&str>,
+) -> std::io::Result<PreflightAuthState> {
+    if enable_codex_api_key_env && read_codex_api_key_from_env().is_some() {
+        return Ok(PreflightAuthState::ApiKey);
+    }
+
+    let ephemeral_storage = create_auth_storage(
+        codex_home.to_path_buf(),
+        AuthCredentialsStoreMode::Ephemeral,
+    );
+    if let Some(mut store) = ephemeral_storage.load()? {
+        let preflight_state = preflight_state_from_store(&mut store, required_workspace_id);
+        if preflight_state != PreflightAuthState::None {
+            return Ok(preflight_state);
+        }
+    }
+
+    if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
+        return Ok(PreflightAuthState::None);
+    }
+
+    let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
+    let mut store = match storage.load()? {
+        Some(store) => store,
+        None => return Ok(PreflightAuthState::None),
+    };
+    Ok(preflight_state_from_store(
+        &mut store,
+        required_workspace_id,
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistedActiveAccountWriteMode {
+    #[cfg(test)]
+    Preserve,
+    Strip,
+}
+
 async fn update_tokens(
     codex_home: &Path,
     storage: &Arc<dyn AuthStorageBackend>,
@@ -1012,6 +1081,7 @@ async fn update_tokens(
     id_token: Option<String>,
     access_token: Option<String>,
     refresh_token: Option<String>,
+    persisted_active_account_write_mode: PersistedActiveAccountWriteMode,
 ) -> std::io::Result<AuthStore> {
     let _lock = storage::lock_auth_store(codex_home)?;
 
@@ -1042,7 +1112,11 @@ async fn update_tokens(
         );
     }
     store.validate()?;
-    storage.save(&store)?;
+    let mut persisted_store = store.clone();
+    if persisted_active_account_write_mode == PersistedActiveAccountWriteMode::Strip {
+        strip_runtime_active_account_from_store(&mut persisted_store);
+    }
+    storage.save(&persisted_store)?;
     Ok(store)
 }
 
@@ -1527,6 +1601,7 @@ pub struct AuthManager {
     codex_home: PathBuf,
     storage: Arc<dyn AuthStorageBackend>,
     account_state_store: Option<AccountStateStore>,
+    runtime_session_id: String,
     inner: RwLock<CachedAuth>,
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
@@ -1562,6 +1637,7 @@ impl Debug for AuthManager {
         f.debug_struct("AuthManager")
             .field("codex_home", &self.codex_home)
             .field("account_state_store", &self.account_state_store)
+            .field("runtime_session_id", &self.runtime_session_id)
             .field("inner", &self.inner)
             .field("enable_codex_api_key_env", &self.enable_codex_api_key_env)
             .field(
@@ -1578,6 +1654,172 @@ impl Debug for AuthManager {
 }
 
 impl AuthManager {
+    fn bootstrap_runtime_active_account_candidates(
+        store: &AuthStore,
+        required_workspace_id: Option<&str>,
+    ) -> Vec<String> {
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        if let Some(legacy_active_account_id) = store.active_account_id.as_deref()
+            && store
+                .account(legacy_active_account_id)
+                .is_some_and(|account| {
+                    account_matches_required_workspace(account, required_workspace_id)
+                })
+        {
+            candidates.push(legacy_active_account_id.to_string());
+            seen.insert(legacy_active_account_id.to_string());
+        }
+        for account in &store.accounts {
+            if !account_matches_required_workspace(account, required_workspace_id) {
+                continue;
+            }
+            if seen.insert(account.id.clone()) {
+                candidates.push(account.id.clone());
+            }
+        }
+        candidates
+    }
+
+    fn hydrate_runtime_active_account(
+        account_state_store: Option<&AccountStateStore>,
+        runtime_session_id: &str,
+        required_workspace_id: Option<&str>,
+        store: &mut AuthStore,
+    ) -> std::io::Result<()> {
+        if store.accounts.is_empty() {
+            store.active_account_id = None;
+            return Ok(());
+        }
+        let Some(account_state_store) = account_state_store else {
+            store.active_account_id = None;
+            return Ok(());
+        };
+
+        let now = Utc::now();
+        let mut allow_bootstrap = true;
+        let mut current_active_account_id = match account_state_store
+            .refresh_session_active_account(
+                runtime_session_id,
+                now,
+                ACTIVE_ACCOUNT_LEASE_TTL_SECONDS,
+            ) {
+            Ok(SessionActiveAccountRefresh::Active(account_id)) => Some(account_id),
+            Ok(SessionActiveAccountRefresh::None) => None,
+            Ok(SessionActiveAccountRefresh::LostToOtherSession {
+                account_id,
+                owner_session_id,
+                lease_until,
+            }) => {
+                tracing::info!(
+                    account_id,
+                    owner_session_id,
+                    lease_until = ?lease_until,
+                    "runtime session lost its active-account lease to another live session"
+                );
+                allow_bootstrap = false;
+                None
+            }
+            Err(error) => {
+                return Err(std::io::Error::other(format!(
+                    "failed to refresh runtime active-account lease: {error}"
+                )));
+            }
+        };
+
+        if let Some(active_account_id) = current_active_account_id.as_deref()
+            && !store.account(active_account_id).is_some_and(|account| {
+                account_matches_required_workspace(account, required_workspace_id)
+            })
+        {
+            account_state_store
+                .clear_session_active_account(runtime_session_id)
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to clear invalid runtime active-account row: {error}"
+                    ))
+                })?;
+            current_active_account_id = None;
+        }
+
+        if current_active_account_id.is_none() && allow_bootstrap {
+            for candidate_account_id in
+                Self::bootstrap_runtime_active_account_candidates(store, required_workspace_id)
+            {
+                match account_state_store.set_session_active_account(
+                    runtime_session_id,
+                    candidate_account_id.as_str(),
+                    now,
+                    ACTIVE_ACCOUNT_LEASE_TTL_SECONDS,
+                ) {
+                    Ok(SessionActiveAccountSetOutcome::Assigned) => {
+                        current_active_account_id = Some(candidate_account_id);
+                        break;
+                    }
+                    Ok(SessionActiveAccountSetOutcome::Conflict(conflict)) => {
+                        tracing::debug!(
+                            candidate_account_id,
+                            owner_session_id = conflict.owner_session_id,
+                            lease_until = ?conflict.lease_until,
+                            "skipping runtime active-account bootstrap candidate leased by another live session"
+                        );
+                    }
+                    Err(error) => {
+                        return Err(std::io::Error::other(format!(
+                            "failed to bootstrap runtime active-account row: {error}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        store.active_account_id = current_active_account_id;
+        Ok(())
+    }
+
+    fn reconcile_runtime_active_account(&self, store: &AuthStore) -> std::io::Result<()> {
+        let Some(account_state_store) = self.account_state_store.as_ref() else {
+            if store.active_account_id.is_some() {
+                return Err(std::io::Error::other(
+                    "runtime active-account owner is unavailable",
+                ));
+            }
+            return Ok(());
+        };
+        let now = Utc::now();
+        match store.active_account_id.as_deref() {
+            Some(active_account_id) => {
+                if store.account(active_account_id).is_none() {
+                    return Err(std::io::Error::other(format!(
+                        "runtime active account '{active_account_id}' is missing from the auth store"
+                    )));
+                }
+                match account_state_store.set_session_active_account(
+                    self.runtime_session_id.as_str(),
+                    active_account_id,
+                    now,
+                    ACTIVE_ACCOUNT_LEASE_TTL_SECONDS,
+                ) {
+                    Ok(SessionActiveAccountSetOutcome::Assigned) => Ok(()),
+                    Ok(SessionActiveAccountSetOutcome::Conflict(conflict)) => {
+                        Err(lease_conflict_error(active_account_id, &conflict))
+                    }
+                    Err(error) => Err(std::io::Error::other(format!(
+                        "failed to persist runtime active-account state: {error}"
+                    ))),
+                }
+            }
+            None => account_state_store
+                .clear_session_active_account(self.runtime_session_id.as_str())
+                .map(|_| ())
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to clear runtime active-account state: {error}"
+                    ))
+                }),
+        }
+    }
+
     /// Create a new manager loading the initial auth using the provided
     /// preferred auth method. Errors loading auth or opening the WS12
     /// account-state store are swallowed; `auth()` will simply return `None`
@@ -1605,7 +1847,9 @@ impl AuthManager {
     ) -> Self {
         let storage = create_auth_storage(codex_home.clone(), auth_credentials_store_mode);
         let account_state_store = open_account_state_store(sqlite_home.as_path());
+        let runtime_session_id = uuid::Uuid::new_v4().to_string();
         let mut store = storage.load().ok().flatten().unwrap_or_default();
+        let loaded_had_persisted_active_account = store.active_account_id.is_some();
         let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
         let mut sync_outcome = UsageStateSyncOutcome::default();
         if let Some(account_state_store) = account_state_store.as_ref() {
@@ -1627,7 +1871,20 @@ impl AuthManager {
                 "removed accounts with unsupported ChatGPT plans during auth manager initialization"
             );
         }
-        if (sync_outcome.strip_persisted_auth_store || !removed_account_ids.is_empty())
+        if let Err(error) = Self::hydrate_runtime_active_account(
+            account_state_store.as_ref(),
+            runtime_session_id.as_str(),
+            None,
+            &mut store,
+        ) {
+            tracing::warn!(
+                error = %error,
+                "failed to hydrate runtime active-account state during auth manager initialization"
+            );
+        }
+        if (sync_outcome.strip_persisted_auth_store
+            || !removed_account_ids.is_empty()
+            || (account_state_store.is_some() && loaded_had_persisted_active_account))
             && let Err(error) =
                 persist_auth_store(&*storage, &store, sync_outcome.strip_persisted_auth_store)
         {
@@ -1636,17 +1893,13 @@ impl AuthManager {
                 "failed to persist auth store during auth manager initialization"
             );
         }
-        let auth = load_auth(
-            &codex_home,
-            enable_codex_api_key_env,
-            auth_credentials_store_mode,
-        )
-        .ok()
-        .flatten();
+        let auth =
+            Self::derive_auth_from_store(&store, Arc::clone(&storage), enable_codex_api_key_env);
         Self {
             codex_home,
             storage,
             account_state_store,
+            runtime_session_id,
             inner: RwLock::new(CachedAuth {
                 store,
                 auth,
@@ -1679,6 +1932,7 @@ impl AuthManager {
             codex_home,
             storage,
             account_state_store,
+            runtime_session_id: uuid::Uuid::new_v4().to_string(),
             inner: RwLock::new(cached),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
@@ -1704,6 +1958,7 @@ impl AuthManager {
             codex_home,
             storage,
             account_state_store,
+            runtime_session_id: uuid::Uuid::new_v4().to_string(),
             inner: RwLock::new(cached),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
@@ -1722,6 +1977,7 @@ impl AuthManager {
             codex_home,
             storage,
             account_state_store: None,
+            runtime_session_id: uuid::Uuid::new_v4().to_string(),
             inner: RwLock::new(CachedAuth {
                 store: AuthStore::default(),
                 auth: None,
@@ -1741,7 +1997,26 @@ impl AuthManager {
 
     /// Current cached auth (clone) without attempting a refresh.
     pub fn auth_cached(&self) -> Option<CodexAuth> {
-        self.inner.read().ok().and_then(|c| c.auth.clone())
+        let mut store = self.inner.read().ok()?.store.clone();
+        if let Err(error) = Self::hydrate_runtime_active_account(
+            self.account_state_store.as_ref(),
+            self.runtime_session_id.as_str(),
+            self.forced_chatgpt_workspace_id().as_deref(),
+            &mut store,
+        ) {
+            tracing::warn!(
+                error = %error,
+                "failed to hydrate runtime active-account state while reading cached auth"
+            );
+            store.active_account_id = None;
+        }
+        let auth = Self::derive_auth_from_store(
+            &store,
+            Arc::clone(&self.storage),
+            self.enable_codex_api_key_env,
+        );
+        self.set_cached_with_auth(store, auth.clone());
+        auth
     }
 
     pub fn active_chatgpt_account_summary(&self) -> Option<ActiveChatgptAccountSummary> {
@@ -1861,6 +2136,18 @@ impl AuthManager {
                 "failed to refresh saved-account usage truth before listing accounts"
             );
         }
+        if let Err(error) = Self::hydrate_runtime_active_account(
+            self.account_state_store.as_ref(),
+            self.runtime_session_id.as_str(),
+            self.forced_chatgpt_workspace_id().as_deref(),
+            &mut store,
+        ) {
+            tracing::warn!(
+                error = %error,
+                "failed to hydrate runtime active-account state before listing accounts"
+            );
+            store.active_account_id = None;
+        }
 
         let active_account_id = store.active_account_id.clone();
         store
@@ -1925,7 +2212,7 @@ impl AuthManager {
                     });
                 }
             }
-            if make_active || store.active_account_id.is_none() {
+            if make_active {
                 store.active_account_id = Some(account_id.clone());
             }
             Ok(account_id.clone())
@@ -1934,6 +2221,7 @@ impl AuthManager {
 
     pub fn remove_account(&self, id: &str) -> std::io::Result<bool> {
         self.update_store(|store| {
+            let required_workspace_id = self.forced_chatgpt_workspace_id();
             let prev_len = store.accounts.len();
             store.accounts.retain(|account| account.id != id);
             let removed = store.accounts.len() != prev_len;
@@ -1941,7 +2229,13 @@ impl AuthManager {
                 return Ok(false);
             }
             if store.active_account_id.as_deref() == Some(id) {
-                store.active_account_id = store.accounts.first().map(|a| a.id.clone());
+                store.active_account_id = self.select_account_for_auto_switch_with_leases(
+                    store,
+                    required_workspace_id.as_deref(),
+                    /*exclude_store_account_id*/ None,
+                    Utc::now(),
+                    UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+                );
             }
             Ok(true)
         })
@@ -2250,7 +2544,7 @@ impl AuthManager {
                 return Ok(None);
             }
 
-            let Some(next_account_id) = select_account_for_auto_switch_from_store(
+            let Some(next_account_id) = self.select_account_for_auto_switch_with_leases(
                 store,
                 required_workspace_id,
                 Some(failing_store_account_id.as_str()),
@@ -2287,6 +2581,46 @@ impl AuthManager {
         Ok(switched_to)
     }
 
+    fn select_account_for_auto_switch_with_leases(
+        &self,
+        store: &AuthStore,
+        required_workspace_id: Option<&str>,
+        exclude_store_account_id: Option<&str>,
+        now: DateTime<Utc>,
+        selection_scope: UsageLimitAutoSwitchSelectionScope,
+    ) -> Option<String> {
+        let account_state_store = self.account_state_store.as_ref()?;
+        let mut filtered_store = store.clone();
+        filtered_store.accounts.retain(|account| {
+            if Some(account.id.as_str()) == exclude_store_account_id {
+                return false;
+            }
+            match account_state_store.account_is_leased_by_other(
+                self.runtime_session_id.as_str(),
+                account.id.as_str(),
+                now,
+            ) {
+                Ok(false) => true,
+                Ok(true) => false,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        account_id = account.id,
+                        "failed to evaluate active-account lease conflict while selecting an auto-switch candidate"
+                    );
+                    false
+                }
+            }
+        });
+        select_account_for_auto_switch_from_store(
+            &filtered_store,
+            required_workspace_id,
+            exclude_store_account_id,
+            now,
+            selection_scope,
+        )
+    }
+
     pub fn select_account_for_auto_switch(
         &self,
         required_workspace_id: Option<&str>,
@@ -2296,7 +2630,7 @@ impl AuthManager {
             return None;
         }
         let store = self.inner.read().ok()?.store.clone();
-        select_account_for_auto_switch_from_store(
+        self.select_account_for_auto_switch_with_leases(
             &store,
             required_workspace_id,
             exclude_store_account_id,
@@ -2384,13 +2718,23 @@ impl AuthManager {
         tracing::info!("Reloading auth (strict)");
         let _lock = storage::lock_auth_store(&self.codex_home)?;
         let mut store = self.storage.load()?.unwrap_or_default();
+        let loaded_had_persisted_active_account = store.active_account_id.is_some();
         let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
         let mut sync_outcome = UsageStateSyncOutcome::default();
         if let Some(account_state_store) = self.account_state_store.as_ref() {
             sync_outcome =
                 synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store)?;
         }
-        if sync_outcome.strip_persisted_auth_store || !removed_account_ids.is_empty() {
+        Self::hydrate_runtime_active_account(
+            self.account_state_store.as_ref(),
+            self.runtime_session_id.as_str(),
+            self.forced_chatgpt_workspace_id().as_deref(),
+            &mut store,
+        )?;
+        if sync_outcome.strip_persisted_auth_store
+            || !removed_account_ids.is_empty()
+            || (self.account_state_store.is_some() && loaded_had_persisted_active_account)
+        {
             persist_auth_store(
                 &*self.storage,
                 &store,
@@ -2425,18 +2769,42 @@ impl AuthManager {
                 return ReloadOutcome::Skipped;
             }
         };
+        let loaded_had_persisted_active_account = store.active_account_id.is_some();
         let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
         if !removed_account_ids.is_empty() {
             tracing::info!(
                 removed_account_ids = ?removed_account_ids,
                 "removed accounts with unsupported ChatGPT plans during guarded auth reload"
             );
-            if let Err(error) =
+        }
+        if let Err(error) = Self::hydrate_runtime_active_account(
+            self.account_state_store.as_ref(),
+            self.runtime_session_id.as_str(),
+            self.forced_chatgpt_workspace_id().as_deref(),
+            &mut store,
+        ) {
+            tracing::warn!(
+                error = %error,
+                "skipping guarded auth reload because runtime active-account state could not be hydrated"
+            );
+            return ReloadOutcome::Skipped;
+        }
+        if loaded_had_persisted_active_account || !removed_account_ids.is_empty() {
+            let persist_result = if self.account_state_store.is_some() {
+                let mut stripped_store = store.clone();
+                strip_runtime_active_account_from_store(&mut stripped_store);
+                save_auth(
+                    &self.codex_home,
+                    &stripped_store,
+                    self.auth_credentials_store_mode,
+                )
+            } else {
                 save_auth(&self.codex_home, &store, self.auth_credentials_store_mode)
-            {
+            };
+            if let Err(error) = persist_result {
                 tracing::warn!(
                     error = %error,
-                    "failed to persist supported ChatGPT plan policy during guarded reload"
+                    "failed to persist auth store during guarded auth reload"
                 );
                 return ReloadOutcome::Skipped;
             }
@@ -2569,6 +2937,7 @@ impl AuthManager {
     fn load_store_from_storage(&self) -> AuthStore {
         match self.storage.load() {
             Ok(Some(mut store)) => {
+                let loaded_had_persisted_active_account = store.active_account_id.is_some();
                 let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
                 let mut sync_outcome = UsageStateSyncOutcome::default();
                 if let Some(account_state_store) = self.account_state_store.as_ref() {
@@ -2593,7 +2962,21 @@ impl AuthManager {
                         "removed accounts with unsupported ChatGPT plans while loading auth store"
                     );
                 }
-                if (sync_outcome.strip_persisted_auth_store || !removed_account_ids.is_empty())
+                if let Err(error) = Self::hydrate_runtime_active_account(
+                    self.account_state_store.as_ref(),
+                    self.runtime_session_id.as_str(),
+                    self.forced_chatgpt_workspace_id().as_deref(),
+                    &mut store,
+                ) {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to hydrate runtime active-account state while loading auth store"
+                    );
+                    store.active_account_id = None;
+                }
+                if (sync_outcome.strip_persisted_auth_store
+                    || !removed_account_ids.is_empty()
+                    || (self.account_state_store.is_some() && loaded_had_persisted_active_account))
                     && let Err(error) = persist_auth_store(
                         &*self.storage,
                         &store,
@@ -2693,6 +3076,12 @@ impl AuthManager {
         if let Some(account_state_store) = self.account_state_store.as_ref() {
             synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store)?;
         }
+        Self::hydrate_runtime_active_account(
+            self.account_state_store.as_ref(),
+            self.runtime_session_id.as_str(),
+            self.forced_chatgpt_workspace_id().as_deref(),
+            &mut store,
+        )?;
 
         let out = mutator(&mut store)?;
         let removed_after_mutation = enforce_supported_chatgpt_auth_accounts(&mut store);
@@ -2702,6 +3091,7 @@ impl AuthManager {
                 "removed accounts with unsupported ChatGPT plans after auth store mutation"
             );
         }
+        self.reconcile_runtime_active_account(&store)?;
         store.validate()?;
         if let Some(account_state_store) = self.account_state_store.as_ref() {
             persist_usage_state_from_store(account_state_store, &store)?;
@@ -2975,6 +3365,13 @@ impl AuthManager {
                 "removed accounts with unsupported ChatGPT plans before terminal refresh-token eviction"
             );
         }
+        Self::hydrate_runtime_active_account(
+            self.account_state_store.as_ref(),
+            self.runtime_session_id.as_str(),
+            self.forced_chatgpt_workspace_id().as_deref(),
+            &mut store,
+        )
+        .map_err(RefreshTokenError::Transient)?;
 
         let was_active = store.active_account_id.as_deref() == Some(store_account_id);
         let previous_account_count = store.accounts.len();
@@ -2987,7 +3384,7 @@ impl AuthManager {
 
         let required_workspace_id = self.forced_chatgpt_workspace_id();
         let switched_to_store_account_id = if was_active {
-            let next_store_account_id = select_account_for_auto_switch_from_store(
+            let next_store_account_id = self.select_account_for_auto_switch_with_leases(
                 &store,
                 required_workspace_id.as_deref(),
                 /*exclude_store_account_id*/ None,
@@ -3014,10 +3411,19 @@ impl AuthManager {
             );
         }
 
-        store.validate().map_err(RefreshTokenError::Transient)?;
-        self.storage
-            .save(&store)
+        self.reconcile_runtime_active_account(&store)
             .map_err(RefreshTokenError::Transient)?;
+        store.validate().map_err(RefreshTokenError::Transient)?;
+        if let Some(account_state_store) = self.account_state_store.as_ref() {
+            persist_usage_state_from_store(account_state_store, &store)
+                .map_err(RefreshTokenError::Transient)?;
+            persist_stripped_auth_store(&*self.storage, &store)
+                .map_err(RefreshTokenError::Transient)?;
+        } else {
+            self.storage
+                .save(&store)
+                .map_err(RefreshTokenError::Transient)?;
+        }
 
         let cached_auth =
             if let Some(switched_to_store_account_id) = switched_to_store_account_id.as_deref() {
@@ -3276,6 +3682,7 @@ impl AuthManager {
             refresh_id_token,
             refresh_access_token,
             refresh_refresh_token,
+            PersistedActiveAccountWriteMode::Strip,
         )
         .await
         .map_err(RefreshTokenError::from)?;
@@ -3363,18 +3770,17 @@ fn enforce_supported_chatgpt_auth_accounts(store: &mut AuthStore) -> Vec<String>
         keep_account
     });
 
-    let active_account_missing =
-        store
-            .active_account_id
-            .as_ref()
-            .is_some_and(|active_account_id| {
-                !store
-                    .accounts
-                    .iter()
-                    .any(|account| &account.id == active_account_id)
-            });
-    if active_account_missing {
-        store.active_account_id = store.accounts.first().map(|account| account.id.clone());
+    if store
+        .active_account_id
+        .as_ref()
+        .is_some_and(|active_account_id| {
+            !store
+                .accounts
+                .iter()
+                .any(|account| &account.id == active_account_id)
+        })
+    {
+        store.active_account_id = None;
     }
 
     removed_account_ids

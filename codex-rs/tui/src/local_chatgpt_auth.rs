@@ -70,6 +70,7 @@ fn local_chatgpt_auth_from_store_account(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn load_local_chatgpt_auth(
     codex_home: &Path,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
@@ -106,6 +107,26 @@ pub(crate) fn load_local_chatgpt_auth_for_chatgpt_account_id(
         })
         .ok_or_else(|| {
             format!("no saved ChatGPT account matches workspace {requested_chatgpt_account_id:?}")
+        })?;
+
+    local_chatgpt_auth_from_store_account(account, forced_chatgpt_workspace_id)
+}
+
+pub(crate) fn load_local_chatgpt_auth_for_store_account_id(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    requested_store_account_id: &str,
+    forced_chatgpt_workspace_id: Option<&str>,
+) -> Result<LocalChatgptAuth, String> {
+    let auth_store = load_local_chatgpt_auth_store(codex_home, auth_credentials_store_mode)?;
+    let account = auth_store
+        .accounts
+        .iter()
+        .find(|account| account.id == requested_store_account_id)
+        .ok_or_else(|| {
+            format!(
+                "no saved ChatGPT account matches store account id {requested_store_account_id:?}"
+            )
         })?;
 
     local_chatgpt_auth_from_store_account(account, forced_chatgpt_workspace_id)

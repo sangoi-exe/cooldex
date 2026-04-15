@@ -32,6 +32,29 @@ pub struct AccountUsageState {
     pub last_seen_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountLeaseConflict {
+    pub owner_session_id: String,
+    pub lease_until: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionActiveAccountSetOutcome {
+    Assigned,
+    Conflict(AccountLeaseConflict),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionActiveAccountRefresh {
+    None,
+    Active(String),
+    LostToOtherSession {
+        account_id: String,
+        owner_session_id: String,
+        lease_until: DateTime<Utc>,
+    },
+}
+
 #[derive(Clone)]
 pub struct AccountStateStore {
     sqlite_home: PathBuf,
@@ -61,6 +84,17 @@ CREATE TABLE IF NOT EXISTS account_usage_state (
     rate_limits_json TEXT,
     exhausted_until INTEGER,
     last_seen_at INTEGER,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_active_account (
+    session_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS account_leases (
+    account_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    lease_until INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
             "#,
@@ -194,6 +228,112 @@ ON CONFLICT(account_id) DO UPDATE SET
         Ok(())
     }
 
+    pub fn refresh_session_active_account(
+        &self,
+        session_id: &str,
+        now: DateTime<Utc>,
+        lease_ttl_seconds: i64,
+    ) -> Result<SessionActiveAccountRefresh> {
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction()?;
+        let now_epoch = now.timestamp();
+        let Some(account_id) = load_session_active_account_id(&transaction, session_id)? else {
+            transaction.commit()?;
+            return Ok(SessionActiveAccountRefresh::None);
+        };
+        if let Some(conflict) =
+            load_unexpired_lease_conflict(&transaction, account_id.as_str(), session_id, now_epoch)?
+        {
+            transaction.execute(
+                "DELETE FROM session_active_account WHERE session_id = ?",
+                [session_id],
+            )?;
+            transaction.commit()?;
+            return Ok(SessionActiveAccountRefresh::LostToOtherSession {
+                account_id,
+                owner_session_id: conflict.owner_session_id,
+                lease_until: conflict.lease_until,
+            });
+        }
+        upsert_session_active_account(&transaction, session_id, account_id.as_str(), now_epoch)?;
+        upsert_account_lease(
+            &transaction,
+            account_id.as_str(),
+            session_id,
+            lease_until_epoch(now_epoch, lease_ttl_seconds),
+            now_epoch,
+        )?;
+        transaction.commit()?;
+        Ok(SessionActiveAccountRefresh::Active(account_id))
+    }
+
+    pub fn set_session_active_account(
+        &self,
+        session_id: &str,
+        account_id: &str,
+        now: DateTime<Utc>,
+        lease_ttl_seconds: i64,
+    ) -> Result<SessionActiveAccountSetOutcome> {
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction()?;
+        let now_epoch = now.timestamp();
+        if let Some(conflict) =
+            load_unexpired_lease_conflict(&transaction, account_id, session_id, now_epoch)?
+        {
+            transaction.commit()?;
+            return Ok(SessionActiveAccountSetOutcome::Conflict(conflict));
+        }
+        if let Some(previous_account_id) = load_session_active_account_id(&transaction, session_id)?
+            && previous_account_id != account_id
+        {
+            transaction.execute(
+                "DELETE FROM account_leases WHERE account_id = ? AND session_id = ?",
+                params![previous_account_id, session_id],
+            )?;
+        }
+        upsert_session_active_account(&transaction, session_id, account_id, now_epoch)?;
+        upsert_account_lease(
+            &transaction,
+            account_id,
+            session_id,
+            lease_until_epoch(now_epoch, lease_ttl_seconds),
+            now_epoch,
+        )?;
+        transaction.commit()?;
+        Ok(SessionActiveAccountSetOutcome::Assigned)
+    }
+
+    pub fn clear_session_active_account(&self, session_id: &str) -> Result<Option<String>> {
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction()?;
+        let account_id = load_session_active_account_id(&transaction, session_id)?;
+        if let Some(account_id) = account_id.as_deref() {
+            transaction.execute(
+                "DELETE FROM account_leases WHERE account_id = ? AND session_id = ?",
+                params![account_id, session_id],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM session_active_account WHERE session_id = ?",
+            [session_id],
+        )?;
+        transaction.commit()?;
+        Ok(account_id)
+    }
+
+    pub fn account_is_leased_by_other(
+        &self,
+        session_id: &str,
+        account_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let connection = self.lock_connection()?;
+        Ok(
+            load_unexpired_lease_conflict(&connection, account_id, session_id, now.timestamp())?
+                .is_some(),
+        )
+    }
+
     fn lock_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.connection
             .lock()
@@ -229,6 +369,98 @@ fn datetime_to_epoch_seconds(value: Option<&DateTime<Utc>>) -> Option<i64> {
 
 fn epoch_seconds_to_datetime(value: Option<i64>) -> Option<DateTime<Utc>> {
     value.and_then(|value| DateTime::<Utc>::from_timestamp(value, 0))
+}
+
+fn load_session_active_account_id(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT account_id FROM session_active_account WHERE session_id = ?",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn load_unexpired_lease_conflict(
+    connection: &Connection,
+    account_id: &str,
+    session_id: &str,
+    now_epoch: i64,
+) -> Result<Option<AccountLeaseConflict>> {
+    connection
+        .query_row(
+            r#"
+SELECT session_id, lease_until
+FROM account_leases
+WHERE account_id = ? AND lease_until > ? AND session_id != ?
+            "#,
+            params![account_id, now_epoch, session_id],
+            |row| {
+                let lease_until_epoch = row.get::<_, i64>(1)?;
+                let lease_until =
+                    epoch_seconds_to_datetime(Some(lease_until_epoch)).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Integer,
+                            format!("invalid lease_until epoch {lease_until_epoch}").into(),
+                        )
+                    })?;
+                Ok(AccountLeaseConflict {
+                    owner_session_id: row.get::<_, String>(0)?,
+                    lease_until,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn upsert_session_active_account(
+    connection: &Connection,
+    session_id: &str,
+    account_id: &str,
+    now_epoch: i64,
+) -> Result<()> {
+    connection.execute(
+        r#"
+INSERT INTO session_active_account (session_id, account_id, updated_at)
+VALUES (?, ?, ?)
+ON CONFLICT(session_id) DO UPDATE SET
+    account_id = excluded.account_id,
+    updated_at = excluded.updated_at
+        "#,
+        params![session_id, account_id, now_epoch],
+    )?;
+    Ok(())
+}
+
+fn upsert_account_lease(
+    connection: &Connection,
+    account_id: &str,
+    session_id: &str,
+    lease_until: i64,
+    now_epoch: i64,
+) -> Result<()> {
+    connection.execute(
+        r#"
+INSERT INTO account_leases (account_id, session_id, lease_until, updated_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(account_id) DO UPDATE SET
+    session_id = excluded.session_id,
+    lease_until = excluded.lease_until,
+    updated_at = excluded.updated_at
+        "#,
+        params![account_id, session_id, lease_until, now_epoch],
+    )?;
+    Ok(())
+}
+
+fn lease_until_epoch(now_epoch: i64, lease_ttl_seconds: i64) -> i64 {
+    now_epoch + lease_ttl_seconds
 }
 
 #[cfg(test)]
@@ -328,6 +560,130 @@ mod tests {
         assert_eq!(
             loaded.get("account-b"),
             incremental_usage_by_account.get("account-b")
+        );
+    }
+
+    #[test]
+    fn set_session_active_account_acquires_and_refreshes_lease() {
+        let sqlite_home = TempDir::new().expect("tempdir");
+        let store = AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open store");
+        let now = fixed_now();
+
+        assert_eq!(
+            store
+                .set_session_active_account("session-a", "account-a", now, 300)
+                .expect("assign initial lease"),
+            SessionActiveAccountSetOutcome::Assigned
+        );
+        assert_eq!(
+            store
+                .refresh_session_active_account(
+                    "session-a",
+                    now + chrono::Duration::seconds(30),
+                    300,
+                )
+                .expect("refresh owned lease"),
+            SessionActiveAccountRefresh::Active("account-a".to_string())
+        );
+    }
+
+    #[test]
+    fn set_session_active_account_conflicts_with_other_live_session() {
+        let sqlite_home = TempDir::new().expect("tempdir");
+        let store = AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open store");
+        let now = fixed_now();
+
+        store
+            .set_session_active_account("session-a", "account-a", now, 300)
+            .expect("assign initial lease");
+        let outcome = store
+            .set_session_active_account(
+                "session-b",
+                "account-a",
+                now + chrono::Duration::seconds(1),
+                300,
+            )
+            .expect("second assignment should not error");
+        assert_eq!(
+            outcome,
+            SessionActiveAccountSetOutcome::Conflict(AccountLeaseConflict {
+                owner_session_id: "session-a".to_string(),
+                lease_until: now + chrono::Duration::seconds(300),
+            })
+        );
+    }
+
+    #[test]
+    fn clear_session_active_account_releases_owned_lease() {
+        let sqlite_home = TempDir::new().expect("tempdir");
+        let store = AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open store");
+        let now = fixed_now();
+
+        store
+            .set_session_active_account("session-a", "account-a", now, 300)
+            .expect("assign initial lease");
+        assert_eq!(
+            store
+                .clear_session_active_account("session-a")
+                .expect("clear session active account"),
+            Some("account-a".to_string())
+        );
+        assert_eq!(
+            store
+                .set_session_active_account(
+                    "session-b",
+                    "account-a",
+                    now + chrono::Duration::seconds(1),
+                    300,
+                )
+                .expect("reassign released lease"),
+            SessionActiveAccountSetOutcome::Assigned
+        );
+    }
+
+    #[test]
+    fn refresh_session_active_account_clears_row_after_losing_expired_lease() {
+        let sqlite_home = TempDir::new().expect("tempdir");
+        let store = AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open store");
+        let now = fixed_now();
+
+        store
+            .set_session_active_account("session-a", "account-a", now, 60)
+            .expect("assign initial lease");
+        assert_eq!(
+            store
+                .set_session_active_account(
+                    "session-b",
+                    "account-a",
+                    now + chrono::Duration::seconds(61),
+                    60,
+                )
+                .expect("expired lease should be reusable"),
+            SessionActiveAccountSetOutcome::Assigned
+        );
+        assert_eq!(
+            store
+                .refresh_session_active_account(
+                    "session-a",
+                    now + chrono::Duration::seconds(62),
+                    60,
+                )
+                .expect("refresh after losing lease"),
+            SessionActiveAccountRefresh::LostToOtherSession {
+                account_id: "account-a".to_string(),
+                owner_session_id: "session-b".to_string(),
+                lease_until: now + chrono::Duration::seconds(121),
+            }
+        );
+        assert_eq!(
+            store
+                .refresh_session_active_account(
+                    "session-a",
+                    now + chrono::Duration::seconds(63),
+                    60,
+                )
+                .expect("row should be cleared after lost lease"),
+            SessionActiveAccountRefresh::None
         );
     }
 }
