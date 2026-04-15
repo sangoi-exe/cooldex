@@ -2202,21 +2202,9 @@ impl AuthManager {
     }
 
     pub fn list_accounts(&self) -> Vec<AccountSummary> {
-        let Ok(guard) = self.inner.read() else {
+        let Some(mut store) = self.clone_cached_store_with_sqlite_usage_truth() else {
             return Vec::new();
         };
-
-        let mut store = guard.store.clone();
-        drop(guard);
-
-        if let Some(account_state_store) = self.account_state_store.as_ref()
-            && let Err(error) = hydrate_store_usage_from_sqlite(account_state_store, &mut store)
-        {
-            tracing::warn!(
-                error = %error,
-                "failed to refresh saved-account usage truth before listing accounts"
-            );
-        }
         if let Err(error) = Self::hydrate_runtime_active_account(
             self.account_state_store.as_ref(),
             self.runtime_session_id.as_str(),
@@ -2236,6 +2224,26 @@ impl AuthManager {
             .iter()
             .map(|account| AccountSummary::from_stored(account, active_account_id.as_deref()))
             .collect()
+    }
+
+    // Merge-safety anchor: `/accounts` rows and the popup cache-expiry gate must share this one
+    // SQLite-backed saved-account usage truth read so TUI polling never falls back to stale
+    // in-memory auth-store usage while `list_accounts()` is already showing refreshed data.
+    fn clone_cached_store_with_sqlite_usage_truth(&self) -> Option<AuthStore> {
+        let guard = self.inner.read().ok()?;
+        let mut store = guard.store.clone();
+        drop(guard);
+
+        if let Some(account_state_store) = self.account_state_store.as_ref()
+            && let Err(error) = hydrate_store_usage_from_sqlite(account_state_store, &mut store)
+        {
+            tracing::warn!(
+                error = %error,
+                "failed to refresh saved-account usage truth from sqlite"
+            );
+        }
+
+        Some(store)
     }
 
     pub fn set_active_account(&self, id: &str) -> std::io::Result<()> {
@@ -2728,8 +2736,7 @@ impl AuthManager {
             return None;
         }
 
-        let guard = self.inner.read().ok()?;
-        let store = &guard.store;
+        let store = self.clone_cached_store_with_sqlite_usage_truth()?;
 
         let next_release_at = store
             .accounts

@@ -1084,6 +1084,52 @@ fn list_accounts_reads_latest_usage_truth_from_sqlite_across_managers() {
 }
 
 #[test]
+fn accounts_rate_limits_cache_expires_at_reads_latest_usage_truth_from_sqlite_across_managers() {
+    let codex_home = tempdir().unwrap();
+    let active_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-a", "org-b"], 0);
+    let reader = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let writer = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    assert_eq!(
+        reader.accounts_rate_limits_cache_expires_at(Utc::now()),
+        None
+    );
+
+    let reset_at = Utc::now() + chrono::Duration::minutes(45);
+    writer
+        .update_rate_limits_for_account(
+            &active_store_account_id,
+            RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    remaining_percent: 42.0,
+                    window_minutes: Some(300),
+                    resets_at: Some(reset_at.timestamp()),
+                }),
+                secondary: None,
+                credits: None,
+                plan_type: Some(AccountPlanType::Pro),
+            },
+        )
+        .expect("persist usage truth");
+
+    assert_eq!(
+        reader.accounts_rate_limits_cache_expires_at(Utc::now()),
+        DateTime::from_timestamp(reset_at.timestamp(), 0)
+    );
+}
+
+#[test]
 fn auth_manager_preserves_legacy_usage_when_sqlite_sync_fails() {
     let now = Utc::now();
     let codex_home = tempdir().unwrap();

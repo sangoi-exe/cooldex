@@ -8263,6 +8263,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accounts_cache_gate_uses_sqlite_refreshed_truth_from_other_manager() {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_account_cache(&mut app);
+        app.recompute_accounts_status_cache_expiry(Utc::now());
+        assert_eq!(app.accounts_status_cache_expires_at, None);
+
+        let store_account_id = app
+            .auth_manager
+            .list_accounts()
+            .into_iter()
+            .map(|account| account.id)
+            .next()
+            .expect("cached account should exist");
+        let writer = auth_manager_from_config(&app.config);
+        let reset_at = Utc::now() + chrono::Duration::minutes(45);
+        writer
+            .update_rate_limits_for_account(
+                &store_account_id,
+                RateLimitSnapshot {
+                    limit_id: Some("codex".to_string()),
+                    limit_name: None,
+                    primary: Some(RateLimitWindow {
+                        remaining_percent: 42.0,
+                        window_minutes: Some(60),
+                        resets_at: Some(reset_at.timestamp()),
+                    }),
+                    secondary: None,
+                    credits: None,
+                    plan_type: None,
+                },
+            )
+            .expect("persist rate-limit snapshot");
+
+        app.maybe_start_accounts_status_refresh(
+            /*force*/ false, /*open_popup_when_ready*/ false,
+            /*show_loading_popup*/ false,
+        );
+
+        assert_eq!(
+            app.accounts_status_cache_expires_at,
+            DateTime::from_timestamp(reset_at.timestamp(), 0)
+        );
+        assert!(!app.accounts_status_refresh_in_flight);
+    }
+
+    #[tokio::test]
     async fn partial_accounts_refresh_without_persisted_time_keeps_cache_inactive() {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
         seed_chatgpt_account_cache(&mut app);
