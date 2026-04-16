@@ -115,6 +115,8 @@ use codex_core::lookup_message_history_entry;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_features::Feature;
 use codex_login::AccountRateLimitRefreshOutcome;
+use codex_login::AccountRateLimitRefreshRoster;
+use codex_login::AccountRateLimitRefreshRosterStatus;
 use codex_login::AuthManager;
 use codex_login::ChatgptAccountAuthResolution;
 use codex_login::ChatgptAccountRefreshMode;
@@ -512,12 +514,21 @@ async fn fetch_accounts_rate_limit_updates(
     auth_manager: Arc<AuthManager>,
 ) -> AccountsRateLimitRefreshResult {
     const MAX_IN_FLIGHT: usize = 4;
+    let refresh_roster = auth_manager.account_rate_limit_refresh_roster();
+    let Some(pending_store_account_ids) =
+        accounts_rate_limit_refresh_pending_store_account_ids(refresh_roster.clone())
+    else {
+        return AccountsRateLimitRefreshResult {
+            outcomes: Vec::new(),
+            attempted_fetches: 0,
+            successful_fetches: 0,
+            projection_refresh_needed: false,
+            roster_status: refresh_roster.status,
+        };
+    };
     let mut outcomes = Vec::new();
     let mut join_set = tokio::task::JoinSet::new();
-    let mut pending = auth_manager
-        .list_accounts()
-        .into_iter()
-        .map(|account| account.id);
+    let mut pending = pending_store_account_ids.into_iter();
 
     for _ in 0..MAX_IN_FLIGHT {
         if !spawn_next_accounts_rate_limit_fetch(
@@ -543,7 +554,19 @@ async fn fetch_accounts_rate_limit_updates(
         ) {}
     }
 
-    accounts_rate_limit_refresh_result_from_outcomes(outcomes)
+    accounts_rate_limit_refresh_result_from_outcomes(outcomes, refresh_roster.status)
+}
+
+fn accounts_rate_limit_refresh_pending_store_account_ids(
+    refresh_roster: AccountRateLimitRefreshRoster,
+) -> Option<Vec<String>> {
+    match refresh_roster.status {
+        AccountRateLimitRefreshRosterStatus::LeaseManaged
+        | AccountRateLimitRefreshRosterStatus::NoLeaseOwner => {
+            Some(refresh_roster.store_account_ids)
+        }
+        AccountRateLimitRefreshRosterStatus::LeaseReadFailed => None,
+    }
 }
 
 struct AccountsRateLimitFetchOutcome {
@@ -558,10 +581,12 @@ struct AccountsRateLimitRefreshResult {
     attempted_fetches: usize,
     successful_fetches: usize,
     projection_refresh_needed: bool,
+    roster_status: AccountRateLimitRefreshRosterStatus,
 }
 
 fn accounts_rate_limit_refresh_result_from_outcomes(
     outcomes: Vec<AccountsRateLimitFetchOutcome>,
+    roster_status: AccountRateLimitRefreshRosterStatus,
 ) -> AccountsRateLimitRefreshResult {
     let mut refresh_outcomes = Vec::new();
     let mut attempted_fetches = 0usize;
@@ -586,6 +611,7 @@ fn accounts_rate_limit_refresh_result_from_outcomes(
         attempted_fetches,
         successful_fetches,
         projection_refresh_needed,
+        roster_status,
     }
 }
 
@@ -593,8 +619,11 @@ fn accounts_status_cache_fully_refreshed(
     attempted_fetches: usize,
     successful_fetches: usize,
     persistence_succeeded: bool,
+    roster_status: AccountRateLimitRefreshRosterStatus,
 ) -> bool {
-    persistence_succeeded && attempted_fetches == successful_fetches
+    roster_status != AccountRateLimitRefreshRosterStatus::LeaseReadFailed
+        && persistence_succeeded
+        && attempted_fetches == successful_fetches
 }
 
 #[derive(Debug, Clone)]
@@ -2021,6 +2050,7 @@ impl App {
                         refresh_result.attempted_fetches,
                         refresh_result.successful_fetches,
                         /*persistence_succeeded*/ true,
+                        refresh_result.roster_status,
                     ),
                 )
             } else {
@@ -2033,6 +2063,7 @@ impl App {
                             refresh_result.attempted_fetches,
                             refresh_result.successful_fetches,
                             /*persistence_succeeded*/ true,
+                            refresh_result.roster_status,
                         ),
                     ),
                     Err(err) => {
@@ -8308,11 +8339,73 @@ mod tests {
 
     #[test]
     fn accounts_status_cache_fully_refreshed_requires_complete_success() {
-        assert!(accounts_status_cache_fully_refreshed(0, 0, true));
-        assert!(accounts_status_cache_fully_refreshed(2, 2, true));
-        assert!(!accounts_status_cache_fully_refreshed(1, 0, true));
-        assert!(!accounts_status_cache_fully_refreshed(2, 1, true));
-        assert!(!accounts_status_cache_fully_refreshed(2, 2, false));
+        assert!(accounts_status_cache_fully_refreshed(
+            0,
+            0,
+            true,
+            AccountRateLimitRefreshRosterStatus::LeaseManaged,
+        ));
+        assert!(accounts_status_cache_fully_refreshed(
+            2,
+            2,
+            true,
+            AccountRateLimitRefreshRosterStatus::LeaseManaged,
+        ));
+        assert!(!accounts_status_cache_fully_refreshed(
+            1,
+            0,
+            true,
+            AccountRateLimitRefreshRosterStatus::LeaseManaged,
+        ));
+        assert!(!accounts_status_cache_fully_refreshed(
+            2,
+            1,
+            true,
+            AccountRateLimitRefreshRosterStatus::LeaseManaged,
+        ));
+        assert!(!accounts_status_cache_fully_refreshed(
+            2,
+            2,
+            false,
+            AccountRateLimitRefreshRosterStatus::LeaseManaged,
+        ));
+        assert!(!accounts_status_cache_fully_refreshed(
+            0,
+            0,
+            true,
+            AccountRateLimitRefreshRosterStatus::LeaseReadFailed,
+        ));
+    }
+
+    #[test]
+    fn accounts_rate_limit_refresh_pending_store_account_ids_respects_roster_status() {
+        assert_eq!(
+            accounts_rate_limit_refresh_pending_store_account_ids(
+                codex_login::AccountRateLimitRefreshRoster {
+                    store_account_ids: vec!["account-a".to_string()],
+                    status: AccountRateLimitRefreshRosterStatus::LeaseManaged,
+                },
+            ),
+            Some(vec!["account-a".to_string()]),
+        );
+        assert_eq!(
+            accounts_rate_limit_refresh_pending_store_account_ids(
+                codex_login::AccountRateLimitRefreshRoster {
+                    store_account_ids: vec!["account-b".to_string()],
+                    status: AccountRateLimitRefreshRosterStatus::NoLeaseOwner,
+                },
+            ),
+            Some(vec!["account-b".to_string()]),
+        );
+        assert_eq!(
+            accounts_rate_limit_refresh_pending_store_account_ids(
+                codex_login::AccountRateLimitRefreshRoster {
+                    store_account_ids: vec!["account-c".to_string()],
+                    status: AccountRateLimitRefreshRosterStatus::LeaseReadFailed,
+                },
+            ),
+            None,
+        );
     }
 
     #[test]
@@ -8345,30 +8438,39 @@ mod tests {
             credits: None,
             plan_type: None,
         };
-        let refresh_result = accounts_rate_limit_refresh_result_from_outcomes(vec![
-            AccountsRateLimitFetchOutcome {
-                store_account_id: "account-a".to_string(),
-                refresh_outcome: Some(AccountRateLimitRefreshOutcome::NoUsableSnapshot),
-                fetch_attempted: true,
-                projection_refresh_needed: false,
-            },
-            AccountsRateLimitFetchOutcome {
-                store_account_id: "account-b".to_string(),
-                refresh_outcome: None,
-                fetch_attempted: false,
-                projection_refresh_needed: true,
-            },
-            AccountsRateLimitFetchOutcome {
-                store_account_id: "account-c".to_string(),
-                refresh_outcome: Some(AccountRateLimitRefreshOutcome::Snapshot(snapshot.clone())),
-                fetch_attempted: true,
-                projection_refresh_needed: false,
-            },
-        ]);
+        let refresh_result = accounts_rate_limit_refresh_result_from_outcomes(
+            vec![
+                AccountsRateLimitFetchOutcome {
+                    store_account_id: "account-a".to_string(),
+                    refresh_outcome: Some(AccountRateLimitRefreshOutcome::NoUsableSnapshot),
+                    fetch_attempted: true,
+                    projection_refresh_needed: false,
+                },
+                AccountsRateLimitFetchOutcome {
+                    store_account_id: "account-b".to_string(),
+                    refresh_outcome: None,
+                    fetch_attempted: false,
+                    projection_refresh_needed: true,
+                },
+                AccountsRateLimitFetchOutcome {
+                    store_account_id: "account-c".to_string(),
+                    refresh_outcome: Some(AccountRateLimitRefreshOutcome::Snapshot(
+                        snapshot.clone(),
+                    )),
+                    fetch_attempted: true,
+                    projection_refresh_needed: false,
+                },
+            ],
+            AccountRateLimitRefreshRosterStatus::LeaseManaged,
+        );
 
         assert_eq!(refresh_result.attempted_fetches, 2);
         assert_eq!(refresh_result.successful_fetches, 1);
         assert!(refresh_result.projection_refresh_needed);
+        assert_eq!(
+            refresh_result.roster_status,
+            AccountRateLimitRefreshRosterStatus::LeaseManaged
+        );
         assert_eq!(
             refresh_result.outcomes,
             vec![

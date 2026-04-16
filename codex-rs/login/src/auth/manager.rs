@@ -2202,9 +2202,68 @@ impl AuthManager {
     }
 
     pub fn list_accounts(&self) -> Vec<AccountSummary> {
-        let Some(mut store) = self.clone_cached_store_with_sqlite_usage_truth() else {
+        let Some(store) = self.clone_cached_store_with_runtime_active_account() else {
             return Vec::new();
         };
+
+        let active_account_id = store.active_account_id.clone();
+        store
+            .accounts
+            .iter()
+            .map(|account| AccountSummary::from_stored(account, active_account_id.as_deref()))
+            .collect()
+    }
+
+    pub fn account_rate_limit_refresh_roster(&self) -> AccountRateLimitRefreshRoster {
+        let Some(store) = self.clone_cached_store_with_runtime_active_account() else {
+            tracing::warn!(
+                "failed to snapshot auth store before listing rate-limit refresh candidates"
+            );
+            return AccountRateLimitRefreshRoster {
+                store_account_ids: Vec::new(),
+                status: AccountRateLimitRefreshRosterStatus::LeaseReadFailed,
+            };
+        };
+
+        let required_workspace_id = self.forced_chatgpt_workspace_id();
+        let workspace_filtered_store_account_ids =
+            workspace_filtered_store_account_ids(&store, required_workspace_id.as_deref());
+
+        let Some(account_state_store) = self.account_state_store.as_ref() else {
+            return account_rate_limit_refresh_roster_from_workspace_filtered_ids(
+                workspace_filtered_store_account_ids,
+                AccountRateLimitRefreshLeaseState::NoLeaseOwner,
+            );
+        };
+
+        match account_state_store.account_ids_leased_by_other(
+            self.runtime_session_id.as_str(),
+            &workspace_filtered_store_account_ids,
+            Utc::now(),
+        ) {
+            Ok(leased_by_other_store_account_ids) => {
+                account_rate_limit_refresh_roster_from_workspace_filtered_ids(
+                    workspace_filtered_store_account_ids,
+                    AccountRateLimitRefreshLeaseState::LeaseManaged(
+                        &leased_by_other_store_account_ids,
+                    ),
+                )
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to load lease-aware rate-limit refresh roster"
+                );
+                account_rate_limit_refresh_roster_from_workspace_filtered_ids(
+                    workspace_filtered_store_account_ids,
+                    AccountRateLimitRefreshLeaseState::LeaseReadFailed,
+                )
+            }
+        }
+    }
+
+    fn clone_cached_store_with_runtime_active_account(&self) -> Option<AuthStore> {
+        let mut store = self.clone_cached_store_with_sqlite_usage_truth()?;
         if let Err(error) = Self::hydrate_runtime_active_account(
             self.account_state_store.as_ref(),
             self.runtime_session_id.as_str(),
@@ -2213,17 +2272,11 @@ impl AuthManager {
         ) {
             tracing::warn!(
                 error = %error,
-                "failed to hydrate runtime active-account state before listing accounts"
+                "failed to hydrate runtime active-account state before loading account truth"
             );
             store.active_account_id = None;
         }
-
-        let active_account_id = store.active_account_id.clone();
-        store
-            .accounts
-            .iter()
-            .map(|account| AccountSummary::from_stored(account, active_account_id.as_deref()))
-            .collect()
+        Some(store)
     }
 
     // Merge-safety anchor: `/accounts` rows and the popup cache-expiry gate must share this one
@@ -3921,6 +3974,19 @@ pub struct AccountSummary {
     pub last_rate_limits: Option<RateLimitSnapshot>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountRateLimitRefreshRosterStatus {
+    LeaseManaged,
+    NoLeaseOwner,
+    LeaseReadFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRateLimitRefreshRoster {
+    pub store_account_ids: Vec<String>,
+    pub status: AccountRateLimitRefreshRosterStatus,
+}
+
 impl AccountSummary {
     fn from_stored(account: &StoredAccount, active_id: Option<&str>) -> Self {
         Self {
@@ -3934,6 +4000,55 @@ impl AccountSummary {
                 .as_ref()
                 .and_then(|u| u.last_rate_limits.clone()),
         }
+    }
+}
+
+enum AccountRateLimitRefreshLeaseState<'a> {
+    LeaseManaged(&'a HashSet<String>),
+    NoLeaseOwner,
+    LeaseReadFailed,
+}
+
+fn workspace_filtered_store_account_ids(
+    store: &AuthStore,
+    required_workspace_id: Option<&str>,
+) -> Vec<String> {
+    store
+        .accounts
+        .iter()
+        .filter(|account| account_matches_required_workspace(account, required_workspace_id))
+        .map(|account| account.id.clone())
+        .collect()
+}
+
+fn account_rate_limit_refresh_roster_from_workspace_filtered_ids(
+    workspace_filtered_store_account_ids: Vec<String>,
+    lease_state: AccountRateLimitRefreshLeaseState<'_>,
+) -> AccountRateLimitRefreshRoster {
+    let status = match lease_state {
+        AccountRateLimitRefreshLeaseState::LeaseManaged(_) => {
+            AccountRateLimitRefreshRosterStatus::LeaseManaged
+        }
+        AccountRateLimitRefreshLeaseState::NoLeaseOwner => {
+            AccountRateLimitRefreshRosterStatus::NoLeaseOwner
+        }
+        AccountRateLimitRefreshLeaseState::LeaseReadFailed => {
+            AccountRateLimitRefreshRosterStatus::LeaseReadFailed
+        }
+    };
+    let store_account_ids = match lease_state {
+        AccountRateLimitRefreshLeaseState::LeaseManaged(leased_by_other_store_account_ids) => {
+            workspace_filtered_store_account_ids
+                .into_iter()
+                .filter(|account_id| !leased_by_other_store_account_ids.contains(account_id))
+                .collect()
+        }
+        AccountRateLimitRefreshLeaseState::NoLeaseOwner => workspace_filtered_store_account_ids,
+        AccountRateLimitRefreshLeaseState::LeaseReadFailed => Vec::new(),
+    };
+    AccountRateLimitRefreshRoster {
+        store_account_ids,
+        status,
     }
 }
 

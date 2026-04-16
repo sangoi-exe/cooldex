@@ -1567,6 +1567,79 @@ fn switching_active_account_releases_previous_lease_for_other_sessions() {
 }
 
 #[test]
+fn account_rate_limit_refresh_roster_excludes_accounts_leased_by_other_sessions() {
+    let codex_home = tempdir().unwrap();
+    let primary_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-a", "org-b"], 0);
+    let secondary_store_account_id =
+        test_store_account_id("org-b").expect("secondary store account id");
+    let manager_a = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let manager_b = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    let roster_a = manager_a.account_rate_limit_refresh_roster();
+    assert_eq!(
+        roster_a.status,
+        AccountRateLimitRefreshRosterStatus::LeaseManaged
+    );
+    assert_eq!(roster_a.store_account_ids, vec![primary_store_account_id]);
+
+    let roster_b = manager_b.account_rate_limit_refresh_roster();
+    assert_eq!(
+        roster_b.status,
+        AccountRateLimitRefreshRosterStatus::LeaseManaged
+    );
+    assert_eq!(roster_b.store_account_ids, vec![secondary_store_account_id]);
+}
+
+#[test]
+fn account_rate_limit_refresh_roster_uses_workspace_filtered_ids_without_lease_owner() {
+    let codex_home = tempdir().unwrap();
+    let sqlite_home_parent = tempdir().unwrap();
+    let sqlite_home = sqlite_home_parent.path().join("sqlite-home-file");
+    std::fs::write(sqlite_home.as_path(), "not a directory").expect("seed invalid sqlite home");
+    persist_test_chatgpt_accounts(codex_home.path(), &["org-a", "org-b"], 0);
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home,
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    manager.set_forced_chatgpt_workspace_id(Some("org-b".to_string()));
+
+    let roster = manager.account_rate_limit_refresh_roster();
+    assert_eq!(
+        roster.status,
+        AccountRateLimitRefreshRosterStatus::NoLeaseOwner
+    );
+    assert_eq!(
+        roster.store_account_ids,
+        vec![test_store_account_id("org-b").expect("workspace-filtered account id")],
+    );
+}
+
+#[test]
+fn account_rate_limit_refresh_roster_filter_fails_closed_on_lease_read_failure() {
+    let roster = account_rate_limit_refresh_roster_from_workspace_filtered_ids(
+        vec!["account-a".to_string(), "account-b".to_string()],
+        AccountRateLimitRefreshLeaseState::LeaseReadFailed,
+    );
+    assert_eq!(
+        roster.status,
+        AccountRateLimitRefreshRosterStatus::LeaseReadFailed
+    );
+    assert_eq!(roster.store_account_ids, Vec::<String>::new());
+}
+
+#[test]
 fn guarded_reload_strips_persisted_active_account_after_supported_plan_prune() {
     let codex_home = tempdir().unwrap();
     let active_store_account_id = persist_test_chatgpt_accounts(codex_home.path(), &["org-a"], 0);

@@ -12,6 +12,7 @@ use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::params;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -332,6 +333,29 @@ ON CONFLICT(account_id) DO UPDATE SET
             load_unexpired_lease_conflict(&connection, account_id, session_id, now.timestamp())?
                 .is_some(),
         )
+    }
+
+    pub fn account_ids_leased_by_other(
+        &self,
+        session_id: &str,
+        account_ids: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<HashSet<String>> {
+        if account_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let connection = self.lock_connection()?;
+        let now_epoch = now.timestamp();
+        let mut leased_account_ids = HashSet::new();
+        for account_id in account_ids {
+            if load_unexpired_lease_conflict(&connection, account_id, session_id, now_epoch)?
+                .is_some()
+            {
+                leased_account_ids.insert(account_id.clone());
+            }
+        }
+        Ok(leased_account_ids)
     }
 
     fn lock_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
@@ -685,5 +709,37 @@ mod tests {
                 .expect("row should be cleared after lost lease"),
             SessionActiveAccountRefresh::None
         );
+    }
+
+    #[test]
+    fn account_ids_leased_by_other_returns_only_live_foreign_leases() {
+        let sqlite_home = TempDir::new().expect("tempdir");
+        let store = AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open store");
+        let now = fixed_now();
+
+        store
+            .set_session_active_account("session-a", "account-a", now, 300)
+            .expect("assign foreign live lease");
+        store
+            .set_session_active_account("session-b", "account-b", now, 300)
+            .expect("assign owned live lease");
+        store
+            .set_session_active_account("session-c", "account-c", now, 60)
+            .expect("assign expiring foreign lease");
+
+        let leased_account_ids = store
+            .account_ids_leased_by_other(
+                "session-b",
+                &[
+                    "account-a".to_string(),
+                    "account-b".to_string(),
+                    "account-c".to_string(),
+                    "account-d".to_string(),
+                ],
+                now + chrono::Duration::seconds(61),
+            )
+            .expect("load bulk lease conflicts");
+
+        assert_eq!(leased_account_ids, HashSet::from(["account-a".to_string()]),);
     }
 }

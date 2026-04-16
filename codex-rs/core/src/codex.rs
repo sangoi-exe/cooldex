@@ -79,6 +79,8 @@ use codex_hooks::HookResult;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
 use codex_login::AccountRateLimitRefreshOutcome;
+use codex_login::AccountRateLimitRefreshRoster;
+use codex_login::AccountRateLimitRefreshRosterStatus;
 use codex_login::AuthManager;
 use codex_login::ChatgptAccountAuthResolution;
 use codex_login::ChatgptAccountRefreshMode;
@@ -8795,6 +8797,16 @@ pub(crate) async fn maybe_emit_transport_fallback_warning_for_execution_mode(
 // Merge-safety anchor: usage-limit auto-switch must carry just-refreshed explicit unsupported
 // proof from `/api/codex/usage` into the same auth-store mutation that selects the fallback
 // account; ambiguous `Unknown` accounts must never enter this set.
+fn auto_switch_refresh_account_ids_from_roster(
+    roster: AccountRateLimitRefreshRoster,
+) -> Option<Vec<String>> {
+    match roster.status {
+        AccountRateLimitRefreshRosterStatus::LeaseManaged
+        | AccountRateLimitRefreshRosterStatus::NoLeaseOwner => Some(roster.store_account_ids),
+        AccountRateLimitRefreshRosterStatus::LeaseReadFailed => None,
+    }
+}
+
 async fn refresh_accounts_rate_limits_before_auto_switch(
     sess: &Session,
     turn_context: &TurnContext,
@@ -8803,11 +8815,14 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
         return AutoSwitchRefreshState::default();
     }
 
-    let account_summaries = sess.services.auth_manager.list_accounts();
-    let account_ids = account_summaries
-        .iter()
-        .map(|account| account.id.clone())
-        .collect::<Vec<_>>();
+    let refresh_roster = sess
+        .services
+        .auth_manager
+        .account_rate_limit_refresh_roster();
+    let Some(account_ids) = auto_switch_refresh_account_ids_from_roster(refresh_roster) else {
+        warn!("failed to load lease-aware refresh roster before usage-limit auto-switch");
+        return AutoSwitchRefreshState::default();
+    };
     if account_ids.is_empty() {
         return AutoSwitchRefreshState::default();
     }

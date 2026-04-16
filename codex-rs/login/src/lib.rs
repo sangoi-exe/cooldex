@@ -23,6 +23,8 @@ pub use server::run_login_server;
 // consumed by login flows and tests after the auth crate extraction.
 pub use api_bridge::auth_provider_from_auth;
 pub use auth::AccountRateLimitRefreshOutcome;
+pub use auth::AccountRateLimitRefreshRoster;
+pub use auth::AccountRateLimitRefreshRosterStatus;
 pub use auth::AccountSummary;
 pub use auth::AccountUsageCache;
 pub use auth::AuthConfig;

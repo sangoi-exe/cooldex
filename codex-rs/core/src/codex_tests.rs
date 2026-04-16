@@ -2240,6 +2240,31 @@ fn visible_usage_limit_retry_allows_changed_active_account_without_explicit_unsu
 }
 
 #[test]
+fn auto_switch_refresh_account_ids_from_roster_retains_only_refreshable_candidates() {
+    assert_eq!(
+        auto_switch_refresh_account_ids_from_roster(codex_login::AccountRateLimitRefreshRoster {
+            store_account_ids: vec!["account-a".to_string(), "account-b".to_string()],
+            status: codex_login::AccountRateLimitRefreshRosterStatus::LeaseManaged,
+        }),
+        Some(vec!["account-a".to_string(), "account-b".to_string()]),
+    );
+    assert_eq!(
+        auto_switch_refresh_account_ids_from_roster(codex_login::AccountRateLimitRefreshRoster {
+            store_account_ids: vec!["account-a".to_string()],
+            status: codex_login::AccountRateLimitRefreshRosterStatus::NoLeaseOwner,
+        }),
+        Some(vec!["account-a".to_string()]),
+    );
+    assert_eq!(
+        auto_switch_refresh_account_ids_from_roster(codex_login::AccountRateLimitRefreshRoster {
+            store_account_ids: vec!["account-a".to_string()],
+            status: codex_login::AccountRateLimitRefreshRosterStatus::LeaseReadFailed,
+        }),
+        None,
+    );
+}
+
+#[test]
 fn auto_switch_refresh_explicit_unsupported_predicate_rejects_missing_and_unknown_plans() {
     let snapshot = RateLimitSnapshot {
         limit_id: Some("codex".to_string()),
