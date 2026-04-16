@@ -2074,7 +2074,8 @@ async fn visible_usage_limit_retry_marks_failing_account_exhausted_even_when_sta
 }
 
 #[test]
-fn visible_usage_limit_retry_stops_when_changed_active_account_was_freshly_proven_unsupported() {
+fn visible_usage_limit_retry_stops_when_changed_active_account_was_freshly_proven_explicitly_unsupported()
+ {
     let refresh_state = AutoSwitchRefreshState {
         freshly_selectable_store_account_ids: std::collections::HashSet::new(),
         freshly_unsupported_store_account_ids: std::collections::HashSet::from([String::from(
@@ -2091,7 +2092,7 @@ fn visible_usage_limit_retry_stops_when_changed_active_account_was_freshly_prove
 
     assert!(
         !should_retry,
-        "retry should stop once the changed active account was freshly proven unsupported"
+        "retry should stop once the changed active account was freshly proven explicitly unsupported"
     );
 }
 
@@ -2215,8 +2216,31 @@ async fn visible_usage_limit_retry_allows_chatgpt_auth_tokens_mode_with_saved_fa
     );
 }
 
+// Merge-safety anchor: WS12 autoswitch tests in this file must stay aligned with the single
+// login-owned explicit-unsupported predicate so `Unknown` and missing plan data never become
+// durable purge or stale-retry stop signals through a core-local alias.
 #[test]
-fn auto_switch_refresh_does_not_mark_missing_plan_as_unsupported() {
+fn visible_usage_limit_retry_allows_changed_active_account_without_explicit_unsupported_proof() {
+    let refresh_state = AutoSwitchRefreshState {
+        freshly_selectable_store_account_ids: std::collections::HashSet::new(),
+        freshly_unsupported_store_account_ids: std::collections::HashSet::new(),
+    };
+
+    let should_retry = stale_request_should_retry_without_switch(
+        Some("acc-1"),
+        Some("acc-1"),
+        Some("acc-2"),
+        &refresh_state,
+    );
+
+    assert!(
+        should_retry,
+        "retry should continue when the changed active account was not freshly proven explicitly unsupported"
+    );
+}
+
+#[test]
+fn auto_switch_refresh_explicit_unsupported_predicate_rejects_missing_and_unknown_plans() {
     let snapshot = RateLimitSnapshot {
         limit_id: Some("codex".to_string()),
         limit_name: None,
@@ -2227,8 +2251,20 @@ fn auto_switch_refresh_does_not_mark_missing_plan_as_unsupported() {
     };
 
     assert!(
-        !auto_switch_refresh_marks_account_unsupported(&snapshot),
+        !crate::auth::usage_limit_auto_switch_removes_plan_type(snapshot.plan_type.as_ref()),
         "missing plan data must not create a fresh unsupported-account eviction signal"
+    );
+
+    let unknown_snapshot = RateLimitSnapshot {
+        plan_type: Some(codex_protocol::account::PlanType::Unknown),
+        ..snapshot
+    };
+
+    assert!(
+        !crate::auth::usage_limit_auto_switch_removes_plan_type(
+            unknown_snapshot.plan_type.as_ref()
+        ),
+        "unknown plan data must stay ambiguous instead of creating a fresh unsupported-account eviction signal"
     );
 }
 

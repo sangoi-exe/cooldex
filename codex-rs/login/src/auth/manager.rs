@@ -2551,9 +2551,9 @@ impl AuthManager {
                 mutation_now,
             ));
 
-            // Merge-safety anchor: usage-limit auto-switch must purge fallback accounts whose
-            // just-refreshed usage snapshot proves they are `free` or `unknown`, or `/accounts`
-            // can immediately retry into a GPT-5.4-ineligible account.
+            // Merge-safety anchor: usage-limit auto-switch must purge fallback accounts only when
+            // the shared pre-refresh fan-in already proved an explicit unsupported plan; ambiguous
+            // `Unknown` accounts must stay fail-soft in saved accounts instead of being erased.
             let removed_fallback_account_ids = store
                 .accounts
                 .iter()
@@ -4068,10 +4068,7 @@ fn account_matches_required_workspace(
 }
 
 pub fn usage_limit_auto_switch_removes_plan_type(plan_type: Option<&AccountPlanType>) -> bool {
-    matches!(
-        plan_type,
-        Some(AccountPlanType::Free | AccountPlanType::Unknown)
-    )
+    matches!(plan_type, Some(AccountPlanType::Free))
 }
 
 fn account_selectable(

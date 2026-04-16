@@ -542,11 +542,11 @@ async fn auth_manager_reload_prefers_external_ephemeral_chatgpt_tokens() {
 }
 
 #[test]
-fn usage_limit_auto_switch_removes_only_free_and_unknown_plans() {
+fn usage_limit_auto_switch_accepts_only_free_as_explicit_unsupported_proof() {
     assert!(super::usage_limit_auto_switch_removes_plan_type(Some(
         &AccountPlanType::Free
     )));
-    assert!(super::usage_limit_auto_switch_removes_plan_type(Some(
+    assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
         &AccountPlanType::Unknown
     )));
     assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
@@ -566,6 +566,12 @@ fn usage_limit_auto_switch_removes_only_free_and_unknown_plans() {
     )));
     assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
         &AccountPlanType::Enterprise
+    )));
+    assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+        &AccountPlanType::SelfServeBusinessUsageBased
+    )));
+    assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
+        &AccountPlanType::EnterpriseCbpUsageBased
     )));
     assert!(!super::usage_limit_auto_switch_removes_plan_type(Some(
         &AccountPlanType::Edu
@@ -712,7 +718,77 @@ fn mark_usage_limit_reached_clamps_matched_weekly_window_to_zero() {
 }
 
 #[test]
-fn cooldown_still_purges_freshly_unsupported_fallbacks_and_marks_failing_account() {
+fn cooldown_does_not_purge_ambiguous_unknown_fallbacks_and_marks_failing_account() {
+    let codex_home = tempdir().unwrap();
+    let active_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-primary", "org-fallback"], 0);
+    let fallback_store_account_id =
+        test_store_account_id("org-fallback").expect("fallback store account id");
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    *manager
+        .usage_limit_auto_switch_cooldown_until
+        .lock()
+        .expect("cooldown lock") = Some(Utc::now() + chrono::Duration::seconds(30));
+
+    let switched_to = manager
+        .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
+            required_workspace_id: None,
+            failing_store_account_id: Some(active_store_account_id.as_str()),
+            resets_at: None,
+            snapshot: Some(RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    remaining_percent: 100.0,
+                    window_minutes: Some(15),
+                    resets_at: Some((Utc::now() + chrono::Duration::minutes(15)).timestamp()),
+                }),
+                secondary: None,
+                credits: None,
+                plan_type: Some(AccountPlanType::Pro),
+            }),
+            freshly_unsupported_store_account_ids: &HashSet::new(),
+            protected_store_account_id: None,
+            selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+            fallback_selection_mode:
+                UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
+        })
+        .expect("cooldown path should succeed");
+
+    assert_eq!(
+        switched_to, None,
+        "cooldown should still suppress switching"
+    );
+    let accounts = manager.list_accounts();
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id.as_str()),
+        Some(active_store_account_id.as_str())
+    );
+    assert!(
+        accounts
+            .iter()
+            .any(|account| account.id == fallback_store_account_id),
+        "ambiguous fallback accounts must survive when no explicit unsupported proof was refreshed"
+    );
+    assert!(
+        accounts
+            .iter()
+            .find(|account| account.id == active_store_account_id)
+            .and_then(|account| account.exhausted_until)
+            .is_some(),
+        "failing account should still be marked exhausted during cooldown"
+    );
+}
+
+#[test]
+fn cooldown_still_purges_freshly_free_fallbacks_and_marks_failing_account() {
     let codex_home = tempdir().unwrap();
     let active_store_account_id =
         persist_test_chatgpt_accounts(codex_home.path(), &["org-primary", "org-fallback"], 0);
@@ -771,7 +847,7 @@ fn cooldown_still_purges_freshly_unsupported_fallbacks_and_marks_failing_account
         accounts
             .iter()
             .all(|account| account.id != fallback_store_account_id),
-        "freshly unsupported fallback should be purged even during cooldown"
+        "fresh explicit unsupported proof should still purge the fallback even during cooldown"
     );
     assert!(
         accounts

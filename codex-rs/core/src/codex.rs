@@ -8792,8 +8792,9 @@ pub(crate) async fn maybe_emit_transport_fallback_warning_for_execution_mode(
     }
 }
 
-// Merge-safety anchor: usage-limit auto-switch must carry just-refreshed unsupported account ids
-// from `/api/codex/usage` into the same auth-store mutation that selects the fallback account.
+// Merge-safety anchor: usage-limit auto-switch must carry just-refreshed explicit unsupported
+// proof from `/api/codex/usage` into the same auth-store mutation that selects the fallback
+// account; ambiguous `Unknown` accounts must never enter this set.
 async fn refresh_accounts_rate_limits_before_auto_switch(
     sess: &Session,
     turn_context: &TurnContext,
@@ -8926,7 +8927,7 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
             }
         };
         if let Some(snapshot) = snapshot {
-            if auto_switch_refresh_marks_account_unsupported(&snapshot) {
+            if crate::auth::usage_limit_auto_switch_removes_plan_type(snapshot.plan_type.as_ref()) {
                 refresh_state
                     .freshly_unsupported_store_account_ids
                     .insert(store_account_id.clone());
@@ -8972,10 +8973,6 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
     }
 
     refresh_state
-}
-
-fn auto_switch_refresh_marks_account_unsupported(snapshot: &RateLimitSnapshot) -> bool {
-    crate::auth::usage_limit_auto_switch_removes_plan_type(snapshot.plan_type.as_ref())
 }
 
 fn auto_switch_refresh_snapshot_is_selectable(
