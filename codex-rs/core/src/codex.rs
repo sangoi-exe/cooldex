@@ -968,6 +968,8 @@ pub(crate) struct TurnContext {
     pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
     pub(crate) turn_skills: TurnSkillsContext,
     pub(crate) turn_timing_state: Arc<TurnTimingState>,
+    #[cfg(test)]
+    pub(crate) allow_usage_limit_auto_switch_pre_refresh_in_tests: bool,
 }
 impl TurnContext {
     pub(crate) fn model_context_window(&self) -> Option<i64> {
@@ -1086,7 +1088,20 @@ impl TurnContext {
             turn_metadata_state: self.turn_metadata_state.clone(),
             turn_skills: self.turn_skills.clone(),
             turn_timing_state: Arc::clone(&self.turn_timing_state),
+            #[cfg(test)]
+            allow_usage_limit_auto_switch_pre_refresh_in_tests: self
+                .allow_usage_limit_auto_switch_pre_refresh_in_tests,
         }
+    }
+
+    #[cfg(test)]
+    fn usage_limit_auto_switch_pre_refresh_enabled_in_tests(&self) -> bool {
+        self.allow_usage_limit_auto_switch_pre_refresh_in_tests
+    }
+
+    #[cfg(not(test))]
+    fn usage_limit_auto_switch_pre_refresh_enabled_in_tests(&self) -> bool {
+        false
     }
 
     pub(crate) fn resolve_path(&self, path: Option<String>) -> PathBuf {
@@ -1654,6 +1669,8 @@ impl Session {
             turn_metadata_state,
             turn_skills: TurnSkillsContext::new(skills_outcome),
             turn_timing_state: Arc::new(TurnTimingState::default()),
+            #[cfg(test)]
+            allow_usage_limit_auto_switch_pre_refresh_in_tests: false,
         }
     }
 
@@ -6258,6 +6275,8 @@ async fn spawn_review_thread(
         turn_metadata_state,
         turn_skills: TurnSkillsContext::new(parent_turn_context.turn_skills.outcome.clone()),
         turn_timing_state: Arc::new(TurnTimingState::default()),
+        #[cfg(test)]
+        allow_usage_limit_auto_switch_pre_refresh_in_tests: false,
     };
 
     // Seed the child task with the review prompt as the initial user message.
@@ -8811,7 +8830,7 @@ async fn refresh_accounts_rate_limits_before_auto_switch(
     sess: &Session,
     turn_context: &TurnContext,
 ) -> AutoSwitchRefreshState {
-    if cfg!(test) {
+    if cfg!(test) && !turn_context.usage_limit_auto_switch_pre_refresh_enabled_in_tests() {
         return AutoSwitchRefreshState::default();
     }
 

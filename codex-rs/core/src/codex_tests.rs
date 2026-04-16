@@ -2293,6 +2293,300 @@ fn auto_switch_refresh_explicit_unsupported_predicate_rejects_missing_and_unknow
     );
 }
 
+// Merge-safety anchor: core-owned WS12 autoswitch E2E in this file must keep the
+// real `codex-core` pre-refresh path, SQLite lease-aware roster, and one-warning-visible
+// contract aligned so the no-ping-pong proof does not regress back to a login-only seam.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_limit_auto_switch_pre_refresh_stays_default_off_without_test_opt_in() {
+    let (session, mut turn_context, _rx) = make_session_and_context_with_rx().await;
+    let server = MockServer::start().await;
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    let mut config = (*turn_context_mut.config).clone();
+    config.chatgpt_base_url = server.uri();
+    turn_context_mut.config = Arc::new(config);
+
+    Mock::given(method("GET"))
+        .and(path("/api/codex/usage"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let refresh_state =
+        refresh_accounts_rate_limits_before_auto_switch(&session, &turn_context).await;
+
+    assert_eq!(
+        refresh_state.freshly_selectable_store_account_ids,
+        std::collections::HashSet::new()
+    );
+    assert_eq!(
+        refresh_state.freshly_unsupported_store_account_ids,
+        std::collections::HashSet::new()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn visible_usage_limit_core_pre_refresh_respects_foreign_leases_until_release() {
+    let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let server = MockServer::start().await;
+    let observed_refresh_account_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let auth_home = tempfile::tempdir().expect("create auth tempdir");
+
+    let mut acc_0_tokens = test_chatgpt_token_data("acc-0");
+    acc_0_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_0_tokens.id_token.raw_jwt)
+            .expect("parse acc-0 id token");
+    let acc_0_store_account_id = acc_0_tokens
+        .preferred_store_account_id()
+        .expect("acc-0 store account id");
+
+    let mut acc_1_tokens = test_chatgpt_token_data("acc-1");
+    acc_1_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_1_tokens.id_token.raw_jwt)
+            .expect("parse acc-1 id token");
+    let acc_1_store_account_id = acc_1_tokens
+        .preferred_store_account_id()
+        .expect("acc-1 store account id");
+
+    let mut acc_2_tokens = test_chatgpt_token_data("acc-2");
+    acc_2_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_2_tokens.id_token.raw_jwt)
+            .expect("parse acc-2 id token");
+    let acc_2_store_account_id = acc_2_tokens
+        .preferred_store_account_id()
+        .expect("acc-2 store account id");
+
+    let auth_store = crate::auth::AuthStore {
+        active_account_id: Some(acc_0_store_account_id.clone()),
+        accounts: vec![
+            crate::auth::StoredAccount {
+                id: acc_0_store_account_id.clone(),
+                label: Some("Account A".to_string()),
+                tokens: acc_0_tokens,
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+            crate::auth::StoredAccount {
+                id: acc_1_store_account_id.clone(),
+                label: Some("Account B".to_string()),
+                tokens: acc_1_tokens,
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+            crate::auth::StoredAccount {
+                id: acc_2_store_account_id.clone(),
+                label: Some("Account C".to_string()),
+                tokens: acc_2_tokens,
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+        ],
+        ..crate::auth::AuthStore::default()
+    };
+    crate::auth::save_auth(
+        auth_home.path(),
+        &auth_store,
+        crate::auth::AuthCredentialsStoreMode::File,
+    )
+    .expect("persist auth store");
+
+    let manager_a = AuthManager::shared(
+        auth_home.path().to_path_buf(),
+        false,
+        crate::auth::AuthCredentialsStoreMode::File,
+    );
+    let manager_b = AuthManager::shared(
+        auth_home.path().to_path_buf(),
+        false,
+        crate::auth::AuthCredentialsStoreMode::File,
+    );
+
+    assert_eq!(
+        manager_a
+            .active_chatgpt_account_summary()
+            .expect("primary session active account")
+            .store_account_id,
+        acc_0_store_account_id
+    );
+    assert_eq!(
+        manager_b
+            .active_chatgpt_account_summary()
+            .expect("secondary session active account")
+            .store_account_id,
+        acc_1_store_account_id
+    );
+
+    let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
+    session_mut.services.auth_manager = Arc::clone(&manager_a);
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.auth_manager = Some(Arc::clone(&manager_a));
+    let mut config = (*turn_context_mut.config).clone();
+    config.chatgpt_base_url = server.uri();
+    turn_context_mut.config = Arc::new(config);
+    turn_context_mut.allow_usage_limit_auto_switch_pre_refresh_in_tests = true;
+
+    Mock::given(method("GET"))
+        .and(path("/api/codex/usage"))
+        .respond_with(UsageLimitRefreshSequenceResponder {
+            calls: AtomicUsize::new(0),
+            observed_account_ids: Arc::clone(&observed_refresh_account_ids),
+        })
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let phase_1_usage_limit = UsageLimitReachedError {
+        plan_type: Some(codex_protocol::auth::PlanType::Known(
+            codex_protocol::auth::KnownPlan::Pro,
+        )),
+        resets_at: Some(Utc::now() + chrono::Duration::minutes(15)),
+        rate_limits: Some(Box::new(RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                remaining_percent: 0.0,
+                window_minutes: Some(15),
+                resets_at: Some((Utc::now() + chrono::Duration::minutes(15)).timestamp()),
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: Some(codex_protocol::account::PlanType::Pro),
+        })),
+        promo_message: None,
+    };
+
+    let phase_1_retry = maybe_auto_switch_account_on_usage_limit(
+        &session,
+        &turn_context,
+        &phase_1_usage_limit,
+        Some(acc_0_store_account_id.as_str()),
+        UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch,
+    )
+    .await
+    .expect("phase-1 core pre-refresh should auto-switch");
+
+    assert!(phase_1_retry);
+    assert_eq!(
+        manager_a
+            .active_chatgpt_account_summary()
+            .expect("primary session should move to the unleased fallback")
+            .store_account_id,
+        acc_2_store_account_id
+    );
+    assert_eq!(
+        observed_refresh_account_ids
+            .lock()
+            .expect("phase-1 refresh headers should be readable")
+            .clone(),
+        vec!["acc-0".to_string(), "acc-2".to_string()]
+    );
+    let phase_1_message = match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout waiting for phase-1 warning")
+        .expect("phase-1 warning")
+        .msg
+    {
+        EventMsg::Warning(WarningEvent { message }) => message,
+        other => panic!("expected phase-1 warning event, got {other:?}"),
+    };
+    assert_eq!(
+        phase_1_message,
+        "Usage limit reached for account 'Account A'. Auto-switched to account 'Account C' and retrying."
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "phase-1 core auto-switch should emit exactly one warning event"
+    );
+
+    manager_b
+        .set_active_account(&acc_0_store_account_id)
+        .expect("secondary session should take the released primary account");
+    assert_eq!(
+        manager_b
+            .active_chatgpt_account_summary()
+            .expect("secondary session should now hold Account A")
+            .store_account_id,
+        acc_0_store_account_id
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let phase_2_usage_limit = UsageLimitReachedError {
+        plan_type: Some(codex_protocol::auth::PlanType::Known(
+            codex_protocol::auth::KnownPlan::Pro,
+        )),
+        resets_at: Some(Utc::now() + chrono::Duration::minutes(15)),
+        rate_limits: Some(Box::new(RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                remaining_percent: 0.0,
+                window_minutes: Some(15),
+                resets_at: Some((Utc::now() + chrono::Duration::minutes(15)).timestamp()),
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: Some(codex_protocol::account::PlanType::Pro),
+        })),
+        promo_message: None,
+    };
+
+    let phase_2_retry = maybe_auto_switch_account_on_usage_limit(
+        &session,
+        &turn_context,
+        &phase_2_usage_limit,
+        Some(acc_2_store_account_id.as_str()),
+        UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch,
+    )
+    .await
+    .expect("phase-2 core pre-refresh should auto-switch after lease release");
+
+    assert!(phase_2_retry);
+    assert_eq!(
+        manager_a
+            .active_chatgpt_account_summary()
+            .expect("primary session should now move onto the released account")
+            .store_account_id,
+        acc_1_store_account_id
+    );
+    let observed_refresh_account_ids = observed_refresh_account_ids
+        .lock()
+        .expect("phase-2 refresh headers should be readable")
+        .clone();
+    assert_eq!(
+        observed_refresh_account_ids,
+        vec![
+            "acc-0".to_string(),
+            "acc-2".to_string(),
+            "acc-1".to_string(),
+            "acc-2".to_string(),
+        ]
+    );
+    assert_eq!(
+        observed_refresh_account_ids[2..].to_vec(),
+        vec!["acc-1".to_string(), "acc-2".to_string()]
+    );
+    let phase_2_message = match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout waiting for phase-2 warning")
+        .expect("phase-2 warning")
+        .msg
+    {
+        EventMsg::Warning(WarningEvent { message }) => message,
+        other => panic!("expected phase-2 warning event, got {other:?}"),
+    };
+    assert_eq!(
+        phase_2_message,
+        "Usage limit reached for account 'Account C'. Auto-switched to account 'Account B' and retrying."
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "phase-2 core auto-switch should emit exactly one warning event"
+    );
+}
+
 // Merge-safety anchor: prompt_gc tests in this file must stay aligned with the
 // summary-only hidden contract, override rejection, recovery path, and fail-loud
 // schema enforcement.
@@ -3251,6 +3545,61 @@ impl Respond for PromptGcRetryResponder {
                 .set_body_string(self.response_body.clone()),
             call_num => panic!("unexpected extra prompt_gc request {call_num}"),
         }
+    }
+}
+
+struct UsageLimitRefreshSequenceResponder {
+    calls: AtomicUsize,
+    observed_account_ids: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Respond for UsageLimitRefreshSequenceResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let account_id = request
+            .headers
+            .get("chatgpt-account-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("chatgpt-account-id header")
+            .to_string();
+        let authorization = request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .expect("authorization header")
+            .to_string();
+        let (expected_account_id, used_percent) = match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => ("acc-0", 100),
+            1 => ("acc-2", 0),
+            2 => ("acc-1", 0),
+            3 => ("acc-2", 100),
+            call_num => panic!("unexpected extra usage refresh request {call_num}"),
+        };
+        assert_eq!(account_id, expected_account_id);
+        assert_eq!(
+            authorization,
+            format!("Bearer access-{expected_account_id}")
+        );
+        self.observed_account_ids
+            .lock()
+            .expect("observed usage refresh headers should be writable")
+            .push(account_id);
+
+        let reset_at = (Utc::now() + chrono::Duration::minutes(15)).timestamp();
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/json")
+            .set_body_json(json!({
+                "plan_type": "pro",
+                "rate_limit": {
+                    "allowed": used_percent < 100,
+                    "limit_reached": used_percent >= 100,
+                    "primary_window": {
+                        "used_percent": used_percent,
+                        "limit_window_seconds": 900,
+                        "reset_after_seconds": 900,
+                        "reset_at": reset_at,
+                    }
+                }
+            }))
     }
 }
 
