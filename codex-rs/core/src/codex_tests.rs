@@ -2097,7 +2097,8 @@ fn visible_usage_limit_retry_stops_when_changed_active_account_was_freshly_prove
 }
 
 #[tokio::test]
-async fn visible_usage_limit_retry_allows_chatgpt_auth_tokens_mode_with_saved_fallbacks() {
+async fn visible_usage_limit_retry_prefers_managed_auth_when_saved_fallbacks_and_external_tokens_both_exist()
+ {
     let (mut session, mut turn_context, _rx) = make_session_and_context_with_rx().await;
     let auth_home = tempfile::tempdir().expect("create auth tempdir");
 
@@ -2138,10 +2139,14 @@ async fn visible_usage_limit_retry_allows_chatgpt_auth_tokens_mode_with_saved_fa
     };
     crate::auth::save_auth(
         auth_home.path(),
-        &auth_store,
+        &crate::auth::AuthStore {
+            active_account_id: None,
+            accounts: auth_store.accounts.clone(),
+            ..crate::auth::AuthStore::default()
+        },
         crate::auth::AuthCredentialsStoreMode::File,
     )
-    .expect("persist auth store");
+    .expect("persist auth store without a managed active account");
     crate::auth::save_auth(
         auth_home.path(),
         &crate::auth::AuthStore {
@@ -2160,7 +2165,7 @@ async fn visible_usage_limit_retry_allows_chatgpt_auth_tokens_mode_with_saved_fa
     );
     assert_eq!(
         auth_manager.auth_mode(),
-        Some(crate::auth::AuthMode::ChatgptAuthTokens)
+        Some(crate::auth::AuthMode::Chatgpt)
     );
 
     let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
@@ -2203,7 +2208,7 @@ async fn visible_usage_limit_retry_allows_chatgpt_auth_tokens_mode_with_saved_fa
         UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch,
     )
     .await
-    .expect("usage-limit retry should switch when ChatgptAuthTokens auth is active");
+    .expect("usage-limit retry should switch when the mixed roster stays on managed auth");
 
     assert!(should_retry);
     let accounts = auth_manager.list_accounts();

@@ -1456,6 +1456,11 @@ struct LoadedCachedStore {
     store_origin: CachedStoreOrigin,
 }
 
+struct LoadedStoreCandidate {
+    store: AuthStore,
+    store_origin: CachedStoreOrigin,
+}
+
 #[derive(Clone)]
 struct AuthScopedRefreshFailure {
     auth: CodexAuth,
@@ -3121,81 +3126,76 @@ impl AuthManager {
                     AuthCredentialsStoreMode::Ephemeral,
                 )
             });
-
-        let (mut store, store_origin, persist_storage) = match external_storage.as_ref() {
-            Some(external_storage) => match external_storage.load() {
-                Ok(Some(store)) if !store.accounts.is_empty() || store.openai_api_key.is_some() => {
-                    (
-                        store,
-                        CachedStoreOrigin::ExternalEphemeral,
-                        Arc::clone(external_storage),
-                    )
-                }
-                Ok(Some(_)) | Ok(None) => match storage.load() {
-                    Ok(Some(store)) => (store, CachedStoreOrigin::Persistent, Arc::clone(storage)),
-                    Ok(None) => (
-                        AuthStore::default(),
-                        CachedStoreOrigin::Persistent,
-                        Arc::clone(storage),
-                    ),
+        let persistent_store = match storage.load() {
+            Ok(Some(store)) => store,
+            Ok(None) => AuthStore::default(),
+            Err(err) => {
+                tracing::warn!("Failed to load auth store: {err}");
+                AuthStore::default()
+            }
+        };
+        let persistent_origin =
+            if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
+                CachedStoreOrigin::ExternalEphemeral
+            } else {
+                CachedStoreOrigin::Persistent
+            };
+        let persistent_candidate = Self::prepare_loaded_store_candidate(
+            persistent_store,
+            Arc::clone(storage),
+            persistent_origin,
+            account_state_store,
+            runtime_session_id,
+            required_workspace_id,
+        );
+        let external_candidate =
+            external_storage
+                .as_ref()
+                .and_then(|external_storage| match external_storage.load() {
+                    Ok(Some(store))
+                        if !store.accounts.is_empty() || store.openai_api_key.is_some() =>
+                    {
+                        Some(Self::prepare_loaded_store_candidate(
+                            store,
+                            Arc::clone(external_storage),
+                            CachedStoreOrigin::ExternalEphemeral,
+                            account_state_store,
+                            runtime_session_id,
+                            required_workspace_id,
+                        ))
+                    }
+                    Ok(Some(_)) | Ok(None) => None,
                     Err(err) => {
-                        tracing::warn!("Failed to load auth store: {err}");
-                        (
-                            AuthStore::default(),
-                            CachedStoreOrigin::Persistent,
-                            Arc::clone(storage),
-                        )
+                        tracing::warn!("Failed to load external auth store: {err}");
+                        None
                     }
-                },
-                Err(err) => {
-                    tracing::warn!("Failed to load external auth store: {err}");
-                    match storage.load() {
-                        Ok(Some(store)) => {
-                            (store, CachedStoreOrigin::Persistent, Arc::clone(storage))
-                        }
-                        Ok(None) => (
-                            AuthStore::default(),
-                            CachedStoreOrigin::Persistent,
-                            Arc::clone(storage),
-                        ),
-                        Err(err) => {
-                            tracing::warn!("Failed to load auth store: {err}");
-                            (
-                                AuthStore::default(),
-                                CachedStoreOrigin::Persistent,
-                                Arc::clone(storage),
-                            )
-                        }
-                    }
-                }
-            },
-            None => match storage.load() {
-                Ok(Some(store)) => {
-                    let store_origin =
-                        if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
-                            CachedStoreOrigin::ExternalEphemeral
-                        } else {
-                            CachedStoreOrigin::Persistent
-                        };
-                    (store, store_origin, Arc::clone(storage))
-                }
-                Ok(None) => (
-                    AuthStore::default(),
-                    CachedStoreOrigin::Persistent,
-                    Arc::clone(storage),
-                ),
-                Err(err) => {
-                    tracing::warn!("Failed to load auth store: {err}");
-                    (
-                        AuthStore::default(),
-                        CachedStoreOrigin::Persistent,
-                        Arc::clone(storage),
-                    )
-                }
-            },
+                });
+
+        let selected = if auth_credentials_store_mode != AuthCredentialsStoreMode::Ephemeral
+            && persistent_candidate.store.active_account().is_some()
+        {
+            persistent_candidate
+        } else if let Some(external_candidate) = external_candidate {
+            external_candidate
+        } else {
+            persistent_candidate
         };
 
-        let loaded_had_persisted_active_account = store.active_account_id.is_some();
+        LoadedCachedStore {
+            store: selected.store,
+            store_origin: selected.store_origin,
+        }
+    }
+
+    fn prepare_loaded_store_candidate(
+        mut store: AuthStore,
+        persist_storage: Arc<dyn AuthStorageBackend>,
+        store_origin: CachedStoreOrigin,
+        account_state_store: Option<&AccountStateStore>,
+        runtime_session_id: &str,
+        required_workspace_id: Option<&str>,
+    ) -> LoadedStoreCandidate {
+        let loaded_had_active_account = store.active_account_id.is_some();
         let removed_account_ids = enforce_supported_chatgpt_auth_accounts(&mut store);
         let mut sync_outcome = UsageStateSyncOutcome::default();
         if let Some(account_state_store) = account_state_store {
@@ -3231,7 +3231,7 @@ impl AuthManager {
         }
         if (sync_outcome.strip_persisted_auth_store
             || !removed_account_ids.is_empty()
-            || (account_state_store.is_some() && loaded_had_persisted_active_account))
+            || (account_state_store.is_some() && loaded_had_active_account))
             && let Err(error) = persist_auth_store(
                 &*persist_storage,
                 &store,
@@ -3244,7 +3244,7 @@ impl AuthManager {
             );
         }
 
-        LoadedCachedStore {
+        LoadedStoreCandidate {
             store,
             store_origin,
         }

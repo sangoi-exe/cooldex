@@ -541,6 +541,58 @@ async fn auth_manager_reload_prefers_external_ephemeral_chatgpt_tokens() {
     );
 }
 
+#[tokio::test]
+#[serial(codex_api_key)]
+async fn auth_manager_reload_prefers_persisted_chatgpt_auth_when_external_tokens_also_exist() {
+    let codex_home = tempdir().unwrap();
+    let persisted_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-persisted"], 0);
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let access_token =
+        make_test_chatgpt_jwt(Some("pro".to_string()), Some("org-external".to_string()))
+            .expect("jwt");
+
+    super::login_with_chatgpt_auth_tokens(
+        codex_home.path(),
+        &access_token,
+        "org-external",
+        Some("pro"),
+        None,
+    )
+    .expect("external auth should save");
+    manager.set_external_auth(Arc::new(FailingExternalChatgptAuth {
+        error: RefreshTokenFailedError::new(
+            RefreshTokenFailedReason::Revoked,
+            "refresh token invalidated",
+        ),
+    }));
+
+    assert!(
+        !manager.reload(),
+        "reload should keep the persisted managed auth selected"
+    );
+
+    let cached = manager
+        .auth_cached()
+        .expect("persisted managed auth should remain cached");
+    assert_eq!(cached.api_auth_mode(), AuthMode::Chatgpt);
+    assert_eq!(
+        cached
+            .active_chatgpt_account_summary()
+            .expect("persisted account summary")
+            .store_account_id,
+        persisted_store_account_id
+    );
+    assert_eq!(
+        manager.auth().await.map(|auth| auth.api_auth_mode()),
+        Some(AuthMode::Chatgpt)
+    );
+}
+
 #[test]
 fn usage_limit_auto_switch_accepts_only_free_as_explicit_unsupported_proof() {
     assert!(super::usage_limit_auto_switch_removes_plan_type(Some(
@@ -2040,7 +2092,7 @@ async fn refresh_token_from_authority_succeeds_when_terminal_failure_switches_to
 }
 
 #[tokio::test]
-async fn refresh_token_from_authority_succeeds_when_external_terminal_failure_switches_to_fallback_store_account()
+async fn unauthorized_recovery_prefers_managed_lane_when_external_tokens_and_persisted_auth_both_exist()
  {
     let codex_home = tempdir().unwrap();
     let active_store_account_id =
@@ -2070,74 +2122,26 @@ async fn refresh_token_from_authority_succeeds_when_external_terminal_failure_sw
             "refresh token invalidated",
         ),
     }));
-
-    assert_eq!(manager.auth_mode(), Some(AuthMode::ChatgptAuthTokens));
-
-    manager
-        .refresh_token_from_authority()
-        .await
-        .expect("external refresh should succeed by switching to fallback");
-
-    let cached_auth = manager
+    let auth = manager
         .auth_cached()
-        .expect("fallback auth should be cached");
-    let active_account = cached_auth
-        .active_chatgpt_account_summary()
-        .expect("fallback account should be active");
-    assert_eq!(active_account.store_account_id, fallback_store_account_id);
-    assert_eq!(
-        cached_auth.get_account_id().as_deref(),
-        Some("org-fallback")
+        .expect("managed auth should stay cached");
+    let error = RefreshTokenFailedError::new(
+        RefreshTokenFailedReason::Revoked,
+        "refresh token invalidated",
     );
-
-    let accounts = manager.list_accounts();
-    assert_eq!(accounts.len(), 1);
-    assert_eq!(accounts[0].id, fallback_store_account_id);
-    assert!(accounts[0].is_active);
-    assert!(
-        accounts
-            .iter()
-            .all(|account| account.id != active_store_account_id),
-        "the invalidated account should be removed from the saved store"
-    );
-}
-
-#[tokio::test]
-async fn unauthorized_recovery_succeeds_when_external_terminal_failure_switches_to_fallback() {
-    let codex_home = tempdir().unwrap();
-    let active_store_account_id =
-        persist_test_chatgpt_accounts(codex_home.path(), &["org-primary", "org-fallback"], 0);
-    let fallback_store_account_id =
-        test_store_account_id("org-fallback").expect("fallback store account id");
-    let external_store = AuthStore {
-        active_account_id: Some(active_store_account_id.clone()),
-        accounts: vec![stored_test_chatgpt_account("org-primary", Some(Utc::now()))],
-        ..AuthStore::default()
-    };
-    save_auth(
-        codex_home.path(),
-        &external_store,
-        AuthCredentialsStoreMode::Ephemeral,
-    )
-    .expect("save external auth store");
-
-    let manager = AuthManager::shared(
-        codex_home.path().to_path_buf(),
-        false,
-        AuthCredentialsStoreMode::File,
-    );
-    manager.set_external_auth(Arc::new(FailingExternalChatgptAuth {
-        error: RefreshTokenFailedError::new(
-            RefreshTokenFailedReason::Revoked,
-            "refresh token invalidated",
-        ),
-    }));
+    manager.record_permanent_refresh_failure_if_unchanged(&auth, &error);
 
     let mut recovery = manager.unauthorized_recovery();
+    assert_eq!(recovery.mode_name(), "managed");
+    let reload_result = recovery
+        .next()
+        .await
+        .expect("managed reload step should keep the persisted auth selected");
+    assert_eq!(reload_result.auth_state_changed(), Some(false));
     let refresh_result = recovery
         .next()
         .await
-        .expect("external refresh step should switch to fallback");
+        .expect("managed refresh step should switch to fallback");
     assert_eq!(refresh_result.auth_state_changed(), Some(true));
 
     let accounts = manager.list_accounts();
