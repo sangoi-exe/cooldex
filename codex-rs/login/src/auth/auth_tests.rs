@@ -1567,6 +1567,130 @@ fn switching_active_account_releases_previous_lease_for_other_sessions() {
 }
 
 #[test]
+fn usage_limit_auto_switch_does_not_ping_pong_into_live_foreign_lease_until_released() {
+    let codex_home = tempdir().unwrap();
+    let primary_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-a", "org-b", "org-c"], 0);
+    let secondary_store_account_id =
+        test_store_account_id("org-b").expect("secondary store account id");
+    let tertiary_store_account_id =
+        test_store_account_id("org-c").expect("tertiary store account id");
+    let manager_a = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let manager_b = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let usage_limit_snapshot = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            remaining_percent: 100.0,
+            window_minutes: Some(15),
+            resets_at: Some((Utc::now() + chrono::Duration::minutes(15)).timestamp()),
+        }),
+        secondary: None,
+        credits: None,
+        plan_type: Some(AccountPlanType::Pro),
+    };
+
+    assert_eq!(
+        manager_a
+            .active_chatgpt_account_summary()
+            .expect("primary session active account")
+            .store_account_id,
+        primary_store_account_id
+    );
+    assert_eq!(
+        manager_b
+            .active_chatgpt_account_summary()
+            .expect("secondary session active account")
+            .store_account_id,
+        secondary_store_account_id
+    );
+
+    let switched_to = manager_a
+        .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
+            required_workspace_id: None,
+            failing_store_account_id: Some(primary_store_account_id.as_str()),
+            resets_at: None,
+            snapshot: Some(usage_limit_snapshot.clone()),
+            freshly_unsupported_store_account_ids: &HashSet::new(),
+            protected_store_account_id: None,
+            selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+            fallback_selection_mode:
+                UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
+        })
+        .expect("auto-switch should succeed while a foreign lease is active");
+
+    assert_eq!(
+        switched_to,
+        Some(tertiary_store_account_id.clone()),
+        "foreign live lease must keep the secondary account out of fallback selection"
+    );
+    assert_eq!(
+        manager_a
+            .active_chatgpt_account_summary()
+            .expect("primary session should switch to the unleased fallback")
+            .store_account_id,
+        tertiary_store_account_id
+    );
+    assert_eq!(
+        manager_b
+            .active_chatgpt_account_summary()
+            .expect("secondary session should keep its leased account")
+            .store_account_id,
+        secondary_store_account_id
+    );
+
+    manager_b
+        .set_active_account(&primary_store_account_id)
+        .expect("secondary session should be able to take the released primary account");
+    *manager_a
+        .usage_limit_auto_switch_cooldown_until
+        .lock()
+        .expect("cooldown lock") = None;
+
+    let switched_to = manager_a
+        .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
+            required_workspace_id: None,
+            failing_store_account_id: Some(tertiary_store_account_id.as_str()),
+            resets_at: None,
+            snapshot: Some(usage_limit_snapshot),
+            freshly_unsupported_store_account_ids: &HashSet::new(),
+            protected_store_account_id: None,
+            selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+            fallback_selection_mode:
+                UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
+        })
+        .expect("auto-switch should succeed after the foreign lease is released");
+
+    assert_eq!(
+        switched_to,
+        Some(secondary_store_account_id.clone()),
+        "released account should become the best fallback once the foreign lease is gone"
+    );
+    assert_eq!(
+        manager_a
+            .active_chatgpt_account_summary()
+            .expect("primary session should now hold the released secondary account")
+            .store_account_id,
+        secondary_store_account_id
+    );
+    assert_eq!(
+        manager_b
+            .active_chatgpt_account_summary()
+            .expect("secondary session should keep the manually selected released-primary account")
+            .store_account_id,
+        primary_store_account_id
+    );
+}
+
+#[test]
 fn account_rate_limit_refresh_roster_excludes_accounts_leased_by_other_sessions() {
     let codex_home = tempdir().unwrap();
     let primary_store_account_id =
