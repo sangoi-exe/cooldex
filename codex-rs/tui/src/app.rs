@@ -409,6 +409,13 @@ fn default_exec_approval_decisions(
 /// perceived typing speed for non-backlogged output.
 const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
 
+fn removed_active_account_needs_projection_refresh(
+    active_store_account_id_before_refresh: Option<&str>,
+    removed_store_account_id: &str,
+) -> bool {
+    active_store_account_id_before_refresh == Some(removed_store_account_id)
+}
+
 fn spawn_next_accounts_rate_limit_fetch(
     join_set: &mut tokio::task::JoinSet<AccountsRateLimitFetchOutcome>,
     pending: &mut impl Iterator<Item = String>,
@@ -420,6 +427,9 @@ fn spawn_next_accounts_rate_limit_fetch(
         let base_url = base_url.to_string();
         join_set.spawn(async move {
             let account_id_for_log = store_account_id.clone();
+            let active_store_account_id_before_refresh = auth_manager
+                .active_chatgpt_account_summary()
+                .map(|summary| summary.store_account_id);
             match auth_manager
                 .resolve_chatgpt_auth_for_store_account_id(
                     &store_account_id,
@@ -452,6 +462,7 @@ fn spawn_next_accounts_rate_limit_fetch(
                             ),
                         ),
                         fetch_attempted: true,
+                        projection_refresh_needed: false,
                     }
                 }
                 Ok(ChatgptAccountAuthResolution::Removed { error, .. }) => {
@@ -464,12 +475,17 @@ fn spawn_next_accounts_rate_limit_fetch(
                         store_account_id,
                         refresh_outcome: None,
                         fetch_attempted: false,
+                        projection_refresh_needed: removed_active_account_needs_projection_refresh(
+                            active_store_account_id_before_refresh.as_deref(),
+                            account_id_for_log.as_str(),
+                        ),
                     }
                 }
                 Ok(ChatgptAccountAuthResolution::Missing) => AccountsRateLimitFetchOutcome {
                     store_account_id,
                     refresh_outcome: None,
                     fetch_attempted: false,
+                    projection_refresh_needed: false,
                 },
                 Err(err) => {
                     tracing::warn!(
@@ -481,6 +497,7 @@ fn spawn_next_accounts_rate_limit_fetch(
                         store_account_id,
                         refresh_outcome: Some(AccountRateLimitRefreshOutcome::NoUsableSnapshot),
                         fetch_attempted: true,
+                        projection_refresh_needed: false,
                     }
                 }
             }
@@ -497,8 +514,6 @@ async fn fetch_accounts_rate_limit_updates(
     const MAX_IN_FLIGHT: usize = 4;
     let mut outcomes = Vec::new();
     let mut join_set = tokio::task::JoinSet::new();
-    let mut attempted_fetches = 0usize;
-    let mut successful_fetches = 0usize;
     let mut pending = auth_manager
         .list_accounts()
         .into_iter()
@@ -517,15 +532,7 @@ async fn fetch_accounts_rate_limit_updates(
 
     while let Some(result) = join_set.join_next().await {
         if let Ok(outcome) = result {
-            if outcome.fetch_attempted {
-                attempted_fetches += 1;
-            }
-            if let Some(refresh_outcome) = outcome.refresh_outcome {
-                if matches!(refresh_outcome, AccountRateLimitRefreshOutcome::Snapshot(_)) {
-                    successful_fetches += 1;
-                }
-                outcomes.push((outcome.store_account_id, refresh_outcome));
-            }
+            outcomes.push(outcome);
         }
 
         if spawn_next_accounts_rate_limit_fetch(
@@ -536,23 +543,50 @@ async fn fetch_accounts_rate_limit_updates(
         ) {}
     }
 
-    AccountsRateLimitRefreshResult {
-        outcomes,
-        attempted_fetches,
-        successful_fetches,
-    }
+    accounts_rate_limit_refresh_result_from_outcomes(outcomes)
 }
 
 struct AccountsRateLimitFetchOutcome {
     store_account_id: String,
     refresh_outcome: Option<AccountRateLimitRefreshOutcome>,
     fetch_attempted: bool,
+    projection_refresh_needed: bool,
 }
 
 struct AccountsRateLimitRefreshResult {
     outcomes: Vec<(String, AccountRateLimitRefreshOutcome)>,
     attempted_fetches: usize,
     successful_fetches: usize,
+    projection_refresh_needed: bool,
+}
+
+fn accounts_rate_limit_refresh_result_from_outcomes(
+    outcomes: Vec<AccountsRateLimitFetchOutcome>,
+) -> AccountsRateLimitRefreshResult {
+    let mut refresh_outcomes = Vec::new();
+    let mut attempted_fetches = 0usize;
+    let mut successful_fetches = 0usize;
+    let mut projection_refresh_needed = false;
+
+    for outcome in outcomes {
+        if outcome.fetch_attempted {
+            attempted_fetches += 1;
+        }
+        projection_refresh_needed |= outcome.projection_refresh_needed;
+        if let Some(refresh_outcome) = outcome.refresh_outcome {
+            if matches!(refresh_outcome, AccountRateLimitRefreshOutcome::Snapshot(_)) {
+                successful_fetches += 1;
+            }
+            refresh_outcomes.push((outcome.store_account_id, refresh_outcome));
+        }
+    }
+
+    AccountsRateLimitRefreshResult {
+        outcomes: refresh_outcomes,
+        attempted_fetches,
+        successful_fetches,
+        projection_refresh_needed,
+    }
 }
 
 fn accounts_status_cache_fully_refreshed(
@@ -2010,16 +2044,21 @@ impl App {
             app_event_tx.send(AppEvent::AccountsStatusCacheFetched {
                 updated_accounts,
                 cache_fully_refreshed,
+                projection_refresh_needed: refresh_result.projection_refresh_needed,
             });
         });
     }
 
+    // Merge-safety anchor: `/accounts` refresh completion must compute the batch-owned projection
+    // refresh decision once before any early return so revoked active-account removal cannot lose
+    // the bounded follower-convergence signal.
     fn handle_accounts_status_cache_fetched(
         &mut self,
         updated_accounts: usize,
         cache_fully_refreshed: bool,
+        projection_refresh_needed: bool,
         now: DateTime<Utc>,
-    ) {
+    ) -> bool {
         self.accounts_status_refresh_in_flight = false;
         if updated_accounts > 0 {
             tracing::debug!(updated_accounts, "refreshed account rate limits");
@@ -2028,7 +2067,14 @@ impl App {
                 "account status refresh did not fully refresh all attempted accounts; preserving prior cache freshness state"
             );
         }
+        if projection_refresh_needed {
+            self.refresh_observed_active_store_account_id();
+            if self.live_account_state_owner == LiveAccountStateOwner::AppServerProjection {
+                self.invalidate_rate_limit_state_for_account_change();
+            }
+        }
         self.recompute_accounts_status_cache_expiry(now);
+        let should_refresh_projection = projection_refresh_needed;
         if self.pending_forced_accounts_status_refresh {
             self.pending_forced_accounts_status_refresh = false;
             let show_loading_popup = self.open_accounts_popup_when_cache_ready;
@@ -2037,11 +2083,60 @@ impl App {
                 /*open_popup_when_ready*/ false,
                 show_loading_popup,
             );
-            return;
+            return should_refresh_projection;
         }
         if self.open_accounts_popup_when_cache_ready {
             self.open_accounts_popup_when_cache_ready = false;
             self.chat_widget.open_accounts_popup();
+        }
+        should_refresh_projection
+    }
+
+    async fn complete_accounts_status_cache_fetched(
+        &mut self,
+        updated_accounts: usize,
+        cache_fully_refreshed: bool,
+        projection_refresh_needed: bool,
+        now: DateTime<Utc>,
+        app_server_client: &mut AppServerSession,
+    ) {
+        if self.handle_accounts_status_cache_fetched(
+            updated_accounts,
+            cache_fully_refreshed,
+            projection_refresh_needed,
+            now,
+        ) {
+            self.refresh_app_server_account_projection_after_local_auth_change(
+                app_server_client,
+                AccountProjectionRefreshTrigger::AuthTokenRefresh,
+            )
+            .await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn complete_accounts_status_cache_fetched_with<F, Fut>(
+        &mut self,
+        updated_accounts: usize,
+        cache_fully_refreshed: bool,
+        projection_refresh_needed: bool,
+        now: DateTime<Utc>,
+        load_projection: F,
+    ) where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<AppServerAccountProjection>>,
+    {
+        if self.handle_accounts_status_cache_fetched(
+            updated_accounts,
+            cache_fully_refreshed,
+            projection_refresh_needed,
+            now,
+        ) {
+            self.refresh_app_server_account_projection_after_local_auth_change_with(
+                AccountProjectionRefreshTrigger::AuthTokenRefresh,
+                load_projection,
+            )
+            .await;
         }
     }
 
@@ -5944,12 +6039,16 @@ impl App {
             AppEvent::AccountsStatusCacheFetched {
                 updated_accounts,
                 cache_fully_refreshed,
+                projection_refresh_needed,
             } => {
-                self.handle_accounts_status_cache_fetched(
+                self.complete_accounts_status_cache_fetched(
                     updated_accounts,
                     cache_fully_refreshed,
+                    projection_refresh_needed,
                     Utc::now(),
-                );
+                    app_server,
+                )
+                .await;
             }
             AppEvent::SetActiveAccount { account_id } => {
                 match self.auth_manager.set_active_account(&account_id) {
@@ -8216,6 +8315,75 @@ mod tests {
         assert!(!accounts_status_cache_fully_refreshed(2, 2, false));
     }
 
+    #[test]
+    fn removed_active_account_needs_projection_refresh_only_for_removed_active_account() {
+        assert!(removed_active_account_needs_projection_refresh(
+            Some("account-a"),
+            "account-a",
+        ));
+        assert!(!removed_active_account_needs_projection_refresh(
+            Some("account-a"),
+            "account-b",
+        ));
+        assert!(!removed_active_account_needs_projection_refresh(
+            None,
+            "account-a",
+        ));
+    }
+
+    #[test]
+    fn accounts_rate_limit_refresh_result_sticky_ors_projection_refresh_needed() {
+        let snapshot = RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                remaining_percent: 42.0,
+                window_minutes: Some(60),
+                resets_at: None,
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: None,
+        };
+        let refresh_result = accounts_rate_limit_refresh_result_from_outcomes(vec![
+            AccountsRateLimitFetchOutcome {
+                store_account_id: "account-a".to_string(),
+                refresh_outcome: Some(AccountRateLimitRefreshOutcome::NoUsableSnapshot),
+                fetch_attempted: true,
+                projection_refresh_needed: false,
+            },
+            AccountsRateLimitFetchOutcome {
+                store_account_id: "account-b".to_string(),
+                refresh_outcome: None,
+                fetch_attempted: false,
+                projection_refresh_needed: true,
+            },
+            AccountsRateLimitFetchOutcome {
+                store_account_id: "account-c".to_string(),
+                refresh_outcome: Some(AccountRateLimitRefreshOutcome::Snapshot(snapshot.clone())),
+                fetch_attempted: true,
+                projection_refresh_needed: false,
+            },
+        ]);
+
+        assert_eq!(refresh_result.attempted_fetches, 2);
+        assert_eq!(refresh_result.successful_fetches, 1);
+        assert!(refresh_result.projection_refresh_needed);
+        assert_eq!(
+            refresh_result.outcomes,
+            vec![
+                (
+                    "account-a".to_string(),
+                    AccountRateLimitRefreshOutcome::NoUsableSnapshot,
+                ),
+                (
+                    "account-c".to_string(),
+                    AccountRateLimitRefreshOutcome::Snapshot(snapshot),
+                ),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn accounts_cache_stays_inactive_without_persisted_reset_time() {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
@@ -8314,9 +8482,63 @@ mod tests {
         seed_chatgpt_account_cache(&mut app);
         app.accounts_status_refresh_in_flight = true;
 
-        app.handle_accounts_status_cache_fetched(0, false, Utc::now());
+        assert!(!app.handle_accounts_status_cache_fetched(0, false, false, Utc::now()));
 
         assert_eq!(app.accounts_status_cache_expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn handle_event_accounts_status_cache_fetched_keeps_projection_when_refresh_not_needed()
+    -> Result<()> {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let initial_models = vec![all_model_presets()[0].clone()];
+        let initial_default_model = initial_models[0].model.clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@example.com",
+            PlanType::Plus,
+            initial_models,
+            initial_default_model.clone(),
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+        let terminal = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        let mut tui = crate::tui::Tui::new(terminal);
+        let mut app_server =
+            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+                .await
+                .expect("embedded app server");
+
+        let control = app
+            .handle_event(
+                &mut tui,
+                &mut app_server,
+                AppEvent::AccountsStatusCacheFetched {
+                    updated_accounts: 1,
+                    cache_fully_refreshed: true,
+                    projection_refresh_needed: false,
+                },
+            )
+            .await?;
+
+        assert!(matches!(control, AppRunControl::Continue));
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == "Server Account" && email == "server@example.com" && plan == "Plus"
+        ));
+        assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
+        assert_eq!(app.chat_widget.current_model(), initial_default_model);
+        Ok(())
     }
 
     #[tokio::test]
@@ -9045,6 +9267,409 @@ mod tests {
         assert!(!app.chat_widget.has_chatgpt_account());
         assert_eq!(app.feedback_audience, FeedbackAudience::External);
         assert_eq!(app.chat_widget.current_model(), default_model);
+    }
+
+    #[tokio::test]
+    async fn accounts_status_cache_completion_refreshes_projection_when_active_account_was_removed()
+    {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let initial_models = vec![all_model_presets()[0].clone()];
+        let initial_default_model = initial_models[0].model.clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@example.com",
+            PlanType::Plus,
+            initial_models,
+            initial_default_model,
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        let accounts = app.auth_manager.list_accounts();
+        let active_store_account_id = accounts
+            .iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id.clone())
+            .expect("active account should exist");
+        let fallback_store_account_id = accounts
+            .iter()
+            .find(|account| !account.is_active)
+            .map(|account| account.id.clone())
+            .expect("secondary account should exist");
+        assert!(
+            app.auth_manager
+                .remove_account(&active_store_account_id)
+                .expect("remove active account"),
+            "active account should be removed",
+        );
+
+        let refreshed_models = vec![all_model_presets()[1].clone()];
+        let refreshed_default_model = refreshed_models[0].model.clone();
+        let expected_default_model = refreshed_default_model.clone();
+        let projection_polled = Arc::new(AtomicBool::new(false));
+        let projection_polled_clone = Arc::clone(&projection_polled);
+        app.complete_accounts_status_cache_fetched_with(1, true, true, Utc::now(), move || {
+            let projection_polled = Arc::clone(&projection_polled_clone);
+            let refreshed_models = refreshed_models.clone();
+            let refreshed_default_model = refreshed_default_model.clone();
+            async move {
+                projection_polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(test_chatgpt_account_projection(
+                    "Fallback Account",
+                    "fallback@openai.com",
+                    PlanType::Business,
+                    refreshed_models,
+                    refreshed_default_model,
+                ))
+            }
+        })
+        .await;
+
+        assert!(projection_polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(fallback_store_account_id)
+        );
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == "Fallback Account" && email == "fallback@openai.com" && plan == "Enterprise"
+        ));
+        assert_eq!(
+            app.chat_widget.current_plan_type(),
+            Some(PlanType::Business)
+        );
+        assert!(app.chat_widget.has_chatgpt_account());
+        assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
+        assert_eq!(app.chat_widget.current_model(), expected_default_model);
+    }
+
+    #[tokio::test]
+    async fn accounts_status_cache_completion_refreshes_projection_to_logged_out_when_active_last_account_was_removed()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let store = AuthStore {
+            active_account_id: Some("account-a".to_string()),
+            accounts: vec![chatgpt_account(
+                "account-a",
+                "primary@example.com",
+                Some("Primary"),
+            )],
+            ..AuthStore::default()
+        };
+        save_auth(
+            &app.config.codex_home,
+            &store,
+            app.config.cli_auth_credentials_store_mode,
+        )
+        .expect("save auth store");
+        app.auth_manager = auth_manager_from_config(&app.config);
+        app.auth_manager
+            .reload_strict()
+            .expect("reload seeded auth store");
+        let active_store_account_id = app
+            .auth_manager
+            .list_accounts()
+            .into_iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id)
+            .expect("active account should exist");
+
+        let initial_models = vec![all_model_presets()[0].clone()];
+        let initial_default_model = initial_models[0].model.clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@example.com",
+            PlanType::Plus,
+            initial_models,
+            initial_default_model,
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        assert!(
+            app.auth_manager
+                .remove_account(&active_store_account_id)
+                .expect("remove last account"),
+            "last account should be removed",
+        );
+
+        let available_models = all_model_presets();
+        let default_model = available_models[0].model.clone();
+        let expected_default_model = default_model.clone();
+        let projection_polled = Arc::new(AtomicBool::new(false));
+        let projection_polled_clone = Arc::clone(&projection_polled);
+        app.complete_accounts_status_cache_fetched_with(1, true, true, Utc::now(), move || {
+            let projection_polled = Arc::clone(&projection_polled_clone);
+            let available_models = available_models.clone();
+            let default_model = default_model.clone();
+            async move {
+                projection_polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(AppServerAccountProjection {
+                    account_email: None,
+                    auth_mode: None,
+                    status_account_display: None,
+                    plan_type: None,
+                    requires_openai_auth: false,
+                    default_model,
+                    feedback_audience: FeedbackAudience::External,
+                    has_chatgpt_account: false,
+                    available_models,
+                })
+            }
+        })
+        .await;
+
+        assert!(projection_polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert_eq!(app.observed_active_store_account_id, None);
+        assert!(app.chat_widget.status_account_display().is_none());
+        assert_eq!(app.chat_widget.current_plan_type(), None);
+        assert!(!app.chat_widget.has_chatgpt_account());
+        assert_eq!(app.feedback_audience, FeedbackAudience::External);
+        assert_eq!(app.chat_widget.current_model(), expected_default_model);
+    }
+
+    #[tokio::test]
+    async fn accounts_status_cache_completion_does_not_refresh_projection_when_non_active_account_was_removed()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let initial_models = vec![all_model_presets()[0].clone()];
+        let initial_default_model = initial_models[0].model.clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@example.com",
+            PlanType::Plus,
+            initial_models,
+            initial_default_model.clone(),
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        let accounts = app.auth_manager.list_accounts();
+        let active_store_account_id = accounts
+            .iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id.clone())
+            .expect("active account should exist");
+        let non_active_store_account_id = accounts
+            .iter()
+            .find(|account| !account.is_active)
+            .map(|account| account.id.clone())
+            .expect("secondary account should exist");
+        assert!(
+            app.auth_manager
+                .remove_account(&non_active_store_account_id)
+                .expect("remove non-active account"),
+            "non-active account should be removed",
+        );
+
+        let projection_polled = Arc::new(AtomicBool::new(false));
+        let projection_polled_clone = Arc::clone(&projection_polled);
+        app.complete_accounts_status_cache_fetched_with(1, true, false, Utc::now(), move || {
+            let projection_polled = Arc::clone(&projection_polled_clone);
+            async move {
+                projection_polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(test_chatgpt_account_projection(
+                    "Should Not Load",
+                    "ignore@example.com",
+                    PlanType::Business,
+                    vec![all_model_presets()[1].clone()],
+                    all_model_presets()[1].model.clone(),
+                ))
+            }
+        })
+        .await;
+
+        assert!(!projection_polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(active_store_account_id)
+        );
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == "Server Account" && email == "server@example.com" && plan == "Plus"
+        ));
+        assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
+        assert!(app.chat_widget.has_chatgpt_account());
+        assert_eq!(app.chat_widget.current_model(), initial_default_model);
+    }
+
+    #[tokio::test]
+    async fn accounts_status_cache_completion_preserves_projection_refresh_cue_through_pending_forced_follow_up()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let initial_models = vec![all_model_presets()[0].clone()];
+        let initial_default_model = initial_models[0].model.clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@example.com",
+            PlanType::Plus,
+            initial_models,
+            initial_default_model,
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        let accounts = app.auth_manager.list_accounts();
+        let active_store_account_id = accounts
+            .iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id.clone())
+            .expect("active account should exist");
+        let fallback_store_account_id = accounts
+            .iter()
+            .find(|account| !account.is_active)
+            .map(|account| account.id.clone())
+            .expect("secondary account should exist");
+        assert!(
+            app.auth_manager
+                .remove_account(&active_store_account_id)
+                .expect("remove active account"),
+            "active account should be removed",
+        );
+        let reset_at = Utc::now() + chrono::Duration::minutes(45);
+        app.auth_manager
+            .update_rate_limits_for_account(
+                &fallback_store_account_id,
+                RateLimitSnapshot {
+                    limit_id: Some("codex".to_string()),
+                    limit_name: None,
+                    primary: Some(RateLimitWindow {
+                        remaining_percent: 42.0,
+                        window_minutes: Some(60),
+                        resets_at: Some(reset_at.timestamp()),
+                    }),
+                    secondary: None,
+                    credits: None,
+                    plan_type: None,
+                },
+            )
+            .expect("persist rate-limit snapshot");
+        app.pending_forced_accounts_status_refresh = true;
+
+        let refreshed_models = vec![all_model_presets()[1].clone()];
+        let refreshed_default_model = refreshed_models[0].model.clone();
+        let expected_default_model = refreshed_default_model.clone();
+        let projection_polled = Arc::new(AtomicBool::new(false));
+        let projection_polled_clone = Arc::clone(&projection_polled);
+        app.complete_accounts_status_cache_fetched_with(1, false, true, Utc::now(), move || {
+            let projection_polled = Arc::clone(&projection_polled_clone);
+            let refreshed_models = refreshed_models.clone();
+            let refreshed_default_model = refreshed_default_model.clone();
+            async move {
+                projection_polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(test_chatgpt_account_projection(
+                    "Forced Fallback",
+                    "forced@openai.com",
+                    PlanType::Business,
+                    refreshed_models,
+                    refreshed_default_model,
+                ))
+            }
+        })
+        .await;
+
+        assert!(projection_polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!app.pending_forced_accounts_status_refresh);
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(fallback_store_account_id)
+        );
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == "Forced Fallback" && email == "forced@openai.com" && plan == "Enterprise"
+        ));
+        assert_eq!(
+            app.chat_widget.current_plan_type(),
+            Some(PlanType::Business)
+        );
+        assert_eq!(app.chat_widget.current_model(), expected_default_model);
+    }
+
+    #[tokio::test]
+    async fn accounts_status_cache_completion_does_not_refresh_projection_without_auth_change() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let initial_models = vec![all_model_presets()[0].clone()];
+        let initial_default_model = initial_models[0].model.clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Server Account",
+            "server@example.com",
+            PlanType::Plus,
+            initial_models,
+            initial_default_model.clone(),
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        let active_store_account_id = app
+            .auth_manager
+            .list_accounts()
+            .into_iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id)
+            .expect("active account should exist");
+        let projection_polled = Arc::new(AtomicBool::new(false));
+        let projection_polled_clone = Arc::clone(&projection_polled);
+        app.complete_accounts_status_cache_fetched_with(1, true, false, Utc::now(), move || {
+            let projection_polled = Arc::clone(&projection_polled_clone);
+            async move {
+                projection_polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(test_chatgpt_account_projection(
+                    "Should Not Load",
+                    "ignore@example.com",
+                    PlanType::Business,
+                    vec![all_model_presets()[1].clone()],
+                    all_model_presets()[1].model.clone(),
+                ))
+            }
+        })
+        .await;
+
+        assert!(!projection_polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(active_store_account_id)
+        );
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: Some(plan),
+            }) if label == "Server Account" && email == "server@example.com" && plan == "Plus"
+        ));
+        assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
+        assert_eq!(app.chat_widget.current_model(), initial_default_model);
     }
 
     #[tokio::test]

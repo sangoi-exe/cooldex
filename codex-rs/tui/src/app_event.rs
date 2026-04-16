@@ -370,9 +370,13 @@ pub(crate) enum AppEvent {
     PollAccountsStatusCache,
 
     /// Result of refreshing per-account rate limits cache.
+    /// Merge-safety anchor: `/accounts` refresh completion must carry the batch-owned follower cue
+    /// that tells the TUI when local account refresh removed the active saved account and therefore
+    /// needs the bounded app-server projection refresh owner.
     AccountsStatusCacheFetched {
         updated_accounts: usize,
         cache_fully_refreshed: bool,
+        projection_refresh_needed: bool,
     },
 
     /// Switch the active ChatGPT account in the auth store.
