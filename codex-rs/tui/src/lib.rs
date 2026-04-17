@@ -21,7 +21,7 @@ use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadSortKey as AppServerThreadSortKey;
 use codex_app_server_protocol::ThreadSourceKind;
-use codex_cloud_requirements::cloud_requirements_loader_for_storage;
+use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -366,12 +366,11 @@ async fn start_app_server(
     }
 }
 
-pub(crate) async fn start_app_server_for_picker(
+pub(crate) async fn start_app_server_for_picker_with_auth_manager(
     config: &Config,
     target: &AppServerTarget,
+    auth_manager: Arc<AuthManager>,
 ) -> color_eyre::Result<AppServerSession> {
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false);
     let app_server = start_app_server(
         target,
         EmbeddedAppServerStartArgs {
@@ -386,6 +385,19 @@ pub(crate) async fn start_app_server_for_picker(
     )
     .await?;
     Ok(AppServerSession::new(app_server))
+}
+
+#[cfg(test)]
+pub(crate) async fn start_app_server_for_picker(
+    config: &Config,
+    target: &AppServerTarget,
+) -> color_eyre::Result<AppServerSession> {
+    start_app_server_for_picker_with_auth_manager(
+        config,
+        target,
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -769,11 +781,18 @@ pub async fn run_main(
         .chatgpt_base_url
         .clone()
         .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
-    let cloud_requirements = cloud_requirements_loader_for_storage(
+    // Merge-safety anchor: TUI startup, cloud bootstrap, and post-login/onboarding rebuild must
+    // reuse one lease-bearing `AuthManager` so one visible session does not mint hidden WS12
+    // runtime owners through `cloud_requirements_loader_for_storage(...)`.
+    let startup_auth_manager = AuthManager::shared(
         codex_home.to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         config_toml.cli_auth_credentials_store.unwrap_or_default(),
-        chatgpt_base_url,
+    );
+    let cloud_requirements = cloud_requirements_loader(
+        startup_auth_manager.clone(),
+        chatgpt_base_url.clone(),
+        codex_home.to_path_buf(),
     );
 
     let model_provider_override = if cli.oss {
@@ -988,6 +1007,7 @@ pub async fn run_main(
         config,
         overrides,
         cli_kv_overrides,
+        startup_auth_manager,
         cloud_requirements,
         feedback,
         remote_url,
@@ -1007,6 +1027,7 @@ async fn run_ratatui_app(
     initial_config: Config,
     overrides: ConfigOverrides,
     cli_kv_overrides: Vec<(String, toml::Value)>,
+    startup_auth_manager: Arc<AuthManager>,
     mut cloud_requirements: CloudRequirementsLoader,
     feedback: codex_feedback::CodexFeedback,
     remote_url: Option<String>,
@@ -1057,8 +1078,8 @@ async fn run_ratatui_app(
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
-    let startup_auth_manager =
-        AuthManager::shared_from_config(&initial_config, /*enable_codex_api_key_env*/ false);
+    startup_auth_manager
+        .set_forced_chatgpt_workspace_id(initial_config.forced_chatgpt_workspace_id.clone());
     let mut app_server = Some(
         match start_app_server(
             &app_server_target,
@@ -1146,11 +1167,10 @@ async fn run_ratatui_app(
         // rebuild config. This avoids missing newly available cloud requirements due to login
         // status detection edge cases.
         if show_login_screen && !remote_mode {
-            cloud_requirements = cloud_requirements_loader_for_storage(
-                initial_config.codex_home.clone(),
-                /*enable_codex_api_key_env*/ false,
-                initial_config.cli_auth_credentials_store_mode,
+            cloud_requirements = cloud_requirements_loader(
+                startup_auth_manager.clone(),
                 initial_config.chatgpt_base_url.clone(),
+                initial_config.codex_home.clone(),
             );
         }
 
@@ -1402,11 +1422,9 @@ async fn run_ratatui_app(
 
     let use_alt_screen = determine_alt_screen_mode(no_alt_screen, config.tui_alternate_screen);
     tui.set_alt_screen_enabled(use_alt_screen);
-    let auth_manager = if app_server.is_some() {
-        startup_auth_manager
-    } else {
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
-    };
+    startup_auth_manager
+        .set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
+    let auth_manager = startup_auth_manager.clone();
     let app_server = match app_server {
         Some(app_server) => app_server,
         None => match start_app_server(

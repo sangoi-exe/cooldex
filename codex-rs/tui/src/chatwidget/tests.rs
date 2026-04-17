@@ -3478,6 +3478,20 @@ fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {
     s
 }
 
+fn normalize_vt100_history(text: impl Into<String>) -> String {
+    let mut lines: Vec<String> = normalize_snapshot_paths(text)
+        .lines()
+        .map(|line| line.trim_end().to_string())
+        .collect();
+    while matches!(lines.first(), Some(line) if line.is_empty()) {
+        lines.remove(0);
+    }
+    while matches!(lines.last(), Some(line) if line.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
 #[tokio::test]
 async fn collab_spawn_end_shows_effective_profile_model_and_effort() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
@@ -12057,6 +12071,82 @@ async fn accounts_popup() {
 }
 
 #[tokio::test]
+async fn accounts_popup_foreign_leased_account_opens_force_release_popup() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+
+    let competing_manager = AuthManager::new(
+        chat.config.codex_home.clone(),
+        false,
+        chat.config.cli_auth_credentials_store_mode,
+    );
+    competing_manager
+        .reload_strict()
+        .expect("reload competing auth manager");
+    competing_manager
+        .set_active_account("personal-account")
+        .expect("lease personal account from competing manager");
+
+    chat.open_accounts_popup_at(chrono::Local::now());
+    let popup = render_bottom_popup(&chat, 100);
+    assert_snapshot!("accounts_popup_foreign_lease", popup);
+    assert!(
+        popup.contains("lease: another live session"),
+        "expected the foreign lease to be visible in /accounts:\n{popup}"
+    );
+    assert!(
+        popup.contains("status: leased by another live session"),
+        "expected the foreign lease status to override availability:\n{popup}"
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::OpenForceReleaseAccountPopup { account_id }) if account_id == "personal-account"
+    );
+}
+
+#[tokio::test]
+async fn force_release_account_popup_dispatches_force_release_action() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+    set_chatgpt_auth_with_secondary_account(&mut chat);
+
+    let competing_manager = AuthManager::new(
+        chat.config.codex_home.clone(),
+        false,
+        chat.config.cli_auth_credentials_store_mode,
+    );
+    competing_manager
+        .reload_strict()
+        .expect("reload competing auth manager");
+    competing_manager
+        .set_active_account("personal-account")
+        .expect("lease personal account from competing manager");
+
+    let account = chat
+        .auth_manager
+        .list_accounts()
+        .into_iter()
+        .find(|account| account.id == "personal-account")
+        .expect("personal account should exist");
+
+    chat.open_force_release_account_popup(&account);
+    let popup = render_bottom_popup(&chat, 100);
+    assert_snapshot!("force_release_account_popup", popup);
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::ForceReleaseAccountLease { account_id }) if account_id == "personal-account"
+    );
+}
+
+#[tokio::test]
 async fn accounts_popup_omits_stale_rows_after_attempted_refresh_without_usable_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
     chat.thread_id = Some(ThreadId::new());
@@ -17491,6 +17581,50 @@ async fn chatwidget_tall() {
     assert_snapshot!(normalize_snapshot_paths(
         term.backend().vt100().screen().contents()
     ));
+}
+
+#[tokio::test]
+async fn vt100_history_cell_live_insert_matches_display_lines() {
+    let width: u16 = 88;
+    let vt_height: u16 = 24;
+    let viewport_height: u16 = 8;
+    let backend = VT100Backend::new(width, vt_height);
+    let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+    term.set_viewport_area(Rect::new(
+        0,
+        vt_height.saturating_sub(viewport_height),
+        width,
+        viewport_height,
+    ));
+
+    let source = concat!(
+        "• Está aberto ainda, mas o lado de auth/accounts ficou praticamente fechado.\n\n",
+        "**Workstreams fechados**\n\n",
+        "- `WS12` SQLite/account/autoswitch/lease/sqlite  \n",
+        "  owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:394`\n\n",
+        "**Quase fechado**\n\n",
+        "- `WS1` está com `1` item aberto só:\n",
+        "  - remover os mirrors/detours restantes de config que não são de accounts  \n",
+        "    owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:252`\n",
+    );
+    let mut rendered_markdown = Vec::new();
+    crate::markdown::append_markdown(
+        source,
+        /*width*/ None,
+        Some(test_project_path().as_path()),
+        &mut rendered_markdown,
+    );
+    let cell =
+        crate::history_cell::AgentMessageCell::new(rendered_markdown, /*is_first_line*/ true);
+    let display_lines = cell.display_lines(width);
+
+    crate::insert_history::insert_history_display_lines(&mut term, display_lines.clone())
+        .expect("Failed to insert prewrapped history lines");
+
+    let expected = normalize_vt100_history(lines_to_single_string(&display_lines));
+    let actual = normalize_vt100_history(term.backend().vt100().screen().contents());
+
+    assert_eq!(actual, expected);
 }
 
 #[tokio::test]

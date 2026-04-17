@@ -239,6 +239,9 @@ pub enum TuiEvent {
     Draw,
 }
 
+// Merge-safety anchor: queued TUI history insertions are already-rendered
+// `HistoryCell::display_lines()` output and must stay verbatim until the terminal writer.
+
 pub struct Tui {
     frame_requester: FrameRequester,
     draw_tx: broadcast::Sender<()>,
@@ -447,7 +450,7 @@ impl Tui {
         Ok(())
     }
 
-    pub fn insert_history_lines(&mut self, lines: Vec<Line<'static>>) {
+    pub fn insert_history_display_lines(&mut self, lines: Vec<Line<'static>>) {
         self.pending_history_lines.extend(lines);
         self.frame_requester().schedule_frame();
     }
@@ -523,7 +526,7 @@ impl Tui {
             return Ok(false);
         }
 
-        crate::insert_history::insert_history_lines_with_mode(
+        crate::insert_history::insert_history_display_lines_with_mode(
             terminal,
             pending_history_lines.clone(),
             crate::insert_history::InsertHistoryMode::new(is_zellij),

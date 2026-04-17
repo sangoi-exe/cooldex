@@ -15,6 +15,7 @@ pub use device_code_auth::complete_device_code_login;
 pub use device_code_auth::request_device_code;
 pub use device_code_auth::run_device_code_login;
 pub use server::LoginServer;
+pub use server::LoginSuccess;
 pub use server::ServerOptions;
 pub use server::ShutdownHandle;
 pub use server::run_login_server;
@@ -22,6 +23,7 @@ pub use server::run_login_server;
 // Merge-safety anchor: codex-login re-exports define the split auth surface
 // consumed by login flows and tests after the auth crate extraction.
 pub use api_bridge::auth_provider_from_auth;
+pub use auth::AccountLeaseState;
 pub use auth::AccountRateLimitRefreshOutcome;
 pub use auth::AccountRateLimitRefreshRoster;
 pub use auth::AccountRateLimitRefreshRosterStatus;
@@ -66,6 +68,7 @@ pub use auth::save_auth;
 pub use auth::usage_limit_auto_switch_removes_plan_type;
 pub use auth_env_telemetry::AuthEnvTelemetry;
 pub use auth_env_telemetry::collect_auth_env_telemetry;
+pub use codex_account_state::ForceReleaseAccountOutcome;
 pub use codex_app_server_protocol::AuthMode;
 pub use provider_auth::auth_manager_for_provider;
 pub use provider_auth::required_auth_manager_for_provider;

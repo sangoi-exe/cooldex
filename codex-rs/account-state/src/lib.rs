@@ -11,6 +11,7 @@ use codex_protocol::protocol::RateLimitSnapshot;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::params;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -56,6 +57,18 @@ pub enum SessionActiveAccountRefresh {
         owner_codex_session_id: Option<String>,
         lease_until: DateTime<Utc>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForceReleasedAccountOwners {
+    pub session_ids: Vec<String>,
+    pub codex_session_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForceReleaseAccountOutcome {
+    NotFound,
+    Released(ForceReleasedAccountOwners),
 }
 
 #[derive(Clone)]
@@ -253,6 +266,12 @@ ON CONFLICT(account_id) DO UPDATE SET
             load_unexpired_lease_conflict(&transaction, account_id.as_str(), session_id, now_epoch)?
         {
             if conflict_matches_codex_session(&conflict, codex_session_id) {
+                collapse_logical_session_runtime_rows(
+                    &transaction,
+                    session_id,
+                    codex_session_id,
+                    account_id.as_str(),
+                )?;
                 upsert_session_active_account(
                     &transaction,
                     session_id,
@@ -283,6 +302,12 @@ ON CONFLICT(account_id) DO UPDATE SET
                 lease_until: conflict.lease_until,
             });
         }
+        collapse_logical_session_runtime_rows(
+            &transaction,
+            session_id,
+            codex_session_id,
+            account_id.as_str(),
+        )?;
         upsert_session_active_account(
             &transaction,
             session_id,
@@ -328,6 +353,12 @@ ON CONFLICT(account_id) DO UPDATE SET
                 params![previous_account_id, session_id],
             )?;
         }
+        collapse_logical_session_runtime_rows(
+            &transaction,
+            session_id,
+            codex_session_id,
+            account_id,
+        )?;
         upsert_session_active_account(
             &transaction,
             session_id,
@@ -363,6 +394,26 @@ ON CONFLICT(account_id) DO UPDATE SET
         )?;
         transaction.commit()?;
         Ok(account_id)
+    }
+
+    pub fn force_release_account(&self, account_id: &str) -> Result<ForceReleaseAccountOutcome> {
+        let mut connection = self.lock_connection()?;
+        let transaction = connection.transaction()?;
+        let released_owners = load_force_released_account_owners(&transaction, account_id)?;
+        if released_owners.session_ids.is_empty() && released_owners.codex_session_ids.is_empty() {
+            transaction.commit()?;
+            return Ok(ForceReleaseAccountOutcome::NotFound);
+        }
+        transaction.execute(
+            "DELETE FROM account_leases WHERE account_id = ?",
+            [account_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM session_active_account WHERE account_id = ?",
+            [account_id],
+        )?;
+        transaction.commit()?;
+        Ok(ForceReleaseAccountOutcome::Released(released_owners))
     }
 
     pub fn account_is_leased_by_other(
@@ -456,6 +507,46 @@ fn load_session_active_account_id(
         )
         .optional()
         .map_err(Into::into)
+}
+
+fn load_force_released_account_owners(
+    connection: &Connection,
+    account_id: &str,
+) -> Result<ForceReleasedAccountOwners> {
+    let mut session_ids = BTreeSet::new();
+    let mut codex_session_ids = BTreeSet::new();
+
+    let mut session_rows = connection.prepare(
+        "SELECT session_id, codex_session_id FROM session_active_account WHERE account_id = ?",
+    )?;
+    let session_rows = session_rows.query_map([account_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    for row in session_rows {
+        let (session_id, codex_session_id) = row?;
+        session_ids.insert(session_id);
+        if let Some(codex_session_id) = codex_session_id {
+            codex_session_ids.insert(codex_session_id);
+        }
+    }
+
+    let mut lease_rows = connection
+        .prepare("SELECT session_id, codex_session_id FROM account_leases WHERE account_id = ?")?;
+    let lease_rows = lease_rows.query_map([account_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    for row in lease_rows {
+        let (session_id, codex_session_id) = row?;
+        session_ids.insert(session_id);
+        if let Some(codex_session_id) = codex_session_id {
+            codex_session_ids.insert(codex_session_id);
+        }
+    }
+
+    Ok(ForceReleasedAccountOwners {
+        session_ids: session_ids.into_iter().collect(),
+        codex_session_ids: codex_session_ids.into_iter().collect(),
+    })
 }
 
 fn load_unexpired_lease_conflict(
@@ -561,6 +652,32 @@ fn ensure_optional_text_column(
     Ok(())
 }
 
+fn collapse_logical_session_runtime_rows(
+    connection: &Connection,
+    session_id: &str,
+    codex_session_id: Option<&str>,
+    account_id: &str,
+) -> Result<()> {
+    let Some(codex_session_id) = codex_session_id else {
+        return Ok(());
+    };
+    connection.execute(
+        r#"
+DELETE FROM session_active_account
+WHERE codex_session_id = ? AND session_id != ?
+        "#,
+        params![codex_session_id, session_id],
+    )?;
+    connection.execute(
+        r#"
+DELETE FROM account_leases
+WHERE codex_session_id = ? AND account_id != ?
+        "#,
+        params![codex_session_id, account_id],
+    )?;
+    Ok(())
+}
+
 fn conflict_matches_codex_session(
     conflict: &AccountLeaseConflict,
     codex_session_id: Option<&str>,
@@ -598,6 +715,68 @@ mod tests {
             credits: None,
             plan_type: None,
         }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct SessionActiveAccountRow {
+        session_id: String,
+        account_id: String,
+        codex_session_id: Option<String>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct AccountLeaseRow {
+        account_id: String,
+        session_id: String,
+        codex_session_id: Option<String>,
+    }
+
+    fn load_session_active_rows(store: &AccountStateStore) -> Vec<SessionActiveAccountRow> {
+        let connection = store.lock_connection().expect("lock connection");
+        let mut statement = connection
+            .prepare(
+                r#"
+SELECT session_id, account_id, codex_session_id
+FROM session_active_account
+ORDER BY session_id
+                "#,
+            )
+            .expect("prepare session_active_account query");
+        let rows = statement
+            .query_map([], |row| {
+                Ok(SessionActiveAccountRow {
+                    session_id: row.get::<_, String>(0)?,
+                    account_id: row.get::<_, String>(1)?,
+                    codex_session_id: row.get::<_, Option<String>>(2)?,
+                })
+            })
+            .expect("query session_active_account rows");
+        rows.map(|row| row.expect("read session_active_account row"))
+            .collect()
+    }
+
+    fn load_account_lease_rows(store: &AccountStateStore) -> Vec<AccountLeaseRow> {
+        let connection = store.lock_connection().expect("lock connection");
+        let mut statement = connection
+            .prepare(
+                r#"
+SELECT account_id, session_id, codex_session_id
+FROM account_leases
+ORDER BY account_id
+                "#,
+            )
+            .expect("prepare account_leases query");
+        let rows = statement
+            .query_map([], |row| {
+                Ok(AccountLeaseRow {
+                    account_id: row.get::<_, String>(0)?,
+                    session_id: row.get::<_, String>(1)?,
+                    codex_session_id: row.get::<_, Option<String>>(2)?,
+                })
+            })
+            .expect("query account_leases rows");
+        rows.map(|row| row.expect("read account_leases row"))
+            .collect()
     }
 
     #[test]
@@ -840,7 +1019,7 @@ mod tests {
     }
 
     #[test]
-    fn same_codex_session_can_reclaim_live_lease_from_old_runtime() {
+    fn same_codex_session_takeover_collapses_old_runtime_rows() {
         let sqlite_home = TempDir::new().expect("tempdir");
         let store = AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open store");
         let now = fixed_now();
@@ -880,6 +1059,22 @@ mod tests {
                 .expect("same-session lease should not be foreign"),
         );
         assert_eq!(
+            load_session_active_rows(&store),
+            vec![SessionActiveAccountRow {
+                session_id: "runtime-b".to_string(),
+                account_id: "account-a".to_string(),
+                codex_session_id: Some("codex-session-1".to_string()),
+            }]
+        );
+        assert_eq!(
+            load_account_lease_rows(&store),
+            vec![AccountLeaseRow {
+                account_id: "account-a".to_string(),
+                session_id: "runtime-b".to_string(),
+                codex_session_id: Some("codex-session-1".to_string()),
+            }]
+        );
+        assert_eq!(
             store
                 .refresh_session_active_account(
                     "runtime-a",
@@ -887,8 +1082,8 @@ mod tests {
                     now + chrono::Duration::seconds(2),
                     300,
                 )
-                .expect("same-session runtime should reclaim lease on refresh"),
-            SessionActiveAccountRefresh::Active("account-a".to_string())
+                .expect("collapsed runtime row should stay gone"),
+            SessionActiveAccountRefresh::None
         );
         assert!(
             !store
@@ -899,6 +1094,143 @@ mod tests {
                     now + chrono::Duration::seconds(3),
                 )
                 .expect("reclaimed lease should stay local"),
+        );
+    }
+
+    #[test]
+    fn same_codex_session_switching_accounts_releases_old_lease() {
+        let sqlite_home = TempDir::new().expect("tempdir");
+        let store = AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open store");
+        let now = fixed_now();
+
+        assert_eq!(
+            store
+                .set_session_active_account(
+                    "runtime-a",
+                    Some("codex-session-1"),
+                    "account-a",
+                    now,
+                    300,
+                )
+                .expect("assign initial lease"),
+            SessionActiveAccountSetOutcome::Assigned
+        );
+        assert_eq!(
+            store
+                .set_session_active_account(
+                    "runtime-b",
+                    Some("codex-session-1"),
+                    "account-b",
+                    now + chrono::Duration::seconds(1),
+                    300,
+                )
+                .expect("same-session account switch should succeed"),
+            SessionActiveAccountSetOutcome::Assigned
+        );
+        assert_eq!(
+            load_session_active_rows(&store),
+            vec![SessionActiveAccountRow {
+                session_id: "runtime-b".to_string(),
+                account_id: "account-b".to_string(),
+                codex_session_id: Some("codex-session-1".to_string()),
+            }]
+        );
+        assert_eq!(
+            load_account_lease_rows(&store),
+            vec![AccountLeaseRow {
+                account_id: "account-b".to_string(),
+                session_id: "runtime-b".to_string(),
+                codex_session_id: Some("codex-session-1".to_string()),
+            }]
+        );
+        assert_eq!(
+            store
+                .set_session_active_account(
+                    "runtime-c",
+                    None,
+                    "account-a",
+                    now + chrono::Duration::seconds(2),
+                    300,
+                )
+                .expect("released old lease should be reusable"),
+            SessionActiveAccountSetOutcome::Assigned
+        );
+    }
+
+    #[test]
+    fn force_release_account_clears_lease_and_session_rows() {
+        let sqlite_home = TempDir::new().expect("tempdir");
+        let store = AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open store");
+        let now = fixed_now();
+
+        assert_eq!(
+            store
+                .set_session_active_account("session-a", None, "account-a", now, 300)
+                .expect("assign initial lease"),
+            SessionActiveAccountSetOutcome::Assigned
+        );
+        {
+            let connection = store.lock_connection().expect("lock connection");
+            upsert_session_active_account(
+                &connection,
+                "session-b",
+                "account-a",
+                Some("codex-session-2"),
+                now.timestamp(),
+            )
+            .expect("seed duplicate runtime row");
+            upsert_session_active_account(
+                &connection,
+                "session-c",
+                "account-b",
+                None,
+                now.timestamp(),
+            )
+            .expect("seed unrelated session row");
+        }
+
+        assert_eq!(
+            store
+                .force_release_account("account-a")
+                .expect("force release owned account"),
+            ForceReleaseAccountOutcome::Released(ForceReleasedAccountOwners {
+                session_ids: vec!["session-a".to_string(), "session-b".to_string()],
+                codex_session_ids: vec!["codex-session-2".to_string()],
+            })
+        );
+        assert_eq!(
+            load_session_active_rows(&store),
+            vec![SessionActiveAccountRow {
+                session_id: "session-c".to_string(),
+                account_id: "account-b".to_string(),
+                codex_session_id: None,
+            }]
+        );
+        assert!(load_account_lease_rows(&store).is_empty());
+        assert_eq!(
+            store
+                .set_session_active_account(
+                    "session-d",
+                    None,
+                    "account-a",
+                    now + chrono::Duration::seconds(1),
+                    300,
+                )
+                .expect("force-released account should be reusable"),
+            SessionActiveAccountSetOutcome::Assigned
+        );
+    }
+
+    #[test]
+    fn force_release_account_is_loud_when_account_has_no_runtime_state() {
+        let sqlite_home = TempDir::new().expect("tempdir");
+        let store = AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open store");
+
+        assert_eq!(
+            store
+                .force_release_account("account-a")
+                .expect("force release should not error on missing account"),
+            ForceReleaseAccountOutcome::NotFound
         );
     }
 }

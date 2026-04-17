@@ -243,6 +243,7 @@ use codex_login::CodexAuth;
 use codex_login::EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE;
 use codex_login::EXTERNAL_SUPPORTED_CHATGPT_PLAN_REQUIRED_MESSAGE;
 use codex_login::ExternalAuthLoginError;
+use codex_login::LoginSuccess;
 use codex_login::ServerOptions as LoginServerOptions;
 use codex_login::ShutdownHandle;
 use codex_login::auth::login_with_chatgpt_auth_tokens;
@@ -505,6 +506,13 @@ impl CodexMessageProcessor {
                 .and_then(|summary| summary.label),
             plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
         }
+    }
+
+    fn finalize_chatgpt_login_success(
+        auth_manager: &AuthManager,
+        login_success: &LoginSuccess,
+    ) -> std::io::Result<()> {
+        auth_manager.reload_strict_and_set_active_account(&login_success.store_account_id)
     }
 
     async fn load_thread(
@@ -1200,7 +1208,20 @@ impl CodexMessageProcessor {
                         )
                         .await
                         {
-                            Ok(Ok(())) => (true, None),
+                            Ok(Ok(login_success)) => {
+                                match Self::finalize_chatgpt_login_success(
+                                    auth_manager.as_ref(),
+                                    &login_success,
+                                ) {
+                                    Ok(()) => (true, None),
+                                    Err(err) => (
+                                        false,
+                                        Some(format!(
+                                            "Failed to select newly added ChatGPT account after login: {err}"
+                                        )),
+                                    ),
+                                }
+                            }
                             Ok(Err(err)) => (false, Some(format!("Login server error: {err}"))),
                             Err(_elapsed) => {
                                 shutdown_handle.shutdown();
@@ -1220,7 +1241,6 @@ impl CodexMessageProcessor {
                             .await;
 
                         if success {
-                            auth_manager.reload();
                             replace_cloud_requirements_loader(
                                 cloud_requirements.as_ref(),
                                 auth_manager.clone(),
@@ -1314,7 +1334,20 @@ impl CodexMessageProcessor {
                             }
                             r = complete_device_code_login(opts, device_code) => {
                                 match r {
-                                    Ok(()) => (true, None),
+                                    Ok(login_success) => {
+                                        match Self::finalize_chatgpt_login_success(
+                                            auth_manager.as_ref(),
+                                            &login_success,
+                                        ) {
+                                            Ok(()) => (true, None),
+                                            Err(err) => (
+                                                false,
+                                                Some(format!(
+                                                    "Failed to select newly added ChatGPT account after login: {err}"
+                                                )),
+                                            ),
+                                        }
+                                    }
                                     Err(err) => (false, Some(err.to_string())),
                                 }
                             }
@@ -1332,7 +1365,6 @@ impl CodexMessageProcessor {
                             .await;
 
                         if success {
-                            auth_manager.reload();
                             replace_cloud_requirements_loader(
                                 cloud_requirements.as_ref(),
                                 auth_manager.clone(),

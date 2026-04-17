@@ -1,0 +1,11 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: popup
+---
+  Force release account lease?
+  Release the live lease for Personal so it becomes selectable again.
+
+› 1. Force release lease  Clear the current live lease for this account
+  2. Cancel               Go back to `/accounts` without changing the lease
+
+  Press enter to confirm or esc to go back

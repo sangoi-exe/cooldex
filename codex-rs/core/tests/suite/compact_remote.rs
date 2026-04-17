@@ -2705,6 +2705,91 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_auto_compact_followup_reinjects_prompt_top_context() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config.model_auto_compact_token_limit = Some(200);
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+
+    let responses_mock = responses::mount_sse_sequence(
+        harness.server(),
+        vec![
+            responses::sse(vec![
+                responses::ev_assistant_message("setup-1", "FIRST_REPLY"),
+                responses::ev_completed_with_tokens("setup-response-1", /*total_tokens*/ 80),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("setup-2", "SECOND_REPLY"),
+                responses::ev_completed_with_tokens("setup-response-2", /*total_tokens*/ 80),
+            ]),
+            responses::sse(vec![
+                responses::ev_function_call(
+                    "call-remote-follow-up-prompt-top",
+                    DUMMY_FUNCTION_NAME,
+                    "{}",
+                ),
+                responses::ev_completed_with_tokens("third-response", /*total_tokens*/ 500),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("follow-up", "REMOTE_FOLLOW_UP_PROMPT_TOP_REPLY"),
+                responses::ev_completed_with_tokens("follow-up-response", /*total_tokens*/ 80),
+            ]),
+        ],
+    )
+    .await;
+
+    let compact_mock = responses::mount_compact_user_history_with_summary_once(
+        harness.server(),
+        &summary_with_prefix("REMOTE_FOLLOW_UP_PROMPT_TOP_SUMMARY"),
+    )
+    .await;
+
+    for user_message in ["USER_ONE", "USER_TWO", "USER_THREE"] {
+        codex
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: user_message.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+            })
+            .await?;
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    }
+
+    assert_eq!(compact_mock.requests().len(), 1);
+    let compact_request = compact_mock.single_request();
+    let compact_user_messages = compact_request.message_input_texts("user");
+    for user_message in ["USER_ONE", "USER_TWO", "USER_THREE"] {
+        assert!(
+            compact_user_messages
+                .iter()
+                .any(|message| message == user_message),
+            "expected compact request to retain {user_message}"
+        );
+    }
+
+    let requests = responses_mock.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "expected two setup requests, one tool turn, and one post-compaction follow-up"
+    );
+
+    let post_compact_follow_up_request = &requests[3];
+    assert_prompt_top_has_canonical_context(post_compact_follow_up_request);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

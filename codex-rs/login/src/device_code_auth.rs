@@ -7,6 +7,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::pkce::PkceCodes;
+use crate::server::LoginSuccess;
 use crate::server::ServerOptions;
 use codex_client::build_reqwest_client_with_custom_ca;
 use std::io;
@@ -284,7 +285,7 @@ pub async fn request_device_code(opts: &ServerOptions) -> std::io::Result<Device
 pub async fn complete_device_code_login(
     opts: ServerOptions,
     device_code: DeviceCode,
-) -> std::io::Result<()> {
+) -> std::io::Result<LoginSuccess> {
     let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
     let base_url = opts.issuer.trim_end_matches('/');
     let api_base_url = format!("{base_url}/api/accounts");
@@ -322,7 +323,7 @@ pub async fn complete_device_code_login(
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
     }
 
-    crate::server::persist_tokens_async(
+    let store_account_id = crate::server::persist_tokens_async(
         &opts.codex_home,
         /*api_key*/ None,
         tokens.id_token,
@@ -330,10 +331,11 @@ pub async fn complete_device_code_login(
         tokens.refresh_token,
         opts.cli_auth_credentials_store_mode,
     )
-    .await
+    .await?;
+    Ok(LoginSuccess { store_account_id })
 }
 
-pub async fn run_device_code_login(opts: ServerOptions) -> std::io::Result<()> {
+pub async fn run_device_code_login(opts: ServerOptions) -> std::io::Result<LoginSuccess> {
     let device_code = request_device_code(&opts).await?;
     print_device_code_prompt(
         &device_code.verification_url,

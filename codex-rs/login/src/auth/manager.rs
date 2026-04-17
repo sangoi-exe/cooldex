@@ -20,6 +20,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use codex_account_state::AccountLeaseConflict;
 use codex_account_state::AccountStateStore;
 use codex_account_state::AccountUsageState;
+use codex_account_state::ForceReleaseAccountOutcome;
 use codex_account_state::SessionActiveAccountRefresh;
 use codex_account_state::SessionActiveAccountSetOutcome;
 use codex_app_server_protocol::AuthMode;
@@ -2236,16 +2237,31 @@ impl AuthManager {
     }
 
     pub fn list_accounts(&self) -> Vec<AccountSummary> {
-        let Some(store) = self.clone_cached_store_with_runtime_active_account() else {
-            return Vec::new();
-        };
-
+        let store = self.load_store_from_storage().store;
         let active_account_id = store.active_account_id.clone();
+        let lease_states = self.account_lease_states(&store);
         store
             .accounts
             .iter()
-            .map(|account| AccountSummary::from_stored(account, active_account_id.as_deref()))
+            .map(|account| {
+                let lease_state = lease_states
+                    .get(account.id.as_str())
+                    .copied()
+                    .unwrap_or(AccountLeaseState::Unavailable);
+                AccountSummary::from_stored(account, active_account_id.as_deref(), lease_state)
+            })
             .collect()
+    }
+
+    pub fn force_release_account(&self, id: &str) -> std::io::Result<ForceReleaseAccountOutcome> {
+        let Some(account_state_store) = self.account_state_store.as_ref() else {
+            return Err(std::io::Error::other(
+                "account lease management is unavailable in this auth mode",
+            ));
+        };
+        account_state_store
+            .force_release_account(id)
+            .map_err(std::io::Error::other)
     }
 
     pub fn account_rate_limit_refresh_roster(&self) -> AccountRateLimitRefreshRoster {
@@ -2315,6 +2331,48 @@ impl AuthManager {
         Some(store)
     }
 
+    fn account_lease_states(&self, store: &AuthStore) -> HashMap<String, AccountLeaseState> {
+        let account_ids = store
+            .accounts
+            .iter()
+            .map(|account| account.id.clone())
+            .collect::<Vec<_>>();
+        let mut lease_states = HashMap::with_capacity(account_ids.len());
+        let active_account_id = store.active_account_id.as_deref();
+
+        let foreign_leases = self
+            .account_state_store
+            .as_ref()
+            .map(|account_state_store| {
+                account_state_store.account_ids_leased_by_other(
+                    self.runtime_session_id.as_str(),
+                    self.linked_codex_session_id().as_deref(),
+                    &account_ids,
+                    Utc::now(),
+                )
+            });
+
+        for account_id in account_ids {
+            let lease_state = match foreign_leases.as_ref() {
+                Some(Ok(foreign_leases)) if foreign_leases.contains(account_id.as_str()) => {
+                    AccountLeaseState::LeasedByOtherSession
+                }
+                Some(Ok(_)) if active_account_id == Some(account_id.as_str()) => {
+                    AccountLeaseState::LeasedByCurrentSession
+                }
+                Some(Ok(_)) => AccountLeaseState::NotLeased,
+                Some(Err(_)) if active_account_id == Some(account_id.as_str()) => {
+                    AccountLeaseState::LeasedByCurrentSession
+                }
+                Some(Err(_)) => AccountLeaseState::Unavailable,
+                None => AccountLeaseState::Unavailable,
+            };
+            lease_states.insert(account_id, lease_state);
+        }
+
+        lease_states
+    }
+
     // Merge-safety anchor: `/accounts` rows and the popup cache-expiry gate must share this one
     // SQLite-backed saved-account usage truth read so TUI polling never falls back to stale
     // in-memory auth-store usage while `list_accounts()` is already showing refreshed data.
@@ -2355,6 +2413,14 @@ impl AuthManager {
             }
             Ok(())
         })
+    }
+
+    pub fn reload_strict_and_set_active_account(
+        &self,
+        store_account_id: &str,
+    ) -> std::io::Result<()> {
+        self.reload_strict()?;
+        self.set_active_account(store_account_id)
     }
 
     pub fn upsert_account(
@@ -4067,6 +4133,15 @@ pub struct AccountSummary {
     pub is_active: bool,
     pub exhausted_until: Option<DateTime<Utc>>,
     pub last_rate_limits: Option<RateLimitSnapshot>,
+    pub lease_state: AccountLeaseState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountLeaseState {
+    NotLeased,
+    LeasedByCurrentSession,
+    LeasedByOtherSession,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4083,7 +4158,11 @@ pub struct AccountRateLimitRefreshRoster {
 }
 
 impl AccountSummary {
-    fn from_stored(account: &StoredAccount, active_id: Option<&str>) -> Self {
+    fn from_stored(
+        account: &StoredAccount,
+        active_id: Option<&str>,
+        lease_state: AccountLeaseState,
+    ) -> Self {
         Self {
             id: account.id.clone(),
             label: account.label.clone(),
@@ -4094,6 +4173,7 @@ impl AccountSummary {
                 .usage
                 .as_ref()
                 .and_then(|u| u.last_rate_limits.clone()),
+            lease_state,
         }
     }
 }

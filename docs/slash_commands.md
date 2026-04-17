@@ -27,7 +27,7 @@ Control Codex’s behavior during an interactive session with slash commands.
 | `/status`       | show current session configuration and token usage                         |
 | `/subagents`    | switch the active subagent thread                                          |
 | `/stop`         | stop all background terminals                                              |
-| `/accounts`     | manage ChatGPT accounts (switch active / add account)                      |
+| `/accounts`     | manage ChatGPT accounts (switch active / add account / inspect leases)     |
 | `/mcp`          | list configured MCP tools                                                  |
 | `/experimental` | open the experimental menu to enable features from our beta program        |
 | `/skills`       | browse and insert skills (experimental; see [docs/skills.md](./skills.md)) |

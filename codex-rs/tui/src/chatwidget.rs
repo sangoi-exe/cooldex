@@ -765,6 +765,8 @@ enum RateLimitErrorKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AccountAvailabilityStatus {
     Available,
+    LeasedByOtherSession,
+    BlockedUntil,
     FiveHourLimitReached,
     WeeklyLimitReached,
 }
@@ -773,6 +775,8 @@ impl AccountAvailabilityStatus {
     fn label_foreground(self) -> Color {
         match self {
             Self::Available => Color::Green,
+            Self::LeasedByOtherSession => Color::Cyan,
+            Self::BlockedUntil => Color::Yellow,
             Self::FiveHourLimitReached => Color::Yellow,
             Self::WeeklyLimitReached => Color::DarkGray,
         }
@@ -781,6 +785,8 @@ impl AccountAvailabilityStatus {
     fn summary(self, primary_label: &str, secondary_label: &str) -> String {
         match self {
             Self::Available => "status: available".to_string(),
+            Self::LeasedByOtherSession => "status: leased by another live session".to_string(),
+            Self::BlockedUntil => "status: blocked".to_string(),
             Self::FiveHourLimitReached => format!("status: {primary_label} limit reached"),
             Self::WeeklyLimitReached => format!("status: {secondary_label} limit reached"),
         }
@@ -10194,13 +10200,23 @@ impl ChatWidget {
         let snapshot = account.last_rate_limits.as_ref();
         let primary_label = Self::rate_limit_primary_label(snapshot);
         let secondary_label = Self::rate_limit_secondary_label(snapshot);
-        let status = snapshot.map(|_| Self::rate_limit_account_status(now_local, snapshot));
+        let status = Some(Self::account_availability_status(now_local, account));
         let has_fresh_window_usage = Self::rate_limit_snapshot_has_fresh_usage(now_local, snapshot);
         let is_exhausted = account.exhausted_until.is_some_and(|until| until > now);
         let mut description_parts = Vec::new();
 
         if include_current_marker && account.is_active {
             description_parts.push("currently active".to_string());
+        }
+        match account.lease_state {
+            codex_login::AccountLeaseState::LeasedByCurrentSession => {
+                description_parts.push("lease: current session".to_string());
+            }
+            codex_login::AccountLeaseState::LeasedByOtherSession => {
+                description_parts.push("lease: another live session".to_string());
+            }
+            codex_login::AccountLeaseState::NotLeased
+            | codex_login::AccountLeaseState::Unavailable => {}
         }
         if let Some(status) = status {
             description_parts
@@ -10233,6 +10249,24 @@ impl ChatWidget {
         description_parts
     }
 
+    fn account_availability_status(
+        now_local: DateTime<Local>,
+        account: &codex_login::AccountSummary,
+    ) -> AccountAvailabilityStatus {
+        if account.lease_state == codex_login::AccountLeaseState::LeasedByOtherSession {
+            return AccountAvailabilityStatus::LeasedByOtherSession;
+        }
+        let snapshot = account.last_rate_limits.as_ref();
+        let has_fresh_window_usage = Self::rate_limit_snapshot_has_fresh_usage(now_local, snapshot);
+        let is_exhausted = account
+            .exhausted_until
+            .is_some_and(|until| until > now_local.with_timezone(&Utc));
+        if is_exhausted && !has_fresh_window_usage {
+            return AccountAvailabilityStatus::BlockedUntil;
+        }
+        Self::rate_limit_account_status(now_local, snapshot)
+    }
+
     pub(crate) fn open_accounts_popup_at(&mut self, now_local: DateTime<Local>) {
         if !self.can_manage_chatgpt_accounts() {
             self.add_error_message(
@@ -10262,25 +10296,34 @@ impl ChatWidget {
                     .or_else(|| account.email.clone())
                     .unwrap_or_else(|| account.id.clone());
 
-                let snapshot = account.last_rate_limits.as_ref();
-                let status: Option<AccountAvailabilityStatus> =
-                    snapshot.map(|_| Self::rate_limit_account_status(now_local, snapshot));
+                let status = Self::account_availability_status(now_local, &account);
                 let description_parts =
                     Self::account_popup_description_parts(now_local, &account, false);
                 let description =
                     (!description_parts.is_empty()).then(|| description_parts.join(" • "));
 
                 let account_id = account.id;
-                SelectionItem {
-                    name,
-                    name_foreground: status.map(AccountAvailabilityStatus::label_foreground),
-                    description,
-                    is_current: account.is_active,
-                    actions: vec![Box::new(move |tx| {
+                let actions: Vec<SelectionAction> = if account.lease_state
+                    == codex_login::AccountLeaseState::LeasedByOtherSession
+                {
+                    vec![Box::new(move |tx| {
+                        tx.send(AppEvent::OpenForceReleaseAccountPopup {
+                            account_id: account_id.clone(),
+                        });
+                    })]
+                } else {
+                    vec![Box::new(move |tx| {
                         tx.send(AppEvent::SetActiveAccount {
                             account_id: account_id.clone(),
                         });
-                    })],
+                    })]
+                };
+                SelectionItem {
+                    name,
+                    name_foreground: Some(status.label_foreground()),
+                    description,
+                    is_current: account.is_active,
+                    actions,
                     dismiss_on_select: true,
                     ..Default::default()
                 }
@@ -10296,6 +10339,54 @@ impl ChatWidget {
             dismiss_on_select: true,
             ..Default::default()
         });
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn open_force_release_account_popup(
+        &mut self,
+        account: &codex_login::AccountSummary,
+    ) {
+        let display = account
+            .label
+            .clone()
+            .or_else(|| account.email.clone())
+            .unwrap_or_else(|| account.id.clone());
+        let account_id = account.id.clone();
+
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from("Force release account lease?").bold());
+        header.push(Line::from(format!(
+            "Release the live lease for {display} so it becomes selectable again."
+        )));
+
+        let items = vec![
+            SelectionItem {
+                name: "Force release lease".to_string(),
+                description: Some("Clear the current live lease for this account".to_string()),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::ForceReleaseAccountLease {
+                        account_id: account_id.clone(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Cancel".to_string(),
+                description: Some("Go back to `/accounts` without changing the lease".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::StartOpenAccountsPopup);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
             header: Box::new(header),
@@ -10356,9 +10447,7 @@ impl ChatWidget {
                 .or_else(|| email.clone())
                 .unwrap_or_else(|| account.id.clone());
 
-            let snapshot = account.last_rate_limits.as_ref();
-            let status: Option<AccountAvailabilityStatus> =
-                snapshot.map(|_| Self::rate_limit_account_status(now_local, snapshot));
+            let status = Self::account_availability_status(now_local, &account);
             let description_parts =
                 Self::account_popup_description_parts(now_local, &account, true);
             let description =
@@ -10367,7 +10456,7 @@ impl ChatWidget {
             let account_id = account.id;
             items.push(SelectionItem {
                 name: format!("Remove: {name}"),
-                name_foreground: status.map(AccountAvailabilityStatus::label_foreground),
+                name_foreground: Some(status.label_foreground()),
                 description,
                 actions: vec![Box::new(move |tx| {
                     tx.send(AppEvent::RemoveAccount {

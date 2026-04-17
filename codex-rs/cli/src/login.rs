@@ -127,7 +127,8 @@ pub async fn login_with_chatgpt(
 
     print_login_server_start(server.actual_port, &server.auth_url);
 
-    server.block_until_done().await
+    let _ = server.block_until_done().await?;
+    Ok(())
 }
 
 pub async fn run_login_with_chatgpt(cli_config_overrides: CliConfigOverrides) -> ! {
@@ -240,7 +241,7 @@ pub async fn run_login_with_device_code(
         opts.issuer = iss;
     }
     match run_device_code_login(opts).await {
-        Ok(()) => {
+        Ok(_login_success) => {
             eprintln!("{LOGIN_SUCCESS_MESSAGE}");
             std::process::exit(0);
         }
@@ -281,7 +282,7 @@ pub async fn run_login_with_device_code_fallback_to_browser(
     opts.open_browser = false;
 
     match run_device_code_login(opts.clone()).await {
-        Ok(()) => {
+        Ok(_login_success) => {
             eprintln!("{LOGIN_SUCCESS_MESSAGE}");
             std::process::exit(0);
         }
@@ -292,7 +293,7 @@ pub async fn run_login_with_device_code_fallback_to_browser(
                     Ok(server) => {
                         print_login_server_start(server.actual_port, &server.auth_url);
                         match server.block_until_done().await {
-                            Ok(()) => {
+                            Ok(_login_success) => {
                                 eprintln!("{LOGIN_SUCCESS_MESSAGE}");
                                 std::process::exit(0);
                             }

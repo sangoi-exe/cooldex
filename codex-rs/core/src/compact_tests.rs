@@ -5,6 +5,19 @@ async fn process_compacted_history_with_test_session(
     compacted_history: Vec<ResponseItem>,
     previous_turn_settings: Option<&PreviousTurnSettings>,
 ) -> (Vec<ResponseItem>, Vec<ResponseItem>) {
+    process_compacted_history_with_test_session_and_placement(
+        compacted_history,
+        previous_turn_settings,
+        crate::compact::CompactionInitialContextPlacement::BeforeLastUser,
+    )
+    .await
+}
+
+async fn process_compacted_history_with_test_session_and_placement(
+    compacted_history: Vec<ResponseItem>,
+    previous_turn_settings: Option<&PreviousTurnSettings>,
+    initial_context_placement: crate::compact::CompactionInitialContextPlacement,
+) -> (Vec<ResponseItem>, Vec<ResponseItem>) {
     let (session, turn_context) = crate::codex::make_session_and_context().await;
     session
         .set_previous_turn_settings(previous_turn_settings.cloned())
@@ -14,7 +27,7 @@ async fn process_compacted_history_with_test_session(
         &session,
         &turn_context,
         compacted_history,
-        crate::compact::CompactionInitialContextPlacement::BeforeLastUser,
+        initial_context_placement,
     )
     .await;
     (refreshed, initial_context)
@@ -258,6 +271,68 @@ async fn process_compacted_history_reinjects_full_initial_context() {
         end_turn: None,
         phase: None,
     });
+    assert_eq!(refreshed, expected);
+}
+
+// Merge-safety anchor: prompt-top compaction followers must keep the canonical
+// initial-context prefix ahead of the compacted suffix so remote auto-compact
+// follow-up turns rebuild the same prompt ordering as a fresh session.
+#[tokio::test]
+async fn process_compacted_history_prompt_top_prepends_initial_context() {
+    let compacted_history = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "older user".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        },
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "latest user".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        },
+        ResponseItem::Compaction {
+            encrypted_content: "encrypted".to_string(),
+        },
+    ];
+
+    let (refreshed, mut expected) = process_compacted_history_with_test_session_and_placement(
+        compacted_history,
+        /*previous_turn_settings*/ None,
+        crate::compact::CompactionInitialContextPlacement::PromptTop,
+    )
+    .await;
+    expected.extend([
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "older user".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        },
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "latest user".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        },
+        ResponseItem::Compaction {
+            encrypted_content: "encrypted".to_string(),
+        },
+    ]);
+
     assert_eq!(refreshed, expected);
 }
 

@@ -6711,10 +6711,13 @@ pub(crate) async fn run_turn(
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if token_limit_reached && needs_follow_up {
+                    // Merge-safety anchor: remote continuation compaction must rebuild the
+                    // canonical prompt prefix at prompt top so developer + AGENTS/project-doc
+                    // context stays ahead of compacted history just like a fresh session.
                     if run_auto_compact(
                         &sess,
                         &turn_context,
-                        CompactionInitialContextPlacement::BeforeLastUser,
+                        CompactionInitialContextPlacement::PromptTop,
                     )
                     .await
                     .is_err()

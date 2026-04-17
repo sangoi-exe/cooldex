@@ -211,39 +211,19 @@ fn format_account_display(label: Option<&str>, email: Option<&str>, fallback: &s
 fn build_chatgpt_add_account_success_outcome(
     auth_manager: &AuthManager,
     shared_state: &crate::bottom_pane::ChatGptAddAccountSharedState,
+    login_success: &codex_login::LoginSuccess,
 ) -> ChatGptAddAccountOutcome {
-    let requested_store_account_id = match auth_manager.persisted_active_store_account_id() {
-        Ok(store_account_id) => store_account_id,
-        Err(err) => {
-            let message =
-                format!("failed to read persisted active account after ChatGPT login: {err}");
-            shared_state.set_failed(message.clone());
-            return ChatGptAddAccountOutcome::Failed { message };
-        }
-    };
-    match auth_manager.reload_strict() {
-        Ok(_) => {
-            if let Some(store_account_id) = requested_store_account_id.as_deref()
-                && auth_manager
-                    .list_accounts()
-                    .into_iter()
-                    .any(|account| account.id == store_account_id)
-                && let Err(err) = auth_manager.set_active_account(store_account_id)
-            {
-                let message =
-                    format!("failed to select newly added ChatGPT account after login: {err}");
-                shared_state.set_failed(message.clone());
-                return ChatGptAddAccountOutcome::Failed { message };
-            }
+    match auth_manager.reload_strict_and_set_active_account(&login_success.store_account_id) {
+        Ok(()) => {
             let active_account_display = auth_manager
                 .list_accounts()
                 .iter()
-                .find(|account| account.is_active)
+                .find(|account| account.id == login_success.store_account_id)
                 .map(|account| {
                     format_account_display(
                         account.label.as_deref(),
                         account.email.as_deref(),
-                        &account.id,
+                        &login_success.store_account_id,
                     )
                 });
             shared_state.set_success(active_account_display.clone());
@@ -252,7 +232,8 @@ fn build_chatgpt_add_account_success_outcome(
             }
         }
         Err(err) => {
-            let message = format!("failed to reload auth store after ChatGPT login: {err}");
+            let message =
+                format!("failed to select newly added ChatGPT account after login: {err}");
             shared_state.set_failed(message.clone());
             ChatGptAddAccountOutcome::Failed { message }
         }
@@ -2671,7 +2652,7 @@ impl App {
         let width = tui.terminal.last_known_screen_size.width;
         let header_lines = self.clear_ui_header_lines(width);
         if !header_lines.is_empty() {
-            tui.insert_history_lines(header_lines);
+            tui.insert_history_display_lines(header_lines);
             self.has_emitted_history_lines = true;
         }
     }
@@ -5616,7 +5597,7 @@ impl App {
                     .await;
             }
             AppEvent::OpenResumePicker => {
-                let picker_app_server = match crate::start_app_server_for_picker(
+                let picker_app_server = match crate::start_app_server_for_picker_with_auth_manager(
                     &self.config,
                     &match self.remote_app_server_url.clone() {
                         Some(websocket_url) => crate::AppServerTarget::Remote {
@@ -5625,6 +5606,7 @@ impl App {
                         },
                         None => crate::AppServerTarget::Embedded,
                     },
+                    self.auth_manager.clone(),
                 )
                 .await
                 {
@@ -5830,7 +5812,7 @@ impl App {
                     if self.overlay.is_some() {
                         self.deferred_history_lines.extend(display);
                     } else {
-                        tui.insert_history_lines(display);
+                        tui.insert_history_display_lines(display);
                     }
                 }
             }
@@ -6149,6 +6131,58 @@ impl App {
                     }
                 }
             }
+            AppEvent::OpenForceReleaseAccountPopup { account_id } => {
+                let Some(account) = self
+                    .auth_manager
+                    .list_accounts()
+                    .into_iter()
+                    .find(|account| account.id == account_id)
+                else {
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to open force-release popup: account '{account_id}' not found"
+                    ));
+                    return Ok(AppRunControl::Continue);
+                };
+                self.chat_widget.open_force_release_account_popup(&account);
+            }
+            AppEvent::ForceReleaseAccountLease { account_id } => {
+                let display = self
+                    .auth_manager
+                    .list_accounts()
+                    .into_iter()
+                    .find(|account| account.id == account_id)
+                    .map(|account| {
+                        format_account_display(
+                            account.label.as_deref(),
+                            account.email.as_deref(),
+                            &account_id,
+                        )
+                    })
+                    .unwrap_or_else(|| account_id.clone());
+                match self.auth_manager.force_release_account(&account_id) {
+                    Ok(codex_login::ForceReleaseAccountOutcome::Released(_)) => {
+                        self.refresh_account_mutation_bookkeeping();
+                        self.maybe_start_accounts_status_refresh(
+                            /*force*/ true, /*open_popup_when_ready*/ true,
+                            /*show_loading_popup*/ false,
+                        );
+                        self.chat_widget.add_info_message(
+                            format!("Released lease for {display}."),
+                            /*hint*/ None,
+                        );
+                    }
+                    Ok(codex_login::ForceReleaseAccountOutcome::NotFound) => {
+                        self.chat_widget
+                            .add_error_message(format!("No live lease found for {display}."));
+                        self.app_event_tx.send(AppEvent::StartOpenAccountsPopup);
+                    }
+                    Err(err) => {
+                        self.chat_widget
+                            .add_error_message(format!("Failed to force-release account: {err}"));
+                        self.app_event_tx.send(AppEvent::StartOpenAccountsPopup);
+                    }
+                }
+            }
             AppEvent::RemoveAccount {
                 account_id,
                 exit_after,
@@ -6286,9 +6320,11 @@ impl App {
                 tokio::spawn(async move {
                     let result = child.block_until_done().await;
                     let outcome = match result {
-                        Ok(()) => {
-                            build_chatgpt_add_account_success_outcome(&auth_manager, &shared_state)
-                        }
+                        Ok(login_success) => build_chatgpt_add_account_success_outcome(
+                            &auth_manager,
+                            &shared_state,
+                            &login_success,
+                        ),
                         Err(err) => {
                             if shared_state.cancelled_by_user() {
                                 shared_state.set_cancelled();
@@ -9871,7 +9907,14 @@ mod tests {
         .expect("save updated auth store");
 
         let shared_state = Arc::new(crate::bottom_pane::ChatGptAddAccountSharedState::new());
-        let outcome = build_chatgpt_add_account_success_outcome(&app.auth_manager, &shared_state);
+        let login_success = codex_login::LoginSuccess {
+            store_account_id: canonical_chatgpt_store_account_id("account-c"),
+        };
+        let outcome = build_chatgpt_add_account_success_outcome(
+            &app.auth_manager,
+            &shared_state,
+            &login_success,
+        );
         let active_account_display = match outcome {
             ChatGptAddAccountOutcome::Success {
                 active_account_display,
@@ -9968,14 +10011,20 @@ mod tests {
         broken_config.codex_home = broken_path;
         let broken_auth_manager = auth_manager_from_config(&broken_config);
         let shared_state = Arc::new(crate::bottom_pane::ChatGptAddAccountSharedState::new());
+        let login_success = codex_login::LoginSuccess {
+            store_account_id: canonical_chatgpt_store_account_id("account-c"),
+        };
 
-        let outcome =
-            build_chatgpt_add_account_success_outcome(&broken_auth_manager, shared_state.as_ref());
+        let outcome = build_chatgpt_add_account_success_outcome(
+            &broken_auth_manager,
+            shared_state.as_ref(),
+            &login_success,
+        );
 
         assert!(matches!(
             outcome,
             ChatGptAddAccountOutcome::Failed { ref message }
-                if message.contains("failed to reload auth store after ChatGPT login")
+                if message.contains("failed to select newly added ChatGPT account after login")
         ));
         assert!(matches!(
             app.chat_widget.status_account_display(),

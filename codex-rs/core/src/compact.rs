@@ -40,6 +40,7 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CompactionInitialContextPlacement {
     PromptTop,
+    #[cfg(test)]
     BeforeLastUser,
 }
 
@@ -112,7 +113,7 @@ async fn run_compact_task_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
-    initial_context_placement: CompactionInitialContextPlacement,
+    _initial_context_placement: CompactionInitialContextPlacement,
 ) -> CodexResult<()> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
@@ -220,20 +221,20 @@ async fn run_compact_task_inner(
     let user_messages = collect_user_messages(history_items);
 
     let initial_context = sess.build_initial_context(turn_context.as_ref()).await;
-    let mut new_history = match initial_context_placement {
-        CompactionInitialContextPlacement::PromptTop => {
-            build_compacted_history(initial_context, &user_messages, &summary_text)
-        }
-        CompactionInitialContextPlacement::BeforeLastUser => {
-            let compacted_history =
-                build_compacted_history(Vec::new(), &user_messages, &summary_text);
-            inject_initial_context_into_compacted_history(
-                compacted_history,
-                initial_context,
-                initial_context_placement,
-            )
-        }
-    };
+    let mut new_history =
+        build_compacted_history(initial_context.clone(), &user_messages, &summary_text);
+    #[cfg(test)]
+    if matches!(
+        _initial_context_placement,
+        CompactionInitialContextPlacement::BeforeLastUser
+    ) {
+        let compacted_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
+        new_history = inject_initial_context_into_compacted_history(
+            compacted_history,
+            initial_context,
+            _initial_context_placement,
+        );
+    }
     let ghost_snapshots: Vec<ResponseItem> = history_items
         .iter()
         .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
@@ -302,74 +303,81 @@ pub(crate) fn is_summary_message(message: &str) -> bool {
 
 /// Injects canonical initial context into compacted replacement history.
 ///
-/// `PromptTop` re-establishes the canonical prompt prefix immediately. `BeforeLastUser` keeps the
-/// compaction summary as the last history item while still placing fresh instructions ahead of the
-/// latest real user input.
+/// `PromptTop` re-establishes the canonical prompt prefix immediately. In tests,
+/// `BeforeLastUser` keeps the older insertion point covered so the legacy helper behavior still
+/// has direct regression proof.
 pub(crate) fn inject_initial_context_into_compacted_history(
-    mut compacted_history: Vec<ResponseItem>,
+    compacted_history: Vec<ResponseItem>,
     initial_context: Vec<ResponseItem>,
     placement: CompactionInitialContextPlacement,
 ) -> Vec<ResponseItem> {
-    match placement {
-        CompactionInitialContextPlacement::PromptTop => {
-            let mut refreshed = initial_context;
-            refreshed.extend(compacted_history);
-            return refreshed;
-        }
-        CompactionInitialContextPlacement::BeforeLastUser => {}
+    if matches!(placement, CompactionInitialContextPlacement::PromptTop) {
+        let mut refreshed = initial_context;
+        refreshed.extend(compacted_history);
+        return refreshed;
     }
 
-    let mut last_user_or_summary_index = None;
-    let mut last_real_user_index = None;
-    for (i, item) in compacted_history.iter().enumerate().rev() {
-        let Some(TurnItem::UserMessage(user)) = crate::event_mapping::parse_turn_item(item) else {
-            continue;
-        };
-        // Compaction summaries are encoded as user messages, so track both:
-        // the last real user message (preferred insertion point) and the last
-        // user-message-like item (fallback summary insertion point).
-        last_user_or_summary_index.get_or_insert(i);
-        if !is_summary_message(&user.message()) {
-            last_real_user_index = Some(i);
-            break;
-        }
-    }
-    let last_compaction_index = compacted_history
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(i, item)| matches!(item, ResponseItem::Compaction { .. }).then_some(i));
-    let mut insertion_index = last_real_user_index
-        .or(last_user_or_summary_index)
-        .or(last_compaction_index);
-    if insertion_index.is_none()
-        && compacted_history
-            .iter()
-            .any(|item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"))
+    #[cfg(not(test))]
     {
-        // Remote compact can legally return assistant-only notes. With no user/summary/compaction
-        // anchor left, keep the canonical prompt prefix at the very front instead of appending it
-        // after assistant content.
-        insertion_index = Some(0);
+        compacted_history
     }
-    if insertion_index.is_some_and(|index| {
-        compacted_history[..index]
+
+    #[cfg(test)]
+    {
+        let mut compacted_history = compacted_history;
+        let mut last_user_or_summary_index = None;
+        let mut last_real_user_index = None;
+        for (i, item) in compacted_history.iter().enumerate().rev() {
+            let Some(TurnItem::UserMessage(user)) = crate::event_mapping::parse_turn_item(item)
+            else {
+                continue;
+            };
+            // Compaction summaries are encoded as user messages, so track both:
+            // the last real user message (preferred insertion point) and the last
+            // user-message-like item (fallback summary insertion point).
+            last_user_or_summary_index.get_or_insert(i);
+            if !is_summary_message(&user.message()) {
+                last_real_user_index = Some(i);
+                break;
+            }
+        }
+        let last_compaction_index = compacted_history
             .iter()
-            .any(|item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"))
-    }) {
-        insertion_index = Some(0);
-    }
+            .enumerate()
+            .rev()
+            .find_map(|(i, item)| matches!(item, ResponseItem::Compaction { .. }).then_some(i));
+        let mut insertion_index = last_real_user_index
+            .or(last_user_or_summary_index)
+            .or(last_compaction_index);
+        if insertion_index.is_none()
+            && compacted_history.iter().any(
+                |item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"),
+            )
+        {
+            // Remote compact can legally return assistant-only notes. With no user/summary/compaction
+            // anchor left, keep the canonical prompt prefix at the very front instead of appending it
+            // after assistant content.
+            insertion_index = Some(0);
+        }
+        if insertion_index.is_some_and(|index| {
+            compacted_history[..index].iter().any(
+                |item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"),
+            )
+        }) {
+            insertion_index = Some(0);
+        }
 
-    // Re-inject canonical context from the current session since compaction strips the instruction
-    // wrappers from history. Mid-turn continuation keeps the compaction item last, so place the
-    // canonical block immediately before the last real user when possible.
-    if let Some(insertion_index) = insertion_index {
-        compacted_history.splice(insertion_index..insertion_index, initial_context);
-    } else {
-        compacted_history.extend(initial_context);
-    }
+        // Re-inject canonical context from the current session since compaction strips the instruction
+        // wrappers from history. Mid-turn continuation keeps the compaction item last, so place the
+        // canonical block immediately before the last real user when possible.
+        if let Some(insertion_index) = insertion_index {
+            compacted_history.splice(insertion_index..insertion_index, initial_context);
+        } else {
+            compacted_history.extend(initial_context);
+        }
 
-    compacted_history
+        compacted_history
+    }
 }
 
 pub(crate) fn build_compacted_history(

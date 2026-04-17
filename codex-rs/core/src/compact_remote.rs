@@ -82,7 +82,7 @@ async fn run_remote_compact_task_inner_impl(
     let mut history = sess.clone_history().await;
     // Keep compaction prompts in-distribution: if a model-switch update was injected at the
     // tail of history (between turns), exclude it from the compaction request payload.
-    let stripped_model_switch_item =
+    let _stripped_model_switch_item =
         extract_trailing_model_switch_update_for_compaction_request(&mut history);
 
     let base_instructions = sess.get_base_instructions().await;
@@ -198,14 +198,18 @@ async fn run_remote_compact_task_inner_impl(
     )
     .await;
 
-    // PromptTop compaction already rebuilds the canonical developer block, including model-switch
-    // state, so reattaching the stripped tail item would duplicate instructions.
-    if matches!(
-        initial_context_placement,
-        CompactionInitialContextPlacement::BeforeLastUser
-    ) && let Some(model_switch_item) = stripped_model_switch_item
+    #[cfg(test)]
     {
-        new_history.push(model_switch_item);
+        // PromptTop compaction already rebuilds the canonical developer block, including
+        // model-switch state, so reattaching the stripped tail item is only useful when tests
+        // intentionally exercise the legacy BeforeLastUser path.
+        if matches!(
+            initial_context_placement,
+            CompactionInitialContextPlacement::BeforeLastUser
+        ) && let Some(model_switch_item) = _stripped_model_switch_item
+        {
+            new_history.push(model_switch_item);
+        }
     }
 
     if !ghost_snapshots.is_empty() {

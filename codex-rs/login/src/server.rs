@@ -94,13 +94,18 @@ impl ServerOptions {
 pub struct LoginServer {
     pub auth_url: String,
     pub actual_port: u16,
-    server_handle: tokio::task::JoinHandle<io::Result<()>>,
+    server_handle: tokio::task::JoinHandle<io::Result<LoginSuccess>>,
     shutdown_handle: ShutdownHandle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginSuccess {
+    pub store_account_id: String,
 }
 
 impl LoginServer {
     /// Waits for the login callback loop to finish.
-    pub async fn block_until_done(self) -> io::Result<()> {
+    pub async fn block_until_done(self) -> io::Result<LoginSuccess> {
         self.server_handle
             .await
             .map_err(|err| io::Error::other(format!("login server thread panicked: {err:?}")))?
@@ -250,7 +255,7 @@ enum HandledRequest {
     ResponseAndExit {
         headers: Vec<Header>,
         body: Vec<u8>,
-        result: io::Result<()>,
+        result: io::Result<LoginSuccess>,
     },
 }
 
@@ -349,7 +354,7 @@ async fn process_request(
                     let api_key = obtain_api_key(&opts.issuer, &opts.client_id, &tokens.id_token)
                         .await
                         .ok();
-                    if let Err(err) = persist_tokens_async(
+                    let stored_account_id = match persist_tokens_async(
                         &opts.codex_home,
                         api_key.clone(),
                         tokens.id_token.clone(),
@@ -359,28 +364,32 @@ async fn process_request(
                     )
                     .await
                     {
-                        eprintln!("Persist error: {err}");
-                        if err.kind() == io::ErrorKind::PermissionDenied {
+                        Ok(stored_account_id) => stored_account_id,
+                        Err(err) => {
+                            eprintln!("Persist error: {err}");
+                            if err.kind() == io::ErrorKind::PermissionDenied {
+                                return login_error_response(
+                                    &err.to_string(),
+                                    io::ErrorKind::PermissionDenied,
+                                    Some("unsupported_plan"),
+                                    /*error_description*/ None,
+                                );
+                            }
                             return login_error_response(
-                                &err.to_string(),
-                                io::ErrorKind::PermissionDenied,
-                                Some("unsupported_plan"),
-                                /*error_description*/ None,
+                                "Sign-in completed but credentials could not be saved locally.",
+                                io::ErrorKind::Other,
+                                Some("persist_failed"),
+                                Some(&err.to_string()),
                             );
                         }
-                        return login_error_response(
-                            "Sign-in completed but credentials could not be saved locally.",
-                            io::ErrorKind::Other,
-                            Some("persist_failed"),
-                            Some(&err.to_string()),
-                        );
-                    }
+                    };
 
                     let success_url = compose_success_url(
                         actual_port,
                         &opts.issuer,
                         &tokens.id_token,
                         &tokens.access_token,
+                        &stored_account_id,
                     );
                     match tiny_http::Header::from_bytes(&b"Location"[..], success_url.as_bytes()) {
                         Ok(header) => HandledRequest::RedirectWithHeader(header),
@@ -405,6 +414,21 @@ async fn process_request(
             }
         }
         "/success" => {
+            let store_account_id = match parsed_url
+                .query_pairs()
+                .find(|(key, _)| key == "account_id")
+                .map(|(_, value)| value.into_owned())
+            {
+                Some(store_account_id) => store_account_id,
+                None => {
+                    return login_error_response(
+                        "Login success callback missing account id.",
+                        io::ErrorKind::InvalidData,
+                        Some("missing_account_id"),
+                        /*error_description*/ None,
+                    );
+                }
+            };
             let body = include_str!("assets/success.html");
             HandledRequest::ResponseAndExit {
                 headers: match Header::from_bytes(
@@ -415,7 +439,7 @@ async fn process_request(
                     Err(_) => Vec::new(),
                 },
                 body: body.as_bytes().to_vec(),
-                result: Ok(()),
+                result: Ok(LoginSuccess { store_account_id }),
             }
         }
         "/cancel" => HandledRequest::ResponseAndExit {
@@ -773,7 +797,7 @@ pub(crate) async fn persist_tokens_async(
     access_token: String,
     refresh_token: String,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
-) -> io::Result<()> {
+) -> io::Result<String> {
     // Reuse existing synchronous logic but run it off the async runtime.
     let codex_home = codex_home.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -840,13 +864,19 @@ pub(crate) async fn persist_tokens_async(
                 UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE,
             ));
         }
-        Ok(())
+        Ok(stored_account_id)
     })
     .await
     .map_err(|e| io::Error::other(format!("persist task failed: {e}")))?
 }
 
-fn compose_success_url(port: u16, issuer: &str, id_token: &str, access_token: &str) -> String {
+fn compose_success_url(
+    port: u16,
+    issuer: &str,
+    id_token: &str,
+    access_token: &str,
+    store_account_id: &str,
+) -> String {
     let token_claims = jwt_auth_claims(id_token);
     let access_claims = jwt_auth_claims(access_token);
 
@@ -879,6 +909,7 @@ fn compose_success_url(port: u16, issuer: &str, id_token: &str, access_token: &s
     };
 
     let mut params = vec![
+        ("account_id", store_account_id.to_string()),
         ("id_token", id_token.to_string()),
         ("needs_setup", needs_setup.to_string()),
         ("org_id", org_id.to_string()),

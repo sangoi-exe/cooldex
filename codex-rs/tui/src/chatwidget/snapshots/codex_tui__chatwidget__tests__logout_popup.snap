@@ -7,7 +7,8 @@ expression: popup
   Select an option below.
 
 › 1. Logout all accounts  Remove all stored credentials.
-  2. Remove: Work         currently active • email: work@example.com
-  3. Remove: Personal     email: personal@example.com
+  2. Remove: Work         currently active • lease: current session • status:
+                          available • email: work@example.com
+  3. Remove: Personal     status: available • email: personal@example.com
 
   Press enter to confirm or esc to go back

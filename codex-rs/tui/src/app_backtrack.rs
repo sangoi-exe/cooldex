@@ -237,11 +237,13 @@ impl App {
 
     /// Close transcript overlay and restore normal UI.
     pub(crate) fn close_transcript_overlay(&mut self, tui: &mut tui::Tui) {
+        // Merge-safety anchor: deferred transcript reinsertion must preserve rendered
+        // `HistoryCell::display_lines()` layout so overlay close matches resumed transcript output.
         let _ = tui.leave_alt_screen();
         let was_backtrack = self.backtrack.overlay_preview_active;
         if !self.deferred_history_lines.is_empty() {
             let lines = std::mem::take(&mut self.deferred_history_lines);
-            tui.insert_history_lines(lines);
+            tui.insert_history_display_lines(lines);
         }
         self.overlay = None;
         self.backtrack.overlay_preview_active = false;
@@ -257,7 +259,7 @@ impl App {
         if !self.transcript_cells.is_empty() {
             let width = tui.terminal.last_known_screen_size.width;
             for cell in &self.transcript_cells {
-                tui.insert_history_lines(cell.display_lines(width));
+                tui.insert_history_display_lines(cell.display_lines(width));
             }
         }
     }

@@ -384,6 +384,16 @@ pub(crate) enum AppEvent {
         account_id: String,
     },
 
+    /// Open the confirmation popup for force-releasing a foreign account lease.
+    OpenForceReleaseAccountPopup {
+        account_id: String,
+    },
+
+    /// Force-release a foreign account lease from the local account-state owner.
+    ForceReleaseAccountLease {
+        account_id: String,
+    },
+
     /// Remove a stored ChatGPT account from the auth store.
     RemoveAccount {
         account_id: String,
