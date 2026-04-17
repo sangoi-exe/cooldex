@@ -912,6 +912,32 @@ fn consecutive_unordered_list_local_file_links_do_not_detach_paths() {
 }
 
 #[test]
+fn unordered_list_local_file_link_does_not_split_rendered_path_token() {
+    let text = render_markdown_text_with_width_and_cwd(
+        "- [plan](/home/lucas/work/codex/.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294) keeps transcript truth",
+        Some(80),
+        Some(Path::new("/home/lucas/work/codex")),
+    );
+    let rendered = text
+        .lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rendered,
+        vec![
+            "- .sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294",
+            "  keeps transcript truth",
+        ]
+    );
+}
+
+#[test]
 fn code_block_known_lang_has_syntax_colors() {
     let text = render_markdown_text("```rust\nfn main() {}\n```\n");
     let content: Vec<String> = text

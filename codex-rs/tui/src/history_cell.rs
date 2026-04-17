@@ -3555,6 +3555,48 @@ mod tests {
     }
 
     #[test]
+    fn agent_message_cell_preserves_list_item_hard_break_file_refs() {
+        let markdown = concat!(
+            "**Ainda abertos**\n\n",
+            "- `WS3` resume/history/memory-state: 4 itens  \n",
+            "  `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294`\n",
+            "- `WS4` debug/operator surfaces: 5 itens  \n",
+            "  `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:309`\n",
+            "- `WS5` session recording/support-log: 7 itens  \n",
+            "  `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:317`\n",
+        );
+        let mut rendered_markdown = Vec::new();
+        append_markdown(
+            markdown,
+            /*width*/ None,
+            Some(test_cwd().as_path()),
+            &mut rendered_markdown,
+        );
+        let cell = AgentMessageCell::new(rendered_markdown, /*is_first_line*/ true);
+        let rendered = render_lines(&cell.display_lines(/*width*/ 80));
+
+        assert_eq!(
+            rendered,
+            vec![
+                "• Ainda abertos".to_string(),
+                "  ".to_string(),
+                "  - WS3 resume/history/memory-state: 4 itens".to_string(),
+                "  ".to_string(),
+                "  .sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294"
+                    .to_string(),
+                "  - WS4 debug/operator surfaces: 5 itens".to_string(),
+                "  ".to_string(),
+                "  .sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:309"
+                    .to_string(),
+                "  - WS5 session recording/support-log: 7 itens".to_string(),
+                "  ".to_string(),
+                "  .sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:317"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn prefixed_wrapped_history_cell_indents_wrapped_lines() {
         let summary = Line::from(vec![
             "You ".into(),

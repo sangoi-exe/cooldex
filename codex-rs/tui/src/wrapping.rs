@@ -1,9 +1,10 @@
-//! Word-wrapping with URL-aware heuristics.
+//! Word-wrapping with protected-token heuristics.
 //!
-//! The TUI renders text that frequently contains URLs — command output,
-//! markdown, agent messages, tool-call results. Standard `textwrap`
-//! hyphenation treats `/` and `-` as split points, which breaks URLs
-//! across lines and makes them unclickable in terminal emulators.
+//! The TUI renders text that frequently contains URLs and local file
+//! paths — command output, markdown, agent messages, tool-call
+//! results. Standard `textwrap` hyphenation treats `/` and `-` as split
+//! points, which breaks URLs and path-like tokens across lines and
+//! makes them noisy or misleading in transcript surfaces.
 //!
 //! This module provides two wrapping paths:
 //!
@@ -11,20 +12,21 @@
 //!   `textwrap` with the caller's options unchanged. Used when the
 //!   content is known to be plain prose.
 //! - **Adaptive** (`adaptive_wrap_line`, `adaptive_wrap_lines`):
-//!   inspects the line for URL-like tokens; if any are found, the
+//!   inspects the line for protected tokens; if any are found, the
 //!   wrapping switches to `AsciiSpace` word separation and a custom
-//!   `WordSplitter` that refuses to split URL tokens. Non-URL tokens
-//!   on the same line still break at every character boundary (the
-//!   custom splitter returns all char indices for non-URL words).
+//!   `WordSplitter` that refuses to split protected tokens. Non-protected
+//!   tokens on the same line still break at every character boundary
+//!   (the custom splitter returns all char indices for other words).
 //!
-//! Callers that *might* encounter URLs should use the `adaptive_*`
-//! functions. Callers that definitely will not (code blocks, pure
-//! numeric output) can use the standard path for speed.
+//! Callers that *might* encounter URLs or local path-like tokens should
+//! use the `adaptive_*` functions. Callers that definitely will not
+//! (code blocks, pure numeric output) can use the standard path for
+//! speed.
 //!
-//! URL detection is heuristic — see [`text_contains_url_like`] for the
-//! rules. False positives suppress hyphenation for that line; false
-//! negatives let a URL get split. The heuristic is intentionally
-//! conservative: file paths like `src/main.rs` are not matched.
+//! Token protection is heuristic — see [`text_contains_url_like`] and
+//! [`text_contains_local_path_like`] for the rules. False positives
+//! suppress hyphenation for that line; false negatives let a token get
+//! split.
 
 use ratatui::text::Line;
 use ratatui::text::Span;
@@ -214,6 +216,10 @@ pub(crate) fn text_contains_url_like(text: &str) -> bool {
     text.split_ascii_whitespace().any(is_url_like_token)
 }
 
+fn text_contains_local_path_like(text: &str) -> bool {
+    text.split_ascii_whitespace().any(is_local_path_like_token)
+}
+
 /// Returns `true` if `text` contains at least one URL-like token and at least
 /// one substantive non-URL token.
 fn text_has_mixed_url_and_non_url_tokens(text: &str) -> bool {
@@ -242,6 +248,52 @@ fn text_has_mixed_url_and_non_url_tokens(text: &str) -> bool {
 fn is_url_like_token(raw_token: &str) -> bool {
     let token = trim_url_token(raw_token);
     !token.is_empty() && (is_absolute_url_like(token) || is_bare_url_like(token))
+}
+
+fn is_local_path_like_token(raw_token: &str) -> bool {
+    let token = trim_url_token(raw_token);
+    if token.is_empty() || token.contains("://") {
+        return false;
+    }
+
+    if is_rooted_local_path(token) {
+        return true;
+    }
+
+    token.contains(['/', '\\']) && (has_pathish_segment(token) || has_location_suffix(token))
+}
+
+fn is_rooted_local_path(token: &str) -> bool {
+    token.starts_with('/')
+        || token.starts_with("~/")
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with(".\\")
+        || token.starts_with("..\\")
+        || token.starts_with("\\\\")
+        || matches!(
+            token.as_bytes(),
+            [drive, b':', separator, ..]
+                if drive.is_ascii_alphabetic() && matches!(separator, b'/' | b'\\')
+        )
+}
+
+fn has_pathish_segment(token: &str) -> bool {
+    token.split(['/', '\\']).any(|segment| {
+        !segment.is_empty()
+            && ((segment.starts_with('.') && segment.len() > 1)
+                || (segment.contains('.') && segment.chars().any(char::is_alphanumeric)))
+    })
+}
+
+fn has_location_suffix(token: &str) -> bool {
+    if let Some((prefix, suffix)) = token.rsplit_once(':') {
+        return prefix.contains(['/', '\\'])
+            && !suffix.is_empty()
+            && suffix.chars().all(|c| c.is_ascii_digit());
+    }
+
+    false
 }
 
 fn is_substantive_non_url_token(raw_token: &str) -> bool {
@@ -455,24 +507,34 @@ fn is_domain_label(label: &str) -> bool {
         && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// Reconfigures wrapping options so that URL-like tokens are never split.
+fn line_contains_protected_token(line: &Line<'_>) -> bool {
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    text_contains_url_like(&text) || text_contains_local_path_like(&text)
+}
+
+/// Reconfigures wrapping options so that protected tokens are never split.
 ///
-/// Sets `AsciiSpace` word separation (so `/` and `-` inside URLs are
-/// not treated as break points), disables `break_words`, and installs a
-/// custom `WordSplitter` that returns no split points for URL tokens
-/// while still allowing character-level splitting for non-URL words.
-pub(crate) fn url_preserving_wrap_options<'a>(opts: RtOptions<'a>) -> RtOptions<'a> {
+/// Sets `AsciiSpace` word separation (so `/` and `-` inside URLs and
+/// local paths are not treated as break points), disables
+/// `break_words`, and installs a custom `WordSplitter` that returns no
+/// split points for protected tokens while still allowing
+/// character-level splitting for everything else.
+pub(crate) fn protected_token_wrap_options<'a>(opts: RtOptions<'a>) -> RtOptions<'a> {
     opts.word_separator(textwrap::WordSeparator::AsciiSpace)
-        .word_splitter(textwrap::WordSplitter::Custom(split_non_url_word))
+        .word_splitter(textwrap::WordSplitter::Custom(split_non_protected_word))
         .break_words(/*break_words*/ false)
 }
 
 /// Custom `textwrap::WordSplitter` callback. Returns empty (no split
-/// points) for URL-like tokens so they are kept intact; returns every
-/// char-boundary index for everything else so non-URL words can still
+/// points) for protected tokens so they are kept intact; returns every
+/// char-boundary index for everything else so other words can still
 /// break at any position.
-fn split_non_url_word(word: &str) -> Vec<usize> {
-    if is_url_like_token(word) {
+fn split_non_protected_word(word: &str) -> Vec<usize> {
+    if is_url_like_token(word) || is_local_path_like_token(word) {
         return Vec::new();
     }
 
@@ -480,16 +542,17 @@ fn split_non_url_word(word: &str) -> Vec<usize> {
 }
 
 /// Wraps a single ratatui `Line`, automatically switching to
-/// URL-preserving options when the line contains a URL-like token.
+/// protected-token-preserving options when the line contains a URL-like
+/// or local path-like token.
 ///
 /// When no URL is detected, wrapping behavior is identical to
-/// [`word_wrap_line`]. When a URL is detected, the line is wrapped with
-/// [`url_preserving_wrap_options`] — URLs stay intact while non-URL
-/// words on the same line still break normally.
+/// [`word_wrap_line`]. When a protected token is detected, the line is
+/// wrapped with [`protected_token_wrap_options`] — protected tokens stay
+/// intact while other words on the same line still break normally.
 #[must_use]
 pub(crate) fn adaptive_wrap_line<'a>(line: &'a Line<'a>, base: RtOptions<'a>) -> Vec<Line<'a>> {
-    let selected = if line_contains_url_like(line) {
-        url_preserving_wrap_options(base)
+    let selected = if line_contains_protected_token(line) {
+        protected_token_wrap_options(base)
     } else {
         base
     };
@@ -1187,6 +1250,22 @@ them."#
     }
 
     #[test]
+    fn text_contains_local_path_like_matches_file_refs() {
+        let positives = [
+            ".sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294",
+            "/Users/example/code/codex/codex-rs/README.md:93",
+            "C:/workspace/codex/codex-rs/tui/src/chatwidget.rs:4903",
+        ];
+
+        for text in positives {
+            assert!(
+                text_contains_local_path_like(text),
+                "expected local-path-like match for {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn line_contains_url_like_checks_across_spans() {
         let line = Line::from(vec![
             "see ".into(),
@@ -1201,6 +1280,48 @@ them."#
     fn line_has_mixed_url_and_non_url_tokens_detects_prose_plus_url() {
         let line = Line::from("see https://example.com/path for details");
         assert!(line_has_mixed_url_and_non_url_tokens(&line));
+    }
+
+    #[test]
+    fn adaptive_wrap_line_keeps_local_path_token_intact() {
+        let line = Line::from(
+            ".sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294",
+        );
+
+        let out = adaptive_wrap_line(&line, RtOptions::new(/*width*/ 48));
+        let rendered: Vec<String> = out.iter().map(concat_line).collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                ".sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn adaptive_wrap_line_wraps_suffix_words_without_splitting_local_path() {
+        let line = Line::from(concat!(
+            "- ",
+            ".sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294",
+            " stays aligned",
+        ));
+
+        let out = adaptive_wrap_line(
+            &line,
+            RtOptions::new(/*width*/ 80).subsequent_indent("  ".into()),
+        );
+        let rendered: Vec<String> = out.iter().map(concat_line).collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "- .sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294"
+                    .to_string(),
+                "  stays aligned".to_string(),
+            ]
+        );
     }
 
     #[test]
