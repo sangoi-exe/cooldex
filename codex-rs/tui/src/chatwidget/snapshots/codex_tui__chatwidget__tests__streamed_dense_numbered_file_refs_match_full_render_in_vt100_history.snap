@@ -1,0 +1,34 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: normalize_snapshot_paths(actual)
+---
+• Feito. Rodei a passada 2 no range estendido 15e1b35a1^..2924460bf — 42 commits — incluindo o commit corretivo
+  2924460bf.
+
+  Consenso forte: o corretivo realmente fechou
+
+  1. Split de lease da mesma sessão lógica: fechado em codex-rs/account-state/src/lib.rs:265 e
+  codex-rs/account-state/src/lib.rs:655.
+  2. Handoff de add-account por store_account_id: fechado em codex-rs/login/src/server.rs:416,
+  codex-rs/login/src/device_code_auth.rs:326, codex-rs/tui/src/app.rs:211,
+  codex-rs/app-server/src/codex_message_processor.rs:511.
+  3. Embedded TUI/app-server usando o mesmo AuthManager: fechado em codex-rs/tui/src/lib.rs:369 e
+  codex-rs/tui/src/app.rs:5600.
+  4. /accounts lease-aware no TUI: fechado em codex-rs/login/src/auth/manager.rs:2239 e
+  codex-rs/tui/src/chatwidget.rs:10211.
+  5. Remote auto-compact voltando para PromptTop: fechado em codex-rs/core/src/codex.rs:6713,
+  codex-rs/core/src/compact.rs:35, codex-rs/core/src/compact_remote.rs:193.
+
+  Problemas que continuam
+
+  1. Blocker de governança: faltam Merge-safety anchor: específicos nos seams corrigidos de seleção pós-login em
+  codex-rs/app-server/src/codex_message_processor.rs:511 e codex-rs/tui/src/app.rs:211.
+  2. Bug médio: o browser login ainda conclui por /success?account_id=... sem estado server-side validado.
+  codex-rs/login/src/server.rs:416 encerra com LoginSuccess só pelo query param; codex-rs/cli/src/login.rs:130 trata
+  qualquer Ok(_) como sucesso.
+
+  Próximo batch que eu recomendo
+
+  1. Adicionar Merge-safety anchor: nos seams de seleção pós-login em
+  codex-rs/app-server/src/codex_message_processor.rs e codex-rs/tui/src/app.rs.
+  2. Fazer /success depender de estado validado do /auth/callback, não só de query string.

@@ -17628,6 +17628,158 @@ async fn vt100_history_cell_live_insert_matches_display_lines() {
 }
 
 #[tokio::test]
+async fn streamed_dense_numbered_file_refs_match_full_render_in_vt100_history() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.cwd = test_project_path().abs();
+    chat.handle_codex_event(Event {
+        id: "turn-start".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
+        }),
+    });
+
+    let source = concat!(
+        "Feito. Rodei a passada 2 no range estendido `15e1b35a1^..2924460bf` — 42 commits — ",
+        "incluindo o commit corretivo `2924460bf`.\n\n",
+        "**Consenso forte: o corretivo realmente fechou**\n\n",
+        "1. Split de lease da mesma sessão lógica: fechado em ",
+        "`codex-rs/account-state/src/lib.rs:265` e `codex-rs/account-state/src/lib.rs:655`.\n",
+        "2. Handoff de add-account por `store_account_id`: fechado em ",
+        "`codex-rs/login/src/server.rs:416`, ",
+        "`codex-rs/login/src/device_code_auth.rs:326`, ",
+        "`codex-rs/tui/src/app.rs:211`, ",
+        "`codex-rs/app-server/src/codex_message_processor.rs:511`.\n",
+        "3. Embedded TUI/app-server usando o mesmo `AuthManager`: fechado em ",
+        "`codex-rs/tui/src/lib.rs:369` e `codex-rs/tui/src/app.rs:5600`.\n",
+        "4. `/accounts` lease-aware no TUI: fechado em ",
+        "`codex-rs/login/src/auth/manager.rs:2239` e ",
+        "`codex-rs/tui/src/chatwidget.rs:10211`.\n",
+        "5. Remote auto-compact voltando para `PromptTop`: fechado em ",
+        "`codex-rs/core/src/codex.rs:6713`, `codex-rs/core/src/compact.rs:35`, ",
+        "`codex-rs/core/src/compact_remote.rs:193`.\n\n",
+        "**Problemas que continuam**\n\n",
+        "1. Blocker de governança: faltam `Merge-safety anchor:` específicos nos seams corrigidos ",
+        "de seleção pós-login em `codex-rs/app-server/src/codex_message_processor.rs:511` e ",
+        "`codex-rs/tui/src/app.rs:211`.\n",
+        "2. Bug médio: o browser login ainda conclui por `/success?account_id=...` sem estado ",
+        "server-side validado. `codex-rs/login/src/server.rs:416` encerra com `LoginSuccess` só ",
+        "pelo query param; `codex-rs/cli/src/login.rs:130` trata qualquer `Ok(_)` como sucesso.\n\n",
+        "**Próximo batch que eu recomendo**\n\n",
+        "1. Adicionar `Merge-safety anchor:` nos seams de seleção pós-login em ",
+        "`codex-rs/app-server/src/codex_message_processor.rs` e `codex-rs/tui/src/app.rs`.\n",
+        "2. Fazer `/success` depender de estado validado do `/auth/callback`, não só de query ",
+        "string.\n",
+    );
+
+    let width: u16 = 118;
+    let height: u16 = 80;
+    let make_term = || {
+        let backend = VT100Backend::new(width, height);
+        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        term.set_viewport_area(Rect::new(0, height - 1, width, 1));
+        term
+    };
+    let mut actual_term = make_term();
+    let mut actual_has_emitted_history_lines = false;
+
+    let mut source_chars = source.chars();
+    loop {
+        let mut delta = String::new();
+        match source_chars.next() {
+            Some(ch) => delta.push(ch),
+            None => break,
+        }
+        if let Some(ch) = source_chars.next() {
+            delta.push(ch);
+        }
+
+        chat.handle_codex_event(Event {
+            id: "delta".into(),
+            msg: EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }),
+        });
+
+        loop {
+            chat.on_commit_tick();
+            let mut inserted_any = false;
+            while let Ok(app_event) = rx.try_recv() {
+                if let AppEvent::InsertHistoryCell(cell) = app_event {
+                    let mut display = cell.display_lines(width);
+                    if display.is_empty() {
+                        continue;
+                    }
+                    if !cell.is_stream_continuation() {
+                        if actual_has_emitted_history_lines {
+                            display.insert(0, "".into());
+                        } else {
+                            actual_has_emitted_history_lines = true;
+                        }
+                    }
+                    crate::insert_history::insert_history_display_lines(&mut actual_term, display)
+                        .expect("Failed to insert streamed history lines");
+                    inserted_any = true;
+                }
+            }
+            if !inserted_any {
+                break;
+            }
+        }
+    }
+
+    chat.handle_codex_event(Event {
+        id: "turn-complete".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
+        }),
+    });
+    while let Ok(app_event) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = app_event {
+            let mut display = cell.display_lines(width);
+            if display.is_empty() {
+                continue;
+            }
+            if !cell.is_stream_continuation() {
+                if actual_has_emitted_history_lines {
+                    display.insert(0, "".into());
+                } else {
+                    actual_has_emitted_history_lines = true;
+                }
+            }
+            crate::insert_history::insert_history_display_lines(&mut actual_term, display)
+                .expect("Failed to insert finalized history lines");
+        }
+    }
+
+    let mut rendered_markdown = Vec::new();
+    crate::markdown::append_markdown(
+        source,
+        /*width*/ None,
+        Some(test_project_path().as_path()),
+        &mut rendered_markdown,
+    );
+    let expected_cell =
+        crate::history_cell::AgentMessageCell::new(rendered_markdown, /*is_first_line*/ true);
+    let expected_display = expected_cell.display_lines(width);
+    let mut expected_term = make_term();
+    crate::insert_history::insert_history_display_lines(&mut expected_term, expected_display)
+        .expect("Failed to insert expected history lines");
+
+    let actual = normalize_vt100_history(actual_term.backend().vt100().screen().contents());
+    let expected = normalize_vt100_history(expected_term.backend().vt100().screen().contents());
+    assert_eq!(actual, expected);
+    assert_snapshot!(
+        "streamed_dense_numbered_file_refs_match_full_render_in_vt100_history",
+        normalize_snapshot_paths(actual)
+    );
+}
+
+#[tokio::test]
 async fn enter_submits_steer_while_review_is_running() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());

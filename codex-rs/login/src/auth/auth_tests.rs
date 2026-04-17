@@ -1633,6 +1633,61 @@ fn linked_codex_session_reclaims_its_live_lease_after_runtime_restart() {
 }
 
 #[test]
+fn hydrate_runtime_active_account_switches_to_available_account_after_lost_lease() {
+    let codex_home = tempdir().unwrap();
+    let primary_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-a", "org-b"], 0);
+    let secondary_store_account_id =
+        test_store_account_id("org-b").expect("secondary store account id");
+    let sqlite_home = codex_home.path().join("sqlite-home");
+    let account_state_store =
+        AccountStateStore::open(sqlite_home.clone()).expect("open account-state store");
+    let now = Utc::now();
+
+    assert_eq!(
+        account_state_store
+            .set_session_active_account("runtime-a", None, &primary_store_account_id, now, 1)
+            .expect("seed initial runtime-a lease"),
+        SessionActiveAccountSetOutcome::Assigned
+    );
+    assert_eq!(
+        account_state_store
+            .set_session_active_account(
+                "runtime-b",
+                None,
+                &primary_store_account_id,
+                now + chrono::Duration::seconds(2),
+                300,
+            )
+            .expect("runtime-b should take over expired primary lease"),
+        SessionActiveAccountSetOutcome::Assigned
+    );
+
+    let storage = create_auth_storage(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+    );
+    let mut store = storage
+        .load()
+        .expect("load saved auth store")
+        .expect("saved auth store should exist");
+
+    AuthManager::hydrate_runtime_active_account(
+        Some(&account_state_store),
+        "runtime-a",
+        None,
+        None,
+        &mut store,
+    )
+    .expect("hydrate runtime active account");
+
+    assert_eq!(
+        store.active_account_id.as_deref(),
+        Some(secondary_store_account_id.as_str())
+    );
+}
+
+#[test]
 fn switching_active_account_releases_previous_lease_for_other_sessions() {
     let codex_home = tempdir().unwrap();
     let primary_store_account_id =

@@ -657,6 +657,10 @@ fn split_before_local_path_token_if_better<'a>(
     line: &'a Line<'a>,
     base: &RtOptions<'a>,
 ) -> Option<Vec<Line<'a>>> {
+    // Merge-safety anchor: dense list/file-ref turns only split before a local path when moving
+    // the path to the continuation line materially improves fit; if the list marker or short
+    // prefix still fits with the path on the first line, keep them together to avoid marker-only
+    // rows and live-vs-resume transcript drift.
     if !line_contains_local_path_like(line) {
         return None;
     }
@@ -706,6 +710,13 @@ fn split_before_local_path_token_if_better<'a>(
             continue;
         }
 
+        let prefix_with_token_end = flat[..token_end]
+            .trim_end_matches(char::is_whitespace)
+            .width();
+        if prefix_with_token_end <= initial_available {
+            continue;
+        }
+
         let prefix_end = flat[..token_start]
             .trim_end_matches(char::is_whitespace)
             .len();
@@ -726,7 +737,11 @@ fn split_before_local_path_token_if_better<'a>(
             .clone()
             .initial_indent(base_static.subsequent_indent.clone())
             .subsequent_indent(base_static.subsequent_indent.clone());
-        out.extend(word_wrap_line_owned(&remainder_line, remainder_opts));
+        out.extend(
+            adaptive_wrap_line(&remainder_line, remainder_opts)
+                .into_iter()
+                .map(|line| line_to_static(&line)),
+        );
         return Some(retag_owned_lines(out));
     }
 
@@ -1636,8 +1651,7 @@ them."#
         assert_eq!(
             rendered,
             vec![
-                "-".to_string(),
-                "  .sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294"
+                "- .sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294"
                     .to_string(),
                 "  stays aligned".to_string(),
             ]

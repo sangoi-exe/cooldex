@@ -1825,7 +1825,10 @@ impl AuthManager {
         };
 
         let now = Utc::now();
-        let mut allow_bootstrap = true;
+        // Merge-safety anchor: WS12 missing-bearer fail-loud only stays honest when a foreign
+        // lease takeover blocks the stolen account itself, not the whole bootstrap pass; this
+        // session must still try every other eligible saved account before surfacing no bearer.
+        let mut blocked_bootstrap_account_id = None;
         let mut current_active_account_id = match account_state_store
             .refresh_session_active_account(
                 runtime_session_id,
@@ -1848,7 +1851,7 @@ impl AuthManager {
                     lease_until = ?lease_until,
                     "runtime session lost its active-account lease to another live session"
                 );
-                allow_bootstrap = false;
+                blocked_bootstrap_account_id = Some(account_id);
                 None
             }
             Err(error) => {
@@ -1873,10 +1876,17 @@ impl AuthManager {
             current_active_account_id = None;
         }
 
-        if current_active_account_id.is_none() && allow_bootstrap {
+        if current_active_account_id.is_none() {
             for candidate_account_id in
                 Self::bootstrap_runtime_active_account_candidates(store, required_workspace_id)
             {
+                if blocked_bootstrap_account_id.as_deref() == Some(candidate_account_id.as_str()) {
+                    tracing::debug!(
+                        candidate_account_id,
+                        "skipping runtime active-account bootstrap candidate that was just lost to another live session"
+                    );
+                    continue;
+                }
                 match account_state_store.set_session_active_account(
                     runtime_session_id,
                     linked_codex_session_id,
