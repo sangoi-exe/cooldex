@@ -993,7 +993,7 @@ async fn resumed_turn_history_replays_declined_file_change_failure() {
         .join("\n");
 
     assert!(
-        rendered.contains("Failed to apply patch"),
+        rendered.contains("Patch application declined"),
         "expected resumed declined file-change replay to surface the rejection, got {rendered:?}"
     );
 }

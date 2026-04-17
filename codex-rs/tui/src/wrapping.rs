@@ -14,9 +14,9 @@
 //! - **Adaptive** (`adaptive_wrap_line`, `adaptive_wrap_lines`):
 //!   inspects the line for protected tokens; if any are found, the
 //!   wrapping switches to `AsciiSpace` word separation and a custom
-//!   `WordSplitter` that refuses to split protected tokens. Non-protected
-//!   tokens on the same line still break at every character boundary
-//!   (the custom splitter returns all char indices for other words).
+//!   `WordSplitter` that refuses to split URL-like tokens while still
+//!   allowing controlled intra-token wrapping for local paths and
+//!   ordinary words.
 //!
 //! Callers that *might* encounter URLs or local path-like tokens should
 //! use the `adaptive_*` functions. Callers that definitely will not
@@ -33,7 +33,9 @@ use ratatui::text::Span;
 use std::borrow::Cow;
 use std::ops::Range;
 use textwrap::Options;
+use unicode_width::UnicodeWidthStr;
 
+use crate::render::line_utils::line_to_static;
 use crate::render::line_utils::push_owned_lines;
 
 /// Returns byte-ranges into `text` for each wrapped line, including
@@ -187,6 +189,15 @@ pub(crate) fn line_contains_url_like(line: &Line<'_>) -> bool {
     text_contains_url_like(&text)
 }
 
+fn line_contains_local_path_like(line: &Line<'_>) -> bool {
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    text_contains_local_path_like(&text)
+}
+
 /// Returns `true` if `line` contains both a URL-like token and at least one
 /// substantive non-URL token.
 ///
@@ -294,6 +305,27 @@ fn has_location_suffix(token: &str) -> bool {
     }
 
     false
+}
+
+fn local_path_location_suffix_start(token: &str) -> Option<usize> {
+    if !token.contains(['/', '\\']) {
+        return None;
+    }
+
+    let last_colon = token.rfind(':')?;
+    let line_or_col = &token[last_colon + 1..];
+    if line_or_col.is_empty() || !line_or_col.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    if let Some(prev_colon) = token[..last_colon].rfind(':') {
+        let maybe_line = &token[prev_colon + 1..last_colon];
+        if !maybe_line.is_empty() && maybe_line.chars().all(|c| c.is_ascii_digit()) {
+            return Some(prev_colon);
+        }
+    }
+
+    Some(last_colon)
 }
 
 fn is_substantive_non_url_token(raw_token: &str) -> bool {
@@ -516,26 +548,76 @@ fn line_contains_protected_token(line: &Line<'_>) -> bool {
     text_contains_url_like(&text) || text_contains_local_path_like(&text)
 }
 
-/// Reconfigures wrapping options so that protected tokens are never split.
+fn local_path_tokens_fit_in_available_width(line: &Line<'_>, base: &RtOptions<'_>) -> bool {
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    let initial_available = base
+        .width
+        .saturating_sub(base.initial_indent.width())
+        .max(1);
+    let subsequent_available = base
+        .width
+        .saturating_sub(base.subsequent_indent.width())
+        .max(1);
+    let available_width = initial_available.max(subsequent_available);
+
+    text.split_ascii_whitespace()
+        .map(trim_url_token)
+        .filter(|token| is_local_path_like_token(token))
+        .all(|token| token.width() <= available_width)
+}
+
+fn preserve_url_and_path_wrap_options<'a>(opts: RtOptions<'a>) -> RtOptions<'a> {
+    opts.word_separator(textwrap::WordSeparator::AsciiSpace)
+        .word_splitter(textwrap::WordSplitter::Custom(split_non_url_or_path_word))
+        .break_words(/*break_words*/ false)
+}
+
+/// Reconfigures wrapping options so that URL-like tokens are never split while
+/// still allowing controlled wrapping for local paths.
 ///
 /// Sets `AsciiSpace` word separation (so `/` and `-` inside URLs and
-/// local paths are not treated as break points), disables
+/// local paths are not treated as default break points), disables
 /// `break_words`, and installs a custom `WordSplitter` that returns no
-/// split points for protected tokens while still allowing
-/// character-level splitting for everything else.
+/// split points for URL-like tokens while still allowing local
+/// file-path tokens to wrap at explicit character boundaries under our
+/// control instead of relying on terminal autowrap.
 pub(crate) fn protected_token_wrap_options<'a>(opts: RtOptions<'a>) -> RtOptions<'a> {
     opts.word_separator(textwrap::WordSeparator::AsciiSpace)
         .word_splitter(textwrap::WordSplitter::Custom(split_non_protected_word))
         .break_words(/*break_words*/ false)
 }
 
-/// Custom `textwrap::WordSplitter` callback. Returns empty (no split
-/// points) for protected tokens so they are kept intact; returns every
-/// char-boundary index for everything else so other words can still
-/// break at any position.
-fn split_non_protected_word(word: &str) -> Vec<usize> {
+fn split_non_url_or_path_word(word: &str) -> Vec<usize> {
     if is_url_like_token(word) || is_local_path_like_token(word) {
         return Vec::new();
+    }
+
+    word.char_indices().skip(1).map(|(idx, _)| idx).collect()
+}
+
+/// Custom `textwrap::WordSplitter` callback.
+///
+/// URL-like tokens return no split points so they stay intact for
+/// clickability. Local file-path-like tokens return character
+/// boundaries so transcript wrapping stays deterministic and does not
+/// depend on terminal autowrap behavior. Everything else also returns
+/// character boundaries.
+fn split_non_protected_word(word: &str) -> Vec<usize> {
+    if is_url_like_token(word) {
+        return Vec::new();
+    }
+
+    if let Some(suffix_start) = local_path_location_suffix_start(word) {
+        return word
+            .char_indices()
+            .skip(1)
+            .map(|(idx, _)| idx)
+            .filter(|idx| *idx <= suffix_start)
+            .collect();
     }
 
     word.char_indices().skip(1).map(|(idx, _)| idx).collect()
@@ -551,12 +633,104 @@ fn split_non_protected_word(word: &str) -> Vec<usize> {
 /// intact while other words on the same line still break normally.
 #[must_use]
 pub(crate) fn adaptive_wrap_line<'a>(line: &'a Line<'a>, base: RtOptions<'a>) -> Vec<Line<'a>> {
-    let selected = if line_contains_protected_token(line) {
+    if let Some(split_before_path) = split_before_local_path_token_if_better(line, &base) {
+        return split_before_path;
+    }
+
+    let selected = if line_contains_url_like(line) {
+        preserve_url_and_path_wrap_options(base)
+    } else if line_contains_local_path_like(line) {
+        if local_path_tokens_fit_in_available_width(line, &base) {
+            preserve_url_and_path_wrap_options(base)
+        } else {
+            protected_token_wrap_options(base)
+        }
+    } else if line_contains_protected_token(line) {
         protected_token_wrap_options(base)
     } else {
         base
     };
     word_wrap_line(line, selected)
+}
+
+fn split_before_local_path_token_if_better<'a>(
+    line: &'a Line<'a>,
+    base: &RtOptions<'a>,
+) -> Option<Vec<Line<'a>>> {
+    if !line_contains_local_path_like(line) {
+        return None;
+    }
+
+    let mut flat = String::new();
+    let mut span_bounds = Vec::new();
+    let mut acc = 0usize;
+    for span in &line.spans {
+        let text = span.content.as_ref();
+        let start = acc;
+        flat.push_str(text);
+        acc += text.len();
+        span_bounds.push((start..acc, span.style));
+    }
+
+    let initial_available = base
+        .width
+        .saturating_sub(base.initial_indent.width())
+        .max(1);
+    let subsequent_available = base
+        .width
+        .saturating_sub(base.subsequent_indent.width())
+        .max(1);
+
+    if flat.width() <= initial_available {
+        return None;
+    }
+
+    let bytes = flat.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < flat.len() {
+        while cursor < flat.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= flat.len() {
+            break;
+        }
+
+        let token_start = cursor;
+        while cursor < flat.len() && !bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let token_end = cursor;
+        let raw_token = &flat[token_start..token_end];
+
+        if !is_local_path_like_token(raw_token) || raw_token.width() > subsequent_available {
+            continue;
+        }
+
+        let prefix_end = flat[..token_start]
+            .trim_end_matches(char::is_whitespace)
+            .len();
+        if prefix_end == 0 {
+            continue;
+        }
+
+        let prefix_line = line_to_static(&slice_line_spans(line, &span_bounds, &(0..prefix_end)));
+        let remainder_line = line_to_static(&slice_line_spans(
+            line,
+            &span_bounds,
+            &(token_start..flat.len()),
+        ));
+        let base_static = rt_options_to_static(base);
+
+        let mut out = word_wrap_line_owned(&prefix_line, base_static.clone());
+        let remainder_opts = base_static
+            .clone()
+            .initial_indent(base_static.subsequent_indent.clone())
+            .subsequent_indent(base_static.subsequent_indent.clone());
+        out.extend(word_wrap_line_owned(&remainder_line, remainder_opts));
+        return Some(retag_owned_lines(out));
+    }
+
+    None
 }
 
 /// Wraps multiple input lines with URL-aware heuristics, applying
@@ -721,6 +895,7 @@ where
         .wrap_algorithm(rt_opts.wrap_algorithm)
         .word_separator(rt_opts.word_separator)
         .word_splitter(rt_opts.word_splitter);
+    let line_style = line.style;
 
     let mut out: Vec<Line<'a>> = Vec::new();
 
@@ -743,7 +918,7 @@ where
             &mut sliced
                 .spans
                 .into_iter()
-                .map(|s| s.patch_style(line.style))
+                .map(|s| s.patch_style(line_style))
                 .collect(),
         );
         first_line.spans = spans;
@@ -771,7 +946,7 @@ where
             &mut sliced
                 .spans
                 .into_iter()
-                .map(|s| s.patch_style(line.style))
+                .map(|s| s.patch_style(line_style))
                 .collect(),
         );
         subsequent_line.spans = spans;
@@ -932,6 +1107,150 @@ fn slice_line_spans<'a>(
             });
         }
         if e >= end_byte {
+            break;
+        }
+    }
+    Line {
+        style: original.style,
+        alignment: original.alignment,
+        spans: acc,
+    }
+}
+
+fn rt_options_to_static(opts: &RtOptions<'_>) -> RtOptions<'static> {
+    RtOptions::new(opts.width)
+        .line_ending(opts.line_ending)
+        .initial_indent(line_to_static(&opts.initial_indent))
+        .subsequent_indent(line_to_static(&opts.subsequent_indent))
+        .break_words(opts.break_words)
+        .word_separator(opts.word_separator)
+        .wrap_algorithm(opts.wrap_algorithm)
+        .word_splitter(opts.word_splitter.clone())
+}
+
+fn retag_owned_lines<'a>(lines: Vec<Line<'static>>) -> Vec<Line<'a>> {
+    lines
+        .into_iter()
+        .map(|line| Line {
+            style: line.style,
+            alignment: line.alignment,
+            spans: line
+                .spans
+                .into_iter()
+                .map(|span| Span {
+                    style: span.style,
+                    content: Cow::Owned(span.content.into_owned()),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn word_wrap_line_owned(line: &Line<'_>, rt_opts: RtOptions<'static>) -> Vec<Line<'static>> {
+    let mut flat = String::new();
+    let mut span_bounds = Vec::new();
+    let mut acc = 0usize;
+    for span in &line.spans {
+        let text = span.content.as_ref();
+        let start = acc;
+        flat.push_str(text);
+        acc += text.len();
+        span_bounds.push((start..acc, span.style));
+    }
+
+    let opts = Options::new(rt_opts.width)
+        .line_ending(rt_opts.line_ending)
+        .break_words(rt_opts.break_words)
+        .wrap_algorithm(rt_opts.wrap_algorithm)
+        .word_separator(rt_opts.word_separator)
+        .word_splitter(rt_opts.word_splitter);
+    let line_style = line.style;
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let initial_width_available = opts
+        .width
+        .saturating_sub(rt_opts.initial_indent.width())
+        .max(1);
+    let initial_wrapped = wrap_ranges_trim(&flat, opts.clone().width(initial_width_available));
+    let Some(first_line_range) = initial_wrapped.first() else {
+        return vec![rt_opts.initial_indent.clone()];
+    };
+
+    let mut first_line = rt_opts.initial_indent.clone().style(line.style);
+    {
+        let sliced = slice_line_spans_owned(line, &span_bounds, first_line_range);
+        let mut spans = first_line.spans;
+        spans.append(
+            &mut sliced
+                .spans
+                .into_iter()
+                .map(|span| span.patch_style(line_style))
+                .collect(),
+        );
+        first_line.spans = spans;
+        out.push(first_line);
+    }
+
+    let base = first_line_range.end;
+    let skip_leading_spaces = flat[base..].chars().take_while(|ch| *ch == ' ').count();
+    let base = base + skip_leading_spaces;
+    let subsequent_width_available = opts
+        .width
+        .saturating_sub(rt_opts.subsequent_indent.width())
+        .max(1);
+    let remaining_wrapped = wrap_ranges_trim(&flat[base..], opts.width(subsequent_width_available));
+    for range in &remaining_wrapped {
+        if range.is_empty() {
+            continue;
+        }
+        let mut subsequent_line = rt_opts.subsequent_indent.clone().style(line.style);
+        let offset_range = (range.start + base)..(range.end + base);
+        let sliced = slice_line_spans_owned(line, &span_bounds, &offset_range);
+        let mut spans = subsequent_line.spans;
+        spans.append(
+            &mut sliced
+                .spans
+                .into_iter()
+                .map(|span| span.patch_style(line_style))
+                .collect(),
+        );
+        subsequent_line.spans = spans;
+        out.push(subsequent_line);
+    }
+
+    out
+}
+
+fn slice_line_spans_owned(
+    original: &Line<'_>,
+    span_bounds: &[(Range<usize>, ratatui::style::Style)],
+    range: &Range<usize>,
+) -> Line<'static> {
+    let start_byte = range.start;
+    let end_byte = range.end;
+    let mut acc: Vec<Span<'static>> = Vec::new();
+    for (index, (bounds, style)) in span_bounds.iter().enumerate() {
+        let start = bounds.start;
+        let end = bounds.end;
+        if end <= start_byte {
+            continue;
+        }
+        if start >= end_byte {
+            break;
+        }
+        let seg_start = start_byte.max(start);
+        let seg_end = end_byte.min(end);
+        if seg_end > seg_start {
+            let local_start = seg_start - start;
+            let local_end = seg_end - start;
+            let content = original.spans[index].content.as_ref();
+            let slice = &content[local_start..local_end];
+            acc.push(Span {
+                style: *style,
+                content: Cow::Owned(slice.to_string()),
+            });
+        }
+        if end >= end_byte {
             break;
         }
     }
@@ -1283,7 +1602,7 @@ them."#
     }
 
     #[test]
-    fn adaptive_wrap_line_keeps_local_path_token_intact() {
+    fn adaptive_wrap_line_wraps_local_path_token_under_wrapper_control() {
         let line = Line::from(
             ".sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294",
         );
@@ -1294,8 +1613,8 @@ them."#
         assert_eq!(
             rendered,
             vec![
-                ".sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294"
-                    .to_string(),
+                ".sangoi/planning/2026-04-10-codex-cli-rust-full-".to_string(),
+                "remediation-master-plan.md:294".to_string(),
             ]
         );
     }
@@ -1317,7 +1636,8 @@ them."#
         assert_eq!(
             rendered,
             vec![
-                "- .sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294"
+                "-".to_string(),
+                "  .sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294"
                     .to_string(),
                 "  stays aligned".to_string(),
             ]

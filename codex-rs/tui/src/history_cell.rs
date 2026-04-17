@@ -2696,18 +2696,36 @@ pub(crate) fn new_patch_event(
     }
 }
 
-pub(crate) fn new_patch_apply_failure(stderr: String) -> PlainHistoryCell {
+pub(crate) fn new_patch_apply_failure(
+    status: codex_protocol::protocol::PatchApplyStatus,
+    stdout: String,
+    stderr: String,
+) -> PlainHistoryCell {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let detail = if !stderr.trim().is_empty() {
+        stderr
+    } else {
+        stdout
+    };
 
-    // Failure title
-    lines.push(Line::from("✘ Failed to apply patch".magenta().bold()));
+    let title = match status {
+        codex_protocol::protocol::PatchApplyStatus::Declined => "✘ Patch application declined",
+        codex_protocol::protocol::PatchApplyStatus::Failed
+            if detail.to_ascii_lowercase().contains("timed out") =>
+        {
+            "✘ Patch application timed out"
+        }
+        codex_protocol::protocol::PatchApplyStatus::Failed => "✘ Patch application failed",
+        codex_protocol::protocol::PatchApplyStatus::Completed => "✘ Patch application failed",
+    };
+    lines.push(Line::from(title.magenta().bold()));
 
-    if !stderr.trim().is_empty() {
+    if !detail.trim().is_empty() {
         let output = output_lines(
             Some(&CommandOutput {
                 exit_code: 1,
                 formatted_output: String::new(),
-                aggregated_output: stderr,
+                aggregated_output: detail,
             }),
             OutputLinesParams {
                 line_limit: TOOL_CALL_MAX_LINES,
@@ -2977,6 +2995,7 @@ mod tests {
     use codex_protocol::parse_command::ParsedCommand;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::McpAuthStatus;
+    use codex_protocol::protocol::PatchApplyStatus;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionConfiguredEvent;
     use dirs::home_dir;
@@ -3594,6 +3613,38 @@ mod tests {
                     .to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn patch_apply_failure_uses_status_specific_title() {
+        let declined =
+            new_patch_apply_failure(PatchApplyStatus::Declined, String::new(), String::new());
+        assert_eq!(
+            declined.lines[0],
+            Line::from("✘ Patch application declined".magenta().bold()),
+        );
+
+        let timed_out = new_patch_apply_failure(
+            PatchApplyStatus::Failed,
+            String::new(),
+            "command timed out after 10000 milliseconds".to_string(),
+        );
+        assert_eq!(
+            timed_out.lines[0],
+            Line::from("✘ Patch application timed out".magenta().bold()),
+        );
+    }
+
+    #[test]
+    fn patch_apply_failure_falls_back_to_stdout_details() {
+        let failure = new_patch_apply_failure(
+            PatchApplyStatus::Failed,
+            "apply_patch verification failed: parse error".to_string(),
+            String::new(),
+        );
+        let rendered = render_lines(&failure.display_lines(/*width*/ 120)).join("\n");
+        assert!(rendered.contains("Patch application failed"));
+        assert!(rendered.contains("apply_patch verification failed: parse error"));
     }
 
     #[test]

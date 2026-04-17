@@ -398,10 +398,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history_cell::AgentMessageCell;
+    use crate::history_cell::HistoryCell;
+    use crate::markdown::append_markdown;
     use crate::markdown_render::render_markdown_text;
     use crate::test_backend::VT100Backend;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
+    use std::path::Path;
 
     #[test]
     fn writes_bold_then_regular_spans() {
@@ -797,6 +801,95 @@ mod tests {
         assert!(
             url_row <= prompt_row + 2,
             "expected URL content to appear immediately after prompt (allowing at most one spacer row), got prompt_row={prompt_row}, url_row={url_row}, rows={rows:?}",
+        );
+    }
+
+    #[test]
+    fn vt100_master_plan_reply_keeps_owner_file_refs_intact() {
+        let width: u16 = 88;
+        let height: u16 = 80;
+        let backend = VT100Backend::new(width, height);
+        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        let viewport = Rect::new(0, height - 1, width, 1);
+        term.set_viewport_area(viewport);
+
+        let markdown = concat!(
+            "• Está aberto ainda, mas o lado de auth/accounts ficou praticamente fechado.\n\n",
+            "**Estado geral**\n\n",
+            "- owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:1`\n",
+            "- total de checklist no plano:\n",
+            "  - `45` concluídos\n",
+            "  - `37` abertos\n\n",
+            "**Workstreams fechados**\n\n",
+            "- `WS0` evidência/ledger freeze\n",
+            "- `WS2` app-server interaction/runtime parity\n",
+            "- `WS7` guardian approvals\n",
+            "- `WS12` SQLite/account/autoswitch/lease/sqlite  \n",
+            "  owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:394`\n\n",
+            "**Quase fechado**\n\n",
+            "- `WS1` está com `1` item aberto só:\n",
+            "  - remover os mirrors/detours restantes de config que não são de accounts  \n",
+            "    owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:252`\n\n",
+            "**Ainda abertos**\n\n",
+            "- `WS3` resume/history/memory-state: `4` itens  \n",
+            "  owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:289`\n",
+            "- `WS4` debug/operator surfaces: `5` itens  \n",
+            "  owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:307`\n",
+            "- `WS5` session recording/support-log: `7` itens  \n",
+            "  owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:315`\n",
+            "- `WS6` legacy collab/config canon: `5` itens  \n",
+            "  owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:330`\n",
+            "- `WS8` logging/runtime standards: `4` itens  \n",
+            "  owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:363`\n",
+            "- `WS9` OTEL: `4` itens  \n",
+            "  owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:370`\n",
+            "- `WS10` manage_context / project-doc fallback: `3` itens  \n",
+            "  owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:377`\n",
+            "- `WS11` personality migration retirement: `4` itens  \n",
+            "  owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:387`\n",
+            "\n**Observação importante**\n\n",
+            "- o bloco `Current execution state` no topo ainda está defasado  \n",
+            "  owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:19`\n",
+            "- ele não cita os commits posteriores de fechamento/seguimento, incluindo:\n",
+            "  - `3ea943a65` e `.sangoi` `a16f022` do closeout de `WS12`\n",
+            "  - `83bb13c01` e `.sangoi` `ad6056f` do fix da renderização final da TUI\n",
+            "- mas o checklist por workstream continua sendo a fonte certa de verdade, e nele `WS12` já está fechado\n\n",
+            "**Resumo curto**\n\n",
+            "- o master plan **não acabou**\n",
+            "- `WS12` **acabou**\n",
+            "- `WS1` ficou com um resto pequeno\n",
+            "- o backlog principal agora está em `WS3`, `WS4`, `WS5`, `WS6`, `WS8`, `WS9`, `WS10`, `WS11`\n",
+        );
+
+        let mut rendered_markdown = Vec::new();
+        append_markdown(
+            markdown,
+            /*width*/ None,
+            Some(Path::new("/home/lucas/work/codex")),
+            &mut rendered_markdown,
+        );
+        let cell = AgentMessageCell::new(rendered_markdown, /*is_first_line*/ true);
+        let lines = cell.display_lines(width);
+
+        insert_history_lines(&mut term, lines).expect("insert history");
+
+        let contents = term.backend().vt100().screen().contents();
+        assert!(
+            contents.contains(
+                "owner:\n  .sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:394"
+            ),
+            "expected owner hard break to keep the file ref intact, contents:\n{contents}",
+        );
+        assert!(
+            contents.contains(
+                "owner:\n  .sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:252"
+            ),
+            "expected later owner file refs to stay intact too, contents:\n{contents}",
+        );
+        assert!(
+            !contents.contains("master-plan.md\n  :394")
+                && !contents.contains("master-plan.md\n  :252"),
+            "did not expect line suffixes to be stranded onto their own rows, contents:\n{contents}",
         );
     }
 

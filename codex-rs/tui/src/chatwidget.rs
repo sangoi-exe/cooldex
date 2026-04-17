@@ -4924,10 +4924,7 @@ impl ChatWidget {
                 // Reset the flag even if we don't show separator (no work was done)
                 self.needs_final_message_separator = false;
             }
-            self.stream_controller = Some(StreamController::new(
-                self.last_rendered_width.get().map(|w| w.saturating_sub(2)),
-                &self.config.cwd,
-            ));
+            self.stream_controller = Some(StreamController::new(&self.config.cwd));
         }
         if let Some(controller) = self.stream_controller.as_mut()
             && controller.push(&delta)
@@ -5087,7 +5084,11 @@ impl ChatWidget {
         // If the patch was successful, just let the "Edited" block stand.
         // Otherwise, add a failure block.
         if !event.success {
-            self.add_to_history(history_cell::new_patch_apply_failure(event.stderr));
+            self.add_to_history(history_cell::new_patch_apply_failure(
+                event.status,
+                event.stdout,
+                event.stderr,
+            ));
         }
         // Mark that actual work was done (patch applied)
         self.had_work_activity = true;

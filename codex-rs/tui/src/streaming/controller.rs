@@ -21,11 +21,15 @@ pub(crate) struct StreamController {
 impl StreamController {
     /// Create a controller whose markdown renderer shortens local file links relative to `cwd`.
     ///
+    /// Live assistant commentary should not pre-wrap markdown at collector time; that produced
+    /// different line breaking from the committed/resumed history path for long local file refs.
+    /// Keep streaming markdown unwrapped here and let the `HistoryCell` display path own wrapping.
+    ///
     /// The controller snapshots the path into stream state so later commit ticks and finalization
     /// render against the same session cwd that was active when streaming started.
-    pub(crate) fn new(width: Option<usize>, cwd: &Path) -> Self {
+    pub(crate) fn new(cwd: &Path) -> Self {
         Self {
-            state: StreamState::new(width, cwd),
+            state: StreamState::new(/*width*/ None, cwd),
             finishing_after_drain: false,
             header_emitted: false,
         }
@@ -283,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn controller_loose_vs_tight_with_commit_ticks_matches_full() {
-        let mut ctrl = StreamController::new(/*width*/ None, &test_cwd());
+        let mut ctrl = StreamController::new(&test_cwd());
         let mut lines = Vec::new();
 
         // Exact deltas from the session log (section: Loose vs. tight list items)
@@ -408,6 +412,51 @@ mod tests {
         assert_eq!(
             streamed, expected,
             "expected exact rendered lines for loose/tight section"
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_live_owner_file_refs_match_full_render() {
+        let width: u16 = 88;
+        let cwd = test_cwd();
+        let mut ctrl = StreamController::new(&cwd);
+        let source = concat!(
+            "• Está aberto ainda, mas o lado de auth/accounts ficou praticamente fechado.\n\n",
+            "**Workstreams fechados**\n\n",
+            "- `WS12` SQLite/account/autoswitch/lease/sqlite  \n",
+            "  owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:394`\n\n",
+            "**Quase fechado**\n\n",
+            "- `WS1` está com `1` item aberto só:\n",
+            "  - remover os mirrors/detours restantes de config que não são de accounts  \n",
+            "    owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:252`\n",
+        );
+
+        ctrl.push(source);
+        let mut streamed_display = Vec::new();
+        while let (Some(cell), idle) = ctrl.on_commit_tick() {
+            streamed_display.extend(cell.display_lines(width));
+            if idle {
+                break;
+            }
+        }
+        if let Some(cell) = ctrl.finalize() {
+            streamed_display.extend(cell.display_lines(width));
+        }
+
+        let mut rendered_markdown = Vec::new();
+        crate::markdown::append_markdown(
+            source,
+            /*width*/ None,
+            Some(cwd.as_path()),
+            &mut rendered_markdown,
+        );
+        let expected =
+            history_cell::AgentMessageCell::new(rendered_markdown, /*is_first_line*/ true)
+                .display_lines(width);
+
+        assert_eq!(
+            lines_to_plain_strings(&streamed_display),
+            lines_to_plain_strings(&expected),
         );
     }
 }
