@@ -109,6 +109,8 @@ pub struct InProcessStartArgs {
     pub arg0_paths: Arg0DispatchPaths,
     /// Shared base config used to initialize core components.
     pub config: Arc<Config>,
+    /// Shared auth manager used by both the embedder and the in-process runtime.
+    pub auth_manager: Arc<AuthManager>,
     /// CLI config overrides that are already parsed into TOML values.
     pub cli_overrides: Vec<(String, TomlValue)>,
     /// Loader override knobs used by config API paths.
@@ -380,8 +382,7 @@ fn start_uninitialized(args: InProcessStartArgs) -> InProcessClientHandle {
         });
 
         let processor_outgoing = Arc::clone(&outgoing_message_sender);
-        let auth_manager =
-            AuthManager::shared_from_config(args.config.as_ref(), args.enable_codex_api_key_env);
+        let auth_manager = Arc::clone(&args.auth_manager);
         let (processor_tx, mut processor_rx) = mpsc::channel::<ProcessorCommand>(channel_capacity);
         let mut processor_handle = tokio::spawn(async move {
             let mut processor = MessageProcessor::new(MessageProcessorArgs {
@@ -714,9 +715,14 @@ mod tests {
         session_source: SessionSource,
         channel_capacity: usize,
     ) -> InProcessClientHandle {
+        let config = Arc::new(build_test_config().await);
         let args = InProcessStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
-            config: Arc::new(build_test_config().await),
+            auth_manager: AuthManager::shared_from_config(
+                config.as_ref(),
+                /*enable_codex_api_key_env*/ false,
+            ),
+            config,
             cli_overrides: Vec::new(),
             loader_overrides: LoaderOverrides::default(),
             cloud_requirements: CloudRequirementsLoader::default(),

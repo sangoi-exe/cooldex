@@ -26,6 +26,7 @@ use std::io::Result as IoResult;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_app_server::SharedAuthManager;
 pub use codex_app_server::in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 pub use codex_app_server::in_process::InProcessServerEvent;
 use codex_app_server::in_process::InProcessStartArgs;
@@ -261,6 +262,8 @@ pub struct InProcessClientStartArgs {
     pub arg0_paths: Arg0DispatchPaths,
     /// Shared config used to initialize app-server runtime.
     pub config: Arc<Config>,
+    /// Shared auth manager used by both the embedder and the in-process runtime.
+    pub auth_manager: Arc<SharedAuthManager>,
     /// CLI config overrides that are already parsed into TOML values.
     pub cli_overrides: Vec<(String, TomlValue)>,
     /// Loader override knobs used by config API paths.
@@ -314,6 +317,7 @@ impl InProcessClientStartArgs {
         InProcessStartArgs {
             arg0_paths: self.arg0_paths,
             config: self.config,
+            auth_manager: self.auth_manager,
             cli_overrides: self.cli_overrides,
             loader_overrides: self.loader_overrides,
             cloud_requirements: self.cloud_requirements,
@@ -887,9 +891,14 @@ mod tests {
         session_source: SessionSource,
         channel_capacity: usize,
     ) -> InProcessAppServerClient {
+        let config = Arc::new(build_test_config().await);
         InProcessAppServerClient::start(InProcessClientStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
-            config: Arc::new(build_test_config().await),
+            auth_manager: SharedAuthManager::shared_from_config(
+                config.as_ref(),
+                /*enable_codex_api_key_env*/ false,
+            ),
+            config,
             cli_overrides: Vec::new(),
             loader_overrides: LoaderOverrides::default(),
             cloud_requirements: CloudRequirementsLoader::default(),
@@ -1893,11 +1902,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_start_args_leave_manager_bootstrap_to_app_server() {
+    async fn caller_provided_auth_manager_is_retained_by_in_process_runtime() {
         let config = Arc::new(build_test_config().await);
+        let auth_manager = SharedAuthManager::shared_from_config(
+            config.as_ref(),
+            /*enable_codex_api_key_env*/ false,
+        );
 
         let runtime_args = InProcessClientStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
+            auth_manager: auth_manager.clone(),
             config: config.clone(),
             cli_overrides: Vec::new(),
             loader_overrides: LoaderOverrides::default(),
@@ -1915,6 +1929,7 @@ mod tests {
         .into_runtime_start_args();
 
         assert_eq!(runtime_args.config, config);
+        assert!(Arc::ptr_eq(&runtime_args.auth_manager, &auth_manager));
     }
 
     #[tokio::test]

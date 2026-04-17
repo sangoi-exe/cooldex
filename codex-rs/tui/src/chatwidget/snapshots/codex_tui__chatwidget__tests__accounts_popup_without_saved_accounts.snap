@@ -1,0 +1,10 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: popup
+---
+  Accounts
+  No ChatGPT accounts are saved yet. Add one to continue.
+
+› 1. Add account...  sign in to add another ChatGPT account
+
+  Press enter to confirm or esc to go back

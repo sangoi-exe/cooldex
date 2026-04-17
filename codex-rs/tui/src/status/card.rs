@@ -135,6 +135,7 @@ struct StatusHistoryCell {
     model_provider: Option<String>,
     account: Option<StatusAccountDisplay>,
     thread_name: Option<String>,
+    auth_session_id: Option<String>,
     session_id: Option<String>,
     forked_from: Option<String>,
     token_usage: StatusTokenUsageData,
@@ -164,6 +165,7 @@ pub(crate) fn new_status_output(
         account_display,
         token_info,
         total_usage,
+        None,
         session_id,
         thread_name,
         forked_from,
@@ -184,6 +186,7 @@ pub(crate) fn new_status_output_with_rate_limits(
     account_display: Option<&StatusAccountDisplay>,
     token_info: Option<&TokenUsageInfo>,
     total_usage: &TokenUsage,
+    auth_session_id: Option<&str>,
     session_id: &Option<ThreadId>,
     thread_name: Option<String>,
     forked_from: Option<ThreadId>,
@@ -200,6 +203,7 @@ pub(crate) fn new_status_output_with_rate_limits(
         account_display,
         token_info,
         total_usage,
+        auth_session_id,
         session_id,
         thread_name,
         forked_from,
@@ -221,6 +225,7 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
     account_display: Option<&StatusAccountDisplay>,
     token_info: Option<&TokenUsageInfo>,
     total_usage: &TokenUsage,
+    auth_session_id: Option<&str>,
     session_id: &Option<ThreadId>,
     thread_name: Option<String>,
     forked_from: Option<ThreadId>,
@@ -239,6 +244,7 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
         account_display,
         token_info,
         total_usage,
+        auth_session_id,
         session_id,
         thread_name,
         forked_from,
@@ -265,6 +271,7 @@ impl StatusHistoryCell {
         account_display: Option<&StatusAccountDisplay>,
         token_info: Option<&TokenUsageInfo>,
         total_usage: &TokenUsage,
+        auth_session_id: Option<&str>,
         session_id: &Option<ThreadId>,
         thread_name: Option<String>,
         forked_from: Option<ThreadId>,
@@ -340,6 +347,7 @@ impl StatusHistoryCell {
         };
         let model_provider = format_model_provider(config);
         let account = compose_account_display(account_display);
+        let auth_session_id = auth_session_id.map(str::to_string);
         let session_id = session_id.as_ref().map(std::string::ToString::to_string);
         let forked_from = forked_from.map(|id| id.to_string());
         let default_usage = TokenUsage::default();
@@ -380,6 +388,7 @@ impl StatusHistoryCell {
                 model_provider,
                 account,
                 thread_name,
+                auth_session_id,
                 session_id,
                 forked_from,
                 token_usage,
@@ -607,6 +616,9 @@ impl HistoryCell for StatusHistoryCell {
         if thread_name.is_some() {
             push_label(&mut labels, &mut seen, "Thread name");
         }
+        if self.auth_session_id.is_some() {
+            push_label(&mut labels, &mut seen, "Auth session");
+        }
         if self.session_id.is_some() {
             push_label(&mut labels, &mut seen, "Session");
         }
@@ -669,6 +681,9 @@ impl HistoryCell for StatusHistoryCell {
         }
         if let Some(collab_mode) = self.collaboration_mode.as_ref() {
             lines.push(formatter.line("Collaboration mode", vec![Span::from(collab_mode.clone())]));
+        }
+        if let Some(auth_session) = self.auth_session_id.as_ref() {
+            lines.push(formatter.line("Auth session", vec![Span::from(auth_session.clone())]));
         }
         if let Some(session) = self.session_id.as_ref() {
             lines.push(formatter.line("Session", vec![Span::from(session.clone())]));

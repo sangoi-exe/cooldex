@@ -36,6 +36,7 @@ pub struct AccountUsageState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountLeaseConflict {
     pub owner_session_id: String,
+    pub owner_codex_session_id: Option<String>,
     pub lease_until: DateTime<Utc>,
 }
 
@@ -52,6 +53,7 @@ pub enum SessionActiveAccountRefresh {
     LostToOtherSession {
         account_id: String,
         owner_session_id: String,
+        owner_codex_session_id: Option<String>,
         lease_until: DateTime<Utc>,
     },
 }
@@ -90,16 +92,20 @@ CREATE TABLE IF NOT EXISTS account_usage_state (
 CREATE TABLE IF NOT EXISTS session_active_account (
     session_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL,
+    codex_session_id TEXT,
     updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS account_leases (
     account_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
+    codex_session_id TEXT,
     lease_until INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
             "#,
         )?;
+        ensure_optional_text_column(&connection, "session_active_account", "codex_session_id")?;
+        ensure_optional_text_column(&connection, "account_leases", "codex_session_id")?;
         Ok(Self {
             sqlite_home,
             connection: Arc::new(Mutex::new(connection)),
@@ -232,6 +238,7 @@ ON CONFLICT(account_id) DO UPDATE SET
     pub fn refresh_session_active_account(
         &self,
         session_id: &str,
+        codex_session_id: Option<&str>,
         now: DateTime<Utc>,
         lease_ttl_seconds: i64,
     ) -> Result<SessionActiveAccountRefresh> {
@@ -245,6 +252,25 @@ ON CONFLICT(account_id) DO UPDATE SET
         if let Some(conflict) =
             load_unexpired_lease_conflict(&transaction, account_id.as_str(), session_id, now_epoch)?
         {
+            if conflict_matches_codex_session(&conflict, codex_session_id) {
+                upsert_session_active_account(
+                    &transaction,
+                    session_id,
+                    account_id.as_str(),
+                    codex_session_id,
+                    now_epoch,
+                )?;
+                upsert_account_lease(
+                    &transaction,
+                    account_id.as_str(),
+                    session_id,
+                    codex_session_id,
+                    lease_until_epoch(now_epoch, lease_ttl_seconds),
+                    now_epoch,
+                )?;
+                transaction.commit()?;
+                return Ok(SessionActiveAccountRefresh::Active(account_id));
+            }
             transaction.execute(
                 "DELETE FROM session_active_account WHERE session_id = ?",
                 [session_id],
@@ -253,14 +279,22 @@ ON CONFLICT(account_id) DO UPDATE SET
             return Ok(SessionActiveAccountRefresh::LostToOtherSession {
                 account_id,
                 owner_session_id: conflict.owner_session_id,
+                owner_codex_session_id: conflict.owner_codex_session_id,
                 lease_until: conflict.lease_until,
             });
         }
-        upsert_session_active_account(&transaction, session_id, account_id.as_str(), now_epoch)?;
+        upsert_session_active_account(
+            &transaction,
+            session_id,
+            account_id.as_str(),
+            codex_session_id,
+            now_epoch,
+        )?;
         upsert_account_lease(
             &transaction,
             account_id.as_str(),
             session_id,
+            codex_session_id,
             lease_until_epoch(now_epoch, lease_ttl_seconds),
             now_epoch,
         )?;
@@ -271,6 +305,7 @@ ON CONFLICT(account_id) DO UPDATE SET
     pub fn set_session_active_account(
         &self,
         session_id: &str,
+        codex_session_id: Option<&str>,
         account_id: &str,
         now: DateTime<Utc>,
         lease_ttl_seconds: i64,
@@ -280,6 +315,7 @@ ON CONFLICT(account_id) DO UPDATE SET
         let now_epoch = now.timestamp();
         if let Some(conflict) =
             load_unexpired_lease_conflict(&transaction, account_id, session_id, now_epoch)?
+            && !conflict_matches_codex_session(&conflict, codex_session_id)
         {
             transaction.commit()?;
             return Ok(SessionActiveAccountSetOutcome::Conflict(conflict));
@@ -292,11 +328,18 @@ ON CONFLICT(account_id) DO UPDATE SET
                 params![previous_account_id, session_id],
             )?;
         }
-        upsert_session_active_account(&transaction, session_id, account_id, now_epoch)?;
+        upsert_session_active_account(
+            &transaction,
+            session_id,
+            account_id,
+            codex_session_id,
+            now_epoch,
+        )?;
         upsert_account_lease(
             &transaction,
             account_id,
             session_id,
+            codex_session_id,
             lease_until_epoch(now_epoch, lease_ttl_seconds),
             now_epoch,
         )?;
@@ -325,19 +368,23 @@ ON CONFLICT(account_id) DO UPDATE SET
     pub fn account_is_leased_by_other(
         &self,
         session_id: &str,
+        codex_session_id: Option<&str>,
         account_id: &str,
         now: DateTime<Utc>,
     ) -> Result<bool> {
         let connection = self.lock_connection()?;
         Ok(
             load_unexpired_lease_conflict(&connection, account_id, session_id, now.timestamp())?
-                .is_some(),
+                .is_some_and(|conflict| {
+                    !conflict_matches_codex_session(&conflict, codex_session_id)
+                }),
         )
     }
 
     pub fn account_ids_leased_by_other(
         &self,
         session_id: &str,
+        codex_session_id: Option<&str>,
         account_ids: &[String],
         now: DateTime<Utc>,
     ) -> Result<HashSet<String>> {
@@ -350,7 +397,9 @@ ON CONFLICT(account_id) DO UPDATE SET
         let mut leased_account_ids = HashSet::new();
         for account_id in account_ids {
             if load_unexpired_lease_conflict(&connection, account_id, session_id, now_epoch)?
-                .is_some()
+                .is_some_and(|conflict| {
+                    !conflict_matches_codex_session(&conflict, codex_session_id)
+                })
             {
                 leased_account_ids.insert(account_id.clone());
             }
@@ -418,23 +467,24 @@ fn load_unexpired_lease_conflict(
     connection
         .query_row(
             r#"
-SELECT session_id, lease_until
+SELECT session_id, codex_session_id, lease_until
 FROM account_leases
 WHERE account_id = ? AND lease_until > ? AND session_id != ?
             "#,
             params![account_id, now_epoch, session_id],
             |row| {
-                let lease_until_epoch = row.get::<_, i64>(1)?;
+                let lease_until_epoch = row.get::<_, i64>(2)?;
                 let lease_until =
                     epoch_seconds_to_datetime(Some(lease_until_epoch)).ok_or_else(|| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            1,
+                            2,
                             rusqlite::types::Type::Integer,
                             format!("invalid lease_until epoch {lease_until_epoch}").into(),
                         )
                     })?;
                 Ok(AccountLeaseConflict {
                     owner_session_id: row.get::<_, String>(0)?,
+                    owner_codex_session_id: row.get::<_, Option<String>>(1)?,
                     lease_until,
                 })
             },
@@ -447,17 +497,19 @@ fn upsert_session_active_account(
     connection: &Connection,
     session_id: &str,
     account_id: &str,
+    codex_session_id: Option<&str>,
     now_epoch: i64,
 ) -> Result<()> {
     connection.execute(
         r#"
-INSERT INTO session_active_account (session_id, account_id, updated_at)
-VALUES (?, ?, ?)
+INSERT INTO session_active_account (session_id, account_id, codex_session_id, updated_at)
+VALUES (?, ?, ?, ?)
 ON CONFLICT(session_id) DO UPDATE SET
     account_id = excluded.account_id,
+    codex_session_id = excluded.codex_session_id,
     updated_at = excluded.updated_at
         "#,
-        params![session_id, account_id, now_epoch],
+        params![session_id, account_id, codex_session_id, now_epoch],
     )?;
     Ok(())
 }
@@ -466,21 +518,56 @@ fn upsert_account_lease(
     connection: &Connection,
     account_id: &str,
     session_id: &str,
+    codex_session_id: Option<&str>,
     lease_until: i64,
     now_epoch: i64,
 ) -> Result<()> {
     connection.execute(
         r#"
-INSERT INTO account_leases (account_id, session_id, lease_until, updated_at)
-VALUES (?, ?, ?, ?)
+INSERT INTO account_leases (account_id, session_id, codex_session_id, lease_until, updated_at)
+VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(account_id) DO UPDATE SET
     session_id = excluded.session_id,
+    codex_session_id = excluded.codex_session_id,
     lease_until = excluded.lease_until,
     updated_at = excluded.updated_at
         "#,
-        params![account_id, session_id, lease_until, now_epoch],
+        params![
+            account_id,
+            session_id,
+            codex_session_id,
+            lease_until,
+            now_epoch
+        ],
     )?;
     Ok(())
+}
+
+fn ensure_optional_text_column(
+    connection: &Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<()> {
+    let pragma = format!("PRAGMA table_info({table_name})");
+    let mut statement = connection.prepare(pragma.as_str())?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column_name {
+            return Ok(());
+        }
+    }
+    let alter = format!("ALTER TABLE {table_name} ADD COLUMN {column_name} TEXT");
+    connection.execute(alter.as_str(), [])?;
+    Ok(())
+}
+
+fn conflict_matches_codex_session(
+    conflict: &AccountLeaseConflict,
+    codex_session_id: Option<&str>,
+) -> bool {
+    codex_session_id.is_some_and(|codex_session_id| {
+        conflict.owner_codex_session_id.as_deref() == Some(codex_session_id)
+    })
 }
 
 fn lease_until_epoch(now_epoch: i64, lease_ttl_seconds: i64) -> i64 {
@@ -595,7 +682,7 @@ mod tests {
 
         assert_eq!(
             store
-                .set_session_active_account("session-a", "account-a", now, 300)
+                .set_session_active_account("session-a", None, "account-a", now, 300)
                 .expect("assign initial lease"),
             SessionActiveAccountSetOutcome::Assigned
         );
@@ -603,6 +690,7 @@ mod tests {
             store
                 .refresh_session_active_account(
                     "session-a",
+                    None,
                     now + chrono::Duration::seconds(30),
                     300,
                 )
@@ -618,11 +706,12 @@ mod tests {
         let now = fixed_now();
 
         store
-            .set_session_active_account("session-a", "account-a", now, 300)
+            .set_session_active_account("session-a", None, "account-a", now, 300)
             .expect("assign initial lease");
         let outcome = store
             .set_session_active_account(
                 "session-b",
+                None,
                 "account-a",
                 now + chrono::Duration::seconds(1),
                 300,
@@ -632,6 +721,7 @@ mod tests {
             outcome,
             SessionActiveAccountSetOutcome::Conflict(AccountLeaseConflict {
                 owner_session_id: "session-a".to_string(),
+                owner_codex_session_id: None,
                 lease_until: now + chrono::Duration::seconds(300),
             })
         );
@@ -644,7 +734,7 @@ mod tests {
         let now = fixed_now();
 
         store
-            .set_session_active_account("session-a", "account-a", now, 300)
+            .set_session_active_account("session-a", None, "account-a", now, 300)
             .expect("assign initial lease");
         assert_eq!(
             store
@@ -656,6 +746,7 @@ mod tests {
             store
                 .set_session_active_account(
                     "session-b",
+                    None,
                     "account-a",
                     now + chrono::Duration::seconds(1),
                     300,
@@ -672,12 +763,13 @@ mod tests {
         let now = fixed_now();
 
         store
-            .set_session_active_account("session-a", "account-a", now, 60)
+            .set_session_active_account("session-a", None, "account-a", now, 60)
             .expect("assign initial lease");
         assert_eq!(
             store
                 .set_session_active_account(
                     "session-b",
+                    None,
                     "account-a",
                     now + chrono::Duration::seconds(61),
                     60,
@@ -689,6 +781,7 @@ mod tests {
             store
                 .refresh_session_active_account(
                     "session-a",
+                    None,
                     now + chrono::Duration::seconds(62),
                     60,
                 )
@@ -696,6 +789,7 @@ mod tests {
             SessionActiveAccountRefresh::LostToOtherSession {
                 account_id: "account-a".to_string(),
                 owner_session_id: "session-b".to_string(),
+                owner_codex_session_id: None,
                 lease_until: now + chrono::Duration::seconds(121),
             }
         );
@@ -703,6 +797,7 @@ mod tests {
             store
                 .refresh_session_active_account(
                     "session-a",
+                    None,
                     now + chrono::Duration::seconds(63),
                     60,
                 )
@@ -718,18 +813,19 @@ mod tests {
         let now = fixed_now();
 
         store
-            .set_session_active_account("session-a", "account-a", now, 300)
+            .set_session_active_account("session-a", None, "account-a", now, 300)
             .expect("assign foreign live lease");
         store
-            .set_session_active_account("session-b", "account-b", now, 300)
+            .set_session_active_account("session-b", None, "account-b", now, 300)
             .expect("assign owned live lease");
         store
-            .set_session_active_account("session-c", "account-c", now, 60)
+            .set_session_active_account("session-c", None, "account-c", now, 60)
             .expect("assign expiring foreign lease");
 
         let leased_account_ids = store
             .account_ids_leased_by_other(
                 "session-b",
+                None,
                 &[
                     "account-a".to_string(),
                     "account-b".to_string(),
@@ -741,5 +837,68 @@ mod tests {
             .expect("load bulk lease conflicts");
 
         assert_eq!(leased_account_ids, HashSet::from(["account-a".to_string()]),);
+    }
+
+    #[test]
+    fn same_codex_session_can_reclaim_live_lease_from_old_runtime() {
+        let sqlite_home = TempDir::new().expect("tempdir");
+        let store = AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open store");
+        let now = fixed_now();
+
+        assert_eq!(
+            store
+                .set_session_active_account(
+                    "runtime-a",
+                    Some("codex-session-1"),
+                    "account-a",
+                    now,
+                    300,
+                )
+                .expect("assign initial lease"),
+            SessionActiveAccountSetOutcome::Assigned
+        );
+        assert_eq!(
+            store
+                .set_session_active_account(
+                    "runtime-b",
+                    Some("codex-session-1"),
+                    "account-a",
+                    now + chrono::Duration::seconds(1),
+                    300,
+                )
+                .expect("same-session takeover should succeed"),
+            SessionActiveAccountSetOutcome::Assigned
+        );
+        assert!(
+            !store
+                .account_is_leased_by_other(
+                    "runtime-b",
+                    Some("codex-session-1"),
+                    "account-a",
+                    now + chrono::Duration::seconds(2),
+                )
+                .expect("same-session lease should not be foreign"),
+        );
+        assert_eq!(
+            store
+                .refresh_session_active_account(
+                    "runtime-a",
+                    Some("codex-session-1"),
+                    now + chrono::Duration::seconds(2),
+                    300,
+                )
+                .expect("same-session runtime should reclaim lease on refresh"),
+            SessionActiveAccountRefresh::Active("account-a".to_string())
+        );
+        assert!(
+            !store
+                .account_is_leased_by_other(
+                    "runtime-a",
+                    Some("codex-session-1"),
+                    "account-a",
+                    now + chrono::Duration::seconds(3),
+                )
+                .expect("reclaimed lease should stay local"),
+        );
     }
 }

@@ -1711,6 +1711,7 @@ pub struct AuthManager {
     storage: Arc<dyn AuthStorageBackend>,
     account_state_store: Option<AccountStateStore>,
     runtime_session_id: String,
+    linked_codex_session_id: RwLock<Option<String>>,
     inner: RwLock<CachedAuth>,
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
@@ -1747,6 +1748,7 @@ impl Debug for AuthManager {
             .field("codex_home", &self.codex_home)
             .field("account_state_store", &self.account_state_store)
             .field("runtime_session_id", &self.runtime_session_id)
+            .field("linked_codex_session_id", &self.linked_codex_session_id)
             .field("inner", &self.inner)
             .field("enable_codex_api_key_env", &self.enable_codex_api_key_env)
             .field(
@@ -1759,6 +1761,21 @@ impl Debug for AuthManager {
             )
             .field("has_external_auth", &self.has_external_auth())
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AuthManager {
+    fn drop(&mut self) {
+        // Merge-safety anchor: WS12 runtime session leases must be released when a live manager
+        // shuts down cleanly, or one-shot login/status processes leave fresh foreign-lease rows
+        // that block the next prompt send for the full TTL.
+        if let Err(error) = self.release_runtime_active_account() {
+            tracing::warn!(
+                error = %error,
+                runtime_session_id = self.runtime_session_id,
+                "failed to clear runtime active-account state while dropping auth manager"
+            );
+        }
     }
 }
 
@@ -1793,6 +1810,7 @@ impl AuthManager {
     fn hydrate_runtime_active_account(
         account_state_store: Option<&AccountStateStore>,
         runtime_session_id: &str,
+        linked_codex_session_id: Option<&str>,
         required_workspace_id: Option<&str>,
         store: &mut AuthStore,
     ) -> std::io::Result<()> {
@@ -1810,6 +1828,7 @@ impl AuthManager {
         let mut current_active_account_id = match account_state_store
             .refresh_session_active_account(
                 runtime_session_id,
+                linked_codex_session_id,
                 now,
                 ACTIVE_ACCOUNT_LEASE_TTL_SECONDS,
             ) {
@@ -1818,11 +1837,13 @@ impl AuthManager {
             Ok(SessionActiveAccountRefresh::LostToOtherSession {
                 account_id,
                 owner_session_id,
+                owner_codex_session_id,
                 lease_until,
             }) => {
                 tracing::info!(
                     account_id,
                     owner_session_id,
+                    owner_codex_session_id,
                     lease_until = ?lease_until,
                     "runtime session lost its active-account lease to another live session"
                 );
@@ -1857,6 +1878,7 @@ impl AuthManager {
             {
                 match account_state_store.set_session_active_account(
                     runtime_session_id,
+                    linked_codex_session_id,
                     candidate_account_id.as_str(),
                     now,
                     ACTIVE_ACCOUNT_LEASE_TTL_SECONDS,
@@ -1905,6 +1927,7 @@ impl AuthManager {
                 }
                 match account_state_store.set_session_active_account(
                     self.runtime_session_id.as_str(),
+                    self.linked_codex_session_id().as_deref(),
                     active_account_id,
                     now,
                     ACTIVE_ACCOUNT_LEASE_TTL_SECONDS,
@@ -1964,6 +1987,7 @@ impl AuthManager {
             account_state_store.as_ref(),
             runtime_session_id.as_str(),
             None,
+            None,
         );
         let store = loaded.store;
         let store_origin = loaded.store_origin;
@@ -1978,6 +2002,7 @@ impl AuthManager {
             storage,
             account_state_store,
             runtime_session_id,
+            linked_codex_session_id: RwLock::new(None),
             inner: RwLock::new(CachedAuth {
                 store,
                 store_origin,
@@ -2013,6 +2038,7 @@ impl AuthManager {
             storage,
             account_state_store,
             runtime_session_id: uuid::Uuid::new_v4().to_string(),
+            linked_codex_session_id: RwLock::new(None),
             inner: RwLock::new(cached),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
@@ -2040,6 +2066,7 @@ impl AuthManager {
             storage,
             account_state_store,
             runtime_session_id: uuid::Uuid::new_v4().to_string(),
+            linked_codex_session_id: RwLock::new(None),
             inner: RwLock::new(cached),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
@@ -2059,6 +2086,7 @@ impl AuthManager {
             storage,
             account_state_store: None,
             runtime_session_id: uuid::Uuid::new_v4().to_string(),
+            linked_codex_session_id: RwLock::new(None),
             inner: RwLock::new(CachedAuth {
                 store: AuthStore::default(),
                 store_origin: CachedStoreOrigin::Persistent,
@@ -2086,6 +2114,7 @@ impl AuthManager {
         if let Err(error) = Self::hydrate_runtime_active_account(
             self.account_state_store.as_ref(),
             self.runtime_session_id.as_str(),
+            self.linked_codex_session_id().as_deref(),
             self.forced_chatgpt_workspace_id().as_deref(),
             &mut store,
         ) {
@@ -2243,6 +2272,7 @@ impl AuthManager {
 
         match account_state_store.account_ids_leased_by_other(
             self.runtime_session_id.as_str(),
+            self.linked_codex_session_id().as_deref(),
             &workspace_filtered_store_account_ids,
             Utc::now(),
         ) {
@@ -2272,6 +2302,7 @@ impl AuthManager {
         if let Err(error) = Self::hydrate_runtime_active_account(
             self.account_state_store.as_ref(),
             self.runtime_session_id.as_str(),
+            self.linked_codex_session_id().as_deref(),
             self.forced_chatgpt_workspace_id().as_deref(),
             &mut store,
         ) {
@@ -2744,6 +2775,7 @@ impl AuthManager {
             }
             match account_state_store.account_is_leased_by_other(
                 self.runtime_session_id.as_str(),
+                self.linked_codex_session_id().as_deref(),
                 account.id.as_str(),
                 now,
             ) {
@@ -2880,6 +2912,7 @@ impl AuthManager {
         Self::hydrate_runtime_active_account(
             self.account_state_store.as_ref(),
             self.runtime_session_id.as_str(),
+            self.linked_codex_session_id().as_deref(),
             self.forced_chatgpt_workspace_id().as_deref(),
             &mut store,
         )?;
@@ -2932,6 +2965,7 @@ impl AuthManager {
         if let Err(error) = Self::hydrate_runtime_active_account(
             self.account_state_store.as_ref(),
             self.runtime_session_id.as_str(),
+            self.linked_codex_session_id().as_deref(),
             self.forced_chatgpt_workspace_id().as_deref(),
             &mut store,
         ) {
@@ -3107,6 +3141,7 @@ impl AuthManager {
             self.auth_credentials_store_mode,
             self.account_state_store.as_ref(),
             self.runtime_session_id.as_str(),
+            self.linked_codex_session_id().as_deref(),
             self.forced_chatgpt_workspace_id().as_deref(),
         )
     }
@@ -3117,6 +3152,7 @@ impl AuthManager {
         auth_credentials_store_mode: AuthCredentialsStoreMode,
         account_state_store: Option<&AccountStateStore>,
         runtime_session_id: &str,
+        linked_codex_session_id: Option<&str>,
         required_workspace_id: Option<&str>,
     ) -> LoadedCachedStore {
         let external_storage = (auth_credentials_store_mode != AuthCredentialsStoreMode::Ephemeral)
@@ -3146,6 +3182,7 @@ impl AuthManager {
             persistent_origin,
             account_state_store,
             runtime_session_id,
+            linked_codex_session_id,
             required_workspace_id,
         );
         let external_candidate =
@@ -3161,6 +3198,7 @@ impl AuthManager {
                             CachedStoreOrigin::ExternalEphemeral,
                             account_state_store,
                             runtime_session_id,
+                            linked_codex_session_id,
                             required_workspace_id,
                         ))
                     }
@@ -3193,6 +3231,7 @@ impl AuthManager {
         store_origin: CachedStoreOrigin,
         account_state_store: Option<&AccountStateStore>,
         runtime_session_id: &str,
+        linked_codex_session_id: Option<&str>,
         required_workspace_id: Option<&str>,
     ) -> LoadedStoreCandidate {
         let loaded_had_active_account = store.active_account_id.is_some();
@@ -3220,6 +3259,7 @@ impl AuthManager {
         if let Err(error) = Self::hydrate_runtime_active_account(
             account_state_store,
             runtime_session_id,
+            linked_codex_session_id,
             required_workspace_id,
             &mut store,
         ) {
@@ -3338,6 +3378,7 @@ impl AuthManager {
         Self::hydrate_runtime_active_account(
             self.account_state_store.as_ref(),
             self.runtime_session_id.as_str(),
+            self.linked_codex_session_id().as_deref(),
             self.forced_chatgpt_workspace_id().as_deref(),
             &mut store,
         )?;
@@ -3378,6 +3419,45 @@ impl AuthManager {
         if let Ok(mut guard) = self.forced_chatgpt_workspace_id.write() {
             *guard = workspace_id;
         }
+    }
+
+    pub fn set_linked_codex_session_id(
+        &self,
+        codex_session_id: Option<String>,
+    ) -> std::io::Result<bool> {
+        let changed = if let Ok(mut guard) = self.linked_codex_session_id.write() {
+            if *guard == codex_session_id {
+                false
+            } else {
+                *guard = codex_session_id;
+                true
+            }
+        } else {
+            return Err(std::io::Error::other(
+                "failed to update linked Codex session id",
+            ));
+        };
+        if !changed {
+            return Ok(false);
+        }
+        if self.account_state_store.is_some() {
+            let _ = self.reload_strict()?;
+        }
+        Ok(true)
+    }
+
+    pub fn linked_codex_session_id(&self) -> Option<String> {
+        self.linked_codex_session_id
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    pub fn persisted_active_store_account_id(&self) -> std::io::Result<Option<String>> {
+        Ok(self
+            .storage
+            .load()?
+            .and_then(|store| store.active_account_id))
     }
 
     pub fn forced_chatgpt_workspace_id(&self) -> Option<String> {
@@ -3627,6 +3707,7 @@ impl AuthManager {
         Self::hydrate_runtime_active_account(
             self.account_state_store.as_ref(),
             self.runtime_session_id.as_str(),
+            self.linked_codex_session_id().as_deref(),
             self.forced_chatgpt_workspace_id().as_deref(),
             &mut store,
         )
@@ -3735,11 +3816,25 @@ impl AuthManager {
         self.get_api_auth_mode()
     }
 
-    fn has_saved_chatgpt_accounts(&self) -> bool {
+    pub fn has_saved_chatgpt_accounts(&self) -> bool {
         self.inner
             .read()
             .ok()
             .is_some_and(|cached| !cached.store.accounts.is_empty())
+    }
+
+    pub fn runtime_session_id(&self) -> &str {
+        self.runtime_session_id.as_str()
+    }
+
+    pub fn release_runtime_active_account(&self) -> std::io::Result<()> {
+        let Some(account_state_store) = self.account_state_store.as_ref() else {
+            return Ok(());
+        };
+        account_state_store
+            .clear_session_active_account(self.runtime_session_id.as_str())
+            .map(|_| ())
+            .map_err(std::io::Error::other)
     }
 
     pub fn auth_mode(&self) -> Option<AuthMode> {

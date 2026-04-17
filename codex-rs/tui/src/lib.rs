@@ -227,29 +227,27 @@ use crate::onboarding::onboarding_screen::run_onboarding_app;
 use crate::tui::Tui;
 pub use cli::Cli;
 use codex_arg0::Arg0DispatchPaths;
+use codex_login::AuthManager;
 pub use markdown_render::render_markdown_text;
 pub use public_widgets::composer_input::ComposerAction;
 pub use public_widgets::composer_input::ComposerInput;
 // (tests access modules directly within the crate)
 
-async fn start_embedded_app_server(
+#[derive(Clone)]
+struct EmbeddedAppServerStartArgs {
     arg0_paths: Arg0DispatchPaths,
     config: Config,
+    auth_manager: Arc<AuthManager>,
     cli_kv_overrides: Vec<(String, toml::Value)>,
     loader_overrides: LoaderOverrides,
     cloud_requirements: CloudRequirementsLoader,
     feedback: codex_feedback::CodexFeedback,
+}
+
+async fn start_embedded_app_server(
+    args: EmbeddedAppServerStartArgs,
 ) -> color_eyre::Result<InProcessAppServerClient> {
-    start_embedded_app_server_with(
-        arg0_paths,
-        config,
-        cli_kv_overrides,
-        loader_overrides,
-        cloud_requirements,
-        feedback,
-        InProcessAppServerClient::start,
-    )
-    .await
+    start_embedded_app_server_with(args, InProcessAppServerClient::start).await
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -355,24 +353,12 @@ async fn connect_remote_app_server(
 
 async fn start_app_server(
     target: &AppServerTarget,
-    arg0_paths: Arg0DispatchPaths,
-    config: Config,
-    cli_kv_overrides: Vec<(String, toml::Value)>,
-    loader_overrides: LoaderOverrides,
-    cloud_requirements: CloudRequirementsLoader,
-    feedback: codex_feedback::CodexFeedback,
+    args: EmbeddedAppServerStartArgs,
 ) -> color_eyre::Result<AppServerClient> {
     match target {
-        AppServerTarget::Embedded => start_embedded_app_server(
-            arg0_paths,
-            config,
-            cli_kv_overrides,
-            loader_overrides,
-            cloud_requirements,
-            feedback,
-        )
-        .await
-        .map(AppServerClient::InProcess),
+        AppServerTarget::Embedded => start_embedded_app_server(args)
+            .await
+            .map(AppServerClient::InProcess),
         AppServerTarget::Remote {
             websocket_url,
             auth_token,
@@ -384,14 +370,19 @@ pub(crate) async fn start_app_server_for_picker(
     config: &Config,
     target: &AppServerTarget,
 ) -> color_eyre::Result<AppServerSession> {
+    let auth_manager =
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false);
     let app_server = start_app_server(
         target,
-        Arg0DispatchPaths::default(),
-        config.clone(),
-        Vec::new(),
-        LoaderOverrides::default(),
-        CloudRequirementsLoader::default(),
-        codex_feedback::CodexFeedback::new(),
+        EmbeddedAppServerStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            config: config.clone(),
+            auth_manager,
+            cli_kv_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            feedback: codex_feedback::CodexFeedback::new(),
+        },
     )
     .await?;
     Ok(AppServerSession::new(app_server))
@@ -405,18 +396,22 @@ pub(crate) async fn start_embedded_app_server_for_picker(
 }
 
 async fn start_embedded_app_server_with<F, Fut>(
-    arg0_paths: Arg0DispatchPaths,
-    config: Config,
-    cli_kv_overrides: Vec<(String, toml::Value)>,
-    loader_overrides: LoaderOverrides,
-    cloud_requirements: CloudRequirementsLoader,
-    feedback: codex_feedback::CodexFeedback,
+    args: EmbeddedAppServerStartArgs,
     start_client: F,
 ) -> color_eyre::Result<InProcessAppServerClient>
 where
     F: FnOnce(InProcessClientStartArgs) -> Fut,
     Fut: Future<Output = std::io::Result<InProcessAppServerClient>>,
 {
+    let EmbeddedAppServerStartArgs {
+        arg0_paths,
+        config,
+        auth_manager,
+        cli_kv_overrides,
+        loader_overrides,
+        cloud_requirements,
+        feedback,
+    } = args;
     let config_warnings = config
         .startup_warnings
         .iter()
@@ -430,6 +425,7 @@ where
     let client = start_client(InProcessClientStartArgs {
         arg0_paths,
         config: Arc::new(config),
+        auth_manager,
         cli_overrides: cli_kv_overrides,
         loader_overrides,
         cloud_requirements,
@@ -563,6 +559,48 @@ async fn lookup_latest_session_target_with_app_server(
         .data
         .into_iter()
         .find_map(session_target_from_app_server_thread))
+}
+
+async fn maybe_link_startup_auth_manager_to_resume_target(
+    cli: &Cli,
+    config: &Config,
+    remote_mode: bool,
+    remote_cwd_override: Option<&Path>,
+    app_server: &mut AppServerSession,
+    auth_manager: &AuthManager,
+) -> color_eyre::Result<()> {
+    let maybe_target = if let Some(id_or_name) = cli.resume_session_id.as_deref() {
+        lookup_session_target_with_app_server(app_server, id_or_name).await?
+    } else if cli.resume_last {
+        let cwd_filter = latest_session_cwd_filter(
+            remote_mode,
+            remote_cwd_override,
+            config,
+            cli.resume_show_all,
+        );
+        lookup_latest_session_target_with_app_server(
+            app_server,
+            config,
+            cwd_filter,
+            cli.resume_include_non_interactive,
+        )
+        .await?
+    } else {
+        None
+    };
+
+    if let Some(target) = maybe_target
+        && let Err(error) =
+            auth_manager.set_linked_codex_session_id(Some(target.thread_id.to_string()))
+    {
+        warn!(
+            error = %error,
+            runtime_session_id = auth_manager.runtime_session_id(),
+            thread_id = %target.thread_id,
+            "failed to pre-link auth runtime to resume target before login-status check"
+        );
+    }
+    Ok(())
 }
 
 fn latest_session_lookup_params(
@@ -1019,15 +1057,20 @@ async fn run_ratatui_app(
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
+    let startup_auth_manager =
+        AuthManager::shared_from_config(&initial_config, /*enable_codex_api_key_env*/ false);
     let mut app_server = Some(
         match start_app_server(
             &app_server_target,
-            arg0_paths.clone(),
-            initial_config.clone(),
-            cli_kv_overrides.clone(),
-            loader_overrides.clone(),
-            cloud_requirements.clone(),
-            feedback.clone(),
+            EmbeddedAppServerStartArgs {
+                arg0_paths: arg0_paths.clone(),
+                config: initial_config.clone(),
+                auth_manager: startup_auth_manager.clone(),
+                cli_kv_overrides: cli_kv_overrides.clone(),
+                loader_overrides: loader_overrides.clone(),
+                cloud_requirements: cloud_requirements.clone(),
+                feedback: feedback.clone(),
+            },
         )
         .await
         {
@@ -1040,6 +1083,17 @@ async fn run_ratatui_app(
             }
         },
     );
+    if let Some(app_server) = app_server.as_mut() {
+        maybe_link_startup_auth_manager_to_resume_target(
+            &cli,
+            &initial_config,
+            remote_mode,
+            remote_cwd_override.as_deref(),
+            app_server,
+            startup_auth_manager.as_ref(),
+        )
+        .await?;
+    }
 
     let should_show_trust_screen_flag = !remote_mode && should_show_trust_screen(&initial_config);
     let mut trust_decision_was_made = false;
@@ -1348,16 +1402,24 @@ async fn run_ratatui_app(
 
     let use_alt_screen = determine_alt_screen_mode(no_alt_screen, config.tui_alternate_screen);
     tui.set_alt_screen_enabled(use_alt_screen);
+    let auth_manager = if app_server.is_some() {
+        startup_auth_manager
+    } else {
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+    };
     let app_server = match app_server {
         Some(app_server) => app_server,
         None => match start_app_server(
             &app_server_target,
-            arg0_paths,
-            config.clone(),
-            cli_kv_overrides.clone(),
-            loader_overrides,
-            cloud_requirements.clone(),
-            feedback.clone(),
+            EmbeddedAppServerStartArgs {
+                arg0_paths,
+                config: config.clone(),
+                auth_manager: auth_manager.clone(),
+                cli_kv_overrides: cli_kv_overrides.clone(),
+                loader_overrides,
+                cloud_requirements: cloud_requirements.clone(),
+                feedback: feedback.clone(),
+            },
         )
         .await
         {
@@ -1374,6 +1436,7 @@ async fn run_ratatui_app(
     let app_result = App::run(
         &mut tui,
         app_server,
+        auth_manager,
         config,
         cli_kv_overrides.clone(),
         overrides.clone(),
@@ -1736,14 +1799,17 @@ mod tests {
     async fn start_test_embedded_app_server(
         config: Config,
     ) -> color_eyre::Result<InProcessAppServerClient> {
-        start_embedded_app_server(
-            Arg0DispatchPaths::default(),
+        let auth_manager =
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+        start_embedded_app_server(EmbeddedAppServerStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
             config,
-            Vec::new(),
-            LoaderOverrides::default(),
-            CloudRequirementsLoader::default(),
-            codex_feedback::CodexFeedback::new(),
-        )
+            auth_manager,
+            cli_kv_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            cloud_requirements: CloudRequirementsLoader::default(),
+            feedback: codex_feedback::CodexFeedback::new(),
+        })
         .await
     }
 
@@ -2036,13 +2102,18 @@ mod tests {
     async fn embedded_app_server_start_failure_is_returned() -> color_eyre::Result<()> {
         let temp_dir = TempDir::new()?;
         let config = build_config(&temp_dir).await?;
+        let auth_manager =
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
         let result = start_embedded_app_server_with(
-            Arg0DispatchPaths::default(),
-            config,
-            Vec::new(),
-            LoaderOverrides::default(),
-            CloudRequirementsLoader::default(),
-            codex_feedback::CodexFeedback::new(),
+            EmbeddedAppServerStartArgs {
+                arg0_paths: Arg0DispatchPaths::default(),
+                config,
+                auth_manager,
+                cli_kv_overrides: Vec::new(),
+                loader_overrides: LoaderOverrides::default(),
+                cloud_requirements: CloudRequirementsLoader::default(),
+                feedback: codex_feedback::CodexFeedback::new(),
+            },
             |_args| async { Err(std::io::Error::other("boom")) },
         )
         .await;

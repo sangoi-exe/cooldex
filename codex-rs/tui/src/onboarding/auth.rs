@@ -964,6 +964,7 @@ mod tests {
     use codex_cloud_requirements::cloud_requirements_loader_for_storage;
     use codex_config::types::AuthCredentialsStoreMode;
     use codex_core::config::ConfigBuilder;
+    use codex_login::AuthManager;
 
     use codex_protocol::protocol::SessionSource;
     use pretty_assertions::assert_eq;
@@ -980,6 +981,9 @@ mod tests {
             .unwrap();
         let client = InProcessAppServerClient::start(InProcessClientStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
+            auth_manager: AuthManager::shared_from_config(
+                &config, /*enable_codex_api_key_env*/ false,
+            ),
             config: Arc::new(config),
             cli_overrides: Vec::new(),
             loader_overrides: Default::default(),

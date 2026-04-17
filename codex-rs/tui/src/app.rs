@@ -212,8 +212,29 @@ fn build_chatgpt_add_account_success_outcome(
     auth_manager: &AuthManager,
     shared_state: &crate::bottom_pane::ChatGptAddAccountSharedState,
 ) -> ChatGptAddAccountOutcome {
+    let requested_store_account_id = match auth_manager.persisted_active_store_account_id() {
+        Ok(store_account_id) => store_account_id,
+        Err(err) => {
+            let message =
+                format!("failed to read persisted active account after ChatGPT login: {err}");
+            shared_state.set_failed(message.clone());
+            return ChatGptAddAccountOutcome::Failed { message };
+        }
+    };
     match auth_manager.reload_strict() {
         Ok(_) => {
+            if let Some(store_account_id) = requested_store_account_id.as_deref()
+                && auth_manager
+                    .list_accounts()
+                    .into_iter()
+                    .any(|account| account.id == store_account_id)
+                && let Err(err) = auth_manager.set_active_account(store_account_id)
+            {
+                let message =
+                    format!("failed to select newly added ChatGPT account after login: {err}");
+                shared_state.set_failed(message.clone());
+                return ChatGptAddAccountOutcome::Failed { message };
+            }
             let active_account_display = auth_manager
                 .list_accounts()
                 .iter()
@@ -263,6 +284,7 @@ fn status_account_displays_match(
     }
 }
 
+#[cfg(test)]
 fn auth_manager_from_config(config: &Config) -> Arc<AuthManager> {
     AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
 }
@@ -4003,6 +4025,7 @@ impl App {
     ) -> Result<()> {
         let thread_id = session.thread_id;
         self.primary_thread_id = Some(thread_id);
+        self.sync_auth_manager_primary_thread_link(thread_id);
         self.primary_session_configured = Some(session.clone());
         self.upsert_agent_picker_thread(
             thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
@@ -4086,6 +4109,7 @@ impl App {
         if let EventMsg::SessionConfigured(session) = &event.msg {
             if self.primary_thread_id.is_none() {
                 self.primary_thread_id = Some(session.session_id);
+                self.sync_auth_manager_primary_thread_link(session.session_id);
                 self.upsert_agent_picker_thread(
                     session.session_id,
                     /*agent_nickname*/ None,
@@ -5083,6 +5107,7 @@ impl App {
     pub async fn run(
         tui: &mut tui::Tui,
         mut app_server: AppServerSession,
+        auth_manager: Arc<AuthManager>,
         mut config: Config,
         cli_kv_overrides: Vec<(String, TomlValue)>,
         harness_overrides: ConfigOverrides,
@@ -5158,7 +5183,6 @@ impl App {
 
         let status_line_invalid_items_warned = Arc::new(AtomicBool::new(false));
         let terminal_title_invalid_items_warned = Arc::new(AtomicBool::new(false));
-        let auth_manager = auth_manager_from_config(&config);
 
         let enhanced_keys_supported = tui.enhanced_keys_supported();
         let wait_for_initial_session_configured =
@@ -5272,6 +5296,18 @@ impl App {
                 (ChatWidget::new_with_app_event(init), Some(forked))
             }
         };
+
+        if let Some(started) = initial_started_thread.as_ref()
+            && let Err(error) = auth_manager
+                .set_linked_codex_session_id(Some(started.session.thread_id.to_string()))
+        {
+            tracing::warn!(
+                error = %error,
+                runtime_session_id = auth_manager.runtime_session_id(),
+                thread_id = %started.session.thread_id,
+                "failed to link auth runtime to initial primary thread"
+            );
+        }
 
         chat_widget
             .maybe_prompt_windows_sandbox_enable(should_prompt_windows_sandbox_nux_at_startup);
@@ -6210,9 +6246,12 @@ impl App {
                 }
             },
             AppEvent::StartChatGptAddAccount => {
-                if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
+                if !self.auth_manager.has_saved_chatgpt_accounts()
+                    && !self.config.model_provider.requires_openai_auth
+                {
                     self.chat_widget.add_error_message(
-                        "'/accounts' add requires ChatGPT authentication.".to_string(),
+                        "'/accounts' add needs saved ChatGPT accounts or an OpenAI-auth provider."
+                            .to_string(),
                     );
                     return Ok(AppRunControl::Continue);
                 }
@@ -7313,6 +7352,7 @@ impl App {
         app_server: &mut AppServerSession,
         mode: ExitMode,
     ) -> AppRunControl {
+        self.release_runtime_auth_lease_for_exit();
         match mode {
             ExitMode::ShutdownFirst => {
                 // Mark the thread we are explicitly shutting down for exit so
@@ -7329,6 +7369,30 @@ impl App {
                 self.pending_shutdown_exit_thread_id = None;
                 AppRunControl::Exit(ExitReason::UserRequested)
             }
+        }
+    }
+
+    fn release_runtime_auth_lease_for_exit(&self) {
+        if let Err(error) = self.auth_manager.release_runtime_active_account() {
+            tracing::warn!(
+                error = %error,
+                runtime_session_id = self.auth_manager.runtime_session_id(),
+                "failed to release runtime auth lease during tui exit"
+            );
+        }
+    }
+
+    fn sync_auth_manager_primary_thread_link(&self, thread_id: ThreadId) {
+        if let Err(error) = self
+            .auth_manager
+            .set_linked_codex_session_id(Some(thread_id.to_string()))
+        {
+            tracing::warn!(
+                error = %error,
+                runtime_session_id = self.auth_manager.runtime_session_id(),
+                thread_id = %thread_id,
+                "failed to link auth runtime to primary Codex session"
+            );
         }
     }
 
@@ -13957,6 +14021,67 @@ guardian_approval = true
         assert_snapshot!("clear_ui_header_fast_status_fast_capable_models", rendered);
     }
 
+    #[tokio::test]
+    async fn exit_mode_releases_runtime_auth_lease_immediately() {
+        let mut app = make_test_app().await;
+        let store = AuthStore {
+            active_account_id: Some("account-a".to_string()),
+            accounts: vec![chatgpt_account(
+                "account-a",
+                "primary@example.com",
+                Some("Primary"),
+            )],
+            ..AuthStore::default()
+        };
+        save_auth(
+            &app.config.codex_home,
+            &store,
+            app.config.cli_auth_credentials_store_mode,
+        )
+        .expect("save single-account auth store");
+        app.auth_manager = auth_manager_from_config(&app.config);
+        app.auth_manager
+            .reload_strict()
+            .expect("reload single-account auth store");
+        let expected_store_account_id = canonical_chatgpt_store_account_id("account-a");
+        let releasing_active = app
+            .auth_manager
+            .active_chatgpt_account_summary()
+            .expect("app auth manager should acquire the single saved account");
+        assert_eq!(releasing_active.store_account_id, expected_store_account_id);
+
+        let competing_manager = auth_manager_from_config(&app.config);
+        competing_manager
+            .reload_strict()
+            .expect("reload competing auth manager");
+
+        assert!(
+            competing_manager
+                .list_accounts()
+                .into_iter()
+                .all(|account| !account.is_active),
+            "expected the live app manager to hold the only saved-account lease before exit"
+        );
+
+        app.release_runtime_auth_lease_for_exit();
+
+        competing_manager
+            .reload_strict()
+            .expect("reload competing auth manager after exit");
+
+        assert!(
+            competing_manager
+                .list_accounts()
+                .into_iter()
+                .any(|account| account.is_active),
+            "expected a competing manager to acquire the released runtime lease immediately"
+        );
+        let competing_active = competing_manager
+            .active_chatgpt_account_summary()
+            .expect("competing manager should acquire the released account");
+        assert_eq!(competing_active.store_account_id, expected_store_account_id);
+    }
+
     async fn make_test_app() -> App {
         let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
         let config = chat_widget.config_ref().clone();
@@ -14336,6 +14461,24 @@ guardian_approval = true
         assert_snapshot!(
             "manual_set_active_account_restriction_error_message",
             rendered
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_primary_thread_session_links_auth_manager_to_primary_thread() -> Result<()> {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+
+        app.enqueue_primary_thread_session(
+            test_thread_session(thread_id, PathBuf::from("/tmp/project")),
+            Vec::new(),
+        )
+        .await?;
+
+        assert_eq!(
+            app.auth_manager.linked_codex_session_id(),
+            Some(thread_id.to_string())
         );
         Ok(())
     }

@@ -12113,6 +12113,17 @@ async fn accounts_popup_loading() {
 }
 
 #[tokio::test]
+async fn accounts_popup_without_saved_accounts_still_allows_add_account() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5-codex")).await;
+    chat.thread_id = Some(ThreadId::new());
+
+    chat.open_accounts_popup_at(chrono::Local::now());
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert_snapshot!("accounts_popup_without_saved_accounts", popup);
+}
+
+#[tokio::test]
 async fn rate_limit_account_status_prioritizes_weekly_over_5h() {
     let now = chrono::Utc::now();
     let popup_now = now.with_timezone(&chrono::Local);

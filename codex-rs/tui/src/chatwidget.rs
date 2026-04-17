@@ -8530,6 +8530,7 @@ impl ChatWidget {
             self.status_account_display.as_ref(),
             token_info,
             total_usage,
+            Some(self.auth_manager.runtime_session_id()),
             &self.thread_id,
             self.thread_name.clone(),
             self.forked_from,
@@ -9942,10 +9943,15 @@ impl ChatWidget {
         self.open_accounts_popup_at(Local::now());
     }
 
+    fn can_manage_chatgpt_accounts(&self) -> bool {
+        self.auth_manager.has_saved_chatgpt_accounts()
+            || self.config.model_provider.requires_openai_auth
+    }
+
     pub(crate) fn open_accounts_loading_popup(&mut self) {
-        if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
+        if !self.can_manage_chatgpt_accounts() {
             self.add_error_message(
-                "'/accounts' is only available when using ChatGPT authentication.".to_string(),
+                "'/accounts' needs saved ChatGPT accounts or an OpenAI-auth provider.".to_string(),
             );
             return;
         }
@@ -10227,9 +10233,9 @@ impl ChatWidget {
     }
 
     pub(crate) fn open_accounts_popup_at(&mut self, now_local: DateTime<Local>) {
-        if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
+        if !self.can_manage_chatgpt_accounts() {
             self.add_error_message(
-                "'/accounts' is only available when using ChatGPT authentication.".to_string(),
+                "'/accounts' needs saved ChatGPT accounts or an OpenAI-auth provider.".to_string(),
             );
             return;
         }
@@ -10237,16 +10243,14 @@ impl ChatWidget {
         // Merge-safety anchor: `/accounts` descriptions depend on `AccountSummary` cache semantics from
         // `AuthManager::list_accounts()` (active flag, exhausted_until, last_rate_limits).
         let accounts = self.auth_manager.list_accounts();
-        if accounts.is_empty() {
-            self.add_error_message("No ChatGPT accounts found.".to_string());
-            return;
-        }
 
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Accounts".bold()));
-        header.push(Line::from(
-            "Select an account to make it active, or add a new one.".dim(),
-        ));
+        header.push(Line::from(if accounts.is_empty() {
+            "No ChatGPT accounts are saved yet. Add one to continue.".dim()
+        } else {
+            "Select an account to make it active, or add a new one.".dim()
+        }));
 
         let mut items = accounts
             .into_iter()
@@ -10310,9 +10314,9 @@ impl ChatWidget {
             return;
         }
 
-        if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
+        if !self.auth_manager.has_saved_chatgpt_accounts() {
             self.add_error_message(
-                "'/logout' account selection is only available when using ChatGPT authentication."
+                "'/logout' account selection is only available when saved ChatGPT accounts exist."
                     .to_string(),
             );
             return;

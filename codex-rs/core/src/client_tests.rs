@@ -68,6 +68,24 @@ fn test_model_client(session_source: SessionSource) -> ModelClient {
     )
 }
 
+fn test_model_client_with_provider(
+    auth_manager: Option<std::sync::Arc<AuthManager>>,
+    provider: ModelProviderInfo,
+    session_source: SessionSource,
+) -> ModelClient {
+    ModelClient::new(
+        auth_manager,
+        ThreadId::new(),
+        /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
+        provider,
+        session_source,
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+    )
+}
+
 fn test_provider(base_url: &str) -> ModelProviderInfo {
     let mut provider = create_oss_provider_with_base_url(base_url, WireApi::Responses);
     provider.supports_websockets = true;
@@ -154,6 +172,20 @@ fn test_chatgpt_token_data(chatgpt_account_id: &str) -> TokenData {
         access_token: format!("access-{chatgpt_account_id}"),
         refresh_token: format!("refresh-{chatgpt_account_id}"),
         account_id: Some(chatgpt_account_id.to_string()),
+    }
+}
+
+fn stored_test_chatgpt_account(
+    store_account_id: &str,
+    chatgpt_account_id: &str,
+    last_refresh: chrono::DateTime<Utc>,
+) -> StoredAccount {
+    StoredAccount {
+        id: store_account_id.to_string(),
+        label: None,
+        tokens: test_chatgpt_token_data(chatgpt_account_id),
+        last_refresh: Some(last_refresh),
+        usage: None,
     }
 }
 
@@ -653,4 +685,75 @@ fn auth_request_telemetry_context_tracks_attached_auth_and_retry_phase() {
     assert!(auth_context.retry_after_unauthorized);
     assert_eq!(auth_context.recovery_mode, Some("managed"));
     assert_eq!(auth_context.recovery_phase, Some("refresh_token"));
+}
+
+#[tokio::test]
+async fn missing_openai_auth_required_fails_before_request_setup() {
+    let mut provider = test_provider("https://example.com/v1");
+    provider.requires_openai_auth = true;
+    let client =
+        test_model_client_with_provider(/*auth_manager*/ None, provider, SessionSource::Cli);
+
+    let err = match client.current_client_setup().await {
+        Ok(_) => panic!("missing required auth should fail before transport"),
+        Err(err) => err,
+    };
+
+    assert_eq!(
+        err.to_string(),
+        "OpenAI auth is required, but no bearer token is available for this session."
+    );
+}
+
+#[tokio::test]
+async fn lease_conflict_openai_auth_required_fails_before_request_setup() {
+    let codex_home = tempdir().expect("tempdir");
+    let store_account_id = "account-primary";
+    let store = AuthStore {
+        active_account_id: Some(store_account_id.to_string()),
+        accounts: vec![stored_test_chatgpt_account(
+            store_account_id,
+            "workspace-primary",
+            Utc::now(),
+        )],
+        ..AuthStore::default()
+    };
+    save_auth(codex_home.path(), &store, AuthCredentialsStoreMode::File).expect("save auth store");
+
+    let manager_a = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    assert_eq!(
+        manager_a
+            .active_chatgpt_account_summary()
+            .expect("first manager should lease the saved account")
+            .store_account_id,
+        store_account_id
+    );
+
+    let manager_b = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    assert!(
+        manager_b.auth_cached().is_none(),
+        "second manager should not receive bearer auth when the only saved account is leased"
+    );
+
+    let mut provider = test_provider("https://example.com/v1");
+    provider.requires_openai_auth = true;
+    let client = test_model_client_with_provider(Some(manager_b), provider, SessionSource::Cli);
+
+    let err = match client.current_client_setup().await {
+        Ok(_) => panic!("lease-conflicted auth should fail before transport"),
+        Err(err) => err,
+    };
+
+    assert_eq!(
+        err.to_string(),
+        "OpenAI auth is required, but this session has no active saved account because another live Codex session currently holds the available account lease. Switch accounts, close the other session, or wait for the lease to expire."
+    );
 }

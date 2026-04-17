@@ -1561,6 +1561,78 @@ fn set_active_account_rejects_account_leased_by_other_live_session() {
 }
 
 #[test]
+fn dropping_manager_releases_active_account_lease_for_next_session() {
+    let codex_home = tempdir().unwrap();
+    let primary_store_account_id = persist_test_chatgpt_accounts(codex_home.path(), &["org-a"], 0);
+
+    let manager_a = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    assert_eq!(
+        manager_a
+            .active_chatgpt_account_summary()
+            .expect("first session active account")
+            .store_account_id,
+        primary_store_account_id
+    );
+
+    drop(manager_a);
+
+    let manager_b = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    assert_eq!(
+        manager_b
+            .active_chatgpt_account_summary()
+            .expect("released account should be immediately reusable")
+            .store_account_id,
+        primary_store_account_id
+    );
+}
+
+#[test]
+fn linked_codex_session_reclaims_its_live_lease_after_runtime_restart() {
+    let codex_home = tempdir().unwrap();
+    let primary_store_account_id = persist_test_chatgpt_accounts(codex_home.path(), &["org-a"], 0);
+
+    let manager_a = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    manager_a
+        .set_linked_codex_session_id(Some("019d943e-a836-7071-9c92-8fb11079df45".to_string()))
+        .expect("link first runtime to codex session");
+    assert_eq!(
+        manager_a
+            .active_chatgpt_account_summary()
+            .expect("first runtime active account")
+            .store_account_id,
+        primary_store_account_id
+    );
+
+    let manager_b = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    manager_b
+        .set_linked_codex_session_id(Some("019d943e-a836-7071-9c92-8fb11079df45".to_string()))
+        .expect("relinked runtime should reclaim same-session lease");
+    assert_eq!(
+        manager_b
+            .active_chatgpt_account_summary()
+            .expect("relinked runtime active account")
+            .store_account_id,
+        primary_store_account_id
+    );
+}
+
+#[test]
 fn switching_active_account_releases_previous_lease_for_other_sessions() {
     let codex_home = tempdir().unwrap();
     let primary_store_account_id =

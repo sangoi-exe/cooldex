@@ -24,9 +24,9 @@ use std::sync::LazyLock;
 use std::thread;
 use std::time::Duration;
 
-use crate::AuthManager;
 use crate::auth::StoredAccount;
 use crate::auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
+use crate::auth::load_auth_store;
 use crate::auth::update_auth_store;
 use crate::default_client::originator;
 use crate::pkce::PkceCodes;
@@ -764,7 +764,8 @@ pub(crate) async fn exchange_code_for_tokens(
 /// Persists exchanged credentials using the configured local auth store.
 ///
 /// Merge-safety anchor: browser/device ChatGPT login persistence must enforce the
-/// same supported-plan admission policy as core auth-store mutation and external auth.
+/// same supported-plan admission policy as core auth-store mutation and external auth,
+/// but login success must not depend on immediate runtime-active lease ownership.
 pub(crate) async fn persist_tokens_async(
     codex_home: &Path,
     api_key: Option<String>,
@@ -827,15 +828,12 @@ pub(crate) async fn persist_tokens_async(
             Ok(())
         })?;
 
-        let auth_manager = AuthManager::new(
-            codex_home.clone(),
-            /*enable_codex_api_key_env*/ false,
-            auth_credentials_store_mode,
-        );
-        let accounts = auth_manager.list_accounts();
-        if !accounts
+        let store = load_auth_store(&codex_home, auth_credentials_store_mode)?
+            .ok_or_else(|| io::Error::other("saved auth store missing after login persistence"))?;
+        if !store
+            .accounts
             .iter()
-            .any(|account| account.id == stored_account_id && account.is_active)
+            .any(|account| account.id == stored_account_id)
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1166,6 +1164,8 @@ mod tests {
     use crate::auth::load_auth_store;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use chrono::Utc;
+    use codex_account_state::AccountStateStore;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -1333,6 +1333,55 @@ mod tests {
                 .get_chatgpt_plan_type()
                 .as_deref(),
             Some("Business")
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_tokens_async_succeeds_when_supported_account_is_temporarily_inactive() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path();
+        let mode = AuthCredentialsStoreMode::File;
+        let user_id = "user-business";
+        let account_id = "acc-business";
+        let stored_account_id = store_account_id(user_id, account_id);
+        let account_state_store =
+            AccountStateStore::open(codex_home.to_path_buf()).expect("open account state store");
+
+        account_state_store
+            .set_session_active_account(
+                "foreign-session",
+                None,
+                stored_account_id.as_str(),
+                Utc::now(),
+                300,
+            )
+            .expect("seed foreign lease");
+
+        persist_tokens_async(
+            codex_home,
+            None,
+            id_token(
+                "workspace@example.com",
+                user_id,
+                account_id,
+                Some("business"),
+            ),
+            "access-business".to_string(),
+            "refresh-business".to_string(),
+            mode,
+        )
+        .await
+        .expect("supported account should persist even when runtime lease is busy");
+
+        let store = load_auth_store(codex_home, mode)
+            .expect("load auth store")
+            .expect("auth store should exist");
+        assert_eq!(store.accounts.len(), 1);
+        assert!(
+            store
+                .accounts
+                .iter()
+                .any(|account| account.id == stored_account_id)
         );
     }
 

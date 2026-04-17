@@ -104,6 +104,7 @@ use codex_api::CoreAuthProvider;
 use codex_api::map_api_error;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
+use codex_login::AccountRateLimitRefreshRosterStatus;
 use codex_login::api_bridge::auth_provider_from_auth;
 use codex_login::auth_env_telemetry::AuthEnvTelemetry;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
@@ -642,11 +643,52 @@ impl ModelClient {
             .provider
             .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
         let api_auth = auth_provider_from_auth(auth.clone(), &self.state.provider)?;
+        self.ensure_required_openai_auth(&api_auth)?;
         Ok(CurrentClientSetup {
             auth,
             api_provider,
             api_auth,
         })
+    }
+
+    // Merge-safety anchor: OpenAI-auth-required request setup must fail loud before transport when
+    // WS12 lease-aware runtime auth yields no bearer header, or prompt sends regress into opaque
+    // upstream 401s instead of preserving local auth/lease truth.
+    fn ensure_required_openai_auth(&self, api_auth: &CoreAuthProvider) -> Result<()> {
+        if !self.state.provider.requires_openai_auth || api_auth.auth_header_attached() {
+            return Ok(());
+        }
+
+        let Some(auth_manager) = self.state.auth_manager.as_ref() else {
+            return Err(CodexErr::InvalidRequest(
+                "OpenAI auth is required, but no bearer token is available for this session."
+                    .to_string(),
+            ));
+        };
+
+        let accounts = auth_manager.list_accounts();
+        if accounts.is_empty() {
+            return Err(CodexErr::InvalidRequest(
+                "OpenAI auth is required, but no saved ChatGPT account or API key is available for this session."
+                    .to_string(),
+            ));
+        }
+
+        let roster = auth_manager.account_rate_limit_refresh_roster();
+        if accounts.iter().all(|account| !account.is_active)
+            && roster.status == AccountRateLimitRefreshRosterStatus::LeaseManaged
+            && roster.store_account_ids.is_empty()
+        {
+            return Err(CodexErr::InvalidRequest(
+                "OpenAI auth is required, but this session has no active saved account because another live Codex session currently holds the available account lease. Switch accounts, close the other session, or wait for the lease to expire."
+                    .to_string(),
+            ));
+        }
+
+        Err(CodexErr::InvalidRequest(
+            "OpenAI auth is required, but no active bearer token is available for this session."
+                .to_string(),
+        ))
     }
 
     /// Opens a websocket connection using the same header and telemetry wiring as normal turns.
