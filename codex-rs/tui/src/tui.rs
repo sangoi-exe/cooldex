@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crossterm::Command;
+use crossterm::SynchronizedUpdate;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableFocusChange;
 use crossterm::event::EnableBracketedPaste;
@@ -239,8 +240,8 @@ pub enum TuiEvent {
     Draw,
 }
 
-// Merge-safety anchor: queued TUI history insertions mutate the physical screen outside ratatui's
-// diff buffer, so any non-empty flush must force a viewport repaint before the next draw.
+// Merge-safety anchor: queued TUI history insertions are already-rendered
+// `HistoryCell::display_lines()` output and must stay verbatim until the terminal writer.
 
 pub struct Tui {
     frame_requester: FrameRequester,
@@ -260,6 +261,12 @@ pub struct Tui {
     is_zellij: bool,
     // When false, enter_alt_screen() becomes a no-op (for Zellij scrollback support)
     alt_screen_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrawPreparation {
+    pub(crate) viewport_requires_full_repaint: bool,
+    pub(crate) history_lines_flushed: bool,
 }
 
 impl Tui {
@@ -450,7 +457,7 @@ impl Tui {
         Ok(())
     }
 
-    pub fn insert_history_lines(&mut self, lines: Vec<Line<'static>>) {
+    pub fn insert_history_display_lines(&mut self, lines: Vec<Line<'static>>) {
         self.pending_history_lines.extend(lines);
         self.frame_requester().schedule_frame();
     }
@@ -521,8 +528,7 @@ impl Tui {
     }
 
     /// Write any buffered history lines above the viewport and clear the buffer.
-    /// Returns `true` when any history lines were flushed, signaling that the caller must
-    /// invalidate the diff buffer for a full repaint.
+    /// Returns `true` when any history lines were flushed.
     fn flush_pending_history_lines<B>(
         terminal: &mut custom_terminal::Terminal<B>,
         pending_history_lines: &mut Vec<Line<'static>>,
@@ -535,13 +541,39 @@ impl Tui {
             return Ok(false);
         }
 
-        crate::insert_history::insert_history_lines_with_mode(
+        crate::insert_history::insert_history_display_lines_with_mode(
             terminal,
             pending_history_lines.clone(),
             crate::insert_history::InsertHistoryMode::new(is_zellij),
         )?;
         pending_history_lines.clear();
         Ok(true)
+    }
+
+    pub(crate) fn prepare_terminal_for_draw<B>(
+        terminal: &mut custom_terminal::Terminal<B>,
+        pending_viewport_area: &mut Option<Rect>,
+        pending_history_lines: &mut Vec<Line<'static>>,
+        height: u16,
+        is_zellij: bool,
+    ) -> Result<DrawPreparation>
+    where
+        B: Backend + Write,
+    {
+        if let Some(new_area) = pending_viewport_area.take() {
+            terminal.set_viewport_area(new_area);
+            terminal.clear()?;
+        }
+
+        let viewport_requires_full_repaint =
+            Self::update_inline_viewport(terminal, height, is_zellij)?;
+        let history_lines_flushed =
+            Self::flush_pending_history_lines(terminal, pending_history_lines, is_zellij)?;
+
+        Ok(DrawPreparation {
+            viewport_requires_full_repaint,
+            history_lines_flushed,
+        })
     }
 
     pub fn draw(
@@ -560,34 +592,24 @@ impl Tui {
         // the synchronized update, to avoid racing with the event reader.
         let mut pending_viewport_area = self.pending_viewport_area()?;
 
-        // Merge-safety anchor: synchronized-update framing for live TUI draws must use the same
-        // backend writer as queued-history insertion and `terminal.draw()`, or final-turn history
-        // mutations can reach the terminal outside the begin/end update window.
-        crossterm::queue!(
-            self.terminal.backend_mut(),
-            crossterm::terminal::BeginSynchronizedUpdate
-        )?;
-        let draw_result = (|| -> Result<()> {
+        stdout().sync_update(|_| {
             #[cfg(unix)]
             if let Some(prepared) = prepared_resume.take() {
                 prepared.apply(&mut self.terminal)?;
             }
 
             let terminal = &mut self.terminal;
-            if let Some(new_area) = pending_viewport_area.take() {
-                terminal.set_viewport_area(new_area);
-                terminal.clear()?;
-            }
-
-            let mut needs_full_repaint =
-                Self::update_inline_viewport(terminal, height, self.is_zellij)?;
-            needs_full_repaint |= Self::flush_pending_history_lines(
+            let draw_preparation = Self::prepare_terminal_for_draw(
                 terminal,
+                &mut pending_viewport_area,
                 &mut self.pending_history_lines,
+                height,
                 self.is_zellij,
             )?;
 
-            if needs_full_repaint {
+            if draw_preparation.viewport_requires_full_repaint
+                || draw_preparation.history_lines_flushed
+            {
                 terminal.invalidate_viewport();
             }
 
@@ -608,17 +630,7 @@ impl Tui {
             terminal.draw(|frame| {
                 draw_fn(frame);
             })
-        })();
-        let sync_end_result = (|| -> Result<()> {
-            crossterm::queue!(
-                self.terminal.backend_mut(),
-                crossterm::terminal::EndSynchronizedUpdate
-            )?;
-            std::io::Write::flush(self.terminal.backend_mut())?;
-            Ok(())
-        })();
-        draw_result?;
-        sync_end_result
+        })?
     }
 
     fn pending_viewport_area(&mut self) -> Result<Option<Rect>> {

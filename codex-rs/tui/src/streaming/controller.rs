@@ -21,11 +21,15 @@ pub(crate) struct StreamController {
 impl StreamController {
     /// Create a controller whose markdown renderer shortens local file links relative to `cwd`.
     ///
+    /// Live assistant commentary should not pre-wrap markdown at collector time; that produced
+    /// different line breaking from the committed/resumed history path for long local file refs.
+    /// Keep streaming markdown unwrapped here and let the `HistoryCell` display path own wrapping.
+    ///
     /// The controller snapshots the path into stream state so later commit ticks and finalization
     /// render against the same session cwd that was active when streaming started.
-    pub(crate) fn new(width: Option<usize>, cwd: &Path) -> Self {
+    pub(crate) fn new(cwd: &Path) -> Self {
         Self {
-            state: StreamState::new(width, cwd),
+            state: StreamState::new(/*width*/ None, cwd),
             finishing_after_drain: false,
             header_emitted: false,
         }
@@ -100,6 +104,8 @@ impl StreamController {
         self.state.oldest_queued_age(now)
     }
 
+    // Merge-safety anchor: commentary status-row hiding must key off committed visible output,
+    // not mere controller existence, so no-newline deltas keep the status row visible.
     pub(crate) fn has_visible_output(&self) -> bool {
         self.header_emitted
     }
@@ -281,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn controller_loose_vs_tight_with_commit_ticks_matches_full() {
-        let mut ctrl = StreamController::new(/*width*/ None, &test_cwd());
+        let mut ctrl = StreamController::new(&test_cwd());
         let mut lines = Vec::new();
 
         // Exact deltas from the session log (section: Loose vs. tight list items)
@@ -413,7 +419,7 @@ mod tests {
     async fn controller_live_owner_file_refs_match_full_render() {
         let width: u16 = 88;
         let cwd = test_cwd();
-        let mut ctrl = StreamController::new(/*width*/ None, &cwd);
+        let mut ctrl = StreamController::new(&cwd);
         let source = concat!(
             "• Está aberto ainda, mas o lado de auth/accounts ficou praticamente fechado.\n\n",
             "**Workstreams fechados**\n\n",
