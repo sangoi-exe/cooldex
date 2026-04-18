@@ -637,7 +637,11 @@ pub(crate) fn adaptive_wrap_line<'a>(line: &'a Line<'a>, base: RtOptions<'a>) ->
         return split_before_path;
     }
 
-    let selected = if line_contains_url_like(line) {
+    word_wrap_line(line, select_adaptive_wrap_options(line, base))
+}
+
+fn select_adaptive_wrap_options<'a>(line: &Line<'a>, base: RtOptions<'a>) -> RtOptions<'a> {
+    if line_contains_url_like(line) {
         preserve_url_and_path_wrap_options(base)
     } else if line_contains_local_path_like(line) {
         if local_path_tokens_fit_in_available_width(line, &base) {
@@ -649,8 +653,7 @@ pub(crate) fn adaptive_wrap_line<'a>(line: &'a Line<'a>, base: RtOptions<'a>) ->
         protected_token_wrap_options(base)
     } else {
         base
-    };
-    word_wrap_line(line, selected)
+    }
 }
 
 fn split_before_local_path_token_if_better<'a>(
@@ -665,6 +668,39 @@ fn split_before_local_path_token_if_better<'a>(
         return None;
     }
 
+    let mut pending_line = line_to_static(line);
+    let mut pending_opts = rt_options_to_static(base);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut split_any = false;
+
+    while let Some((prefix_line, remainder_line)) =
+        split_before_local_path_token_once(&pending_line, &pending_opts)
+    {
+        split_any = true;
+        out.extend(word_wrap_line_owned(&prefix_line, pending_opts.clone()));
+
+        let continuation_indent = pending_opts.subsequent_indent.clone();
+        pending_opts = pending_opts
+            .initial_indent(continuation_indent.clone())
+            .subsequent_indent(continuation_indent);
+        pending_line = remainder_line;
+    }
+
+    if !split_any {
+        return None;
+    }
+
+    out.extend(word_wrap_line_owned(
+        &pending_line,
+        select_adaptive_wrap_options(&pending_line, pending_opts),
+    ));
+    Some(retag_owned_lines(out))
+}
+
+fn split_before_local_path_token_once(
+    line: &Line<'static>,
+    base: &RtOptions<'static>,
+) -> Option<(Line<'static>, Line<'static>)> {
     let mut flat = String::new();
     let mut span_bounds = Vec::new();
     let mut acc = 0usize;
@@ -730,19 +766,7 @@ fn split_before_local_path_token_if_better<'a>(
             &span_bounds,
             &(token_start..flat.len()),
         ));
-        let base_static = rt_options_to_static(base);
-
-        let mut out = word_wrap_line_owned(&prefix_line, base_static.clone());
-        let remainder_opts = base_static
-            .clone()
-            .initial_indent(base_static.subsequent_indent.clone())
-            .subsequent_indent(base_static.subsequent_indent.clone());
-        out.extend(
-            adaptive_wrap_line(&remainder_line, remainder_opts)
-                .into_iter()
-                .map(|line| line_to_static(&line)),
-        );
-        return Some(retag_owned_lines(out));
+        return Some((prefix_line, remainder_line));
     }
 
     None
@@ -1656,6 +1680,27 @@ them."#
                 "  stays aligned".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn adaptive_wrap_line_handles_many_prefix_and_local_path_pairs_without_recursive_reentry() {
+        let line = Line::from(
+            "- owner: codex-rs/tui/src/chatwidget.rs owner: codex-rs/tui/src/wrapping.rs owner: codex-rs/tui/src/tui.rs",
+        );
+
+        let out = adaptive_wrap_line(
+            &line,
+            RtOptions::new(/*width*/ 24).subsequent_indent("  ".into()),
+        );
+        let rendered: Vec<String> = out.iter().map(concat_line).collect();
+        let collapsed: String = rendered
+            .iter()
+            .flat_map(|line| line.chars().filter(|character| !character.is_whitespace()))
+            .collect();
+
+        assert!(collapsed.contains("-owner:codex-rs/tui/src/chatwidget.rs"),);
+        assert!(collapsed.contains("owner:codex-rs/tui/src/wrapping.rs"),);
+        assert!(collapsed.contains("owner:codex-rs/tui/src/tui.rs"),);
     }
 
     #[test]
