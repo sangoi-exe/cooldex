@@ -1687,6 +1687,133 @@ fn hydrate_runtime_active_account_switches_to_available_account_after_lost_lease
     );
 }
 
+#[tokio::test]
+async fn auth_bootstraps_to_free_account_when_current_runtime_has_no_active_row() {
+    let codex_home = tempdir().unwrap();
+    let primary_store_account_id =
+        persist_test_chatgpt_accounts(codex_home.path(), &["org-a", "org-b"], 0);
+    let secondary_store_account_id =
+        test_store_account_id("org-b").expect("secondary store account id");
+    let sqlite_home = codex_home.path().join("sqlite-home");
+    let account_state_store =
+        AccountStateStore::open(sqlite_home.clone()).expect("open account-state store");
+    let now = Utc::now();
+
+    assert_eq!(
+        account_state_store
+            .set_session_active_account(
+                "other-runtime",
+                /*codex_session_id*/ None,
+                &primary_store_account_id,
+                now,
+                300,
+            )
+            .expect("seed foreign lease on primary account"),
+        SessionActiveAccountSetOutcome::Assigned
+    );
+
+    let manager = AuthManager::shared_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home,
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    assert_eq!(
+        manager
+            .active_chatgpt_account_summary()
+            .expect("manager should bootstrap a free fallback account")
+            .store_account_id,
+        secondary_store_account_id
+    );
+    assert_eq!(
+        manager
+            .auth()
+            .await
+            .and_then(|auth| auth.active_chatgpt_account_summary())
+            .expect("auth() should resolve a free fallback account")
+            .store_account_id,
+        secondary_store_account_id
+    );
+}
+
+#[tokio::test]
+async fn auth_cached_reloads_when_runtime_current_account_exists_only_in_fresh_store_truth() {
+    let codex_home = tempdir().unwrap();
+    let sqlite_home = codex_home.path().join("sqlite-home");
+    persist_test_chatgpt_accounts(codex_home.path(), &["org-a", "org-b"], 0);
+    let manager = AuthManager::shared_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.clone(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let fresh_store_account_id = test_store_account_id("org-c").expect("fresh store account id");
+    let account_a_store_account_id = test_store_account_id("org-a").expect("account-a id");
+    let account_b_store_account_id = test_store_account_id("org-b").expect("account-b id");
+    let now = Utc::now();
+    let account_state_store =
+        AccountStateStore::open(sqlite_home).expect("open account-state store");
+
+    persist_test_chatgpt_accounts(codex_home.path(), &["org-a", "org-b", "org-c"], 2);
+    manager
+        .release_runtime_active_account()
+        .expect("release stale bootstrap lease before reseeding runtime truth");
+
+    assert_eq!(
+        account_state_store
+            .set_session_active_account(
+                "other-runtime-a",
+                /*codex_session_id*/ None,
+                &account_a_store_account_id,
+                now,
+                300,
+            )
+            .expect("seed foreign lease on account a"),
+        SessionActiveAccountSetOutcome::Assigned
+    );
+    assert_eq!(
+        account_state_store
+            .set_session_active_account(
+                "other-runtime-b",
+                /*codex_session_id*/ None,
+                &account_b_store_account_id,
+                now,
+                300,
+            )
+            .expect("seed foreign lease on account b"),
+        SessionActiveAccountSetOutcome::Assigned
+    );
+    assert_eq!(
+        account_state_store
+            .set_session_active_account(
+                manager.runtime_session_id(),
+                /*codex_session_id*/ None,
+                &fresh_store_account_id,
+                now,
+                300,
+            )
+            .expect("seed current runtime lease on fresh-store account"),
+        SessionActiveAccountSetOutcome::Assigned
+    );
+
+    let popup_accounts = manager.list_accounts();
+    assert!(
+        popup_accounts
+            .iter()
+            .find(|account| account.id == fresh_store_account_id)
+            .expect("fresh-store account should be visible in /accounts")
+            .is_active,
+        "fresh disk load should see the runtime current account as active"
+    );
+
+    let auth_summary = manager
+        .auth_cached()
+        .and_then(|auth| auth.active_chatgpt_account_summary())
+        .expect("auth_cached() should reload to the fresh runtime current account");
+    assert_eq!(auth_summary.store_account_id, fresh_store_account_id);
+}
+
 #[test]
 fn switching_active_account_releases_previous_lease_for_other_sessions() {
     let codex_home = tempdir().unwrap();
@@ -2216,6 +2343,48 @@ async fn refresh_token_from_authority_succeeds_when_terminal_failure_switches_to
         "the invalidated account should be removed from the saved store"
     );
     assert_eq!(manager.refresh_failure_for_auth(&cached_auth), None);
+}
+
+#[tokio::test]
+async fn auth_switches_to_fallback_after_terminal_refresh_failure_when_available() {
+    let codex_home = tempdir().unwrap();
+    let active_store_account_id = persist_test_chatgpt_accounts_with_last_refresh(
+        codex_home.path(),
+        &["org-primary", "org-fallback"],
+        0,
+        Some(Utc::now() - chrono::Duration::days(30)),
+    );
+    let fallback_store_account_id =
+        test_store_account_id("org-fallback").expect("fallback store account id");
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+    let auth = manager.auth_cached().expect("auth should be cached");
+    let error = RefreshTokenFailedError::new(
+        RefreshTokenFailedReason::Revoked,
+        "refresh token invalidated",
+    );
+    manager.record_permanent_refresh_failure_if_unchanged(&auth, &error);
+
+    let summary = manager
+        .auth()
+        .await
+        .and_then(|auth| auth.active_chatgpt_account_summary())
+        .expect("auth() should switch to the remaining fallback account");
+
+    assert_eq!(summary.store_account_id, fallback_store_account_id);
+    let accounts = manager.list_accounts();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].id, fallback_store_account_id);
+    assert!(accounts[0].is_active);
+    assert!(
+        accounts
+            .iter()
+            .all(|account| account.id != active_store_account_id),
+        "the invalidated account should be removed from the saved store"
+    );
 }
 
 #[tokio::test]
