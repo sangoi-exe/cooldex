@@ -236,6 +236,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tempfile::NamedTempFile;
 use tempfile::tempdir;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
 use toml::Value as TomlValue;
@@ -17624,16 +17625,6 @@ async fn vt100_history_cell_live_insert_matches_display_lines() {
     let expected = normalize_vt100_history(lines_to_single_string(&display_lines));
     let actual = normalize_vt100_history(term.backend().vt100().screen().contents());
 
-    if actual != expected {
-        let _ = std::fs::write(
-            "/home/lucas/work/codex/codex-rs/tui/streamed_post_push_actual.txt",
-            &actual,
-        );
-        let _ = std::fs::write(
-            "/home/lucas/work/codex/codex-rs/tui/streamed_post_push_expected.txt",
-            &expected,
-        );
-    }
     assert_eq!(actual, expected);
 }
 
@@ -17789,11 +17780,161 @@ async fn streamed_dense_numbered_file_refs_match_full_render_in_vt100_history() 
     );
 }
 
-async fn assert_streamed_live_screen_matches_one_shot_render(
+fn generated_live_render_stress_message() -> String {
+    let role_sections = [
+        (
+            "Senior Plan Auditor",
+            [
+                "Reported problem / target behavior",
+                "Why this is the strongest path",
+                "Alternatives considered / rejected",
+                "Known-good baseline / comparison anchors",
+            ],
+            [
+                "agents/senior-plan-auditor.toml",
+                "config.toml",
+                ".templates/plan-gate-brief-template.md",
+                "skills/plan-gate-bundle/references/readiness-checklist.md",
+            ],
+        ),
+        (
+            "Senior Code Reviewer",
+            [
+                "Reported problem / target behavior",
+                "Claimed causal chain",
+                "Known-good baseline / regression comparison",
+                "Problem-resolution evidence",
+            ],
+            [
+                "agents/senior-code-reviewer.toml",
+                ".templates/code-review-bundle-template.md",
+                "skills/review-bundle-assembly/references/bundle-shape.md",
+                "skills/review-bundle-assembly/references/evidence-map.md",
+            ],
+        ),
+        (
+            "Senior Overengineering Auditor",
+            [
+                "Required outcome / exactness contract",
+                "Optimization target / cost model",
+                "Current solution shape",
+                "Primary task evidence",
+            ],
+            [
+                "agents/senior-overengineering-auditor.toml",
+                ".templates/overengineering-audit-brief-template.md",
+                "agents/senior-recon-scout.toml",
+                "skills/standards-source-resolution/references/reference-checklist.md",
+            ],
+        ),
+    ];
+
+    let mut source = String::from(
+        "Post-compact state is re-grounded. The current handoff must render live exactly like the resumed transcript.\n\n**O que mudou**\n\n",
+    );
+    for (index, (role, fields, files)) in role_sections.iter().enumerate() {
+        source.push_str(&format!("{}. `{role}`\n", index + 1));
+        source.push_str("- Agora o pacote precisa continuar legivel mesmo com muitos itens curtos, detalhes longos e caminhos locais extensos.\n");
+        source.push_str("- Campos novos no bundle:\n");
+        for field in fields {
+            source.push_str(&format!("  - `{field}`\n"));
+        }
+        source.push_str("Arquivos:\n");
+        for file in files {
+            source.push_str(&format!("- `{file}`\n"));
+        }
+        source.push('\n');
+    }
+    source.push_str("**Bookkeeping**\n");
+    source.push_str("- Atualizei:\n");
+    source.push_str("  - `.sangoi/CHANGELOG.md`\n");
+    source.push_str("  - `.sangoi/codex_scratchpad_local.md`\n");
+    source.push_str("- Criei:\n");
+    for index in 1..=4 {
+        source.push_str(&format!(
+            "  - `.sangoi/planning/live-render-follow-up-{index}.md`\n"
+        ));
+    }
+    source.push_str("\n**Estado atual**\n");
+    source.push_str("- live precisa bater com replay.\n");
+    source.push_str("- a tela nao pode perder linhas nem colar fragmentos em rows erradas.\n");
+    source
+}
+
+fn append_history_cell_lines_like_app(
+    pending_history_lines: &mut Vec<ratatui::text::Line<'static>>,
+    cell: &dyn HistoryCell,
+    width: u16,
+    has_emitted_history_lines: &mut bool,
+) {
+    let mut display = cell.display_lines(width);
+    if display.is_empty() {
+        return;
+    }
+    if !cell.is_stream_continuation() {
+        if *has_emitted_history_lines {
+            display.insert(0, "".into());
+        } else {
+            *has_emitted_history_lines = true;
+        }
+    }
+    pending_history_lines.extend(display);
+}
+
+fn draw_chatwidget_frame_with_pending_history(
+    term: &mut crate::custom_terminal::Terminal<VT100Backend>,
+    chat: &ChatWidget,
+    pending_history_lines: &mut Vec<ratatui::text::Line<'static>>,
+    width: u16,
+    vt_height: u16,
+    invalidate_flushed_history: bool,
+) {
+    let ui_height = chat.desired_height(width).min(vt_height.saturating_sub(1));
+    let mut pending_viewport_area = None;
+    let draw_preparation = crate::tui::Tui::prepare_terminal_for_draw(
+        term,
+        &mut pending_viewport_area,
+        pending_history_lines,
+        ui_height,
+        /*is_zellij*/ false,
+    )
+    .expect("prepare terminal for draw");
+    if draw_preparation.viewport_requires_full_repaint
+        || (invalidate_flushed_history && draw_preparation.history_lines_flushed)
+    {
+        term.invalidate_viewport();
+    }
+    term.draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw chatwidget frame");
+}
+
+fn drain_insert_history_cells_into_pending_lines(
+    rx: &mut UnboundedReceiver<AppEvent>,
+    pending_history_lines: &mut Vec<ratatui::text::Line<'static>>,
+    width: u16,
+    has_emitted_history_lines: &mut bool,
+) -> bool {
+    let mut inserted_any = false;
+    while let Ok(app_event) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = app_event {
+            append_history_cell_lines_like_app(
+                pending_history_lines,
+                cell.as_ref(),
+                width,
+                has_emitted_history_lines,
+            );
+            inserted_any = true;
+        }
+    }
+    inserted_any
+}
+
+async fn render_streamed_live_tui_screen_and_one_shot_baseline(
     source: &str,
     width: u16,
     vt_height: u16,
-) {
+    invalidate_flushed_history: bool,
+) -> (String, String) {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.show_welcome_banner = false;
     chat.thread_id = Some(ThreadId::new());
@@ -17808,64 +17949,22 @@ async fn assert_streamed_live_screen_matches_one_shot_render(
         }),
     });
 
-    let ui_height = chat.desired_height(width).min(vt_height.saturating_sub(1));
-    let viewport = Rect::new(
-        0,
-        vt_height.saturating_sub(ui_height.saturating_add(1)),
-        width,
-        ui_height,
-    );
-
-    let make_term = || {
+    let make_term = |chat: &ChatWidget| {
+        let ui_height = chat.desired_height(width).min(vt_height.saturating_sub(1));
+        let viewport = Rect::new(
+            0,
+            vt_height.saturating_sub(ui_height.saturating_add(1)),
+            width,
+            ui_height,
+        );
         let backend = VT100Backend::new(width, vt_height);
         let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
         term.set_viewport_area(viewport);
         term
     };
 
-    let mut actual_inserted_lines = Vec::new();
-    let mut expected_inserted_lines = Vec::new();
-
-    let insert_cell_like_app = |term: &mut crate::custom_terminal::Terminal<VT100Backend>,
-                                cell: &dyn HistoryCell,
-                                has_emitted_history_lines: &mut bool,
-                                captured_lines: &mut Vec<ratatui::text::Line<'static>>| {
-        let mut display = cell.display_lines(width);
-        if display.is_empty() {
-            return;
-        }
-        if !cell.is_stream_continuation() {
-            if *has_emitted_history_lines {
-                display.insert(0, "".into());
-            } else {
-                *has_emitted_history_lines = true;
-            }
-        }
-        captured_lines.extend(display.iter().cloned());
-        crate::insert_history::insert_history_display_lines(term, display)
-            .expect("Failed to insert history display lines in test");
-        term.invalidate_viewport();
-    };
-
-    let mut drain_insert_history_cells =
-        |term: &mut crate::custom_terminal::Terminal<VT100Backend>,
-         has_emitted_history_lines: &mut bool| {
-            let mut inserted_any = false;
-            while let Ok(app_event) = rx.try_recv() {
-                if let AppEvent::InsertHistoryCell(cell) = app_event {
-                    insert_cell_like_app(
-                        term,
-                        cell.as_ref(),
-                        has_emitted_history_lines,
-                        &mut actual_inserted_lines,
-                    );
-                    inserted_any = true;
-                }
-            }
-            inserted_any
-        };
-
-    let mut actual_term = make_term();
+    let mut actual_term = make_term(&chat);
+    let mut actual_pending_history_lines = Vec::new();
     let mut actual_has_emitted_history_lines = false;
 
     let mut source_chars = source.chars();
@@ -17884,16 +17983,36 @@ async fn assert_streamed_live_screen_matches_one_shot_render(
             msg: EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }),
         });
 
-        drain_insert_history_cells(&mut actual_term, &mut actual_has_emitted_history_lines);
-        actual_term
-            .draw(|f| chat.render(f.area(), f.buffer_mut()))
-            .expect("draw live streamed screen");
+        drain_insert_history_cells_into_pending_lines(
+            &mut rx,
+            &mut actual_pending_history_lines,
+            width,
+            &mut actual_has_emitted_history_lines,
+        );
+        draw_chatwidget_frame_with_pending_history(
+            &mut actual_term,
+            &chat,
+            &mut actual_pending_history_lines,
+            width,
+            vt_height,
+            invalidate_flushed_history,
+        );
 
         chat.on_commit_tick();
-        drain_insert_history_cells(&mut actual_term, &mut actual_has_emitted_history_lines);
-        actual_term
-            .draw(|f| chat.render(f.area(), f.buffer_mut()))
-            .expect("draw post-tick streamed screen");
+        drain_insert_history_cells_into_pending_lines(
+            &mut rx,
+            &mut actual_pending_history_lines,
+            width,
+            &mut actual_has_emitted_history_lines,
+        );
+        draw_chatwidget_frame_with_pending_history(
+            &mut actual_term,
+            &chat,
+            &mut actual_pending_history_lines,
+            width,
+            vt_height,
+            invalidate_flushed_history,
+        );
     }
 
     chat.handle_codex_event(Event {
@@ -17905,26 +18024,46 @@ async fn assert_streamed_live_screen_matches_one_shot_render(
             duration_ms: None,
         }),
     });
-    drain_insert_history_cells(&mut actual_term, &mut actual_has_emitted_history_lines);
+    drain_insert_history_cells_into_pending_lines(
+        &mut rx,
+        &mut actual_pending_history_lines,
+        width,
+        &mut actual_has_emitted_history_lines,
+    );
     let mut consecutive_idle_ticks = 0usize;
     while consecutive_idle_ticks < 3 {
         chat.on_commit_tick();
-        let inserted_any =
-            drain_insert_history_cells(&mut actual_term, &mut actual_has_emitted_history_lines);
-        actual_term
-            .draw(|f| chat.render(f.area(), f.buffer_mut()))
-            .expect("draw final streamed screen tick");
+        let inserted_any = drain_insert_history_cells_into_pending_lines(
+            &mut rx,
+            &mut actual_pending_history_lines,
+            width,
+            &mut actual_has_emitted_history_lines,
+        );
+        draw_chatwidget_frame_with_pending_history(
+            &mut actual_term,
+            &chat,
+            &mut actual_pending_history_lines,
+            width,
+            vt_height,
+            invalidate_flushed_history,
+        );
         if inserted_any {
             consecutive_idle_ticks = 0;
         } else {
             consecutive_idle_ticks += 1;
         }
     }
-    actual_term
-        .draw(|f| chat.render(f.area(), f.buffer_mut()))
-        .expect("draw final streamed screen");
+    draw_chatwidget_frame_with_pending_history(
+        &mut actual_term,
+        &chat,
+        &mut actual_pending_history_lines,
+        width,
+        vt_height,
+        invalidate_flushed_history,
+    );
 
-    let mut expected_term = make_term();
+    let mut expected_term = make_term(&chat);
+    let mut expected_pending_history_lines = Vec::new();
     let mut expected_has_emitted_history_lines = false;
     let mut rendered_markdown = Vec::new();
     crate::markdown::append_markdown(
@@ -17935,173 +18074,85 @@ async fn assert_streamed_live_screen_matches_one_shot_render(
     );
     let expected_cell =
         crate::history_cell::AgentMessageCell::new(rendered_markdown, /*is_first_line*/ true);
-    insert_cell_like_app(
-        &mut expected_term,
+    append_history_cell_lines_like_app(
+        &mut expected_pending_history_lines,
         &expected_cell,
+        width,
         &mut expected_has_emitted_history_lines,
-        &mut expected_inserted_lines,
     );
-    expected_term
-        .draw(|f| chat.render(f.area(), f.buffer_mut()))
-        .expect("draw expected one-shot screen");
+    draw_chatwidget_frame_with_pending_history(
+        &mut expected_term,
+        &chat,
+        &mut expected_pending_history_lines,
+        width,
+        vt_height,
+        /*invalidate_flushed_history*/ true,
+    );
 
-    let actual_inserted = normalize_vt100_history(lines_to_single_string(&actual_inserted_lines));
-    let expected_inserted = normalize_vt100_history(lines_to_single_string(&expected_inserted_lines));
     let actual = normalize_snapshot_paths(actual_term.backend().vt100().screen().contents());
     let expected = normalize_snapshot_paths(expected_term.backend().vt100().screen().contents());
-    if actual_inserted != expected_inserted {
-        eprintln!("inserted-display mismatch before terminal diff");
-    }
-    if actual != expected {
-        eprintln!(
-            "viewport actual={:?} expected={:?}",
-            actual_term.viewport_area, expected_term.viewport_area
-        );
-        let actual_lines: Vec<_> = actual.lines().collect();
-        let expected_lines: Vec<_> = expected.lines().collect();
-        let max_len = actual_lines.len().max(expected_lines.len());
-        for index in 0..max_len {
-            let actual_line = actual_lines.get(index).copied();
-            let expected_line = expected_lines.get(index).copied();
-            if actual_line != expected_line {
-                eprintln!("line {index}: actual={actual_line:?} expected={expected_line:?}");
-            }
-        }
-    }
+    (actual, expected)
+}
+
+#[tokio::test]
+async fn standard_history_flush_reports_history_lines_flushed_for_generated_render_stress_message()
+{
+    let source = generated_live_render_stress_message();
+    let width: u16 = 96;
+    let vt_height: u16 = 34;
+    let ui_height: u16 = 8;
+    let viewport = Rect::new(
+        0,
+        vt_height.saturating_sub(ui_height.saturating_add(1)),
+        width,
+        ui_height,
+    );
+    let backend = VT100Backend::new(width, vt_height);
+    let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+    term.set_viewport_area(viewport);
+
+    let mut rendered_markdown = Vec::new();
+    crate::markdown::append_markdown(
+        &source,
+        /*width*/ None,
+        Some(test_project_path().as_path()),
+        &mut rendered_markdown,
+    );
+    let cell =
+        crate::history_cell::AgentMessageCell::new(rendered_markdown, /*is_first_line*/ true);
+    let mut pending_history_lines = Vec::new();
+    let mut has_emitted_history_lines = false;
+    append_history_cell_lines_like_app(
+        &mut pending_history_lines,
+        &cell,
+        width,
+        &mut has_emitted_history_lines,
+    );
+
+    let mut pending_viewport_area = None;
+    let draw_preparation = crate::tui::Tui::prepare_terminal_for_draw(
+        &mut term,
+        &mut pending_viewport_area,
+        &mut pending_history_lines,
+        ui_height,
+        /*is_zellij*/ false,
+    )
+    .expect("prepare terminal for draw");
+
+    assert!(draw_preparation.history_lines_flushed);
+    assert!(!draw_preparation.viewport_requires_full_repaint);
+}
+
+#[tokio::test]
+async fn streamed_generated_render_stress_message_matches_one_shot_render_through_tui_flush_path() {
+    let source = generated_live_render_stress_message();
+    let (actual, expected) = render_streamed_live_tui_screen_and_one_shot_baseline(
+        &source, /*width*/ 96, /*vt_height*/ 34, /*invalidate_flushed_history*/ true,
+    )
+    .await;
+
     assert_eq!(actual, expected);
-}
-
-#[tokio::test]
-async fn streamed_post_push_summary_live_screen_matches_one_shot_render() {
-    let source = concat!(
-        "Push feito.\n\n",
-        "- Main repo: `6a3cc8212` `fix: restore auth fallback and final-turn wrapping`\n",
-        "- `.sangoi`: `36fd2fb` `docs: log auth fallback and wrap follow-up`\n\n",
-        "Estado:\n\n",
-        "- repo principal limpo\n",
-        "- `.sangoi` limpa\n",
-        "- reviewer final do slice novo: `READY`\n\n",
-        "Além do `linked_codex_session_id`, os subagents tinham achado isto:\n\n",
-        "**Abertos**\n\n",
-        "- Blocker de governança: faltam `Merge-safety anchor:` nos seams de seleção pós-login em ",
-        "`codex-rs/app-server/src/codex_message_processor.rs:511` e `codex-rs/tui/src/app.rs:211`.\n",
-        "- Browser login ainda fecha por query string sem estado validado: ",
-        "`codex-rs/login/src/server.rs:416` e `codex-rs/cli/src/login.rs:130`.\n",
-        "- Logout do app-server não libera a lease runtime: ",
-        "`codex-rs/app-server/src/codex_message_processor.rs:1566` e ",
-        "`codex-rs/login/src/auth/manager.rs:3867`.\n",
-        "- Force-release não é durável contra owner ainda vivo: ",
-        "`codex-rs/account-state/src/lib.rs:399` e `codex-rs/tui/src/app.rs:6162`.\n",
-        "- WS12 ainda tem fallback de truth do auth-store quando SQLite falha, mantendo risco de ",
-        "dual-truth: `codex-rs/login/src/auth/manager.rs:531`, ",
-        "`codex-rs/login/src/auth/manager.rs:1956`, ",
-        "`codex-rs/login/src/auth/manager.rs:3411`.\n",
-        "- API morta sobrando: `codex-rs/login/src/auth/manager.rs:3522` ",
-        "(`persisted_active_store_account_id()`).\n",
-        "- `/status` ainda pode mostrar `0 credits` com saldo positivo subunitário por `round()`: ",
-        "`codex-rs/tui/src/status/rate_limits.rs:340`.\n\n",
-        "**Hipótese condicional**\n\n",
-        "- Em config não-default, `codex-rs/tui/src/lib.rs:787` usando `AuthManager::shared(...)` ",
-        "em vez de `shared_from_config(...)` pode perder `sqlite_home`/forced-workspace. O bug ",
-        "hunter marcou isso como hipótese, não repro local.\n\n",
-        "**Coisas que os subagents acharam e eu já fechei**\n\n",
-        "- Lease perdido sem fallback para outra conta livre: fechado agora em ",
-        "`codex-rs/login/src/auth/manager.rs`.\n",
-        "- Render quebrado de final de turno por split errado de prefixo/lista + path: fechado agora ",
-        "em `codex-rs/tui/src/wrapping.rs` com snapshot novo em ",
-        "`codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__streamed_dense_numbered_file_refs_match_full_render_in_vt100_history.snap`.\n\n",
-        "Se quiser, eu pego agora o próximo batch e começo por:\n\n",
-        "1. `linked_codex_session_id` no app-server\n",
-        "2. logout liberar lease\n",
-        "3. force-release realmente matar o owner vivo\n",
-        "4. `/success` deixar de confiar em query string\n",
-    );
-
-    assert_streamed_live_screen_matches_one_shot_render(source, /*width*/ 118, /*vt_height*/ 34)
-        .await;
-}
-
-#[tokio::test]
-async fn streamed_post_compact_handoff_live_screen_matches_one_shot_render() {
-    let source = concat!(
-        "Post-compact state is re-grounded. No subagents were spawned in this task, and the latest ",
-        "`update_plan` state from recall was already fully completed, so I’m resuming straight into ",
-        "the pending handoff.\n",
-        "Feito.\n\n",
-        "**O que mudou**\n\n",
-        "1. `Senior Plan Auditor`\n",
-        "- Agora o gate cobra explicitamente se o plano é o caminho mais forte para resolver o problema relatado, não só se está “coerente”.\n",
-        "- Campos novos no brief:\n",
-        "  - `Reported problem / target behavior`\n",
-        "  - `Why this is the strongest path`\n",
-        "  - `Alternatives considered / rejected`\n",
-        "  - `Known-good baseline / comparison anchors`\n",
-        "- Nova dimensão de avaliação:\n",
-        "  - `Approach fit / strongest path`\n",
-        "- Regra nova:\n",
-        "  - se existe baseline/checkpoint conhecido e o plano ignora isso sem justificar um caminho melhor, o gate falha.\n\n",
-        "Arquivos:\n",
-        "- `agents/senior-plan-auditor.toml`\n",
-        "- `config.toml`\n",
-        "- `.templates/plan-gate-brief-template.md`\n",
-        "- `skills/plan-gate-bundle/references/brief-shape.md`\n",
-        "- `skills/plan-gate-bundle/references/plan-gate-workflow.md`\n",
-        "- `skills/plan-gate-bundle/references/readiness-checklist.md`\n\n",
-        "2. `Senior Code Reviewer`\n",
-        "- Agora o reviewer não pode aprovar algo “bem feito” se não houver prova de que aquilo resolve o problema certo pelo caminho certo.\n",
-        "- Campos novos no bundle:\n",
-        "  - `Reported problem / target behavior`\n",
-        "  - `Claimed causal chain`\n",
-        "  - `Why this path`\n",
-        "  - `Known-good baseline / regression comparison`\n",
-        "  - `Problem-resolution evidence`\n",
-        "- Nova seção obrigatória no output:\n",
-        "  - `Problem fit reviewed`\n",
-        "- Regra nova de verdict:\n",
-        "  - `READY` e `READY_WITH_NITS` só se o `Problem fit reviewed` estiver `supported`\n",
-        "  - `weak` ou `unsupported` vira `NOT_READY`\n\n",
-        "Arquivos:\n",
-        "- `agents/senior-code-reviewer.toml`\n",
-        "- `config.toml`\n",
-        "- `.templates/code-review-bundle-template.md`\n",
-        "- `skills/review-bundle-assembly/references/bundle-shape.md`\n",
-        "- `skills/review-bundle-assembly/references/evidence-map.md`\n\n",
-        "3. O tranche anterior do `Senior Overengineering Auditor` continua junto no worktree\n",
-        "- Ele já foi reorientado para auditar “o caminho até X exato” e não “se a complexidade é justificável hoje”.\n\n",
-        "Arquivos desse tranche ainda no pacote:\n",
-        "- `agents/senior-overengineering-auditor.toml`\n",
-        "- `.templates/overengineering-audit-brief-template.md`\n",
-        "- `.templates/repo-wide-patrol-overengineering-auditor-template.md`\n",
-        "- `agents/senior-recon-scout.toml`\n",
-        "- `agents/senior-standards-auditor.toml`\n",
-        "- `skills/instruction-surgery/references/routing-matrix.md`\n",
-        "- `skills/patrol-results-triage/references/promotion-matrix.md`\n",
-        "- `skills/standards-source-resolution/references/reference-checklist.md`\n\n",
-        "**Bookkeeping**\n",
-        "- Atualizei:\n",
-        "  - `.sangoi/CHANGELOG.md`\n",
-        "  - `.sangoi/codex_scratchpad_local.md`\n",
-        "- Criei:\n",
-        "  - `.sangoi/planning/2026-04-17-overengineering-auditor-exact-result-rewrite.md`\n",
-        "  - `.sangoi/planning/2026-04-17-plan-auditor-and-code-reviewer-problem-fit-hardening.md`\n",
-        "  - `.sangoi/task-logs/2026-04-17-overengineering-auditor-exact-result-rewrite.md`\n",
-        "  - `.sangoi/task-logs/2026-04-17-plan-auditor-and-code-reviewer-problem-fit-hardening.md`\n\n",
-        "**Validação**\n",
-        "- Parse TOML: ok\n",
-        "- `git diff --check`: ok\n",
-        "- Grep dos campos novos: ok\n",
-        "- Grep de resíduos/wording velho: ok\n",
-        "- Revisão manual do diff: feita\n\n",
-        "**Estado atual**\n",
-        "- Não usei subagents nesta tarefa.\n",
-        "- O worktree está sujo com os dois tranches juntos e pronto para commit.\n\n",
-        "Se quiser, eu faço agora o próximo passo:\n",
-        "1. separar em 2 commits lógicos, ou\n",
-        "2. fazer 1 commit único atômico com tudo.\n",
-    );
-
-    assert_streamed_live_screen_matches_one_shot_render(source, /*width*/ 96, /*vt_height*/ 34)
-        .await;
+    assert_snapshot!(normalize_snapshot_paths(actual));
 }
 
 #[tokio::test]

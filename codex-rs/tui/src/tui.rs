@@ -3,6 +3,7 @@ use std::future::Future;
 use std::io::IsTerminal;
 use std::io::Result;
 use std::io::Stdout;
+use std::io::Write;
 use std::io::stdin;
 use std::io::stdout;
 use std::panic;
@@ -262,6 +263,12 @@ pub struct Tui {
     alt_screen_enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrawPreparation {
+    pub(crate) viewport_requires_full_repaint: bool,
+    pub(crate) history_lines_flushed: bool,
+}
+
 impl Tui {
     pub fn new(terminal: Terminal) -> Self {
         let (draw_tx, _) = broadcast::channel(1);
@@ -463,11 +470,14 @@ impl Tui {
     /// the viewport would extend past the bottom of the screen. Returns `true` when
     /// the caller must invalidate the diff buffer (Zellij mode), because the scroll
     /// was performed with raw newlines that ratatui cannot track.
-    fn update_inline_viewport(
-        terminal: &mut Terminal,
+    fn update_inline_viewport<B>(
+        terminal: &mut custom_terminal::Terminal<B>,
         height: u16,
         is_zellij: bool,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        B: Backend + Write,
+    {
         let size = terminal.size()?;
         let mut needs_full_repaint = false;
 
@@ -499,11 +509,14 @@ impl Tui {
     /// newlines at the screen bottom. This is the Zellij-safe alternative to
     /// `scroll_region_up`, which relies on DECSTBM sequences Zellij does not
     /// support.
-    fn scroll_zellij_expanded_viewport(
-        terminal: &mut Terminal,
+    fn scroll_zellij_expanded_viewport<B>(
+        terminal: &mut custom_terminal::Terminal<B>,
         size: Size,
         scroll_by: u16,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        B: Backend + Write,
+    {
         crossterm::queue!(
             terminal.backend_mut(),
             crossterm::cursor::MoveTo(0, size.height.saturating_sub(1))
@@ -515,13 +528,15 @@ impl Tui {
     }
 
     /// Write any buffered history lines above the viewport and clear the buffer.
-    /// Returns `true` when Zellij mode was used, signaling that the caller must
-    /// invalidate the diff buffer for a full repaint.
-    fn flush_pending_history_lines(
-        terminal: &mut Terminal,
+    /// Returns `true` when any history lines were flushed.
+    fn flush_pending_history_lines<B>(
+        terminal: &mut custom_terminal::Terminal<B>,
         pending_history_lines: &mut Vec<Line<'static>>,
         is_zellij: bool,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        B: Backend + Write,
+    {
         if pending_history_lines.is_empty() {
             return Ok(false);
         }
@@ -532,7 +547,33 @@ impl Tui {
             crate::insert_history::InsertHistoryMode::new(is_zellij),
         )?;
         pending_history_lines.clear();
-        Ok(is_zellij)
+        Ok(true)
+    }
+
+    pub(crate) fn prepare_terminal_for_draw<B>(
+        terminal: &mut custom_terminal::Terminal<B>,
+        pending_viewport_area: &mut Option<Rect>,
+        pending_history_lines: &mut Vec<Line<'static>>,
+        height: u16,
+        is_zellij: bool,
+    ) -> Result<DrawPreparation>
+    where
+        B: Backend + Write,
+    {
+        if let Some(new_area) = pending_viewport_area.take() {
+            terminal.set_viewport_area(new_area);
+            terminal.clear()?;
+        }
+
+        let viewport_requires_full_repaint =
+            Self::update_inline_viewport(terminal, height, is_zellij)?;
+        let history_lines_flushed =
+            Self::flush_pending_history_lines(terminal, pending_history_lines, is_zellij)?;
+
+        Ok(DrawPreparation {
+            viewport_requires_full_repaint,
+            history_lines_flushed,
+        })
     }
 
     pub fn draw(
@@ -558,20 +599,17 @@ impl Tui {
             }
 
             let terminal = &mut self.terminal;
-            if let Some(new_area) = pending_viewport_area.take() {
-                terminal.set_viewport_area(new_area);
-                terminal.clear()?;
-            }
-
-            let mut needs_full_repaint =
-                Self::update_inline_viewport(terminal, height, self.is_zellij)?;
-            needs_full_repaint |= Self::flush_pending_history_lines(
+            let draw_preparation = Self::prepare_terminal_for_draw(
                 terminal,
+                &mut pending_viewport_area,
                 &mut self.pending_history_lines,
+                height,
                 self.is_zellij,
             )?;
 
-            if needs_full_repaint {
+            if draw_preparation.viewport_requires_full_repaint
+                || draw_preparation.history_lines_flushed
+            {
                 terminal.invalidate_viewport();
             }
 
