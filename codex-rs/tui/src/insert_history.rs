@@ -29,8 +29,9 @@ use ratatui::style::Modifier;
 use ratatui::text::Line;
 use ratatui::text::Span;
 
-// Merge-safety anchor: live history insertion must preserve `HistoryCell::display_lines()` layout
-// verbatim on the rendered-cell path so live VT100 history matches resumed transcript rendering.
+// Merge-safety anchor: queued history insertion stays on the adaptive wrap path; the only
+// retained local render divergence is viewport invalidation after the physical-screen mutation in
+// `tui.rs`.
 
 /// Selects the terminal escape strategy for inserting history lines above the viewport.
 ///
@@ -42,12 +43,6 @@ use ratatui::text::Span;
 pub enum InsertHistoryMode {
     Standard,
     Zellij,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HistoryLineWrapMode {
-    Adaptive,
-    PreserveLayout,
 }
 
 impl InsertHistoryMode {
@@ -69,28 +64,7 @@ pub fn insert_history_lines<B>(
 where
     B: Backend + Write,
 {
-    insert_history_lines_with_mode_and_wrap(
-        terminal,
-        lines,
-        InsertHistoryMode::Standard,
-        HistoryLineWrapMode::Adaptive,
-    )
-}
-
-#[cfg(test)]
-pub fn insert_history_display_lines<B>(
-    terminal: &mut crate::custom_terminal::Terminal<B>,
-    lines: Vec<Line>,
-) -> io::Result<()>
-where
-    B: Backend + Write,
-{
-    insert_history_lines_with_mode_and_wrap(
-        terminal,
-        lines,
-        InsertHistoryMode::Standard,
-        HistoryLineWrapMode::PreserveLayout,
-    )
+    insert_history_lines_with_mode(terminal, lines, InsertHistoryMode::Standard)
 }
 
 /// Insert `lines` above the viewport, using the escape strategy selected by `mode`.
@@ -101,39 +75,10 @@ where
 /// region escapes) and writes lines at computed absolute positions. Both modes
 /// update `terminal.viewport_area` so subsequent draw passes know where the
 /// viewport moved to.
-#[cfg(test)]
 pub fn insert_history_lines_with_mode<B>(
     terminal: &mut crate::custom_terminal::Terminal<B>,
     lines: Vec<Line>,
     mode: InsertHistoryMode,
-) -> io::Result<()>
-where
-    B: Backend + Write,
-{
-    insert_history_lines_with_mode_and_wrap(terminal, lines, mode, HistoryLineWrapMode::Adaptive)
-}
-
-pub fn insert_history_display_lines_with_mode<B>(
-    terminal: &mut crate::custom_terminal::Terminal<B>,
-    lines: Vec<Line>,
-    mode: InsertHistoryMode,
-) -> io::Result<()>
-where
-    B: Backend + Write,
-{
-    insert_history_lines_with_mode_and_wrap(
-        terminal,
-        lines,
-        mode,
-        HistoryLineWrapMode::PreserveLayout,
-    )
-}
-
-fn insert_history_lines_with_mode_and_wrap<B>(
-    terminal: &mut crate::custom_terminal::Terminal<B>,
-    lines: Vec<Line>,
-    mode: InsertHistoryMode,
-    wrap_mode: HistoryLineWrapMode,
 ) -> io::Result<()>
 where
     B: Backend + Write,
@@ -161,16 +106,12 @@ where
     let mut wrapped_rows = 0usize;
 
     for line in &lines {
-        let line_wrapped = match wrap_mode {
-            HistoryLineWrapMode::Adaptive => {
-                if line_contains_url_like(line) && !line_has_mixed_url_and_non_url_tokens(line) {
-                    vec![line.clone()]
-                } else {
-                    adaptive_wrap_line(line, RtOptions::new(wrap_width))
-                }
-            }
-            HistoryLineWrapMode::PreserveLayout => vec![line.clone()],
-        };
+        let line_wrapped =
+            if line_contains_url_like(line) && !line_has_mixed_url_and_non_url_tokens(line) {
+                vec![line.clone()]
+            } else {
+                adaptive_wrap_line(line, RtOptions::new(wrap_width))
+            };
         wrapped_rows += line_wrapped
             .iter()
             .map(|wrapped_line| wrapped_line.width().max(1).div_ceil(wrap_width))

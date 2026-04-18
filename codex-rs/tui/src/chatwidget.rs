@@ -2087,16 +2087,26 @@ impl ChatWidget {
     }
 
     fn flush_answer_stream_with_separator(&mut self) {
+        let had_stream_controller = self.stream_controller.is_some();
         if let Some(mut controller) = self.stream_controller.take()
             && let Some(cell) = controller.finalize()
         {
             self.add_boxed_history(cell);
+        }
+        if had_stream_controller {
+            self.stop_commit_animation_if_commentary_stream_inactive();
         }
         self.adaptive_chunking.reset();
     }
 
     fn commentary_stream_active(&self) -> bool {
         self.stream_controller.is_some() || self.plan_stream_controller.is_some()
+    }
+
+    fn stop_commit_animation_if_commentary_stream_inactive(&self) {
+        if !self.commentary_stream_active() {
+            self.app_event_tx.send(AppEvent::StopCommitAnimation);
+        }
     }
 
     fn commentary_stream_has_visible_output(&self) -> bool {
@@ -2686,6 +2696,7 @@ impl ChatWidget {
         self.plan_delta_buffer.clear();
         self.plan_item_active = false;
         self.saw_plan_item_this_turn = true;
+        let had_plan_stream_controller = self.plan_stream_controller.is_some();
         let finalized_streamed_cell =
             if let Some(mut controller) = self.plan_stream_controller.take() {
                 controller.finalize()
@@ -2698,6 +2709,9 @@ impl ChatWidget {
             // removed or if we need to reconcile mismatches between streamed and final content.
         } else if !plan_text.is_empty() {
             self.add_to_history(history_cell::new_proposed_plan(plan_text, &self.config.cwd));
+        }
+        if had_plan_stream_controller {
+            self.stop_commit_animation_if_commentary_stream_inactive();
         }
         if should_restore_after_stream {
             self.pending_status_indicator_restore = true;
@@ -2793,10 +2807,14 @@ impl ChatWidget {
         }
         // If a stream is currently active, finalize it.
         self.flush_answer_stream_with_separator();
+        let had_plan_stream_controller = self.plan_stream_controller.is_some();
         if let Some(mut controller) = self.plan_stream_controller.take()
             && let Some(cell) = controller.finalize()
         {
             self.add_boxed_history(cell);
+        }
+        if had_plan_stream_controller {
+            self.stop_commit_animation_if_commentary_stream_inactive();
         }
         self.flush_unified_exec_wait_streak();
         if !from_replay {
@@ -3299,8 +3317,12 @@ impl ChatWidget {
         self.last_unified_wait = None;
         self.unified_exec_wait_streak = None;
         self.adaptive_chunking.reset();
+        let had_commentary_stream = self.commentary_stream_active();
         self.stream_controller = None;
         self.plan_stream_controller = None;
+        if had_commentary_stream {
+            self.stop_commit_animation_if_commentary_stream_inactive();
+        }
         self.pending_turn_copyable_output = None;
         self.pending_status_indicator_restore = false;
         self.request_status_line_branch_refresh();
@@ -4930,7 +4952,12 @@ impl ChatWidget {
                 // Reset the flag even if we don't show separator (no work was done)
                 self.needs_final_message_separator = false;
             }
-            self.stream_controller = Some(StreamController::new(&self.config.cwd));
+            self.stream_controller = Some(StreamController::new(
+                self.last_rendered_width
+                    .get()
+                    .map(|width| width.saturating_sub(2)),
+                &self.config.cwd,
+            ));
         }
         if let Some(controller) = self.stream_controller.as_mut()
             && controller.push(&delta)

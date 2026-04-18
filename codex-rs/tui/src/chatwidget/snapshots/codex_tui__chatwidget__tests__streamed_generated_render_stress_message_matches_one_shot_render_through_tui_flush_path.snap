@@ -2,7 +2,7 @@
 source: tui/src/chatwidget/tests.rs
 expression: normalize_snapshot_paths(actual)
 ---
-  
+
   - Agora o pacote precisa continuar legivel mesmo com muitos itens curtos, detalhes longos e
   caminhos locais extensos.
   - Campos novos no bundle:
@@ -15,9 +15,9 @@ expression: normalize_snapshot_paths(actual)
   - .templates/overengineering-audit-brief-template.md
   - agents/senior-recon-scout.toml
   - skills/standards-source-resolution/references/reference-checklist.md
-  
+
   Bookkeeping
-  
+
   - Atualizei:
       - .sangoi/CHANGELOG.md
       - .sangoi/codex_scratchpad_local.md
@@ -26,9 +26,9 @@ expression: normalize_snapshot_paths(actual)
       - .sangoi/planning/live-render-follow-up-2.md
       - .sangoi/planning/live-render-follow-up-3.md
       - .sangoi/planning/live-render-follow-up-4.md
-  
+
   Estado atual
-  
+
   - live precisa bater com replay.
   - a tela nao pode perder linhas nem colar fragmentos em rows erradas.
 

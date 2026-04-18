@@ -836,6 +836,29 @@ fn emit_system_bwrap_warning(app_event_tx: &AppEventSender, config: &Config) {
     )));
 }
 
+// Merge-safety anchor: committed transcript staging must stay owned here so live inserts and test
+// probes use the same separator policy before `Tui` mutates the physical screen.
+pub(crate) fn stage_insert_history_cell_lines(
+    cell: &dyn HistoryCell,
+    width: u16,
+    has_emitted_history_lines: &mut bool,
+) -> Vec<Line<'static>> {
+    let mut display = cell.display_lines(width);
+    if display.is_empty() {
+        return display;
+    }
+
+    if !cell.is_stream_continuation() {
+        if *has_emitted_history_lines {
+            display.insert(0, Line::from(""));
+        } else {
+            *has_emitted_history_lines = true;
+        }
+    }
+
+    display
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionSummary {
     usage_line: Option<String>,
@@ -2652,7 +2675,7 @@ impl App {
         let width = tui.terminal.last_known_screen_size.width;
         let header_lines = self.clear_ui_header_lines(width);
         if !header_lines.is_empty() {
-            tui.insert_history_display_lines(header_lines);
+            tui.insert_history_lines(header_lines);
             self.has_emitted_history_lines = true;
         }
     }
@@ -5797,22 +5820,16 @@ impl App {
                     tui.frame_requester().schedule_frame();
                 }
                 self.transcript_cells.push(cell.clone());
-                let mut display = cell.display_lines(tui.terminal.last_known_screen_size.width);
+                let display = stage_insert_history_cell_lines(
+                    cell.as_ref(),
+                    tui.terminal.last_known_screen_size.width,
+                    &mut self.has_emitted_history_lines,
+                );
                 if !display.is_empty() {
-                    // Only insert a separating blank line for new cells that are not
-                    // part of an ongoing stream. Streaming continuations should not
-                    // accrue extra blank lines between chunks.
-                    if !cell.is_stream_continuation() {
-                        if self.has_emitted_history_lines {
-                            display.insert(0, Line::from(""));
-                        } else {
-                            self.has_emitted_history_lines = true;
-                        }
-                    }
                     if self.overlay.is_some() {
                         self.deferred_history_lines.extend(display);
                     } else {
-                        tui.insert_history_display_lines(display);
+                        tui.insert_history_lines(display);
                     }
                 }
             }

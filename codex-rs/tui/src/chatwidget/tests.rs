@@ -221,6 +221,7 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
+use ratatui::backend::Backend;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
 use serde_json::json;
@@ -3468,6 +3469,21 @@ fn drain_insert_history(
     out
 }
 
+fn drain_commit_animation_events(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> (usize, usize) {
+    let mut starts = 0usize;
+    let mut stops = 0usize;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AppEvent::StartCommitAnimation => starts += 1,
+            AppEvent::StopCommitAnimation => stops += 1,
+            _ => {}
+        }
+    }
+    (starts, stops)
+}
+
 fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {
     let mut s = String::new();
     for line in lines {
@@ -4758,6 +4774,43 @@ async fn plan_implementation_popup_shows_after_proposed_plan_output() {
         popup.contains(PLAN_IMPLEMENTATION_TITLE),
         "expected plan popup after proposed plan output, got {popup:?}"
     );
+}
+
+#[tokio::test]
+async fn commit_animation_stops_for_assistant_stream_finalize_without_idle_tick() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.handle_codex_event(Event {
+        id: "turn-start".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
+        }),
+    });
+
+    chat.on_agent_message_delta("streamed line\n".to_string());
+    assert_eq!(drain_commit_animation_events(&mut rx), (1, 0));
+
+    chat.on_task_complete(/*last_agent_message*/ None, /*from_replay*/ false);
+    assert_eq!(drain_commit_animation_events(&mut rx), (0, 1));
+}
+
+#[tokio::test]
+async fn commit_animation_stops_for_plan_stream_finalize_without_idle_tick() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+    let plan_mask = collaboration_modes::mask_for_kind(chat.model_catalog.as_ref(), ModeKind::Plan)
+        .expect("expected plan collaboration mask");
+    chat.set_collaboration_mask(plan_mask);
+
+    chat.on_task_started();
+    chat.on_plan_delta("- Step 1\n".to_string());
+    assert_eq!(drain_commit_animation_events(&mut rx), (1, 0));
+
+    chat.on_plan_item_completed("- Step 1\n".to_string());
+    assert_eq!(drain_commit_animation_events(&mut rx), (0, 1));
 }
 
 #[tokio::test]
@@ -17585,50 +17638,6 @@ async fn chatwidget_tall() {
 }
 
 #[tokio::test]
-async fn vt100_history_cell_live_insert_matches_display_lines() {
-    let width: u16 = 88;
-    let vt_height: u16 = 24;
-    let viewport_height: u16 = 8;
-    let backend = VT100Backend::new(width, vt_height);
-    let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
-    term.set_viewport_area(Rect::new(
-        0,
-        vt_height.saturating_sub(viewport_height),
-        width,
-        viewport_height,
-    ));
-
-    let source = concat!(
-        "• Está aberto ainda, mas o lado de auth/accounts ficou praticamente fechado.\n\n",
-        "**Workstreams fechados**\n\n",
-        "- `WS12` SQLite/account/autoswitch/lease/sqlite  \n",
-        "  owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:394`\n\n",
-        "**Quase fechado**\n\n",
-        "- `WS1` está com `1` item aberto só:\n",
-        "  - remover os mirrors/detours restantes de config que não são de accounts  \n",
-        "    owner: `.sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:252`\n",
-    );
-    let mut rendered_markdown = Vec::new();
-    crate::markdown::append_markdown(
-        source,
-        /*width*/ None,
-        Some(test_project_path().as_path()),
-        &mut rendered_markdown,
-    );
-    let cell =
-        crate::history_cell::AgentMessageCell::new(rendered_markdown, /*is_first_line*/ true);
-    let display_lines = cell.display_lines(width);
-
-    crate::insert_history::insert_history_display_lines(&mut term, display_lines.clone())
-        .expect("Failed to insert prewrapped history lines");
-
-    let expected = normalize_vt100_history(lines_to_single_string(&display_lines));
-    let actual = normalize_vt100_history(term.backend().vt100().screen().contents());
-
-    assert_eq!(actual, expected);
-}
-
-#[tokio::test]
 async fn streamed_dense_numbered_file_refs_match_full_render_in_vt100_history() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
@@ -17719,7 +17728,7 @@ async fn streamed_dense_numbered_file_refs_match_full_render_in_vt100_history() 
                             actual_has_emitted_history_lines = true;
                         }
                     }
-                    crate::insert_history::insert_history_display_lines(&mut actual_term, display)
+                    crate::insert_history::insert_history_lines(&mut actual_term, display)
                         .expect("Failed to insert streamed history lines");
                     inserted_any = true;
                 }
@@ -17752,7 +17761,7 @@ async fn streamed_dense_numbered_file_refs_match_full_render_in_vt100_history() 
                     actual_has_emitted_history_lines = true;
                 }
             }
-            crate::insert_history::insert_history_display_lines(&mut actual_term, display)
+            crate::insert_history::insert_history_lines(&mut actual_term, display)
                 .expect("Failed to insert finalized history lines");
         }
     }
@@ -17768,7 +17777,7 @@ async fn streamed_dense_numbered_file_refs_match_full_render_in_vt100_history() 
         crate::history_cell::AgentMessageCell::new(rendered_markdown, /*is_first_line*/ true);
     let expected_display = expected_cell.display_lines(width);
     let mut expected_term = make_term();
-    crate::insert_history::insert_history_display_lines(&mut expected_term, expected_display)
+    crate::insert_history::insert_history_lines(&mut expected_term, expected_display)
         .expect("Failed to insert expected history lines");
 
     let actual = normalize_vt100_history(actual_term.backend().vt100().screen().contents());
@@ -17861,22 +17870,42 @@ fn generated_live_render_stress_message() -> String {
     source
 }
 
+fn resume_baseline_message_source() -> &'static str {
+    concat!(
+        "Feito.\n\n",
+        "Baseline limpo\n\n",
+        "- Voltei o slice de render para o shape da `main` em:\n",
+        "  - `codex-rs/tui/src/app.rs`\n",
+        "  - `codex-rs/tui/src/app_backtrack.rs`\n",
+        "  - `codex-rs/tui/src/chatwidget.rs`\n",
+        "  - `codex-rs/tui/src/streaming/controller.rs`\n",
+        "  - `codex-rs/tui/src/insert_history.rs`\n",
+        "  - `codex-rs/tui/src/tui.rs`\n",
+        "- Removi o path remendado de `insert_history_display_lines` / `PreserveLayout`.\n",
+        "- Mantive so o fix minimo que continuou fazendo sentido: invalidar o viewport depois de qualquer flush de history fora do diff buffer em `codex-rs/tui/src/tui.rs`.\n\n",
+        "Width/wrap\n\n",
+        "- Restaurei o path width-aware do stream em `codex-rs/tui/src/chatwidget.rs` e `codex-rs/tui/src/streaming/controller.rs`.\n",
+        "- Ou seja: o collector volta a usar a largura renderizada da janela no momento do stream, nao um valor fixo hardcoded.\n\n",
+        "Teste melhor\n\n",
+        "- O teste forte agora nao depende de “copiar tua screenshot”.\n",
+        "- Corrigi o harness para seguir o mesmo comportamento de viewport inline do `Tui::draw()` real em `codex-rs/tui/src/chatwidget/tests.rs`.\n",
+        "- Com isso, o teste de stress live-vs-one-shot virou sinal util de novo, em vez de acusar falso positivo por harness stale.\n\n",
+        "Honesto\n\n",
+        "- Eu nao vou dizer que “acabou” sem teu reteste real.\n",
+        "- Mas `Esc` travando e a lentidao no final de turno ainda nao foram provados como resolvidos.\n",
+    )
+}
+
 fn append_history_cell_lines_like_app(
     pending_history_lines: &mut Vec<ratatui::text::Line<'static>>,
     cell: &dyn HistoryCell,
     width: u16,
     has_emitted_history_lines: &mut bool,
 ) {
-    let mut display = cell.display_lines(width);
+    let display =
+        crate::app::stage_insert_history_cell_lines(cell, width, has_emitted_history_lines);
     if display.is_empty() {
         return;
-    }
-    if !cell.is_stream_continuation() {
-        if *has_emitted_history_lines {
-            display.insert(0, "".into());
-        } else {
-            *has_emitted_history_lines = true;
-        }
     }
     pending_history_lines.extend(display);
 }
@@ -17887,21 +17916,30 @@ fn draw_chatwidget_frame_with_pending_history(
     pending_history_lines: &mut Vec<ratatui::text::Line<'static>>,
     width: u16,
     vt_height: u16,
-    invalidate_flushed_history: bool,
 ) {
-    let ui_height = chat.desired_height(width).min(vt_height.saturating_sub(1));
-    let mut pending_viewport_area = None;
-    let draw_preparation = crate::tui::Tui::prepare_terminal_for_draw(
-        term,
-        &mut pending_viewport_area,
-        pending_history_lines,
-        ui_height,
-        /*is_zellij*/ false,
-    )
-    .expect("prepare terminal for draw");
-    if draw_preparation.viewport_requires_full_repaint
-        || (invalidate_flushed_history && draw_preparation.history_lines_flushed)
-    {
+    let size = term.size().expect("terminal size");
+    let mut area = term.viewport_area;
+    area.height = chat.desired_height(width).min(vt_height.saturating_sub(1));
+    area.height = area.height.min(size.height);
+    area.width = size.width;
+    if area.bottom() > size.height {
+        let scroll_by = area.bottom() - size.height;
+        term.backend_mut()
+            .scroll_region_up(0..area.top(), scroll_by)
+            .expect("scroll inline viewport");
+        area.y = size.height - area.height;
+    }
+    if area != term.viewport_area {
+        term.clear().expect("clear resized viewport");
+        term.set_viewport_area(area);
+    }
+    if !pending_history_lines.is_empty() {
+        crate::insert_history::insert_history_lines_with_mode(
+            term,
+            std::mem::take(pending_history_lines),
+            crate::insert_history::InsertHistoryMode::Standard,
+        )
+        .expect("flush pending history lines");
         term.invalidate_viewport();
     }
     term.draw(|f| chat.render(f.area(), f.buffer_mut()))
@@ -17933,7 +17971,6 @@ async fn render_streamed_live_tui_screen_and_one_shot_baseline(
     source: &str,
     width: u16,
     vt_height: u16,
-    invalidate_flushed_history: bool,
 ) -> (String, String) {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.show_welcome_banner = false;
@@ -17995,7 +18032,6 @@ async fn render_streamed_live_tui_screen_and_one_shot_baseline(
             &mut actual_pending_history_lines,
             width,
             vt_height,
-            invalidate_flushed_history,
         );
 
         chat.on_commit_tick();
@@ -18011,7 +18047,6 @@ async fn render_streamed_live_tui_screen_and_one_shot_baseline(
             &mut actual_pending_history_lines,
             width,
             vt_height,
-            invalidate_flushed_history,
         );
     }
 
@@ -18045,7 +18080,6 @@ async fn render_streamed_live_tui_screen_and_one_shot_baseline(
             &mut actual_pending_history_lines,
             width,
             vt_height,
-            invalidate_flushed_history,
         );
         if inserted_any {
             consecutive_idle_ticks = 0;
@@ -18059,7 +18093,6 @@ async fn render_streamed_live_tui_screen_and_one_shot_baseline(
         &mut actual_pending_history_lines,
         width,
         vt_height,
-        invalidate_flushed_history,
     );
 
     let mut expected_term = make_term(&chat);
@@ -18086,7 +18119,6 @@ async fn render_streamed_live_tui_screen_and_one_shot_baseline(
         &mut expected_pending_history_lines,
         width,
         vt_height,
-        /*invalidate_flushed_history*/ true,
     );
 
     let actual = normalize_snapshot_paths(actual_term.backend().vt100().screen().contents());
@@ -18095,64 +18127,268 @@ async fn render_streamed_live_tui_screen_and_one_shot_baseline(
 }
 
 #[tokio::test]
-async fn standard_history_flush_reports_history_lines_flushed_for_generated_render_stress_message()
-{
-    let source = generated_live_render_stress_message();
-    let width: u16 = 96;
-    let vt_height: u16 = 34;
-    let ui_height: u16 = 8;
-    let viewport = Rect::new(
-        0,
-        vt_height.saturating_sub(ui_height.saturating_add(1)),
-        width,
-        ui_height,
-    );
-    let backend = VT100Backend::new(width, vt_height);
-    let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
-    term.set_viewport_area(viewport);
-
-    let mut rendered_markdown = Vec::new();
-    crate::markdown::append_markdown(
-        &source,
-        /*width*/ None,
-        Some(test_project_path().as_path()),
-        &mut rendered_markdown,
-    );
-    let cell =
-        crate::history_cell::AgentMessageCell::new(rendered_markdown, /*is_first_line*/ true);
-    let mut pending_history_lines = Vec::new();
-    let mut has_emitted_history_lines = false;
-    append_history_cell_lines_like_app(
-        &mut pending_history_lines,
-        &cell,
-        width,
-        &mut has_emitted_history_lines,
-    );
-
-    let mut pending_viewport_area = None;
-    let draw_preparation = crate::tui::Tui::prepare_terminal_for_draw(
-        &mut term,
-        &mut pending_viewport_area,
-        &mut pending_history_lines,
-        ui_height,
-        /*is_zellij*/ false,
-    )
-    .expect("prepare terminal for draw");
-
-    assert!(draw_preparation.history_lines_flushed);
-    assert!(!draw_preparation.viewport_requires_full_repaint);
-}
-
-#[tokio::test]
 async fn streamed_generated_render_stress_message_matches_one_shot_render_through_tui_flush_path() {
     let source = generated_live_render_stress_message();
     let (actual, expected) = render_streamed_live_tui_screen_and_one_shot_baseline(
-        &source, /*width*/ 96, /*vt_height*/ 34, /*invalidate_flushed_history*/ true,
+        &source, /*width*/ 96, /*vt_height*/ 34,
     )
     .await;
 
     assert_eq!(actual, expected);
     assert_snapshot!(normalize_snapshot_paths(actual));
+}
+
+#[tokio::test]
+async fn streamed_resume_baseline_message_exposes_first_divergence_checkpoint() {
+    let source = resume_baseline_message_source();
+    let width: u16 = 96;
+    let vt_height: u16 = 34;
+    let cwd = test_project_path().abs();
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.show_welcome_banner = false;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.cwd = cwd.clone();
+    chat.handle_codex_event(Event {
+        id: "turn-start".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+            started_at: None,
+        }),
+    });
+
+    let make_term = |chat: &ChatWidget| {
+        let ui_height = chat.desired_height(width).min(vt_height.saturating_sub(1));
+        let viewport = Rect::new(
+            0,
+            vt_height.saturating_sub(ui_height.saturating_add(1)),
+            width,
+            ui_height,
+        );
+        let backend = VT100Backend::new(width, vt_height);
+        let mut term = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        term.set_viewport_area(viewport);
+        term
+    };
+
+    let mut actual_after_insert_term = make_term(&chat);
+    let mut actual_after_draw_term = make_term(&chat);
+    let mut actual_pending_history_lines = Vec::new();
+    let mut actual_has_emitted_history_lines = false;
+    let mut actual_raw_display_lines = Vec::new();
+    let mut actual_staged_lines = Vec::new();
+
+    let mut source_chars = source.chars();
+    loop {
+        let mut delta = String::new();
+        match source_chars.next() {
+            Some(ch) => delta.push(ch),
+            None => break,
+        }
+        if let Some(ch) = source_chars.next() {
+            delta.push(ch);
+        }
+
+        chat.handle_codex_event(Event {
+            id: "delta".into(),
+            msg: EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }),
+        });
+
+        while let Ok(app_event) = rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = app_event {
+                let raw_display = cell.display_lines(width);
+                actual_raw_display_lines.extend(raw_display.clone());
+                let staged = crate::app::stage_insert_history_cell_lines(
+                    cell.as_ref(),
+                    width,
+                    &mut actual_has_emitted_history_lines,
+                );
+                actual_staged_lines.extend(staged.clone());
+                if !staged.is_empty() {
+                    crate::insert_history::insert_history_lines_with_mode(
+                        &mut actual_after_insert_term,
+                        staged.clone(),
+                        crate::insert_history::InsertHistoryMode::Standard,
+                    )
+                    .expect("insert actual staged lines");
+                    actual_pending_history_lines.extend(staged);
+                }
+            }
+        }
+        draw_chatwidget_frame_with_pending_history(
+            &mut actual_after_draw_term,
+            &chat,
+            &mut actual_pending_history_lines,
+            width,
+            vt_height,
+        );
+
+        chat.on_commit_tick();
+        while let Ok(app_event) = rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = app_event {
+                let raw_display = cell.display_lines(width);
+                actual_raw_display_lines.extend(raw_display.clone());
+                let staged = crate::app::stage_insert_history_cell_lines(
+                    cell.as_ref(),
+                    width,
+                    &mut actual_has_emitted_history_lines,
+                );
+                actual_staged_lines.extend(staged.clone());
+                if !staged.is_empty() {
+                    crate::insert_history::insert_history_lines_with_mode(
+                        &mut actual_after_insert_term,
+                        staged.clone(),
+                        crate::insert_history::InsertHistoryMode::Standard,
+                    )
+                    .expect("insert actual staged lines after tick");
+                    actual_pending_history_lines.extend(staged);
+                }
+            }
+        }
+        draw_chatwidget_frame_with_pending_history(
+            &mut actual_after_draw_term,
+            &chat,
+            &mut actual_pending_history_lines,
+            width,
+            vt_height,
+        );
+    }
+
+    chat.handle_codex_event(Event {
+        id: "turn-complete".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
+        }),
+    });
+    let mut consecutive_idle_ticks = 0usize;
+    while consecutive_idle_ticks < 3 {
+        while let Ok(app_event) = rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = app_event {
+                let raw_display = cell.display_lines(width);
+                actual_raw_display_lines.extend(raw_display.clone());
+                let staged = crate::app::stage_insert_history_cell_lines(
+                    cell.as_ref(),
+                    width,
+                    &mut actual_has_emitted_history_lines,
+                );
+                actual_staged_lines.extend(staged.clone());
+                if !staged.is_empty() {
+                    crate::insert_history::insert_history_lines_with_mode(
+                        &mut actual_after_insert_term,
+                        staged.clone(),
+                        crate::insert_history::InsertHistoryMode::Standard,
+                    )
+                    .expect("insert actual staged lines after complete");
+                    actual_pending_history_lines.extend(staged);
+                }
+            }
+        }
+        draw_chatwidget_frame_with_pending_history(
+            &mut actual_after_draw_term,
+            &chat,
+            &mut actual_pending_history_lines,
+            width,
+            vt_height,
+        );
+        chat.on_commit_tick();
+        let inserted_any = !actual_pending_history_lines.is_empty();
+        if inserted_any {
+            consecutive_idle_ticks = 0;
+        } else {
+            consecutive_idle_ticks += 1;
+        }
+    }
+    draw_chatwidget_frame_with_pending_history(
+        &mut actual_after_draw_term,
+        &chat,
+        &mut actual_pending_history_lines,
+        width,
+        vt_height,
+    );
+
+    let mut rendered_markdown = Vec::new();
+    crate::markdown::append_markdown(
+        source,
+        /*width*/ None,
+        Some(cwd.as_path()),
+        &mut rendered_markdown,
+    );
+    let expected_cell =
+        crate::history_cell::AgentMessageCell::new(rendered_markdown, /*is_first_line*/ true);
+    let expected_raw_display_lines = expected_cell.display_lines(width);
+    let mut expected_has_emitted_history_lines = false;
+    let expected_staged_lines = crate::app::stage_insert_history_cell_lines(
+        &expected_cell,
+        width,
+        &mut expected_has_emitted_history_lines,
+    );
+
+    let mut expected_after_insert_term = make_term(&chat);
+    crate::insert_history::insert_history_lines_with_mode(
+        &mut expected_after_insert_term,
+        expected_staged_lines.clone(),
+        crate::insert_history::InsertHistoryMode::Standard,
+    )
+    .expect("insert expected staged lines");
+
+    let mut expected_after_draw_term = make_term(&chat);
+    let mut expected_pending_history_lines = expected_staged_lines.clone();
+    draw_chatwidget_frame_with_pending_history(
+        &mut expected_after_draw_term,
+        &chat,
+        &mut expected_pending_history_lines,
+        width,
+        vt_height,
+    );
+
+    assert_eq!(
+        lines_to_single_string(&actual_raw_display_lines),
+        lines_to_single_string(&expected_raw_display_lines),
+        "raw display_lines diverged from one-shot baseline"
+    );
+    assert_eq!(
+        lines_to_single_string(&actual_staged_lines),
+        lines_to_single_string(&expected_staged_lines),
+        "app-staged lines diverged from one-shot baseline"
+    );
+    let actual_after_insert = normalize_snapshot_paths(
+        actual_after_insert_term
+            .backend()
+            .vt100()
+            .screen()
+            .contents(),
+    );
+    let expected_after_insert = normalize_snapshot_paths(
+        expected_after_insert_term
+            .backend()
+            .vt100()
+            .screen()
+            .contents(),
+    );
+    let actual_after_draw =
+        normalize_snapshot_paths(actual_after_draw_term.backend().vt100().screen().contents());
+    let expected_after_draw = normalize_snapshot_paths(
+        expected_after_draw_term
+            .backend()
+            .vt100()
+            .screen()
+            .contents(),
+    );
+
+    assert_ne!(
+        actual_after_insert, expected_after_insert,
+        "expected the synthetic raw-insert checkpoint to diverge before the real draw path flushes"
+    );
+    assert_eq!(
+        actual_after_draw, expected_after_draw,
+        "expected the real Tui draw path to converge back to the one-shot baseline\n\
+         --- actual after draw ---\n{actual_after_draw}\n\
+         --- expected after draw ---\n{expected_after_draw}"
+    );
 }
 
 #[tokio::test]
