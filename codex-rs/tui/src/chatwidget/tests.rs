@@ -3,6 +3,11 @@
 //! These tests treat the widget as the adapter between `codex_protocol::protocol::EventMsg` inputs and
 //! the TUI output. Many assertions are snapshot-based so that layout regressions and status/header
 //! changes show up as stable, reviewable diffs.
+//!
+//! Merge-safety anchor: replay/resume fixtures in this module must stay aligned
+//! with the widget-owned history/render bridges so prompt-GC, command replay,
+//! and app-server transcript rows preserve the same visible contract after
+//! upstream merges.
 
 pub(super) use super::*;
 pub(super) use crate::app_event::AppEvent;

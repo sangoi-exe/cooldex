@@ -238,7 +238,12 @@ fn projected_prompt_cost(
 async fn ensure_rollout_compatible_for_prompt_gc(
     session: &Session,
 ) -> Result<(), crate::function_tool::FunctionCallError> {
-    let _ = session.flush_rollout().await;
+    session.flush_rollout().await.map_err(|_| {
+        contract_error(
+            StopReason::IncompatibleRolloutHistory,
+            INCOMPATIBLE_ROLLOUT_HISTORY_STATUS,
+        )
+    })?;
     let Some(rollout_path) = session.current_rollout_path().await else {
         return Err(contract_error(
             StopReason::MissingRolloutRecorder,

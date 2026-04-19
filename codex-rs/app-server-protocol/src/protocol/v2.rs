@@ -9435,6 +9435,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn thread_lifecycle_responses_default_missing_instruction_sources() {
         let response = json!({
             "thread": {

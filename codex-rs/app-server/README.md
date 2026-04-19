@@ -1,5 +1,10 @@
 # codex-app-server
 
+<!-- Merge-safety anchor: this README is the durable operator-facing note for
+the workspace-local `/accounts` and app-server account/auth surfaces, so auth
+and account-flow docs here must stay aligned with the shipped Rust runtime
+owners instead of drifting behind upstream wording. -->
+
 `codex app-server` is the interface Codex uses to power rich interfaces such as the [Codex VS Code extension](https://marketplace.visualstudio.com/items?itemName=openai.chatgpt).
 
 ## Table of Contents

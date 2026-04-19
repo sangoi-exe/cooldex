@@ -81,9 +81,6 @@ use crate::protocol::v2::PatchChangeKind;
 use codex_protocol::protocol::ExecCommandStatus as CoreExecCommandStatus;
 #[cfg(test)]
 use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
-#[cfg(test)]
-use std::path::PathBuf;
-
 /// Convert persisted [`RolloutItem`] entries into a sequence of [`Turn`] values.
 ///
 /// When available, this uses `TurnContext.turn_id` as the canonical turn id so
@@ -218,6 +215,7 @@ fn shell_command_execution_item(
     item_id: String,
     command: Vec<String>,
     cwd: Option<String>,
+    rollout_cwd: Option<&AbsolutePathBuf>,
     status: CommandExecutionStatus,
     aggregated_output: Option<String>,
 ) -> ThreadItem {
@@ -227,8 +225,8 @@ fn shell_command_execution_item(
         .map(AbsolutePathBuf::try_from)
         .transpose()
         .expect("shell command cwd should be absolute")
-        .or_else(|| AbsolutePathBuf::current_dir().ok())
-        .expect("current working directory should resolve");
+        .or_else(|| rollout_cwd.cloned())
+        .expect("shell command replay requires session or turn cwd when workdir is absent");
     let command_actions = parse_command(&command)
         .into_iter()
         .map(|parsed| CommandAction::from_core_with_cwd(parsed, &cwd))
@@ -251,6 +249,7 @@ pub struct ThreadHistoryBuilder {
     turns: Vec<Turn>,
     current_turn: Option<PendingTurn>,
     truthful_turn_ids: Vec<String>,
+    rollout_cwd: Option<AbsolutePathBuf>,
     next_item_index: i64,
     current_rollout_index: usize,
     next_rollout_index: usize,
@@ -268,6 +267,7 @@ impl ThreadHistoryBuilder {
             turns: Vec::new(),
             current_turn: None,
             truthful_turn_ids: Vec::new(),
+            rollout_cwd: None,
             next_item_index: 1,
             current_rollout_index: 0,
             next_rollout_index: 0,
@@ -408,7 +408,18 @@ impl ThreadHistoryBuilder {
             RolloutItem::EventMsg(event) => self.handle_event(event),
             RolloutItem::Compacted(payload) => self.handle_compacted(payload),
             RolloutItem::ResponseItem(item) => self.handle_response_item(item),
-            RolloutItem::TurnContext(_) | RolloutItem::SessionMeta(_) => {}
+            RolloutItem::TurnContext(turn_context) => {
+                self.rollout_cwd = Some(
+                    AbsolutePathBuf::try_from(turn_context.cwd.clone())
+                        .expect("turn context cwd should be absolute"),
+                );
+            }
+            RolloutItem::SessionMeta(meta_line) => {
+                self.rollout_cwd = Some(
+                    AbsolutePathBuf::try_from(meta_line.meta.cwd.clone())
+                        .expect("session meta cwd should be absolute"),
+                );
+            }
         }
     }
 
@@ -504,6 +515,7 @@ impl ThreadHistoryBuilder {
                     item_id,
                     exec.command.clone(),
                     exec.working_directory.clone(),
+                    self.rollout_cwd.as_ref(),
                     local_shell_status_to_command_status(status),
                     /*aggregated_output*/ None,
                 ));
@@ -522,6 +534,7 @@ impl ThreadHistoryBuilder {
                         call_id.clone(),
                         command,
                         cwd,
+                        self.rollout_cwd.as_ref(),
                         CommandExecutionStatus::InProgress,
                         /*aggregated_output*/ None,
                     ));
@@ -4282,14 +4295,14 @@ mod tests {
                 ThreadItem::CommandExecution {
                     id: "call-shell-1".into(),
                     command: "cat runner.py".into(),
-                    cwd: PathBuf::from("/tmp/work"),
+                    cwd: test_path_buf("/tmp/work").abs(),
                     process_id: None,
                     source: CommandExecutionSource::Agent,
                     status: CommandExecutionStatus::Completed,
                     command_actions: vec![CommandAction::Read {
                         command: "cat runner.py".into(),
                         name: "runner.py".into(),
-                        path: PathBuf::from("runner.py"),
+                        path: test_path_buf("/tmp/work/runner.py").abs(),
                     }],
                     aggregated_output: None,
                     exit_code: None,
@@ -4414,6 +4427,61 @@ mod tests {
 
         assert_eq!(turns.len(), 1);
         assert!(turns[0].items.is_empty());
+    }
+
+    #[test]
+    fn reconstructs_shell_response_item_without_workdir_using_session_meta_cwd() {
+        let items = vec![
+            RolloutItem::SessionMeta(codex_protocol::protocol::SessionMetaLine {
+                meta: codex_protocol::protocol::SessionMeta {
+                    cwd: PathBuf::from("/tmp/workspace"),
+                    ..Default::default()
+                },
+                git: None,
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".into(),
+                namespace: None,
+                arguments: r#"{"command":["cat","runner.py"]}"#.into(),
+                call_id: "call-shell-1".into(),
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                completed_at: None,
+                duration_ms: None,
+                last_agent_message: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items,
+            vec![ThreadItem::CommandExecution {
+                id: "call-shell-1".into(),
+                command: "cat runner.py".into(),
+                cwd: test_path_buf("/tmp/workspace").abs(),
+                process_id: None,
+                source: CommandExecutionSource::Agent,
+                status: CommandExecutionStatus::InProgress,
+                command_actions: vec![CommandAction::Read {
+                    command: "cat runner.py".into(),
+                    name: "runner.py".into(),
+                    path: test_path_buf("/tmp/workspace/runner.py").abs(),
+                }],
+                aggregated_output: None,
+                exit_code: None,
+                duration_ms: None,
+            }]
+        );
     }
 
     #[test]
