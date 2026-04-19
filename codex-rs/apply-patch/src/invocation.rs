@@ -138,6 +138,7 @@ pub async fn maybe_parse_apply_patch_verified(
     argv: &[String],
     cwd: &AbsolutePathBuf,
     fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
 ) -> MaybeApplyPatchVerified {
     // Detect a raw patch body passed directly as the command or as the body of a shell
     // script. In these cases, report an explicit error rather than applying the patch.
@@ -173,7 +174,7 @@ pub async fn maybe_parse_apply_patch_verified(
                         );
                     }
                     Hunk::DeleteFile { .. } => {
-                        let content = match fs.read_file_text(&path).await {
+                        let content = match fs.read_file_text(&path, sandbox).await {
                             Ok(content) => content,
                             Err(e) => {
                                 return MaybeApplyPatchVerified::CorrectnessError(
@@ -195,7 +196,7 @@ pub async fn maybe_parse_apply_patch_verified(
                         let ApplyPatchFileUpdate {
                             unified_diff,
                             content: contents,
-                        } = match unified_diff_from_chunks(&path, &chunks, fs).await {
+                        } = match unified_diff_from_chunks(&path, &chunks, fs, sandbox).await {
                             Ok(diff) => diff,
                             Err(e) => {
                                 return MaybeApplyPatchVerified::CorrectnessError(e);
@@ -470,7 +471,8 @@ mod tests {
             maybe_parse_apply_patch_verified(
                 &args,
                 &AbsolutePathBuf::from_absolute_path(dir.path()).unwrap(),
-                LOCAL_FS.as_ref()
+                LOCAL_FS.as_ref(),
+                /*sandbox*/ None,
             )
             .await,
             MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation)
@@ -486,7 +488,8 @@ mod tests {
             maybe_parse_apply_patch_verified(
                 &args,
                 &AbsolutePathBuf::from_absolute_path(dir.path()).unwrap(),
-                LOCAL_FS.as_ref()
+                LOCAL_FS.as_ref(),
+                /*sandbox*/ None,
             )
             .await,
             MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation)
@@ -696,9 +699,10 @@ PATCH"#,
         };
 
         let path_abs = path.as_path().abs();
-        let diff = unified_diff_from_chunks(&path_abs, chunks, LOCAL_FS.as_ref())
-            .await
-            .unwrap();
+        let diff =
+            unified_diff_from_chunks(&path_abs, chunks, LOCAL_FS.as_ref(), /*sandbox*/ None)
+                .await
+                .unwrap();
         let expected_diff = r#"@@ -2,2 +2,2 @@
  bar
 -baz
@@ -734,9 +738,10 @@ PATCH"#,
         };
 
         let path_abs = path.as_path().abs();
-        let diff = unified_diff_from_chunks(&path_abs, chunks, LOCAL_FS.as_ref())
-            .await
-            .unwrap();
+        let diff =
+            unified_diff_from_chunks(&path_abs, chunks, LOCAL_FS.as_ref(), /*sandbox*/ None)
+                .await
+                .unwrap();
         let expected_diff = r#"@@ -3 +3,2 @@
  baz
 +quux
@@ -773,6 +778,7 @@ PATCH"#,
             &argv,
             &AbsolutePathBuf::from_absolute_path(session_dir.path()).unwrap(),
             LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
         )
         .await;
 
@@ -826,6 +832,7 @@ PATCH"#,
             &argv,
             &AbsolutePathBuf::from_absolute_path(session_dir.path()).unwrap(),
             LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
         )
         .await;
         let action = match result {

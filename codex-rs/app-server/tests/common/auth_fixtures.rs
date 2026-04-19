@@ -164,6 +164,7 @@ pub fn write_chatgpt_auth(
         openai_api_key: None,
         tokens: Some(tokens),
         last_refresh,
+        agent_identity: None,
     };
 
     let store = AuthStore::from_legacy(auth);

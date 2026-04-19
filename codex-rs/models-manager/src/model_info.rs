@@ -26,14 +26,19 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
     {
         model.supports_reasoning_summaries = true;
     }
+    // Merge-safety anchor: local model-context overrides must still respect
+    // authoritative remote metadata and upstream max-context caps when both
+    // are present.
     if let Some(config_context_window) = config.model_context_window {
-        let resolved_context_window = if let Some(remote_context_window) = model.context_window
+        let mut resolved_context_window = config_context_window;
+        if let Some(max_context_window) = model.max_context_window {
+            resolved_context_window = resolved_context_window.min(max_context_window);
+        }
+        if let Some(remote_context_window) = model.context_window
             && !model.used_fallback_model_metadata
         {
-            config_context_window.min(remote_context_window)
-        } else {
-            config_context_window
-        };
+            resolved_context_window = resolved_context_window.min(remote_context_window);
+        }
         model.context_window = Some(resolved_context_window);
     }
     if let Some(auto_compact_token_limit) = config.model_auto_compact_token_limit {
@@ -91,6 +96,7 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
+        max_context_window: Some(272_000),
         auto_compact_token_limit: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),

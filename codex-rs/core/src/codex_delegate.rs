@@ -30,15 +30,9 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use crate::codex::Codex;
-use crate::codex::CodexSpawnArgs;
-use crate::codex::CodexSpawnOk;
-use crate::codex::SUBMISSION_CHANNEL_CAPACITY;
-use crate::codex::Session;
-use crate::codex::TurnContext;
-use crate::codex::emit_subagent_session_started;
 use crate::config::Config;
 use crate::guardian::GuardianApprovalRequest;
+use crate::guardian::new_guardian_review_id;
 use crate::guardian::review_approval_request_with_cancel;
 use crate::guardian::routes_approval_to_guardian;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_ACCEPT;
@@ -47,11 +41,19 @@ use crate::mcp_tool_call::MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC;
 use crate::mcp_tool_call::build_guardian_mcp_tool_review_request;
 use crate::mcp_tool_call::is_mcp_tool_approval_question_id;
 use crate::mcp_tool_call::lookup_mcp_tool_metadata;
+use crate::session::Codex;
+use crate::session::CodexSpawnArgs;
+use crate::session::CodexSpawnOk;
+use crate::session::SUBMISSION_CHANNEL_CAPACITY;
+#[cfg(test)]
+use crate::session::completed_session_loop_termination;
+use crate::session::emit_subagent_session_started;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use codex_login::AuthManager;
 use codex_models_manager::manager::ModelsManager;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::InitialHistory;
-
 /// Start an interactive sub-Codex thread and return IO channels.
 ///
 /// The returned `events_rx` yields non-approval events emitted by the sub-agent.
@@ -71,7 +73,7 @@ pub(crate) async fn run_codex_thread_interactive(
     let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
 
-    let CodexSpawnOk { codex, .. } = Codex::spawn(CodexSpawnArgs {
+    let CodexSpawnOk { codex, .. } = Box::pin(Codex::spawn(CodexSpawnArgs {
         config,
         auth_manager,
         models_manager,
@@ -92,7 +94,8 @@ pub(crate) async fn run_codex_thread_interactive(
         user_shell_override: None,
         inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
         parent_trace: None,
-    })
+        analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
+    }))
     .await?;
     if parent_session.enabled(codex_features::Feature::GeneralAnalytics) {
         let thread_config = codex.thread_config_snapshot().await;
@@ -101,6 +104,7 @@ pub(crate) async fn run_codex_thread_interactive(
             &parent_session.services.analytics_events_client,
             client_metadata,
             codex.session.conversation_id,
+            Some(parent_session.conversation_id),
             thread_config,
             subagent_source,
         );
@@ -169,7 +173,7 @@ pub(crate) async fn run_codex_thread_one_shot(
     // Use a child token so we can stop the delegate after completion without
     // requiring the caller to cancel the parent token.
     let child_cancel = cancel_token.child_token();
-    let io = run_codex_thread_interactive(
+    let io = Box::pin(run_codex_thread_interactive(
         config,
         auth_manager,
         models_manager,
@@ -178,13 +182,14 @@ pub(crate) async fn run_codex_thread_one_shot(
         child_cancel.clone(),
         subagent_source,
         initial_history,
-    )
+    ))
     .await?;
 
     // Send the initial input to kick off the one-shot turn.
     io.submit(Op::UserInput {
         items: input,
         final_output_json_schema,
+        responsesapi_client_metadata: None,
     })
     .await?;
 
@@ -465,6 +470,7 @@ async fn handle_exec_approval(
         let review_rx = spawn_guardian_review(
             Arc::clone(parent_session),
             Arc::clone(parent_ctx),
+            new_guardian_review_id(),
             GuardianApprovalRequest::Shell {
                 id: call_id.clone(),
                 command,
@@ -572,9 +578,10 @@ async fn handle_patch_approval(
         let review_rx = spawn_guardian_review(
             Arc::clone(parent_session),
             Arc::clone(parent_ctx),
+            new_guardian_review_id(),
             GuardianApprovalRequest::ApplyPatch {
                 id: approval_id.clone(),
-                cwd: parent_ctx.cwd.to_path_buf(),
+                cwd: parent_ctx.cwd.clone(),
                 files,
                 patch,
             },
@@ -704,6 +711,7 @@ async fn maybe_auto_review_mcp_request_user_input(
     let review_rx = spawn_guardian_review(
         Arc::clone(parent_session),
         Arc::clone(parent_ctx),
+        new_guardian_review_id(),
         build_guardian_mcp_tool_review_request(&event.call_id, &invocation, metadata.as_ref()),
         /*retry_reason*/ None,
         review_cancel.clone(),
@@ -730,7 +738,7 @@ async fn maybe_auto_review_mcp_request_user_input(
         ReviewDecision::Approved
         | ReviewDecision::ApprovedExecpolicyAmendment { .. }
         | ReviewDecision::NetworkPolicyAmendment { .. } => MCP_TOOL_APPROVAL_ACCEPT.to_string(),
-        ReviewDecision::Denied | ReviewDecision::Abort => {
+        ReviewDecision::Denied | ReviewDecision::TimedOut | ReviewDecision::Abort => {
             MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC.to_string()
         }
     };
@@ -747,6 +755,7 @@ async fn maybe_auto_review_mcp_request_user_input(
 fn spawn_guardian_review(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
+    review_id: String,
     request: GuardianApprovalRequest,
     retry_reason: Option<String>,
     cancel_token: CancellationToken,
@@ -763,6 +772,7 @@ fn spawn_guardian_review(
         let decision = runtime.block_on(review_approval_request_with_cancel(
             &session,
             &turn,
+            review_id,
             request,
             retry_reason,
             cancel_token,

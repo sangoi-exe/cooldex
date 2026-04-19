@@ -13,7 +13,6 @@ base64 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 codex-account-state = { workspace = true }
 codex-app-server-protocol = { workspace = true }
-codex-api = { workspace = true }
 codex-client = { workspace = true }
 codex-config = { workspace = true }
 codex-keyring-store = { workspace = true }

@@ -10,14 +10,15 @@ use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
 use crate::tools::handlers::multi_agents::collab_spawn_error;
+use crate::tools::handlers::multi_agents_common::apply_requested_spawn_agent_model_overrides;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_overrides;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_runtime_overrides;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_subagent_overrides;
 use crate::tools::handlers::multi_agents_common::build_agent_spawn_config;
 use crate::tools::handlers::multi_agents_common::finalize_spawn_agent_prompt_config;
 use crate::tools::handlers::multi_agents_common::parse_collab_input;
+use crate::tools::handlers::multi_agents_common::reject_full_fork_spawn_overrides;
 use crate::tools::handlers::multi_agents_common::thread_spawn_source;
-use codex_features::Feature;
 use codex_protocol::AgentPath;
 use codex_protocol::models::DeveloperInstructions;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -71,17 +72,25 @@ impl ToolHandler for Handler {
         }
         let mut config = build_agent_spawn_config(turn.as_ref())?;
         let subagent_file_mutation_mode = config.subagent_file_mutation_mode;
-        apply_requested_spawn_agent_model_overrides(
-            &session,
-            turn.as_ref(),
-            &mut config,
-            args.model.as_deref(),
-            args.reasoning_effort,
-        )
-        .await?;
-        apply_role_to_config(&mut config, role_name)
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
+        if matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)) {
+            reject_full_fork_spawn_overrides(
+                role_name,
+                args.model.as_deref(),
+                args.reasoning_effort,
+            )?;
+        } else {
+            apply_requested_spawn_agent_model_overrides(
+                &session,
+                turn.as_ref(),
+                &mut config,
+                args.model.as_deref(),
+                args.reasoning_effort,
+            )
+            .await?;
+            apply_role_to_config(&mut config, role_name)
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+        }
         apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
         apply_spawn_agent_subagent_overrides(&mut config, subagent_file_mutation_mode)?;
         finalize_spawn_agent_prompt_config(
@@ -237,10 +246,7 @@ impl ToolHandler for Handler {
             )
         })?;
 
-        let hide_agent_metadata = turn
-            .config
-            .features
-            .enabled(Feature::DebugHideSpawnAgentMetadata);
+        let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
         if hide_agent_metadata {
             Ok(SpawnAgentResult::HiddenMetadata { task_name })
         } else {

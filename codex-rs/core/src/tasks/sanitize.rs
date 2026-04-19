@@ -15,9 +15,10 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::client_common::SANITIZE_PROMPT;
-use crate::codex::TurnContext;
-use crate::codex::run_sampling_request;
 use crate::response_item_utils::local_shell_call_output_id;
+use crate::session::session::Session;
+use crate::session::turn::run_sampling_request;
+use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::handlers::ManageContextHandler;
@@ -282,7 +283,7 @@ fn sanitize_allowed_tool_names() -> HashSet<String> {
 }
 
 async fn materialize_sanitize_history_if_changed(
-    sess: &crate::codex::Session,
+    sess: &Session,
     ctx: &TurnContext,
     history_before_sanitize: &[ResponseItem],
     sanitize_generated_non_tool_items: &[ResponseItem],
@@ -343,7 +344,7 @@ async fn materialize_sanitize_history_if_changed(
 }
 
 async fn report_sanitize_materialization_error(
-    sess: &crate::codex::Session,
+    sess: &Session,
     ctx: &TurnContext,
     error: CodexErr,
 ) -> Option<String> {

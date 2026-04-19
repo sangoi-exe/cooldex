@@ -1,17 +1,17 @@
 // Merge-safety anchor: shared collab helpers define the fail-loud operator contract and the
 // single CLI-owned child-spawn config owner reused by legacy collab, MultiAgentV2, and agent jobs.
-
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::config::Config;
 use crate::config::ConfigOverrides;
 use crate::config::deserialize_config_toml_with_base;
 use crate::function_tool::FunctionCallError;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::subagent_file_mutation::apply_file_mutation_mode_to_config;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use codex_config::types::WindowsSandboxModeToml;
+use codex_exec_server::LOCAL_FS;
 use codex_features::Feature;
 use codex_models_manager::manager::ModelsManager;
 use codex_models_manager::manager::RefreshStrategy;
@@ -193,7 +193,7 @@ pub(crate) fn build_agent_resume_config(
 fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
     let mut config = turn.config.as_ref().clone();
     config.model = Some(turn.model_info.slug.clone());
-    config.model_provider = turn.provider.clone();
+    config.model_provider = turn.provider.info().clone();
     // Merge-safety anchor: child spawn config must trust the already-materialized turn context for
     // effective reasoning effort so inherited-vs-explicit ownership stays in `SessionConfiguration`
     // instead of being re-decided here.
@@ -212,7 +212,7 @@ fn apply_child_prompt_overrides(config: &mut Config) {
     // sub-agent recall warning. Re-run this after any role/profile reload that reconstructs
     // `Config` from persisted layers.
     config.pos_compact_instructions =
-        Some(crate::codex::SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY.to_string());
+        Some(crate::session::SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY.to_string());
 }
 
 pub(crate) async fn finalize_spawn_agent_prompt_config(
@@ -257,7 +257,7 @@ pub(crate) async fn finalize_spawn_agent_prompt_config(
     );
 }
 
-pub(crate) fn apply_spawn_agent_profile_override(
+pub(crate) async fn apply_spawn_agent_profile_override(
     config: &mut Config,
     profile_name: Option<&str>,
 ) -> Result<SubagentFileMutationMode, FunctionCallError> {
@@ -296,6 +296,7 @@ pub(crate) fn apply_spawn_agent_profile_override(
     };
 
     let next_config = Config::load_config_with_layer_stack(
+        LOCAL_FS.as_ref(),
         merged_config,
         ConfigOverrides {
             config_profile: Some(profile_name.to_string()),
@@ -310,6 +311,7 @@ pub(crate) fn apply_spawn_agent_profile_override(
         config.codex_home.clone(),
         config.config_layer_stack.clone(),
     )
+    .await
     .map_err(|err| {
         FunctionCallError::RespondToModel(format!(
             "failed to apply profile `{profile_name}`: {err}"
@@ -319,6 +321,19 @@ pub(crate) fn apply_spawn_agent_profile_override(
     *config = next_config;
     config.subagent_file_mutation_mode = effective_subagent_file_mutation_mode;
     Ok(effective_subagent_file_mutation_mode)
+}
+
+pub(crate) fn reject_full_fork_spawn_overrides(
+    agent_type: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Result<(), FunctionCallError> {
+    if agent_type.is_some() || model.is_some() || reasoning_effort.is_some() {
+        return Err(FunctionCallError::RespondToModel(
+            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without fork_context/fork_turns=all.".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Copies runtime-only turn state onto a child config before it is handed to `AgentControl`.

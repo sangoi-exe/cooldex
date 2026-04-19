@@ -42,6 +42,8 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         ],
         agent_type_description: "role help".to_string(),
         hide_agent_type_model_reasoning: false,
+        include_usage_hint: true,
+        usage_hint_text: None,
     });
 
     let ToolSpec::Function(ResponsesApiTool {
@@ -61,6 +63,8 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         .properties
         .as_ref()
         .expect("spawn_agent should use object params");
+    assert!(description.contains("Spawns an agent to work on the specified task."));
+    assert!(description.contains("The spawned agent will have the same tools as you"));
     assert!(description.contains("visible display (`visible-model`)"));
     assert!(!description.contains("hidden display (`hidden-model`)"));
     assert!(properties.contains_key("task_name"));
@@ -88,6 +92,8 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
         available_models: &[],
         agent_type_description: "role help".to_string(),
         hide_agent_type_model_reasoning: false,
+        include_usage_hint: true,
+        usage_hint_text: None,
     });
 
     let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = tool else {
@@ -112,6 +118,7 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
 #[test]
 fn send_message_tool_requires_message_and_has_no_output_schema() {
     let ToolSpec::Function(ResponsesApiTool {
+        description,
         parameters,
         output_schema,
         ..
@@ -132,6 +139,16 @@ fn send_message_tool_requires_message_and_has_no_output_schema() {
     assert!(!properties.contains_key("interrupt"));
     assert!(!properties.contains_key("items"));
     assert_eq!(
+        description,
+        "Send a string message to an existing agent without triggering a new turn."
+    );
+    assert_eq!(
+        properties
+            .get("target")
+            .and_then(|schema| schema.description.as_deref()),
+        Some("Relative or canonical task name to message (from spawn_agent).")
+    );
+    assert_eq!(
         parameters.required.as_ref(),
         Some(&vec!["target".to_string(), "message".to_string()])
     );
@@ -141,6 +158,7 @@ fn send_message_tool_requires_message_and_has_no_output_schema() {
 #[test]
 fn followup_task_tool_requires_message_and_has_no_output_schema() {
     let ToolSpec::Function(ResponsesApiTool {
+        description,
         parameters,
         output_schema,
         ..
@@ -160,6 +178,20 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
     assert!(properties.contains_key("message"));
     assert!(properties.contains_key("interrupt"));
     assert!(!properties.contains_key("items"));
+    assert!(description.contains(
+        "Send a string message to an existing non-root agent and trigger a turn in the target."
+    ));
+    assert!(description.contains(
+        "If interrupt=false and the target's turn has not completed, the message is queued"
+    ));
+    assert_eq!(
+        properties
+            .get("interrupt")
+            .and_then(|schema| schema.description.as_deref()),
+        Some(
+            "When true, stop the agent's current task and handle this immediately. When false (default), queue this message; if the target is already running, it starts the target's next turn after the current turn completes."
+        )
+    );
     assert_eq!(
         parameters.required.as_ref(),
         Some(&vec!["target".to_string(), "message".to_string()])
@@ -221,6 +253,7 @@ fn wait_agent_tool_v1_exposes_ids_conditions_and_agents_output() {
 #[test]
 fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
     let ToolSpec::Function(ResponsesApiTool {
+        description,
         parameters,
         output_schema,
         ..
@@ -242,6 +275,15 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
         .expect("wait_agent should use object params");
     assert!(!properties.contains_key("targets"));
     assert!(properties.contains_key("timeout_ms"));
+    assert!(description.contains(
+        "Does not return the content; returns either a summary of which agents have updates (if any)"
+    ));
+    assert_eq!(
+        properties
+            .get("timeout_ms")
+            .and_then(|schema| schema.description.as_deref()),
+        Some("Optional timeout in milliseconds. Defaults to 30000, min 10000, max 3600000.")
+    );
     assert_eq!(parameters.required.as_ref(), None);
     assert_eq!(
         output_schema.expect("wait output schema")["properties"]["message"]["description"],
@@ -268,6 +310,14 @@ fn list_agents_tool_includes_path_prefix_and_agent_fields() {
         .as_ref()
         .expect("list_agents should use object params");
     assert!(properties.contains_key("path_prefix"));
+    assert_eq!(
+        properties
+            .get("path_prefix")
+            .and_then(|schema| schema.description.as_deref()),
+        Some(
+            "Optional task-path prefix (not ending with trailing slash). Accepts the same relative or absolute task-path syntax."
+        )
+    );
     assert_eq!(
         output_schema.expect("list_agents output schema")["properties"]["agents"]["items"]["required"],
         json!(["agent_name", "agent_status", "last_task_message"])

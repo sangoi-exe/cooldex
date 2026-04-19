@@ -17,8 +17,8 @@ use codex_rmcp_client::ElicitationResponse;
 use rmcp::model::RequestId;
 use tokio::sync::oneshot;
 
-use crate::codex::TurnContext;
 use crate::prompt_gc_sidecar::PromptGcSidecar;
+use crate::session::turn_context::TurnContext;
 use crate::tasks::AnySessionTask;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::ReviewDecision;

@@ -50,6 +50,19 @@ pub struct AuthDotJson {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh: Option<DateTime<Utc>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity: Option<AgentIdentityAuthRecord>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct AgentIdentityAuthRecord {
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chatgpt_user_id: Option<String>,
+    pub agent_runtime_id: String,
+    pub agent_private_key: String,
+    pub registered_at: String,
 }
 
 pub const AUTH_STORE_VERSION: u32 = 1;
@@ -75,6 +88,9 @@ pub struct AuthStore {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_account_id: Option<String>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity: Option<AgentIdentityAuthRecord>,
+
     #[serde(default)]
     pub accounts: Vec<StoredAccount>,
 }
@@ -85,6 +101,7 @@ impl Default for AuthStore {
             version: AUTH_STORE_VERSION,
             openai_api_key: None,
             active_account_id: None,
+            agent_identity: None,
             accounts: Vec::new(),
         }
     }
@@ -159,6 +176,7 @@ impl AuthStore {
             version: AUTH_STORE_VERSION,
             openai_api_key: legacy.openai_api_key,
             active_account_id: None,
+            agent_identity: legacy.agent_identity,
             accounts: Vec::new(),
         };
 

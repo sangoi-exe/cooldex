@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::watch;
 
 use codex_account_state::AccountLeaseConflict;
 use codex_account_state::AccountStateStore;
@@ -29,7 +30,9 @@ use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 
 use super::external_bearer::BearerTokenRefresher;
+use super::revoke::revoke_auth_tokens;
 pub use crate::auth::storage::AccountUsageCache;
+pub use crate::auth::storage::AgentIdentityAuthRecord;
 pub use crate::auth::storage::AuthDotJson;
 use crate::auth::storage::AuthStorageBackend;
 pub use crate::auth::storage::AuthStore;
@@ -75,6 +78,7 @@ pub struct ChatgptAuth {
 #[derive(Debug, Clone)]
 pub struct ChatgptAuthTokens {
     state: ChatgptAuthState,
+    storage: Arc<dyn AuthStorageBackend>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,7 +134,9 @@ pub const EXTERNAL_SUPPORTED_CHATGPT_PLAN_REQUIRED_MESSAGE: &str = "This ChatGPT
 pub const EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE: &str =
     "External ChatGPT auth requires a valid ChatGPT access token JWT.";
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+pub(super) const REVOKE_TOKEN_URL: &str = "https://auth.openai.com/oauth/revoke";
 pub const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
+pub const REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REVOKE_TOKEN_URL_OVERRIDE";
 
 #[derive(Debug, Error)]
 pub enum RefreshTokenError {
@@ -606,7 +612,15 @@ impl CodexAuth {
                 Ok(Self::Chatgpt(ChatgptAuth { state, storage }))
             }
             ApiAuthMode::ChatgptAuthTokens => {
-                Ok(Self::ChatgptAuthTokens(ChatgptAuthTokens { state }))
+                let Some(storage) = storage else {
+                    return Err(std::io::Error::other(
+                        "ChatGPT auth tokens are missing a backing auth store.",
+                    ));
+                };
+                Ok(Self::ChatgptAuthTokens(ChatgptAuthTokens {
+                    state,
+                    storage,
+                }))
             }
             ApiAuthMode::ApiKey => Err(std::io::Error::other(
                 "API key auth cannot be built from a ChatGPT account snapshot.",
@@ -695,6 +709,12 @@ impl CodexAuth {
             .and_then(|active_account| active_account.tokens.account_id.clone())
     }
 
+    /// Returns false if `is_chatgpt_auth()` is false or the token omits the FedRAMP claim.
+    pub fn is_fedramp_account(&self) -> bool {
+        self.get_current_token_data()
+            .is_some_and(|t| t.id_token.is_fedramp_account())
+    }
+
     /// Returns `None` if `is_chatgpt_auth()` is false.
     pub fn get_account_email(&self) -> Option<String> {
         self.current_chatgpt_account_snapshot()
@@ -719,6 +739,7 @@ impl CodexAuth {
             InternalKnownPlan::Go => AccountPlanType::Go,
             InternalKnownPlan::Plus => AccountPlanType::Plus,
             InternalKnownPlan::Pro => AccountPlanType::Pro,
+            InternalKnownPlan::ProLite => AccountPlanType::ProLite,
             InternalKnownPlan::Team => AccountPlanType::Team,
             InternalKnownPlan::SelfServeBusinessUsageBased => {
                 AccountPlanType::SelfServeBusinessUsageBased
@@ -754,9 +775,70 @@ impl CodexAuth {
         Some(&state.active_account)
     }
 
+    fn get_current_auth_json(&self) -> Option<AuthDotJson> {
+        let (active_account, storage) = match self {
+            Self::Chatgpt(auth) => (&auth.state.active_account, &auth.storage),
+            Self::ChatgptAuthTokens(auth) => (&auth.state.active_account, &auth.storage),
+            Self::ApiKey(_) => return None,
+        };
+        let agent_identity = storage
+            .load()
+            .ok()
+            .flatten()
+            .and_then(|store| store.agent_identity);
+        Some(AuthDotJson {
+            auth_mode: Some(active_account.auth_mode),
+            openai_api_key: None,
+            tokens: Some(active_account.tokens.clone()),
+            last_refresh: active_account.last_refresh,
+            agent_identity,
+        })
+    }
+
+    fn get_current_token_data(&self) -> Option<TokenData> {
+        self.current_chatgpt_account_snapshot()
+            .map(|active_account| active_account.tokens.clone())
+    }
+
     pub fn active_chatgpt_account_summary(&self) -> Option<ActiveChatgptAccountSummary> {
         self.current_chatgpt_account_snapshot()
             .map(ActiveChatgptAccountSnapshot::summary)
+    }
+
+    pub fn get_agent_identity(&self, workspace_id: &str) -> Option<AgentIdentityAuthRecord> {
+        self.get_current_auth_json()
+            .and_then(|auth| auth.agent_identity)
+            .filter(|identity| identity.workspace_id == workspace_id)
+    }
+
+    pub fn set_agent_identity(&self, record: AgentIdentityAuthRecord) -> std::io::Result<()> {
+        let storage = match self {
+            Self::Chatgpt(auth) => &auth.storage,
+            Self::ChatgptAuthTokens(auth) => &auth.storage,
+            Self::ApiKey(_) => return Ok(()),
+        };
+        let mut store = storage
+            .load()?
+            .ok_or_else(|| std::io::Error::other("auth data is not available"))?;
+        store.agent_identity = Some(record);
+        storage.save(&store)?;
+        Ok(())
+    }
+
+    pub fn remove_agent_identity(&self) -> std::io::Result<bool> {
+        let storage = match self {
+            Self::Chatgpt(auth) => &auth.storage,
+            Self::ChatgptAuthTokens(auth) => &auth.storage,
+            Self::ApiKey(_) => return Ok(false),
+        };
+        let Some(mut store) = storage.load()? else {
+            return Ok(false);
+        };
+        let removed = store.agent_identity.take().is_some();
+        if removed {
+            storage.save(&store)?;
+        }
+        Ok(removed)
     }
 
     /// Consider this private to integration tests.
@@ -832,6 +914,19 @@ pub fn logout(
     let _lock = storage::lock_auth_store(codex_home)?;
     let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
     storage.delete()
+}
+
+pub async fn logout_with_revoke(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<bool> {
+    AuthManager::new(
+        codex_home.to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        auth_credentials_store_mode,
+    )
+    .logout_with_revoke()
+    .await
 }
 
 /// Writes an `auth.json` that contains only the API key.
@@ -1416,6 +1511,7 @@ impl AuthDotJson {
             openai_api_key: None,
             tokens: Some(tokens),
             last_refresh: Some(Utc::now()),
+            agent_identity: None,
         })
     }
 
@@ -1721,6 +1817,7 @@ pub struct AuthManager {
     _test_home_guard: Option<tempfile::TempDir>,
     refresh_lock: AsyncMutex<()>,
     external_auth: RwLock<Option<Arc<dyn ExternalAuth>>>,
+    auth_state_tx: watch::Sender<()>,
 }
 
 /// Configuration view required to construct a shared [`AuthManager`].
@@ -2006,6 +2103,7 @@ impl AuthManager {
         enable_codex_api_key_env: bool,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
     ) -> Self {
+        let (auth_state_tx, _) = watch::channel(());
         let storage = create_auth_storage(codex_home.clone(), auth_credentials_store_mode);
         let account_state_store = open_account_state_store(sqlite_home.as_path());
         let runtime_session_id = uuid::Uuid::new_v4().to_string();
@@ -2045,6 +2143,7 @@ impl AuthManager {
             _test_home_guard: None,
             refresh_lock: AsyncMutex::new(()),
             external_auth: RwLock::new(None),
+            auth_state_tx,
         }
     }
 
@@ -2055,6 +2154,7 @@ impl AuthManager {
         let storage = create_auth_storage(codex_home.clone(), AuthCredentialsStoreMode::File);
         let account_state_store = open_account_state_store(codex_home.as_path());
         let store = store_from_auth_for_testing(&auth);
+        let (auth_state_tx, _) = watch::channel(());
         let cached = CachedAuth {
             store,
             store_origin: CachedStoreOrigin::Persistent,
@@ -2076,6 +2176,7 @@ impl AuthManager {
             _test_home_guard: Some(temp_dir),
             refresh_lock: AsyncMutex::new(()),
             external_auth: RwLock::new(None),
+            auth_state_tx,
         })
     }
 
@@ -2084,6 +2185,7 @@ impl AuthManager {
         let storage = create_auth_storage(codex_home.clone(), AuthCredentialsStoreMode::File);
         let account_state_store = open_account_state_store(codex_home.as_path());
         let store = store_from_auth_for_testing(&auth);
+        let (auth_state_tx, _) = watch::channel(());
         let cached = CachedAuth {
             store,
             store_origin: CachedStoreOrigin::Persistent,
@@ -2104,12 +2206,14 @@ impl AuthManager {
             _test_home_guard: None,
             refresh_lock: AsyncMutex::new(()),
             external_auth: RwLock::new(None),
+            auth_state_tx,
         })
     }
 
     pub fn external_bearer_only(config: ModelProviderAuthInfo) -> Arc<Self> {
         let codex_home = PathBuf::from("non-existent");
         let storage = create_auth_storage(codex_home.clone(), AuthCredentialsStoreMode::File);
+        let (auth_state_tx, _) = watch::channel(());
         Arc::new(Self {
             codex_home,
             storage,
@@ -2131,6 +2235,7 @@ impl AuthManager {
             external_auth: RwLock::new(Some(
                 Arc::new(BearerTokenRefresher::new(config)) as Arc<dyn ExternalAuth>
             )),
+            auth_state_tx,
         })
     }
 
@@ -3542,18 +3647,23 @@ impl AuthManager {
     pub fn set_external_auth(&self, external_auth: Arc<dyn ExternalAuth>) {
         if let Ok(mut guard) = self.external_auth.write() {
             *guard = Some(external_auth);
+            self.auth_state_tx.send_replace(());
         }
     }
 
     pub fn clear_external_auth(&self) {
         if let Ok(mut guard) = self.external_auth.write() {
             *guard = None;
+            self.auth_state_tx.send_replace(());
         }
     }
 
     pub fn set_forced_chatgpt_workspace_id(&self, workspace_id: Option<String>) {
-        if let Ok(mut guard) = self.forced_chatgpt_workspace_id.write() {
+        if let Ok(mut guard) = self.forced_chatgpt_workspace_id.write()
+            && *guard != workspace_id
+        {
             *guard = workspace_id;
+            self.auth_state_tx.send_replace(());
         }
     }
 
@@ -3601,6 +3711,10 @@ impl AuthManager {
             .read()
             .ok()
             .and_then(|guard| guard.clone())
+    }
+
+    pub fn subscribe_auth_state(&self) -> watch::Receiver<()> {
+        self.auth_state_tx.subscribe()
     }
 
     pub fn has_external_auth(&self) -> bool {
@@ -4019,6 +4133,19 @@ impl AuthManager {
         Ok(removed)
     }
 
+    pub async fn logout_with_revoke(&self) -> std::io::Result<bool> {
+        let auth_dot_json = self
+            .auth_cached()
+            .and_then(|auth| auth.get_current_auth_json());
+        if let Err(err) = revoke_auth_tokens(auth_dot_json.as_ref()).await {
+            tracing::warn!("failed to revoke auth tokens during logout: {err}");
+        }
+        let result = logout_all_stores(&self.codex_home, self.auth_credentials_store_mode)?;
+        // Always reload to clear any cached auth (even if file absent).
+        self.reload();
+        Ok(result)
+    }
+
     pub fn get_api_auth_mode(&self) -> Option<ApiAuthMode> {
         if self.has_external_api_key_auth() {
             return Some(ApiAuthMode::ApiKey);
@@ -4142,7 +4269,7 @@ impl AuthManager {
                 ),
             )));
         }
-        let auth_dot_json =
+        let mut auth_dot_json =
             AuthDotJson::from_external_tokens(&refreshed, forced_chatgpt_workspace_id.as_deref())
                 .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::InvalidData {
@@ -4154,6 +4281,12 @@ impl AuthManager {
                     RefreshTokenError::Transient(error)
                 }
             })?;
+        if let Some(previous_auth) = self
+            .auth_cached()
+            .and_then(|auth| auth.get_current_auth_json())
+        {
+            auth_dot_json.agent_identity = previous_auth.agent_identity;
+        }
         let refreshed_store_account_id = auth_dot_json
             .tokens
             .as_ref()

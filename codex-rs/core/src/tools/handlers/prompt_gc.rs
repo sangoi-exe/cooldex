@@ -1,5 +1,3 @@
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::context_manager::ContextManager;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
 use crate::prompt_gc_rollout::surviving_legacy_prompt_gc_marker_indices;
@@ -10,6 +8,8 @@ use crate::prompt_gc_sidecar::PromptGcCapturedUnit;
 use crate::prompt_gc_sidecar::PromptGcCheckpoint;
 use crate::prompt_gc_sidecar::PromptGcUnitKind;
 use crate::prompt_gc_sidecar::PromptGcUnitResolver;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::REASONING_CONTEXT_CLOSE_TAG;
 use codex_protocol::protocol::REASONING_CONTEXT_OPEN_TAG;
@@ -238,7 +238,7 @@ fn projected_prompt_cost(
 async fn ensure_rollout_compatible_for_prompt_gc(
     session: &Session,
 ) -> Result<(), crate::function_tool::FunctionCallError> {
-    session.flush_rollout().await;
+    let _ = session.flush_rollout().await;
     let Some(rollout_path) = session.current_rollout_path().await else {
         return Err(contract_error(
             StopReason::MissingRolloutRecorder,

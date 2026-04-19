@@ -9,13 +9,14 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use crate::codex::PreviousTurnSettings;
-use crate::codex::SessionConfiguration;
+use crate::agent_identity::RegisteredAgentTask;
 use crate::context_manager::ContextManager;
 use crate::contextual_user_message::is_prompt_gc_contextual_fragment;
 use crate::response_item_utils::is_unified_exec_output_frame;
 use crate::response_item_utils::is_unified_exec_token_qty_marker_line;
 use crate::rid::rid_to_string;
+use crate::session::PreviousTurnSettings;
+use crate::session::session::SessionConfiguration;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::state::ContextItemSummary;
 use crate::state::ContextItemsEvent;
@@ -55,9 +56,11 @@ pub(crate) struct SessionState {
     previous_turn_settings: Option<PreviousTurnSettings>,
     /// Startup prewarmed session prepared during session initialization.
     pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
+    pub(crate) agent_task: Option<RegisteredAgentTask>,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_source: Option<codex_hooks::SessionStartSource>,
     granted_permissions: Option<PermissionProfile>,
+    next_turn_is_first: bool,
 }
 
 #[derive(Clone)]
@@ -85,9 +88,11 @@ impl SessionState {
             mcp_dependency_prompted: HashSet::new(),
             previous_turn_settings: None,
             startup_prewarm: None,
+            agent_task: None,
             active_connector_selection: HashSet::new(),
             pending_session_start_source: None,
             granted_permissions: None,
+            next_turn_is_first: true,
         }
     }
 
@@ -160,6 +165,16 @@ impl SessionState {
         previous_turn_settings: Option<PreviousTurnSettings>,
     ) {
         self.previous_turn_settings = previous_turn_settings;
+    }
+
+    pub(crate) fn set_next_turn_is_first(&mut self, value: bool) {
+        self.next_turn_is_first = value;
+    }
+
+    pub(crate) fn take_next_turn_is_first(&mut self) -> bool {
+        let is_first_turn = self.next_turn_is_first;
+        self.next_turn_is_first = false;
+        is_first_turn
     }
 
     pub(crate) fn clone_history(&self) -> ContextManager {
@@ -453,6 +468,18 @@ impl SessionState {
 
     pub(crate) fn take_session_startup_prewarm(&mut self) -> Option<SessionStartupPrewarmHandle> {
         self.startup_prewarm.take()
+    }
+
+    pub(crate) fn agent_task(&self) -> Option<RegisteredAgentTask> {
+        self.agent_task.clone()
+    }
+
+    pub(crate) fn set_agent_task(&mut self, agent_task: RegisteredAgentTask) {
+        self.agent_task = Some(agent_task);
+    }
+
+    pub(crate) fn clear_agent_task(&mut self) {
+        self.agent_task = None;
     }
 
     // Adds connector IDs to the active set and returns the merged selection.
@@ -784,7 +811,7 @@ fn merge_rate_limit_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex::make_session_configuration_for_tests;
+    use crate::session::tests::make_session_configuration_for_tests;
     use codex_protocol::protocol::CreditsSnapshot;
     use codex_protocol::protocol::RateLimitWindow;
     use codex_protocol::protocol::TOOL_CONTEXT_CLOSE_TAG;

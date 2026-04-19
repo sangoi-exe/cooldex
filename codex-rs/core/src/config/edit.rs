@@ -21,6 +21,9 @@ use toml_edit::value;
 
 const NOTICE_TABLE_KEY: &str = "notice";
 
+// Merge-safety anchor: config persistence must stay aligned with the accepted
+// config-key canon and notice owners; removed prompts cannot linger here as
+// writable aliases after the runtime owner moves on.
 /// Discrete config mutations supported by the persistence engine.
 #[derive(Clone, Debug)]
 pub enum ConfigEdit {
@@ -41,6 +44,16 @@ pub enum ConfigEdit {
     SetNoticeHideRateLimitModelNudge(bool),
     /// Toggle the Windows onboarding acknowledgement flag.
     SetWindowsWslSetupAcknowledged(bool),
+    /// Toggle the model migration prompt acknowledgement flag.
+    SetNoticeHideModelMigrationPrompt(String, bool),
+    /// Toggle the home external config migration prompt acknowledgement flag.
+    SetNoticeHideExternalConfigMigrationPromptHome(bool),
+    /// Record when the home external config migration prompt was last shown.
+    SetNoticeExternalConfigMigrationPromptHomeLastPromptedAt(i64),
+    /// Toggle the project external config migration prompt acknowledgement flag.
+    SetNoticeHideExternalConfigMigrationPromptProject(String, bool),
+    /// Record when the project external config migration prompt was last shown.
+    SetNoticeExternalConfigMigrationPromptProjectLastPromptedAt(String, i64),
     /// Record that a migration prompt was shown for an old->new model mapping.
     RecordModelMigrationSeen { from: String, to: String },
     /// Replace the entire `[mcp_servers]` table.
@@ -220,14 +233,27 @@ mod document_helpers {
         if !config.enabled {
             entry["enabled"] = value(false);
         }
+        if let Some(environment) = &config.experimental_environment {
+            entry["experimental_environment"] = value(environment.clone());
+        }
         if config.required {
             entry["required"] = value(true);
+        }
+        if config.supports_parallel_tool_calls {
+            entry["supports_parallel_tool_calls"] = value(true);
         }
         if let Some(timeout) = config.startup_timeout_sec {
             entry["startup_timeout_sec"] = value(timeout.as_secs_f64());
         }
         if let Some(timeout) = config.tool_timeout_sec {
             entry["tool_timeout_sec"] = value(timeout.as_secs_f64());
+        }
+        if let Some(approval_mode) = config.default_tools_approval_mode {
+            entry["default_tools_approval_mode"] = value(match approval_mode {
+                AppToolApproval::Auto => "auto",
+                AppToolApproval::Prompt => "prompt",
+                AppToolApproval::Approve => "approve",
+            });
         }
         if let Some(enabled_tools) = &config.enabled_tools
             && !enabled_tools.is_empty()
@@ -398,6 +424,60 @@ impl ConfigDocument {
                 Scope::Global,
                 &[NOTICE_TABLE_KEY, "hide_rate_limit_model_nudge"],
                 value(*acknowledged),
+            )),
+            ConfigEdit::SetNoticeHideModelMigrationPrompt(migration_config, acknowledged) => {
+                Ok(self.write_value(
+                    Scope::Global,
+                    &[NOTICE_TABLE_KEY, migration_config.as_str()],
+                    value(*acknowledged),
+                ))
+            }
+            ConfigEdit::SetNoticeHideExternalConfigMigrationPromptHome(acknowledged) => Ok(self
+                .write_value(
+                    Scope::Global,
+                    &[
+                        NOTICE_TABLE_KEY,
+                        "external_config_migration_prompts",
+                        "home",
+                    ],
+                    value(*acknowledged),
+                )),
+            ConfigEdit::SetNoticeExternalConfigMigrationPromptHomeLastPromptedAt(timestamp) => {
+                Ok(self.write_value(
+                    Scope::Global,
+                    &[
+                        NOTICE_TABLE_KEY,
+                        "external_config_migration_prompts",
+                        "home_last_prompted_at",
+                    ],
+                    value(*timestamp),
+                ))
+            }
+            ConfigEdit::SetNoticeHideExternalConfigMigrationPromptProject(
+                project,
+                acknowledged,
+            ) => Ok(self.write_value(
+                Scope::Global,
+                &[
+                    NOTICE_TABLE_KEY,
+                    "external_config_migration_prompts",
+                    "projects",
+                    project.as_str(),
+                ],
+                value(*acknowledged),
+            )),
+            ConfigEdit::SetNoticeExternalConfigMigrationPromptProjectLastPromptedAt(
+                project,
+                timestamp,
+            ) => Ok(self.write_value(
+                Scope::Global,
+                &[
+                    NOTICE_TABLE_KEY,
+                    "external_config_migration_prompts",
+                    "project_last_prompted_at",
+                    project.as_str(),
+                ],
+                value(*timestamp),
             )),
             ConfigEdit::RecordModelMigrationSeen { from, to } => Ok(self.write_value(
                 Scope::Global,
@@ -907,6 +987,37 @@ impl ConfigEditsBuilder {
         self
     }
 
+    pub fn set_hide_model_migration_prompt(mut self, model: &str, acknowledged: bool) -> Self {
+        self.edits
+            .push(ConfigEdit::SetNoticeHideModelMigrationPrompt(
+                model.to_string(),
+                acknowledged,
+            ));
+        self
+    }
+
+    pub fn set_hide_external_config_migration_prompt_home(mut self, acknowledged: bool) -> Self {
+        self.edits
+            .push(ConfigEdit::SetNoticeHideExternalConfigMigrationPromptHome(
+                acknowledged,
+            ));
+        self
+    }
+
+    pub fn set_hide_external_config_migration_prompt_project(
+        mut self,
+        project: &str,
+        acknowledged: bool,
+    ) -> Self {
+        self.edits.push(
+            ConfigEdit::SetNoticeHideExternalConfigMigrationPromptProject(
+                project.to_string(),
+                acknowledged,
+            ),
+        );
+        self
+    }
+
     pub fn record_model_migration_seen(mut self, from: &str, to: &str) -> Self {
         self.edits.push(ConfigEdit::RecordModelMigrationSeen {
             from: from.to_string(),
@@ -1014,6 +1125,18 @@ impl ConfigEditsBuilder {
             Some(speaker) => self.edits.push(ConfigEdit::SetPath {
                 segments,
                 value: value(speaker),
+            }),
+            None => self.edits.push(ConfigEdit::ClearPath { segments }),
+        }
+        self
+    }
+
+    pub fn set_realtime_voice(mut self, voice: Option<&str>) -> Self {
+        let segments = vec!["realtime".to_string(), "voice".to_string()];
+        match voice {
+            Some(voice) => self.edits.push(ConfigEdit::SetPath {
+                segments,
+                value: value(voice),
             }),
             None => self.edits.push(ConfigEdit::ClearPath { segments }),
         }

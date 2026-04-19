@@ -10,7 +10,6 @@
 use crate::exec::ExecCapturePolicy;
 use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::review_approval_request;
-use crate::guardian::routes_approval_to_guardian;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::execute_env;
 use crate::tools::sandboxing::Approvable;
@@ -25,13 +24,16 @@ use crate::tools::sandboxing::with_cached_approval;
 use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
 use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::FileSystemSandboxContext;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxCommand;
+use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::BoxFuture;
@@ -47,7 +49,6 @@ pub struct ApplyPatchRequest {
     pub exec_approval_requirement: ExecApprovalRequirement,
     pub additional_permissions: Option<PermissionProfile>,
     pub permissions_preapproved: bool,
-    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Default)]
@@ -64,7 +65,7 @@ impl ApplyPatchRuntime {
     ) -> GuardianApprovalRequest {
         GuardianApprovalRequest::ApplyPatch {
             id: call_id.to_string(),
-            cwd: req.action.cwd.to_path_buf(),
+            cwd: req.action.cwd.clone(),
             files: req.file_paths.clone(),
             patch: req.action.patch.clone(),
         }
@@ -97,7 +98,7 @@ impl ApplyPatchRuntime {
         }
 
         std::env::current_exe()
-            .map_err(|e| ToolError::Rejected(format!("failed to determine codex exe: {e}")))
+            .map_err(|error| ToolError::Rejected(format!("failed to determine codex exe: {error}")))
     }
 
     fn build_sandbox_command_with_program(req: &ApplyPatchRequest, exe: PathBuf) -> SandboxCommand {
@@ -107,8 +108,7 @@ impl ApplyPatchRuntime {
                 CODEX_CORE_APPLY_PATCH_ARG1.to_string(),
                 req.action.patch.clone(),
             ],
-            cwd: req.action.cwd.to_path_buf(),
-            // Run apply_patch with a minimal environment for determinism and to avoid leaks.
+            cwd: req.action.cwd.clone(),
             env: HashMap::new(),
             additional_permissions: req.additional_permissions.clone(),
         }
@@ -122,9 +122,37 @@ impl ApplyPatchRuntime {
         })
     }
 
+    fn file_system_sandbox_context_for_attempt(
+        req: &ApplyPatchRequest,
+        attempt: &SandboxAttempt<'_>,
+    ) -> Option<FileSystemSandboxContext> {
+        if attempt.sandbox == SandboxType::None {
+            return None;
+        }
+
+        let legacy_file_system_sandbox_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy(
+            attempt.policy,
+            attempt.sandbox_cwd,
+        );
+        let file_system_sandbox_policy = (attempt.file_system_policy
+            != &legacy_file_system_sandbox_policy)
+            .then(|| attempt.file_system_policy.clone());
+
+        Some(FileSystemSandboxContext {
+            sandbox_policy: attempt.policy.clone(),
+            sandbox_policy_cwd: Some(attempt.sandbox_cwd.clone()),
+            file_system_sandbox_policy,
+            windows_sandbox_level: attempt.windows_sandbox_level,
+            windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
+            use_legacy_landlock: attempt.use_legacy_landlock,
+            additional_permissions: req.additional_permissions.clone(),
+        })
+    }
+
     async fn run_with_executor_filesystem(
         req: &ApplyPatchRequest,
         fs: &dyn ExecutorFileSystem,
+        sandbox: Option<&FileSystemSandboxContext>,
     ) -> ExecToolCallOutput {
         let started_at = Instant::now();
         let mut stdout = Vec::new();
@@ -135,6 +163,7 @@ impl ApplyPatchRuntime {
             &mut stdout,
             &mut stderr,
             fs,
+            sandbox,
         )
         .await;
         let stdout = String::from_utf8_lossy(&stdout).into_owned();
@@ -178,13 +207,15 @@ impl Approvable<ApplyPatchRequest> for ApplyPatchRuntime {
         let retry_reason = ctx.retry_reason.clone();
         let approval_keys = self.approval_keys(req);
         let changes = req.changes.clone();
+        let guardian_review_id = ctx.guardian_review_id.clone();
         Box::pin(async move {
             if req.permissions_preapproved && retry_reason.is_none() {
                 return ReviewDecision::Approved;
             }
-            if routes_approval_to_guardian(turn) {
+            if let Some(review_id) = guardian_review_id {
                 let action = ApplyPatchRuntime::build_guardian_review_request(req, ctx.call_id);
-                return review_approval_request(session, turn, action, retry_reason).await;
+                return review_approval_request(session, turn, review_id, action, retry_reason)
+                    .await;
             }
             if let Some(reason) = retry_reason {
                 let rx_approve = session
@@ -245,9 +276,15 @@ impl ToolRuntime<ApplyPatchRequest, ExecToolCallOutput> for ApplyPatchRuntime {
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ExecToolCallOutput, ToolError> {
-        if let Some(environment) = ctx.turn.environment.as_ref().filter(|env| env.is_remote()) {
+        let environment = ctx.turn.environment.as_ref().ok_or_else(|| {
+            ToolError::Rejected("apply_patch is unavailable in this session".to_string())
+        })?;
+        if environment.is_remote() {
             let fs = environment.get_filesystem();
-            return Ok(Self::run_with_executor_filesystem(req, fs.as_ref()).await);
+            let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
+            return Ok(
+                Self::run_with_executor_filesystem(req, fs.as_ref(), sandbox.as_ref()).await,
+            );
         }
 
         #[cfg(target_os = "windows")]
@@ -255,7 +292,7 @@ impl ToolRuntime<ApplyPatchRequest, ExecToolCallOutput> for ApplyPatchRuntime {
         #[cfg(not(target_os = "windows"))]
         let command = Self::build_sandbox_command(req, ctx.turn.codex_self_exe.as_ref())?;
         let options = ExecOptions {
-            expiration: req.timeout_ms.into(),
+            expiration: None.into(),
             capture_policy: ExecCapturePolicy::ShellTool,
         };
         let env = attempt

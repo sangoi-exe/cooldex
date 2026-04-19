@@ -1,7 +1,5 @@
 use std::collections::HashSet;
 
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
 use crate::prompt_gc_rollout::compaction_replacement_history_is_hydratable;
 use crate::prompt_gc_rollout::discarded_rollout_indices_for_rolled_back_turns;
@@ -9,6 +7,8 @@ use crate::prompt_gc_rollout::is_legacy_prompt_gc_compaction_marker;
 use crate::prompt_gc_rollout::is_private_prompt_gc_compaction_marker;
 use crate::prompt_gc_rollout::is_prompt_gc_compaction;
 use crate::rollout::RolloutRecorder;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;

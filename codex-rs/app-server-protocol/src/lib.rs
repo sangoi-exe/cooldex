@@ -6,8 +6,6 @@ mod schema_fixtures;
 
 // Merge-safety anchor: lib-level reexports must keep config keyPath helpers
 // available to both app-server callers and config-service owners.
-
-pub use codex_git_utils::GitSha;
 pub use experimental_api::*;
 pub use export::GenerateTsOptions;
 pub use export::generate_internal_json_schema;
@@ -34,6 +32,7 @@ pub use protocol::v1::GetConversationSummaryParams;
 pub use protocol::v1::GetConversationSummaryResponse;
 pub use protocol::v1::GitDiffToRemoteParams;
 pub use protocol::v1::GitDiffToRemoteResponse;
+pub use protocol::v1::GitSha;
 pub use protocol::v1::InitializeCapabilities;
 pub use protocol::v1::InitializeParams;
 pub use protocol::v1::InitializeResponse;

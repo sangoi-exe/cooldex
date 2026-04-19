@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use codex_app_server_protocol::CollabAgentState as ApiCollabAgentState;
 use codex_app_server_protocol::CollabAgentStatus as ApiCollabAgentStatus;
 use codex_app_server_protocol::CollabAgentTool;
@@ -39,6 +37,8 @@ use codex_protocol::protocol::CollabWaitReturnWhen;
 use codex_protocol::protocol::CollabWaitState;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
+use codex_utils_absolute_path::test_support::PathBufExt;
+use codex_utils_absolute_path::test_support::test_path_buf;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -120,7 +120,7 @@ fn session_configured_produces_thread_started_event() {
         approval_policy: AskForApproval::Never,
         approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        cwd: PathBuf::from("/tmp/project"),
+        cwd: test_path_buf("/tmp/project").abs(),
         reasoning_effort: None,
         history_log_id: 0,
         history_entry_count: 0,
@@ -170,7 +170,7 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
     let command_item = ThreadItem::CommandExecution {
         id: "cmd-1".to_string(),
         command: "ls".to_string(),
-        cwd: PathBuf::from("/tmp/project"),
+        cwd: test_path_buf("/tmp/project").abs(),
         process_id: Some("123".to_string()),
         source: CommandExecutionSource::UserShell,
         status: ApiCommandExecutionStatus::InProgress,
@@ -209,7 +209,7 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
             item: ThreadItem::CommandExecution {
                 id: "cmd-1".to_string(),
                 command: "ls".to_string(),
-                cwd: PathBuf::from("/tmp/project"),
+                cwd: test_path_buf("/tmp/project").abs(),
                 process_id: Some("123".to_string()),
                 source: CommandExecutionSource::UserShell,
                 status: ApiCommandExecutionStatus::Completed,
@@ -469,6 +469,7 @@ fn mcp_tool_call_begin_and_end_emit_item_events() {
                 tool: "tool_x".to_string(),
                 status: ApiMcpToolCallStatus::InProgress,
                 arguments: json!({ "key": "value" }),
+                mcp_app_resource_uri: None,
                 result: None,
                 error: None,
                 duration_ms: None,
@@ -484,11 +485,12 @@ fn mcp_tool_call_begin_and_end_emit_item_events() {
                 tool: "tool_x".to_string(),
                 status: ApiMcpToolCallStatus::Completed,
                 arguments: json!({ "key": "value" }),
-                result: Some(McpToolCallResult {
+                mcp_app_resource_uri: None,
+                result: Some(Box::new(McpToolCallResult {
                     content: Vec::new(),
                     structured_content: None,
                     meta: None,
-                }),
+                })),
                 error: None,
                 duration_ms: Some(1_000),
             },
@@ -552,6 +554,7 @@ fn mcp_tool_call_failure_sets_failed_status() {
                 tool: "tool_y".to_string(),
                 status: ApiMcpToolCallStatus::Failed,
                 arguments: json!({ "param": 42 }),
+                mcp_app_resource_uri: None,
                 result: None,
                 error: Some(McpToolCallError {
                     message: "tool exploded".to_string(),
@@ -598,6 +601,7 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
                 tool: "tool_z".to_string(),
                 status: ApiMcpToolCallStatus::InProgress,
                 arguments: serde_json::Value::Null,
+                mcp_app_resource_uri: None,
                 result: None,
                 error: None,
                 duration_ms: None,
@@ -613,14 +617,15 @@ fn mcp_tool_call_defaults_arguments_and_preserves_structured_content() {
                 tool: "tool_z".to_string(),
                 status: ApiMcpToolCallStatus::Completed,
                 arguments: serde_json::Value::Null,
-                result: Some(McpToolCallResult {
+                mcp_app_resource_uri: None,
+                result: Some(Box::new(McpToolCallResult {
                     content: vec![json!({
                         "type": "text",
                         "text": "done",
                     })],
                     structured_content: Some(json!({ "status": "ok" })),
                     meta: None,
-                }),
+                })),
                 error: None,
                 duration_ms: Some(10),
             },
@@ -1464,7 +1469,7 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
             item: ThreadItem::CommandExecution {
                 id: "cmd-1".to_string(),
                 command: "ls".to_string(),
-                cwd: PathBuf::from("/tmp/project"),
+                cwd: test_path_buf("/tmp/project").abs(),
                 process_id: Some("123".to_string()),
                 source: CommandExecutionSource::UserShell,
                 status: ApiCommandExecutionStatus::InProgress,
@@ -1502,7 +1507,7 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                 items: vec![ThreadItem::CommandExecution {
                     id: "cmd-1".to_string(),
                     command: "ls".to_string(),
-                    cwd: PathBuf::from("/tmp/project"),
+                    cwd: test_path_buf("/tmp/project").abs(),
                     process_id: Some("123".to_string()),
                     source: CommandExecutionSource::UserShell,
                     status: ApiCommandExecutionStatus::Completed,

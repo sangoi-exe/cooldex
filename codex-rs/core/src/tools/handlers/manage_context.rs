@@ -1,8 +1,8 @@
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
 use crate::response_item_utils::local_shell_call_output_id;
 use crate::rid::parse_rid;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::state::ContextItemsEvent;
 use crate::state::ContextOverlay;
 use crate::state::PruneCategory;

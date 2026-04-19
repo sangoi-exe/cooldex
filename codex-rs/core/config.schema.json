@@ -36,10 +36,6 @@
         "$ref": "#/definitions/AgentRoleToml"
       },
       "properties": {
-        "allow_running_subagent_preemption": {
-          "description": "Whether collab tools may interrupt or close active sub-agents. Defaults to `true`.",
-          "type": "boolean"
-        },
         "job_max_runtime_seconds": {
           "description": "Default maximum runtime in seconds for agent job workers.",
           "format": "uint64",
@@ -339,6 +335,9 @@
             "apply_patch_freeform": {
               "type": "boolean"
             },
+            "apply_patch_streaming_events": {
+              "type": "boolean"
+            },
             "apps": {
               "type": "boolean"
             },
@@ -357,10 +356,13 @@
             "codex_hooks": {
               "type": "boolean"
             },
-            "connectors": {
+            "collab": {
               "type": "boolean"
             },
-            "debug_hide_spawn_agent_metadata": {
+            "collaboration_modes": {
+              "type": "boolean"
+            },
+            "connectors": {
               "type": "boolean"
             },
             "default_mode_request_user_input": {
@@ -388,6 +390,9 @@
               "type": "boolean"
             },
             "experimental_windows_sandbox": {
+              "type": "boolean"
+            },
+            "external_migration": {
               "type": "boolean"
             },
             "fast_mode": {
@@ -424,7 +429,7 @@
               "type": "boolean"
             },
             "multi_agent_v2": {
-              "type": "boolean"
+              "$ref": "#/definitions/FeatureToml_for_MultiAgentV2ConfigToml"
             },
             "personality": {
               "type": "boolean"
@@ -486,10 +491,16 @@
             "steer": {
               "type": "boolean"
             },
+            "telepathy": {
+              "type": "boolean"
+            },
             "tool_call_mcp_elicitation": {
               "type": "boolean"
             },
             "tool_search": {
+              "type": "boolean"
+            },
+            "tool_search_always_defer_mcp_tools": {
               "type": "boolean"
             },
             "tool_suggest": {
@@ -498,10 +509,16 @@
             "tui_app_server": {
               "type": "boolean"
             },
+            "unavailable_dummy_tools": {
+              "type": "boolean"
+            },
             "undo": {
               "type": "boolean"
             },
             "unified_exec": {
+              "type": "boolean"
+            },
+            "use_agent_identity": {
               "type": "boolean"
             },
             "use_legacy_landlock": {
@@ -517,6 +534,9 @@
               "type": "boolean"
             },
             "web_search_request": {
+              "type": "boolean"
+            },
+            "workspace_dependencies": {
               "type": "boolean"
             }
           },
@@ -591,22 +611,6 @@
         "service_tier": {
           "$ref": "#/definitions/ServiceTier"
         },
-        "subagent": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/SubagentProfileConfig"
-            }
-          ],
-          "default": null
-        },
-        "subagent_instructions_file": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/AbsolutePathBuf"
-            }
-          ],
-          "description": "Optional path to a file containing sub-agent model instructions."
-        },
         "tools": {
           "$ref": "#/definitions/ToolsToml"
         },
@@ -634,6 +638,49 @@
         }
       },
       "type": "object"
+    },
+    "ExternalConfigMigrationPrompts": {
+      "additionalProperties": false,
+      "description": "Settings for notices we display to users via the tui and app-server clients (primarily the Codex IDE extension). NOTE: these are different from notifications - notices are warnings, NUX screens, acknowledgements, etc.",
+      "properties": {
+        "home": {
+          "description": "Tracks whether home-level external config migration prompts are hidden.",
+          "type": "boolean"
+        },
+        "home_last_prompted_at": {
+          "description": "Tracks the last time the home-level external config migration prompt was shown.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "project_last_prompted_at": {
+          "additionalProperties": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "default": {},
+          "description": "Tracks the last time a project-level external config migration prompt was shown.",
+          "type": "object"
+        },
+        "projects": {
+          "additionalProperties": {
+            "type": "boolean"
+          },
+          "default": {},
+          "description": "Tracks which project paths have opted out of external config migration prompts.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "FeatureToml_for_MultiAgentV2ConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/MultiAgentV2ConfigToml"
+        }
+      ]
     },
     "FeedbackConfigToml": {
       "additionalProperties": false,
@@ -668,6 +715,14 @@
       ]
     },
     "FilesystemPermissionsToml": {
+      "properties": {
+        "glob_scan_max_depth": {
+          "description": "Optional maximum depth for expanding unreadable glob patterns on platforms that snapshot glob matches before sandbox startup.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
       "type": "object"
     },
     "ForcedLoginMethod": {
@@ -771,39 +826,55 @@
         }
       ]
     },
-    "ManageContextPolicyToml": {
+    "MarketplaceConfig": {
       "additionalProperties": false,
       "properties": {
-        "fixed_point_k": {
-          "description": "Number of successive retrieve/apply cycles to use for fixed-point checks.",
-          "format": "uint",
-          "minimum": 1.0,
-          "type": "integer"
-        },
-        "max_chunks_per_apply": {
-          "description": "Maximum chunk count allowed in a single `manage_context.apply`.",
-          "format": "uint",
-          "minimum": 1.0,
-          "type": "integer"
-        },
-        "quality_rubric_id": {
-          "description": "Identifier for the quality rubric used by manage_context orchestration.",
+        "last_revision": {
+          "default": null,
+          "description": "Git revision Codex last successfully activated for this marketplace.",
           "type": "string"
         },
-        "stalled_signature_threshold": {
-          "description": "Repeated stalled-signature count needed before declaring stagnation.",
-          "format": "uint",
-          "minimum": 1.0,
-          "type": "integer"
+        "last_updated": {
+          "default": null,
+          "description": "Last time Codex successfully added or refreshed this marketplace.",
+          "type": "string"
+        },
+        "ref": {
+          "default": null,
+          "description": "Git ref to check out when `source_type` is `git`.",
+          "type": "string"
+        },
+        "source": {
+          "default": null,
+          "description": "Source location used when the marketplace was added.",
+          "type": "string"
+        },
+        "source_type": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/MarketplaceSourceType"
+            }
+          ],
+          "default": null,
+          "description": "Source kind used to install this marketplace."
+        },
+        "sparse_paths": {
+          "default": null,
+          "description": "Sparse checkout paths used when `source_type` is `git`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
-      "required": [
-        "fixed_point_k",
-        "max_chunks_per_apply",
-        "quality_rubric_id",
-        "stalled_signature_threshold"
-      ],
       "type": "object"
+    },
+    "MarketplaceSourceType": {
+      "enum": [
+        "git",
+        "local"
+      ],
+      "type": "string"
     },
     "McpServerToolConfig": {
       "additionalProperties": false,
@@ -828,6 +899,10 @@
           "description": "Model used for memory consolidation.",
           "type": "string"
         },
+        "disable_on_external_context": {
+          "description": "When `true`, external context sources mark the thread `memory_mode` as `\"polluted\"`.",
+          "type": "boolean"
+        },
         "extract_model": {
           "description": "Model used for thread summarisation.",
           "type": "string"
@@ -839,7 +914,8 @@
         "max_raw_memories_for_consolidation": {
           "description": "Maximum number of recent raw memories retained for global consolidation.",
           "format": "uint",
-          "minimum": 0.0,
+          "maximum": 4096.0,
+          "minimum": 1.0,
           "type": "integer"
         },
         "max_rollout_age_days": {
@@ -850,7 +926,8 @@
         "max_rollouts_per_startup": {
           "description": "Maximum number of rollout candidates processed per pass.",
           "format": "uint",
-          "minimum": 0.0,
+          "maximum": 128.0,
+          "minimum": 1.0,
           "type": "integer"
         },
         "max_unused_days": {
@@ -862,10 +939,6 @@
           "description": "Minimum idle time between last thread activity and memory creation (hours). > 12h recommended.",
           "format": "int64",
           "type": "integer"
-        },
-        "no_memories_if_mcp_or_web_search": {
-          "description": "When `true`, web searches and MCP tool calls mark the thread `memory_mode` as `\"polluted\"`.",
-          "type": "boolean"
         },
         "use_memories": {
           "description": "When `false`, skip injecting memory usage instructions into developer prompts.",
@@ -1028,6 +1101,24 @@
       ],
       "type": "object"
     },
+    "MultiAgentV2ConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "hide_spawn_agent_metadata": {
+          "type": "boolean"
+        },
+        "usage_hint_enabled": {
+          "type": "boolean"
+        },
+        "usage_hint_text": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "NetworkDomainPermissionToml": {
       "enum": [
         "allow",
@@ -1098,10 +1189,32 @@
       "type": "object"
     },
     "Notice": {
-      "description": "Settings for notices we display to users via the tui and app-server clients (primarily the Codex IDE extension). NOTE: these are different from notifications - notices are warnings, NUX screens, acknowledgements, etc.",
+      "additionalProperties": false,
       "properties": {
+        "external_config_migration_prompts": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExternalConfigMigrationPrompts"
+            }
+          ],
+          "default": {
+            "home": null,
+            "home_last_prompted_at": null,
+            "project_last_prompted_at": {},
+            "projects": {}
+          },
+          "description": "Tracks scopes where external config migration prompts should be suppressed."
+        },
         "hide_full_access_warning": {
           "description": "Tracks whether the user has acknowledged the full access warning prompt.",
+          "type": "boolean"
+        },
+        "hide_gpt-5.1-codex-max_migration_prompt": {
+          "description": "Tracks whether the user has seen the gpt-5.1-codex-max migration prompt",
+          "type": "boolean"
+        },
+        "hide_gpt5_1_migration_prompt": {
+          "description": "Tracks whether the user has seen the model migration prompt",
           "type": "boolean"
         },
         "hide_rate_limit_model_nudge": {
@@ -1122,6 +1235,24 @@
         }
       },
       "type": "object"
+    },
+    "NotificationCondition": {
+      "oneOf": [
+        {
+          "description": "Emit TUI notifications only while the terminal is unfocused.",
+          "enum": [
+            "unfocused"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Emit TUI notifications regardless of terminal focus.",
+          "enum": [
+            "always"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "NotificationMethod": {
       "enum": [
@@ -1396,6 +1527,14 @@
           "default": null,
           "type": "string"
         },
+        "default_tools_approval_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AppToolApproval"
+            }
+          ],
+          "default": null
+        },
         "disabled_tools": {
           "default": null,
           "items": {
@@ -1435,6 +1574,10 @@
           },
           "type": "array"
         },
+        "experimental_environment": {
+          "default": null,
+          "type": "string"
+        },
         "http_headers": {
           "additionalProperties": {
             "type": "string"
@@ -1471,6 +1614,10 @@
           "default": null,
           "format": "double",
           "type": "number"
+        },
+        "supports_parallel_tool_calls": {
+          "default": null,
+          "type": "boolean"
         },
         "tool_timeout_sec": {
           "default": null,
@@ -1512,14 +1659,51 @@
     "RealtimeToml": {
       "additionalProperties": false,
       "properties": {
+        "transport": {
+          "$ref": "#/definitions/RealtimeTransport"
+        },
         "type": {
           "$ref": "#/definitions/RealtimeWsMode"
         },
         "version": {
           "$ref": "#/definitions/RealtimeConversationVersion"
+        },
+        "voice": {
+          "$ref": "#/definitions/RealtimeVoice"
         }
       },
       "type": "object"
+    },
+    "RealtimeTransport": {
+      "enum": [
+        "webrtc",
+        "websocket"
+      ],
+      "type": "string"
+    },
+    "RealtimeVoice": {
+      "enum": [
+        "alloy",
+        "arbor",
+        "ash",
+        "ballad",
+        "breeze",
+        "cedar",
+        "coral",
+        "cove",
+        "echo",
+        "ember",
+        "juniper",
+        "maple",
+        "marin",
+        "sage",
+        "shimmer",
+        "sol",
+        "spruce",
+        "vale",
+        "verse"
+      ],
+      "type": "string"
     },
     "RealtimeWsMode": {
       "enum": [
@@ -1559,13 +1743,6 @@
           "type": "string"
         }
       ]
-    },
-    "ResumeHistoryMode": {
-      "enum": [
-        "full",
-        "since-last-compaction"
-      ],
-      "type": "string"
     },
     "SandboxMode": {
       "enum": [
@@ -1707,22 +1884,6 @@
       },
       "type": "object"
     },
-    "SubagentFileMutationMode": {
-      "enum": [
-        "inherit",
-        "deny"
-      ],
-      "type": "string"
-    },
-    "SubagentProfileConfig": {
-      "additionalProperties": false,
-      "properties": {
-        "file_mutation": {
-          "$ref": "#/definitions/SubagentFileMutationMode"
-        }
-      },
-      "type": "object"
-    },
     "ToolSuggestConfig": {
       "additionalProperties": false,
       "properties": {
@@ -1813,6 +1974,15 @@
           "default": {},
           "description": "Startup tooltip availability NUX state persisted by the TUI."
         },
+        "notification_condition": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/NotificationCondition"
+            }
+          ],
+          "default": "unfocused",
+          "description": "Controls whether TUI notifications are delivered only when the terminal is unfocused or regardless of focus. Defaults to `unfocused`."
+        },
         "notification_method": {
           "allOf": [
             {
@@ -1820,7 +1990,7 @@
             }
           ],
           "default": "auto",
-          "description": "Notification method to use for unfocused terminal notifications. Defaults to `auto`."
+          "description": "Notification method to use for terminal notifications. Defaults to `auto`."
         },
         "notifications": {
           "allOf": [
@@ -1829,16 +1999,7 @@
             }
           ],
           "default": true,
-          "description": "Enable desktop notifications from the TUI when the terminal is unfocused. Defaults to `true`."
-        },
-        "resume_history": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/ResumeHistoryMode"
-            }
-          ],
-          "default": "since-last-compaction",
-          "description": "Controls how much history the TUI renders when resuming a stored session.\n\n- `since-last-compaction` (default): render only the suffix starting at the last surviving visible `Context compacted` marker. - `full`: render the entire reconstructed persisted transcript."
+          "description": "Enable desktop notifications from the TUI. Defaults to `true`."
         },
         "show_tooltips": {
           "default": true,
@@ -1847,7 +2008,7 @@
         },
         "status_line": {
           "default": null,
-          "description": "Ordered list of status line item identifiers.\n\nWhen set, the TUI renders the selected items as the status line. When unset, the TUI defaults to: `model-with-reasoning`, `context-remaining`, and `current-dir`.",
+          "description": "Ordered list of status line item identifiers.\n\nWhen set, the TUI renders the selected items as the status line. When unset, the TUI defaults to: `model-with-reasoning` and `current-dir`.",
           "items": {
             "type": "string"
           },
@@ -2120,6 +2281,9 @@
         "apply_patch_freeform": {
           "type": "boolean"
         },
+        "apply_patch_streaming_events": {
+          "type": "boolean"
+        },
         "apps": {
           "type": "boolean"
         },
@@ -2138,10 +2302,13 @@
         "codex_hooks": {
           "type": "boolean"
         },
-        "connectors": {
+        "collab": {
           "type": "boolean"
         },
-        "debug_hide_spawn_agent_metadata": {
+        "collaboration_modes": {
+          "type": "boolean"
+        },
+        "connectors": {
           "type": "boolean"
         },
         "default_mode_request_user_input": {
@@ -2169,6 +2336,9 @@
           "type": "boolean"
         },
         "experimental_windows_sandbox": {
+          "type": "boolean"
+        },
+        "external_migration": {
           "type": "boolean"
         },
         "fast_mode": {
@@ -2205,7 +2375,7 @@
           "type": "boolean"
         },
         "multi_agent_v2": {
-          "type": "boolean"
+          "$ref": "#/definitions/FeatureToml_for_MultiAgentV2ConfigToml"
         },
         "personality": {
           "type": "boolean"
@@ -2267,10 +2437,16 @@
         "steer": {
           "type": "boolean"
         },
+        "telepathy": {
+          "type": "boolean"
+        },
         "tool_call_mcp_elicitation": {
           "type": "boolean"
         },
         "tool_search": {
+          "type": "boolean"
+        },
+        "tool_search_always_defer_mcp_tools": {
           "type": "boolean"
         },
         "tool_suggest": {
@@ -2279,10 +2455,16 @@
         "tui_app_server": {
           "type": "boolean"
         },
+        "unavailable_dummy_tools": {
+          "type": "boolean"
+        },
         "undo": {
           "type": "boolean"
         },
         "unified_exec": {
+          "type": "boolean"
+        },
+        "use_agent_identity": {
           "type": "boolean"
         },
         "use_legacy_landlock": {
@@ -2298,6 +2480,9 @@
           "type": "boolean"
         },
         "web_search_request": {
+          "type": "boolean"
+        },
+        "workspace_dependencies": {
           "type": "boolean"
         }
       },
@@ -2394,13 +2579,13 @@
       ],
       "description": "Directory where Codex writes log files, for example `codex-tui.log`. Defaults to `$CODEX_HOME/log`."
     },
-    "manage_context_policy": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/ManageContextPolicyToml"
-        }
-      ],
-      "description": "Explicit policy knobs for `manage_context` orchestration."
+    "marketplaces": {
+      "additionalProperties": {
+        "$ref": "#/definitions/MarketplaceConfig"
+      },
+      "default": {},
+      "description": "User-level marketplace entries keyed by marketplace name.",
+      "type": "object"
     },
     "mcp_oauth_callback_port": {
       "description": "Optional fixed port for the local HTTP callback server used during MCP OAuth login. When unset, Codex will bind to an ephemeral port chosen by the OS.",
@@ -2557,10 +2742,6 @@
       "description": "User-level plugin config entries keyed by plugin name.",
       "type": "object"
     },
-    "pos_compact_instructions": {
-      "description": "Optional instructions appended after successful remote auto-compaction.",
-      "type": "string"
-    },
     "profile": {
       "description": "Profile to use from the `profiles` map.",
       "type": "string"
@@ -2608,16 +2789,6 @@
       ],
       "default": null,
       "description": "Experimental / do not use. Realtime websocket session selection. `version` controls v1/v2 and `type` controls conversational/transcription."
-    },
-    "recall_debug": {
-      "description": "Controls recall payload verbosity. When unset/false, use a compact string-list payload. When true, use the full/debug payload. Keep recall runtime/docs/schema aligned with this default.",
-      "type": "boolean"
-    },
-    "recall_kbytes_limit": {
-      "description": "Maximum size budget (KiB) for recall payload items returned to the model.",
-      "format": "uint",
-      "minimum": 1.0,
-      "type": "integer"
     },
     "review_model": {
       "description": "Review model override used by the `/review` feature.",
@@ -2681,14 +2852,6 @@
         }
       ],
       "description": "Directory where Codex stores the SQLite state DB. Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses `$CODEX_HOME`."
-    },
-    "subagent_instructions_file": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/AbsolutePathBuf"
-        }
-      ],
-      "description": "Optional path to a file containing model instructions for sub-agent threads spawned via the collab `spawn_agent` tool."
     },
     "suppress_unstable_features_warning": {
       "description": "Suppress warnings about unstable (under development) features.",

@@ -1,10 +1,5 @@
 use std::sync::Arc;
 
-use codex_core::CodexThread;
-use codex_core::NewThread;
-use codex_core::PromptGcActivityEdge;
-use codex_core::ThreadManager;
-use codex_core::config::Config;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -15,6 +10,11 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
+use crate::legacy_core::CodexThread;
+use crate::legacy_core::NewThread;
+use crate::legacy_core::PromptGcActivityEdge;
+use crate::legacy_core::ThreadManager;
+use crate::legacy_core::config::Config;
 
 const TUI_NOTIFY_CLIENT: &str = "codex-tui";
 

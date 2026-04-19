@@ -2,11 +2,10 @@ use super::*;
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::control::render_input_preview;
-use crate::agent::role::DEFAULT_ROLE_NAME;
-use crate::agent::role::apply_role_to_config;
-
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
+use crate::agent::role::DEFAULT_ROLE_NAME;
+use crate::agent::role::apply_role_to_config;
 
 pub(crate) struct Handler;
 
@@ -53,7 +52,7 @@ impl ToolHandler for Handler {
         }
         let mut config = build_agent_spawn_config(turn.as_ref())?;
         let subagent_file_mutation_mode =
-            apply_spawn_agent_profile_override(&mut config, profile_name)?;
+            apply_spawn_agent_profile_override(&mut config, profile_name).await?;
         apply_role_to_config(&mut config, role_name)
             .await
             .map_err(FunctionCallError::RespondToModel)?;

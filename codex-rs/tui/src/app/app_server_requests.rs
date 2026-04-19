@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 
 use crate::app_command::AppCommand;
 use crate::app_command::AppCommandView;
@@ -33,13 +34,33 @@ pub(super) struct UnsupportedAppServerRequest {
     pub(super) message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedAppServerRequest {
+    ExecApproval {
+        id: String,
+    },
+    FileChangeApproval {
+        id: String,
+    },
+    PermissionsApproval {
+        id: String,
+    },
+    UserInput {
+        call_id: String,
+    },
+    McpElicitation {
+        server_name: String,
+        request_id: McpRequestId,
+    },
+}
+
 #[derive(Debug, Default)]
 pub(super) struct PendingAppServerRequests {
     exec_approvals: HashMap<String, AppServerRequestId>,
     file_change_approvals: HashMap<String, AppServerRequestId>,
     permissions_approvals: HashMap<String, AppServerRequestId>,
-    user_inputs: HashMap<String, AppServerRequestId>,
     dynamic_tools: HashMap<ThreadScopedDynamicToolCallKey, AppServerRequestId>,
+    user_inputs: HashMap<String, VecDeque<PendingUserInputRequest>>,
     mcp_requests: HashMap<McpLegacyRequestKey, AppServerRequestId>,
 }
 
@@ -77,7 +98,7 @@ impl PendingAppServerRequests {
                 None
             }
             ServerRequest::ToolRequestUserInput { request_id, params } => {
-                if self.user_inputs.contains_key(&params.item_id) {
+                if self.contains_pending_user_input_item_id(&params.item_id) {
                     return Some(UnsupportedAppServerRequest {
                         request_id: request_id.clone(),
                         message: format!(
@@ -87,7 +108,12 @@ impl PendingAppServerRequests {
                     });
                 }
                 self.user_inputs
-                    .insert(params.item_id.clone(), request_id.clone());
+                    .entry(params.turn_id.clone())
+                    .or_default()
+                    .push_back(PendingUserInputRequest {
+                        item_id: params.item_id.clone(),
+                        request_id: request_id.clone(),
+                    });
                 None
             }
             ServerRequest::McpServerElicitationRequest { request_id, params } => {
@@ -197,18 +223,22 @@ impl PendingAppServerRequests {
                 request_item_id,
                 response,
             } => {
-                let Some(request_item_id) = request_item_id else {
-                    return Err(format!(
-                        "app-server request_user_input answer for turn `{id}` is missing request_item_id"
-                    ));
-                };
-                let Some(request_id) = self.user_inputs.remove(request_item_id) else {
-                    return Err(format!(
-                        "app-server request_user_input answer for turn `{id}` has unknown request_item_id `{request_item_id}`"
-                    ));
+                let pending = if let Some(request_item_id) = request_item_id {
+                    self.remove_user_input_request_by_item_id(request_item_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "app-server request_user_input answer for turn `{id}` has unknown request_item_id `{request_item_id}`"
+                            )
+                        })?
+                } else {
+                    self.pop_user_input_request_for_turn(id).ok_or_else(|| {
+                        format!(
+                            "app-server request_user_input answer for turn `{id}` has no pending request"
+                        )
+                    })?
                 };
                 Some(AppServerRequestResolution {
-                    request_id,
+                    request_id: pending.request_id,
                     result: serde_json::to_value(
                         serde_json::from_value::<ToolRequestUserInputResponse>(
                             serde_json::to_value(response).map_err(|err| {
@@ -287,16 +317,155 @@ impl PendingAppServerRequests {
         Ok(resolution)
     }
 
-    pub(super) fn resolve_notification(&mut self, request_id: &AppServerRequestId) {
-        self.exec_approvals.retain(|_, value| value != request_id);
-        self.file_change_approvals
-            .retain(|_, value| value != request_id);
-        self.permissions_approvals
-            .retain(|_, value| value != request_id);
-        self.user_inputs.retain(|_, value| value != request_id);
-        self.dynamic_tools.retain(|_, value| value != request_id);
-        self.mcp_requests.retain(|_, value| value != request_id);
+    pub(super) fn resolve_notification(
+        &mut self,
+        request_id: &AppServerRequestId,
+    ) -> Option<ResolvedAppServerRequest> {
+        if let Some(id) = self
+            .exec_approvals
+            .iter()
+            .find_map(|(id, value)| (value == request_id).then(|| id.clone()))
+        {
+            self.exec_approvals.remove(&id);
+            return Some(ResolvedAppServerRequest::ExecApproval { id });
+        }
+
+        if let Some(id) = self
+            .file_change_approvals
+            .iter()
+            .find_map(|(id, value)| (value == request_id).then(|| id.clone()))
+        {
+            self.file_change_approvals.remove(&id);
+            return Some(ResolvedAppServerRequest::FileChangeApproval { id });
+        }
+
+        if let Some(id) = self
+            .permissions_approvals
+            .iter()
+            .find_map(|(id, value)| (value == request_id).then(|| id.clone()))
+        {
+            self.permissions_approvals.remove(&id);
+            return Some(ResolvedAppServerRequest::PermissionsApproval { id });
+        }
+
+        if let Some(pending) = self.remove_user_input_request(request_id) {
+            return Some(ResolvedAppServerRequest::UserInput {
+                call_id: pending.item_id,
+            });
+        }
+
+        if let Some(key) = self
+            .mcp_requests
+            .iter()
+            .find_map(|(key, value)| (value == request_id).then(|| key.clone()))
+        {
+            self.mcp_requests.remove(&key);
+            return Some(ResolvedAppServerRequest::McpElicitation {
+                server_name: key.server_name,
+                request_id: key.request_id,
+            });
+        }
+
+        None
     }
+
+    pub(super) fn contains_server_request(&self, request: &ServerRequest) -> bool {
+        match request {
+            ServerRequest::CommandExecutionRequestApproval { request_id, .. } => self
+                .exec_approvals
+                .values()
+                .any(|pending_request_id| pending_request_id == request_id),
+            ServerRequest::FileChangeRequestApproval { request_id, .. } => self
+                .file_change_approvals
+                .values()
+                .any(|pending_request_id| pending_request_id == request_id),
+            ServerRequest::PermissionsRequestApproval { request_id, .. } => self
+                .permissions_approvals
+                .values()
+                .any(|pending_request_id| pending_request_id == request_id),
+            ServerRequest::ToolRequestUserInput { request_id, .. } => {
+                self.user_inputs.values().any(|queue| {
+                    queue
+                        .iter()
+                        .any(|pending| &pending.request_id == request_id)
+                })
+            }
+            ServerRequest::McpServerElicitationRequest { request_id, .. } => self
+                .mcp_requests
+                .values()
+                .any(|pending_request_id| pending_request_id == request_id),
+            ServerRequest::DynamicToolCall { .. }
+            | ServerRequest::ChatgptAuthTokensRefresh { .. }
+            | ServerRequest::ApplyPatchApproval { .. }
+            | ServerRequest::ExecCommandApproval { .. } => true,
+        }
+    }
+
+    fn pop_user_input_request_for_turn(
+        &mut self,
+        turn_id: &str,
+    ) -> Option<PendingUserInputRequest> {
+        let pending = self
+            .user_inputs
+            .get_mut(turn_id)
+            .and_then(VecDeque::pop_front);
+        if self
+            .user_inputs
+            .get(turn_id)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.user_inputs.remove(turn_id);
+        }
+        pending
+    }
+
+    fn contains_pending_user_input_item_id(&self, item_id: &str) -> bool {
+        self.user_inputs
+            .values()
+            .any(|queue| queue.iter().any(|pending| pending.item_id == item_id))
+    }
+
+    fn remove_user_input_request_by_item_id(
+        &mut self,
+        item_id: &str,
+    ) -> Option<PendingUserInputRequest> {
+        let (turn_id, index) = self.user_inputs.iter().find_map(|(turn_id, queue)| {
+            queue
+                .iter()
+                .position(|pending| pending.item_id == item_id)
+                .map(|index| (turn_id.clone(), index))
+        })?;
+        let queue = self.user_inputs.get_mut(&turn_id)?;
+        let removed = queue.remove(index);
+        if queue.is_empty() {
+            self.user_inputs.remove(&turn_id);
+        }
+        removed
+    }
+
+    fn remove_user_input_request(
+        &mut self,
+        request_id: &AppServerRequestId,
+    ) -> Option<PendingUserInputRequest> {
+        let (turn_id, index) = self.user_inputs.iter().find_map(|(turn_id, queue)| {
+            queue
+                .iter()
+                .position(|pending| &pending.request_id == request_id)
+                .map(|index| (turn_id.clone(), index))
+        })?;
+        let queue = self.user_inputs.get_mut(&turn_id)?;
+        let removed = queue.remove(index);
+        if queue.is_empty() {
+            self.user_inputs.remove(&turn_id);
+        }
+        removed
+    }
+}
+
+#[derive(Debug)]
+struct PendingUserInputRequest {
+    item_id: String,
+    request_id: AppServerRequestId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -353,6 +522,7 @@ fn file_change_decision(decision: &ReviewDecision) -> Result<FileChangeApprovalD
         ReviewDecision::Approved => Ok(FileChangeApprovalDecision::Accept),
         ReviewDecision::ApprovedForSession => Ok(FileChangeApprovalDecision::AcceptForSession),
         ReviewDecision::Denied => Ok(FileChangeApprovalDecision::Decline),
+        ReviewDecision::TimedOut => Ok(FileChangeApprovalDecision::Decline),
         ReviewDecision::Abort => Ok(FileChangeApprovalDecision::Cancel),
         ReviewDecision::ApprovedExecpolicyAmendment { .. } => {
             Err("execpolicy amendment is not a valid file change approval decision".to_string())
@@ -366,6 +536,7 @@ fn file_change_decision(decision: &ReviewDecision) -> Result<FileChangeApprovalD
 #[cfg(test)]
 mod tests {
     use super::PendingAppServerRequests;
+    use super::ResolvedAppServerRequest;
     use codex_app_server_protocol::AdditionalFileSystemPermissions;
     use codex_app_server_protocol::AdditionalNetworkPermissions;
     use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
@@ -396,6 +567,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     #[test]
@@ -723,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_request_user_input_item_id() {
+    fn falls_back_to_turn_fifo_when_request_user_input_item_id_is_missing() {
         let mut pending = PendingAppServerRequests::default();
         assert_eq!(
             pending.note_server_request(&ServerRequest::ToolRequestUserInput {
@@ -738,7 +910,7 @@ mod tests {
             None
         );
 
-        let error = pending
+        let resolution = pending
             .take_resolution(
                 "thread-1",
                 &Op::UserInputAnswer {
@@ -749,11 +921,9 @@ mod tests {
                     },
                 },
             )
-            .expect_err("missing item_id should fail loud");
-        assert_eq!(
-            error,
-            "app-server request_user_input answer for turn `turn-2` is missing request_item_id"
-        );
+            .expect("missing item_id should fall back to FIFO")
+            .expect("pending request should resolve");
+        assert_eq!(resolution.request_id, AppServerRequestId::Integer(8));
     }
 
     #[test]
@@ -1023,5 +1193,142 @@ mod tests {
             error,
             "execpolicy amendment is not a valid file change approval decision"
         );
+    }
+
+    #[test]
+    fn resolve_notification_returns_resolved_exec_request() {
+        let mut pending = PendingAppServerRequests::default();
+        assert_eq!(
+            pending.note_server_request(&ServerRequest::CommandExecutionRequestApproval {
+                request_id: AppServerRequestId::Integer(41),
+                params: CommandExecutionRequestApprovalParams {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "call-1".to_string(),
+                    approval_id: Some("approval-1".to_string()),
+                    reason: None,
+                    network_approval_context: None,
+                    command: Some("ls".to_string()),
+                    cwd: None,
+                    command_actions: None,
+                    additional_permissions: None,
+                    proposed_execpolicy_amendment: None,
+                    proposed_network_policy_amendments: None,
+                    available_decisions: None,
+                },
+            }),
+            None
+        );
+
+        assert_eq!(
+            pending.resolve_notification(&AppServerRequestId::Integer(41)),
+            Some(ResolvedAppServerRequest::ExecApproval {
+                id: "approval-1".to_string(),
+            })
+        );
+        assert_eq!(
+            pending.resolve_notification(&AppServerRequestId::Integer(41)),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_notification_returns_resolved_mcp_request() {
+        let mut pending = PendingAppServerRequests::default();
+        assert_eq!(
+            pending.note_server_request(&ServerRequest::McpServerElicitationRequest {
+                request_id: AppServerRequestId::Integer(12),
+                params: McpServerElicitationRequestParams {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: Some("turn-1".to_string()),
+                    server_name: "example".to_string(),
+                    request: McpServerElicitationRequest::Form {
+                        meta: None,
+                        message: "Need input".to_string(),
+                        requested_schema: McpElicitationSchema {
+                            schema_uri: None,
+                            type_: McpElicitationObjectType::Object,
+                            properties: BTreeMap::new(),
+                            required: None,
+                        },
+                    },
+                },
+            }),
+            None
+        );
+
+        assert_eq!(
+            pending.resolve_notification(&AppServerRequestId::Integer(12)),
+            Some(ResolvedAppServerRequest::McpElicitation {
+                server_name: "example".to_string(),
+                request_id: McpRequestId::Integer(12),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_notification_returns_resolved_user_input_item_id() {
+        let mut pending = PendingAppServerRequests::default();
+        pending.note_server_request(&ServerRequest::ToolRequestUserInput {
+            request_id: AppServerRequestId::Integer(8),
+            params: ToolRequestUserInputParams {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "tool-1".to_string(),
+                questions: Vec::new(),
+            },
+        });
+
+        assert_eq!(
+            pending.resolve_notification(&AppServerRequestId::Integer(8)),
+            Some(ResolvedAppServerRequest::UserInput {
+                call_id: "tool-1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn same_turn_user_input_answers_resolve_app_server_requests_fifo() {
+        let mut pending = PendingAppServerRequests::default();
+        for (request_id, item_id) in [(8, "tool-1"), (9, "tool-2")] {
+            pending.note_server_request(&ServerRequest::ToolRequestUserInput {
+                request_id: AppServerRequestId::Integer(request_id),
+                params: ToolRequestUserInputParams {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: item_id.to_string(),
+                    questions: Vec::new(),
+                },
+            });
+        }
+
+        let response = codex_protocol::request_user_input::RequestUserInputResponse {
+            answers: HashMap::new(),
+        };
+        let first_response = pending
+            .take_resolution(
+                "thread-1",
+                &Op::UserInputAnswer {
+                    id: "turn-1".to_string(),
+                    request_item_id: None,
+                    response: response.clone(),
+                },
+            )
+            .expect("user input response should serialize")
+            .expect("first user input request should be pending");
+        let second_response = pending
+            .take_resolution(
+                "thread-1",
+                &Op::UserInputAnswer {
+                    id: "turn-1".to_string(),
+                    request_item_id: None,
+                    response,
+                },
+            )
+            .expect("user input response should serialize")
+            .expect("second user input request should be pending");
+
+        assert_eq!(first_response.request_id, AppServerRequestId::Integer(8));
+        assert_eq!(second_response.request_id, AppServerRequestId::Integer(9));
     }
 }

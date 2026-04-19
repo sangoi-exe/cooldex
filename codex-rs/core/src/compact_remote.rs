@@ -2,16 +2,23 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::Prompt;
-use crate::codex::Session;
-use crate::codex::TurnContext;
-use crate::codex::built_tools;
-use crate::codex::maybe_auto_switch_account_on_usage_limit;
-use crate::compact::CompactionInitialContextPlacement;
-use crate::compact::inject_initial_context_into_compacted_history;
+use crate::compact::CompactionAnalyticsAttempt;
+use crate::compact::InitialContextInjection;
+use crate::compact::compaction_status_from_result;
+use crate::compact::insert_initial_context_before_last_real_user_or_summary;
 use crate::context_manager::ContextManager;
 use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
 use crate::context_manager::is_codex_generated_item;
+use crate::session::session::Session;
+use crate::session::turn::UsageLimitHandlingPolicy;
+use crate::session::turn::built_tools;
+use crate::session::turn::maybe_auto_switch_account_on_usage_limit;
+use crate::session::turn_context::TurnContext;
+use codex_analytics::CompactionImplementation;
+use codex_analytics::CompactionPhase;
+use codex_analytics::CompactionReason;
+use codex_analytics::CompactionTrigger;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
@@ -28,9 +35,19 @@ use tracing::info;
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
-    initial_context_placement: CompactionInitialContextPlacement,
+    initial_context_injection: InitialContextInjection,
+    reason: CompactionReason,
+    phase: CompactionPhase,
 ) -> CodexResult<()> {
-    run_remote_compact_task_inner(&sess, &turn_context, initial_context_placement).await?;
+    run_remote_compact_task_inner(
+        &sess,
+        &turn_context,
+        initial_context_injection,
+        CompactionTrigger::Auto,
+        reason,
+        phase,
+    )
+    .await?;
     Ok(())
 }
 
@@ -49,7 +66,10 @@ pub(crate) async fn run_remote_compact_task(
     run_remote_compact_task_inner(
         &sess,
         &turn_context,
-        CompactionInitialContextPlacement::PromptTop,
+        InitialContextInjection::DoNotInject,
+        CompactionTrigger::Manual,
+        CompactionReason::UserRequested,
+        CompactionPhase::StandaloneTurn,
     )
     .await
 }
@@ -57,11 +77,30 @@ pub(crate) async fn run_remote_compact_task(
 async fn run_remote_compact_task_inner(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    initial_context_placement: CompactionInitialContextPlacement,
+    initial_context_injection: InitialContextInjection,
+    trigger: CompactionTrigger,
+    reason: CompactionReason,
+    phase: CompactionPhase,
 ) -> CodexResult<()> {
-    if let Err(err) =
-        run_remote_compact_task_inner_impl(sess, turn_context, initial_context_placement).await
-    {
+    let attempt = CompactionAnalyticsAttempt::begin(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        trigger,
+        reason,
+        CompactionImplementation::ResponsesCompact,
+        phase,
+    )
+    .await;
+    let result =
+        run_remote_compact_task_inner_impl(sess, turn_context, initial_context_injection).await;
+    attempt
+        .track(
+            sess.as_ref(),
+            compaction_status_from_result(&result),
+            result.as_ref().err().map(ToString::to_string),
+        )
+        .await;
+    if let Err(err) = result {
         let event = EventMsg::Error(
             err.to_error_event(Some("Error running remote compact task".to_string())),
         );
@@ -74,7 +113,7 @@ async fn run_remote_compact_task_inner(
 async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    initial_context_placement: CompactionInitialContextPlacement,
+    initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &compaction_item)
@@ -161,7 +200,7 @@ async fn run_remote_compact_task_inner_impl(
                     turn_context.as_ref(),
                     &usage_limit,
                     request_store_account_id.as_deref(),
-                    crate::codex::UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch,
+                    UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch,
                 )
                 .await?
                 {
@@ -194,18 +233,15 @@ async fn run_remote_compact_task_inner_impl(
         sess.as_ref(),
         turn_context.as_ref(),
         new_history,
-        initial_context_placement,
+        initial_context_injection,
     )
     .await;
 
     #[cfg(test)]
     {
-        // PromptTop compaction already rebuilds the canonical developer block, including
-        // model-switch state, so reattaching the stripped tail item is only useful when tests
-        // intentionally exercise the legacy BeforeLastUser path.
         if matches!(
-            initial_context_placement,
-            CompactionInitialContextPlacement::BeforeLastUser
+            initial_context_injection,
+            InitialContextInjection::BeforeLastUserMessage
         ) && let Some(model_switch_item) = _stripped_model_switch_item
         {
             new_history.push(model_switch_item);
@@ -215,15 +251,17 @@ async fn run_remote_compact_task_inner_impl(
     if !ghost_snapshots.is_empty() {
         new_history.extend(ghost_snapshots);
     }
-    let reference_context_item = Some(turn_context.to_turn_context_item());
+    let reference_context_item = match initial_context_injection {
+        InitialContextInjection::DoNotInject => None,
+        InitialContextInjection::BeforeLastUserMessage => Some(turn_context.to_turn_context_item()),
+    };
     let compacted_item = CompactedItem {
         message: String::new(),
         replacement_history: Some(new_history.clone()),
         prompt_gc: None,
     };
     sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
-        .await
-        .map_err(CodexErr::Fatal)?;
+        .await;
     sess.recompute_token_usage(turn_context).await;
 
     sess.emit_turn_item_completed(turn_context, compaction_item)
@@ -265,15 +303,18 @@ pub(crate) async fn process_compacted_history(
     sess: &Session,
     turn_context: &TurnContext,
     mut compacted_history: Vec<ResponseItem>,
-    initial_context_placement: CompactionInitialContextPlacement,
+    initial_context_injection: InitialContextInjection,
 ) -> Vec<ResponseItem> {
-    let initial_context = sess.build_initial_context(turn_context).await;
+    let initial_context = if matches!(
+        initial_context_injection,
+        InitialContextInjection::BeforeLastUserMessage
+    ) {
+        sess.build_initial_context(turn_context).await
+    } else {
+        Vec::new()
+    };
     compacted_history.retain(should_keep_compacted_history_item);
-    inject_initial_context_into_compacted_history(
-        compacted_history,
-        initial_context,
-        initial_context_placement,
-    )
+    insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context)
 }
 
 /// Returns whether an item from remote compaction output should be preserved.
@@ -413,8 +454,8 @@ mod tests {
     use crate::auth::StoredAccount;
     use crate::auth::save_auth;
     use crate::client::ModelClient;
-    use crate::codex::make_session_and_context_with_rx;
     use crate::features::Feature;
+    use crate::session::tests::make_session_and_context_with_rx;
     use codex_login::token_data;
     use codex_model_provider_info::built_in_model_providers;
     use codex_protocol::models::ContentItem;
@@ -639,7 +680,7 @@ mod tests {
         run_remote_compact_task_inner_impl(
             &session,
             &turn_context,
-            CompactionInitialContextPlacement::PromptTop,
+            InitialContextInjection::BeforeLastUserMessage,
         )
         .await
         .expect("remote compact should retry after auto-switch");

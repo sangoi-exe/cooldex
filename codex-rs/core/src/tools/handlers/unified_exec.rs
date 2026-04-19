@@ -23,8 +23,10 @@ use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use crate::unified_exec::ExecCommandRequest;
 use crate::unified_exec::UnifiedExecContext;
+use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::WriteStdinRequest;
+use crate::unified_exec::generate_chunk_id;
 use codex_features::Feature;
 use codex_otel::SessionTelemetry;
 use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
@@ -33,7 +35,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TerminalInteractionEvent;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 use codex_tools::UnifiedExecShellMode;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_output_truncation::approx_token_count;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -128,7 +130,9 @@ impl ToolHandler for UnifiedExecHandler {
     }
 
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
-        if invocation.tool_name != UNIFIED_EXEC_FUNCTION_TOOL_NAME {
+        if invocation.tool_name.namespace.is_some()
+            || invocation.tool_name.name.as_str() != UNIFIED_EXEC_FUNCTION_TOOL_NAME
+        {
             return None;
         }
 
@@ -193,11 +197,10 @@ impl ToolHandler for UnifiedExecHandler {
         let manager: &UnifiedExecProcessManager = &session.services.unified_exec_manager;
         let context = UnifiedExecContext::new(session.clone(), turn.clone(), call_id.clone());
 
-        let response = match tool_name.as_str() {
+        let response = match tool_name.name.as_str() {
             UNIFIED_EXEC_FUNCTION_TOOL_NAME => {
-                let cwd = resolve_workdir_base_path(&arguments, context.turn.cwd.as_path())?;
-                let args: ExecCommandArgs =
-                    parse_arguments_with_base_path(&arguments, cwd.as_path())?;
+                let cwd = resolve_workdir_base_path(&arguments, &context.turn.cwd)?;
+                let args: ExecCommandArgs = parse_arguments_with_base_path(&arguments, &cwd)?;
                 let workdir = context.turn.resolve_path(args.workdir.clone());
                 maybe_emit_implicit_skill_invocation(
                     session.as_ref(),
@@ -301,25 +304,15 @@ impl ToolHandler for UnifiedExecHandler {
                     }
                 };
 
-                let apply_patch_cwd = match AbsolutePathBuf::from_absolute_path(&cwd) {
-                    Ok(cwd) => cwd,
-                    Err(err) => {
-                        manager.release_process_id(process_id).await;
-                        return Err(FunctionCallError::RespondToModel(format!(
-                            "apply_patch verification failed: failed to resolve cwd: {err}"
-                        )));
-                    }
-                };
                 if let Some(output) = intercept_apply_patch(
                     &command,
-                    &apply_patch_cwd,
+                    &cwd,
                     fs.as_ref(),
-                    Some(yield_time_ms),
                     context.session.clone(),
                     context.turn.clone(),
                     Some(&tracker),
                     &context.call_id,
-                    tool_name.as_str(),
+                    &tool_name.name,
                 )
                 .await?
                 {
@@ -338,10 +331,12 @@ impl ToolHandler for UnifiedExecHandler {
                 }
 
                 emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
-                manager
+                let session_command = command.clone();
+                match manager
                     .exec_command(
                         ExecCommandRequest {
                             command,
+                            hook_command: args.cmd,
                             process_id,
                             yield_time_ms,
                             max_output_tokens,
@@ -359,11 +354,31 @@ impl ToolHandler for UnifiedExecHandler {
                         &context,
                     )
                     .await
-                    .map_err(|err| {
-                        FunctionCallError::RespondToModel(format!(
+                {
+                    Ok(response) => response,
+                    Err(UnifiedExecError::SandboxDenied { output, .. }) => {
+                        let output_text = output.aggregated_output.text;
+                        let original_token_count = approx_token_count(&output_text);
+                        ExecCommandToolOutput {
+                            event_call_id: context.call_id.clone(),
+                            chunk_id: generate_chunk_id(),
+                            wall_time: output.duration,
+                            raw_output: output_text.into_bytes(),
+                            max_output_tokens,
+                            // Sandbox denial is terminal, so there is no live
+                            // process for write_stdin to resume.
+                            process_id: None,
+                            exit_code: Some(output.exit_code),
+                            original_token_count: Some(original_token_count),
+                            session_command: Some(session_command),
+                        }
+                    }
+                    Err(err) => {
+                        return Err(FunctionCallError::RespondToModel(format!(
                             "exec_command failed for `{command_for_display}`: {err:?}"
-                        ))
-                    })?
+                        )));
+                    }
+                }
             }
             "write_stdin" => {
                 let args: WriteStdinArgs = parse_arguments(&arguments)?;

@@ -27,6 +27,7 @@ use codex_app_server_protocol::AppReview;
 use codex_app_server_protocol::AppScreenshot;
 use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::AppsListResponse;
+use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -35,7 +36,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_config::types::AuthCredentialsStoreMode;
-use codex_login::AuthStore;
+use codex_login::AuthDotJson;
 use codex_login::save_auth;
 use pretty_assertions::assert_eq;
 use rmcp::handler::server::ServerHandler;
@@ -55,11 +56,9 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-// Merge-safety anchor: app-list auth fixtures keep `/accounts` and connector
-// startup behavior aligned so account-store changes do not silently regress app
-// availability tests.
-
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+// Bazel CI can spend tens of seconds starting app-server subprocesses or
+// processing app-list RPCs under load.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[tokio::test]
 async fn list_apps_returns_empty_when_connectors_disabled() -> Result<()> {
@@ -115,9 +114,12 @@ async fn list_apps_returns_empty_with_api_key_auth() -> Result<()> {
     write_connectors_config(codex_home.path(), &server_url)?;
     save_auth(
         codex_home.path(),
-        &AuthStore {
+        &AuthDotJson {
+            auth_mode: Some(AuthMode::ApiKey),
             openai_api_key: Some("test-api-key".to_string()),
-            ..AuthStore::default()
+            tokens: None,
+            last_refresh: None,
+            agent_identity: None,
         },
         AuthCredentialsStoreMode::File,
     )?;

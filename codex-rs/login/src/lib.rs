@@ -1,7 +1,5 @@
-pub mod api_bridge;
 pub mod auth;
 pub mod auth_env_telemetry;
-pub mod provider_auth;
 pub mod token_data;
 
 mod device_code_auth;
@@ -22,13 +20,13 @@ pub use server::run_login_server;
 
 // Merge-safety anchor: codex-login re-exports define the split auth surface
 // consumed by login flows and tests after the auth crate extraction.
-pub use api_bridge::auth_provider_from_auth;
 pub use auth::AccountLeaseState;
 pub use auth::AccountRateLimitRefreshOutcome;
 pub use auth::AccountRateLimitRefreshRoster;
 pub use auth::AccountRateLimitRefreshRosterStatus;
 pub use auth::AccountSummary;
 pub use auth::AccountUsageCache;
+pub use auth::AgentIdentityAuthRecord;
 pub use auth::AuthConfig;
 pub use auth::AuthDotJson;
 pub use auth::AuthManager;
@@ -50,6 +48,7 @@ pub use auth::ExternalAuthTokens;
 pub use auth::OPENAI_API_KEY_ENV_VAR;
 pub use auth::PreflightAuthState;
 pub use auth::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
+pub use auth::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR;
 pub use auth::RefreshTokenError;
 pub use auth::StoredAccount;
 pub use auth::UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE;
@@ -63,6 +62,7 @@ pub use auth::load_auth_preflight_state;
 pub use auth::load_auth_store;
 pub use auth::login_with_api_key;
 pub use auth::logout;
+pub use auth::logout_with_revoke;
 pub use auth::read_openai_api_key_from_env;
 pub use auth::save_auth;
 pub use auth::usage_limit_auto_switch_removes_plan_type;
@@ -70,6 +70,4 @@ pub use auth_env_telemetry::AuthEnvTelemetry;
 pub use auth_env_telemetry::collect_auth_env_telemetry;
 pub use codex_account_state::ForceReleaseAccountOutcome;
 pub use codex_app_server_protocol::AuthMode;
-pub use provider_auth::auth_manager_for_provider;
-pub use provider_auth::required_auth_manager_for_provider;
 pub use token_data::TokenData;

@@ -1,15 +1,24 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
 #[cfg(test)]
-use crate::codex::PreviousTurnSettings;
-use crate::codex::Session;
-use crate::codex::TurnContext;
-use crate::codex::get_last_assistant_message_from_turn;
+use crate::session::PreviousTurnSettings;
+use crate::session::session::Session;
+use crate::session::turn::get_last_assistant_message_from_turn;
+use crate::session::turn_context::TurnContext;
 use crate::util::backoff;
-use codex_model_provider_info::ModelProviderInfo;
+use codex_analytics::CodexCompactionEvent;
+use codex_analytics::CompactionImplementation;
+use codex_analytics::CompactionPhase;
+use codex_analytics::CompactionReason;
+use codex_analytics::CompactionStatus;
+use codex_analytics::CompactionStrategy;
+use codex_analytics::CompactionTrigger;
+use codex_analytics::now_unix_seconds;
+use codex_features::Feature;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
@@ -28,30 +37,41 @@ use codex_utils_output_truncation::truncate_text;
 use futures::prelude::*;
 use tracing::error;
 
+use codex_model_provider_info::ModelProviderInfo;
+
 pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt.md");
 pub const SUMMARY_PREFIX: &str = include_str!("../templates/compact/summary_prefix.md");
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 
-/// Controls where canonical initial context is placed when compaction rewrites history.
+/// Controls whether compaction replacement history must include initial context.
+///
+/// Pre-turn/manual compaction variants use `DoNotInject`: they replace history with a summary and
+/// clear `reference_context_item`, so the next regular turn will fully reinject initial context
+/// after compaction.
+///
+/// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
+/// compaction summary as the last item in history after mid-turn compaction; we therefore inject
+/// initial context into the replacement history just above the last real user message.
 ///
 /// Merge-safety anchor: prompt order is part of the runtime contract. When compaction rewrites
 /// history, the canonical developer/contextual-user block must stay ahead of compacted task
 /// history instead of relying on a later generic append path to repair ordering.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CompactionInitialContextPlacement {
-    PromptTop,
-    #[cfg(test)]
-    BeforeLastUser,
+pub(crate) enum InitialContextInjection {
+    BeforeLastUserMessage,
+    DoNotInject,
 }
 
 pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
-    provider.is_openai()
+    provider.supports_remote_compaction()
 }
 
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
-    initial_context_placement: CompactionInitialContextPlacement,
+    initial_context_injection: InitialContextInjection,
+    reason: CompactionReason,
+    phase: CompactionPhase,
 ) -> CodexResult<()> {
     let prompt = turn_context.compact_prompt().to_string();
     let input = vec![UserInput::Text {
@@ -64,7 +84,10 @@ pub(crate) async fn run_inline_auto_compact_task(
         sess.clone(),
         turn_context.clone(),
         input,
-        initial_context_placement,
+        initial_context_injection,
+        CompactionTrigger::Auto,
+        reason,
+        phase,
     )
     .await;
     finalize_local_compact_result(&sess, &turn_context, result).await
@@ -86,7 +109,10 @@ pub(crate) async fn run_compact_task(
         sess.clone(),
         turn_context.clone(),
         input,
-        CompactionInitialContextPlacement::PromptTop,
+        InitialContextInjection::DoNotInject,
+        CompactionTrigger::Manual,
+        CompactionReason::UserRequested,
+        CompactionPhase::StandaloneTurn,
     )
     .await;
     finalize_local_compact_result(&sess, &turn_context, result).await
@@ -113,7 +139,42 @@ async fn run_compact_task_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
-    _initial_context_placement: CompactionInitialContextPlacement,
+    initial_context_injection: InitialContextInjection,
+    trigger: CompactionTrigger,
+    reason: CompactionReason,
+    phase: CompactionPhase,
+) -> CodexResult<()> {
+    let attempt = CompactionAnalyticsAttempt::begin(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        trigger,
+        reason,
+        CompactionImplementation::Responses,
+        phase,
+    )
+    .await;
+    let result = run_compact_task_inner_impl(
+        Arc::clone(&sess),
+        Arc::clone(&turn_context),
+        input,
+        initial_context_injection,
+    )
+    .await;
+    attempt
+        .track(
+            sess.as_ref(),
+            compaction_status_from_result(&result),
+            result.as_ref().err().map(ToString::to_string),
+        )
+        .await;
+    result
+}
+
+async fn run_compact_task_inner_impl(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    input: Vec<UserInput>,
+    initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
@@ -128,7 +189,7 @@ async fn run_compact_task_inner(
 
     let mut truncated_count = 0usize;
 
-    let max_retries = turn_context.provider.stream_max_retries();
+    let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
     let mut client_session = sess.services.model_client.new_session();
     // Reuse one client session so turn-scoped state (sticky routing, websocket incremental
@@ -220,20 +281,14 @@ async fn run_compact_task_inner(
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let user_messages = collect_user_messages(history_items);
 
-    let initial_context = sess.build_initial_context(turn_context.as_ref()).await;
-    let mut new_history =
-        build_compacted_history(initial_context.clone(), &user_messages, &summary_text);
-    #[cfg(test)]
+    let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
     if matches!(
-        _initial_context_placement,
-        CompactionInitialContextPlacement::BeforeLastUser
+        initial_context_injection,
+        InitialContextInjection::BeforeLastUserMessage
     ) {
-        let compacted_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
-        new_history = inject_initial_context_into_compacted_history(
-            compacted_history,
-            initial_context,
-            _initial_context_placement,
-        );
+        let initial_context = sess.build_initial_context(turn_context.as_ref()).await;
+        new_history =
+            insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
     }
     let ghost_snapshots: Vec<ResponseItem> = history_items
         .iter()
@@ -241,15 +296,17 @@ async fn run_compact_task_inner(
         .cloned()
         .collect();
     new_history.extend(ghost_snapshots);
-    let reference_context_item = Some(turn_context.to_turn_context_item());
+    let reference_context_item = match initial_context_injection {
+        InitialContextInjection::DoNotInject => None,
+        InitialContextInjection::BeforeLastUserMessage => Some(turn_context.to_turn_context_item()),
+    };
     let compacted_item = CompactedItem {
         message: summary_text.clone(),
         replacement_history: Some(new_history.clone()),
         prompt_gc: None,
     };
     sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
-        .await
-        .map_err(CodexErr::Fatal)?;
+        .await;
     client_session.reset_websocket_session();
     sess.recompute_token_usage(&turn_context).await;
 
@@ -260,6 +317,85 @@ async fn run_compact_task_inner(
     });
     sess.send_event(&turn_context, warning).await;
     Ok(())
+}
+
+pub(crate) struct CompactionAnalyticsAttempt {
+    enabled: bool,
+    thread_id: String,
+    turn_id: String,
+    trigger: CompactionTrigger,
+    reason: CompactionReason,
+    implementation: CompactionImplementation,
+    phase: CompactionPhase,
+    active_context_tokens_before: i64,
+    started_at: u64,
+    start_instant: Instant,
+}
+
+impl CompactionAnalyticsAttempt {
+    pub(crate) async fn begin(
+        sess: &Session,
+        turn_context: &TurnContext,
+        trigger: CompactionTrigger,
+        reason: CompactionReason,
+        implementation: CompactionImplementation,
+        phase: CompactionPhase,
+    ) -> Self {
+        let enabled = sess.enabled(Feature::GeneralAnalytics);
+        let active_context_tokens_before = sess.get_total_token_usage().await;
+        Self {
+            enabled,
+            thread_id: sess.conversation_id.to_string(),
+            turn_id: turn_context.sub_id.clone(),
+            trigger,
+            reason,
+            implementation,
+            phase,
+            active_context_tokens_before,
+            started_at: now_unix_seconds(),
+            start_instant: Instant::now(),
+        }
+    }
+
+    pub(crate) async fn track(
+        self,
+        sess: &Session,
+        status: CompactionStatus,
+        error: Option<String>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let active_context_tokens_after = sess.get_total_token_usage().await;
+        sess.services
+            .analytics_events_client
+            .track_compaction(CodexCompactionEvent {
+                thread_id: self.thread_id,
+                turn_id: self.turn_id,
+                trigger: self.trigger,
+                reason: self.reason,
+                implementation: self.implementation,
+                phase: self.phase,
+                strategy: CompactionStrategy::Memento,
+                status,
+                error,
+                active_context_tokens_before: self.active_context_tokens_before,
+                active_context_tokens_after,
+                started_at: self.started_at,
+                completed_at: now_unix_seconds(),
+                duration_ms: Some(
+                    u64::try_from(self.start_instant.elapsed().as_millis()).unwrap_or(u64::MAX),
+                ),
+            });
+    }
+}
+
+pub(crate) fn compaction_status_from_result<T>(result: &CodexResult<T>) -> CompactionStatus {
+    match result {
+        Ok(_) => CompactionStatus::Completed,
+        Err(CodexErr::Interrupted | CodexErr::TurnAborted) => CompactionStatus::Interrupted,
+        Err(_) => CompactionStatus::Failed,
+    }
 }
 
 pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
@@ -301,83 +437,73 @@ pub(crate) fn is_summary_message(message: &str) -> bool {
     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
 }
 
-/// Injects canonical initial context into compacted replacement history.
+/// Inserts canonical initial context into compacted replacement history at the
+/// model-expected boundary.
 ///
-/// `PromptTop` re-establishes the canonical prompt prefix immediately. In tests,
-/// `BeforeLastUser` keeps the older insertion point covered so the legacy helper behavior still
-/// has direct regression proof.
-pub(crate) fn inject_initial_context_into_compacted_history(
-    compacted_history: Vec<ResponseItem>,
+/// Placement rules:
+/// - Prefer immediately before the last real user message.
+/// - If no real user messages remain, insert before the compaction summary so
+///   the summary stays last.
+/// - If there are no user messages, insert before the last compaction item so
+///   that item remains last (remote compaction may return only compaction items).
+/// - If there are no user messages or compaction items, append the context.
+pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
+    mut compacted_history: Vec<ResponseItem>,
     initial_context: Vec<ResponseItem>,
-    placement: CompactionInitialContextPlacement,
 ) -> Vec<ResponseItem> {
-    if matches!(placement, CompactionInitialContextPlacement::PromptTop) {
-        let mut refreshed = initial_context;
-        refreshed.extend(compacted_history);
-        return refreshed;
-    }
-
-    #[cfg(not(test))]
-    {
-        compacted_history
-    }
-
-    #[cfg(test)]
-    {
-        let mut compacted_history = compacted_history;
-        let mut last_user_or_summary_index = None;
-        let mut last_real_user_index = None;
-        for (i, item) in compacted_history.iter().enumerate().rev() {
-            let Some(TurnItem::UserMessage(user)) = crate::event_mapping::parse_turn_item(item)
-            else {
-                continue;
-            };
-            // Compaction summaries are encoded as user messages, so track both:
-            // the last real user message (preferred insertion point) and the last
-            // user-message-like item (fallback summary insertion point).
-            last_user_or_summary_index.get_or_insert(i);
-            if !is_summary_message(&user.message()) {
-                last_real_user_index = Some(i);
-                break;
-            }
+    let mut last_user_or_summary_index = None;
+    let mut last_real_user_index = None;
+    for (i, item) in compacted_history.iter().enumerate().rev() {
+        let Some(TurnItem::UserMessage(user)) = crate::event_mapping::parse_turn_item(item) else {
+            continue;
+        };
+        // Compaction summaries are encoded as user messages, so track both:
+        // the last real user message (preferred insertion point) and the last
+        // user-message-like item (fallback summary insertion point).
+        last_user_or_summary_index.get_or_insert(i);
+        if !is_summary_message(&user.message()) {
+            last_real_user_index = Some(i);
+            break;
         }
-        let last_compaction_index = compacted_history
+    }
+    let last_compaction_index = compacted_history
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, item)| matches!(item, ResponseItem::Compaction { .. }).then_some(i));
+    let mut insertion_index = last_real_user_index
+        .or(last_user_or_summary_index)
+        .or(last_compaction_index);
+
+    if insertion_index.is_none()
+        && compacted_history
             .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(i, item)| matches!(item, ResponseItem::Compaction { .. }).then_some(i));
-        let mut insertion_index = last_real_user_index
-            .or(last_user_or_summary_index)
-            .or(last_compaction_index);
-        if insertion_index.is_none()
-            && compacted_history.iter().any(
-                |item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"),
-            )
-        {
-            // Remote compact can legally return assistant-only notes. With no user/summary/compaction
-            // anchor left, keep the canonical prompt prefix at the very front instead of appending it
-            // after assistant content.
-            insertion_index = Some(0);
-        }
-        if insertion_index.is_some_and(|index| {
-            compacted_history[..index].iter().any(
-                |item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"),
-            )
-        }) {
-            insertion_index = Some(0);
-        }
-
-        // Re-inject canonical context from the current session since compaction strips the instruction
-        // wrappers from history. Mid-turn continuation keeps the compaction item last, so place the
-        // canonical block immediately before the last real user when possible.
-        if let Some(insertion_index) = insertion_index {
-            compacted_history.splice(insertion_index..insertion_index, initial_context);
-        } else {
-            compacted_history.extend(initial_context);
-        }
-
-        compacted_history
+            .any(|item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"))
+    {
+        // Remote compact can legally return assistant-only notes. With no user/summary/compaction
+        // anchor left, keep the canonical prompt prefix at the very front instead of appending it
+        // after assistant content.
+        insertion_index = Some(0);
     }
+    if insertion_index.is_some_and(|index| {
+        compacted_history[..index]
+            .iter()
+            .any(|item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"))
+    }) {
+        insertion_index = Some(0);
+    }
+
+    // Re-inject canonical context from the current session since we stripped it
+    // from the pre-compaction history. Prefer placing it before the last real
+    // user message; if there is no real user message left, place it before the
+    // summary or compaction item so the compaction item remains last.
+    if let Some(insertion_index) = insertion_index {
+        compacted_history.splice(insertion_index..insertion_index, initial_context);
+    } else {
+        compacted_history.extend(initial_context);
+    }
+
+    compacted_history
 }
 
 pub(crate) fn build_compacted_history(

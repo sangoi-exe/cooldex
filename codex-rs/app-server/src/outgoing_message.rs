@@ -737,6 +737,7 @@ mod tests {
                     secondary: None,
                     credits: None,
                     plan_type: Some(PlanType::Plus),
+                    rate_limit_reached_type: None,
                 },
             });
 
@@ -755,7 +756,8 @@ mod tests {
                         },
                         "secondary": null,
                         "credits": null,
-                        "planType": "plus"
+                        "planType": "plus",
+                        "rateLimitReachedType": null
                     }
                 },
             }),

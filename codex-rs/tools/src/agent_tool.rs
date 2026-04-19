@@ -14,6 +14,8 @@ pub struct SpawnAgentToolOptions<'a> {
     pub available_models: &'a [ModelPreset],
     pub agent_type_description: String,
     pub hide_agent_type_model_reasoning: bool,
+    pub include_usage_hint: bool,
+    pub usage_hint_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +28,8 @@ pub struct WaitAgentTimeoutOptions {
 pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions<'_>) -> ToolSpec {
     let return_value_description =
         "Returns the spawned agent id plus the user-facing nickname when available.";
+    let available_models_description = (!options.hide_agent_type_model_reasoning)
+        .then(|| spawn_agent_models_description(options.available_models));
     let mut properties = spawn_agent_common_properties_v1(&options.agent_type_description);
     if options.hide_agent_type_model_reasoning {
         hide_spawn_agent_metadata_options_v1(&mut properties);
@@ -33,7 +37,12 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions<'_>) -> ToolSpe
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agent".to_string(),
-        description: spawn_agent_tool_description(None, return_value_description),
+        description: spawn_agent_tool_description(
+            available_models_description.as_deref(),
+            return_value_description,
+            options.include_usage_hint,
+            options.usage_hint_text,
+        ),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
@@ -44,11 +53,6 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions<'_>) -> ToolSpe
 pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions<'_>) -> ToolSpec {
     let available_models_description = (!options.hide_agent_type_model_reasoning)
         .then(|| spawn_agent_models_description(options.available_models));
-    let return_value_description = if options.hide_agent_type_model_reasoning {
-        "Returns the canonical task name for the spawned agent."
-    } else {
-        "Returns the canonical task name for the spawned agent, plus the user-facing nickname when available."
-    };
     let mut properties = spawn_agent_common_properties_v2(&options.agent_type_description);
     if options.hide_agent_type_model_reasoning {
         hide_spawn_agent_metadata_options_v2(&mut properties);
@@ -63,9 +67,10 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions<'_>) -> ToolSpe
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agent".to_string(),
-        description: spawn_agent_tool_description(
+        description: spawn_agent_tool_description_v2(
             available_models_description.as_deref(),
-            return_value_description,
+            options.include_usage_hint,
+            options.usage_hint_text,
         ),
         strict: false,
         defer_loading: None,
@@ -119,7 +124,7 @@ pub fn create_send_message_tool() -> ToolSpec {
         (
             "target".to_string(),
             JsonSchema::string(Some(
-                "Agent id or canonical task name to message (from spawn_agent).".to_string(),
+                "Relative or canonical task name to message (from spawn_agent).".to_string(),
             )),
         ),
         (
@@ -132,11 +137,15 @@ pub fn create_send_message_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "send_message".to_string(),
-        description: "Add a message to an existing agent without triggering a new turn. In MultiAgentV2, this tool currently supports text content only."
+        description: "Send a string message to an existing agent without triggering a new turn."
             .to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(properties, Some(vec!["target".to_string(), "message".to_string()]), Some(false.into())),
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["target".to_string(), "message".to_string()]),
+            Some(false.into()),
+        ),
         output_schema: None,
     })
 }
@@ -158,7 +167,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
         (
             "interrupt".to_string(),
             JsonSchema::boolean(Some(
-                "When true, stop the agent's current task and handle this immediately. When false (default), queue this message."
+                "When true, stop the agent's current task and handle this immediately. When false (default), queue this message; if the target is already running, it starts the target's next turn after the current turn completes."
                     .to_string(),
             )),
         ),
@@ -166,7 +175,7 @@ pub fn create_followup_task_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "followup_task".to_string(),
-        description: "Add a message to an existing non-root agent and trigger a turn in the target. Use interrupt=true to redirect work immediately. In MultiAgentV2, this tool currently supports text content only."
+        description: "Send a string message to an existing non-root agent and trigger a turn in the target. Use interrupt=true to redirect work immediately. If interrupt=false and the target's turn has not completed, the message is queued and starts the target's next turn after the current turn completes."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -211,7 +220,7 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. Returns a brief wait summary instead of agent content, or a timeout summary if no mailbox update arrives before the deadline."
+        description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. Does not return the content; returns either a summary of which agents have updates (if any), or a timeout summary if no mailbox update arrives before the deadline."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -224,7 +233,7 @@ pub fn create_list_agents_tool() -> ToolSpec {
     let properties = BTreeMap::from([(
         "path_prefix".to_string(),
         JsonSchema::string(Some(
-            "Optional task-path prefix. Accepts the same relative or absolute task-path syntax as other MultiAgentV2 agent targets."
+            "Optional task-path prefix (not ending with trailing slash). Accepts the same relative or absolute task-path syntax."
                 .to_string(),
         )),
     )]);
@@ -470,7 +479,7 @@ fn wait_output_schema_v2() -> Value {
             },
             "timed_out": {
                 "type": "boolean",
-                "description": "Whether the wait call returned due to timeout before any mailbox update arrived."
+                "description": "Whether the wait call returned because no mailbox update arrived before the timeout."
             }
         },
         "required": ["message", "timed_out"],
@@ -570,7 +579,7 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
         (
             "fork_turns".to_string(),
             JsonSchema::string(Some(
-                "Optional MultiAgentV2 fork mode. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
+                "Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
                     .to_string(),
             )),
         ),
@@ -605,20 +614,40 @@ fn hide_spawn_agent_metadata_options_v2(properties: &mut BTreeMap<String, JsonSc
 fn spawn_agent_tool_description(
     available_models_description: Option<&str>,
     return_value_description: &str,
+    include_usage_hint: bool,
+    usage_hint_text: Option<String>,
 ) -> String {
-    let agent_role_guidance = available_models_description
-        .map(|description| {
-            format!(
-                "Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself.\n{description}"
-            )
+    let agent_role_guidance = available_models_description.unwrap_or_default();
+
+    let tool_description = format!(
+        r#"
+        {agent_role_guidance}
+        Spawn a sub-agent for a well-scoped task. {return_value_description}"#
+    );
+
+    if !include_usage_hint {
+        return tool_description;
+    }
+    if let Some(usage_hint_text) = usage_hint_text {
+        return format!(
+            r#"
+        {tool_description}
+{usage_hint_text}"#
+        );
+    }
+    let agent_role_usage_hint = available_models_description
+        .map(|_| {
+            "Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself."
         })
         .unwrap_or_default();
     format!(
         r#"
-        Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work.
-        Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.
-        {agent_role_guidance}
-        Spawn a sub-agent for a well-scoped task. {return_value_description} This spawn_agent tool provides you access to smaller but more efficient sub-agents. A mini model can solve many tasks faster than the main model. You should follow the rules and guidelines below to use this tool.
+        {tool_description}
+This spawn_agent tool provides you access to smaller but more efficient sub-agents. A mini model can solve many tasks faster than the main model. You should follow the rules and guidelines below to use this tool.
+
+Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work.
+Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.
+{agent_role_usage_hint}
 
 ### When to delegate vs. do the subtask yourself
 - First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers on the critical path, and which tasks are sidecar tasks that are needed but can run in parallel without blocking the next local step. As part of that plan, explicitly decide what immediate task you should do locally right now. Do this planning step before delegating to agents so you do not hand off the immediate blocking task to a submodel and then waste time waiting on it.
@@ -649,6 +678,36 @@ fn spawn_agent_tool_description(
 - Delegate verification only when it can run in parallel with ongoing implementation and is likely to catch a concrete risk before final integration.
 - The key is to find opportunities to spawn multiple independent subtasks in parallel within the same round, while ensuring each subtask is well-defined, self-contained, and materially advances the main task."#
     )
+}
+
+fn spawn_agent_tool_description_v2(
+    available_models_description: Option<&str>,
+    include_usage_hint: bool,
+    usage_hint_text: Option<String>,
+) -> String {
+    let agent_role_guidance = available_models_description.unwrap_or_default();
+
+    let tool_description = format!(
+        r#"
+        {agent_role_guidance}
+        Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name "task_3" the agent will have canonical task name `/root/task1/task_3`.
+You are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.
+The spawned agent will have the same tools as you and the ability to spawn its own subagents.
+It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
+The new agent's canonical task name will be provided to it along with the message."#
+    );
+
+    if !include_usage_hint {
+        return tool_description;
+    }
+    if let Some(usage_hint_text) = usage_hint_text {
+        return format!(
+            r#"
+        {tool_description}
+{usage_hint_text}"#
+        );
+    }
+    tool_description
 }
 
 fn spawn_agent_models_description(models: &[ModelPreset]) -> String {
@@ -723,7 +782,7 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
     let properties = BTreeMap::from([(
         "timeout_ms".to_string(),
         JsonSchema::number(Some(format!(
-            "Optional timeout in milliseconds. Defaults to {}, min {}, max {}. Prefer longer waits (minutes) to avoid busy polling.",
+            "Optional timeout in milliseconds. Defaults to {}, min {}, max {}.",
             options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
         ))),
     )]);

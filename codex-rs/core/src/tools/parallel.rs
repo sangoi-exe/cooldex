@@ -13,13 +13,14 @@ use tracing::Instrument;
 use tracing::instrument;
 use tracing::trace_span;
 
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::AbortedToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::AnyToolResult;
+use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
 use crate::tools::router::ToolRouter;
@@ -61,8 +62,15 @@ impl ToolCallRuntime {
         }
     }
 
-    pub(crate) fn find_spec(&self, tool_name: &str) -> Option<ToolSpec> {
+    pub(crate) fn find_spec(&self, tool_name: &codex_tools::ToolName) -> Option<ToolSpec> {
         self.router.find_spec(tool_name)
+    }
+
+    pub(crate) fn create_diff_consumer(
+        &self,
+        tool_name: &codex_tools::ToolName,
+    ) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
+        self.router.create_diff_consumer(tool_name)
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -73,7 +81,7 @@ impl ToolCallRuntime {
     ) -> Result<ResponseInputItem, CodexErr> {
         let error_call = call.clone();
         if let Some(allowed_tool_names) = self.allowed_tool_names.as_ref()
-            && !allowed_tool_names.contains(call.tool_name.as_str())
+            && !allowed_tool_names.contains(call.tool_name.name.as_str())
         {
             return Ok(Self::disallowed_response(&call));
         }
@@ -95,18 +103,19 @@ impl ToolCallRuntime {
         source: ToolCallSource,
         cancellation_token: CancellationToken,
     ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
-        let supports_parallel = self.router.tool_supports_parallel(&call.tool_name);
+        let supports_parallel = self.router.tool_supports_parallel(&call);
         let router = Arc::clone(&self.router);
         let session = Arc::clone(&self.session);
         let turn = Arc::clone(&self.turn_context);
         let tracker = Arc::clone(&self.tracker);
         let lock = Arc::clone(&self.parallel_execution);
         let started = Instant::now();
+        let display_name = call.tool_name.display();
 
         let dispatch_span = trace_span!(
             "dispatch_tool_call_with_code_mode_result",
-            otel.name = call.tool_name.as_str(),
-            tool_name = call.tool_name.as_str(),
+            otel.name = display_name.as_str(),
+            tool_name = display_name.as_str(),
             call_id = call.call_id.as_str(),
             aborted = false,
         );
@@ -187,11 +196,15 @@ impl ToolCallRuntime {
     }
 
     fn abort_message(call: &ToolCall, secs: f32) -> String {
-        match call.tool_name.as_str() {
-            "shell" | "container.exec" | "local_shell" | "shell_command" | "unified_exec" => {
-                format!("Wall time: {secs:.1} seconds\naborted by user")
-            }
-            _ => format!("aborted by user after {secs:.1}s"),
+        if call.tool_name.namespace.is_none()
+            && matches!(
+                call.tool_name.name.as_str(),
+                "shell" | "container.exec" | "local_shell" | "shell_command" | "unified_exec"
+            )
+        {
+            format!("Wall time: {secs:.1} seconds\naborted by user")
+        } else {
+            format!("aborted by user after {secs:.1}s")
         }
     }
 
@@ -203,7 +216,7 @@ impl ToolCallRuntime {
         match &call.payload {
             ToolPayload::Custom { .. } => ResponseInputItem::CustomToolCallOutput {
                 call_id: call.call_id.clone(),
-                name: Some(call.tool_name.clone()),
+                name: Some(call.tool_name.to_string()),
                 output: FunctionCallOutputPayload {
                     body: FunctionCallOutputBody::Text(message),
                     success: Some(false),

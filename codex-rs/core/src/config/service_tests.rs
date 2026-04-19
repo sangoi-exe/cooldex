@@ -4,14 +4,10 @@ use codex_app_server_protocol::AppConfig;
 use codex_app_server_protocol::AppToolApproval;
 use codex_app_server_protocol::AppsConfig;
 use codex_app_server_protocol::AskForApproval;
-use codex_app_server_protocol::join_config_key_path_segments;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use tempfile::tempdir;
-
-// Merge-safety anchor: config service tests protect the local loader/override layering contract
-// that custom workspace config flows depend on.
 
 #[test]
 fn toml_value_to_item_handles_nested_config_tables() {
@@ -169,32 +165,27 @@ async fn write_value_supports_nested_app_paths() -> Result<()> {
 }
 
 #[tokio::test]
-async fn write_value_supports_escaped_dotted_app_keys() -> Result<()> {
+async fn write_value_supports_custom_mcp_server_default_tool_approval_mode() -> Result<()> {
     let tmp = tempdir().expect("tempdir");
-    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "")?;
+    std::fs::write(
+        tmp.path().join(CONFIG_TOML_FILE),
+        "[mcp_servers.docs]\ncommand = \"docs-server\"\n",
+    )?;
 
     let service = ConfigService::without_managed_config_for_tests(tmp.path().to_path_buf());
     service
         .write_value(ConfigValueWriteParams {
             file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
-            key_path: join_config_key_path_segments(["apps", "demo.app", "enabled"]),
-            value: serde_json::json!(false),
+            key_path: "mcp_servers.docs.default_tools_approval_mode".to_string(),
+            value: serde_json::json!("approve"),
             merge_strategy: MergeStrategy::Replace,
             expected_version: None,
         })
         .await
-        .expect("write dotted app enabled succeeds");
+        .expect("write mcp server default_tools_approval_mode succeeds");
 
-    service
-        .write_value(ConfigValueWriteParams {
-            file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
-            key_path: join_config_key_path_segments(["apps", "demo.app", "disabled_reason"]),
-            value: serde_json::json!("user"),
-            merge_strategy: MergeStrategy::Replace,
-            expected_version: None,
-        })
-        .await
-        .expect("write dotted app disabled_reason succeeds");
+    let contents = std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE))?;
+    assert!(contents.contains("default_tools_approval_mode = \"approve\""));
 
     let read = service
         .read(ConfigReadParams {
@@ -205,25 +196,14 @@ async fn write_value_supports_escaped_dotted_app_keys() -> Result<()> {
         .expect("config read succeeds");
 
     assert_eq!(
-        read.config.apps,
-        Some(AppsConfig {
-            default: None,
-            apps: std::collections::HashMap::from([(
-                "demo.app".to_string(),
-                AppConfig {
-                    enabled: false,
-                    destructive_enabled: None,
-                    open_world_enabled: None,
-                    default_tools_approval_mode: None,
-                    default_tools_enabled: None,
-                    tools: None,
-                },
-            )]),
-        })
+        read.config
+            .additional
+            .get("mcp_servers")
+            .and_then(|servers| servers.get("docs"))
+            .and_then(|docs| docs.get("default_tools_approval_mode")),
+        Some(&serde_json::json!("approve"))
     );
-    let config = std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE))?;
-    assert!(config.contains("[apps.\"demo.app\"]"));
-    assert!(config.contains("disabled_reason = \"user\""));
+
     Ok(())
 }
 

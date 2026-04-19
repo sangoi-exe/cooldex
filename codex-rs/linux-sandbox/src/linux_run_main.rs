@@ -438,6 +438,7 @@ fn run_bwrap_with_proc_fallback(
     let options = BwrapOptions {
         mount_proc,
         network_mode,
+        ..Default::default()
     };
     let mut bwrap_args = build_bwrap_argv(
         inner,
@@ -558,6 +559,7 @@ fn build_preflight_bwrap_argv(
         BwrapOptions {
             mount_proc: true,
             network_mode,
+            ..Default::default()
         },
     )
 }
