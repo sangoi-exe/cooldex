@@ -92,3 +92,7 @@ CHANGELOG.ignore.md
 __pycache__/
 *.pyc
 
+# Merge-safety anchor: keep the root repo ignoring the separate `.sangoi` checkout and local image captures after upstream resets/syncs.
+# Sangoi project docs / dev tooling (lives in separate repo; keep local checkout here)
+/.sangoi/
+*.png
