@@ -285,7 +285,8 @@ impl Session {
                 turn_state.push_pending_input(item);
             }
             let should_enable_prompt_gc = supports_prompt_gc
-                && !matches!(turn_context.session_source, SessionSource::SubAgent(_));
+                && !matches!(turn_context.session_source, SessionSource::SubAgent(_))
+                && crate::session::rollout_recovery_enabled(turn_context.config.as_ref());
             drop(turn_state);
             if should_enable_prompt_gc {
                 Some(turn.ensure_prompt_gc_sidecar())

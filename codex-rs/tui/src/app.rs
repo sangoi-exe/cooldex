@@ -1477,6 +1477,23 @@ impl AccountProjectionRefreshTrigger {
     }
 }
 
+#[derive(Clone, Debug)]
+struct VisibleAccountProjectionFollowers {
+    active_store_account_id: Option<String>,
+    status_account_display: Option<StatusAccountDisplay>,
+    plan_type: Option<PlanType>,
+    has_chatgpt_account: bool,
+    feedback_audience: FeedbackAudience,
+    default_model: String,
+    available_models: Vec<ModelPreset>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccountProjectionRefreshExpectation {
+    AcceptBaselineAfterRetries,
+    RequireChangeFromBaseline,
+}
+
 #[derive(Default)]
 struct WindowsSandboxState {
     setup_started_at: Option<Instant>,
@@ -2425,10 +2442,24 @@ impl App {
         changed
     }
 
+    fn visible_account_projection_followers(&self) -> VisibleAccountProjectionFollowers {
+        VisibleAccountProjectionFollowers {
+            active_store_account_id: self.observed_active_store_account_id.clone(),
+            status_account_display: self.chat_widget.status_account_display().cloned(),
+            plan_type: self.chat_widget.current_plan_type(),
+            has_chatgpt_account: self.chat_widget.has_chatgpt_account(),
+            feedback_audience: self.feedback_audience,
+            default_model: self.chat_widget.current_model().to_string(),
+            available_models: self
+                .model_catalog
+                .try_list_models()
+                .expect("model catalog listing is infallible"),
+        }
+    }
+
     // Merge-safety anchor: account-switch handling must keep chat-widget account identity and
     // rate-limit generation state in sync so stale refresh results never repopulate the next
     // account's `/status` cache or suppress its warnings.
-    #[cfg(test)]
     fn handle_active_account_changed(&mut self) {
         self.live_account_state_owner = LiveAccountStateOwner::AuthManager;
         self.refresh_observed_active_store_account_id();
@@ -2452,6 +2483,12 @@ impl App {
     fn refresh_account_mutation_bookkeeping(&mut self) {
         self.refresh_observed_active_store_account_id();
         self.recompute_accounts_status_cache_expiry(Utc::now());
+    }
+
+    fn begin_manual_account_projection_refresh(&mut self) -> VisibleAccountProjectionFollowers {
+        let stale_projection_baseline = self.visible_account_projection_followers();
+        self.handle_active_account_changed();
+        stale_projection_baseline
     }
 
     fn build_model_catalog(
@@ -2614,25 +2651,47 @@ impl App {
         app_server_client: &AppServerSession,
         trigger: AccountProjectionRefreshTrigger,
     ) {
+        self.refresh_app_server_account_projection_after_local_auth_change_from_baseline(
+            app_server_client,
+            trigger,
+            self.visible_account_projection_followers(),
+            AccountProjectionRefreshExpectation::AcceptBaselineAfterRetries,
+        );
+    }
+
+    fn refresh_app_server_account_projection_after_manual_auth_change(
+        &mut self,
+        app_server_client: &AppServerSession,
+        trigger: AccountProjectionRefreshTrigger,
+    ) {
+        let stale_projection_baseline = self.begin_manual_account_projection_refresh();
+        self.refresh_app_server_account_projection_after_local_auth_change_from_baseline(
+            app_server_client,
+            trigger,
+            stale_projection_baseline,
+            AccountProjectionRefreshExpectation::RequireChangeFromBaseline,
+        );
+    }
+
+    fn refresh_app_server_account_projection_after_local_auth_change_from_baseline(
+        &mut self,
+        app_server_client: &AppServerSession,
+        trigger: AccountProjectionRefreshTrigger,
+        stale_projection_baseline: VisibleAccountProjectionFollowers,
+        expectation: AccountProjectionRefreshExpectation,
+    ) {
         let request_id = self.next_account_projection_refresh_request_id;
         self.next_account_projection_refresh_request_id += 1;
         self.pending_account_projection_refresh_request_id = Some(request_id);
+        let expected_projection_followers = self.visible_account_projection_followers();
 
         let request_handle = app_server_client.request_handle();
         let app_event_tx = self.app_event_tx.clone();
-        let visible_status_account_display = self.chat_widget.status_account_display().cloned();
-        let visible_plan_type = self.chat_widget.current_plan_type();
-        let visible_has_chatgpt_account = self.chat_widget.has_chatgpt_account();
-        let visible_feedback_audience = self.feedback_audience;
-        let visible_model = self.chat_widget.current_model().to_string();
-        let visible_models = self
-            .model_catalog
-            .try_list_models()
-            .expect("model catalog listing is infallible");
         let trigger_description = trigger.description();
 
         tokio::spawn(async move {
             let mut last_successful_projection = None;
+            let mut saw_successful_projection = false;
             let mut last_error_message = None;
 
             for delay in [
@@ -2647,15 +2706,13 @@ impl App {
 
                 match load_account_projection_from_request_handle(request_handle.clone()).await {
                     Ok(projection) => {
-                        let changes_visible = !status_account_displays_match(
-                            visible_status_account_display.as_ref(),
-                            projection.status_account_display.as_ref(),
-                        ) || visible_plan_type != projection.plan_type
-                            || visible_has_chatgpt_account != projection.has_chatgpt_account
-                            || visible_feedback_audience != projection.feedback_audience
-                            || visible_model != projection.default_model
-                            || visible_models != projection.available_models;
-                        if changes_visible {
+                        saw_successful_projection = true;
+                        if App::app_server_projection_is_acceptable_after_local_auth_change(
+                            &stale_projection_baseline,
+                            &expected_projection_followers,
+                            &projection,
+                            expectation,
+                        ) {
                             app_event_tx.send(AppEvent::AppServerAccountProjectionRefreshed {
                                 request_id,
                                 trigger_description,
@@ -2663,7 +2720,11 @@ impl App {
                             });
                             return;
                         }
-                        last_successful_projection = Some(projection);
+                        if expectation
+                            == AccountProjectionRefreshExpectation::AcceptBaselineAfterRetries
+                        {
+                            last_successful_projection = Some(projection);
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -2679,9 +2740,25 @@ impl App {
             let result = if let Some(projection) = last_successful_projection {
                 Ok(projection)
             } else {
-                Err(last_error_message.unwrap_or_else(|| {
-                    "app-server account projection refresh returned no projection".to_string()
-                }))
+                Err(match expectation {
+                    AccountProjectionRefreshExpectation::AcceptBaselineAfterRetries => {
+                        last_error_message.unwrap_or_else(|| {
+                            "app-server account projection refresh returned no projection"
+                                .to_string()
+                        })
+                    }
+                    AccountProjectionRefreshExpectation::RequireChangeFromBaseline => {
+                        if saw_successful_projection {
+                            "app-server account projection stayed stale after the local account change"
+                                .to_string()
+                        } else {
+                            last_error_message.unwrap_or_else(|| {
+                                "app-server account projection refresh returned no projection"
+                                    .to_string()
+                            })
+                        }
+                    }
+                })
             };
             app_event_tx.send(AppEvent::AppServerAccountProjectionRefreshed {
                 request_id,
@@ -2715,12 +2792,53 @@ impl App {
     async fn refresh_app_server_account_projection_after_local_auth_change_with<F, Fut>(
         &mut self,
         trigger: AccountProjectionRefreshTrigger,
+        load_projection: F,
+    ) where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<AppServerAccountProjection>>,
+    {
+        self.refresh_app_server_account_projection_after_local_auth_change_with_baseline(
+            trigger,
+            self.visible_account_projection_followers(),
+            AccountProjectionRefreshExpectation::AcceptBaselineAfterRetries,
+            load_projection,
+        )
+        .await;
+    }
+
+    #[cfg(test)]
+    async fn refresh_app_server_account_projection_after_manual_auth_change_with<F, Fut>(
+        &mut self,
+        trigger: AccountProjectionRefreshTrigger,
+        load_projection: F,
+    ) where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<AppServerAccountProjection>>,
+    {
+        let stale_projection_baseline = self.begin_manual_account_projection_refresh();
+        self.refresh_app_server_account_projection_after_local_auth_change_with_baseline(
+            trigger,
+            stale_projection_baseline,
+            AccountProjectionRefreshExpectation::RequireChangeFromBaseline,
+            load_projection,
+        )
+        .await;
+    }
+
+    #[cfg(test)]
+    async fn refresh_app_server_account_projection_after_local_auth_change_with_baseline<F, Fut>(
+        &mut self,
+        trigger: AccountProjectionRefreshTrigger,
+        stale_projection_baseline: VisibleAccountProjectionFollowers,
+        expectation: AccountProjectionRefreshExpectation,
         mut load_projection: F,
     ) where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<AppServerAccountProjection>>,
     {
+        let expected_projection_followers = self.visible_account_projection_followers();
         let mut last_successful_projection = None;
+        let mut saw_successful_projection = false;
         let mut last_error_message = None;
 
         for delay in [
@@ -2735,11 +2853,21 @@ impl App {
 
             match load_projection().await {
                 Ok(projection) => {
-                    if self.app_server_projection_changes_visible_followers(&projection) {
+                    saw_successful_projection = true;
+                    if Self::app_server_projection_is_acceptable_after_local_auth_change(
+                        &stale_projection_baseline,
+                        &expected_projection_followers,
+                        &projection,
+                        expectation,
+                    ) {
                         self.finish_app_server_account_projection_refresh(projection);
                         return;
                     }
-                    last_successful_projection = Some(projection);
+                    if expectation
+                        == AccountProjectionRefreshExpectation::AcceptBaselineAfterRetries
+                    {
+                        last_successful_projection = Some(projection);
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -2757,7 +2885,20 @@ impl App {
             return;
         }
 
-        if let Some(error_message) = last_error_message {
+        let error_message = match expectation {
+            AccountProjectionRefreshExpectation::AcceptBaselineAfterRetries => last_error_message,
+            AccountProjectionRefreshExpectation::RequireChangeFromBaseline => {
+                if saw_successful_projection {
+                    Some(
+                        "app-server account projection stayed stale after the local account change"
+                            .to_string(),
+                    )
+                } else {
+                    last_error_message
+                }
+            }
+        };
+        if let Some(error_message) = error_message {
             self.report_app_server_account_projection_refresh_error(
                 trigger.description(),
                 error_message,
@@ -2782,23 +2923,34 @@ impl App {
         false
     }
 
-    #[cfg(test)]
-    fn app_server_projection_changes_visible_followers(
-        &self,
+    fn app_server_projection_changes_followers_from(
+        visible_followers: &VisibleAccountProjectionFollowers,
         projection: &AppServerAccountProjection,
     ) -> bool {
         !status_account_displays_match(
-            self.chat_widget.status_account_display(),
+            visible_followers.status_account_display.as_ref(),
             projection.status_account_display.as_ref(),
-        ) || self.chat_widget.current_plan_type() != projection.plan_type
-            || self.chat_widget.has_chatgpt_account() != projection.has_chatgpt_account
-            || self.feedback_audience != projection.feedback_audience
-            || self.chat_widget.current_model() != projection.default_model
-            || self
-                .model_catalog
-                .try_list_models()
-                .expect("model catalog listing is infallible")
-                != projection.available_models
+        ) || visible_followers.plan_type != projection.plan_type
+            || visible_followers.has_chatgpt_account != projection.has_chatgpt_account
+            || visible_followers.feedback_audience != projection.feedback_audience
+            || visible_followers.default_model != projection.default_model
+            || visible_followers.available_models != projection.available_models
+    }
+
+    fn app_server_projection_is_acceptable_after_local_auth_change(
+        stale_projection_baseline: &VisibleAccountProjectionFollowers,
+        expected_projection_followers: &VisibleAccountProjectionFollowers,
+        projection: &AppServerAccountProjection,
+        expectation: AccountProjectionRefreshExpectation,
+    ) -> bool {
+        Self::app_server_projection_changes_followers_from(stale_projection_baseline, projection)
+            || (expectation == AccountProjectionRefreshExpectation::RequireChangeFromBaseline
+                && stale_projection_baseline.active_store_account_id
+                    != expected_projection_followers.active_store_account_id
+                && !Self::app_server_projection_changes_followers_from(
+                    expected_projection_followers,
+                    projection,
+                ))
     }
 
     fn report_app_server_account_projection_refresh_error(
@@ -4000,7 +4152,7 @@ impl App {
             }
             AppCommandView::StopBackgroundTerminals => {
                 app_server
-                    .thread_background_terminals_stop(thread_id)
+                    .thread_background_terminals_clean(thread_id)
                     .await?;
                 Ok(true)
             }
@@ -6705,8 +6857,7 @@ impl App {
                                 )
                             })
                             .unwrap_or_else(|| account_id.clone());
-                        self.refresh_account_mutation_bookkeeping();
-                        self.refresh_app_server_account_projection_after_local_auth_change(
+                        self.refresh_app_server_account_projection_after_manual_auth_change(
                             app_server,
                             AccountProjectionRefreshTrigger::ManualSetActiveAccount,
                         );
@@ -6838,14 +6989,13 @@ impl App {
                 ChatGptAddAccountOutcome::Success {
                     active_account_display,
                 } => {
-                    self.refresh_account_mutation_bookkeeping();
+                    self.refresh_app_server_account_projection_after_manual_auth_change(
+                        app_server,
+                        AccountProjectionRefreshTrigger::ManualAddAccount,
+                    );
                     self.maybe_start_accounts_status_refresh(
                         /*force*/ true, /*open_popup_when_ready*/ false,
                         /*show_loading_popup*/ false,
-                    );
-                    self.refresh_app_server_account_projection_after_local_auth_change(
-                        app_server,
-                        AccountProjectionRefreshTrigger::ManualAddAccount,
                     );
                     if let Some(display) = active_account_display {
                         self.chat_widget.add_info_message(
@@ -9842,19 +9992,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_app_server_account_projection_after_manual_set_active_account_converges_followers()
+    async fn refresh_app_server_account_projection_after_manual_set_active_account_skips_stale_projection_before_converging_followers()
      {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
         seed_chatgpt_accounts(&mut app, "account-a");
         let initial_models = vec![all_model_presets()[0].clone()];
         let initial_default_model = initial_models[0].model.clone();
-        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+        let stale_projection = test_chatgpt_account_projection(
             "Server Account",
             "server@example.com",
             PlanType::Plus,
-            initial_models,
+            initial_models.clone(),
             initial_default_model,
-        ));
+        );
+        app.finish_app_server_account_projection_refresh(stale_projection.clone());
         while app_event_rx.try_recv().is_ok() {}
 
         let secondary_store_account_id = app
@@ -9867,22 +10018,22 @@ mod tests {
         app.auth_manager
             .set_active_account(&secondary_store_account_id)
             .expect("switch active account");
-        app.refresh_account_mutation_bookkeeping();
 
         let refreshed_models = vec![all_model_presets()[1].clone()];
         let refreshed_default_model = refreshed_models[0].model.clone();
-        let attempts = Arc::new(Mutex::new(VecDeque::from(vec![Ok(
-            test_chatgpt_account_projection(
+        let attempts = Arc::new(Mutex::new(VecDeque::from(vec![
+            Ok(stale_projection),
+            Ok(test_chatgpt_account_projection(
                 "Switched Account",
                 "switched@openai.com",
                 PlanType::Pro,
                 refreshed_models,
                 refreshed_default_model.clone(),
-            ),
-        )])));
+            )),
+        ])));
         let attempts_clone = Arc::clone(&attempts);
 
-        app.refresh_app_server_account_projection_after_local_auth_change_with(
+        app.refresh_app_server_account_projection_after_manual_auth_change_with(
             AccountProjectionRefreshTrigger::ManualSetActiveAccount,
             move || {
                 let attempts = Arc::clone(&attempts_clone);
@@ -9896,6 +10047,11 @@ mod tests {
             },
         )
         .await;
+
+        assert!(
+            attempts.lock().await.is_empty(),
+            "manual refresh should consume the stale projection before accepting the converged one"
+        );
 
         assert_eq!(
             app.live_account_state_owner,
@@ -9916,6 +10072,96 @@ mod tests {
         assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Pro));
         assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
         assert_eq!(app.chat_widget.current_model(), refreshed_default_model);
+    }
+
+    #[tokio::test]
+    async fn refresh_app_server_account_projection_after_manual_set_active_account_accepts_identical_followers_when_store_account_changed()
+     {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        app.handle_active_account_changed();
+        while app_event_rx.try_recv().is_ok() {}
+
+        let primary_store_account_id = app
+            .observed_active_store_account_id
+            .clone()
+            .expect("primary account should be observed");
+        let secondary_store_account_id = app
+            .auth_manager
+            .list_accounts()
+            .into_iter()
+            .find(|account| account.label.as_deref() == Some("Secondary"))
+            .map(|account| account.id)
+            .expect("secondary account should exist");
+        app.auth_manager
+            .set_active_account(&secondary_store_account_id)
+            .expect("switch active account");
+        app.handle_active_account_changed();
+
+        let expected_projection_followers = app.visible_account_projection_followers();
+        let stale_projection_baseline = VisibleAccountProjectionFollowers {
+            active_store_account_id: Some(primary_store_account_id),
+            ..expected_projection_followers.clone()
+        };
+        let projection = AppServerAccountProjection {
+            account_email: match expected_projection_followers
+                .status_account_display
+                .as_ref()
+            {
+                Some(StatusAccountDisplay::ChatGpt {
+                    email: Some(email), ..
+                }) => Some(email.clone()),
+                _ => None,
+            },
+            auth_mode: Some(codex_otel::TelemetryAuthMode::Chatgpt),
+            status_account_display: expected_projection_followers.status_account_display.clone(),
+            plan_type: expected_projection_followers.plan_type,
+            requires_openai_auth: expected_projection_followers.has_chatgpt_account,
+            default_model: expected_projection_followers.default_model.clone(),
+            feedback_audience: expected_projection_followers.feedback_audience,
+            has_chatgpt_account: expected_projection_followers.has_chatgpt_account,
+            available_models: expected_projection_followers.available_models.clone(),
+        };
+        let attempts = Arc::new(Mutex::new(VecDeque::from(vec![Ok(projection)])));
+        let attempts_clone = Arc::clone(&attempts);
+
+        app.refresh_app_server_account_projection_after_local_auth_change_with_baseline(
+            AccountProjectionRefreshTrigger::ManualSetActiveAccount,
+            stale_projection_baseline,
+            AccountProjectionRefreshExpectation::RequireChangeFromBaseline,
+            move || {
+                let attempts = Arc::clone(&attempts_clone);
+                async move {
+                    attempts
+                        .lock()
+                        .await
+                        .pop_front()
+                        .expect("projection attempt should exist")
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            attempts.lock().await.is_empty(),
+            "manual refresh should accept an observationally identical projection once the active store account id changed"
+        );
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(secondary_store_account_id)
+        );
+        assert!(matches!(
+            app.chat_widget.status_account_display(),
+            Some(StatusAccountDisplay::ChatGpt {
+                label: Some(label),
+                email: Some(email),
+                plan: None,
+            }) if label == "Secondary" && email == "secondary@example.com"
+        ));
     }
 
     #[tokio::test]
@@ -9951,7 +10197,6 @@ mod tests {
                 .expect("remove active account"),
             "active account should be removed",
         );
-        app.refresh_account_mutation_bookkeeping();
 
         let refreshed_models = vec![all_model_presets()[1].clone()];
         let refreshed_default_model = refreshed_models[0].model.clone();
@@ -9966,7 +10211,7 @@ mod tests {
         )])));
         let attempts_clone = Arc::clone(&attempts);
 
-        app.refresh_app_server_account_projection_after_local_auth_change_with(
+        app.refresh_app_server_account_projection_after_manual_auth_change_with(
             AccountProjectionRefreshTrigger::ManualRemoveActiveAccount,
             move || {
                 let attempts = Arc::clone(&attempts_clone);
@@ -10052,7 +10297,6 @@ mod tests {
                 .expect("remove last account"),
             "last account should be removed",
         );
-        app.refresh_account_mutation_bookkeeping();
 
         let available_models = all_model_presets();
         let default_model = available_models[0].model.clone();
@@ -10071,7 +10315,7 @@ mod tests {
         )])));
         let attempts_clone = Arc::clone(&attempts);
 
-        app.refresh_app_server_account_projection_after_local_auth_change_with(
+        app.refresh_app_server_account_projection_after_manual_auth_change_with(
             AccountProjectionRefreshTrigger::ManualRemoveLastAccount,
             move || {
                 let attempts = Arc::clone(&attempts_clone);
@@ -10559,7 +10803,6 @@ mod tests {
             .map(|summary| summary.store_account_id)
             .expect("active store account id after add-account reload");
 
-        app.refresh_account_mutation_bookkeeping();
         let refreshed_models = vec![all_model_presets()[1].clone()];
         let refreshed_default_model = refreshed_models[0].model.clone();
         let attempts = Arc::new(Mutex::new(VecDeque::from(vec![Ok(
@@ -10573,7 +10816,7 @@ mod tests {
         )])));
         let attempts_clone = Arc::clone(&attempts);
 
-        app.refresh_app_server_account_projection_after_local_auth_change_with(
+        app.refresh_app_server_account_projection_after_manual_auth_change_with(
             AccountProjectionRefreshTrigger::ManualAddAccount,
             move || {
                 let attempts = Arc::clone(&attempts_clone);
@@ -10669,21 +10912,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_app_server_account_projection_after_manual_account_change_keeps_last_good_state_and_emits_error()
+    async fn refresh_app_server_account_projection_after_manual_account_change_keeps_local_account_identity_and_emits_error()
      {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let initial_models = vec![all_model_presets()[0].clone()];
+        let initial_default_model = initial_models[0].model.clone();
+        app.finish_app_server_account_projection_refresh(test_chatgpt_account_projection(
+            "Original",
+            "original@example.com",
+            PlanType::Plus,
+            initial_models,
+            initial_default_model.clone(),
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        let secondary_store_account_id = app
+            .auth_manager
+            .list_accounts()
+            .into_iter()
+            .find(|account| account.label.as_deref() == Some("Secondary"))
+            .map(|account| account.id)
+            .expect("secondary account should exist");
+        app.auth_manager
+            .set_active_account(&secondary_store_account_id)
+            .expect("switch active account");
         let original_model_catalog = app.model_catalog.clone();
         let original_model = app.chat_widget.current_model().to_string();
-        app.chat_widget.update_account_state(
-            Some(StatusAccountDisplay::ChatGpt {
-                label: Some("Original".to_string()),
-                email: Some("original@example.com".to_string()),
-                plan: Some("Plus".to_string()),
-            }),
-            Some(PlanType::Plus),
-            true,
-        );
-        app.feedback_audience = FeedbackAudience::OpenAiEmployee;
 
         let attempts = Arc::new(Mutex::new(VecDeque::from(vec![
             Err(color_eyre::eyre::eyre!("model/list failed")),
@@ -10693,7 +10948,7 @@ mod tests {
         ])));
         let attempts_clone = Arc::clone(&attempts);
 
-        app.refresh_app_server_account_projection_after_local_auth_change_with(
+        app.refresh_app_server_account_projection_after_manual_auth_change_with(
             AccountProjectionRefreshTrigger::ManualSetActiveAccount,
             move || {
                 let attempts = Arc::clone(&attempts_clone);
@@ -10708,15 +10963,23 @@ mod tests {
         )
         .await;
 
+        assert_eq!(
+            app.live_account_state_owner,
+            LiveAccountStateOwner::AuthManager
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(secondary_store_account_id)
+        );
         assert!(matches!(
             app.chat_widget.status_account_display(),
             Some(StatusAccountDisplay::ChatGpt {
                 label: Some(label),
                 email: Some(email),
-                plan: Some(plan),
-            }) if label == "Original" && email == "original@example.com" && plan == "Plus"
+                plan: None,
+            }) if label == "Secondary" && email == "secondary@example.com"
         ));
-        assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
+        assert_eq!(app.chat_widget.current_plan_type(), None);
         assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
         assert!(Arc::ptr_eq(&app.model_catalog, &original_model_catalog));
         assert_eq!(app.chat_widget.current_model(), original_model);

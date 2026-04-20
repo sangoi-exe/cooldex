@@ -37,6 +37,7 @@ use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::AuthDotJson;
+use codex_login::AuthStore;
 use codex_login::save_auth;
 use pretty_assertions::assert_eq;
 use rmcp::handler::server::ServerHandler;
@@ -114,13 +115,13 @@ async fn list_apps_returns_empty_with_api_key_auth() -> Result<()> {
     write_connectors_config(codex_home.path(), &server_url)?;
     save_auth(
         codex_home.path(),
-        &AuthDotJson {
+        &AuthStore::from_legacy(AuthDotJson {
             auth_mode: Some(AuthMode::ApiKey),
             openai_api_key: Some("test-api-key".to_string()),
             tokens: None,
             last_refresh: None,
             agent_identity: None,
-        },
+        }),
         AuthCredentialsStoreMode::File,
     )?;
 

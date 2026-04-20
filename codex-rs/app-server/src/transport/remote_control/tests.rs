@@ -1069,7 +1069,9 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
     let codex_home = TempDir::new().expect("temp dir should create");
     save_auth(
         codex_home.path(),
-        &remote_control_auth_dot_json(/*account_id*/ None),
+        &codex_login::AuthStore::from_legacy(remote_control_auth_dot_json(
+            /*account_id*/ None,
+        )),
         AuthCredentialsStoreMode::File,
     )
     .expect("auth without account id should save");
@@ -1108,7 +1110,7 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
 
     save_auth(
         codex_home.path(),
-        &remote_control_auth_dot_json(Some("account_id")),
+        &codex_login::AuthStore::from_legacy(remote_control_auth_dot_json(Some("account_id"))),
         AuthCredentialsStoreMode::File,
     )
     .expect("auth with account id should save");

@@ -190,6 +190,7 @@ Example with notification opt-out:
 - `collaborationMode/list` — list available collaboration mode presets (experimental, no pagination). This response omits built-in developer instructions; clients should either pass `settings.developer_instructions: null` when setting a mode to use Codex's built-in instructions, or provide their own instructions explicitly.
 - `skills/list` — list skills for one or more `cwd` values (optional `forceReload`).
 - `marketplace/add` — add a remote plugin marketplace from an HTTP(S) Git URL, SSH Git URL, or GitHub `owner/repo` shorthand, then persist it into the user marketplace config. Returns the installed root path plus whether the marketplace was already present.
+- `marketplace/remove` — remove a configured marketplace by name from the user marketplace config, and delete its installed marketplace root when one exists.
 - `plugin/list` — list discovered plugin marketplaces and plugin state, including effective marketplace install/auth policy metadata, fail-open `marketplaceLoadErrors` entries for marketplace files that could not be parsed or loaded, and best-effort `featuredPluginIds` for the official curated marketplace. `interface.category` uses the marketplace category when present; otherwise it falls back to the plugin manifest category (**under development; do not call from production clients yet**).
 - `plugin/read` — read one plugin by `marketplacePath` plus `pluginName`, returning marketplace info, a list-style `summary`, manifest descriptions/interface metadata, and bundled skills/apps/MCP server names. Returned plugin skills include their current `enabled` state after local config filtering. Plugin app summaries also include `needsAuth` when the server can determine connector accessibility (**under development; do not call from production clients yet**).
 - `skills/changed` — notification emitted when watched local skill files change.
@@ -1438,7 +1439,7 @@ The JSON-RPC auth/account surface exposes request/response methods plus server-i
 
 ### Authentication modes
 
-Codex supports these authentication modes. The current mode is surfaced in `account/updated` (`authMode`), which also includes the current ChatGPT `planType` when available, and can be inferred from `account/read`.
+Codex supports these authentication modes. The current mode is surfaced in `account/updated` (`authMode`), which also includes the current ChatGPT `label` and `planType` when available, and can be inferred from `account/read`.
 
 - **API key (`apiKey`)**: Caller supplies an OpenAI API key via `account/login/start` with `type: "apiKey"`. The API key is saved and used for API requests.
 - **ChatGPT managed (`chatgpt`)** (recommended): Codex owns the ChatGPT OAuth flow and refresh tokens. Start via `account/login/start` with `type: "chatgpt"` for the browser flow or `type: "chatgptDeviceCode"` for device code; Codex persists tokens to disk and refreshes them automatically.
@@ -1450,7 +1451,7 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 - `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
 - `account/login/cancel` — cancel a pending managed ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated`.
-- `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, or `null`) and includes the current ChatGPT `planType` when available.
+- `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, or `null`) and includes the current ChatGPT `label` and `planType` when available.
 - `account/rateLimits/read` — fetch ChatGPT rate limits; updates arrive via `account/rateLimits/updated` (notify).
 - `account/rateLimits/updated` (notify) — emitted whenever a user's ChatGPT rate limits change.
 - `account/sendAddCreditsNudgeEmail` — ask ChatGPT to email the workspace owner about depleted credits or a reached usage limit.
@@ -1471,7 +1472,7 @@ Response examples:
 { "id": 1, "result": { "account": null, "requiresOpenaiAuth": false } } // No OpenAI auth needed (e.g., OSS/local models)
 { "id": 1, "result": { "account": null, "requiresOpenaiAuth": true } }  // OpenAI auth required (typical for OpenAI-hosted models)
 { "id": 1, "result": { "account": { "type": "apiKey" }, "requiresOpenaiAuth": true } }
-{ "id": 1, "result": { "account": { "type": "chatgpt", "email": "user@example.com", "planType": "pro" }, "requiresOpenaiAuth": true } }
+{ "id": 1, "result": { "account": { "type": "chatgpt", "label": null, "email": "user@example.com", "planType": "pro" }, "requiresOpenaiAuth": true } }
 ```
 
 Field notes:
@@ -1496,7 +1497,7 @@ Field notes:
 3. Notifications:
    ```json
    { "method": "account/login/completed", "params": { "loginId": null, "success": true, "error": null } }
-   { "method": "account/updated", "params": { "authMode": "apikey", "planType": null } }
+   { "method": "account/updated", "params": { "authMode": "apikey", "label": null, "planType": null } }
    ```
 
 ### 3) Log in with ChatGPT (browser flow)
@@ -1510,7 +1511,7 @@ Field notes:
 3. Wait for notifications:
    ```json
    { "method": "account/login/completed", "params": { "loginId": "<uuid>", "success": true, "error": null } }
-   { "method": "account/updated", "params": { "authMode": "chatgpt", "planType": "plus" } }
+   { "method": "account/updated", "params": { "authMode": "chatgpt", "label": "ChatGPT", "planType": "plus" } }
    ```
 
 ### 4) Log in with ChatGPT (device code flow)
@@ -1524,7 +1525,7 @@ Field notes:
 3. Wait for notifications:
    ```json
    { "method": "account/login/completed", "params": { "loginId": "<uuid>", "success": true, "error": null } }
-   { "method": "account/updated", "params": { "authMode": "chatgpt", "planType": "plus" } }
+   { "method": "account/updated", "params": { "authMode": "chatgpt", "label": "ChatGPT", "planType": "plus" } }
    ```
 
 ### 5) Cancel a ChatGPT login
@@ -1539,20 +1540,20 @@ Field notes:
 ```json
 { "method": "account/logout", "id": 6 }
 { "id": 6, "result": {} }
-{ "method": "account/updated", "params": { "authMode": null, "planType": null } }
+{ "method": "account/updated", "params": { "authMode": null, "label": null, "planType": null } }
 ```
 
 ### 7) Rate limits (ChatGPT)
 
 ```json
 { "method": "account/rateLimits/read", "id": 7 }
-{ "id": 7, "result": { "rateLimits": { "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "rateLimitReachedType": null } } }
+{ "id": 7, "result": { "rateLimits": { "primary": { "remainingPercent": 75, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "rateLimitReachedType": null } } }
 { "method": "account/rateLimits/updated", "params": { "rateLimits": { … } } }
 ```
 
 Field notes:
 
-- `usedPercent` is current usage within the OpenAI quota window.
+- `remainingPercent` is the remaining quota percentage within the OpenAI quota window.
 - `windowDurationMins` is the quota window length.
 - `resetsAt` is a Unix timestamp (seconds) for the next reset.
 - `rateLimitReachedType` identifies the backend-classified limit state when one has been reached.

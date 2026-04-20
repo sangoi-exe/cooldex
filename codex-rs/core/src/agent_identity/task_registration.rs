@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_login::AgentIdentityAuthRecord;
+use codex_protocol::protocol::SessionAgentTask;
 use crypto_box::SecretKey as Curve25519SecretKey;
 use ed25519_dalek::Signer as _;
 use serde::Deserialize;
@@ -33,6 +36,14 @@ struct RegisterTaskRequest {
 #[derive(Debug, Deserialize)]
 struct RegisterTaskResponse {
     encrypted_task_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct AgentAssertionEnvelope {
+    agent_runtime_id: String,
+    task_id: String,
+    timestamp: String,
+    signature: String,
 }
 
 impl AgentIdentityManager {
@@ -107,6 +118,49 @@ impl AgentIdentityManager {
 }
 
 impl RegisteredAgentTask {
+    pub(crate) fn authorization_header(&self, record: &AgentIdentityAuthRecord) -> Result<String> {
+        anyhow::ensure!(
+            record.agent_runtime_id == self.agent_runtime_id,
+            "agent task runtime {} does not match stored agent identity {}",
+            self.agent_runtime_id,
+            record.agent_runtime_id
+        );
+
+        let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let envelope = AgentAssertionEnvelope {
+            agent_runtime_id: self.agent_runtime_id.clone(),
+            task_id: self.task_id.clone(),
+            timestamp: timestamp.clone(),
+            signature: sign_agent_assertion_payload(record, self, &timestamp)?,
+        };
+        let serialized_assertion = serialize_agent_assertion(&envelope)?;
+        Ok(format!("AgentAssertion {serialized_assertion}"))
+    }
+
+    pub(crate) fn to_session_agent_task(&self) -> SessionAgentTask {
+        SessionAgentTask {
+            agent_runtime_id: self.agent_runtime_id.clone(),
+            task_id: self.task_id.clone(),
+            registered_at: self.registered_at.clone(),
+        }
+    }
+
+    pub(crate) fn from_session_agent_task(
+        task: SessionAgentTask,
+        binding_id: String,
+        chatgpt_account_id: String,
+        chatgpt_user_id: Option<String>,
+    ) -> Self {
+        Self {
+            binding_id,
+            chatgpt_account_id,
+            chatgpt_user_id,
+            agent_runtime_id: task.agent_runtime_id,
+            task_id: task.task_id,
+            registered_at: task.registered_at,
+        }
+    }
+
     pub(super) fn matches_binding(&self, binding: &AgentIdentityBinding) -> bool {
         binding.matches_parts(
             &self.binding_id,
@@ -114,12 +168,27 @@ impl RegisteredAgentTask {
             self.chatgpt_user_id.as_deref(),
         )
     }
+}
 
-    pub(crate) fn has_same_binding(&self, other: &Self) -> bool {
-        self.binding_id == other.binding_id
-            && self.chatgpt_account_id == other.chatgpt_account_id
-            && self.chatgpt_user_id == other.chatgpt_user_id
-    }
+fn sign_agent_assertion_payload(
+    record: &AgentIdentityAuthRecord,
+    task: &RegisteredAgentTask,
+    timestamp: &str,
+) -> Result<String> {
+    let signing_key = signing_key_from_private_key_pkcs8_base64(&record.agent_private_key)?;
+    let payload = format!("{}:{}:{timestamp}", task.agent_runtime_id, task.task_id);
+    Ok(BASE64_STANDARD.encode(signing_key.sign(payload.as_bytes()).to_bytes()))
+}
+
+fn serialize_agent_assertion(envelope: &AgentAssertionEnvelope) -> Result<String> {
+    let payload = serde_json::to_vec(&BTreeMap::from([
+        ("agent_runtime_id", envelope.agent_runtime_id.as_str()),
+        ("signature", envelope.signature.as_str()),
+        ("task_id", envelope.task_id.as_str()),
+        ("timestamp", envelope.timestamp.as_str()),
+    ]))
+    .context("failed to serialize agent assertion envelope")?;
+    Ok(URL_SAFE_NO_PAD.encode(payload))
 }
 
 fn sign_task_registration_payload(

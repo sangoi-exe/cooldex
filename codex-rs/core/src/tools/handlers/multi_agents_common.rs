@@ -212,7 +212,7 @@ fn apply_child_prompt_overrides(config: &mut Config) {
     // sub-agent recall warning. Re-run this after any role/profile reload that reconstructs
     // `Config` from persisted layers.
     config.pos_compact_instructions =
-        Some(crate::session::SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY.to_string());
+        Some(crate::session::default_pos_compact_warning(config, /*is_subagent*/ true).to_string());
 }
 
 pub(crate) async fn finalize_spawn_agent_prompt_config(

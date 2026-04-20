@@ -7,9 +7,10 @@ use codex_app_server_protocol::AuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::AuthDotJson;
 use codex_login::AuthManager;
+use codex_login::AuthStore;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_login::RefreshTokenError;
-use codex_login::load_auth_dot_json;
+use codex_login::load_auth_store;
 use codex_login::save_auth;
 use codex_login::token_data::IdTokenInfo;
 use codex_login::token_data::TokenData;
@@ -19,6 +20,7 @@ use pretty_assertions::assert_eq;
 use serde::Serialize;
 use serde_json::json;
 use std::ffi::OsString;
+use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 use wiremock::Mock;
@@ -29,6 +31,9 @@ use wiremock::matchers::path;
 
 const INITIAL_ACCESS_TOKEN: &str = "initial-access-token";
 const INITIAL_REFRESH_TOKEN: &str = "initial-refresh-token";
+
+// Merge-safety anchor: auth refresh tests must persist fixtures through AuthStore and
+// assert against the live store contract instead of removed legacy-only load/save helpers.
 
 #[serial_test::serial(auth_refresh)]
 #[tokio::test]
@@ -69,9 +74,9 @@ async fn refresh_token_succeeds_updates_storage() -> Result<()> {
         ..initial_tokens.clone()
     };
     let stored = ctx.load_auth()?;
-    let tokens = stored.tokens.as_ref().context("tokens should exist")?;
-    assert_eq!(tokens, &refreshed_tokens);
-    let refreshed_at = stored
+    let active_account = active_account(&stored)?;
+    assert_eq!(&active_account.tokens, &refreshed_tokens);
+    let refreshed_at = active_account
         .last_refresh
         .as_ref()
         .context("last_refresh should be recorded")?;
@@ -133,9 +138,9 @@ async fn refresh_token_refreshes_when_auth_is_unchanged() -> Result<()> {
         ..initial_tokens.clone()
     };
     let stored = ctx.load_auth()?;
-    let tokens = stored.tokens.as_ref().context("tokens should exist")?;
-    assert_eq!(tokens, &refreshed_tokens);
-    let refreshed_at = stored
+    let active_account = active_account(&stored)?;
+    assert_eq!(&active_account.tokens, &refreshed_tokens);
+    let refreshed_at = active_account
         .last_refresh
         .as_ref()
         .context("last_refresh should be recorded")?;
@@ -185,11 +190,7 @@ async fn refresh_token_skips_refresh_when_auth_changed() -> Result<()> {
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
     };
-    save_auth(
-        ctx.codex_home.path(),
-        &disk_auth,
-        AuthCredentialsStoreMode::File,
-    )?;
+    save_legacy_auth(ctx.codex_home.path(), &disk_auth)?;
 
     ctx.auth_manager
         .refresh_token()
@@ -197,7 +198,7 @@ async fn refresh_token_skips_refresh_when_auth_changed() -> Result<()> {
         .context("refresh should be skipped")?;
 
     let stored = ctx.load_auth()?;
-    assert_eq!(stored, disk_auth);
+    assert_store_matches_legacy(&stored, &disk_auth);
 
     let cached_auth = ctx
         .auth_manager
@@ -251,11 +252,7 @@ async fn refresh_token_errors_on_account_mismatch() -> Result<()> {
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
     };
-    save_auth(
-        ctx.codex_home.path(),
-        &disk_auth,
-        AuthCredentialsStoreMode::File,
-    )?;
+    save_legacy_auth(ctx.codex_home.path(), &disk_auth)?;
 
     let err = ctx
         .auth_manager
@@ -266,7 +263,7 @@ async fn refresh_token_errors_on_account_mismatch() -> Result<()> {
     assert_eq!(err.failed_reason(), Some(RefreshTokenFailedReason::Other));
 
     let stored = ctx.load_auth()?;
-    assert_eq!(stored, disk_auth);
+    assert_store_matches_legacy(&stored, &disk_auth);
 
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(requests.is_empty(), "expected no refresh token requests");
@@ -323,7 +320,7 @@ async fn returns_fresh_tokens_as_is() -> Result<()> {
     assert_eq!(cached, initial_tokens);
 
     let stored = ctx.load_auth()?;
-    assert_eq!(stored, initial_auth);
+    assert_store_matches_legacy(&stored, &initial_auth);
 
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(requests.is_empty(), "expected no refresh token requests");
@@ -376,9 +373,9 @@ async fn refreshes_token_when_access_token_is_expired() -> Result<()> {
     assert_eq!(cached, refreshed_tokens);
 
     let stored = ctx.load_auth()?;
-    let tokens = stored.tokens.as_ref().context("tokens should exist")?;
-    assert_eq!(tokens, &refreshed_tokens);
-    let refreshed_at = stored
+    let active_account = active_account(&stored)?;
+    assert_eq!(&active_account.tokens, &refreshed_tokens);
+    let refreshed_at = active_account
         .last_refresh
         .as_ref()
         .context("last_refresh should be recorded")?;
@@ -419,11 +416,7 @@ async fn auth_reloads_disk_auth_when_cached_auth_is_stale() -> Result<()> {
         last_refresh: Some(fresh_refresh),
         agent_identity: None,
     };
-    save_auth(
-        ctx.codex_home.path(),
-        &disk_auth,
-        AuthCredentialsStoreMode::File,
-    )?;
+    save_legacy_auth(ctx.codex_home.path(), &disk_auth)?;
 
     let cached_auth = ctx
         .auth_manager
@@ -436,7 +429,7 @@ async fn auth_reloads_disk_auth_when_cached_auth_is_stale() -> Result<()> {
     assert_eq!(cached, disk_tokens);
 
     let stored = ctx.load_auth()?;
-    assert_eq!(stored, disk_auth);
+    assert_store_matches_legacy(&stored, &disk_auth);
 
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(requests.is_empty(), "expected no refresh token requests");
@@ -482,11 +475,7 @@ async fn auth_reloads_disk_auth_without_calling_expired_refresh_token() -> Resul
         last_refresh: Some(fresh_refresh),
         agent_identity: None,
     };
-    save_auth(
-        ctx.codex_home.path(),
-        &disk_auth,
-        AuthCredentialsStoreMode::File,
-    )?;
+    save_legacy_auth(ctx.codex_home.path(), &disk_auth)?;
 
     let cached_auth = ctx
         .auth_manager
@@ -499,7 +488,7 @@ async fn auth_reloads_disk_auth_without_calling_expired_refresh_token() -> Resul
     assert_eq!(cached, disk_tokens);
 
     let stored = ctx.load_auth()?;
-    assert_eq!(stored, disk_auth);
+    assert_store_matches_legacy(&stored, &disk_auth);
 
     server.verify().await;
     Ok(())
@@ -543,7 +532,7 @@ async fn refresh_token_returns_permanent_error_for_expired_refresh_token() -> Re
     assert_eq!(err.failed_reason(), Some(RefreshTokenFailedReason::Expired));
 
     let stored = ctx.load_auth()?;
-    assert_eq!(stored, initial_auth);
+    assert_store_matches_legacy(&stored, &initial_auth);
     let cached_auth = ctx
         .auth_manager
         .auth()
@@ -610,7 +599,7 @@ async fn refresh_token_does_not_retry_after_permanent_failure() -> Result<()> {
     );
 
     let stored = ctx.load_auth()?;
-    assert_eq!(stored, initial_auth);
+    assert_store_matches_legacy(&stored, &initial_auth);
     let cached_auth = ctx
         .auth_manager
         .auth()
@@ -674,11 +663,7 @@ async fn refresh_token_reloads_changed_auth_after_permanent_failure() -> Result<
         last_refresh: Some(fresh_refresh),
         agent_identity: None,
     };
-    save_auth(
-        ctx.codex_home.path(),
-        &disk_auth,
-        AuthCredentialsStoreMode::File,
-    )?;
+    save_legacy_auth(ctx.codex_home.path(), &disk_auth)?;
 
     ctx.auth_manager
         .refresh_token()
@@ -686,7 +671,7 @@ async fn refresh_token_reloads_changed_auth_after_permanent_failure() -> Result<
         .context("refresh should reload changed auth without retrying")?;
 
     let stored = ctx.load_auth()?;
-    assert_eq!(stored, disk_auth);
+    assert_store_matches_legacy(&stored, &disk_auth);
 
     let cached_auth = ctx
         .auth_manager
@@ -745,7 +730,7 @@ async fn refresh_token_returns_transient_error_on_server_failure() -> Result<()>
     assert_eq!(err.failed_reason(), None);
 
     let stored = ctx.load_auth()?;
-    assert_eq!(stored, initial_auth);
+    assert_store_matches_legacy(&stored, &initial_auth);
     let cached_auth = ctx
         .auth_manager
         .auth()
@@ -796,11 +781,7 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
     };
-    save_auth(
-        ctx.codex_home.path(),
-        &disk_auth,
-        AuthCredentialsStoreMode::File,
-    )?;
+    save_legacy_auth(ctx.codex_home.path(), &disk_auth)?;
 
     let cached_before = ctx
         .auth_manager
@@ -836,8 +817,8 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
         ..disk_tokens.clone()
     };
     let stored = ctx.load_auth()?;
-    let tokens = stored.tokens.as_ref().context("tokens should exist")?;
-    assert_eq!(tokens, &refreshed_tokens);
+    let active_account = active_account(&stored)?;
+    assert_eq!(&active_account.tokens, &refreshed_tokens);
 
     let cached_auth = ctx
         .auth_manager
@@ -891,11 +872,7 @@ async fn unauthorized_recovery_errors_on_account_mismatch() -> Result<()> {
         last_refresh: Some(initial_last_refresh),
         agent_identity: None,
     };
-    save_auth(
-        ctx.codex_home.path(),
-        &disk_auth,
-        AuthCredentialsStoreMode::File,
-    )?;
+    save_legacy_auth(ctx.codex_home.path(), &disk_auth)?;
 
     let cached_before = ctx
         .auth_manager
@@ -917,7 +894,7 @@ async fn unauthorized_recovery_errors_on_account_mismatch() -> Result<()> {
     assert_eq!(err.failed_reason(), Some(RefreshTokenFailedReason::Other));
 
     let stored = ctx.load_auth()?;
-    assert_eq!(stored, disk_auth);
+    assert_store_matches_legacy(&stored, &disk_auth);
 
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(requests.is_empty(), "expected no refresh token requests");
@@ -967,6 +944,25 @@ async fn unauthorized_recovery_requires_chatgpt_auth() -> Result<()> {
     Ok(())
 }
 
+fn save_legacy_auth(codex_home: &Path, auth_dot_json: &AuthDotJson) -> Result<()> {
+    save_auth(
+        codex_home,
+        &AuthStore::from_legacy(auth_dot_json.clone()),
+        AuthCredentialsStoreMode::File,
+    )?;
+    Ok(())
+}
+
+fn active_account(store: &AuthStore) -> Result<&codex_login::StoredAccount> {
+    store
+        .active_account()
+        .context("active account should exist")
+}
+
+fn assert_store_matches_legacy(store: &AuthStore, auth_dot_json: &AuthDotJson) {
+    assert_eq!(store, &AuthStore::from_legacy(auth_dot_json.clone()));
+}
+
 struct RefreshTokenTestContext {
     codex_home: TempDir,
     auth_manager: Arc<AuthManager>,
@@ -993,18 +989,14 @@ impl RefreshTokenTestContext {
         })
     }
 
-    fn load_auth(&self) -> Result<AuthDotJson> {
-        load_auth_dot_json(self.codex_home.path(), AuthCredentialsStoreMode::File)
-            .context("load auth.json")?
-            .context("auth.json should exist")
+    fn load_auth(&self) -> Result<AuthStore> {
+        load_auth_store(self.codex_home.path(), AuthCredentialsStoreMode::File)
+            .context("load auth store")?
+            .context("auth store should exist")
     }
 
     fn write_auth(&self, auth_dot_json: &AuthDotJson) -> Result<()> {
-        save_auth(
-            self.codex_home.path(),
-            auth_dot_json,
-            AuthCredentialsStoreMode::File,
-        )?;
+        save_legacy_auth(self.codex_home.path(), auth_dot_json)?;
         self.auth_manager.reload();
         Ok(())
     }

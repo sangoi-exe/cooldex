@@ -113,7 +113,7 @@ use codex_app_server_protocol::guardian_auto_approval_review_notification;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
 use codex_core::find_thread_name_by_id;
-use codex_core::review_format::format_review_findings_block;
+use codex_core::review_format::render_review_output_text;
 use codex_core::review_prompts;
 use codex_protocol::ThreadId;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
@@ -1614,10 +1614,10 @@ pub(crate) async fn apply_bespoke_event_handling(
             }
         }
         EventMsg::ExitedReviewMode(review_event) => {
-            let review = match review_event.review_output {
-                Some(output) => render_review_output_text(&output),
-                None => REVIEW_FALLBACK_MESSAGE.to_string(),
-            };
+            let review = review_event.review_output.as_ref().map_or_else(
+                || render_review_output_text(&ReviewOutputEvent::default()),
+                render_review_output_text,
+            );
             let item = ThreadItem::ExitedReviewMode {
                 id: event_turn_id.clone(),
                 review,
@@ -2688,28 +2688,6 @@ fn request_permissions_response_from_client_result(
         .into(),
         scope: response.scope.to_core(),
     })
-}
-
-const REVIEW_FALLBACK_MESSAGE: &str = "Reviewer failed to output a response.";
-
-fn render_review_output_text(output: &ReviewOutputEvent) -> String {
-    let mut sections = Vec::new();
-    let explanation = output.overall_explanation.trim();
-    if !explanation.is_empty() {
-        sections.push(explanation.to_string());
-    }
-    if !output.findings.is_empty() {
-        let findings = format_review_findings_block(&output.findings, /*selection*/ None);
-        let trimmed = findings.trim();
-        if !trimmed.is_empty() {
-            sections.push(trimmed.to_string());
-        }
-    }
-    if sections.is_empty() {
-        REVIEW_FALLBACK_MESSAGE.to_string()
-    } else {
-        sections.join("\n\n")
-    }
 }
 
 fn map_file_change_approval_decision(
@@ -5000,7 +4978,7 @@ mod tests {
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
-                config.codex_home.clone(),
+                config.codex_home.to_path_buf(),
                 Arc::new(codex_exec_server::EnvironmentManager::new(
                     /*exec_server_url*/ None,
                 )),
@@ -5042,6 +5020,7 @@ mod tests {
             conversation_id,
             conversation,
             thread_manager,
+            None,
             outgoing,
             thread_state,
             thread_watch_manager,
@@ -5077,7 +5056,7 @@ mod tests {
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
-                config.codex_home.clone(),
+                config.codex_home.to_path_buf(),
                 Arc::new(codex_exec_server::EnvironmentManager::new(
                     /*exec_server_url*/ None,
                 )),
@@ -5120,6 +5099,7 @@ mod tests {
             conversation_id,
             conversation,
             thread_manager,
+            None,
             outgoing,
             thread_state,
             thread_watch_manager,
@@ -5155,7 +5135,7 @@ mod tests {
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
-                config.codex_home.clone(),
+                config.codex_home.to_path_buf(),
                 Arc::new(codex_exec_server::EnvironmentManager::new(
                     /*exec_server_url*/ None,
                 )),
@@ -5200,6 +5180,7 @@ mod tests {
             conversation_id,
             conversation,
             thread_manager,
+            None,
             outgoing,
             thread_state,
             thread_watch_manager,
@@ -5234,7 +5215,7 @@ mod tests {
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
-                config.codex_home.clone(),
+                config.codex_home.to_path_buf(),
                 Arc::new(codex_exec_server::EnvironmentManager::new(
                     /*exec_server_url*/ None,
                 )),
@@ -5276,6 +5257,7 @@ mod tests {
             conversation_id,
             conversation,
             thread_manager,
+            None,
             outgoing,
             thread_state,
             thread_watch_manager,
@@ -5297,7 +5279,7 @@ mod tests {
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
-                config.codex_home.clone(),
+                config.codex_home.to_path_buf(),
                 Arc::new(codex_exec_server::EnvironmentManager::new(
                     /*exec_server_url*/ None,
                 )),
@@ -5342,6 +5324,7 @@ mod tests {
             conversation_id,
             conversation,
             thread_manager,
+            None,
             outgoing,
             thread_state,
             thread_watch_manager,
@@ -5363,7 +5346,7 @@ mod tests {
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
-                config.codex_home.clone(),
+                config.codex_home.to_path_buf(),
                 Arc::new(codex_exec_server::EnvironmentManager::new(
                     /*exec_server_url*/ None,
                 )),
@@ -5407,6 +5390,7 @@ mod tests {
             conversation_id,
             conversation,
             thread_manager,
+            None,
             outgoing,
             thread_state,
             thread_watch_manager,

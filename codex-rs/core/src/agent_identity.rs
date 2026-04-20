@@ -13,6 +13,7 @@ use codex_login::AgentIdentityAuthRecord;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::default_client::create_client;
+use codex_protocol::protocol::SessionAgentTask;
 use codex_protocol::protocol::SessionSource;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
@@ -163,6 +164,24 @@ impl AgentIdentityManager {
             .is_some_and(|(_, binding)| task.matches_binding(&binding))
     }
 
+    pub(crate) async fn restore_task_for_current_identity(
+        &self,
+        task: SessionAgentTask,
+    ) -> Option<RegisteredAgentTask> {
+        let (_, binding) = self.current_auth_binding().await?;
+        let stored_identity = self.current_stored_identity().await?;
+        if stored_identity.agent_runtime_id != task.agent_runtime_id {
+            return None;
+        }
+
+        Some(RegisteredAgentTask::from_session_agent_task(
+            task,
+            binding.binding_id,
+            binding.chatgpt_account_id,
+            binding.chatgpt_user_id,
+        ))
+    }
+
     async fn current_auth_binding(&self) -> Option<(CodexAuth, AgentIdentityBinding)> {
         let Some(auth) = self.auth_manager.auth().await else {
             debug!("skipping agent identity flow because no auth is available");
@@ -175,6 +194,11 @@ impl AgentIdentityManager {
             debug!("skipping agent identity flow because ChatGPT auth is unavailable");
         }
         binding.map(|binding| (auth, binding))
+    }
+
+    async fn current_stored_identity(&self) -> Option<StoredAgentIdentity> {
+        let (auth, binding) = self.current_auth_binding().await?;
+        self.load_stored_identity(&auth, &binding).ok().flatten()
     }
 
     async fn register_agent_identity(

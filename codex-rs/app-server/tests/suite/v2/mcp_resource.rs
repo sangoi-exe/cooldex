@@ -26,6 +26,7 @@ use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::LoaderOverrides;
 use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
+use codex_login::AuthManager;
 use codex_protocol::protocol::SessionSource;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
@@ -167,11 +168,15 @@ async fn mcp_resource_read_returns_error_for_unknown_thread() -> Result<()> {
         .loader_overrides(loader_overrides.clone())
         .build()
         .await?;
+    let config = Arc::new(config);
+    let auth_manager =
+        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false);
     // This negative-path test does not need the stdio subprocess; keeping it
     // in-process avoids child-process teardown timing in nextest leak detection.
     let client = in_process::start(InProcessStartArgs {
         arg0_paths: Arg0DispatchPaths::default(),
-        config: Arc::new(config),
+        config,
+        auth_manager,
         cli_overrides: Vec::new(),
         loader_overrides,
         cloud_requirements: CloudRequirementsLoader::default(),

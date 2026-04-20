@@ -3291,14 +3291,29 @@ pub struct ThreadShellCommandResponse {}
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-pub struct ThreadBackgroundTerminalsStopParams {
+pub struct ThreadBackgroundTerminalsCleanParams {
     pub thread_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-pub struct ThreadBackgroundTerminalsStopResponse {}
+pub struct ThreadBackgroundTerminalsCleanResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MarketplaceRemoveParams {
+    pub marketplace_name: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MarketplaceRemoveResponse {
+    pub marketplace_name: String,
+    pub installed_root: Option<AbsolutePathBuf>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]

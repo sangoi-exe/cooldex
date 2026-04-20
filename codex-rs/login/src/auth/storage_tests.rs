@@ -9,6 +9,10 @@ use tempfile::tempdir;
 use codex_keyring_store::tests::MockKeyringStore;
 use keyring::Error as KeyringError;
 
+fn auth_store_from_legacy(auth_dot_json: AuthDotJson) -> AuthStore {
+    AuthStore::from_legacy(auth_dot_json)
+}
+
 #[tokio::test]
 async fn file_storage_load_returns_auth_dot_json() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
@@ -22,11 +26,11 @@ async fn file_storage_load_returns_auth_dot_json() -> anyhow::Result<()> {
     };
 
     storage
-        .save(&auth_dot_json)
+        .save(&auth_store_from_legacy(auth_dot_json.clone()))
         .context("failed to save auth file")?;
 
     let loaded = storage.load().context("failed to load auth file")?;
-    assert_eq!(Some(auth_dot_json), loaded);
+    assert_eq!(Some(auth_store_from_legacy(auth_dot_json)), loaded);
     Ok(())
 }
 
@@ -44,13 +48,13 @@ async fn file_storage_save_persists_auth_dot_json() -> anyhow::Result<()> {
 
     let file = get_auth_file(codex_home.path());
     storage
-        .save(&auth_dot_json)
+        .save(&auth_store_from_legacy(auth_dot_json.clone()))
         .context("failed to save auth file")?;
 
-    let same_auth_dot_json = storage
-        .try_read_auth_json(&file)
+    let same_auth_store = storage
+        .try_read_auth_store(&file)
         .context("failed to read auth file after save")?;
-    assert_eq!(auth_dot_json, same_auth_dot_json);
+    assert_eq!(auth_store_from_legacy(auth_dot_json), same_auth_store);
     Ok(())
 }
 
@@ -72,9 +76,9 @@ async fn file_storage_persists_agent_identity() -> anyhow::Result<()> {
         }),
     };
 
-    storage.save(&auth_dot_json)?;
+    storage.save(&auth_store_from_legacy(auth_dot_json.clone()))?;
 
-    assert_eq!(storage.load()?, Some(auth_dot_json));
+    assert_eq!(storage.load()?, Some(auth_store_from_legacy(auth_dot_json)));
     Ok(())
 }
 
@@ -89,7 +93,7 @@ fn file_storage_delete_removes_auth_file() -> anyhow::Result<()> {
         agent_identity: None,
     };
     let storage = create_auth_storage(dir.path().to_path_buf(), AuthCredentialsStoreMode::File);
-    storage.save(&auth_dot_json)?;
+    storage.save(&auth_store_from_legacy(auth_dot_json))?;
     assert!(dir.path().join("auth.json").exists());
     let storage = FileAuthStorage::new(dir.path().to_path_buf());
     let removed = storage.delete()?;
@@ -113,9 +117,9 @@ fn ephemeral_storage_save_load_delete_is_in_memory_only() -> anyhow::Result<()> 
         agent_identity: None,
     };
 
-    storage.save(&auth_dot_json)?;
+    storage.save(&auth_store_from_legacy(auth_dot_json.clone()))?;
     let loaded = storage.load()?;
-    assert_eq!(Some(auth_dot_json), loaded);
+    assert_eq!(Some(auth_store_from_legacy(auth_dot_json)), loaded);
 
     let removed = storage.delete()?;
     assert!(removed);
@@ -143,7 +147,7 @@ where
 fn seed_keyring_with_auth<F>(
     mock_keyring: &MockKeyringStore,
     compute_key: F,
-    auth: &AuthDotJson,
+    auth: &AuthStore,
 ) -> anyhow::Result<()>
 where
     F: FnOnce() -> std::io::Result<String>,
@@ -158,7 +162,7 @@ fn assert_keyring_saved_auth_and_removed_fallback(
     mock_keyring: &MockKeyringStore,
     key: &str,
     codex_home: &Path,
-    expected: &AuthDotJson,
+    expected: &AuthStore,
 ) {
     let saved_value = mock_keyring
         .saved_value(key)
@@ -198,8 +202,8 @@ fn id_token_with_prefix(prefix: &str) -> IdTokenInfo {
     crate::token_data::parse_chatgpt_jwt_claims(&fake_jwt).expect("fake JWT should parse")
 }
 
-fn auth_with_prefix(prefix: &str) -> AuthDotJson {
-    AuthDotJson {
+fn auth_with_prefix(prefix: &str) -> AuthStore {
+    auth_store_from_legacy(AuthDotJson {
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some(format!("{prefix}-api-key")),
         tokens: Some(TokenData {
@@ -210,7 +214,7 @@ fn auth_with_prefix(prefix: &str) -> AuthDotJson {
         }),
         last_refresh: None,
         agent_identity: None,
-    }
+    })
 }
 
 #[test]
@@ -221,13 +225,13 @@ fn keyring_auth_storage_load_returns_deserialized_auth() -> anyhow::Result<()> {
         codex_home.path().to_path_buf(),
         Arc::new(mock_keyring.clone()),
     );
-    let expected = AuthDotJson {
+    let expected = auth_store_from_legacy(AuthDotJson {
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("sk-test".to_string()),
         tokens: None,
         last_refresh: None,
         agent_identity: None,
-    };
+    });
     seed_keyring_with_auth(
         &mock_keyring,
         || compute_store_key(codex_home.path()),
@@ -259,7 +263,7 @@ fn keyring_auth_storage_save_persists_and_removes_fallback_file() -> anyhow::Res
     );
     let auth_file = get_auth_file(codex_home.path());
     std::fs::write(&auth_file, "stale")?;
-    let auth = AuthDotJson {
+    let auth = auth_store_from_legacy(AuthDotJson {
         auth_mode: Some(AuthMode::Chatgpt),
         openai_api_key: None,
         tokens: Some(TokenData {
@@ -270,7 +274,7 @@ fn keyring_auth_storage_save_persists_and_removes_fallback_file() -> anyhow::Res
         }),
         last_refresh: Some(Utc::now()),
         agent_identity: None,
-    };
+    });
 
     storage.save(&auth)?;
 

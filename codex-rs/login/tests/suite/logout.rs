@@ -5,6 +5,7 @@ use codex_app_server_protocol::AuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::AuthDotJson;
 use codex_login::AuthManager;
+use codex_login::AuthStore;
 use codex_login::CLIENT_ID;
 use codex_login::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_login::logout_with_revoke;
@@ -16,6 +17,7 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::ffi::OsString;
+use std::path::Path;
 use tempfile::TempDir;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -25,6 +27,9 @@ use wiremock::matchers::path;
 
 const ACCESS_TOKEN: &str = "access-token";
 const REFRESH_TOKEN: &str = "refresh-token";
+
+// Merge-safety anchor: logout integration tests must persist legacy fixtures through AuthStore
+// so they keep exercising the live auth-store contract.
 
 #[serial_test::serial(logout_revoke)]
 #[tokio::test]
@@ -46,11 +51,7 @@ async fn logout_with_revoke_revokes_refresh_token_then_removes_auth() -> Result<
     );
 
     let codex_home = TempDir::new()?;
-    save_auth(
-        codex_home.path(),
-        &chatgpt_auth(),
-        AuthCredentialsStoreMode::File,
-    )?;
+    save_legacy_auth(codex_home.path(), &chatgpt_auth())?;
 
     let removed = logout_with_revoke(codex_home.path(), AuthCredentialsStoreMode::File).await?;
 
@@ -98,11 +99,7 @@ async fn logout_with_revoke_removes_auth_when_revoke_fails() -> Result<()> {
     );
 
     let codex_home = TempDir::new()?;
-    save_auth(
-        codex_home.path(),
-        &chatgpt_auth(),
-        AuthCredentialsStoreMode::File,
-    )?;
+    save_legacy_auth(codex_home.path(), &chatgpt_auth())?;
 
     let removed = logout_with_revoke(codex_home.path(), AuthCredentialsStoreMode::File).await?;
 
@@ -133,20 +130,18 @@ async fn auth_manager_logout_with_revoke_uses_cached_auth() -> Result<()> {
     );
 
     let codex_home = TempDir::new()?;
-    save_auth(
+    save_legacy_auth(
         codex_home.path(),
         &chatgpt_auth_with_refresh_token(REFRESH_TOKEN),
-        AuthCredentialsStoreMode::File,
     )?;
     let manager = AuthManager::new(
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
     );
-    save_auth(
+    save_legacy_auth(
         codex_home.path(),
         &chatgpt_auth_with_refresh_token("newer-disk-refresh-token"),
-        AuthCredentialsStoreMode::File,
     )?;
 
     let removed = manager.logout_with_revoke().await?;
@@ -202,6 +197,15 @@ fn minimal_jwt() -> String {
     let payload_b64 = b64(br#"{"sub":"user-123"}"#);
     let signature_b64 = b64(b"sig");
     format!("{header_b64}.{payload_b64}.{signature_b64}")
+}
+
+fn save_legacy_auth(codex_home: &Path, auth_dot_json: &AuthDotJson) -> Result<()> {
+    save_auth(
+        codex_home,
+        &AuthStore::from_legacy(auth_dot_json.clone()),
+        AuthCredentialsStoreMode::File,
+    )?;
+    Ok(())
 }
 
 struct EnvGuard {

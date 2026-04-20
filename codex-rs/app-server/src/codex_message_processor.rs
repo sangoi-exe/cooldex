@@ -84,6 +84,8 @@ use codex_app_server_protocol::LogoutAccountResponse;
 use codex_app_server_protocol::MarketplaceAddParams;
 use codex_app_server_protocol::MarketplaceAddResponse;
 use codex_app_server_protocol::MarketplaceInterface;
+use codex_app_server_protocol::MarketplaceRemoveParams;
+use codex_app_server_protocol::MarketplaceRemoveResponse;
 use codex_app_server_protocol::McpResourceReadParams;
 use codex_app_server_protocol::McpResourceReadResponse;
 use codex_app_server_protocol::McpServerOauthLoginCompletedNotification;
@@ -132,8 +134,8 @@ use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadArchivedNotification;
-use codex_app_server_protocol::ThreadBackgroundTerminalsStopParams;
-use codex_app_server_protocol::ThreadBackgroundTerminalsStopResponse;
+use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
+use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
 use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
@@ -242,12 +244,15 @@ use codex_core::find_thread_names_by_ids;
 use codex_core::find_thread_path_by_id_str;
 use codex_core::path_utils;
 use codex_core::plugins::MarketplaceAddError;
+use codex_core::plugins::MarketplaceRemoveError;
+use codex_core::plugins::MarketplaceRemoveRequest as CoreMarketplaceRemoveRequest;
 use codex_core::plugins::OPENAI_CURATED_MARKETPLACE_NAME;
 use codex_core::plugins::PluginInstallError as CorePluginInstallError;
 use codex_core::plugins::PluginInstallRequest;
 use codex_core::plugins::PluginReadRequest;
 use codex_core::plugins::PluginUninstallError as CorePluginUninstallError;
 use codex_core::plugins::add_marketplace as add_marketplace_to_codex_home;
+use codex_core::plugins::remove_marketplace;
 use codex_core::read_head_for_summary;
 use codex_core::read_session_meta_line;
 use codex_core::sandboxing::SandboxPermissions;
@@ -958,9 +963,12 @@ impl CodexMessageProcessor {
                 self.thread_compact_start(to_connection_request_id(request_id), params)
                     .await;
             }
-            ClientRequest::ThreadBackgroundTerminalsStop { request_id, params } => {
-                self.thread_background_terminals_stop(to_connection_request_id(request_id), params)
-                    .await;
+            ClientRequest::ThreadBackgroundTerminalsClean { request_id, params } => {
+                self.thread_background_terminals_clean(
+                    to_connection_request_id(request_id),
+                    params,
+                )
+                .await;
             }
             ClientRequest::ThreadRollback { request_id, params } => {
                 self.thread_rollback(to_connection_request_id(request_id), params)
@@ -992,6 +1000,10 @@ impl CodexMessageProcessor {
             }
             ClientRequest::MarketplaceAdd { request_id, params } => {
                 self.marketplace_add(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::MarketplaceRemove { request_id, params } => {
+                self.marketplace_remove(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::PluginList { request_id, params } => {
@@ -3714,12 +3726,12 @@ impl CodexMessageProcessor {
         }
     }
 
-    async fn thread_background_terminals_stop(
+    async fn thread_background_terminals_clean(
         &self,
         request_id: ConnectionRequestId,
-        params: ThreadBackgroundTerminalsStopParams,
+        params: ThreadBackgroundTerminalsCleanParams,
     ) {
-        let ThreadBackgroundTerminalsStopParams { thread_id } = params;
+        let ThreadBackgroundTerminalsCleanParams { thread_id } = params;
 
         let (_, thread) = match self.load_thread(&thread_id).await {
             Ok(v) => v,
@@ -3735,7 +3747,7 @@ impl CodexMessageProcessor {
         {
             Ok(_) => {
                 self.outgoing
-                    .send_response(request_id, ThreadBackgroundTerminalsStopResponse {})
+                    .send_response(request_id, ThreadBackgroundTerminalsCleanResponse {})
                     .await;
             }
             Err(err) => {
@@ -6772,6 +6784,40 @@ impl CodexMessageProcessor {
                 self.send_invalid_request_error(request_id, message).await;
             }
             Err(MarketplaceAddError::Internal(message)) => {
+                self.send_internal_error(request_id, message).await;
+            }
+        }
+    }
+
+    async fn marketplace_remove(
+        &self,
+        request_id: ConnectionRequestId,
+        params: MarketplaceRemoveParams,
+    ) {
+        let result = remove_marketplace(
+            self.config.codex_home.to_path_buf(),
+            CoreMarketplaceRemoveRequest {
+                marketplace_name: params.marketplace_name,
+            },
+        )
+        .await;
+
+        match result {
+            Ok(outcome) => {
+                self.outgoing
+                    .send_response(
+                        request_id,
+                        MarketplaceRemoveResponse {
+                            marketplace_name: outcome.marketplace_name,
+                            installed_root: outcome.removed_installed_root,
+                        },
+                    )
+                    .await;
+            }
+            Err(MarketplaceRemoveError::InvalidRequest(message)) => {
+                self.send_invalid_request_error(request_id, message).await;
+            }
+            Err(MarketplaceRemoveError::Internal(message)) => {
                 self.send_internal_error(request_id, message).await;
             }
         }
@@ -10730,7 +10776,7 @@ mod tests {
             approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
             approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
             sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
-            cwd: PathBuf::from("/tmp"),
+            cwd: AbsolutePathBuf::from_absolute_path("/tmp").expect("absolute path"),
             config_path: PathBuf::from("/tmp/config.toml"),
             ephemeral: false,
             reasoning_effort: None,
@@ -10963,6 +11009,7 @@ mod tests {
                     approval_policy: TurnContextApprovalPolicy::Never,
                     sandbox_policy: SandboxPolicy::new_read_only_policy(),
                     network: None,
+                    file_system_sandbox_policy: None,
                     model: "gpt-5".to_string(),
                     personality: None,
                     collaboration_mode: None,
@@ -11008,6 +11055,7 @@ mod tests {
                 approval_policy: TurnContextApprovalPolicy::Never,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 network: None,
+                file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
                 personality: None,
                 collaboration_mode: None,
@@ -11065,6 +11113,7 @@ mod tests {
                     approval_policy: TurnContextApprovalPolicy::Never,
                     sandbox_policy: SandboxPolicy::new_read_only_policy(),
                     network: None,
+                    file_system_sandbox_policy: None,
                     model: "gpt-5".to_string(),
                     personality: None,
                     collaboration_mode: None,

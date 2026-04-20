@@ -358,20 +358,23 @@ pub(crate) async fn run_turn(
         }))
         .await;
     }
-    if let Err(error) = sess.ensure_agent_task_registered().await {
-        warn!(error = %error, "agent task registration failed");
-        sess.send_event(
-            turn_context.as_ref(),
-            EventMsg::Error(ErrorEvent {
-                message: format!(
-                    "Agent task registration failed. Please try again; Codex will attempt to register the task again on the next turn: {error}"
-                ),
-                codex_error_info: Some(CodexErrorInfo::Other),
-            }),
-        )
-        .await;
-        return None;
-    }
+    let agent_task = match sess.ensure_agent_task_registered().await {
+        Ok(agent_task) => agent_task,
+        Err(error) => {
+            warn!(error = %error, "agent task registration failed");
+            sess.send_event(
+                turn_context.as_ref(),
+                EventMsg::Error(ErrorEvent {
+                    message: format!(
+                        "Agent task registration failed. Please try again; Codex will attempt to register the task again on the next turn: {error}"
+                    ),
+                    codex_error_info: Some(CodexErrorInfo::Other),
+                }),
+            )
+            .await;
+            return None;
+        }
+    };
 
     if !skill_items.is_empty() {
         sess.record_conversation_items(&turn_context, &skill_items)
@@ -396,8 +399,21 @@ pub(crate) async fn run_turn(
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
-    let mut client_session =
-        prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    let mut prewarmed_client_session = prewarmed_client_session;
+    if agent_task.is_some()
+        && let Some(prewarmed_client_session) = prewarmed_client_session.as_mut()
+    {
+        prewarmed_client_session.disable_cached_websocket_session_on_drop();
+    }
+    let mut client_session = if let Some(agent_task) = agent_task {
+        sess.services
+            .model_client
+            .new_session_with_agent_task(Some(agent_task))
+    } else if let Some(prewarmed_client_session) = prewarmed_client_session.take() {
+        prewarmed_client_session
+    } else {
+        sess.services.model_client.new_session()
+    };
     // Pending input is drained into history before building the next model request.
     // However, we defer that drain until after sampling in two cases:
     // 1. At the start of a turn, so the fresh user prompt in `input` gets sampled first.
@@ -858,7 +874,8 @@ async fn run_auto_compact(
 }
 
 fn resolved_pos_compact_warning(config: &crate::config::Config) -> String {
-    let default_warning = crate::session::AUTO_COMPACT_RECON_WARNING_BODY.to_string();
+    let default_warning =
+        crate::session::default_pos_compact_warning(config, /*is_subagent*/ false).to_string();
     let Some(raw) = config.pos_compact_instructions.as_deref() else {
         return default_warning;
     };
@@ -1683,19 +1700,28 @@ pub(super) async fn run_prompt_gc_sidecar_if_needed(
     .await;
     struct PromptGcActivityGuard<'a> {
         session: &'a Session,
+        refresh_private_context_usage: bool,
     }
     impl<'a> PromptGcActivityGuard<'a> {
         fn new(session: &'a Session) -> Self {
             session.set_prompt_gc_activity(/*active*/ true);
-            Self { session }
+            Self {
+                session,
+                refresh_private_context_usage: false,
+            }
+        }
+
+        fn mark_context_usage_refresh(&mut self) {
+            self.refresh_private_context_usage = true;
         }
     }
     impl Drop for PromptGcActivityGuard<'_> {
         fn drop(&mut self) {
-            self.session.set_prompt_gc_activity(/*active*/ false);
+            self.session
+                .clear_prompt_gc_activity(self.refresh_private_context_usage);
         }
     }
-    let _prompt_gc_activity_guard = PromptGcActivityGuard::new(sess.as_ref());
+    let mut prompt_gc_activity_guard = PromptGcActivityGuard::new(sess.as_ref());
 
     let plan = match crate::tools::handlers::prompt_gc::build_runtime_plan(
         sess.as_ref(),
@@ -1919,7 +1945,10 @@ pub(super) async fn run_prompt_gc_sidecar_if_needed(
     )
     .await
     {
-        Ok(outcome) => sidecar.lock().await.complete_cycle(outcome),
+        Ok(outcome) => {
+            prompt_gc_activity_guard.mark_context_usage_refresh();
+            sidecar.lock().await.complete_cycle(outcome);
+        }
         Err(error) => {
             warn!(
                 turn_id = %turn_context.sub_id,

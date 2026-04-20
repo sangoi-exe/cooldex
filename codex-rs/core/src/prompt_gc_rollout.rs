@@ -151,7 +151,9 @@ pub(crate) fn discarded_rollout_indices_for_rolled_back_turns(
                     );
                 }
             }
-            RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => {}
+            RolloutItem::EventMsg(_)
+            | RolloutItem::SessionMeta(_)
+            | RolloutItem::SessionState(_) => {}
         }
     }
 

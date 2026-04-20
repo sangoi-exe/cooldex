@@ -15,7 +15,6 @@ use crate::agent::agent_last_activity_from_event;
 use crate::agent::agent_status_from_event;
 use crate::agent::status::is_final;
 use crate::agent_identity::AgentIdentityManager;
-use crate::agent_identity::RegisteredAgentTask;
 use crate::apps::render_apps_section;
 use crate::commit_attribution::commit_message_trailer_instruction;
 use crate::compact;
@@ -166,6 +165,7 @@ use codex_protocol::error::Result as CodexResult;
 #[cfg(test)]
 use codex_protocol::exec_output::StreamOutput;
 
+mod agent_task_lifecycle;
 mod handlers;
 mod mcp;
 mod review;
@@ -378,9 +378,27 @@ pub struct PromptGcActivityEdge {
 
 pub(crate) const THREAD_START_SKILLS_TRIMMED_WARNING_MESSAGE: &str = "Some enabled skills were not included in the model-visible skills list for this session. Mention a skill by name or path if you need it.";
 pub(crate) const AUTO_COMPACT_RECON_WARNING_BODY: &str = "STOP. Codex CLI has just performed an auto-compact. BEFORE any other action: call recall. Then recon unstaged changes and update_plan status. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
+pub(crate) const AUTO_COMPACT_RECON_NO_RECALL_WARNING_BODY: &str = "STOP. Codex CLI has just performed an auto-compact. BEFORE any other action: recon unstaged changes and update_plan status. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
 // Merge-safety anchor: sub-agents must get a recall-only post-compact warning so child threads do
 // not inherit lead-only recon/manage_context rituals from workspace-local overlays.
 pub(crate) const SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY: &str = "STOP. Codex CLI has just performed an auto-compact. BEFORE any other action: call recall. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
+pub(crate) const SUBAGENT_AUTO_COMPACT_NO_RECALL_WARNING_BODY: &str = "STOP. Codex CLI has just performed an auto-compact. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
+
+pub(crate) fn rollout_recovery_enabled(config: &crate::config::Config) -> bool {
+    !config.ephemeral
+}
+
+pub(crate) fn default_pos_compact_warning(
+    config: &crate::config::Config,
+    is_subagent: bool,
+) -> &'static str {
+    match (is_subagent, rollout_recovery_enabled(config)) {
+        (false, true) => AUTO_COMPACT_RECON_WARNING_BODY,
+        (false, false) => AUTO_COMPACT_RECON_NO_RECALL_WARNING_BODY,
+        (true, true) => SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY,
+        (true, false) => SUBAGENT_AUTO_COMPACT_NO_RECALL_WARNING_BODY,
+    }
+}
 
 /// Wrapper returned by [`Codex::spawn`] containing the spawned [`Codex`] and
 /// the unique session id.
@@ -1030,7 +1048,10 @@ impl Session {
                     .ensure_registered_identity()
                     .await
                 {
-                    Ok(Some(_)) => return,
+                    Ok(Some(_)) => {
+                        sess.maybe_prewarm_agent_task_registration().await;
+                        return;
+                    }
                     Ok(None) => {
                         drop(sess);
                         if auth_state_rx.changed().await.is_err() {
@@ -1059,90 +1080,6 @@ impl Session {
             }),
         })
         .await;
-    }
-
-    async fn cached_agent_task_for_current_binding(&self) -> Option<RegisteredAgentTask> {
-        let agent_task = {
-            let state = self.state.lock().await;
-            state.agent_task()
-        }?;
-
-        if self
-            .services
-            .agent_identity_manager
-            .task_matches_current_binding(&agent_task)
-            .await
-        {
-            debug!(
-                agent_runtime_id = %agent_task.agent_runtime_id,
-                task_id = %agent_task.task_id,
-                "reusing cached agent task"
-            );
-            return Some(agent_task);
-        }
-
-        debug!(
-            agent_runtime_id = %agent_task.agent_runtime_id,
-            task_id = %agent_task.task_id,
-            "discarding cached agent task because auth binding changed"
-        );
-        let mut state = self.state.lock().await;
-        if state.agent_task().as_ref() == Some(&agent_task) {
-            state.clear_agent_task();
-        }
-        None
-    }
-
-    async fn ensure_agent_task_registered(&self) -> anyhow::Result<Option<RegisteredAgentTask>> {
-        if let Some(agent_task) = self.cached_agent_task_for_current_binding().await {
-            return Ok(Some(agent_task));
-        }
-
-        for _ in 0..2 {
-            let Some(agent_task) = self.services.agent_identity_manager.register_task().await?
-            else {
-                return Ok(None);
-            };
-
-            if !self
-                .services
-                .agent_identity_manager
-                .task_matches_current_binding(&agent_task)
-                .await
-            {
-                debug!(
-                    agent_runtime_id = %agent_task.agent_runtime_id,
-                    task_id = %agent_task.task_id,
-                    "discarding newly registered agent task because auth binding changed"
-                );
-                continue;
-            }
-
-            {
-                let mut state = self.state.lock().await;
-                if let Some(existing_agent_task) = state.agent_task() {
-                    if existing_agent_task.has_same_binding(&agent_task) {
-                        return Ok(Some(existing_agent_task));
-                    }
-                    debug!(
-                        agent_runtime_id = %existing_agent_task.agent_runtime_id,
-                        task_id = %existing_agent_task.task_id,
-                        "replacing cached agent task because auth binding changed"
-                    );
-                }
-                state.set_agent_task(agent_task.clone());
-            }
-
-            info!(
-                thread_id = %self.conversation_id,
-                agent_runtime_id = %agent_task.agent_runtime_id,
-                task_id = %agent_task.task_id,
-                "registered agent task for thread"
-            );
-            return Ok(Some(agent_task));
-        }
-
-        Ok(None)
     }
 
     pub(crate) fn get_tx_event(&self) -> Sender<Event> {
@@ -1292,6 +1229,7 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => {
                 let rollout_items = resumed_history.history;
+                self.restore_persisted_agent_task(&rollout_items).await;
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
@@ -1687,6 +1625,13 @@ impl Session {
         self.emit_prompt_gc_activity_edge(PromptGcActivityEdge {
             active,
             refresh_private_context_usage: false,
+        });
+    }
+
+    fn clear_prompt_gc_activity(&self, refresh_private_context_usage: bool) {
+        self.emit_prompt_gc_activity_edge(PromptGcActivityEdge {
+            active: false,
+            refresh_private_context_usage,
         });
     }
 
@@ -2295,8 +2240,7 @@ impl Session {
             state.record_items_and_snapshot_appended(items.iter(), turn_context.truncation_policy);
         appended_items
             .into_iter()
-            .enumerate()
-            .map(|(_offset, item)| PromptGcObservedItem::Recorded { item })
+            .map(|item| PromptGcObservedItem::Recorded { item })
             .collect()
     }
 
@@ -2422,6 +2366,7 @@ impl Session {
             sidecar.lock().await.clear_pending_calls_for_rewrite();
         }
         self.recompute_token_usage(turn_context).await;
+        self.services.model_client.advance_window_generation();
         Ok(())
     }
 

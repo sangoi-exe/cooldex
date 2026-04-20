@@ -2,6 +2,7 @@ use super::*;
 use crate::auth::storage::FileAuthStorage;
 use crate::auth::storage::get_auth_file;
 use crate::token_data::IdTokenInfo;
+use chrono::Utc;
 use codex_app_server_protocol::AuthMode;
 use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::auth::KnownPlan as InternalKnownPlan;
@@ -18,6 +19,9 @@ use tempfile::TempDir;
 use tempfile::tempdir;
 use tokio::time::Duration;
 use tokio::time::timeout;
+
+// Merge-safety anchor: auth tests must exercise the AuthStore-backed persistence surface
+// and current constructor paths rather than removed legacy-only helpers.
 
 #[tokio::test]
 async fn refresh_without_id_token() {
@@ -36,15 +40,30 @@ async fn refresh_without_id_token() {
         codex_home.path().to_path_buf(),
         AuthCredentialsStoreMode::File,
     );
-    let updated = super::persist_tokens(
+    let store_account_id = storage
+        .load()
+        .expect("auth store should load")
+        .expect("auth store should exist")
+        .active_account()
+        .expect("active account should exist")
+        .id
+        .clone();
+    let updated = super::update_tokens(
+        codex_home.path(),
         &storage,
+        &store_account_id,
         /*id_token*/ None,
         Some("new-access-token".to_string()),
         Some("new-refresh-token".to_string()),
+        PersistedActiveAccountWriteMode::Preserve,
     )
+    .await
     .expect("update_tokens should succeed");
 
-    let tokens = updated.tokens.expect("tokens should exist");
+    let tokens = &updated
+        .active_account()
+        .expect("active account should exist")
+        .tokens;
     assert_eq!(tokens.id_token.raw_jwt, fake_jwt);
     assert_eq!(tokens.access_token, "new-access-token");
     assert_eq!(tokens.refresh_token, "new-refresh-token");
@@ -74,10 +93,13 @@ fn login_with_api_key_overwrites_existing_auth_json() {
 
     let storage = FileAuthStorage::new(dir.path().to_path_buf());
     let auth = storage
-        .try_read_auth_json(&auth_path)
+        .try_read_auth_store(&auth_path)
         .expect("auth.json should parse");
     assert_eq!(auth.openai_api_key.as_deref(), Some("sk-new"));
-    assert!(auth.tokens.is_none(), "tokens should be cleared");
+    assert!(
+        auth.accounts.is_empty(),
+        "stored accounts should be cleared"
+    );
 }
 
 #[test]
@@ -178,12 +200,130 @@ fn logout_removes_auth_file() -> Result<(), std::io::Error> {
         last_refresh: None,
         agent_identity: None,
     };
-    super::save_auth(dir.path(), &auth_dot_json, AuthCredentialsStoreMode::File)?;
+    let auth_store = AuthStore::from_legacy(auth_dot_json);
+    super::save_auth(dir.path(), &auth_store, AuthCredentialsStoreMode::File)?;
     let auth_file = get_auth_file(dir.path());
     assert!(auth_file.exists());
     assert!(logout(dir.path(), AuthCredentialsStoreMode::File)?);
     assert!(!auth_file.exists());
     Ok(())
+}
+
+fn chatgpt_auth_store_for_manager_logout(
+    store_account_id: &str,
+    workspace_id: &str,
+    access_token: &str,
+    refresh_token: &str,
+) -> AuthStore {
+    AuthStore {
+        active_account_id: Some(store_account_id.to_string()),
+        accounts: vec![StoredAccount {
+            id: store_account_id.to_string(),
+            label: Some("Primary".to_string()),
+            tokens: TokenData {
+                id_token: IdTokenInfo {
+                    email: Some("primary@example.com".to_string()),
+                    chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                    chatgpt_user_id: Some("user-12345".to_string()),
+                    chatgpt_account_id: Some(workspace_id.to_string()),
+                    chatgpt_account_is_fedramp: false,
+                    raw_jwt: "test.header.payload".to_string(),
+                },
+                access_token: access_token.to_string(),
+                refresh_token: refresh_token.to_string(),
+                account_id: Some(workspace_id.to_string()),
+            },
+            last_refresh: None,
+            usage: None,
+        }],
+        ..AuthStore::default()
+    }
+}
+
+#[test]
+fn auth_manager_logout_releases_runtime_active_account_lease() {
+    let dir = tempdir().unwrap();
+    let store_account_id = "store-account-a";
+    save_auth(
+        dir.path(),
+        &chatgpt_auth_store_for_manager_logout(
+            store_account_id,
+            "workspace-a",
+            "access-token",
+            "refresh-token",
+        ),
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store");
+    let manager = AuthManager::new_with_sqlite_home(
+        dir.path().to_path_buf(),
+        dir.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    assert!(
+        manager
+            .account_state_store
+            .as_ref()
+            .expect("account-state store should open")
+            .account_is_leased_by_other("other-session", None, store_account_id, Utc::now())
+            .expect("lease lookup should succeed")
+    );
+
+    assert!(manager.logout().expect("logout should succeed"));
+
+    assert!(
+        !manager
+            .account_state_store
+            .as_ref()
+            .expect("account-state store should remain open")
+            .account_is_leased_by_other("other-session", None, store_account_id, Utc::now())
+            .expect("lease lookup should succeed")
+    );
+}
+
+#[tokio::test]
+async fn auth_manager_logout_with_revoke_releases_runtime_active_account_lease() {
+    let dir = tempdir().unwrap();
+    let store_account_id = "store-account-a";
+    save_auth(
+        dir.path(),
+        &chatgpt_auth_store_for_manager_logout(store_account_id, "workspace-a", "", ""),
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store");
+    let manager = AuthManager::new_with_sqlite_home(
+        dir.path().to_path_buf(),
+        dir.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    assert!(
+        manager
+            .account_state_store
+            .as_ref()
+            .expect("account-state store should open")
+            .account_is_leased_by_other("other-session", None, store_account_id, Utc::now())
+            .expect("lease lookup should succeed")
+    );
+
+    assert!(
+        manager
+            .logout_with_revoke()
+            .await
+            .expect("logout with revoke should succeed")
+    );
+
+    assert!(
+        !manager
+            .account_state_store
+            .as_ref()
+            .expect("account-state store should remain open")
+            .account_is_leased_by_other("other-session", None, store_account_id, Utc::now())
+            .expect("lease lookup should succeed")
+    );
 }
 
 #[test]
@@ -240,7 +380,7 @@ fn unauthorized_recovery_reports_mode_and_step_names() {
     let managed = UnauthorizedRecovery {
         manager: Arc::clone(&manager),
         step: UnauthorizedRecoveryStep::Reload,
-        expected_account_id: None,
+        expected_store_account_id: None,
         mode: UnauthorizedRecoveryMode::Managed,
     };
     assert_eq!(managed.mode_name(), "managed");
@@ -249,7 +389,7 @@ fn unauthorized_recovery_reports_mode_and_step_names() {
     let external = UnauthorizedRecovery {
         manager,
         step: UnauthorizedRecoveryStep::ExternalRefresh,
-        expected_account_id: None,
+        expected_store_account_id: None,
         mode: UnauthorizedRecoveryMode::External,
     };
     assert_eq!(external.mode_name(), "external");
@@ -285,12 +425,18 @@ fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
         .expect("tokens should exist");
     updated_tokens.access_token = "new-access-token".to_string();
     updated_tokens.refresh_token = "new-refresh-token".to_string();
-    let updated_auth = CodexAuth::from_auth_dot_json(
-        codex_home.path(),
-        updated_auth_dot_json,
+    let updated_auth_home = tempdir().unwrap();
+    let updated_auth_store = AuthStore::from_legacy(updated_auth_dot_json);
+    save_auth(
+        updated_auth_home.path(),
+        &updated_auth_store,
         AuthCredentialsStoreMode::File,
     )
-    .expect("updated auth should parse");
+    .expect("updated auth should save");
+    let updated_auth =
+        CodexAuth::from_auth_storage(updated_auth_home.path(), AuthCredentialsStoreMode::File)
+            .expect("updated auth should load")
+            .expect("updated auth should exist");
 
     let manager = AuthManager::from_auth_for_testing(auth.clone());
     let error = RefreshTokenFailedError::new(
@@ -305,9 +451,10 @@ fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
 
 #[test]
 fn external_auth_tokens_without_chatgpt_metadata_cannot_seed_chatgpt_auth() {
-    let err = AuthDotJson::from_external_tokens(&ExternalAuthTokens::access_token_only(
-        "test-access-token",
-    ))
+    let err = AuthDotJson::from_external_tokens(
+        &ExternalAuthTokens::access_token_only("test-access-token"),
+        None,
+    )
     .expect_err("bearer-only external auth should not seed ChatGPT auth");
 
     assert_eq!(
@@ -534,13 +681,13 @@ async fn auth_manager_notifies_when_auth_state_changes() {
 
     save_auth(
         dir.path(),
-        &AuthDotJson {
+        &AuthStore::from_legacy(AuthDotJson {
             auth_mode: Some(ApiAuthMode::ApiKey),
             openai_api_key: Some("sk-test-key".to_string()),
             tokens: None,
             last_refresh: None,
             agent_identity: None,
-        },
+        }),
         AuthCredentialsStoreMode::File,
     )
     .expect("save auth");
@@ -556,13 +703,13 @@ async fn auth_manager_notifies_when_auth_state_changes() {
 
     save_auth(
         dir.path(),
-        &AuthDotJson {
+        &AuthStore::from_legacy(AuthDotJson {
             auth_mode: Some(ApiAuthMode::ApiKey),
             openai_api_key: Some("sk-updated-key".to_string()),
             tokens: None,
             last_refresh: None,
             agent_identity: None,
-        },
+        }),
         AuthCredentialsStoreMode::File,
     )
     .expect("save updated auth");

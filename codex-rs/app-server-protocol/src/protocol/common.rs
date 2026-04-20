@@ -309,10 +309,10 @@ client_request_definitions! {
         params: v2::ThreadShellCommandParams,
         response: v2::ThreadShellCommandResponse,
     },
-    #[experimental("thread/backgroundTerminals/stop")]
-    ThreadBackgroundTerminalsStop => "thread/backgroundTerminals/stop" {
-        params: v2::ThreadBackgroundTerminalsStopParams,
-        response: v2::ThreadBackgroundTerminalsStopResponse,
+    #[experimental("thread/backgroundTerminals/clean")]
+    ThreadBackgroundTerminalsClean => "thread/backgroundTerminals/clean" {
+        params: v2::ThreadBackgroundTerminalsCleanParams,
+        response: v2::ThreadBackgroundTerminalsCleanResponse,
     },
     ThreadRollback => "thread/rollback" {
         params: v2::ThreadRollbackParams,
@@ -346,6 +346,10 @@ client_request_definitions! {
     MarketplaceAdd => "marketplace/add" {
         params: v2::MarketplaceAddParams,
         response: v2::MarketplaceAddResponse,
+    },
+    MarketplaceRemove => "marketplace/remove" {
+        params: v2::MarketplaceRemoveParams,
+        response: v2::MarketplaceRemoveResponse,
     },
     PluginList => "plugin/list" {
         params: v2::PluginListParams,
@@ -1789,16 +1793,16 @@ mod tests {
     }
 
     #[test]
-    fn serialize_thread_background_terminals_stop() -> Result<()> {
-        let request = ClientRequest::ThreadBackgroundTerminalsStop {
+    fn serialize_thread_background_terminals_clean() -> Result<()> {
+        let request = ClientRequest::ThreadBackgroundTerminalsClean {
             request_id: RequestId::Integer(8),
-            params: v2::ThreadBackgroundTerminalsStopParams {
+            params: v2::ThreadBackgroundTerminalsCleanParams {
                 thread_id: "thr_123".to_string(),
             },
         };
         assert_eq!(
             json!({
-                "method": "thread/backgroundTerminals/stop",
+                "method": "thread/backgroundTerminals/clean",
                 "id": 8,
                 "params": {
                     "threadId": "thr_123"

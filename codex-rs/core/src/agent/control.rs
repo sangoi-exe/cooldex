@@ -138,6 +138,7 @@ fn keep_forked_rollout_item(item: &RolloutItem) -> bool {
             | ResponseItem::Compaction { .. }
             | ResponseItem::Other,
         ) => false,
+        RolloutItem::SessionState(_) => false,
         RolloutItem::Compacted(_)
         | RolloutItem::EventMsg(_)
         | RolloutItem::SessionMeta(_)
@@ -167,6 +168,7 @@ fn export_forked_subagent_rollout_item(item: RolloutItem) -> Option<RolloutItem>
             export_forked_subagent_turn_context(turn_context),
         )),
         RolloutItem::EventMsg(EventMsg::UserMessage(_)) => None,
+        RolloutItem::SessionState(_) => None,
         RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => Some(item),
     }
 }

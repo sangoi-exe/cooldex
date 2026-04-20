@@ -54,6 +54,7 @@ use codex_protocol::protocol::McpToolCallBeginEvent;
 use codex_protocol::protocol::McpToolCallEndEvent;
 use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::PatchApplyEndEvent;
+use codex_protocol::protocol::ReviewFinding;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadRolledBackEvent;
@@ -68,6 +69,7 @@ use codex_protocol::protocol::WebSearchEndEvent;
 use codex_shell_command::parse_command::parse_command;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
+use std::path::Path;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -218,20 +220,15 @@ fn shell_command_execution_item(
     rollout_cwd: Option<&AbsolutePathBuf>,
     status: CommandExecutionStatus,
     aggregated_output: Option<String>,
-) -> ThreadItem {
+) -> Option<ThreadItem> {
     let command_display =
         shlex::try_join(command.iter().map(String::as_str)).unwrap_or_else(|_| command.join(" "));
-    let cwd = cwd
-        .map(AbsolutePathBuf::try_from)
-        .transpose()
-        .expect("shell command cwd should be absolute")
-        .or_else(|| rollout_cwd.cloned())
-        .expect("shell command replay requires session or turn cwd when workdir is absent");
+    let cwd = resolve_shell_command_cwd(cwd.as_deref(), rollout_cwd, &item_id)?;
     let command_actions = parse_command(&command)
         .into_iter()
         .map(|parsed| CommandAction::from_core_with_cwd(parsed, &cwd))
         .collect();
-    ThreadItem::CommandExecution {
+    Some(ThreadItem::CommandExecution {
         id: item_id,
         command: command_display,
         cwd,
@@ -242,7 +239,7 @@ fn shell_command_execution_item(
         aggregated_output,
         exit_code: None,
         duration_ms: None,
-    }
+    })
 }
 
 pub struct ThreadHistoryBuilder {
@@ -409,17 +406,20 @@ impl ThreadHistoryBuilder {
             RolloutItem::Compacted(payload) => self.handle_compacted(payload),
             RolloutItem::ResponseItem(item) => self.handle_response_item(item),
             RolloutItem::TurnContext(turn_context) => {
-                self.rollout_cwd = Some(
-                    AbsolutePathBuf::try_from(turn_context.cwd.clone())
-                        .expect("turn context cwd should be absolute"),
+                self.rollout_cwd = normalize_rollout_cwd(
+                    &turn_context.cwd,
+                    "turn context cwd",
+                    self.next_rollout_index - 1,
                 );
             }
             RolloutItem::SessionMeta(meta_line) => {
-                self.rollout_cwd = Some(
-                    AbsolutePathBuf::try_from(meta_line.meta.cwd.clone())
-                        .expect("session meta cwd should be absolute"),
+                self.rollout_cwd = normalize_rollout_cwd(
+                    &meta_line.meta.cwd,
+                    "session meta cwd",
+                    self.next_rollout_index - 1,
                 );
             }
+            RolloutItem::SessionState(_) => {}
         }
     }
 
@@ -511,14 +511,16 @@ impl ThreadHistoryBuilder {
                     .clone()
                     .or_else(|| id.clone())
                     .unwrap_or_else(|| self.next_item_id());
-                self.upsert_item_in_current_turn(shell_command_execution_item(
+                if let Some(item) = shell_command_execution_item(
                     item_id,
                     exec.command.clone(),
                     exec.working_directory.clone(),
                     self.rollout_cwd.as_ref(),
                     local_shell_status_to_command_status(status),
                     /*aggregated_output*/ None,
-                ));
+                ) {
+                    self.upsert_item_in_current_turn(item);
+                }
             }
             ResponseItem::FunctionCall {
                 name,
@@ -529,15 +531,16 @@ impl ThreadHistoryBuilder {
                 if matches!(name.as_str(), "shell" | "shell_command" | "container.exec")
                     && let Some((command, cwd)) =
                         Self::shell_like_response_command(name.as_str(), arguments)
-                {
-                    self.upsert_item_in_current_turn(shell_command_execution_item(
+                    && let Some(item) = shell_command_execution_item(
                         call_id.clone(),
                         command,
                         cwd,
                         self.rollout_cwd.as_ref(),
                         CommandExecutionStatus::InProgress,
                         /*aggregated_output*/ None,
-                    ));
+                    )
+                {
+                    self.upsert_item_in_current_turn(item);
                 }
             }
             ResponseItem::FunctionCallOutput { call_id, output } => {
@@ -1668,12 +1671,101 @@ impl ThreadHistoryBuilder {
 
 const REVIEW_FALLBACK_MESSAGE: &str = "Reviewer failed to output a response.";
 
+fn normalize_rollout_cwd(
+    path: &Path,
+    source: &str,
+    rollout_index: usize,
+) -> Option<AbsolutePathBuf> {
+    match AbsolutePathBuf::from_absolute_path_checked(path) {
+        Ok(cwd) => Some(cwd),
+        Err(err) => {
+            warn!(
+                %source,
+                path = %path.display(),
+                rollout_index,
+                "ignoring non-absolute replay cwd: {err}"
+            );
+            None
+        }
+    }
+}
+
+fn resolve_shell_command_cwd(
+    raw_cwd: Option<&str>,
+    rollout_cwd: Option<&AbsolutePathBuf>,
+    item_id: &str,
+) -> Option<AbsolutePathBuf> {
+    let resolved_cwd = raw_cwd.filter(|cwd| !cwd.is_empty()).map_or_else(
+        || rollout_cwd.cloned(),
+        |cwd| {
+            AbsolutePathBuf::from_absolute_path_checked(cwd)
+                .ok()
+                .or_else(|| rollout_cwd.map(|base| base.join(cwd)))
+        },
+    );
+
+    if resolved_cwd.is_none() {
+        warn!(
+            item_id,
+            raw_cwd = raw_cwd.unwrap_or("<none>"),
+            has_rollout_cwd = rollout_cwd.is_some(),
+            "skipping shell replay item without usable cwd"
+        );
+    }
+
+    resolved_cwd
+}
+
+fn format_review_location(item: &ReviewFinding) -> String {
+    let path = item.code_location.absolute_file_path.display();
+    let start = item.code_location.line_range.start;
+    let end = item.code_location.line_range.end;
+    format!("{path}:{start}-{end}")
+}
+
+fn format_review_findings_block(findings: &[ReviewFinding]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(String::new());
+
+    if findings.len() > 1 {
+        lines.push("Full review comments:".to_string());
+    } else {
+        lines.push("Review comment:".to_string());
+    }
+
+    for item in findings {
+        lines.push(String::new());
+        let title = &item.title;
+        let location = format_review_location(item);
+        lines.push(format!("- {title} — {location}"));
+        for body_line in item.body.lines() {
+            lines.push(format!("  {body_line}"));
+        }
+    }
+
+    lines.join("\n")
+}
+
+// Merge-safety anchor: resumed review items must stay text-identical to the
+// live app-server/core formatter even though this protocol crate cannot depend
+// on `codex_core::review_format`; keep this mirrored logic aligned on sync.
 fn render_review_output_text(output: &ReviewOutputEvent) -> String {
+    let mut sections = Vec::new();
     let explanation = output.overall_explanation.trim();
-    if explanation.is_empty() {
+    if !explanation.is_empty() {
+        sections.push(explanation.to_string());
+    }
+    if !output.findings.is_empty() {
+        let findings = format_review_findings_block(&output.findings);
+        let trimmed = findings.trim();
+        if !trimmed.is_empty() {
+            sections.push(trimmed.to_string());
+        }
+    }
+    if sections.is_empty() {
         REVIEW_FALLBACK_MESSAGE.to_string()
     } else {
-        explanation.to_string()
+        sections.join("\n\n")
     }
 }
 
@@ -1795,6 +1887,7 @@ mod tests {
     use codex_protocol::protocol::DynamicToolCallResponseEvent;
     use codex_protocol::protocol::ExecCommandEndEvent;
     use codex_protocol::protocol::ExecCommandSource;
+    use codex_protocol::protocol::ExitedReviewModeEvent;
     use codex_protocol::protocol::ItemStartedEvent;
     use codex_protocol::protocol::McpInvocation;
     use codex_protocol::protocol::McpToolCallEndEvent;
@@ -1802,6 +1895,10 @@ mod tests {
     use codex_protocol::protocol::PromptGcCompactionMetadata;
     use codex_protocol::protocol::PromptGcExecutionPhase;
     use codex_protocol::protocol::PromptGcOutcomeKind;
+    use codex_protocol::protocol::ReviewCodeLocation;
+    use codex_protocol::protocol::ReviewFinding;
+    use codex_protocol::protocol::ReviewLineRange;
+    use codex_protocol::protocol::ReviewOutputEvent;
     use codex_protocol::protocol::ThreadRolledBackEvent;
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::TurnAbortedEvent;
@@ -4480,6 +4577,144 @@ mod tests {
                 aggregated_output: None,
                 exit_code: None,
                 duration_ms: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn reconstructs_shell_response_item_with_relative_workdir_using_session_meta_cwd() {
+        let items = vec![
+            RolloutItem::SessionMeta(codex_protocol::protocol::SessionMetaLine {
+                meta: codex_protocol::protocol::SessionMeta {
+                    cwd: PathBuf::from("/tmp/workspace"),
+                    ..Default::default()
+                },
+                git: None,
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".into(),
+                namespace: None,
+                arguments: r#"{"command":["cat","runner.py"],"workdir":"scripts"}"#.into(),
+                call_id: "call-shell-1".into(),
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                completed_at: None,
+                duration_ms: None,
+                last_agent_message: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items,
+            vec![ThreadItem::CommandExecution {
+                id: "call-shell-1".into(),
+                command: "cat runner.py".into(),
+                cwd: test_path_buf("/tmp/workspace/scripts").abs(),
+                process_id: None,
+                source: CommandExecutionSource::Agent,
+                status: CommandExecutionStatus::InProgress,
+                command_actions: vec![CommandAction::Read {
+                    command: "cat runner.py".into(),
+                    name: "runner.py".into(),
+                    path: test_path_buf("/tmp/workspace/scripts/runner.py").abs(),
+                }],
+                aggregated_output: None,
+                exit_code: None,
+                duration_ms: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn skips_shell_response_item_when_replay_has_no_usable_cwd() {
+        let items = vec![
+            RolloutItem::SessionMeta(codex_protocol::protocol::SessionMetaLine {
+                meta: codex_protocol::protocol::SessionMeta {
+                    cwd: PathBuf::from("relative-session-cwd"),
+                    ..Default::default()
+                },
+                git: None,
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                id: None,
+                name: "shell".into(),
+                namespace: None,
+                arguments: r#"{"command":["pwd"]}"#.into(),
+                call_id: "call-shell-1".into(),
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                completed_at: None,
+                duration_ms: None,
+                last_agent_message: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].items.is_empty());
+    }
+
+    #[test]
+    fn exited_review_mode_replay_includes_formatted_findings_block() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-a".into(),
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+                review_output: Some(ReviewOutputEvent {
+                    findings: vec![ReviewFinding {
+                        title: "Prefer Stylize helpers".into(),
+                        body: "Use Stylize instead of Span::styled.".into(),
+                        confidence_score: 0.96,
+                        priority: 1,
+                        code_location: ReviewCodeLocation {
+                            absolute_file_path: PathBuf::from("/tmp/file.rs"),
+                            line_range: ReviewLineRange { start: 10, end: 20 },
+                        },
+                    }],
+                    overall_correctness: "patch is incorrect".into(),
+                    overall_explanation: "Needs one formatting fix.".into(),
+                    overall_confidence_score: 0.82,
+                }),
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-a".into(),
+                completed_at: None,
+                duration_ms: None,
+                last_agent_message: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items,
+            vec![ThreadItem::ExitedReviewMode {
+                id: "item-1".into(),
+                review: "Needs one formatting fix.\n\nReview comment:\n\n- Prefer Stylize helpers — /tmp/file.rs:10-20\n  Use Stylize instead of Span::styled.".into(),
             }]
         );
     }

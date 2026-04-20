@@ -1079,6 +1079,9 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             RolloutItem::TurnContext(_) => {
                 // Not included in `head`; skip.
             }
+            RolloutItem::SessionState(_) => {
+                // Not included in `head`; skip.
+            }
             RolloutItem::Compacted(_) => {
                 // Not included in `head`; skip.
             }
@@ -1134,6 +1137,7 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
                     }
                 }
                 RolloutItem::Compacted(_)
+                | RolloutItem::SessionState(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::EventMsg(_) => {}
             }

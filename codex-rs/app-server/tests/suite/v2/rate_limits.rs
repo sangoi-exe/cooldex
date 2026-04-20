@@ -171,12 +171,12 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
             limit_id: Some("codex".to_string()),
             limit_name: None,
             primary: Some(RateLimitWindow {
-                used_percent: 42,
+                remaining_percent: 58,
                 window_duration_mins: Some(60),
                 resets_at: Some(primary_reset_timestamp),
             }),
             secondary: Some(RateLimitWindow {
-                used_percent: 5,
+                remaining_percent: 95,
                 window_duration_mins: Some(1440),
                 resets_at: Some(secondary_reset_timestamp),
             }),
@@ -192,12 +192,12 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
                         limit_id: Some("codex".to_string()),
                         limit_name: None,
                         primary: Some(RateLimitWindow {
-                            used_percent: 42,
+                            remaining_percent: 58,
                             window_duration_mins: Some(60),
                             resets_at: Some(primary_reset_timestamp),
                         }),
                         secondary: Some(RateLimitWindow {
-                            used_percent: 5,
+                            remaining_percent: 95,
                             window_duration_mins: Some(1440),
                             resets_at: Some(secondary_reset_timestamp),
                         }),
@@ -214,7 +214,7 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
                         limit_id: Some("codex_other".to_string()),
                         limit_name: Some("codex_other".to_string()),
                         primary: Some(RateLimitWindow {
-                            used_percent: 88,
+                            remaining_percent: 12,
                             window_duration_mins: Some(30),
                             resets_at: Some(1735693200),
                         }),

@@ -711,6 +711,35 @@ async fn prompt_gc_sidecar_no_eligible_chunks_complete_without_visible_accountin
     assert_eq!(latest_rate_limits, None);
 }
 
+#[tokio::test]
+async fn default_pos_compact_warning_keeps_recall_when_rollout_recovery_is_available() {
+    let config = test_config().await;
+
+    assert_eq!(
+        default_pos_compact_warning(&config, /*is_subagent*/ false),
+        AUTO_COMPACT_RECON_WARNING_BODY
+    );
+    assert_eq!(
+        default_pos_compact_warning(&config, /*is_subagent*/ true),
+        SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY
+    );
+}
+
+#[tokio::test]
+async fn default_pos_compact_warning_drops_recall_for_ephemeral_sessions() {
+    let mut config = test_config().await;
+    config.ephemeral = true;
+
+    assert_eq!(
+        default_pos_compact_warning(&config, /*is_subagent*/ false),
+        AUTO_COMPACT_RECON_NO_RECALL_WARNING_BODY
+    );
+    assert_eq!(
+        default_pos_compact_warning(&config, /*is_subagent*/ true),
+        SUBAGENT_AUTO_COMPACT_NO_RECALL_WARNING_BODY
+    );
+}
+
 fn prompt_gc_unified_exec_output(token_qty: usize, body: &str) -> String {
     format!("Wall time: 0.0000 seconds\nToken qty: {token_qty}\nOutput:\n{body}")
 }
@@ -9331,7 +9360,10 @@ async fn spawned_task_persists_turn_complete_and_handoff_debug_dump() {
 
     let turn_complete = saw_turn_complete.expect("spawned task should emit turn complete");
     assert_eq!(turn_complete.turn_id, turn_id);
-    assert_eq!(turn_complete.last_agent_message.as_deref(), Some(raw_message.as_str()));
+    assert_eq!(
+        turn_complete.last_agent_message.as_deref(),
+        Some(raw_message.as_str())
+    );
 
     assert_eq!(
         std::fs::read_to_string(&expected_dump_path).expect("read final handoff debug dump"),

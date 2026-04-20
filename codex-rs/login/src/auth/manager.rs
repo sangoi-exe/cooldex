@@ -4128,9 +4128,7 @@ impl AuthManager {
     /// unauthenticated state.
     pub fn logout(&self) -> std::io::Result<bool> {
         let removed = logout_all_stores(&self.codex_home, self.auth_credentials_store_mode)?;
-        // Always reload to clear any cached auth (even if file absent).
-        self.reload();
-        Ok(removed)
+        self.finish_logout(removed)
     }
 
     pub async fn logout_with_revoke(&self) -> std::io::Result<bool> {
@@ -4141,9 +4139,7 @@ impl AuthManager {
             tracing::warn!("failed to revoke auth tokens during logout: {err}");
         }
         let result = logout_all_stores(&self.codex_home, self.auth_credentials_store_mode)?;
-        // Always reload to clear any cached auth (even if file absent).
-        self.reload();
-        Ok(result)
+        self.finish_logout(result)
     }
 
     pub fn get_api_auth_mode(&self) -> Option<ApiAuthMode> {
@@ -4166,6 +4162,17 @@ impl AuthManager {
 
     pub fn runtime_session_id(&self) -> &str {
         self.runtime_session_id.as_str()
+    }
+
+    fn finish_logout(&self, removed: bool) -> std::io::Result<bool> {
+        // Merge-safety anchor: WS12 logout must clear the runtime active-account lease before the
+        // live manager stays resident, or app-server/TUI logout leaves a foreign SQLite lease that
+        // blocks the next session from claiming the saved account.
+        let release_result = self.release_runtime_active_account();
+        // Always reload to clear any cached auth (even if file absent).
+        self.reload();
+        release_result?;
+        Ok(removed)
     }
 
     pub fn release_runtime_active_account(&self) -> std::io::Result<()> {

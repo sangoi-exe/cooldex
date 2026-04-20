@@ -741,6 +741,9 @@ impl RolloutRecorder {
                     RolloutItem::Compacted(item) => {
                         items.push(RolloutItem::Compacted(item));
                     }
+                    RolloutItem::SessionState(item) => {
+                        items.push(RolloutItem::SessionState(item));
+                    }
                     RolloutItem::TurnContext(item) => {
                         items.push(RolloutItem::TurnContext(item));
                     }
@@ -1673,6 +1676,7 @@ async fn resume_candidate_matches_cwd(
             RolloutItem::SessionMeta(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::Compacted(_)
+            | RolloutItem::SessionState(_)
             | RolloutItem::EventMsg(_) => None,
         })
     {
@@ -2008,6 +2012,7 @@ mod tests {
             1,
             None,
             ThreadSortKey::CreatedAt,
+            SortDirection::Desc,
             &[],
             None,
             default_provider.as_str(),
@@ -2023,6 +2028,7 @@ mod tests {
             1,
             Some(&cursor),
             ThreadSortKey::CreatedAt,
+            SortDirection::Desc,
             &[],
             None,
             default_provider.as_str(),
@@ -2080,6 +2086,7 @@ mod tests {
             10,
             None,
             ThreadSortKey::CreatedAt,
+            SortDirection::Desc,
             &[],
             None,
             default_provider.as_str(),
@@ -2142,6 +2149,7 @@ mod tests {
             1,
             None,
             ThreadSortKey::CreatedAt,
+            SortDirection::Desc,
             &[],
             None,
             default_provider.as_str(),
@@ -2180,6 +2188,7 @@ mod tests {
                 approval_policy: AskForApproval::Never,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 network: None,
+                file_system_sandbox_policy: None,
                 model: "test-model".to_string(),
                 personality: None,
                 collaboration_mode: None,
@@ -2249,6 +2258,7 @@ mod tests {
                     approval_policy: AskForApproval::Never,
                     sandbox_policy: SandboxPolicy::new_read_only_policy(),
                     network: None,
+                    file_system_sandbox_policy: None,
                     model: "test-model".to_string(),
                     personality: None,
                     collaboration_mode: None,
