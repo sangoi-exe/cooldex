@@ -78,6 +78,23 @@ available they define the resume boundary even if the surviving suffix is not
 currently renderable; Codex falls back to the legacy `initial_messages` replay
 path only when reconstructed turns could not be loaded.
 
+<!-- Merge-safety anchor: final-turn handoff debug docs must stay aligned with
+the core turn-finish raw `last_agent_message` dump contract, including the
+CODEX_HOME/debug/<session_uuid>/turn-<turn_id> path and warning-only failures. -->
+## Final turn handoff debug dump
+
+Set `[tui].final_turn_handoff_debug = true` to dump the raw final assistant
+handoff text for each completed turn to:
+
+`$CODEX_HOME/debug/<session_uuid>/turn-<turn_id>-final-handoff-raw.txt`
+
+Codex writes the exact `last_agent_message` string before the TUI renders it.
+The file preserves Markdown and plain-text symbols verbatim and does not
+include wrapped TUI output, ANSI escapes, or other post-format content. Codex
+only writes the file when the flag is enabled and the final message is
+non-empty. If directory creation or file writing fails, Codex emits a warning
+for that turn and still completes the turn.
+
 ## SQLite State DB
 
 Codex stores the SQLite-backed state DB under `sqlite_home` (config key) or the

@@ -8914,6 +8914,31 @@ struct NeverEndingTask {
     listen_to_cancellation_token: bool,
 }
 
+#[derive(Clone)]
+struct ImmediateMessageTask {
+    final_message: String,
+}
+
+impl SessionTask for ImmediateMessageTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.immediate_message"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<SessionTaskContext>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<UserInput>,
+        _cancellation_token: CancellationToken,
+    ) -> Option<String> {
+        Some(self.final_message.clone())
+    }
+}
+
 impl SessionTask for NeverEndingTask {
     fn kind(&self) -> TaskKind {
         self.kind
@@ -9118,6 +9143,300 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
             ..
         }) if turn_id == tc.sub_id
     ));
+}
+
+#[tokio::test]
+async fn task_finish_writes_raw_final_turn_handoff_debug_dump_when_enabled() {
+    let (sess, mut tc, rx) = make_session_and_context_with_rx().await;
+    Arc::make_mut(
+        &mut Arc::get_mut(&mut tc)
+            .expect("turn context should be exclusively owned")
+            .config,
+    )
+    .tui_final_turn_handoff_debug = true;
+
+    let raw_message = "## Final handoff\n- keep `markdown`\n> preserve _symbols_ and \"quotes\"\n";
+    let session_id = sess.conversation_id.to_string();
+    let turn_id = tc.sub_id.clone();
+    let expected_path = tc
+        .config
+        .codex_home
+        .join("debug")
+        .join(&session_id)
+        .join(format!("turn-{turn_id}-final-handoff-raw.txt"));
+
+    sess.on_task_finished(Arc::clone(&tc), Some(raw_message.to_string()))
+        .await;
+
+    // Merge-safety anchor: the final-turn debug dump test must assert the
+    // exact raw `last_agent_message` bytes and canonical
+    // CODEX_HOME/debug/<session_uuid>/turn-<turn_id> path contract.
+    assert_eq!(
+        std::fs::read_to_string(&expected_path).expect("read final handoff debug dump"),
+        raw_message
+    );
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected turn complete event")
+        .expect("channel open");
+    assert!(matches!(
+        event.msg,
+        EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id,
+            last_agent_message: Some(message),
+            ..
+        }) if turn_id == tc.sub_id && message == raw_message
+    ));
+}
+
+#[tokio::test]
+async fn task_finish_skips_raw_final_turn_handoff_debug_dump_when_disabled() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let raw_message = "plain final handoff";
+    let expected_path = tc
+        .config
+        .codex_home
+        .join("debug")
+        .join(sess.conversation_id.to_string())
+        .join(format!("turn-{}-final-handoff-raw.txt", tc.sub_id));
+
+    sess.on_task_finished(Arc::clone(&tc), Some(raw_message.to_string()))
+        .await;
+
+    assert!(
+        !expected_path.exists(),
+        "final handoff debug dump should stay disabled by default"
+    );
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected turn complete event")
+        .expect("channel open");
+    assert!(matches!(
+        event.msg,
+        EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id,
+            last_agent_message: Some(message),
+            ..
+        }) if turn_id == tc.sub_id && message == raw_message
+    ));
+}
+
+#[tokio::test]
+async fn task_finish_warns_and_still_emits_turn_complete_when_handoff_debug_dir_creation_fails() {
+    let (sess, mut tc, rx) = make_session_and_context_with_rx().await;
+    Arc::make_mut(
+        &mut Arc::get_mut(&mut tc)
+            .expect("turn context should be exclusively owned")
+            .config,
+    )
+    .tui_final_turn_handoff_debug = true;
+
+    let raw_message = "raw final handoff";
+    let session_id = sess.conversation_id.to_string();
+    let expected_path = tc
+        .config
+        .codex_home
+        .join("debug")
+        .join(&session_id)
+        .join(format!("turn-{}-final-handoff-raw.txt", tc.sub_id));
+    let blocking_path = tc.config.codex_home.join("debug").join(&session_id);
+    std::fs::create_dir_all(
+        blocking_path
+            .parent()
+            .expect("session debug path should have a parent"),
+    )
+    .expect("create debug root");
+    std::fs::write(&blocking_path, "not a directory").expect("create blocking session debug file");
+
+    sess.on_task_finished(Arc::clone(&tc), Some(raw_message.to_string()))
+        .await;
+
+    let warning_event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected warning event")
+        .expect("channel open");
+    assert!(matches!(
+        warning_event.msg,
+        EventMsg::Warning(WarningEvent { message })
+            if message.contains("Failed to write final turn handoff debug dump to")
+                && message.contains(&expected_path.display().to_string())
+    ));
+
+    let turn_complete_event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected turn complete event")
+        .expect("channel open");
+    assert!(matches!(
+        turn_complete_event.msg,
+        EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id,
+            last_agent_message: Some(message),
+            ..
+        }) if turn_id == tc.sub_id && message == raw_message
+    ));
+    assert!(
+        !expected_path.exists(),
+        "failed dump writes must not fabricate the handoff debug file"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_task_persists_turn_complete_and_handoff_debug_dump() {
+    let (sess, mut tc, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&sess).await;
+    Arc::make_mut(
+        &mut Arc::get_mut(&mut tc)
+            .expect("turn context should be exclusively owned")
+            .config,
+    )
+    .tui_final_turn_handoff_debug = true;
+
+    let raw_message = "Recebido. Estou pronto.".to_string();
+    let session_id = sess.conversation_id.to_string();
+    let turn_id = tc.sub_id.clone();
+    let expected_dump_path = tc
+        .config
+        .codex_home
+        .join("debug")
+        .join(&session_id)
+        .join(format!("turn-{turn_id}-final-handoff-raw.txt"));
+
+    sess.spawn_task(
+        Arc::clone(&tc),
+        vec![UserInput::Text {
+            text: "teste".to_string(),
+            text_elements: Vec::new(),
+        }],
+        ImmediateMessageTask {
+            final_message: raw_message.clone(),
+        },
+    )
+    .await;
+
+    let mut saw_turn_complete = None;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = tokio::time::timeout(remaining, rx.recv())
+            .await
+            .expect("expected event before timeout")
+            .expect("channel open");
+        if let EventMsg::TurnComplete(turn_complete) = event.msg {
+            saw_turn_complete = Some(turn_complete);
+            break;
+        }
+    }
+
+    let turn_complete = saw_turn_complete.expect("spawned task should emit turn complete");
+    assert_eq!(turn_complete.turn_id, turn_id);
+    assert_eq!(turn_complete.last_agent_message.as_deref(), Some(raw_message.as_str()));
+
+    assert_eq!(
+        std::fs::read_to_string(&expected_dump_path).expect("read final handoff debug dump"),
+        raw_message
+    );
+
+    sess.flush_rollout().await.expect("flush rollout");
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+
+    assert!(resumed.history.into_iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: persisted_turn_id,
+                last_agent_message: Some(message),
+                ..
+            })) if persisted_turn_id == turn_id && message == raw_message
+        )
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_task_emits_turn_complete_with_last_agent_message_when_handoff_debug_disabled() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+
+    sess.spawn_task(
+        Arc::clone(&tc),
+        vec![UserInput::Text {
+            text: "teste".to_string(),
+            text_elements: Vec::new(),
+        }],
+        ImmediateMessageTask {
+            final_message: "Recebido. Estou pronto.".to_string(),
+        },
+    )
+    .await;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected turn complete event before timeout")
+        .expect("channel open");
+    assert!(matches!(
+        event.msg,
+        EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id,
+            last_agent_message: Some(message),
+            ..
+        }) if turn_id == tc.sub_id && message == "Recebido. Estou pronto."
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_task_persists_turn_complete_in_rollout_when_handoff_debug_disabled() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&sess).await;
+    let turn_id = tc.sub_id.clone();
+    let raw_message = "Recebido. Estou pronto.".to_string();
+
+    sess.spawn_task(
+        Arc::clone(&tc),
+        vec![UserInput::Text {
+            text: "teste".to_string(),
+            text_elements: Vec::new(),
+        }],
+        ImmediateMessageTask {
+            final_message: raw_message.clone(),
+        },
+    )
+    .await;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected turn complete event before timeout")
+        .expect("channel open");
+    assert!(matches!(
+        event.msg,
+        EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: completed_turn_id,
+            last_agent_message: Some(message),
+            ..
+        }) if completed_turn_id == turn_id && message == raw_message
+    ));
+
+    sess.flush_rollout().await.expect("flush rollout");
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    assert!(resumed.history.into_iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: persisted_turn_id,
+                last_agent_message: Some(message),
+                ..
+            })) if persisted_turn_id == turn_id && message == raw_message
+        )
+    }));
 }
 
 #[tokio::test]

@@ -391,6 +391,10 @@ pub struct Config {
 
     /// Syntax highlighting theme override (kebab-case name).
     pub tui_theme: Option<String>,
+    /// When `true`, dump the raw final assistant handoff text for each
+    /// completed turn to
+    /// `$CODEX_HOME/debug/<session_uuid>/turn-<turn_id>-final-handoff-raw.txt`.
+    pub tui_final_turn_handoff_debug: bool,
     /// Controls how much history the TUI renders when resuming stored sessions.
     pub tui_resume_history: ResumeHistoryMode,
 
@@ -2514,6 +2518,14 @@ impl Config {
             tui_status_line: cfg.tui.as_ref().and_then(|t| t.status_line.clone()),
             tui_terminal_title: cfg.tui.as_ref().and_then(|t| t.terminal_title.clone()),
             tui_theme: cfg.tui.as_ref().and_then(|t| t.theme.clone()),
+            // Merge-safety anchor: final-turn handoff debug remains a
+            // config-backed core turn-finish dump of the raw
+            // `last_agent_message` bytes under CODEX_HOME/debug.
+            tui_final_turn_handoff_debug: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.final_turn_handoff_debug)
+                .unwrap_or(false),
             // Merge-safety anchor: runtime projection of `[tui].resume_history`
             // must stay aligned with the persisted config/schema/docs contract
             // that defaults resume replay to the last surviving compaction.
@@ -2704,6 +2716,8 @@ mod notifications_tests {
         #[serde(default)]
         notification_method: NotificationMethod,
         #[serde(default)]
+        final_turn_handoff_debug: bool,
+        #[serde(default)]
         resume_history: ResumeHistoryMode,
     }
 
@@ -2759,11 +2773,23 @@ mod notifications_tests {
     }
 
     #[test]
+    fn test_tui_final_turn_handoff_debug_mode() {
+        let toml = r#"
+            [tui]
+            final_turn_handoff_debug = true
+        "#;
+        let parsed: RootTomlTest =
+            toml::from_str(toml).expect("deserialize final_turn_handoff_debug=true");
+        assert!(parsed.tui.final_turn_handoff_debug);
+    }
+
+    #[test]
     fn test_tui_resume_history_mode_defaults_to_since_last_compaction() {
         let toml = r#"
             [tui]
         "#;
         let parsed: RootTomlTest = toml::from_str(toml).expect("deserialize empty tui block");
+        assert!(!parsed.tui.final_turn_handoff_debug);
         assert_eq!(
             parsed.tui.resume_history,
             ResumeHistoryMode::SinceLastCompaction

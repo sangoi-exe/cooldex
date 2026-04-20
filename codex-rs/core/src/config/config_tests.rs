@@ -384,6 +384,7 @@ fn config_toml_deserializes_model_availability_nux() {
             status_line: None,
             terminal_title: None,
             theme: None,
+            final_turn_handoff_debug: false,
             resume_history: ResumeHistoryMode::default(),
             model_availability_nux: ModelAvailabilityNuxConfig {
                 shown_count: HashMap::from([
@@ -1188,6 +1189,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             status_line: None,
             terminal_title: None,
             theme: None,
+            final_turn_handoff_debug: false,
             resume_history: ResumeHistoryMode::default(),
             model_availability_nux: ModelAvailabilityNuxConfig::default(),
         }
@@ -4883,6 +4885,7 @@ async fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             tui_status_line: None,
             tui_terminal_title: None,
             tui_theme: None,
+            tui_final_turn_handoff_debug: false,
             otel: OtelConfig::default(),
             ..o3_profile_config.clone()
         },
@@ -5034,6 +5037,7 @@ async fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         tui_status_line: None,
         tui_terminal_title: None,
         tui_theme: None,
+        tui_final_turn_handoff_debug: false,
         otel: OtelConfig::default(),
         ..gpt3_profile_config.clone()
     };
@@ -5183,6 +5187,7 @@ async fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         tui_status_line: None,
         tui_terminal_title: None,
         tui_theme: None,
+        tui_final_turn_handoff_debug: false,
         otel: OtelConfig::default(),
         ..zdr_profile_config.clone()
     };
@@ -5317,6 +5322,7 @@ async fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         tui_status_line: None,
         tui_terminal_title: None,
         tui_theme: None,
+        tui_final_turn_handoff_debug: false,
         otel: OtelConfig::default(),
         ..gpt5_profile_config.clone()
     };

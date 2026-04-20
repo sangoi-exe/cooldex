@@ -588,6 +588,17 @@ pub struct Tui {
     #[serde(default)]
     pub theme: Option<String>,
 
+    // Merge-safety anchor: `[tui].final_turn_handoff_debug` is the config
+    // owner for raw final handoff dumps; core completion/docs/schema/tests
+    // must keep the exact CODEX_HOME/debug/<session_uuid>/turn-<turn_id> path
+    // and raw `last_agent_message` byte-preservation contract aligned.
+    /// Dump the raw final assistant handoff text for each completed turn to
+    /// `$CODEX_HOME/debug/<session_uuid>/turn-<turn_id>-final-handoff-raw.txt`.
+    ///
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub final_turn_handoff_debug: bool,
+
     // Merge-safety anchor: resume-history mode is a workspace-local persisted
     // contract; plain/app-server TUI resume plus docs/schema must stay aligned
     // on default truncation at the last surviving visible compaction marker.

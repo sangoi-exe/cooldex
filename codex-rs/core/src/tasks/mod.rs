@@ -556,6 +556,43 @@ impl Session {
                 &[("token_type", "reasoning_output"), tmp_mem],
             );
         }
+        if turn_context.config.tui_final_turn_handoff_debug
+            && let Some(raw_message) = last_agent_message.as_ref()
+            && !raw_message.is_empty()
+        {
+            // Merge-safety anchor: final-turn handoff debug must dump the raw
+            // pre-render `last_agent_message` bytes from the core turn-finish
+            // owner under CODEX_HOME/debug/<session_uuid>/turn-<turn_id>.
+            let session_id = self.conversation_id.to_string();
+            let turn_id = &turn_context.sub_id;
+            let handoff_debug_dir = turn_context
+                .config
+                .codex_home
+                .join("debug")
+                .join(&session_id);
+            let handoff_debug_path =
+                handoff_debug_dir.join(format!("turn-{turn_id}-final-handoff-raw.txt"));
+            let write_error = match std::fs::create_dir_all(&handoff_debug_dir) {
+                Ok(()) => std::fs::write(&handoff_debug_path, raw_message.as_bytes()).err(),
+                Err(err) => Some(err),
+            };
+            if let Some(err) = write_error {
+                warn!(
+                    "failed to write final turn handoff debug dump to {}: {err}",
+                    handoff_debug_path.display()
+                );
+                self.send_event(
+                    turn_context.as_ref(),
+                    EventMsg::Warning(WarningEvent {
+                        message: format!(
+                            "Failed to write final turn handoff debug dump to {}: {err}",
+                            handoff_debug_path.display()
+                        ),
+                    }),
+                )
+                .await;
+            }
+        }
         let (completed_at, duration_ms) = turn_context
             .turn_timing_state
             .completed_at_and_duration_ms()

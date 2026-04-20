@@ -36,6 +36,10 @@
         "$ref": "#/definitions/AgentRoleToml"
       },
       "properties": {
+        "allow_running_subagent_preemption": {
+          "description": "Whether collab tools may interrupt or close active sub-agents. Defaults to `true`.",
+          "type": "boolean"
+        },
         "job_max_runtime_seconds": {
           "description": "Default maximum runtime in seconds for agent job workers.",
           "format": "uint64",
@@ -356,12 +360,6 @@
             "codex_hooks": {
               "type": "boolean"
             },
-            "collab": {
-              "type": "boolean"
-            },
-            "collaboration_modes": {
-              "type": "boolean"
-            },
             "connectors": {
               "type": "boolean"
             },
@@ -611,6 +609,22 @@
         "service_tier": {
           "$ref": "#/definitions/ServiceTier"
         },
+        "subagent": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SubagentProfileConfig"
+            }
+          ],
+          "default": null
+        },
+        "subagent_instructions_file": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "description": "Optional path to a file containing sub-agent model instructions."
+        },
         "tools": {
           "$ref": "#/definitions/ToolsToml"
         },
@@ -825,6 +839,40 @@
           "type": "string"
         }
       ]
+    },
+    "ManageContextPolicyToml": {
+      "additionalProperties": false,
+      "properties": {
+        "fixed_point_k": {
+          "description": "Number of successive retrieve/apply cycles to use for fixed-point checks.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "max_chunks_per_apply": {
+          "description": "Maximum chunk count allowed in a single `manage_context.apply`.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "quality_rubric_id": {
+          "description": "Identifier for the quality rubric used by manage_context orchestration.",
+          "type": "string"
+        },
+        "stalled_signature_threshold": {
+          "description": "Repeated stalled-signature count needed before declaring stagnation.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fixed_point_k",
+        "max_chunks_per_apply",
+        "quality_rubric_id",
+        "stalled_signature_threshold"
+      ],
+      "type": "object"
     },
     "MarketplaceConfig": {
       "additionalProperties": false,
@@ -1207,14 +1255,6 @@
         },
         "hide_full_access_warning": {
           "description": "Tracks whether the user has acknowledged the full access warning prompt.",
-          "type": "boolean"
-        },
-        "hide_gpt-5.1-codex-max_migration_prompt": {
-          "description": "Tracks whether the user has seen the gpt-5.1-codex-max migration prompt",
-          "type": "boolean"
-        },
-        "hide_gpt5_1_migration_prompt": {
-          "description": "Tracks whether the user has seen the model migration prompt",
           "type": "boolean"
         },
         "hide_rate_limit_model_nudge": {
@@ -1744,6 +1784,13 @@
         }
       ]
     },
+    "ResumeHistoryMode": {
+      "enum": [
+        "full",
+        "since-last-compaction"
+      ],
+      "type": "string"
+    },
     "SandboxMode": {
       "enum": [
         "read-only",
@@ -1884,6 +1931,22 @@
       },
       "type": "object"
     },
+    "SubagentFileMutationMode": {
+      "enum": [
+        "inherit",
+        "deny"
+      ],
+      "type": "string"
+    },
+    "SubagentProfileConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "file_mutation": {
+          "$ref": "#/definitions/SubagentFileMutationMode"
+        }
+      },
+      "type": "object"
+    },
     "ToolSuggestConfig": {
       "additionalProperties": false,
       "properties": {
@@ -1965,6 +2028,11 @@
           "description": "Enable animations (welcome screen, shimmer effects, spinners). Defaults to `true`.",
           "type": "boolean"
         },
+        "final_turn_handoff_debug": {
+          "default": false,
+          "description": "Dump the raw final assistant handoff text for each completed turn to `$CODEX_HOME/debug/<session_uuid>/turn-<turn_id>-final-handoff-raw.txt`.\n\nDefaults to `false`.",
+          "type": "boolean"
+        },
         "model_availability_nux": {
           "allOf": [
             {
@@ -2000,6 +2068,15 @@
           ],
           "default": true,
           "description": "Enable desktop notifications from the TUI. Defaults to `true`."
+        },
+        "resume_history": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ResumeHistoryMode"
+            }
+          ],
+          "default": "since-last-compaction",
+          "description": "Controls how much history the TUI renders when resuming a stored session.\n\n- `since-last-compaction` (default): render only the suffix starting at the last surviving visible `Context compacted` marker. - `full`: render the entire reconstructed persisted transcript."
         },
         "show_tooltips": {
           "default": true,
@@ -2302,12 +2379,6 @@
         "codex_hooks": {
           "type": "boolean"
         },
-        "collab": {
-          "type": "boolean"
-        },
-        "collaboration_modes": {
-          "type": "boolean"
-        },
         "connectors": {
           "type": "boolean"
         },
@@ -2579,6 +2650,14 @@
       ],
       "description": "Directory where Codex writes log files, for example `codex-tui.log`. Defaults to `$CODEX_HOME/log`."
     },
+    "manage_context_policy": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ManageContextPolicyToml"
+        }
+      ],
+      "description": "Explicit policy knobs for `manage_context` orchestration."
+    },
     "marketplaces": {
       "additionalProperties": {
         "$ref": "#/definitions/MarketplaceConfig"
@@ -2742,6 +2821,10 @@
       "description": "User-level plugin config entries keyed by plugin name.",
       "type": "object"
     },
+    "pos_compact_instructions": {
+      "description": "Optional instructions appended after successful remote auto-compaction.",
+      "type": "string"
+    },
     "profile": {
       "description": "Profile to use from the `profiles` map.",
       "type": "string"
@@ -2789,6 +2872,16 @@
       ],
       "default": null,
       "description": "Experimental / do not use. Realtime websocket session selection. `version` controls v1/v2 and `type` controls conversational/transcription."
+    },
+    "recall_debug": {
+      "description": "Controls recall payload verbosity. When unset/false, use a compact string-list payload. When true, use the full/debug payload. Keep recall runtime/docs/schema aligned with this default.",
+      "type": "boolean"
+    },
+    "recall_kbytes_limit": {
+      "description": "Maximum size budget (KiB) for recall payload items returned to the model.",
+      "format": "uint",
+      "minimum": 1.0,
+      "type": "integer"
     },
     "review_model": {
       "description": "Review model override used by the `/review` feature.",
@@ -2852,6 +2945,14 @@
         }
       ],
       "description": "Directory where Codex stores the SQLite state DB. Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses `$CODEX_HOME`."
+    },
+    "subagent_instructions_file": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      ],
+      "description": "Optional path to a file containing model instructions for sub-agent threads spawned via the collab `spawn_agent` tool."
     },
     "suppress_unstable_features_warning": {
       "description": "Suppress warnings about unstable (under development) features.",
