@@ -61,11 +61,21 @@ async fn preset_matching_accepts_workspace_write_with_extra_roots() {
     };
 
     assert!(
-        ChatWidget::preset_matches_current(AskForApproval::OnRequest, &current_sandbox, &preset),
+        ChatWidget::preset_matches_current(
+            AskForApproval::OnRequest,
+            ApprovalsReviewer::User,
+            &current_sandbox,
+            &preset,
+        ),
         "WorkspaceWrite with extra roots should still match the Default preset"
     );
     assert!(
-        !ChatWidget::preset_matches_current(AskForApproval::Never, &current_sandbox, &preset),
+        !ChatWidget::preset_matches_current(
+            AskForApproval::Never,
+            ApprovalsReviewer::User,
+            &current_sandbox,
+            &preset,
+        ),
         "approval mismatch should prevent matching the preset"
     );
 }

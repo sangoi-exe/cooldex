@@ -299,9 +299,7 @@ mod tests {
             codex_home.path(),
             &AuthStore {
                 openai_api_key: Some("sk-test".to_string()),
-                tokens: None,
-                last_refresh: None,
-                agent_identity: None,
+                ..AuthStore::default()
             },
             AuthCredentialsStoreMode::File,
         )

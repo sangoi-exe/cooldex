@@ -947,7 +947,7 @@ fn collect_manage_context_seed_items(items: &[ResponseItem]) -> Vec<ResponseItem
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex::make_session_configuration_for_tests;
+    use crate::session::tests::make_session_configuration_for_tests;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::LocalShellAction;
     use codex_protocol::models::LocalShellExecAction;
@@ -2484,7 +2484,7 @@ mod tests {
 
     #[tokio::test]
     async fn sanitize_rollout_persist_failure_rolls_back_state() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
 
         let recorder = crate::rollout::RolloutRecorder::new(
             turn.config.as_ref(),
@@ -2563,7 +2563,7 @@ mod tests {
 
     #[tokio::test]
     async fn sanitize_without_rollout_recorder_rolls_back_state_for_persistent_sessions() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
 
         let history_before_sanitize = {
             let mut state = session.state.lock().await;
@@ -2616,7 +2616,7 @@ mod tests {
 
     #[tokio::test]
     async fn sanitize_without_rollout_recorder_succeeds_for_ephemeral_sessions() {
-        let (session, mut turn) = crate::codex::make_session_and_context().await;
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
         let mut config = (*turn.config).clone();
         config.ephemeral = true;
         turn.config = Arc::new(config);

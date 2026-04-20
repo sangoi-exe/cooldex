@@ -1871,7 +1871,7 @@ async fn unified_exec_interrupt_preserves_long_running_session() -> Result<()> {
         "expected unified exec process to remain alive after interrupt"
     );
 
-    codex.submit(Op::CleanBackgroundTerminals).await?;
+    codex.submit(Op::StopBackgroundTerminals).await?;
     wait_for_process_exit(&pid).await?;
 
     Ok(())

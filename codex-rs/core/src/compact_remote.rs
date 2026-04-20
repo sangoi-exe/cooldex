@@ -586,6 +586,7 @@ mod tests {
             }),
             credits: None,
             plan_type: None,
+            rate_limit_reached_type: None,
         };
 
         let (mut session, mut turn_context, rx_event) = make_session_and_context_with_rx().await;

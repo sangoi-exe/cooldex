@@ -455,7 +455,7 @@ async fn wait_for_all_final(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex::make_session_and_context;
+    use crate::session::tests::make_session_and_context;
     use tokio::sync::watch;
 
     #[tokio::test]

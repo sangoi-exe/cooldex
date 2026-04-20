@@ -135,6 +135,9 @@ async fn helpers_are_available_and_do_not_panic() {
         is_first_run: true,
         status_account_display: None,
         initial_plan_type: None,
+        auth_manager: codex_login::AuthManager::shared_from_config(
+            &cfg, /*enable_codex_api_key_env*/ false,
+        ),
         model: Some(resolved_model),
         startup_tooltip_override: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),

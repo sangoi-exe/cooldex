@@ -742,6 +742,7 @@ async fn status_snapshot_uses_default_reasoning_when_config_empty() {
         account_display.as_ref(),
         Some(&token_info),
         &usage,
+        /*auth_session_id*/ None,
         &None,
         /*thread_name*/ None,
         /*forked_from*/ None,
@@ -836,7 +837,7 @@ async fn status_snapshot_includes_auth_session_id() {
     let mut config = test_config(&temp_home).await;
     config.model = Some("gpt-5.1-codex-max".to_string());
     config.model_provider_id = "openai".to_string();
-    config.cwd = PathBuf::from("/workspace/tests").abs();
+    config.cwd = test_path_buf("/workspace/tests").abs();
 
     let account_display = test_status_account_display();
     let usage = TokenUsage {
@@ -851,7 +852,7 @@ async fn status_snapshot_includes_auth_session_id() {
         .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
         .single()
         .expect("timestamp");
-    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
+    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
     let token_info = token_info_for(&model_slug, &config, &usage);
     let composite = new_status_output_with_rate_limits(
         &config,

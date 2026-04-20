@@ -180,6 +180,7 @@ mod tests {
         RequestUserInputEvent {
             call_id: call_id.to_string(),
             turn_id: turn_id.to_string(),
+            thread_id: None,
             questions: Vec::new(),
         }
     }

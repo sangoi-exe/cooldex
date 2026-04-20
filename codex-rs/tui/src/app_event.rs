@@ -29,6 +29,7 @@ use codex_protocol::protocol::TokenUsageInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::ApprovalPreset;
 
+use crate::app_server_session::AppServerAccountProjection;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::TerminalTitleItem;
@@ -427,6 +428,18 @@ pub(crate) enum AppEvent {
         updated_accounts: usize,
         cache_fully_refreshed: bool,
         projection_refresh_needed: bool,
+    },
+
+    /// Refresh the bounded app-server account projection after a live account
+    /// update notification.
+    RefreshAppServerAccountProjectionAfterAccountUpdate,
+
+    /// Result of refreshing the bounded app-server account projection after a
+    /// local or app-server account mutation.
+    AppServerAccountProjectionRefreshed {
+        request_id: u64,
+        trigger_description: &'static str,
+        result: Result<AppServerAccountProjection, String>,
     },
 
     /// Switch the active ChatGPT account in the auth store.

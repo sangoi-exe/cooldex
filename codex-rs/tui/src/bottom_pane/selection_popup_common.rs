@@ -914,7 +914,7 @@ mod tests {
             &state,
             /*max_results*/ 1,
             "empty",
-            ColumnWidthMode::AutoVisible,
+            ColumnWidthConfig::new(ColumnWidthMode::AutoVisible, None),
         );
 
         let label_cell = (0..area.height)

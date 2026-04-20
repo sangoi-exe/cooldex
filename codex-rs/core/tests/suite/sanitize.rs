@@ -97,6 +97,7 @@ async fn cleanup_only_sanitize_reports_no_changes_and_keeps_followup_request_fre
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&test.codex, |event| {

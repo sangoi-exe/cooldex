@@ -111,6 +111,7 @@ use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use uuid::Uuid;
 
 /// Data collected during the TUI bootstrap phase that the main event loop
 /// needs to configure the UI, telemetry, and initial rate-limit prefetch.
@@ -216,26 +217,7 @@ impl AppServerSession {
     }
 
     pub(crate) async fn load_account_projection(&mut self) -> Result<AppServerAccountProjection> {
-        let account = self.read_account().await?;
-        let model_request_id = self.next_request_id();
-        let models: ModelListResponse = self
-            .client
-            .request_typed(ClientRequest::ModelList {
-                request_id: model_request_id,
-                params: ModelListParams {
-                    cursor: None,
-                    limit: None,
-                    include_hidden: Some(true),
-                },
-            })
-            .await
-            .wrap_err("model/list failed while loading TUI account projection")?;
-        let available_models = models
-            .data
-            .into_iter()
-            .map(model_preset_from_api_model)
-            .collect::<Vec<_>>();
-        build_account_projection(account, available_models)
+        load_account_projection_from_request_handle(self.request_handle()).await
     }
 
     pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
@@ -856,6 +838,39 @@ impl AppServerSession {
         self.next_request_id += 1;
         RequestId::Integer(request_id)
     }
+}
+
+pub(crate) async fn load_account_projection_from_request_handle(
+    request_handle: AppServerRequestHandle,
+) -> Result<AppServerAccountProjection> {
+    let account_request_id = RequestId::String(format!("account-read-{}", Uuid::new_v4()));
+    let account: GetAccountResponse = request_handle
+        .request_typed(ClientRequest::GetAccount {
+            request_id: account_request_id,
+            params: GetAccountParams {
+                refresh_token: false,
+            },
+        })
+        .await
+        .wrap_err("account/read failed while loading TUI account projection")?;
+    let model_request_id = RequestId::String(format!("model-list-{}", Uuid::new_v4()));
+    let models: ModelListResponse = request_handle
+        .request_typed(ClientRequest::ModelList {
+            request_id: model_request_id,
+            params: ModelListParams {
+                cursor: None,
+                limit: None,
+                include_hidden: Some(true),
+            },
+        })
+        .await
+        .wrap_err("model/list failed while loading TUI account projection")?;
+    let available_models = models
+        .data
+        .into_iter()
+        .map(model_preset_from_api_model)
+        .collect::<Vec<_>>();
+    build_account_projection(account, available_models)
 }
 
 fn build_account_projection(
@@ -1677,6 +1692,7 @@ mod tests {
             &config,
             ThreadParamsMode::Remote,
             /*remote_cwd_override*/ None,
+            /*session_start_source*/ None,
         );
         let resume = thread_resume_params_from_config(
             config.clone(),
@@ -1716,6 +1732,7 @@ mod tests {
             &config,
             ThreadParamsMode::Remote,
             /*remote_cwd_override*/ None,
+            /*session_start_source*/ None,
         );
         let resume = thread_resume_params_from_config(
             config.clone(),
@@ -1802,7 +1819,7 @@ mod tests {
                 updated_at: 2,
                 status: ThreadStatus::Idle,
                 path: None,
-                cwd: PathBuf::from("/tmp/project"),
+                cwd: test_path_buf("/tmp/project").abs(),
                 cli_version: "0.0.0".to_string(),
                 source: codex_protocol::protocol::SessionSource::Cli.into(),
                 agent_nickname: None,
@@ -1814,8 +1831,9 @@ mod tests {
             model: "gpt-5.4".to_string(),
             model_provider: "openai".to_string(),
             service_tier: None,
-            cwd: PathBuf::from("/tmp/project"),
+            cwd: test_path_buf("/tmp/project").abs(),
             config_path: PathBuf::from("/tmp/project/config.toml"),
+            instruction_sources: Vec::new(),
             approval_policy: codex_protocol::protocol::AskForApproval::Never.into(),
             approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
             sandbox: codex_protocol::protocol::SandboxPolicy::new_read_only_policy().into(),
@@ -1922,7 +1940,7 @@ mod tests {
                 updated_at: 2,
                 status: ThreadStatus::Idle,
                 path: None,
-                cwd: PathBuf::from("/tmp/project"),
+                cwd: test_path_buf("/tmp/project").abs(),
                 cli_version: "0.0.0".to_string(),
                 source: codex_protocol::protocol::SessionSource::Cli.into(),
                 agent_nickname: None,
@@ -1934,8 +1952,9 @@ mod tests {
             model: "gpt-5.4".to_string(),
             model_provider: "openai".to_string(),
             service_tier: None,
-            cwd: PathBuf::from("/tmp/project"),
+            cwd: test_path_buf("/tmp/project").abs(),
             config_path: PathBuf::from("/tmp/project/config.toml"),
+            instruction_sources: Vec::new(),
             approval_policy: codex_protocol::protocol::AskForApproval::Never.into(),
             approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
             sandbox: codex_protocol::protocol::SandboxPolicy::new_read_only_policy().into(),
@@ -1966,7 +1985,7 @@ mod tests {
                 updated_at: 2,
                 status: ThreadStatus::Idle,
                 path: None,
-                cwd: PathBuf::from("/tmp/project"),
+                cwd: test_path_buf("/tmp/project").abs(),
                 cli_version: "0.0.0".to_string(),
                 source: codex_protocol::protocol::SessionSource::Cli.into(),
                 agent_nickname: None,
@@ -1978,8 +1997,9 @@ mod tests {
             model: "gpt-5.4".to_string(),
             model_provider: "openai".to_string(),
             service_tier: None,
-            cwd: PathBuf::from("/tmp/project"),
+            cwd: test_path_buf("/tmp/project").abs(),
             config_path: PathBuf::from("/tmp/project/config.toml"),
+            instruction_sources: Vec::new(),
             approval_policy: codex_protocol::protocol::AskForApproval::OnRequest.into(),
             approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::GuardianSubagent,
             sandbox: codex_protocol::protocol::SandboxPolicy::new_workspace_write_policy().into(),
@@ -2110,7 +2130,7 @@ mod tests {
                 }),
                 requires_openai_auth: true,
             },
-            codex_core::test_support::all_model_presets().clone(),
+            crate::legacy_core::test_support::all_model_presets().clone(),
         )
         .expect("projection should build");
 

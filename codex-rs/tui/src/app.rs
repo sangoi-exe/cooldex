@@ -16,6 +16,7 @@ use crate::app_server_session::AppServerSession;
 use crate::app_server_session::AppServerStartedThread;
 use crate::app_server_session::ThreadSessionState;
 use crate::app_server_session::app_server_rate_limit_snapshots_to_core;
+use crate::app_server_session::load_account_projection_from_request_handle;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::FeedbackAudience;
 use crate::bottom_pane::McpServerElicitationFormRequest;
@@ -426,9 +427,9 @@ fn default_exec_approval_decisions(
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GuardianApprovalsMode {
-    approval_policy: AskForApproval,
+    approval: AskForApproval,
     approvals_reviewer: ApprovalsReviewer,
-    sandbox_policy: SandboxPolicy,
+    sandbox: SandboxPolicy,
 }
 
 /// Enabling the Auto-review experiment in the TUI should also switch the
@@ -438,9 +439,9 @@ struct GuardianApprovalsMode {
 #[cfg(test)]
 fn guardian_approvals_mode() -> GuardianApprovalsMode {
     GuardianApprovalsMode {
-        approval_policy: AskForApproval::OnRequest,
+        approval: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::GuardianSubagent,
-        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+        sandbox: SandboxPolicy::new_workspace_write_policy(),
     }
 }
 /// Baseline cadence for periodic stream commit animation ticks.
@@ -1433,6 +1434,8 @@ pub(crate) struct App {
     open_accounts_popup_when_cache_ready: bool,
     observed_active_store_account_id: Option<String>,
     live_account_state_owner: LiveAccountStateOwner,
+    next_account_projection_refresh_request_id: u64,
+    pending_account_projection_refresh_request_id: Option<u64>,
     suppress_ambiguous_rate_limit_notifications_generation: Option<u64>,
     pending_app_server_requests: PendingAppServerRequests,
     // Serialize plugin enablement writes per plugin so stale completions cannot
@@ -1449,6 +1452,7 @@ enum LiveAccountStateOwner {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AccountProjectionRefreshTrigger {
+    AccountUpdate,
     AuthTokenRefresh,
     ManualSetActiveAccount,
     ManualAddAccount,
@@ -1461,6 +1465,7 @@ enum AccountProjectionRefreshTrigger {
 impl AccountProjectionRefreshTrigger {
     fn description(self) -> &'static str {
         match self {
+            Self::AccountUpdate => "account update",
             Self::AuthTokenRefresh => "auth token refresh",
             Self::ManualSetActiveAccount => "manual account selection",
             Self::ManualAddAccount => "adding ChatGPT account",
@@ -2345,8 +2350,7 @@ impl App {
             self.refresh_app_server_account_projection_after_local_auth_change(
                 app_server_client,
                 AccountProjectionRefreshTrigger::AuthTokenRefresh,
-            )
-            .await;
+            );
         }
     }
 
@@ -2599,61 +2603,92 @@ impl App {
         self.refresh_app_server_account_projection_after_local_auth_change(
             app_server_client,
             AccountProjectionRefreshTrigger::AuthTokenRefresh,
-        )
-        .await;
+        );
     }
 
     // Merge-safety anchor: WS1 account-success flows must share one bounded app-server projection
     // convergence owner after local auth mutation/refresh instead of drifting into separate local
     // UI refresh paths.
-    async fn refresh_app_server_account_projection_after_local_auth_change(
+    fn refresh_app_server_account_projection_after_local_auth_change(
         &mut self,
-        app_server_client: &mut AppServerSession,
+        app_server_client: &AppServerSession,
         trigger: AccountProjectionRefreshTrigger,
     ) {
-        let mut last_successful_projection = None;
-        let mut last_error_message = None;
+        let request_id = self.next_account_projection_refresh_request_id;
+        self.next_account_projection_refresh_request_id += 1;
+        self.pending_account_projection_refresh_request_id = Some(request_id);
 
-        for delay in [
-            None,
-            Some(Duration::from_millis(100)),
-            Some(Duration::from_millis(200)),
-            Some(Duration::from_millis(400)),
-        ] {
-            if let Some(delay) = delay {
-                tokio::time::sleep(delay).await;
-            }
+        let request_handle = app_server_client.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        let visible_status_account_display = self.chat_widget.status_account_display().cloned();
+        let visible_plan_type = self.chat_widget.current_plan_type();
+        let visible_has_chatgpt_account = self.chat_widget.has_chatgpt_account();
+        let visible_feedback_audience = self.feedback_audience;
+        let visible_model = self.chat_widget.current_model().to_string();
+        let visible_models = self
+            .model_catalog
+            .try_list_models()
+            .expect("model catalog listing is infallible");
+        let trigger_description = trigger.description();
 
-            match app_server_client.load_account_projection().await {
-                Ok(projection) => {
-                    if self.app_server_projection_changes_visible_followers(&projection) {
-                        self.finish_app_server_account_projection_refresh(projection);
-                        return;
+        tokio::spawn(async move {
+            let mut last_successful_projection = None;
+            let mut last_error_message = None;
+
+            for delay in [
+                None,
+                Some(Duration::from_millis(100)),
+                Some(Duration::from_millis(200)),
+                Some(Duration::from_millis(400)),
+            ] {
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+
+                match load_account_projection_from_request_handle(request_handle.clone()).await {
+                    Ok(projection) => {
+                        let changes_visible = !status_account_displays_match(
+                            visible_status_account_display.as_ref(),
+                            projection.status_account_display.as_ref(),
+                        ) || visible_plan_type != projection.plan_type
+                            || visible_has_chatgpt_account != projection.has_chatgpt_account
+                            || visible_feedback_audience != projection.feedback_audience
+                            || visible_model != projection.default_model
+                            || visible_models != projection.available_models;
+                        if changes_visible {
+                            app_event_tx.send(AppEvent::AppServerAccountProjectionRefreshed {
+                                request_id,
+                                trigger_description,
+                                result: Ok(projection),
+                            });
+                            return;
+                        }
+                        last_successful_projection = Some(projection);
                     }
-                    last_successful_projection = Some(projection);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        trigger = trigger.description(),
-                        "failed to refresh app-server account projection after local auth change"
-                    );
-                    last_error_message = Some(err.to_string());
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            trigger = trigger_description,
+                            "failed to refresh app-server account projection after local auth change"
+                        );
+                        last_error_message = Some(err.to_string());
+                    }
                 }
             }
-        }
 
-        if let Some(projection) = last_successful_projection {
-            self.finish_app_server_account_projection_refresh(projection);
-            return;
-        }
-
-        if let Some(error_message) = last_error_message {
-            self.report_app_server_account_projection_refresh_error(
-                trigger.description(),
-                error_message,
-            );
-        }
+            let result = if let Some(projection) = last_successful_projection {
+                Ok(projection)
+            } else {
+                Err(last_error_message.unwrap_or_else(|| {
+                    "app-server account projection refresh returned no projection".to_string()
+                }))
+            };
+            app_event_tx.send(AppEvent::AppServerAccountProjectionRefreshed {
+                request_id,
+                trigger_description,
+                result,
+            });
+        });
     }
 
     #[cfg(test)]
@@ -2747,6 +2782,7 @@ impl App {
         false
     }
 
+    #[cfg(test)]
     fn app_server_projection_changes_visible_followers(
         &self,
         projection: &AppServerAccountProjection,
@@ -5734,6 +5770,8 @@ impl App {
             open_accounts_popup_when_cache_ready: false,
             observed_active_store_account_id,
             live_account_state_owner: LiveAccountStateOwner::AppServerProjection,
+            next_account_projection_refresh_request_id: 0,
+            pending_account_projection_refresh_request_id: None,
             suppress_ambiguous_rate_limit_notifications_generation: None,
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_plugin_enabled_writes: HashMap::new(),
@@ -6629,6 +6667,29 @@ impl App {
                 )
                 .await;
             }
+            AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate => {
+                self.refresh_app_server_account_projection_after_local_auth_change(
+                    app_server,
+                    AccountProjectionRefreshTrigger::AccountUpdate,
+                );
+            }
+            AppEvent::AppServerAccountProjectionRefreshed {
+                request_id,
+                trigger_description,
+                result,
+            } => {
+                if self.pending_account_projection_refresh_request_id != Some(request_id) {
+                    return Ok(AppRunControl::Continue);
+                }
+                self.pending_account_projection_refresh_request_id = None;
+                match result {
+                    Ok(projection) => self.finish_app_server_account_projection_refresh(projection),
+                    Err(error_message) => self.report_app_server_account_projection_refresh_error(
+                        trigger_description,
+                        error_message,
+                    ),
+                }
+            }
             AppEvent::SetActiveAccount { account_id } => {
                 match self.auth_manager.set_active_account(&account_id) {
                     Ok(()) => {
@@ -6648,8 +6709,7 @@ impl App {
                         self.refresh_app_server_account_projection_after_local_auth_change(
                             app_server,
                             AccountProjectionRefreshTrigger::ManualSetActiveAccount,
-                        )
-                        .await;
+                        );
                         self.chat_widget.add_info_message(
                             format!("Active account: {display}"),
                             /*hint*/ None,
@@ -6786,8 +6846,7 @@ impl App {
                     self.refresh_app_server_account_projection_after_local_auth_change(
                         app_server,
                         AccountProjectionRefreshTrigger::ManualAddAccount,
-                    )
-                    .await;
+                    );
                     if let Some(display) = active_account_display {
                         self.chat_widget.add_info_message(
                             format!("Active account: {display}"),
@@ -9097,6 +9156,7 @@ mod tests {
             secondary: None,
             credits: None,
             plan_type: None,
+            rate_limit_reached_type: None,
         };
         let refresh_result = accounts_rate_limit_refresh_result_from_outcomes(
             vec![
@@ -9181,6 +9241,7 @@ mod tests {
                     secondary: None,
                     credits: None,
                     plan_type: None,
+                    rate_limit_reached_type: None,
                 },
             )])
             .expect("persist rate-limit snapshot");
@@ -9222,6 +9283,7 @@ mod tests {
                     secondary: None,
                     credits: None,
                     plan_type: None,
+                    rate_limit_reached_type: None,
                 },
             )
             .expect("persist rate-limit snapshot");
@@ -9320,6 +9382,7 @@ mod tests {
             secondary: None,
             credits: None,
             plan_type: None,
+            rate_limit_reached_type: None,
         };
 
         let should_schedule_frame = app.handle_rate_limits_loaded(
@@ -9393,6 +9456,7 @@ mod tests {
                 secondary: None,
                 credits: None,
                 plan_type: None,
+                rate_limit_reached_type: None,
             }));
         assert_eq!(app.chat_widget.rate_limit_snapshot_count(), 1);
 
@@ -9561,6 +9625,7 @@ mod tests {
             secondary: None,
             credits: None,
             plan_type: None,
+            rate_limit_reached_type: None,
         });
 
         assert_eq!(app.chat_widget.rate_limit_snapshot_count(), 0);
@@ -9632,6 +9697,7 @@ mod tests {
                 secondary: None,
                 credits: None,
                 plan_type: None,
+                rate_limit_reached_type: None,
             }]),
         );
 
@@ -9660,6 +9726,7 @@ mod tests {
                 secondary: None,
                 credits: None,
                 plan_type: None,
+                rate_limit_reached_type: None,
             }));
         let available_models = all_model_presets();
         let default_model = available_models
@@ -10322,6 +10389,7 @@ mod tests {
                     secondary: None,
                     credits: None,
                     plan_type: None,
+                    rate_limit_reached_type: None,
                 },
             )
             .expect("persist rate-limit snapshot");
@@ -10568,7 +10636,7 @@ mod tests {
         let broken_path = broken_home.path().join("not-a-directory");
         std::fs::write(&broken_path, "broken codex home")?;
         let mut broken_config = app.config.clone();
-        broken_config.codex_home = broken_path;
+        broken_config.codex_home = broken_path.abs();
         let broken_auth_manager = auth_manager_from_config(&broken_config);
         let shared_state = Arc::new(crate::bottom_pane::ChatGptAddAccountSharedState::new());
         let login_success = codex_login::LoginSuccess {
@@ -13950,7 +14018,7 @@ guardian_approval = true
     {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
         let codex_home = tempdir()?;
-        app.config.codex_home = codex_home.path().to_path_buf();
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
         app.chat_widget
             .set_world_writable_warning_acknowledged(true);
 
@@ -14970,6 +15038,8 @@ guardian_approval = true
             open_accounts_popup_when_cache_ready: false,
             observed_active_store_account_id: None,
             live_account_state_owner: LiveAccountStateOwner::AppServerProjection,
+            next_account_projection_refresh_request_id: 0,
+            pending_account_projection_refresh_request_id: None,
             suppress_ambiguous_rate_limit_notifications_generation: None,
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_plugin_enabled_writes: HashMap::new(),
@@ -15038,6 +15108,8 @@ guardian_approval = true
                 open_accounts_popup_when_cache_ready: false,
                 observed_active_store_account_id: None,
                 live_account_state_owner: LiveAccountStateOwner::AppServerProjection,
+                next_account_projection_refresh_request_id: 0,
+                pending_account_projection_refresh_request_id: None,
                 suppress_ambiguous_rate_limit_notifications_generation: None,
                 pending_app_server_requests: PendingAppServerRequests::default(),
                 pending_plugin_enabled_writes: HashMap::new(),
@@ -15076,6 +15148,7 @@ guardian_approval = true
             secondary: None,
             credits: None,
             plan_type: None,
+            rate_limit_reached_type: None,
         };
         let store = AuthStore {
             active_account_id: Some("account_id".to_string()),
@@ -15842,7 +15915,7 @@ guardian_approval = true
         enabled: bool,
     ) -> crate::app_event::ConnectorsSnapshot {
         crate::app_event::ConnectorsSnapshot {
-            connectors: vec![codex_chatgpt::connectors::AppInfo {
+            connectors: vec![codex_app_server_protocol::AppInfo {
                 id: app_id.to_string(),
                 name: "Demo App".to_string(),
                 description: Some("Demo connector".to_string()),
@@ -16815,7 +16888,7 @@ guardian_approval = true
     -> Result<()> {
         let mut app = make_test_app().await;
         let codex_home = tempdir()?;
-        app.config.codex_home = codex_home.path().to_path_buf();
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
         let current_cwd = app.config.cwd.clone();
         let missing_config_path = codex_home.path().join("missing-config.toml");
 
@@ -17346,7 +17419,7 @@ guardian_approval = true
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
-                cwd: PathBuf::from("/home/user/project"),
+                cwd: test_path_buf("/home/user/project").abs(),
                 reasoning_effort: None,
                 history_log_id: 0,
                 history_entry_count: 0,

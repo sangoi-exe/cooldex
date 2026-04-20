@@ -1554,14 +1554,14 @@ fn structured_function_call_error_payload(
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct PromptGcPlanBuildFailureDetails {
-    error_message: String,
-    marker_stop_reason: String,
-    status_error: String,
-    blocks_remaining_turn: bool,
+pub(super) struct PromptGcPlanBuildFailureDetails {
+    pub(super) error_message: String,
+    pub(super) marker_stop_reason: String,
+    pub(super) status_error: String,
+    pub(super) blocks_remaining_turn: bool,
 }
 
-fn prompt_gc_plan_build_failure_details(
+pub(super) fn prompt_gc_plan_build_failure_details(
     error: &crate::function_tool::FunctionCallError,
 ) -> PromptGcPlanBuildFailureDetails {
     let error_message = error.to_string();
@@ -1614,7 +1614,7 @@ async fn persist_prompt_gc_rollout_marker(
     .await;
 }
 
-async fn run_prompt_gc_sidecar_if_needed(
+pub(super) async fn run_prompt_gc_sidecar_if_needed(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     turn_diff_tracker: SharedTurnDiffTracker,
@@ -1947,7 +1947,7 @@ async fn run_prompt_gc_sidecar_if_needed(
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PromptGcSummaryResponse {
+pub(super) struct PromptGcSummaryResponse {
     summaries: Vec<crate::tools::handlers::prompt_gc::PromptGcChunkSummary>,
 }
 
@@ -1975,7 +1975,7 @@ fn prompt_gc_summary_output_schema() -> Value {
     })
 }
 
-fn parse_prompt_gc_summary_response(
+pub(super) fn parse_prompt_gc_summary_response(
     items: &[ResponseItem],
 ) -> Result<Vec<crate::tools::handlers::prompt_gc::PromptGcChunkSummary>, String> {
     let assistant_messages = items
@@ -1998,7 +1998,9 @@ fn parse_prompt_gc_summary_response(
     parse_prompt_gc_summary_response_text(&assistant_payload).map(|response| response.summaries)
 }
 
-fn parse_prompt_gc_summary_response_text(raw: &str) -> Result<PromptGcSummaryResponse, String> {
+pub(super) fn parse_prompt_gc_summary_response_text(
+    raw: &str,
+) -> Result<PromptGcSummaryResponse, String> {
     let response: PromptGcSummaryResponse = serde_json::from_str(raw)
         .map_err(|error| format!("failed to parse prompt_gc summary JSON: {error}"))?;
     if response.summaries.is_empty() {
@@ -2070,9 +2072,8 @@ async fn run_sampling_request_with_router_and_prompt(
         let request_store_account_id = sess
             .services
             .auth_manager
-            .auth_cached()
-            .as_ref()
-            .and_then(CodexAuth::get_account_id);
+            .active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id);
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),

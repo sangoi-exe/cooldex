@@ -77,22 +77,6 @@ where
     )
 }
 
-#[cfg(test)]
-pub fn insert_history_display_lines<B>(
-    terminal: &mut crate::custom_terminal::Terminal<B>,
-    lines: Vec<Line>,
-) -> io::Result<()>
-where
-    B: Backend + Write,
-{
-    insert_history_lines_with_mode_and_wrap(
-        terminal,
-        lines,
-        InsertHistoryMode::Standard,
-        HistoryLineWrapMode::PreserveLayout,
-    )
-}
-
 /// Insert `lines` above the viewport, using the escape strategy selected by `mode`.
 ///
 /// In `Standard` mode this manipulates DECSTBM scroll regions to slide existing

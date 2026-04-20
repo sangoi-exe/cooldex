@@ -600,10 +600,10 @@ fn contract_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex::make_session_and_context;
     use crate::rollout::RolloutRecorder;
     use crate::rollout::RolloutRecorderParams;
     use crate::rollout::policy::EventPersistenceMode;
+    use crate::session::tests::make_session_and_context;
     use crate::state::ActiveTurn;
     use crate::state::RunningTask;
     use crate::state::TaskKind;
@@ -649,7 +649,7 @@ mod tests {
             *rollout = Some(recorder);
         }
         session.ensure_rollout_materialized().await;
-        session.flush_rollout().await;
+        session.flush_rollout().await.expect("flush rollout");
     }
 
     async fn install_prompt_gc_active_turn(

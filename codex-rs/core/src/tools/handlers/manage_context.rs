@@ -1179,7 +1179,10 @@ mod tests {
             .to_string()
     }
 
-    async fn attach_rollout_recorder(session: &crate::codex::Session, turn: &TurnContext) {
+    async fn attach_rollout_recorder(
+        session: &crate::session::session::Session,
+        turn: &TurnContext,
+    ) {
         let recorder = crate::rollout::RolloutRecorder::new(
             turn.config.as_ref(),
             crate::rollout::RolloutRecorderParams::new(
@@ -1354,7 +1357,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_retrieve_requires_policy_id() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         let args: ManageContextToolArgs =
             serde_json::from_str(r#"{"mode":"retrieve"}"#).expect("parse args");
 
@@ -1384,7 +1387,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_retrieve_rejects_apply_only_fields() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         let args: ManageContextToolArgs = serde_json::from_value(json!({
             "mode": "retrieve",
             "policy_id": turn.config.manage_context_policy.quality_rubric_id,
@@ -1404,7 +1407,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_retrieve_returns_required_fields() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
 
         {
@@ -1457,7 +1460,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_retrieve_is_stable_when_items_append_after_latest_user_message() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
 
         {
@@ -1525,7 +1528,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_retrieve_excludes_post_user_offenders_from_chunk_manifest() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
 
         {
@@ -1563,7 +1566,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_retrieve_never_targets_user_assistant_or_protected_categories() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
 
         {
@@ -1982,7 +1985,7 @@ mod tests {
 
     #[tokio::test]
     async fn materialize_prompt_snapshot_after_apply_keeps_in_flight_manage_context_call() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
 
         {
             let mut state = session.state.lock().await;
@@ -2029,7 +2032,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_apply_accepts_append_only_post_user_changes() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         attach_rollout_recorder(&session, &turn).await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
 
@@ -2111,7 +2114,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_apply_requires_chunk_summaries() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
 
         let args: ManageContextToolArgs = serde_json::from_value(json!({
@@ -2134,7 +2137,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_apply_rejects_state_hash_mismatch() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
 
         {
@@ -2198,7 +2201,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_apply_rejects_plan_id_mismatch() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
         {
             let mut state = session.state.lock().await;
@@ -2261,7 +2264,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_apply_generates_one_context_pair_per_chunk() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         attach_rollout_recorder(&session, &turn).await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
 
@@ -2510,7 +2513,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (mut session, turn, rx) = crate::codex::make_session_and_context_with_rx().await;
+        let (mut session, turn, rx) =
+            crate::session::tests::make_session_and_context_with_rx().await;
         let mut provider = built_in_model_providers(None)["openai"].clone();
         provider.base_url = Some(format!("{}/v1", server.uri()));
 
@@ -2650,7 +2654,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_apply_persists_compacted_replacement_history_for_resume() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
 
         let recorder = crate::rollout::RolloutRecorder::new(
@@ -2741,11 +2745,11 @@ mod tests {
             }]
         }))
         .expect("parse apply args");
-        handle_manage_context(&session, &turn, &apply_args)
+        let _ = handle_manage_context(&session, &turn, &apply_args)
             .await
             .expect("apply");
 
-        session.flush_rollout().await;
+        session.flush_rollout().await.expect("flush rollout");
         let (rollout_items, _thread_id, parse_errors) =
             crate::rollout::RolloutRecorder::load_rollout_items(rollout_path.as_path())
                 .await
@@ -2763,7 +2767,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_apply_rollout_persist_failure_rolls_back_state() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
 
         let recorder = crate::rollout::RolloutRecorder::new(
@@ -2880,7 +2884,7 @@ mod tests {
     #[tokio::test]
     async fn manage_context_apply_without_rollout_recorder_rolls_back_state_for_persistent_sessions()
      {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
 
         {
@@ -2987,7 +2991,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_apply_without_rollout_recorder_succeeds_for_ephemeral_sessions() {
-        let (session, mut turn) = crate::codex::make_session_and_context().await;
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
         let mut config = (*turn.config).clone();
         config.ephemeral = true;
         turn.config = Arc::new(config);
@@ -3063,7 +3067,7 @@ mod tests {
 
     #[tokio::test]
     async fn manage_context_apply_rejects_invalid_chunk_id() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         let policy_id = turn.config.manage_context_policy.quality_rubric_id.clone();
 
         let retrieve_args: ManageContextToolArgs = serde_json::from_value(json!({

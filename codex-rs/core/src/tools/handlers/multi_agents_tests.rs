@@ -25,7 +25,6 @@ use codex_model_provider::create_model_provider;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
-use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseInputItem;
@@ -51,7 +50,6 @@ use core_test_support::TempDirExt;
 use pretty_assertions::assert_eq;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1499,7 +1497,7 @@ async fn multi_agent_v2_followup_task_interrupts_busy_child_without_losing_messa
         .agent_control
         .spawn_agent_with_metadata(
             (*turn.config).clone(),
-            Op::CleanBackgroundTerminals,
+            Op::StopBackgroundTerminals,
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: root.thread_id,
                 depth: 1,
@@ -2616,17 +2614,23 @@ async fn wait_agent_returns_not_found_for_missing_agents() {
         .await
         .expect("wait_agent should succeed");
     let (content, success) = expect_text_output(output);
-    let result: wait::WaitAgentResult =
+    let result: wait::WaitResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert!(!result.timed_out);
+    assert_eq!(result.agents.len(), 2);
     assert_eq!(
-        result,
-        wait::WaitAgentResult {
-            status: HashMap::from([
-                (id_a.to_string(), AgentStatus::NotFound),
-                (id_b.to_string(), AgentStatus::NotFound),
-            ]),
-            timed_out: false
-        }
+        result.agents.get(&id_a),
+        Some(&crate::agent::status::AgentRuntimeState {
+            status: AgentStatus::NotFound,
+            last_activity: None,
+        })
+    );
+    assert_eq!(
+        result.agents.get(&id_b),
+        Some(&crate::agent::status::AgentRuntimeState {
+            status: AgentStatus::NotFound,
+            last_activity: None,
+        })
     );
     assert_eq!(success, None);
 }
@@ -2653,15 +2657,17 @@ async fn wait_agent_times_out_when_status_is_not_final() {
         .await
         .expect("wait_agent should succeed");
     let (content, success) = expect_text_output(output);
-    let result: wait::WaitAgentResult =
+    let result: wait::WaitResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
-    assert_eq!(
-        result,
-        wait::WaitAgentResult {
-            status: HashMap::new(),
-            timed_out: true
-        }
-    );
+    assert!(result.timed_out);
+    assert_eq!(result.agents.len(), 1);
+    assert!(matches!(
+        result
+            .agents
+            .get(&agent_id)
+            .map(|state| state.status.clone()),
+        Some(AgentStatus::PendingInit | AgentStatus::Running)
+    ));
     assert_eq!(success, None);
 
     let _ = thread
@@ -2743,14 +2749,15 @@ async fn wait_agent_returns_final_status_without_timeout() {
         .await
         .expect("wait_agent should succeed");
     let (content, success) = expect_text_output(output);
-    let result: wait::WaitAgentResult =
+    let result: wait::WaitResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert!(!result.timed_out);
     assert_eq!(
-        result,
-        wait::WaitAgentResult {
-            status: HashMap::from([(agent_id.to_string(), AgentStatus::Shutdown)]),
-            timed_out: false
-        }
+        result.agents.get(&agent_id),
+        Some(&crate::agent::status::AgentRuntimeState {
+            status: AgentStatus::Shutdown,
+            last_activity: None,
+        })
     );
     assert_eq!(success, None);
 }
@@ -3474,9 +3481,6 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     }
 
     let (_session, mut turn) = make_session_and_context().await;
-    let base_instructions = BaseInstructions {
-        text: "base".to_string(),
-    };
     turn.developer_instructions = Some("dev".to_string());
     turn.compact_prompt = Some("compact".to_string());
     turn.shell_environment_policy = ShellEnvironmentPolicy {
@@ -3502,9 +3506,14 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         .set(AskForApproval::OnRequest)
         .expect("approval policy set");
 
-    let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
+    let config = build_agent_spawn_config(&turn).expect("spawn config");
     let mut expected = (*turn.config).clone();
-    expected.base_instructions = Some(base_instructions.text);
+    expected.base_instructions = Some(
+        expected
+            .subagent_base_instructions
+            .clone()
+            .unwrap_or_else(|| turn.model_info.get_model_instructions(turn.personality)),
+    );
     expected.model = Some(turn.model_info.slug.clone());
     expected.model_provider = turn.provider.info().clone();
     expected.model_reasoning_effort = turn.reasoning_effort;
@@ -3536,11 +3545,7 @@ async fn build_agent_spawn_config_preserves_base_user_instructions() {
     base_config.user_instructions = Some("base-user".to_string());
     turn.user_instructions = Some("resolved-user".to_string());
     turn.config = Arc::new(base_config.clone());
-    let base_instructions = BaseInstructions {
-        text: "base".to_string(),
-    };
-
-    let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
+    let config = build_agent_spawn_config(&turn).expect("spawn config");
 
     assert_eq!(config.user_instructions, base_config.user_instructions);
 }

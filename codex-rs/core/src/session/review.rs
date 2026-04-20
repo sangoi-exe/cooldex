@@ -139,6 +139,8 @@ pub(super) async fn spawn_review_thread(
         turn_metadata_state,
         turn_skills: TurnSkillsContext::new(parent_turn_context.turn_skills.outcome.clone()),
         turn_timing_state: Arc::new(TurnTimingState::default()),
+        #[cfg(test)]
+        allow_usage_limit_auto_switch_pre_refresh_in_tests: false,
     };
 
     // Seed the child task with the review prompt as the initial user message.

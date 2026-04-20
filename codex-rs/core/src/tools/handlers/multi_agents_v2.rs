@@ -29,8 +29,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
-#[cfg(test)]
-pub(crate) use close_agent::CloseAgentResult;
 pub(crate) use close_agent::Handler as CloseAgentHandler;
 pub(crate) use followup_task::Handler as FollowupTaskHandler;
 pub(crate) use list_agents::Handler as ListAgentsHandler;

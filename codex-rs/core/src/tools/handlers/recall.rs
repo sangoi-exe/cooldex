@@ -796,6 +796,7 @@ mod tests {
             approval_policy: AskForApproval::Never,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             network: None,
+            file_system_sandbox_policy: None,
             model: "gpt-5".to_string(),
             personality: None,
             collaboration_mode: None,
@@ -1615,7 +1616,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_fails_when_session_rollout_is_unavailable() {
-        let (session, turn) = crate::codex::make_session_and_context().await;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
         let args = RecallToolArgs {};
 
         let error = handle_recall(&session, &turn, &args)
@@ -1630,7 +1631,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_returns_rollout_read_error_when_current_rollout_path_is_missing() {
-        let (session, mut turn) = crate::codex::make_session_and_context().await;
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
         let mut config = (*turn.config).clone();
         config.recall_debug = Some(true);
         turn.config = std::sync::Arc::new(config);
@@ -1674,7 +1675,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_ignores_malformed_rollout_line_and_reports_degraded_integrity() {
-        let (session, mut turn) = crate::codex::make_session_and_context().await;
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
         let mut config = (*turn.config).clone();
         config.recall_debug = Some(true);
         turn.config = std::sync::Arc::new(config);

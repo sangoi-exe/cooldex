@@ -147,11 +147,11 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
-    #[test]
-    fn apply_file_mutation_mode_to_config_downgrades_write_access_but_keeps_network() {
+    #[tokio::test]
+    async fn apply_file_mutation_mode_to_config_downgrades_write_access_but_keeps_network() {
         let tempdir = TempDir::new().expect("tempdir");
         let cwd = AbsolutePathBuf::from_absolute_path(tempdir.path()).expect("absolute cwd");
-        let mut config = crate::config::test_config();
+        let mut config = crate::config::test_config().await;
         config.cwd = cwd.clone();
         config.permissions.network_sandbox_policy = NetworkSandboxPolicy::Enabled;
         config.permissions.file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
@@ -217,11 +217,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn restore_file_mutation_mode_to_config_restores_baseline_before_clearing_deny() {
+    #[tokio::test]
+    async fn restore_file_mutation_mode_to_config_restores_baseline_before_clearing_deny() {
         let tempdir = TempDir::new().expect("tempdir");
         let cwd = AbsolutePathBuf::from_absolute_path(tempdir.path()).expect("absolute cwd");
-        let mut config = crate::config::test_config();
+        let mut config = crate::config::test_config().await;
         config.cwd = cwd;
 
         apply_file_mutation_mode_to_config(&mut config, SubagentFileMutationMode::Deny)

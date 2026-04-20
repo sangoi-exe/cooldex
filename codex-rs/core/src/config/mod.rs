@@ -953,15 +953,6 @@ pub(crate) fn deserialize_config_toml_with_base(
     Ok(cfg)
 }
 
-#[cfg(test)]
-pub(crate) fn deserialize_strict_config_toml(root_value: TomlValue) -> std::io::Result<ConfigToml> {
-    let cfg: ConfigToml = root_value
-        .try_into()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    validate_user_toggle_feature_keys_in_config_toml(&cfg)?;
-    Ok(cfg)
-}
-
 fn validate_user_toggle_feature_keys_in_config_toml(cfg: &ConfigToml) -> std::io::Result<()> {
     if let Some(features) = cfg.features.as_ref() {
         validate_user_toggle_feature_table("features", features)?;

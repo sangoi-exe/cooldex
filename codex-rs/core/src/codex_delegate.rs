@@ -45,8 +45,6 @@ use crate::session::Codex;
 use crate::session::CodexSpawnArgs;
 use crate::session::CodexSpawnOk;
 use crate::session::SUBMISSION_CHANNEL_CAPACITY;
-#[cfg(test)]
-use crate::session::completed_session_loop_termination;
 use crate::session::emit_subagent_session_started;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -910,7 +908,8 @@ mod tests {
             watch::channel::<Option<CollabAgentActivity>>(None);
         let (_prompt_gc_active_tx, prompt_gc_active) = watch::channel(false);
         let (prompt_gc_activity_edges, _) = tokio::sync::broadcast::channel(16);
-        let (session, ctx, _rx_evt) = crate::codex::make_session_and_context_with_rx().await;
+        let (session, ctx, _rx_evt) =
+            crate::session::tests::make_session_and_context_with_rx().await;
         let codex = Arc::new(Codex {
             tx_sub,
             rx_event: rx_events,
@@ -919,7 +918,7 @@ mod tests {
             prompt_gc_active,
             prompt_gc_activity_edges,
             session: Arc::clone(&session),
-            session_loop_termination: crate::codex::completed_session_loop_termination(),
+            session_loop_termination: crate::session::completed_session_loop_termination(),
         });
 
         let (tx_out, rx_out) = bounded(1);
@@ -994,7 +993,8 @@ mod tests {
             watch::channel::<Option<CollabAgentActivity>>(None);
         let (_prompt_gc_active_tx, prompt_gc_active) = watch::channel(false);
         let (prompt_gc_activity_edges, _) = tokio::sync::broadcast::channel(16);
-        let (session, _ctx, _rx_evt) = crate::codex::make_session_and_context_with_rx().await;
+        let (session, _ctx, _rx_evt) =
+            crate::session::tests::make_session_and_context_with_rx().await;
         let codex = Arc::new(Codex {
             tx_sub,
             rx_event: rx_events,
@@ -1003,7 +1003,7 @@ mod tests {
             prompt_gc_active,
             prompt_gc_activity_edges,
             session,
-            session_loop_termination: crate::codex::completed_session_loop_termination(),
+            session_loop_termination: crate::session::completed_session_loop_termination(),
         });
         let (tx_ops, rx_ops) = bounded(1);
         let cancel = CancellationToken::new();

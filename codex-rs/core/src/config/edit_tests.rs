@@ -521,6 +521,7 @@ existing = "value"
     .expect("seed");
     apply_blocking(
         codex_home,
+        None,
         /*profile*/ None,
         &[ConfigEdit::SetNoticeHideExternalConfigMigrationPromptHome(
             true,
@@ -551,6 +552,7 @@ existing = "value"
     .expect("seed");
     apply_blocking(
         codex_home,
+        None,
         /*profile*/ None,
         &[
             ConfigEdit::SetNoticeHideExternalConfigMigrationPromptProject(
@@ -584,6 +586,7 @@ existing = "value"
     .expect("seed");
     apply_blocking(
         codex_home,
+        None,
         /*profile*/ None,
         &[ConfigEdit::SetNoticeExternalConfigMigrationPromptHomeLastPromptedAt(1_760_000_000)],
     )
@@ -612,6 +615,7 @@ existing = "value"
     .expect("seed");
     apply_blocking(
         codex_home,
+        None,
         /*profile*/ None,
         &[
             ConfigEdit::SetNoticeExternalConfigMigrationPromptProjectLastPromptedAt(

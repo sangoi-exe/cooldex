@@ -849,7 +849,12 @@ async fn spawn_agent_fork_does_not_leak_parent_spawn_tool_items_into_child_histo
         .session
         .ensure_rollout_materialized()
         .await;
-    parent_thread.codex.session.flush_rollout().await;
+    parent_thread
+        .codex
+        .session
+        .flush_rollout()
+        .await
+        .expect("flush rollout");
 
     let child_thread_id = harness
         .control

@@ -504,7 +504,7 @@ async fn slash_stop_submits_background_terminal_cleanup() {
 
     chat.dispatch_command(SlashCommand::Stop);
 
-    assert_matches!(op_rx.try_recv(), Ok(Op::CleanBackgroundTerminals));
+    assert_matches!(op_rx.try_recv(), Ok(Op::StopBackgroundTerminals));
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1, "expected cleanup confirmation message");
     let rendered = lines_to_single_string(&cells[0]);

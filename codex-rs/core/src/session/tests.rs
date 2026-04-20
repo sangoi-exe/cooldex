@@ -9,10 +9,15 @@ use super::turn::maybe_auto_switch_account_on_usage_limit;
 use super::turn::maybe_auto_switch_account_on_usage_limit_with_refreshed_account_state;
 use super::turn::maybe_emit_transport_fallback_warning_for_execution_mode;
 use super::turn::maybe_set_total_tokens_full_for_execution_mode;
+use super::turn::parse_prompt_gc_summary_response;
+use super::turn::parse_prompt_gc_summary_response_text;
+use super::turn::prompt_gc_plan_build_failure_details;
 use super::turn::refresh_accounts_rate_limits_before_auto_switch;
+use super::turn::run_prompt_gc_sidecar_if_needed;
 use super::turn::stale_request_should_retry_without_switch;
 use super::*;
 use crate::RolloutRecorderParams;
+use crate::client_common::Prompt;
 use crate::config::CONFIG_TOML_FILE;
 use crate::config::ConfigBuilder;
 use crate::config::test_config;
@@ -32,6 +37,7 @@ use crate::shell::default_user_shell;
 use crate::skills::SkillRenderSideEffects;
 use crate::skills::render::SkillMetadataBudget;
 use crate::state::TaskKind;
+use crate::stream_events_utils::SamplingExecutionMode;
 use crate::tasks::RegularTask;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
@@ -63,7 +69,6 @@ use codex_hooks::Hooks;
 use codex_login::CodexAuth;
 use codex_login::token_data::IdTokenInfo;
 use codex_login::token_data::TokenData;
-use codex_mcp::ToolInfo;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
@@ -667,7 +672,7 @@ async fn prompt_gc_sidecar_no_eligible_chunks_complete_without_visible_accountin
     )
     .await;
 
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     assert_eq!(
         prompt_gc_rollout_markers(&rollout_path).await,
         vec![
@@ -839,7 +844,7 @@ async fn prompt_gc_sidecar_skips_when_function_call_output_lacks_token_qty_witho
     let status = sidecar.lock().await.status.clone();
     assert_eq!(status.blocked_reason, None);
     assert!(sidecar.lock().await.checkpoint(&checkpoint_id).is_none());
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     assert_eq!(prompt_gc_rollout_markers(&rollout_path).await, Vec::new());
 
     let tool_calls = {
@@ -921,7 +926,7 @@ async fn prompt_gc_sidecar_final_answer_reasoning_burden_triggers_without_functi
 
     let status = sidecar.lock().await.status.clone();
     assert_eq!(status.blocked_reason, None);
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     let markers = prompt_gc_rollout_markers(&rollout_path).await;
     assert!(!markers.is_empty());
     assert_eq!(markers[0].kind, PromptGcOutcomeKind::Started);
@@ -983,7 +988,7 @@ async fn prompt_gc_sidecar_final_answer_below_fallback_threshold_still_skips_wit
     let status = sidecar.lock().await.status.clone();
     assert_eq!(status.blocked_reason, None);
     assert!(sidecar.lock().await.checkpoint(&checkpoint_id).is_none());
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     assert_eq!(
         prompt_gc_rollout_markers(&rollout_path).await,
         vec![
@@ -1089,7 +1094,7 @@ async fn prompt_gc_sidecar_final_answer_tool_result_burden_triggers_without_func
 
     let status = sidecar.lock().await.status.clone();
     assert_eq!(status.blocked_reason, None);
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     let markers = prompt_gc_rollout_markers(&rollout_path).await;
     assert!(!markers.is_empty());
     assert_eq!(markers[0].kind, PromptGcOutcomeKind::Started);
@@ -1174,7 +1179,7 @@ async fn prompt_gc_sidecar_final_answer_custom_tool_burden_triggers_without_func
 
     let status = sidecar.lock().await.status.clone();
     assert_eq!(status.blocked_reason, None);
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     let markers = prompt_gc_rollout_markers(&rollout_path).await;
     assert!(!markers.is_empty());
     assert_eq!(markers[0].kind, PromptGcOutcomeKind::Started);
@@ -1263,7 +1268,7 @@ async fn prompt_gc_sidecar_function_call_output_token_qty_over_200_triggers_belo
 
     let status = sidecar.lock().await.status.clone();
     assert_eq!(status.blocked_reason, None);
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     let markers = prompt_gc_rollout_markers(&rollout_path).await;
     assert!(!markers.is_empty());
     assert_eq!(markers[0].kind, PromptGcOutcomeKind::Started);
@@ -1352,7 +1357,7 @@ async fn prompt_gc_sidecar_function_call_output_token_qty_over_200_triggers_for_
 
     let status = sidecar.lock().await.status.clone();
     assert_eq!(status.blocked_reason, None);
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     let markers = prompt_gc_rollout_markers(&rollout_path).await;
     assert!(!markers.is_empty());
     assert_eq!(markers[0].kind, PromptGcOutcomeKind::Started);
@@ -1434,7 +1439,7 @@ async fn prompt_gc_sidecar_ignores_ambiguous_exec_command_local_shell_collision_
     let status = sidecar.lock().await.status.clone();
     assert_eq!(status.blocked_reason, None);
     assert!(sidecar.lock().await.checkpoint(&checkpoint_id).is_none());
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     assert_eq!(
         prompt_gc_rollout_markers(&rollout_path).await,
         vec![
@@ -1535,7 +1540,7 @@ async fn prompt_gc_state_hash_mismatch_blocks_remaining_turn() {
 
     let status = sidecar.lock().await.status.clone();
     assert!(status.blocked_reason.is_some(), "{status:?}");
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     let first_markers = prompt_gc_rollout_markers(&rollout_path).await;
     assert_eq!(first_markers.len(), 2);
     assert_eq!(first_markers[0].kind, PromptGcOutcomeKind::Started);
@@ -1578,7 +1583,7 @@ async fn prompt_gc_state_hash_mismatch_blocks_remaining_turn() {
     )
     .await;
 
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     assert_eq!(
         prompt_gc_rollout_markers(&rollout_path).await,
         first_markers
@@ -1653,48 +1658,36 @@ async fn prompt_gc_persist_replacement_history_flush_failure_keeps_live_history_
         eligible_unit_count: 0,
         phase: codex_protocol::models::MessagePhase::Commentary,
     };
-    let history_before = {
-        let mut state = session.state.lock().await;
-        state.record_items(
-            [user_message("before"), assistant_message("still here")].iter(),
-            turn_context.truncation_policy,
-        );
-        state.history_snapshot_lenient()
-    };
-
-    let error = session
-        .persist_prompt_gc_replacement_history_with_sink(
+    session
+        .persist_prompt_gc_replacement_history(
             &turn_context,
             &checkpoint,
             1,
             vec![assistant_message("replacement history")],
-            Some(&FlushFailingPromptGcRolloutSink),
         )
         .await
-        .expect_err("flush failure should fail prompt_gc persistence");
-    assert!(
-        error.contains("failed to persist prompt_gc replacement_history atomically"),
-        "unexpected error: {error}"
-    );
+        .expect("prompt_gc replacement history should persist");
 
     let history_after = {
         let state = session.state.lock().await;
         state.history_snapshot_lenient()
     };
-    assert_eq!(history_after, history_before);
+    assert_eq!(
+        history_after,
+        vec![assistant_message("replacement history")]
+    );
 }
 
 #[tokio::test]
-async fn replace_compacted_history_queue_failure_keeps_live_history_unchanged() {
+async fn replace_compacted_history_queue_failure_still_rewrites_live_history() {
     let (session, turn_context) = make_session_and_context().await;
-    let history_before = {
+    {
         let mut state = session.state.lock().await;
         state.record_items(
             [user_message("before"), assistant_message("still here")].iter(),
             turn_context.truncation_policy,
         );
-        state.history_snapshot_lenient()
-    };
+    }
 
     let config = session.get_config().await;
     let recorder = RolloutRecorder::new(
@@ -1722,40 +1715,35 @@ async fn replace_compacted_history_queue_failure_keeps_live_history_unchanged() 
         .expect("shutting down recorder should close the writer channel");
 
     let replacement_history = vec![assistant_message("replacement history")];
-    let error = session
+    let reference_context_item = Some(turn_context.to_turn_context_item());
+    session
         .replace_compacted_history(
             replacement_history.clone(),
-            Some(turn_context.to_turn_context_item()),
+            reference_context_item.clone(),
             CompactedItem {
                 message: "summary".to_string(),
-                replacement_history: Some(replacement_history),
+                replacement_history: Some(replacement_history.clone()),
                 prompt_gc: None,
             },
         )
-        .await
-        .expect_err("closed recorder should fail compaction persistence");
-    assert!(
-        error.contains("failed to persist compacted history atomically"),
-        "unexpected error: {error}"
-    );
-    assert!(
-        error.contains("channel closed"),
-        "unexpected error: {error}"
-    );
+        .await;
 
     let history_after = {
         let state = session.state.lock().await;
         state.history_snapshot_lenient()
     };
-    assert_eq!(history_after, history_before);
+    assert_eq!(history_after, replacement_history);
     assert!(
-        session.reference_context_item().await.is_none(),
-        "failed compaction must not replace the reference context item"
+        serde_json::to_value(session.reference_context_item().await)
+            .expect("serialize persisted reference context")
+            == serde_json::to_value(reference_context_item)
+                .expect("serialize expected reference context"),
+        "live rewrite must still replace the reference context item even if rollout recording fails"
     );
 }
 
 #[tokio::test]
-async fn replace_compacted_history_persists_atomically_before_live_rewrite() {
+async fn replace_compacted_history_persists_rollout_after_live_rewrite() {
     let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
     let rollout_path = attach_rollout_recorder(&session).await;
     let replacement_history = vec![assistant_message("replacement history")];
@@ -1771,9 +1759,8 @@ async fn replace_compacted_history_persists_atomically_before_live_rewrite() {
                 prompt_gc: None,
             },
         )
-        .await
-        .expect("persist compacted history");
-    session.flush_rollout().await;
+        .await;
+    session.flush_rollout().await.expect("flush rollout");
 
     let history_after = {
         let state = session.state.lock().await;
@@ -1879,7 +1866,7 @@ async fn prompt_gc_persist_replacement_history_records_apply_succeeded_marker() 
         )
         .await
         .expect("persist prompt_gc replacement history");
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
 
     let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
         .await
@@ -1935,6 +1922,7 @@ async fn prompt_gc_hidden_usage_limit_updates_rate_limits_without_visible_events
         secondary: None,
         credits: None,
         plan_type: None,
+        rate_limit_reached_type: None,
     };
     let usage_limit = UsageLimitReachedError {
         plan_type: None,
@@ -2069,6 +2057,7 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
             secondary: None,
             credits: None,
             plan_type: None,
+            rate_limit_reached_type: None,
         })),
         promo_message: None,
     };
@@ -2184,6 +2173,7 @@ async fn visible_usage_limit_retry_marks_failing_account_exhausted_even_when_sta
             secondary: None,
             credits: None,
             plan_type: None,
+            rate_limit_reached_type: None,
         })),
         promo_message: None,
     };
@@ -2341,6 +2331,7 @@ async fn visible_usage_limit_retry_prefers_managed_auth_when_saved_fallbacks_and
             secondary: None,
             credits: None,
             plan_type: Some(codex_protocol::account::PlanType::Pro),
+            rate_limit_reached_type: None,
         })),
         promo_message: None,
     };
@@ -2431,6 +2422,7 @@ fn auto_switch_refresh_explicit_unsupported_predicate_rejects_missing_and_unknow
         secondary: None,
         credits: None,
         plan_type: None,
+        rate_limit_reached_type: None,
     };
 
     assert!(
@@ -2611,6 +2603,7 @@ async fn visible_usage_limit_core_pre_refresh_respects_foreign_leases_until_rele
             secondary: None,
             credits: None,
             plan_type: Some(codex_protocol::account::PlanType::Pro),
+            rate_limit_reached_type: None,
         })),
         promo_message: None,
     };
@@ -2687,6 +2680,7 @@ async fn visible_usage_limit_core_pre_refresh_respects_foreign_leases_until_rele
             secondary: None,
             credits: None,
             plan_type: Some(codex_protocol::account::PlanType::Pro),
+            rate_limit_reached_type: None,
         })),
         promo_message: None,
     };
@@ -2788,7 +2782,7 @@ async fn prompt_gc_sidecar_invalid_summary_payload_is_terminal_after_request() {
     )
     .await;
 
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     let invalid_summary_error =
         "prompt_gc summary response requires a non-empty summaries list".to_string();
     assert_eq!(
@@ -2936,7 +2930,7 @@ async fn prompt_gc_sidecar_incomplete_summary_payload_fails_apply_validation() {
     )
     .await;
 
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     let rollout_markers = prompt_gc_rollout_markers(&rollout_path).await;
     let last_error = rollout_markers
         .last()
@@ -3022,7 +3016,7 @@ async fn prompt_gc_sidecar_non_reducing_summary_fails_apply_validation() {
     )
     .await;
 
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     let rollout_markers = prompt_gc_rollout_markers(&rollout_path).await;
     let last_error = rollout_markers
         .last()
@@ -3070,20 +3064,34 @@ async fn prompt_gc_hidden_usage_limit_auto_switches_and_retries() {
     attach_rollout_recorder(&session).await;
     let observed_headers = Arc::new(std::sync::Mutex::new(Vec::new()));
     let auth_home = tempfile::tempdir().expect("create auth tempdir");
+    let mut acc_0_tokens = test_chatgpt_token_data("acc-0");
+    acc_0_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_0_tokens.id_token.raw_jwt)
+            .expect("parse acc-0 id token");
+    let acc_0_store_account_id = acc_0_tokens
+        .preferred_store_account_id()
+        .expect("acc-0 store account id");
+    let mut acc_1_tokens = test_chatgpt_token_data("acc-1");
+    acc_1_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_1_tokens.id_token.raw_jwt)
+            .expect("parse acc-1 id token");
+    let acc_1_store_account_id = acc_1_tokens
+        .preferred_store_account_id()
+        .expect("acc-1 store account id");
     let auth_store = crate::auth::AuthStore {
-        active_account_id: Some("acc-0".to_string()),
+        active_account_id: Some(acc_0_store_account_id.clone()),
         accounts: vec![
             crate::auth::StoredAccount {
-                id: "acc-0".to_string(),
+                id: acc_0_store_account_id.clone(),
                 label: None,
-                tokens: test_chatgpt_token_data("acc-0"),
+                tokens: acc_0_tokens,
                 last_refresh: Some(Utc::now()),
                 usage: None,
             },
             crate::auth::StoredAccount {
-                id: "acc-1".to_string(),
+                id: acc_1_store_account_id.clone(),
                 label: None,
-                tokens: test_chatgpt_token_data("acc-1"),
+                tokens: acc_1_tokens,
                 last_refresh: Some(Utc::now()),
                 usage: None,
             },
@@ -3156,7 +3164,7 @@ async fn prompt_gc_hidden_usage_limit_auto_switches_and_retries() {
             .into_iter()
             .find(|account| account.is_active)
             .map(|account| account.id),
-        Some("chatgpt-user:user-12345:workspace:acc-1".to_string())
+        Some(acc_1_store_account_id)
     );
     assert_eq!(
         *observed_headers
@@ -3256,7 +3264,7 @@ async fn prompt_gc_hidden_usage_limit_blocks_remaining_turn_after_unrecoverable_
     )
     .await;
 
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     assert_eq!(
         prompt_gc_rollout_markers(&rollout_path).await,
         vec![
@@ -3318,7 +3326,7 @@ async fn prompt_gc_hidden_request_error_does_not_apply() {
     )
     .await;
 
-    session.flush_rollout().await;
+    session.flush_rollout().await.expect("flush rollout");
     let rollout_markers = prompt_gc_rollout_markers(&rollout_path).await;
     let request_error = rollout_markers
         .last()
@@ -3433,11 +3441,7 @@ async fn prompt_gc_hidden_transport_fallback_warning_is_suppressed() {
 
 #[tokio::test]
 async fn prompt_gc_hidden_fallback_does_not_disable_visible_websocket_transport() {
-    let (mut session, mut turn_context, _rx) = make_session_and_context_with_rx().await;
-    let turn_context_mut =
-        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
-    turn_context_mut.provider.supports_websockets = true;
-
+    let (mut session, turn_context, _rx) = make_session_and_context_with_rx().await;
     let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -3463,8 +3467,9 @@ async fn prompt_gc_hidden_fallback_does_not_disable_visible_websocket_transport(
         session_mut.conversation_id,
         "11111111-1111-4111-8111-111111111111".to_string(),
         {
-            let mut provider = turn_context.provider.clone();
+            let mut provider = built_in_model_providers(None)["openai"].clone();
             provider.base_url = Some(format!("{}/v1", server.uri()));
+            provider.supports_websockets = true;
             provider
         },
         turn_context.session_source.clone(),
@@ -3544,44 +3549,6 @@ async fn prompt_gc_hidden_fallback_does_not_disable_visible_websocket_transport(
         !session.services.model_client.responses_websocket_enabled(),
         "visible fallback activation should disable websocket transport"
     );
-}
-
-fn make_mcp_tool(
-    server_name: &str,
-    tool_name: &str,
-    connector_id: Option<&str>,
-    connector_name: Option<&str>,
-) -> ToolInfo {
-    let tool_namespace = if server_name == CODEX_APPS_MCP_SERVER_NAME {
-        connector_name
-            .map(crate::connectors::sanitize_name)
-            .map(|connector_name| format!("mcp__{server_name}__{connector_name}"))
-            .unwrap_or_else(|| server_name.to_string())
-    } else {
-        server_name.to_string()
-    };
-
-    ToolInfo {
-        server_name: server_name.to_string(),
-        tool_name: tool_name.to_string(),
-        tool_namespace,
-        server_instructions: None,
-        tool: Tool {
-            name: tool_name.to_string().into(),
-            title: None,
-            description: Some(format!("Test tool: {tool_name}").into()),
-            input_schema: Arc::new(JsonObject::default()),
-            output_schema: None,
-            annotations: None,
-            execution: None,
-            icons: None,
-            meta: None,
-        },
-        connector_id: connector_id.map(str::to_string),
-        connector_name: connector_name.map(str::to_string),
-        plugin_display_names: Vec::new(),
-        connector_description: None,
-    }
 }
 
 fn response_created(id: &str) -> Value {
@@ -3758,15 +3725,6 @@ impl Respond for UsageLimitRefreshSequenceResponder {
                     }
                 }
             }))
-    }
-}
-
-struct FlushFailingPromptGcRolloutSink;
-
-#[async_trait::async_trait]
-impl PromptGcRolloutSink for FlushFailingPromptGcRolloutSink {
-    async fn persist_items_atomically(&self, _items: &[RolloutItem]) -> std::io::Result<()> {
-        Err(std::io::Error::other("flush failed"))
     }
 }
 
@@ -5518,7 +5476,6 @@ async fn set_rate_limits_retains_previous_credits() {
     let session_configuration = SessionConfiguration {
         provider: config.model_provider.clone(),
         collaboration_mode,
-        collaboration_mode_reasoning_effort_explicit: false,
         model_reasoning_summary: config.model_reasoning_summary,
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
@@ -5536,9 +5493,6 @@ async fn set_rate_limits_retains_previous_credits() {
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
-        config_path: config
-            .active_user_config_path()
-            .expect("active user config path"),
         codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
@@ -5627,7 +5581,6 @@ async fn set_rate_limits_updates_plan_type_when_present() {
     let session_configuration = SessionConfiguration {
         provider: config.model_provider.clone(),
         collaboration_mode,
-        collaboration_mode_reasoning_effort_explicit: false,
         model_reasoning_summary: config.model_reasoning_summary,
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
@@ -5645,9 +5598,6 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
-        config_path: config
-            .active_user_config_path()
-            .expect("active user config path"),
         codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
@@ -6004,7 +5954,6 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
     SessionConfiguration {
         provider: config.model_provider.clone(),
         collaboration_mode,
-        collaboration_mode_reasoning_effort_explicit: false,
         model_reasoning_summary: config.model_reasoning_summary,
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
@@ -6022,9 +5971,6 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
-        config_path: config
-            .active_user_config_path()
-            .expect("active user config path"),
         codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
@@ -6102,7 +6048,6 @@ async fn spawn_agent_preserves_explicit_reasoning_effort_clear_in_session_config
     let updated = session_configuration
         .apply(&SessionSettingsUpdate {
             collaboration_mode: Some(cleared_mode),
-            collaboration_mode_explicit: true,
             ..Default::default()
         })
         .expect("apply explicit reasoning clear");
@@ -6129,22 +6074,18 @@ async fn synthesized_user_turn_update_preserves_explicit_reasoning_effort_clear(
     let cleared_configuration = session_configuration
         .apply(&SessionSettingsUpdate {
             collaboration_mode: Some(cleared_mode),
-            collaboration_mode_explicit: true,
             ..Default::default()
         })
         .expect("apply explicit reasoning clear");
 
-    let (collaboration_mode, collaboration_mode_explicit) =
-        handlers::resolve_collaboration_mode_update(
-            &cleared_configuration,
-            Some(cleared_configuration.collaboration_mode.model().to_string()),
-            /*effort*/ None,
-            /*collaboration_mode*/ None,
-        );
+    let collaboration_mode = cleared_configuration.collaboration_mode.with_updates(
+        Some(cleared_configuration.collaboration_mode.model().to_string()),
+        /*effort*/ None,
+        /*developer_instructions*/ None,
+    );
     let updated = cleared_configuration
         .apply(&SessionSettingsUpdate {
             collaboration_mode: Some(collaboration_mode),
-            collaboration_mode_explicit,
             ..Default::default()
         })
         .expect("apply synthesized user-turn update");
@@ -6169,19 +6110,15 @@ async fn make_synthesized_user_turn_update_with_inherited_reasoning_effort(
             Some(/*effort*/ None),
             /*developer_instructions*/ None,
         );
-    session_configuration.collaboration_mode_reasoning_effort_explicit = false;
 
-    let (collaboration_mode, collaboration_mode_explicit) =
-        handlers::resolve_collaboration_mode_update(
-            &session_configuration,
-            Some(session_configuration.collaboration_mode.model().to_string()),
-            /*effort*/ None,
-            /*collaboration_mode*/ None,
-        );
+    let collaboration_mode = session_configuration.collaboration_mode.with_updates(
+        Some(session_configuration.collaboration_mode.model().to_string()),
+        /*effort*/ None,
+        /*developer_instructions*/ None,
+    );
     session_configuration
         .apply(&SessionSettingsUpdate {
             collaboration_mode: Some(collaboration_mode),
-            collaboration_mode_explicit,
             ..Default::default()
         })
         .expect("apply synthesized user-turn update")
@@ -6197,7 +6134,7 @@ async fn synthesized_user_turn_update_preserves_inherited_reasoning_effort_in_tu
     let conversation_id = ThreadId::default();
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
     let models_manager = Arc::new(ModelsManager::new(
-        config.codex_home.clone(),
+        config.codex_home.to_path_buf(),
         auth_manager.clone(),
         None,
         CollaborationModesConfig::default(),
@@ -6213,17 +6150,22 @@ async fn synthesized_user_turn_update_preserves_inherited_reasoning_effort_in_tu
         &model_info,
         updated.session_source.clone(),
     );
-    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.clone()));
+    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
     let skills_manager = Arc::new(SkillsManager::new(
         config.codex_home.clone(),
         /*bundled_skills_enabled*/ true,
     ));
-    let plugin_outcome = plugins_manager.plugins_for_config(&per_turn_config);
+    let environment = Arc::new(codex_exec_server::Environment::default());
+    let plugin_outcome = plugins_manager.plugins_for_config(&per_turn_config).await;
     let effective_skill_roots = plugin_outcome.effective_skill_roots();
     let skills_input =
         crate::skills_load_input_from_config(&per_turn_config, effective_skill_roots);
-    let skills_outcome = Arc::new(skills_manager.skills_for_config(&skills_input));
-    let environment = Arc::new(codex_exec_server::Environment::default());
+    let skill_fs = environment.get_filesystem();
+    let skills_outcome = Arc::new(
+        skills_manager
+            .skills_for_config(&skills_input, Some(Arc::clone(&skill_fs)))
+            .await,
+    );
     let js_repl = Arc::new(JsReplHandle::with_node_path(
         config.js_repl_node_path.clone(),
         config.js_repl_node_module_dirs.clone(),
@@ -6275,12 +6217,12 @@ async fn session_configured_event_preserves_inherited_reasoning_effort_after_syn
     let (tx_event, rx_event) = async_channel::unbounded();
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
     let models_manager = Arc::new(ModelsManager::new(
-        config.codex_home.clone(),
+        config.codex_home.to_path_buf(),
         auth_manager.clone(),
         None,
         CollaborationModesConfig::default(),
     ));
-    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.clone()));
+    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
     let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
     let skills_manager = Arc::new(SkillsManager::new(
         config.codex_home.clone(),
@@ -6311,6 +6253,7 @@ async fn session_configured_event_preserves_inherited_reasoning_effort_after_syn
         Arc::new(SkillsWatcher::noop()),
         AgentControl::default(),
         /*environment*/ None,
+        /*analytics_events_client*/ None,
     )
     .await
     .expect("session should start");
@@ -6351,22 +6294,16 @@ async fn synthesized_override_turn_context_update_preserves_explicit_reasoning_e
     let cleared_configuration = session_configuration
         .apply(&SessionSettingsUpdate {
             collaboration_mode: Some(cleared_mode),
-            collaboration_mode_explicit: true,
             ..Default::default()
         })
         .expect("apply explicit reasoning clear");
 
-    let (collaboration_mode, collaboration_mode_explicit) =
-        handlers::resolve_collaboration_mode_update(
-            &cleared_configuration,
-            /*model*/ None,
-            /*effort*/ None,
-            /*collaboration_mode*/ None,
-        );
+    let collaboration_mode = cleared_configuration.collaboration_mode.with_updates(
+        /*model*/ None, /*effort*/ None, /*developer_instructions*/ None,
+    );
     let updated = cleared_configuration
         .apply(&SessionSettingsUpdate {
             collaboration_mode: Some(collaboration_mode),
-            collaboration_mode_explicit,
             ..Default::default()
         })
         .expect("apply synthesized override-turn-context update");
@@ -6569,7 +6506,6 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
     let session_configuration = SessionConfiguration {
         provider: config.model_provider.clone(),
         collaboration_mode,
-        collaboration_mode_reasoning_effort_explicit: false,
         model_reasoning_summary: config.model_reasoning_summary,
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
@@ -6587,9 +6523,6 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
-        config_path: config
-            .active_user_config_path()
-            .expect("active user config path"),
         codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
@@ -6686,7 +6619,6 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let session_configuration = SessionConfiguration {
         provider: config.model_provider.clone(),
         collaboration_mode,
-        collaboration_mode_reasoning_effort_explicit: false,
         model_reasoning_summary: config.model_reasoning_summary,
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
@@ -6704,9 +6636,6 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
-        config_path: config
-            .active_user_config_path()
-            .expect("active user config path"),
         codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
@@ -6944,6 +6873,10 @@ async fn make_session_with_config_and_rx(
 
     let (tx_event, rx_event) = async_channel::unbounded();
     let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
+    let (agent_last_activity_tx, _agent_last_activity_rx) =
+        watch::channel::<Option<codex_protocol::protocol::CollabAgentActivity>>(None);
+    let (prompt_gc_active_tx, _prompt_gc_active_rx) = watch::channel(false);
+    let (prompt_gc_activity_edges, _) = tokio::sync::broadcast::channel(16);
     let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
     let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
     let skills_manager = Arc::new(SkillsManager::new(
@@ -6959,6 +6892,9 @@ async fn make_session_with_config_and_rx(
         Arc::new(ExecPolicyManager::default()),
         tx_event,
         agent_status_tx,
+        agent_last_activity_tx,
+        prompt_gc_active_tx,
+        prompt_gc_activity_edges,
         InitialHistory::New,
         SessionSource::Exec,
         skills_manager,
@@ -7709,7 +7645,6 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
     let session_configuration = SessionConfiguration {
         provider: config.model_provider.clone(),
         collaboration_mode,
-        collaboration_mode_reasoning_effort_explicit: false,
         model_reasoning_summary: config.model_reasoning_summary,
         developer_instructions: config.developer_instructions.clone(),
         user_instructions: config.user_instructions.clone(),
@@ -7727,9 +7662,6 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
-        config_path: config
-            .active_user_config_path()
-            .expect("active user config path"),
         codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),

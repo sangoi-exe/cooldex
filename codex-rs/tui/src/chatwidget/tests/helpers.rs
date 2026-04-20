@@ -185,6 +185,8 @@ pub(super) async fn make_chatwidget_manual(
     };
     let current_collaboration_mode = base_mode;
     let active_collaboration_mask = collaboration_modes::default_mask(model_catalog.as_ref());
+    let auth_manager =
+        codex_login::AuthManager::shared_from_config(&cfg, /*enable_codex_api_key_env*/ false);
     let mut widget = ChatWidget {
         app_event_tx,
         codex_op_target: super::CodexOpTarget::Direct(op_tx),
@@ -192,6 +194,7 @@ pub(super) async fn make_chatwidget_manual(
         active_cell: None,
         active_cell_revision: 0,
         config: cfg,
+        auth_manager,
         current_collaboration_mode,
         active_collaboration_mask,
         has_chatgpt_account: false,
@@ -201,9 +204,12 @@ pub(super) async fn make_chatwidget_manual(
         initial_user_message: None,
         status_account_display: None,
         token_info: None,
+        token_info_is_prompt_gc_private: false,
+        prompt_gc_context_usage_unknown: false,
         rate_limit_snapshots_by_limit_id: BTreeMap::new(),
         rate_limit_empty_state: RateLimitEmptyState::Missing,
         rate_limit_account_generation: 0,
+        ignore_token_count_rate_limits_until_next_turn_start: false,
         refreshing_status_outputs: Vec::new(),
         next_status_refresh_request_id: 0,
         plan_type: None,
@@ -217,10 +223,10 @@ pub(super) async fn make_chatwidget_manual(
         terminal_title_status_kind: TerminalTitleStatusKind::Working,
         last_agent_markdown: None,
         latest_proposed_plan_markdown: None,
+        pending_resume_turns: None,
         saw_copy_source_this_turn: false,
         running_commands: HashMap::new(),
         collab_agent_metadata: HashMap::new(),
-        pending_collab_spawn_requests: HashMap::new(),
         suppressed_exec_calls: HashSet::new(),
         skills_all: Vec::new(),
         skills_initial_state: None,
@@ -248,6 +254,8 @@ pub(super) async fn make_chatwidget_manual(
         interrupts: InterruptManager::new(),
         reasoning_buffer: String::new(),
         full_reasoning_buffer: String::new(),
+        function_call_names_by_id: HashMap::new(),
+        last_debug_raw_response_item: None,
         current_status: StatusIndicatorState::working(),
         active_hook_cell: None,
         retry_status_header: None,
@@ -272,6 +280,8 @@ pub(super) async fn make_chatwidget_manual(
         quit_shortcut_key: None,
         is_review_mode: false,
         pre_review_token_info: None,
+        pre_review_token_info_is_prompt_gc_private: None,
+        pre_review_task_running: None,
         needs_final_message_separator: false,
         had_work_activity: false,
         saw_plan_update_this_turn: false,
@@ -300,6 +310,7 @@ pub(super) async fn make_chatwidget_manual(
         external_editor_state: ExternalEditorState::Closed,
         realtime_conversation: RealtimeConversationUiState::default(),
         last_rendered_user_message_event: None,
+        restored_pending_input_state: None,
         last_non_retry_error: None,
     };
     widget.set_model(&resolved_model);

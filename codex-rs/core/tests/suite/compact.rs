@@ -1603,6 +1603,7 @@ async fn local_auto_compact_does_not_emit_remote_warning() {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .unwrap();

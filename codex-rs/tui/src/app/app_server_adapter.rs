@@ -186,19 +186,8 @@ impl App {
                 return;
             }
             ServerNotification::AccountUpdated(_) => {
-                match app_server_client.load_account_projection().await {
-                    Ok(projection) => self.finish_app_server_account_projection_refresh(projection),
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "failed to refresh app-server account projection after account update"
-                        );
-                        self.report_app_server_account_projection_refresh_error(
-                            "account update",
-                            err.to_string(),
-                        );
-                    }
-                }
+                self.app_event_tx
+                    .send(AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate);
                 return;
             }
             ServerNotification::ExternalAgentConfigImportCompleted(_) => {
@@ -1265,8 +1254,6 @@ mod tests {
     use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
     use serde_json::json;
-    use std::path::PathBuf;
-
     #[test]
     fn bridges_completed_agent_messages_from_server_notifications() {
         let thread_id = "019cee8c-b993-7e33-88c0-014d4e62612d".to_string();
@@ -1803,7 +1790,7 @@ mod tests {
                 updated_at: 0,
                 status: ThreadStatus::Idle,
                 path: None,
-                cwd: PathBuf::from("/tmp/project"),
+                cwd: test_path_buf("/tmp/project").abs(),
                 cli_version: "test".to_string(),
                 source: SessionSource::Cli.into(),
                 agent_nickname: None,

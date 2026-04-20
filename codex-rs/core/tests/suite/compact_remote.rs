@@ -564,6 +564,7 @@ async fn remote_auto_compact_warning_is_emitted_after_each_compaction() -> Resul
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
@@ -2812,6 +2813,7 @@ async fn remote_auto_compact_followup_reinjects_prompt_top_context() -> Result<(
                     text_elements: Vec::new(),
                 }],
                 final_output_json_schema: None,
+                responsesapi_client_metadata: None,
             })
             .await?;
         wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;

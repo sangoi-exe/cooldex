@@ -862,6 +862,7 @@ mod tests {
             secondary: None,
             credits: None,
             plan_type: None,
+            rate_limit_reached_type: None,
         });
 
         assert_eq!(
@@ -889,6 +890,7 @@ mod tests {
             secondary: None,
             credits: None,
             plan_type: None,
+            rate_limit_reached_type: None,
         });
         state.set_rate_limits(RateLimitSnapshot {
             limit_id: None,
@@ -901,6 +903,7 @@ mod tests {
             secondary: None,
             credits: None,
             plan_type: None,
+            rate_limit_reached_type: None,
         });
 
         assert_eq!(
@@ -932,6 +935,7 @@ mod tests {
                 balance: Some("50".to_string()),
             }),
             plan_type: Some(codex_protocol::account::PlanType::Plus),
+            rate_limit_reached_type: None,
         });
 
         state.set_rate_limits(RateLimitSnapshot {
@@ -945,6 +949,7 @@ mod tests {
             secondary: None,
             credits: None,
             plan_type: None,
+            rate_limit_reached_type: None,
         });
 
         assert_eq!(
@@ -964,6 +969,7 @@ mod tests {
                     balance: Some("50".to_string()),
                 }),
                 plan_type: Some(codex_protocol::account::PlanType::Plus),
+                rate_limit_reached_type: None,
             })
         );
     }

@@ -790,7 +790,8 @@ mod tests {
             last_refresh: Some(Utc::now()),
             agent_identity: None,
         };
-        save_auth(tempdir.path(), &auth_json, AuthCredentialsStoreMode::File).expect("save auth");
+        let store = codex_login::AuthStore::from_legacy(auth_json);
+        save_auth(tempdir.path(), &store, AuthCredentialsStoreMode::File).expect("save auth");
         CodexAuth::from_auth_storage(tempdir.path(), AuthCredentialsStoreMode::File)
             .expect("load auth")
             .expect("auth")

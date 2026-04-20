@@ -1664,6 +1664,7 @@ async fn record_initial_history_resumed_rollback_discards_prompt_gc_compaction_f
         approval_policy: turn_context.approval_policy.value(),
         sandbox_policy: turn_context.sandbox_policy.get().clone(),
         network: None,
+        file_system_sandbox_policy: None,
         model: turn_context.model_info.slug.clone(),
         personality: turn_context.personality,
         collaboration_mode: Some(turn_context.collaboration_mode.clone()),

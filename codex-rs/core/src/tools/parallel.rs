@@ -245,16 +245,14 @@ mod tests {
     #[test]
     fn disallowed_response_sets_failed_success_for_function_and_custom_outputs() {
         let function_call = ToolCall {
-            tool_name: "blocked_tool".to_string(),
-            tool_namespace: None,
+            tool_name: "blocked_tool".into(),
             call_id: "function-call".to_string(),
             payload: ToolPayload::Function {
                 arguments: "{}".to_string(),
             },
         };
         let custom_call = ToolCall {
-            tool_name: "blocked_tool".to_string(),
-            tool_namespace: None,
+            tool_name: "blocked_tool".into(),
             call_id: "custom-call".to_string(),
             payload: ToolPayload::Custom {
                 input: "{}".to_string(),

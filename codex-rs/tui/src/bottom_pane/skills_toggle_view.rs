@@ -443,7 +443,7 @@ mod tests {
             skill_name: "repo_scout".to_string(),
             description: "Summarize the repo layout".to_string(),
             enabled: true,
-            path: PathBuf::from("/tmp/skills/repo_scout/SKILL.md"),
+            path: test_path_buf("/tmp/skills/repo_scout/SKILL.md").abs(),
         }];
         let mut view = SkillsToggleView::new(items, tx);
 
