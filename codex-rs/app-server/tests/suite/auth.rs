@@ -254,7 +254,7 @@ async fn get_auth_status_with_api_key_refresh_requested() -> Result<()> {
         status,
         GetAuthStatusResponse {
             auth_method: Some(AuthMode::ApiKey),
-            auth_token: Some("sk-test-key".to_string()),
+            auth_token: None,
             requires_openai_auth: Some(true),
         }
     );
@@ -262,7 +262,7 @@ async fn get_auth_status_with_api_key_refresh_requested() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_auth_status_omits_token_after_permanent_refresh_failure() -> Result<()> {
+async fn get_auth_status_clears_auth_method_after_permanent_refresh_failure() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path())?;
     write_chatgpt_auth(
@@ -317,7 +317,7 @@ async fn get_auth_status_omits_token_after_permanent_refresh_failure() -> Result
     assert_eq!(
         status,
         GetAuthStatusResponse {
-            auth_method: Some(AuthMode::Chatgpt),
+            auth_method: None,
             auth_token: None,
             requires_openai_auth: Some(true),
         }
@@ -343,7 +343,7 @@ async fn get_auth_status_omits_token_after_permanent_refresh_failure() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_auth_status_omits_token_after_proactive_refresh_failure() -> Result<()> {
+async fn get_auth_status_clears_auth_method_after_proactive_refresh_failure() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path())?;
     write_chatgpt_auth(
@@ -401,7 +401,7 @@ async fn get_auth_status_omits_token_after_proactive_refresh_failure() -> Result
     assert_eq!(
         status,
         GetAuthStatusResponse {
-            auth_method: Some(AuthMode::Chatgpt),
+            auth_method: None,
             auth_token: None,
             requires_openai_auth: Some(true),
         }
@@ -412,7 +412,8 @@ async fn get_auth_status_omits_token_after_proactive_refresh_failure() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_auth_status_returns_token_after_proactive_refresh_recovery() -> Result<()> {
+async fn get_auth_status_stays_without_auth_method_after_external_recovery_without_reload()
+-> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path())?;
     write_chatgpt_auth(
@@ -470,7 +471,7 @@ async fn get_auth_status_returns_token_after_proactive_refresh_recovery() -> Res
     assert_eq!(
         failed_status,
         GetAuthStatusResponse {
-            auth_method: Some(AuthMode::Chatgpt),
+            auth_method: None,
             auth_token: None,
             requires_openai_auth: Some(true),
         }
@@ -503,8 +504,8 @@ async fn get_auth_status_returns_token_after_proactive_refresh_recovery() -> Res
     assert_eq!(
         recovered_status,
         GetAuthStatusResponse {
-            auth_method: Some(AuthMode::Chatgpt),
-            auth_token: Some("recovered-access-token".to_string()),
+            auth_method: None,
+            auth_token: None,
             requires_openai_auth: Some(true),
         }
     );
