@@ -327,14 +327,20 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
 
 - `codex-rs/cli/src/main.rs`
   - Wide dispatch fanout across almost every shipped command family. Lock the target surface before editing helpers beneath it.
+- `codex-rs/login/src/auth/manager.rs`
+  - Wide auth fanout: login status, refresh, logout/revoke, external bearer flows, and account metadata all converge here.
 - `codex-rs/core/src/session/mod.rs`
   - High-leverage orchestration seam: session startup, initial prompt assembly, service wiring, and turn bootstrap. Small changes here radiate widely.
 - `codex-rs/core/src/session/turn.rs`
   - High-leverage sampling/tool loop seam. Changes here often affect prompt shape, tool flow, rollout persistence, and visible runtime events together.
+- `codex-rs/models-manager/src/manager.rs`
+  - Model catalog/default-selection seam. Small changes here alter available models, defaults, collaboration presets, refresh behavior, and auth-backed `/models` requests together.
 - `codex-rs/core/src/tools/spec.rs`
   - Tool-catalog seam with broad runtime/doc/test fallout. Verify handler, exposure, and feature gating together before editing.
 - `codex-rs/app-server/src/codex_message_processor.rs`
   - Large RPC fanout seam. Prefer the narrow request handler plus adjacent helpers over broad edits across unrelated methods.
+- `codex-rs/app-server/src/config_api.rs`
+  - Config RPC fanout seam. Changes here affect read/write semantics, requirements, runtime feature enablement, and user-config reload propagation together.
 - `codex-rs/tui/src/app.rs`
   - Governing UI/event-loop seam. Expect broad render/state fallout; isolate the owning submodule or adapter when possible.
 - `codex-rs/tui/src/chatwidget.rs`
@@ -584,6 +590,60 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
 - `codex-rs/core/src/tools/spec.rs`
   - Final model-visible tool-catalog assembly point that includes MCP tool exposure.
 
+#### 9. Compaction / history reconstruction flow
+
+- `codex-rs/core/src/tasks/compact.rs`
+  - Chooses the compaction implementation for an explicit compact turn and records whether the task ran locally or remotely.
+- `codex-rs/core/src/compact.rs`
+  - Local/manual/auto compaction owner: builds compact prompts, summarizes history, decides whether initial context must be reinjected, and persists `CompactedItem` replacement history.
+- `codex-rs/core/src/compact_remote.rs`
+  - Remote compaction owner: processes model-provided compacted history and preserves the mid-turn rule that initial context must be reinserted before the last real user or summary item.
+- `codex-rs/core/src/session/mod.rs`
+  - `replace_compacted_history(...)`, `build_initial_context(...)`, and `record_context_updates_and_set_reference_context_item(...)` own how compaction resets or re-establishes the runtime context baseline.
+- `codex-rs/core/src/session/rollout_reconstruction.rs`
+  - Rebuilds history/reference-context state from rollout items after compaction and rollback-sensitive replay.
+- `codex-rs/app-server-protocol/src/protocol/thread_history.rs`
+  - Final visible transcript reconstruction owner for `thread/read` and resume surfaces after compaction has already rewritten history.
+
+#### 10. Config read/write / reload flow
+
+- `codex-rs/app-server/src/config_api.rs`
+  - App-server config RPC owner for `read`, `config_requirements_read`, `write_value`, `batch_write`, runtime feature enablement, and per-thread user-config reload propagation.
+- `codex-rs/app-server-protocol/src/protocol/v2.rs`
+  - Wire payload owner for config RPC params/responses and experimental feature enablement surfaces.
+- `codex-rs/core/src/config_loader/mod.rs`
+  - Layer discovery, trusted-root/project-root semantics, and cloud requirements loading.
+- `codex-rs/core/src/config/mod.rs`
+  - Effective runtime `Config` projection and `ConfigService` behavior used beneath the RPC layer.
+- `codex-rs/config/src/lib.rs`
+  - Raw config-schema/types crate. Open this when the question is about the on-disk contract rather than effective runtime behavior.
+
+#### 11. Model/provider/catalog selection flow
+
+- `codex-rs/models-manager/src/manager.rs`
+  - Catalog/default-selection owner: bundled models, `/models` refresh, cache/etag handling, and collaboration-mode presets.
+- `codex-rs/model-provider-info/src/lib.rs`
+  - Provider capability/config registry: built-in providers, user overrides, retry config, auth metadata, and provider feature flags.
+- `codex-rs/model-provider/src/auth.rs`
+  - Provider-scoped auth routing. Decides when provider-specific command-backed auth replaces or wraps the base `AuthManager`.
+- `codex-rs/codex-api/src/provider.rs`
+  - Concrete API endpoint/retry/header owner used to talk to the selected provider.
+- `codex-rs/core/src/client.rs`
+  - Session-scoped model client: binds provider info, auth, websocket-vs-HTTP transport, and per-turn model/reasoning settings into actual Responses API requests.
+
+#### 12. Remote-control / collab transport flow
+
+- `codex-rs/app-server/src/transport/remote_control/mod.rs`
+  - Remote-control websocket bootstrap that wires auth, state runtime, and transport events for app-server remote control.
+- `codex-rs/app-server/src/transport/remote_control/protocol.rs`
+  - Remote-control envelope/protocol owner.
+- `codex-rs/state/src/runtime/remote_control.rs`
+  - Persistent enrollment storage keyed by websocket target, account, and app-server client name.
+- `codex-rs/core/src/tools/handlers/multi_agents.rs`
+  - Legacy collab tool surface.
+- `codex-rs/core/src/agent/control.rs`
+  - Live spawn/wait/parent-child runtime ownership beneath the tool handlers.
+
 ### Crate map by layer
 
 #### Entry surfaces
@@ -812,10 +872,16 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
   - Transport owner split between session-scoped `ModelClient` and per-turn `ModelClientSession`.
 - `codex-rs/core/src/client_common.rs`
   - Shared prompt/request-response plumbing.
+- `codex-rs/core/src/compact.rs`
+  - Local compaction and replacement-history construction.
+- `codex-rs/core/src/compact_remote.rs`
+  - Remote compaction and post-compaction replacement-history processing.
 - `codex-rs/core/src/context_manager/*`
   - Context/history normalization and update helpers.
 - `codex-rs/core/src/contextual_user_message.rs`
   - Contextual user message helpers and markers.
+- `codex-rs/core/src/prompt_debug.rs`
+  - Prompt-debug rendering helpers and prompt-input materialization for debugging/operator surfaces.
 - `codex-rs/core/src/realtime_context.rs`, `realtime_conversation.rs`, `realtime_prompt.rs`
   - Realtime voice/realtime conversation support.
 
@@ -941,9 +1007,11 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
 - `codex-rs/app-server/src/thread_status.rs`
   - Derived thread status owner.
 - `codex-rs/app-server/src/config_api.rs`
-  - Config RPC owner.
+  - Config RPC owner: read/write/batch-write semantics, requirements reads, experimental feature enablement, and user-config reload propagation.
 - `codex-rs/app-server/src/fs_api.rs`
   - FS RPC owner.
+- `codex-rs/app-server/src/transport/remote_control/mod.rs`
+  - Remote-control transport bootstrap. Start here for websocket remote-control enable/disable/enrollment behavior instead of normal thread RPCs.
 - `codex-rs/app-server/src/transport/*`
   - Transport-specific wiring. Do not start here unless the problem is connection-level rather than runtime/state-level.
 
@@ -968,10 +1036,18 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
   - `AuthManager` owner for login status, refresh, logout, external bearer flows, auth mode decisions, and runtime auth state.
 - `codex-rs/login/src/auth/storage.rs`
   - Persistence backend owner: `auth.json`, keyring-backed storage, delete/save/load behavior, auth file locking.
+- `codex-rs/login/src/auth/external_bearer.rs`
+  - Provider command-backed bearer auth owner: caches command output and refresh intervals for provider-scoped external auth.
+- `codex-rs/login/src/auth/revoke.rs`
+  - Token-revocation path used by logout-with-revoke.
 - `codex-rs/login/src/device_code_auth.rs`
   - Device-code flow.
 - `codex-rs/login/src/server.rs`
   - Local browser login server flow.
+- `codex-rs/login/src/pkce.rs`
+  - PKCE verifier/challenge generation for browser login.
+- `codex-rs/login/src/token_data.rs`
+  - Parsed token payload/JWT-claim owner for account id, plan type, FedRAMP routing, and expiration metadata loaded from `auth.json`.
 - `codex-rs/login/src/agent_identity.rs`
   - Agent-identity/background-task auth helpers.
 - `codex-rs/rmcp-client/src/lib.rs`
@@ -1078,6 +1154,9 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
 - `codex-rs/core/src/tasks/regular.rs`
   - `RegularTask`
     - Default user-turn task wrapper that enters `session::turn::run_turn(...)`.
+- `codex-rs/core/src/tasks/compact.rs`
+  - `CompactTask`
+    - `SessionTask` owner that routes an explicit compact turn to local vs remote compaction.
 - `codex-rs/core/src/session/turn_context.rs`
   - `TurnContext`
     - Per-turn snapshot of cwd, sandbox/approval mode, model/provider, visible tools, telemetry, and related runtime state captured before sampling starts.
@@ -1085,6 +1164,19 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
   - `run_turn(...)`
     - Real turn engine.
     - Consumes the initial context from `session/mod.rs`, builds the final `Prompt` and visible tool surface, opens the model stream, handles streamed tool calls and assistant output, checks compaction/continuation conditions, and emits events back to callers.
+- `codex-rs/core/src/compact.rs`
+  - `run_compact_task(...)` / `run_inline_auto_compact_task(...)`
+    - Local compaction entrypoints for explicit and auto-compact turns.
+  - `insert_initial_context_before_last_real_user_or_summary(...)`
+    - Canonical insertion rule for replacement history after compaction.
+- `codex-rs/core/src/compact_remote.rs`
+  - `run_remote_compact_task(...)` / `run_inline_remote_auto_compact_task(...)`
+    - Remote compaction entrypoints.
+  - `process_compacted_history(...)`
+    - Filters remote compact output and reapplies canonical initial context placement.
+- `codex-rs/core/src/session/rollout_reconstruction.rs`
+  - `reconstruct_history_from_rollout(...)`
+    - Rebuilds compacted history and reference-context state from rollout items.
 - `codex-rs/core/src/client.rs`
   - `ModelClient`
     - Session-scoped model/backend client.
@@ -1104,6 +1196,9 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
 - `codex-rs/core/src/agents_md.rs`
   - `AgentsMdManager::user_instructions(...)` / `instruction_sources(...)`
     - Build the model-visible AGENTS/project-doc stack and track which files supplied it.
+- `codex-rs/models-manager/src/manager.rs`
+  - `list_models(...)` / `get_default_model(...)` / `refresh_if_new_etag(...)`
+    - Catalog/default-model ownership for `/models` refresh, cache, and collaboration-mode presets.
 - `codex-rs/core/src/skills.rs`
   - `skills_load_input_from_config(...)`
     - Converts effective config plus skill roots into the load request consumed by `codex-core-skills`.
@@ -1192,6 +1287,14 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
 - `codex-rs/app-server/src/dynamic_tools.rs`
   - `on_call_response(...)`
     - Converts app-server dynamic-tool results back into `Op::DynamicToolResponse`.
+- `codex-rs/app-server/src/config_api.rs`
+  - `read(...)` / `write_value(...)` / `batch_write(...)`
+    - App-server owner for config RPC semantics.
+  - `load_latest_config(...)`
+    - Rebuilds effective runtime config under the current loader/runtime feature overrides.
+- `codex-rs/app-server/src/transport/remote_control/mod.rs`
+  - `start_remote_control_with_options(...)`
+    - Boots the remote-control websocket transport with auth, state runtime, and enable/disable wiring.
 - `codex-rs/app-server-protocol/src/protocol/thread_history.rs`
   - `ThreadHistoryBuilder`
     - Reconstructs visible turn history from rollout-backed items; this is the owner of resumed/read transcript richness, not the TUI renderer.
@@ -1218,6 +1321,12 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
     - Durable auth payload shape.
   - `AuthStorageBackend`
     - File/keyring/auto/ephemeral backend choice.
+- `codex-rs/login/src/auth/external_bearer.rs`
+  - `BearerTokenRefresher`
+    - Provider command-backed bearer auth with cached token refresh behavior.
+- `codex-rs/login/src/auth/revoke.rs`
+  - `revoke_auth_tokens(...)`
+    - Best-effort token revocation path behind logout-with-revoke.
 - `codex-rs/login/src/server.rs`
   - `run_login_server(...)`
     - Browser callback login server.
@@ -1227,8 +1336,20 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
     - Token persistence after successful login.
   - `ensure_workspace_allowed(...)`
     - Workspace/account gating during login.
+- `codex-rs/login/src/pkce.rs`
+  - `generate_pkce(...)`
+    - PKCE verifier/challenge generation for browser login.
+- `codex-rs/login/src/token_data.rs`
+  - `parse_chatgpt_jwt_claims(...)` / `parse_jwt_expiration(...)`
+    - JWT-derived account/workspace/plan/expiration parsing used by runtime auth decisions.
 - `codex-rs/cli/src/login.rs`
   - Operator-facing login/status/logout UX wrapper.
+- `codex-rs/models-manager/src/manager.rs`
+  - `list_models(...)` / `get_default_model(...)` / `refresh_if_new_etag(...)`
+    - Catalog/default-model and refresh ownership for `/models`-backed availability.
+- `codex-rs/state/src/runtime/remote_control.rs`
+  - `get_remote_control_enrollment(...)` / `upsert_remote_control_enrollment(...)`
+    - Persistent remote-control enrollment ownership by websocket target/account/client name.
 - `codex-rs/sandboxing/src/manager.rs`
   - `SandboxType`
     - Selected backend enum.
@@ -1338,19 +1459,44 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
   - `codex-rs/login/src/auth/manager.rs`
   - `codex-rs/login/src/auth/storage.rs`
   - `codex-rs/cli/src/login.rs`
+  - `codex-rs/login/src/server.rs` for browser callback / token exchange bugs
+  - `codex-rs/login/src/device_code_auth.rs` for device-code flow bugs
+  - `codex-rs/login/src/auth/external_bearer.rs` for provider command-backed auth bugs
+  - `codex-rs/login/src/token_data.rs` when account/workspace/plan claims look wrong
+  - `codex-rs/login/src/auth/revoke.rs` for logout-with-revoke behavior
   - `codex-rs/model-provider/src/auth.rs` if the behavior differs by provider
   - TUI `/accounts` surface only after the auth owner is locked
+- Compact/history reconstruction bug
+  - `codex-rs/core/src/tasks/compact.rs`
+  - `codex-rs/core/src/compact.rs`
+  - `codex-rs/core/src/compact_remote.rs`
+  - `codex-rs/core/src/session/mod.rs`
+  - `codex-rs/core/src/session/rollout_reconstruction.rs`
+  - `codex-rs/app-server-protocol/src/protocol/thread_history.rs` only after the runtime-side history rewrite path is understood
 - Config/feature bug
+  - `codex-rs/app-server/src/config_api.rs` for config RPC semantics or reload propagation
+  - `codex-rs/app-server-protocol/src/protocol/v2.rs` for config wire shapes
   - `codex-rs/core/src/config_loader/mod.rs`
   - `codex-rs/core/src/config/mod.rs`
   - `codex-rs/config/src/lib.rs`
   - `codex-rs/features/src/lib.rs`
+- Model/provider/catalog bug
+  - `codex-rs/models-manager/src/manager.rs`
+  - `codex-rs/model-provider-info/src/lib.rs`
+  - `codex-rs/model-provider/src/auth.rs`
+  - `codex-rs/codex-api/src/provider.rs`
+  - `codex-rs/core/src/client.rs`
 - App-server protocol/API bug
   - `codex-rs/app-server-protocol/src/protocol/v2.rs`
   - `codex-rs/app-server-protocol/src/protocol/common.rs`
   - `codex-rs/app-server-protocol/src/protocol/thread_history.rs`
   - `codex-rs/app-server/src/codex_message_processor.rs`
   - client caller in `tui/src/app_server_session.rs` or `exec/src/lib.rs`
+- Remote-control/runtime coordination bug
+  - `codex-rs/app-server/src/transport/remote_control/mod.rs`
+  - `codex-rs/app-server/src/transport/remote_control/protocol.rs`
+  - `codex-rs/state/src/runtime/remote_control.rs`
+  - `codex-rs/core/src/agent/control.rs` if the symptom is collab/runtime coordination rather than websocket transport
 - Multi-agent/collab bug
   - `codex-rs/core/src/tools/handlers/multi_agents.rs`
   - `codex-rs/core/src/agent/control.rs`
@@ -1374,14 +1520,19 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
 - Do not forget `thread/resume` precedence: `history > path > thread_id`.
 - Do not assume `thread/list` rows come from one source. They are composed from thread-store summaries, title lookup, and runtime status overlays.
 - Do not confuse `codex-rs/config` raw schema/types with `core/src/config/mod.rs` effective runtime config.
+- Do not debug config read/write or reload propagation only in `core/src/config_loader/mod.rs`; the app-server RPC owner is `app-server/src/config_api.rs`.
 - Do not debug config-layer precedence in `ConfigBuilder` first; layer ordering and trust/project-root rules live in `core/src/config_loader/mod.rs`.
 - Do not treat `core/src/agents_md.rs` as just filename constants. It assembles the actual model-visible AGENTS/project-doc stack from codex-home plus project-root -> cwd docs.
 - Do not debug prompt-fragment assembly only in `session/turn.rs`; `core/src/session/mod.rs::build_initial_context(...)` assembles AGENTS/apps/skills/plugins/user-instructions before `turn.rs` wraps and samples them.
+- Do not debug compaction only in `tasks/compact.rs`; real history rewrite spans `compact.rs`, `compact_remote.rs`, `session/mod.rs`, and `session/rollout_reconstruction.rs`.
+- Do not debug login/logout only in `cli/src/login.rs`; browser/device/external-bearer/revoke/token-claim ownership is split across the `codex-login` crate.
 - Do not debug `codex mcp login/logout` only in `cli/src/mcp_cmd.rs`; OAuth discovery/login transport and stdio launcher details live in `codex-rmcp-client`, while live server connections live in `codex-mcp`.
 - Do not treat `core/src/mcp.rs` as the live MCP runtime owner. It owns configured/effective server projection and tool provenance, while live MCP connection management is initialized during `Session::new(...)`.
+- Do not treat model selection as a `core/src/client.rs`-only question; catalog/default selection lives in `codex-models-manager`, while provider capabilities and auth rules live in `codex-model-provider-info` and `codex-model-provider`.
 - Do not collapse tool ownership into one file. `tools/router.rs`, `tools/registry.rs`, and `tools/orchestrator.rs` own different parts of the tool path.
 - Do not treat `codex-state` SQLite data as the canonical transcript owner. Rollout files remain canonical.
 - Do not treat `codex-state` as threads-only. The durable thread/session boundary is `codex-rs/thread-store`, but memories, agent jobs, and remote-control/backfill state still live under `codex-state`.
+- Do not treat remote-control enrollment as generic thread metadata. Live websocket transport lives under `app-server/src/transport/remote_control/*`, while persisted enrollment state lives under `state/src/runtime/remote_control.rs`.
 - Do not treat `codex-linux-sandbox` as sandbox policy owner. `codex-sandboxing` chooses/rewrites the request first.
 - Do not trust legacy naming in the Linux helper. Current main defaults to bubblewrap-first behavior even though some types still say `Landlock`.
 - Do not treat `cli/src/mcp_cmd.rs` OAuth as the same auth surface as `codex-login`.
