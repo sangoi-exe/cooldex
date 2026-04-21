@@ -241,6 +241,18 @@ fn chatgpt_auth_store_for_manager_logout(
 }
 
 fn external_chatgpt_auth_store(store_account_id: &str, workspace_id: &str) -> AuthStore {
+    external_chatgpt_auth_store_with_plan(
+        store_account_id,
+        workspace_id,
+        Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+    )
+}
+
+fn external_chatgpt_auth_store_with_plan(
+    store_account_id: &str,
+    workspace_id: &str,
+    chatgpt_plan_type: Option<InternalPlanType>,
+) -> AuthStore {
     AuthStore {
         active_account_id: Some(store_account_id.to_string()),
         accounts: vec![StoredAccount {
@@ -249,7 +261,7 @@ fn external_chatgpt_auth_store(store_account_id: &str, workspace_id: &str) -> Au
             tokens: TokenData {
                 id_token: IdTokenInfo {
                     email: Some("external@example.com".to_string()),
-                    chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                    chatgpt_plan_type,
                     chatgpt_user_id: Some("user-12345".to_string()),
                     chatgpt_account_id: Some(workspace_id.to_string()),
                     chatgpt_account_is_fedramp: false,
@@ -504,6 +516,92 @@ fn auth_manager_prefers_external_chatgpt_tokens_over_persisted_auth() {
             .map(|summary| summary.store_account_id),
         Some("external-store-account".to_string())
     );
+}
+
+#[test]
+fn auth_manager_falls_back_to_persisted_auth_when_external_store_is_not_admitted() {
+    let codex_home = tempdir().unwrap();
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some("persistent-workspace".to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("write persistent auth file");
+    save_auth(
+        codex_home.path(),
+        &external_chatgpt_auth_store_with_plan(
+            "external-store-account",
+            "external-workspace",
+            Some(InternalPlanType::Unknown("mystery-tier".to_string())),
+        ),
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("save external auth store");
+    let persistent_storage = create_auth_storage(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+    );
+    let persistent_store = persistent_storage
+        .load()
+        .expect("load persistent auth store")
+        .expect("persistent auth store should exist");
+    let persistent_store_account_id = persistent_store
+        .active_account()
+        .expect("persistent auth store should keep an active account")
+        .id
+        .clone();
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+    assert!(manager.account_state_store.is_some());
+    let cached_store = manager
+        .inner
+        .read()
+        .expect("cached auth lock should be readable")
+        .store
+        .clone();
+    let cached_auth = manager.auth_cached();
+    assert!(
+        cached_auth.is_some(),
+        "persistent auth should remain cached; cached_store={cached_store:?}"
+    );
+    let auth = cached_auth.expect("persistent auth should remain cached");
+    assert_eq!(auth.api_auth_mode(), ApiAuthMode::Chatgpt);
+    assert_eq!(
+        auth.active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id),
+        Some(persistent_store_account_id.clone())
+    );
+
+    manager.reload();
+    let reloaded_auth = manager
+        .auth_cached()
+        .expect("persistent auth should still be cached after reload");
+    assert_eq!(reloaded_auth.api_auth_mode(), ApiAuthMode::Chatgpt);
+    assert_eq!(
+        reloaded_auth
+            .active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id),
+        Some(persistent_store_account_id)
+    );
+
+    let external_storage = create_auth_storage(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::Ephemeral,
+    );
+    let external_store = external_storage
+        .load()
+        .expect("load external auth store")
+        .unwrap_or_default();
+    assert!(external_store.accounts.is_empty());
+    assert_eq!(external_store.active_account_id, None);
 }
 
 #[test]

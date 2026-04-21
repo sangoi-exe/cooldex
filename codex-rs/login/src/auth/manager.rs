@@ -3378,6 +3378,15 @@ impl AuthManager {
         None
     }
 
+    fn chatgpt_auth_admission_policy_for_store_origin(
+        store_origin: CachedStoreOrigin,
+    ) -> ChatgptAuthAdmissionPolicy {
+        match store_origin {
+            CachedStoreOrigin::Persistent => ChatgptAuthAdmissionPolicy::Persisted,
+            CachedStoreOrigin::ExternalEphemeral => ChatgptAuthAdmissionPolicy::ExternalStrict,
+        }
+    }
+
     fn chatgpt_api_auth_mode_for_store_origin(store_origin: CachedStoreOrigin) -> ApiAuthMode {
         match store_origin {
             CachedStoreOrigin::Persistent => ApiAuthMode::Chatgpt,
@@ -3466,57 +3475,76 @@ impl AuthManager {
             } else {
                 CachedStoreOrigin::Persistent
             };
-        let selected = if let Some(external_storage) = external_storage.as_ref() {
+        let mut selected_store = persistent_store;
+        let mut selected_storage = Arc::clone(storage);
+        let mut selected_origin = persistent_origin;
+        if let Some(external_storage) = external_storage.as_ref() {
             match external_storage.load() {
                 Ok(Some(store)) if !store.accounts.is_empty() || store.openai_api_key.is_some() => {
-                    Self::prepare_loaded_store_candidate(
+                    let external_candidate = Self::preflight_loaded_store_candidate(
                         store,
                         Arc::clone(external_storage),
                         CachedStoreOrigin::ExternalEphemeral,
-                        account_state_store,
-                        runtime_session_id,
-                        linked_codex_session_id,
-                        required_workspace_id,
-                    )
+                    );
+                    if Self::store_has_selectable_auth_material(&external_candidate.store) {
+                        selected_store = external_candidate.store;
+                        selected_storage = Arc::clone(external_storage);
+                        selected_origin = external_candidate.store_origin;
+                    }
                 }
-                Ok(Some(_)) | Ok(None) => Self::prepare_loaded_store_candidate(
-                    persistent_store,
-                    Arc::clone(storage),
-                    persistent_origin,
-                    account_state_store,
-                    runtime_session_id,
-                    linked_codex_session_id,
-                    required_workspace_id,
-                ),
+                Ok(Some(_)) | Ok(None) => {}
                 Err(err) => {
                     tracing::warn!("Failed to load external auth store: {err}");
-                    Self::prepare_loaded_store_candidate(
-                        persistent_store,
-                        Arc::clone(storage),
-                        persistent_origin,
-                        account_state_store,
-                        runtime_session_id,
-                        linked_codex_session_id,
-                        required_workspace_id,
-                    )
                 }
             }
-        } else {
-            Self::prepare_loaded_store_candidate(
-                persistent_store,
-                Arc::clone(storage),
-                persistent_origin,
-                account_state_store,
-                runtime_session_id,
-                linked_codex_session_id,
-                required_workspace_id,
-            )
-        };
+        }
+        let selected = Self::prepare_loaded_store_candidate(
+            selected_store,
+            selected_storage,
+            selected_origin,
+            account_state_store,
+            runtime_session_id,
+            linked_codex_session_id,
+            required_workspace_id,
+        );
 
         LoadedCachedStore {
             store: selected.store,
             store_origin: selected.store_origin,
         }
+    }
+
+    fn preflight_loaded_store_candidate(
+        mut store: AuthStore,
+        persist_storage: Arc<dyn AuthStorageBackend>,
+        store_origin: CachedStoreOrigin,
+    ) -> LoadedStoreCandidate {
+        let removed_account_ids = enforce_chatgpt_auth_accounts(
+            &mut store,
+            Self::chatgpt_auth_admission_policy_for_store_origin(store_origin),
+        );
+        if !removed_account_ids.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_account_ids,
+                ?store_origin,
+                "removed accounts with unsupported ChatGPT plans while preflighting auth store"
+            );
+            if let Err(error) = persist_storage.save(&store) {
+                tracing::warn!(
+                    error = %error,
+                    ?store_origin,
+                    "failed to persist stripped auth store after preflighting unsupported plans"
+                );
+            }
+        }
+        LoadedStoreCandidate {
+            store,
+            store_origin,
+        }
+    }
+
+    fn store_has_selectable_auth_material(store: &AuthStore) -> bool {
+        !store.accounts.is_empty() || store.openai_api_key.is_some()
     }
 
     fn prepare_loaded_store_candidate(
@@ -3529,8 +3557,10 @@ impl AuthManager {
         required_workspace_id: Option<&str>,
     ) -> LoadedStoreCandidate {
         let loaded_had_active_account = store.active_account_id.is_some();
-        let removed_account_ids =
-            enforce_chatgpt_auth_accounts(&mut store, ChatgptAuthAdmissionPolicy::Persisted);
+        let removed_account_ids = enforce_chatgpt_auth_accounts(
+            &mut store,
+            Self::chatgpt_auth_admission_policy_for_store_origin(store_origin),
+        );
         let mut sync_outcome = UsageStateSyncOutcome::default();
         if let Some(account_state_store) = account_state_store {
             match synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store) {

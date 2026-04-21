@@ -24,6 +24,10 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
+// Merge-safety anchor: `getAuthStatus` compatibility tests must stay aligned
+// with the v1 compatibility contract and the authoritative `account/read`
+// surface so legacy followers do not drift from current auth behavior.
+
 // Bazel CI can spend tens of seconds starting app-server subprocesses or
 // processing auth RPCs under load.
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);

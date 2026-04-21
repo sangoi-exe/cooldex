@@ -1448,7 +1448,7 @@ The stable auth/account surface supports two normal authentication modes. `accou
 
 Experimental/internal-only surface:
 
-- **ChatGPT external tokens (`chatgptAuthTokens`)**: for OpenAI-internal / experimental app-server use only. This path is intentionally excluded from the stable generated schema unless `experimentalApi` is enabled. When active, `account/read` / `account/updated` surface `authMode: "chatgptAuthTokens"` while `account.type` remains `chatgpt` for display purposes. Codex keeps that auth in the external ephemeral store and may request `account/chatgptAuthTokens/refresh` from the client when it needs refreshed tokens.
+- **ChatGPT external tokens (`chatgptAuthTokens`)**: for OpenAI-internal / experimental app-server login only. Stable generated schemas filter the experimental `account/login/start` request/response variant unless `experimentalApi` is enabled, but stable schemas can still surface `authMode: "chatgptAuthTokens"` and the server-initiated `account/chatgptAuthTokens/refresh` request when that auth path is active. `account.type` remains `chatgpt` for display purposes, and Codex keeps that auth in the external ephemeral store.
 
 ### API Overview
 
@@ -1457,7 +1457,7 @@ Experimental/internal-only surface:
 - `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
 - `account/login/cancel` — cancel a pending managed ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated`.
-- `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apiKey`, `chatgpt`, `chatgptAuthTokens`, or `null`) and includes the current ChatGPT `label` and `planType` when available.
+- `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, `chatgptAuthTokens`, or `null`) and includes the current ChatGPT `label` and `planType` when available.
 - `account/rateLimits/read` — fetch ChatGPT rate limits; updates arrive via `account/rateLimits/updated` (notify).
 - `account/rateLimits/updated` (notify) — emitted whenever a user's ChatGPT rate limits change.
 - `account/sendAddCreditsNudgeEmail` — ask ChatGPT to email the workspace owner about depleted credits or a reached usage limit.
@@ -1477,16 +1477,17 @@ Response examples:
 ```json
 { "id": 1, "result": { "account": null, "authMode": null, "requiresOpenaiAuth": false, "activeChatgptStoreAccountId": null } } // No OpenAI auth needed (e.g., OSS/local models)
 { "id": 1, "result": { "account": null, "authMode": null, "requiresOpenaiAuth": true, "activeChatgptStoreAccountId": null } }  // OpenAI auth required (typical for OpenAI-hosted models)
-{ "id": 1, "result": { "account": { "type": "apiKey" }, "authMode": "apiKey", "requiresOpenaiAuth": true, "activeChatgptStoreAccountId": null } }
+{ "id": 1, "result": { "account": { "type": "apiKey" }, "authMode": "apikey", "requiresOpenaiAuth": true, "activeChatgptStoreAccountId": null } }
 { "id": 1, "result": { "account": { "type": "chatgpt", "label": null, "email": "user@example.com", "planType": "pro" }, "authMode": "chatgpt", "requiresOpenaiAuth": true, "activeChatgptStoreAccountId": "chatgpt-user:user-123:workspace:account-123" } }
+{ "id": 1, "result": { "account": { "type": "chatgpt", "label": null, "email": "user@example.com", "planType": "pro" }, "authMode": "chatgptAuthTokens", "requiresOpenaiAuth": true, "activeChatgptStoreAccountId": "org-embedded" } }
 ```
 
 Field notes:
 
 - `refreshToken` (bool): set `true` to force a token refresh.
 - `requiresOpenaiAuth` reflects the active provider; when `false`, Codex can run without OpenAI credentials.
-- `authMode` (`apiKey` | `chatgpt` | `chatgptAuthTokens` | `null`): the exact current auth owner. The experimental/internal `chatgptAuthTokens` value appears only when that auth path is active.
-- `activeChatgptStoreAccountId` (`string | null`): carries the stable saved-account/store identity for the currently selected ChatGPT account, or `null` when the current auth is not a saved ChatGPT account.
+- `authMode` (`apikey` | `chatgpt` | `chatgptAuthTokens` | `null`): the exact current auth owner. The experimental/internal `chatgptAuthTokens` value appears only when that auth path is active.
+- `activeChatgptStoreAccountId` (`string | null`): carries the stable store/workspace identity for the currently selected ChatGPT auth context. It can be non-null for saved-account ChatGPT auth and external `chatgptAuthTokens` auth, and is `null` when the current auth does not expose a ChatGPT store/workspace identity.
 
 ### 2) Log in with an API key
 

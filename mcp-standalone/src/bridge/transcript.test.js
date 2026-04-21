@@ -3,6 +3,10 @@ import test from "node:test";
 
 import { formatTranscriptLine } from "./transcript.js";
 
+// Merge-safety anchor: transcript prefix expectations must stay aligned with
+// `transcript.js`, `runtime.js`, and the bridge README because this stderr
+// format is an operator-facing local contract.
+
 test("formatTranscriptLine includes GMT-3 HH:mm:ss|DD-MM-YYYY timestamp and operator user id", () => {
   const line = formatTranscriptLine({
     channel: "SESSION",

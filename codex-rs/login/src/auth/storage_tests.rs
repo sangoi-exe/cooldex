@@ -9,6 +9,10 @@ use tempfile::tempdir;
 use codex_keyring_store::tests::MockKeyringStore;
 use keyring::Error as KeyringError;
 
+// Merge-safety anchor: auth storage tests must exercise the AuthStore-backed
+// persistence contract so file/keyring followers stay aligned with current
+// auth-manager loading behavior.
+
 fn auth_store_from_legacy(auth_dot_json: AuthDotJson) -> AuthStore {
     AuthStore::from_legacy(auth_dot_json)
 }

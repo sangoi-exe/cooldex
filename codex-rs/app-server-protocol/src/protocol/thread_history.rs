@@ -208,8 +208,9 @@ fn local_shell_status_to_command_status(status: &LocalShellStatus) -> CommandExe
 
 fn function_call_output_status(output: &FunctionCallOutputPayload) -> CommandExecutionStatus {
     match output.success {
+        Some(true) => CommandExecutionStatus::Completed,
         Some(false) => CommandExecutionStatus::Failed,
-        _ => CommandExecutionStatus::Completed,
+        None => CommandExecutionStatus::InProgress,
     }
 }
 

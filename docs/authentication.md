@@ -7,7 +7,7 @@ Codex supports two stable authentication modes:
 
 Experimental/internal-only app-server surface:
 
-- **ChatGPT external tokens (`chatgptAuthTokens`)**: the app-server auth surface can accept caller-supplied ChatGPT tokens and keep them in the external ephemeral store instead of the saved-account store. This path is intentionally excluded from the stable generated app-server schema unless `experimentalApi` is enabled.
+- **ChatGPT external tokens (`chatgptAuthTokens`)**: the app-server auth surface can accept caller-supplied ChatGPT tokens and keep them in the external ephemeral store instead of the saved-account store. The stable generated app-server schema filters the experimental `account/login/start` request/response variant unless `experimentalApi` is enabled, but stable schemas can still mention `authMode: "chatgptAuthTokens"` and the server-initiated `account/chatgptAuthTokens/refresh` request when that auth path is active.
 
 ## Where credentials are stored
 

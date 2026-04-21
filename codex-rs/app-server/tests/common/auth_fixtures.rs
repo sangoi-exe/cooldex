@@ -15,6 +15,10 @@ use codex_login::token_data::TokenData;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
 use serde_json::json;
 
+// Merge-safety anchor: auth test fixtures must stay AuthStore-backed and
+// aligned with the current app-server/auth-manager persistence contract rather
+// than legacy AuthDotJson-only helpers.
+
 /// Builder for writing a fake ChatGPT auth.json in tests.
 #[derive(Debug, Clone)]
 pub struct ChatGptAuthFixture {

@@ -23,6 +23,10 @@ use ts_rs::TS;
 
 use crate::protocol::common::AuthMode;
 
+// Merge-safety anchor: v1 auth compatibility docs/types must stay aligned with
+// the authoritative v2/common auth surfaces so `getAuthStatus` drift does not
+// split the shipped app-server contract.
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeParams {
