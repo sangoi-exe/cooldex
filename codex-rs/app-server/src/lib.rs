@@ -378,6 +378,7 @@ pub async fn run_main_with_transport(
             format!("error parsing -c overrides: {e}"),
         )
     })?;
+    let mut startup_auth_manager: Option<Arc<AuthManager>> = None;
     let cloud_requirements = match ConfigBuilder::default()
         .cli_overrides(cli_kv_overrides.clone())
         .loader_overrides(loader_overrides.clone())
@@ -402,8 +403,12 @@ pub async fn run_main_with_transport(
                 }
             }
 
+            // Merge-safety anchor: app-server startup, cloud bootstrap, remote control, and the
+            // processor must reuse one lease-bearing `AuthManager` so one process does not mint
+            // competing WS12 runtime owners against its own saved-account SQLite state.
             let auth_manager =
                 AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+            startup_auth_manager = Some(auth_manager.clone());
             cloud_requirements_loader(
                 auth_manager,
                 config.chatgpt_base_url,
@@ -566,8 +571,10 @@ pub async fn run_main_with_transport(
         AppServerTransport::Off => {}
     }
 
-    let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+    let auth_manager = startup_auth_manager.unwrap_or_else(|| {
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+    });
+    auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
 
     let remote_control_enabled = config.features.enabled(Feature::RemoteControl);
     if transport_accept_handles.is_empty() && !remote_control_enabled {
@@ -647,8 +654,7 @@ pub async fn run_main_with_transport(
     let processor_handle = tokio::spawn({
         let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(outgoing_tx));
         let outbound_control_tx = outbound_control_tx;
-        let auth_manager =
-            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+        let auth_manager = auth_manager.clone();
         let cli_overrides: Vec<(String, TomlValue)> = cli_kv_overrides.clone();
         let loader_overrides = loader_overrides_for_config_api;
         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {

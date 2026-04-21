@@ -728,12 +728,11 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_web_search_begin(&mut self, payload: &WebSearchBeginEvent) {
-        let item = ThreadItem::WebSearch {
-            id: payload.call_id.clone(),
-            query: String::new(),
-            action: None,
-        };
-        self.upsert_item_in_current_turn(item);
+        // Merge-safety anchor: begin-only web search replay must stay
+        // non-renderable until the end event supplies the truthful query/action
+        // payload; otherwise resume fabricates a visible completed-looking row
+        // from incomplete evidence.
+        let _ = payload;
     }
 
     fn handle_web_search_end(&mut self, payload: &WebSearchEndEvent) {
@@ -918,14 +917,10 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_image_generation_begin(&mut self, payload: &ImageGenerationBeginEvent) {
-        let item = ThreadItem::ImageGeneration {
-            id: payload.call_id.clone(),
-            status: String::new(),
-            revised_prompt: None,
-            result: String::new(),
-            saved_path: None,
-        };
-        self.upsert_item_in_current_turn(item);
+        // Merge-safety anchor: begin-only image-generation replay must stay
+        // non-renderable until the end event supplies a truthful status/result;
+        // a placeholder row would lie about what the rollout actually knows.
+        let _ = payload;
     }
 
     fn handle_image_generation_end(&mut self, payload: &ImageGenerationEndEvent) {
@@ -1179,7 +1174,12 @@ impl ThreadHistoryBuilder {
             status: CollabAgentToolCallStatus::InProgress,
             sender_thread_id: payload.sender_thread_id.to_string(),
             receiver_thread_ids: vec![payload.receiver_thread_id.to_string()],
-            receiver_agents: Vec::new(),
+            receiver_agents: vec![Self::collab_agent_ref(
+                payload.receiver_thread_id.to_string(),
+                /*agent_nickname*/ None,
+                /*agent_role*/ None,
+                payload.receiver_agent_task_name.clone(),
+            )],
             prompt: None,
             profile: None,
             model: None,
@@ -1879,6 +1879,7 @@ mod tests {
     use codex_protocol::protocol::AgentReasoningRawContentEvent;
     use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
     use codex_protocol::protocol::CodexErrorInfo;
+    use codex_protocol::protocol::CollabCloseBeginEvent;
     use codex_protocol::protocol::CollabWaitReturnWhen as CoreCollabWaitReturnWhen;
     use codex_protocol::protocol::CollabWaitState as CoreCollabWaitState;
     use codex_protocol::protocol::CollabWaitingBeginEvent;
@@ -1888,6 +1889,7 @@ mod tests {
     use codex_protocol::protocol::ExecCommandEndEvent;
     use codex_protocol::protocol::ExecCommandSource;
     use codex_protocol::protocol::ExitedReviewModeEvent;
+    use codex_protocol::protocol::ImageGenerationBeginEvent;
     use codex_protocol::protocol::ItemStartedEvent;
     use codex_protocol::protocol::McpInvocation;
     use codex_protocol::protocol::McpToolCallEndEvent;
@@ -1906,6 +1908,7 @@ mod tests {
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::protocol::WarningEvent;
+    use codex_protocol::protocol::WebSearchBeginEvent;
     use codex_protocol::protocol::WebSearchEndEvent;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
@@ -2311,6 +2314,80 @@ mod tests {
                     },
                 ],
             }
+        );
+    }
+
+    #[test]
+    fn web_and_image_begin_events_stay_non_renderable_until_end_events_arrive() {
+        let mut builder = ThreadHistoryBuilder::new();
+        builder.handle_event(&EventMsg::UserMessage(UserMessageEvent {
+            message: "run tools".into(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+        }));
+        builder.handle_event(&EventMsg::WebSearchBegin(WebSearchBeginEvent {
+            call_id: "search-1".into(),
+        }));
+        builder.handle_event(&EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent {
+            call_id: "image-1".into(),
+        }));
+
+        assert_eq!(
+            builder.active_turn_snapshot().expect("active turn").items,
+            vec![ThreadItem::UserMessage {
+                id: "item-1".into(),
+                content: vec![UserInput::Text {
+                    text: "run tools".into(),
+                    text_elements: Vec::new(),
+                }],
+            }]
+        );
+
+        builder.handle_event(&EventMsg::WebSearchEnd(WebSearchEndEvent {
+            call_id: "search-1".into(),
+            query: "codex".into(),
+            action: CoreWebSearchAction::Search {
+                query: Some("codex".into()),
+                queries: None,
+            },
+        }));
+        builder.handle_event(&EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
+            call_id: "image-1".into(),
+            status: "completed".into(),
+            revised_prompt: Some("final prompt".into()),
+            result: "Zm9v".into(),
+            saved_path: Some(test_path_buf("/tmp/generated.png").abs()),
+        }));
+
+        let turns = builder.finish();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items,
+            vec![
+                ThreadItem::UserMessage {
+                    id: "item-1".into(),
+                    content: vec![UserInput::Text {
+                        text: "run tools".into(),
+                        text_elements: Vec::new(),
+                    }],
+                },
+                ThreadItem::WebSearch {
+                    id: "search-1".into(),
+                    query: "codex".into(),
+                    action: Some(WebSearchAction::Search {
+                        query: Some("codex".into()),
+                        queries: None,
+                    }),
+                },
+                ThreadItem::ImageGeneration {
+                    id: "image-1".into(),
+                    status: "completed".into(),
+                    revised_prompt: Some("final prompt".into()),
+                    result: "Zm9v".into(),
+                    saved_path: Some(test_path_buf("/tmp/generated.png").abs()),
+                },
+            ]
         );
     }
 
@@ -4110,6 +4187,57 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                wait_state: None,
+            }
+        );
+    }
+
+    #[test]
+    fn reconstructs_collab_close_begin_with_receiver_identity() {
+        let sender = ThreadId::try_from("00000000-0000-0000-0000-000000000031")
+            .expect("valid sender thread id");
+        let receiver = ThreadId::try_from("00000000-0000-0000-0000-000000000032")
+            .expect("valid receiver thread id");
+        let events = vec![
+            EventMsg::UserMessage(UserMessageEvent {
+                message: "close".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            }),
+            EventMsg::CollabCloseBegin(CollabCloseBeginEvent {
+                call_id: "close-1".into(),
+                sender_thread_id: sender,
+                receiver_thread_id: receiver,
+                receiver_agent_task_name: Some("audit/replay".into()),
+            }),
+        ];
+
+        let items = events
+            .into_iter()
+            .map(RolloutItem::EventMsg)
+            .collect::<Vec<_>>();
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items[1],
+            ThreadItem::CollabAgentToolCall {
+                id: "close-1".into(),
+                tool: CollabAgentTool::CloseAgent,
+                status: CollabAgentToolCallStatus::InProgress,
+                sender_thread_id: sender.to_string(),
+                receiver_thread_ids: vec![receiver.to_string()],
+                receiver_agents: vec![CollabAgentRef {
+                    thread_id: receiver.to_string(),
+                    agent_nickname: None,
+                    agent_role: None,
+                    task_name: Some("audit/replay".into()),
+                }],
+                prompt: None,
+                profile: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: HashMap::new(),
                 wait_state: None,
             }
         );

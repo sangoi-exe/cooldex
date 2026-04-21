@@ -182,8 +182,13 @@ impl ModelProviderInfo {
         Ok(headers)
     }
 
+    // Merge-safety anchor: provider base-url selection must treat external ChatGPT tokens as the
+    // same ChatGPT backend surface as persisted ChatGPT auth.
     pub fn to_api_provider(&self, auth_mode: Option<AuthMode>) -> CodexResult<ApiProvider> {
-        let default_base_url = if matches!(auth_mode, Some(AuthMode::Chatgpt)) {
+        let default_base_url = if matches!(
+            auth_mode,
+            Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)
+        ) {
             "https://chatgpt.com/backend-api/codex"
         } else {
             "https://api.openai.com/v1"

@@ -1,6 +1,6 @@
 import pino from "pino";
 
-// Merge anchor: explicit truncation markers are part of bridge transcript and
+// Merge-safety anchor: explicit truncation markers are part of bridge transcript and
 // persisted-tool-output semantics; do not silently clip without a marker.
 const DEFAULT_TRUNCATION_SUFFIX = " …[truncated]";
 

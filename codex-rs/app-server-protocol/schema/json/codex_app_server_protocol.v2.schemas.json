@@ -1097,6 +1097,30 @@
             },
             "method": {
               "enum": [
+                "thread/backgroundTerminals/clean"
+              ],
+              "title": "Thread/backgroundTerminals/cleanRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ThreadBackgroundTerminalsCleanParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/backgroundTerminals/cleanRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/rollback"
               ],
               "title": "Thread/rollbackRequestMethod",
@@ -1281,6 +1305,30 @@
             "params"
           ],
           "title": "Marketplace/addRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "marketplace/remove"
+              ],
+              "title": "Marketplace/removeRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/MarketplaceRemoveParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Marketplace/removeRequest",
           "type": "object"
         },
         {
@@ -5090,6 +5138,12 @@
             }
           ]
         },
+        "activeChatgptStoreAccountId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "requiresOpenaiAuth": {
           "type": "boolean"
         }
@@ -6005,7 +6059,7 @@
               "type": "string"
             },
             "chatgptPlanType": {
-              "description": "Optional plan type supplied by the client.\n\nWhen present, this value remains authoritative over JWT-derived plan claims. When `null`, Codex attempts to derive the plan type from the access-token claims. If the effective plan is missing, `unknown`, or unsupported, the login request is rejected.",
+              "description": "Optional plan type supplied by the client.\n\nWhen present, Codex verifies this value against the JWT plan claim and rejects the login if the token is missing that claim or the values disagree. When `null`, Codex attempts to derive the plan type from the access-token claims. If the effective plan is missing, `unknown`, or unsupported, the login request is rejected.",
               "type": [
                 "string",
                 "null"
@@ -6201,6 +6255,42 @@
         "marketplacePath",
         "message"
       ],
+      "type": "object"
+    },
+    "MarketplaceRemoveParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "marketplaceName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "marketplaceName"
+      ],
+      "title": "MarketplaceRemoveParams",
+      "type": "object"
+    },
+    "MarketplaceRemoveResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "installedRoot": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "marketplaceName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "marketplaceName"
+      ],
+      "title": "MarketplaceRemoveResponse",
       "type": "object"
     },
     "McpAuthStatus": {
@@ -11104,6 +11194,24 @@
         "threadId"
       ],
       "title": "ThreadArchivedNotification",
+      "type": "object"
+    },
+    "ThreadBackgroundTerminalsCleanParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "title": "ThreadBackgroundTerminalsCleanParams",
+      "type": "object"
+    },
+    "ThreadBackgroundTerminalsCleanResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "ThreadBackgroundTerminalsCleanResponse",
       "type": "object"
     },
     "ThreadClosedNotification": {

@@ -35,11 +35,11 @@ When using ChatGPT authentication, `auth.json` (or the keyring entry) stores a *
 
 ## Auto-switch on usage limit
 
-<!-- Merge-safety anchor: usage-limit auto-switch behavior must stay aligned with the fresh `/api/codex/usage` refresh and auth-store eviction path in `codex-rs/core/src/codex.rs` and `codex-rs/login/src/auth/manager.rs`. -->
+<!-- Merge-safety anchor: usage-limit auto-switch behavior must stay aligned with the pre-refresh fallback-selection path in `codex-rs/core/src/session/turn.rs` and the auth-store eviction path in `codex-rs/login/src/auth/manager.rs`. -->
 When the backend returns `usage_limit_reached` (HTTP 429) for the active **ChatGPT** account, Codex will:
 
 1) mark the active account as exhausted until its reset time (when available),
-2) refresh stored account usage before fallback selection, evict any saved account whose refresh token fails terminally during that refresh, remove any fallback candidates whose just-fetched usage snapshot reports plan `free` or `unknown`, then switch to another stored ChatGPT account that is not exhausted (and matches `forced_chatgpt_workspace_id` when set), and if no eligible ChatGPT fallback remains leave the current runtime unauthenticated instead of silently switching to another auth mode, and
+2) refresh stored account usage before fallback selection, evict any saved account whose refresh token fails terminally during that refresh, remove any fallback candidates whose just-fetched usage snapshot reports plan `free`, then switch to another stored ChatGPT account that is not exhausted (and matches `forced_chatgpt_workspace_id` when set), and if no eligible ChatGPT fallback remains leave the current runtime unauthenticated instead of silently switching to another auth mode, and
 3) retry the request **in the same turn**.
 
 Codex emits a warning event when this happens.

@@ -136,6 +136,39 @@ fn test_supports_remote_compaction_for_openai() {
     assert!(provider.supports_remote_compaction());
 }
 
+// Merge-safety anchor: external ChatGPT-token auth must keep the ChatGPT backend default in lockstep
+// with the provider owner, not drift back to the API-key/OpenAI base URL.
+#[test]
+fn to_api_provider_uses_chatgpt_default_base_url_for_external_chatgpt_tokens() {
+    let provider = ModelProviderInfo {
+        name: "OpenAI".into(),
+        base_url: None,
+        env_key: None,
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        auth: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: true,
+        supports_websockets: false,
+    };
+
+    let api_provider = provider
+        .to_api_provider(Some(AuthMode::ChatgptAuthTokens))
+        .expect("provider should build");
+
+    assert_eq!(
+        api_provider.base_url,
+        "https://chatgpt.com/backend-api/codex"
+    );
+}
+
 #[test]
 fn test_supports_remote_compaction_for_azure_name() {
     let provider = ModelProviderInfo {

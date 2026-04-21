@@ -5,7 +5,12 @@ use chrono::Utc;
 use codex_api::TransportError;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::AuthManager;
+use codex_login::AuthStore;
 use codex_login::CodexAuth;
+use codex_login::StoredAccount;
+use codex_login::save_auth;
+use codex_login::token_data::IdTokenInfo;
+use codex_login::token_data::TokenData;
 use codex_model_provider_info::WireApi;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_protocol::openai_models::ModelsResponse;
@@ -104,6 +109,34 @@ fn provider_for(base_url: String) -> ModelProviderInfo {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+    }
+}
+
+// Merge-safety anchor: models-manager tests must keep external ChatGPT-token auth on the same
+// catalog-refresh and picker-filter path as persisted ChatGPT auth.
+fn external_chatgpt_tokens_store(store_account_id: &str, workspace_id: &str) -> AuthStore {
+    AuthStore {
+        active_account_id: Some(store_account_id.to_string()),
+        accounts: vec![StoredAccount {
+            id: store_account_id.to_string(),
+            label: Some("External".to_string()),
+            tokens: TokenData {
+                id_token: IdTokenInfo {
+                    email: Some("external@example.com".to_string()),
+                    chatgpt_plan_type: None,
+                    chatgpt_user_id: Some("user-123".to_string()),
+                    chatgpt_account_id: Some(workspace_id.to_string()),
+                    chatgpt_account_is_fedramp: false,
+                    raw_jwt: "test.header.payload".to_string(),
+                },
+                access_token: "external-access-token".to_string(),
+                refresh_token: String::new(),
+                account_id: Some(workspace_id.to_string()),
+            },
+            last_refresh: Some(Utc::now()),
+            usage: None,
+        }],
+        ..AuthStore::default()
     }
 }
 
@@ -732,6 +765,59 @@ async fn refresh_available_models_skips_network_without_chatgpt_auth() {
     );
 }
 
+#[tokio::test]
+async fn refresh_available_models_uses_network_with_external_chatgpt_tokens() {
+    let server = MockServer::start().await;
+    let dynamic_slug = "dynamic-model-only-for-test-external-auth";
+    let models_mock = mount_models_once(
+        &server,
+        ModelsResponse {
+            models: vec![remote_model(
+                dynamic_slug,
+                "External Auth",
+                /*priority*/ 1,
+            )],
+        },
+    )
+    .await;
+
+    let codex_home = tempdir().expect("temp dir");
+    save_auth(
+        codex_home.path(),
+        &external_chatgpt_tokens_store("store-account-1", "workspace-123"),
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("save external ChatGPT token auth store");
+    let auth_manager = Arc::new(AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    ));
+    let provider = provider_for(server.uri());
+    let manager = ModelsManager::with_provider_for_tests(
+        codex_home.path().to_path_buf(),
+        auth_manager,
+        provider,
+    );
+
+    manager
+        .refresh_available_models(RefreshStrategy::Online)
+        .await
+        .expect("external ChatGPT token auth should fetch remote models");
+    let cached_remote = manager.get_remote_models().await;
+    assert!(
+        cached_remote
+            .iter()
+            .any(|candidate| candidate.slug == dynamic_slug),
+        "external ChatGPT token auth should fetch the remote model catalog"
+    );
+    assert_eq!(
+        models_mock.requests().len(),
+        1,
+        "external ChatGPT token auth should hit /models once"
+    );
+}
+
 #[test]
 fn models_request_telemetry_emits_auth_env_feedback_tags_on_failure() {
     let tags = Arc::new(Mutex::new(BTreeMap::new()));
@@ -853,6 +939,43 @@ fn build_available_models_picks_default_after_hiding_hidden_models() {
     let available = manager.build_available_models(vec![hidden_model, visible_model]);
 
     assert_eq!(available, vec![expected_hidden, expected_visible]);
+}
+
+#[test]
+fn build_available_models_keeps_chatgpt_only_models_for_external_chatgpt_tokens() {
+    let codex_home = tempdir().expect("temp dir");
+    save_auth(
+        codex_home.path(),
+        &external_chatgpt_tokens_store("store-account-1", "workspace-123"),
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("save external ChatGPT token auth store");
+    let auth_manager = Arc::new(AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    ));
+    let provider = provider_for("http://example.test".to_string());
+    let manager = ModelsManager::with_provider_for_tests(
+        codex_home.path().to_path_buf(),
+        auth_manager,
+        provider,
+    );
+
+    let chatgpt_only_model = ModelInfo {
+        supported_in_api: false,
+        ..remote_model("chatgpt-only", "ChatGPT Only", /*priority*/ 1)
+    };
+    let api_model = remote_model("api-model", "API Model", /*priority*/ 2);
+
+    let available = manager.build_available_models(vec![chatgpt_only_model.clone(), api_model]);
+
+    assert!(
+        available
+            .iter()
+            .any(|preset| preset.model == chatgpt_only_model.slug),
+        "external ChatGPT token auth should keep ChatGPT-only presets visible"
+    );
 }
 
 #[test]

@@ -31,6 +31,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex_api::ApiError;
 use codex_api::AuthProvider;
 use codex_api::CompactClient as ApiCompactClient;
@@ -88,6 +90,7 @@ use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use http::StatusCode as HttpStatusCode;
 use reqwest::StatusCode;
+use serde::Deserialize;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -189,7 +192,7 @@ impl ApiAuthFingerprint {
             authorization: headers
                 .get(http::header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
-                .map(str::to_string),
+                .map(normalize_authorization_fingerprint),
             account_id: headers
                 .get("ChatGPT-Account-ID")
                 .and_then(|value| value.to_str().ok())
@@ -204,6 +207,30 @@ impl ApiAuthFingerprint {
     fn auth_header_attached(&self) -> bool {
         self.authorization.is_some()
     }
+}
+
+#[derive(Deserialize)]
+struct AgentAssertionFingerprintEnvelope {
+    agent_runtime_id: String,
+    task_id: String,
+}
+
+fn normalize_authorization_fingerprint(authorization: &str) -> String {
+    let Some(assertion) = authorization.strip_prefix("AgentAssertion ") else {
+        return authorization.to_string();
+    };
+
+    let Ok(decoded) = URL_SAFE_NO_PAD.decode(assertion) else {
+        return authorization.to_string();
+    };
+    let Ok(envelope) = serde_json::from_slice::<AgentAssertionFingerprintEnvelope>(&decoded) else {
+        return authorization.to_string();
+    };
+
+    format!(
+        "AgentAssertion {}:{}",
+        envelope.agent_runtime_id, envelope.task_id
+    )
 }
 
 #[derive(Clone, Copy)]

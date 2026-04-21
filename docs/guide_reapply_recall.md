@@ -35,7 +35,7 @@ This document lists the required maintenance touchpoints and validation when `re
 - Malformed rollout JSONL lines are skipped before normal payload construction; in debug mode, successful responses must expose the skipped-line count via `integrity.rollout_parse_errors`.
 - In debug mode, `integrity.status` must be exactly `"ok"` when no malformed lines were skipped and `"degraded"` when at least one malformed line was skipped.
 - If no compaction marker exists after malformed lines are skipped, recall fails loud with `stop_reason = "no_compaction_marker"`.
-- Merge-safety note: keep this recall-first recovery contract aligned with auto-compact warning coverage in `codex-rs/core/tests/suite/compact.rs` and `codex-rs/core/tests/suite/compact_remote.rs`.
+- Merge-safety anchor: keep this recall-first recovery contract aligned with auto-compact warning coverage in `codex-rs/core/tests/suite/compact.rs` and `codex-rs/core/tests/suite/compact_remote.rs`.
 
 ## Required Touchpoints for Contract Changes
 
@@ -44,8 +44,8 @@ When changing recall behavior, update these in the same change:
 - `codex-rs/core/src/tools/handlers/recall.rs`
 - `codex-rs/core/src/tools/spec.rs` when the tool description or output-surface wording changes
 - `codex-rs/core/src/prompt_gc_rollout.rs` when prompt-gc hydratability or rollback-discard boundary rules move
-- `codex-rs/core/src/codex/rollout_reconstruction.rs` when legacy-standard compaction replay/recovery semantics move
-- `codex-rs/core/src/codex.rs`, `codex-rs/core/tests/suite/compact.rs`, and `codex-rs/core/tests/suite/compact_remote.rs` when recall-first warning text or injection changes
+- `codex-rs/core/src/session/rollout_reconstruction.rs` when legacy-standard compaction replay/recovery semantics move
+- `codex-rs/core/src/session/mod.rs`, `codex-rs/core/tests/suite/compact.rs`, and `codex-rs/core/tests/suite/compact_remote.rs` when recall-first warning text or injection changes
 - `docs/recall.md`
 - `docs/guide_reapply_recall.md`
 - `AGENTS.md` when the recall inventory or source-of-truth seams change

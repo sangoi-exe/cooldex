@@ -169,7 +169,7 @@ async fn logout_account_removes_auth_and_notifies() -> Result<()> {
     assert!(codex_home.path().join("auth.json").exists());
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let id = mcp.send_logout_account_request().await?;
     let resp: JSONRPCResponse = timeout(
@@ -236,7 +236,7 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let set_id = mcp
         .send_chatgpt_auth_tokens_login_request(
@@ -285,6 +285,7 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
                 plan_type: AccountPlanType::Pro,
             }),
             requires_openai_auth: true,
+            active_chatgpt_store_account_id: Some("org-embedded".to_string()),
         }
     );
 
@@ -311,7 +312,7 @@ async fn account_read_refresh_token_is_noop_in_external_mode() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let set_id = mcp
         .send_chatgpt_auth_tokens_login_request(
@@ -353,6 +354,7 @@ async fn account_read_refresh_token_is_noop_in_external_mode() -> Result<()> {
                 plan_type: AccountPlanType::Pro,
             }),
             requires_openai_auth: true,
+            active_chatgpt_store_account_id: Some("org-embedded".to_string()),
         }
     );
 
@@ -437,7 +439,7 @@ async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let set_id = mcp
         .send_chatgpt_auth_tokens_login_request(
@@ -543,7 +545,7 @@ async fn external_auth_refresh_error_fails_turn() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let set_id = mcp
         .send_chatgpt_auth_tokens_login_request(
@@ -665,7 +667,7 @@ async fn external_auth_refresh_mismatched_workspace_fails_turn() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let set_id = mcp
         .send_chatgpt_auth_tokens_login_request(
@@ -780,7 +782,7 @@ async fn external_auth_refresh_invalid_access_token_fails_turn() -> Result<()> {
     )?;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let set_id = mcp
         .send_chatgpt_auth_tokens_login_request(
@@ -872,7 +874,7 @@ async fn login_account_api_key_succeeds_and_notifies() -> Result<()> {
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     let req_id = mcp
         .send_login_account_api_key_request("sk-test-key")
@@ -1345,7 +1347,7 @@ async fn set_auth_token_cancels_active_chatgpt_login() -> Result<()> {
     create_config_toml(codex_home.path(), CreateConfigTomlParams::default())?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize_experimental()).await??;
 
     // Initiate the ChatGPT login flow
     let request_id = mcp.send_login_account_chatgpt_request().await?;
@@ -1510,6 +1512,7 @@ async fn get_account_with_api_key() -> Result<()> {
     let expected = GetAccountResponse {
         account: Some(Account::ApiKey {}),
         requires_openai_auth: true,
+        active_chatgpt_store_account_id: None,
     };
     assert_eq!(received, expected);
     Ok(())
@@ -1544,6 +1547,7 @@ async fn get_account_when_auth_not_required() -> Result<()> {
     let expected = GetAccountResponse {
         account: None,
         requires_openai_auth: false,
+        active_chatgpt_store_account_id: None,
     };
     assert_eq!(received, expected);
     Ok(())
@@ -1563,7 +1567,9 @@ async fn get_account_with_chatgpt() -> Result<()> {
         codex_home.path(),
         ChatGptAuthFixture::new("access-chatgpt")
             .email("user@example.com")
-            .plan_type("pro"),
+            .plan_type("pro")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123"),
         AuthCredentialsStoreMode::File,
     )?;
 
@@ -1589,6 +1595,9 @@ async fn get_account_with_chatgpt() -> Result<()> {
             plan_type: AccountPlanType::Pro,
         }),
         requires_openai_auth: true,
+        active_chatgpt_store_account_id: Some(
+            "chatgpt-user:user-123:workspace:account-123".to_string(),
+        ),
     };
     assert_eq!(received, expected);
     Ok(())
@@ -1606,7 +1615,9 @@ async fn get_account_with_chatgpt_missing_plan_claim_returns_unknown() -> Result
     )?;
     write_chatgpt_auth(
         codex_home.path(),
-        ChatGptAuthFixture::new("access-chatgpt").email("user@example.com"),
+        ChatGptAuthFixture::new("access-chatgpt")
+            .email("user@example.com")
+            .chatgpt_user_id("user-123"),
         AuthCredentialsStoreMode::File,
     )?;
 
@@ -1632,6 +1643,7 @@ async fn get_account_with_chatgpt_missing_plan_claim_returns_unknown() -> Result
             plan_type: AccountPlanType::Unknown,
         }),
         requires_openai_auth: true,
+        active_chatgpt_store_account_id: Some("chatgpt-user:user-123".to_string()),
     };
     assert_eq!(received, expected);
     Ok(())

@@ -7,6 +7,8 @@ use tracing::info;
 use tracing::warn;
 
 impl Session {
+    // Merge-safety anchor: persisted/restored agent-task state and the auth-bound agent assertion
+    // path must stay one owner so resume, prewarm, and live task reuse cannot drift apart.
     pub(super) async fn maybe_prewarm_agent_task_registration(&self) {
         // Startup task registration is best-effort: regular turns already retry on demand, and
         // a prewarm failure should not shut down the session or block unrelated work.

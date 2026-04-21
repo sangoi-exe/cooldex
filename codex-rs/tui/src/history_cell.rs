@@ -2109,7 +2109,7 @@ pub(crate) fn new_mcp_tools_output(
     servers.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     for (server, cfg) in servers {
-        let prefix = qualified_mcp_tool_name_prefix(&server);
+        let prefix = qualified_mcp_tool_name_prefix(server);
         let mut names: Vec<String> = tools
             .keys()
             .filter(|k| k.starts_with(&prefix))

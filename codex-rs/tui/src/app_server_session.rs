@@ -136,6 +136,7 @@ pub(crate) struct AppServerBootstrap {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AppServerAccountProjection {
+    pub(crate) active_store_account_id: Option<String>,
     pub(crate) account_email: Option<String>,
     pub(crate) auth_mode: Option<TelemetryAuthMode>,
     pub(crate) status_account_display: Option<StatusAccountDisplay>,
@@ -918,6 +919,7 @@ fn build_account_projection(
         None => (None, None, None, None, FeedbackAudience::External, false),
     };
     Ok(AppServerAccountProjection {
+        active_store_account_id: account.active_chatgpt_store_account_id,
         account_email,
         auth_mode,
         status_account_display,
@@ -2129,11 +2131,16 @@ mod tests {
                     plan_type: codex_protocol::account::PlanType::Pro,
                 }),
                 requires_openai_auth: true,
+                active_chatgpt_store_account_id: Some("store-alice".to_string()),
             },
             crate::legacy_core::test_support::all_model_presets().clone(),
         )
         .expect("projection should build");
 
+        assert_eq!(
+            projection.active_store_account_id,
+            Some("store-alice".to_string())
+        );
         assert_eq!(
             projection.account_email,
             Some("alice@openai.com".to_string())
@@ -2171,6 +2178,7 @@ mod tests {
             GetAccountResponse {
                 account: Some(Account::ApiKey {}),
                 requires_openai_auth: false,
+                active_chatgpt_store_account_id: None,
             },
             Vec::new(),
         )

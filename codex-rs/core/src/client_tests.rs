@@ -1,3 +1,4 @@
+use super::ApiAuthFingerprint;
 use super::AuthRequestTelemetryContext;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
@@ -7,7 +8,10 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex_app_server_protocol::AuthMode;
+use codex_model_provider::AuthorizationHeaderAuthProvider;
 use codex_model_provider::BearerAuthProvider;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
@@ -77,6 +81,19 @@ fn test_session_telemetry() -> SessionTelemetry {
         "test-terminal".to_string(),
         SessionSource::Cli,
     )
+}
+
+// Merge-safety anchor: agent-task websocket reuse must stay keyed to the stable task binding rather
+// than volatile per-request assertion bytes, and these tests guard that local contract.
+fn agent_assertion_header(agent_runtime_id: &str, task_id: &str, timestamp: &str) -> String {
+    let envelope = json!({
+        "agent_runtime_id": agent_runtime_id,
+        "signature": format!("sig-{timestamp}"),
+        "task_id": task_id,
+        "timestamp": timestamp,
+    });
+    let payload = serde_json::to_vec(&envelope).expect("agent assertion envelope should serialize");
+    format!("AgentAssertion {}", URL_SAFE_NO_PAD.encode(payload))
 }
 
 #[test]
@@ -168,4 +185,30 @@ fn auth_request_telemetry_context_tracks_attached_auth_and_retry_phase() {
     assert!(auth_context.retry_after_unauthorized);
     assert_eq!(auth_context.recovery_mode, Some("managed"));
     assert_eq!(auth_context.recovery_phase, Some("refresh_token"));
+}
+
+#[test]
+fn api_auth_fingerprint_normalizes_agent_assertion_timestamp_and_signature() {
+    let first_header = agent_assertion_header("runtime-1", "task-1", "2026-04-20T01:02:03Z");
+    let second_header = agent_assertion_header("runtime-1", "task-1", "2026-04-20T01:02:04Z");
+    let first_auth = AuthorizationHeaderAuthProvider::for_test(Some(&first_header), None);
+    let second_auth = AuthorizationHeaderAuthProvider::for_test(Some(&second_header), None);
+
+    assert_eq!(
+        ApiAuthFingerprint::from_auth_provider(&first_auth),
+        ApiAuthFingerprint::from_auth_provider(&second_auth)
+    );
+}
+
+#[test]
+fn api_auth_fingerprint_distinguishes_different_agent_tasks() {
+    let first_header = agent_assertion_header("runtime-1", "task-1", "2026-04-20T01:02:03Z");
+    let second_header = agent_assertion_header("runtime-1", "task-2", "2026-04-20T01:02:04Z");
+    let first_auth = AuthorizationHeaderAuthProvider::for_test(Some(&first_header), None);
+    let second_auth = AuthorizationHeaderAuthProvider::for_test(Some(&second_header), None);
+
+    assert_ne!(
+        ApiAuthFingerprint::from_auth_provider(&first_auth),
+        ApiAuthFingerprint::from_auth_provider(&second_auth)
+    );
 }

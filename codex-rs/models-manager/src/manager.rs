@@ -391,6 +391,8 @@ impl ModelsManager {
     }
 
     /// Refresh available models according to the specified strategy.
+    // Merge-safety anchor: external ChatGPT-token sessions must share the same ChatGPT-gated model
+    // catalog refresh surface as persisted ChatGPT auth.
     async fn refresh_available_models(&self, refresh_strategy: RefreshStrategy) -> CoreResult<()> {
         // don't override the custom model catalog if one was provided by the user
         if matches!(self.catalog_mode, CatalogMode::Custom) {
@@ -401,7 +403,11 @@ impl ModelsManager {
             .provider
             .auth_manager()
             .and_then(|auth_manager| auth_manager.auth_mode());
-        if auth_mode != Some(AuthMode::Chatgpt) && !self.provider.info().has_command_auth() {
+        if !matches!(
+            auth_mode,
+            Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)
+        ) && !self.provider.info().has_command_auth()
+        {
             if matches!(
                 refresh_strategy,
                 RefreshStrategy::Offline | RefreshStrategy::OnlineIfUncached
@@ -530,7 +536,12 @@ impl ModelsManager {
             .provider
             .auth_manager()
             .and_then(|auth_manager| auth_manager.auth_mode());
-        let chatgpt_mode = matches!(auth_mode, Some(AuthMode::Chatgpt));
+        // Merge-safety anchor: picker visibility must not diverge between persistent ChatGPT auth
+        // and the local external-token ChatGPT surface.
+        let chatgpt_mode = matches!(
+            auth_mode,
+            Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)
+        );
         presets = ModelPreset::filter_by_auth(presets, chatgpt_mode);
 
         ModelPreset::mark_default_by_picker_visibility(&mut presets);

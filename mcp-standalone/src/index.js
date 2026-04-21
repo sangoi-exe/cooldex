@@ -48,7 +48,7 @@ async function main() {
 
   const app = createApp({ config, logger, bridgeRuntime });
   server = app.listen(config.port, () => {
-    // Merge anchor: startup log fields must stay aligned with `/healthz` and
+    // Merge-safety anchor: startup log fields must stay aligned with `/healthz` and
     // config defaults so operator diagnostics stay consistent.
     logger.info(
       {

@@ -2,10 +2,12 @@ use super::*;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 
+// Merge-safety anchor: image-generation tool exposure must follow the same ChatGPT-capable auth
+// surface as the local external-token runtime, not only the persistent ChatGPT account mode.
 pub(super) fn image_generation_tool_auth_allowed(auth_manager: Option<&AuthManager>) -> bool {
     matches!(
         auth_manager.and_then(AuthManager::auth_mode),
-        Some(AuthMode::Chatgpt)
+        Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)
     )
 }
 

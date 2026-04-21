@@ -5,9 +5,11 @@ import type { AbsolutePathBuf } from "../AbsolutePathBuf";
 import type { MessagePhase } from "../MessagePhase";
 import type { ReasoningEffort } from "../ReasoningEffort";
 import type { JsonValue } from "../serde_json/JsonValue";
+import type { CollabAgentRef } from "./CollabAgentRef";
 import type { CollabAgentState } from "./CollabAgentState";
 import type { CollabAgentTool } from "./CollabAgentTool";
 import type { CollabAgentToolCallStatus } from "./CollabAgentToolCallStatus";
+import type { CollabWaitState } from "./CollabWaitState";
 import type { CommandAction } from "./CommandAction";
 import type { CommandExecutionSource } from "./CommandExecutionSource";
 import type { CommandExecutionStatus } from "./CommandExecutionStatus";
@@ -23,7 +25,7 @@ import type { PatchApplyStatus } from "./PatchApplyStatus";
 import type { UserInput } from "./UserInput";
 import type { WebSearchAction } from "./WebSearchAction";
 
-export type ThreadItem = { "type": "userMessage", id: string, content: Array<UserInput>, } | { "type": "hookPrompt", id: string, fragments: Array<HookPromptFragment>, } | { "type": "agentMessage", id: string, text: string, phase: MessagePhase | null, memoryCitation: MemoryCitation | null, } | { "type": "plan", id: string, text: string, } | { "type": "reasoning", id: string, summary: Array<string>, content: Array<string>, } | { "type": "commandExecution", id: string,
+export type ThreadItem = { "type": "userMessage", id: string, content: Array<UserInput>, } | { "type": "hookPrompt", id: string, fragments: Array<HookPromptFragment>, } | { "type": "agentMessage", id: string, text: string, phase: MessagePhase | null, memoryCitation: MemoryCitation | null, } | { "type": "warning", id: string, message: string, } | { "type": "plan", id: string, text: string, } | { "type": "reasoning", id: string, summary: Array<string>, content: Array<string>, } | { "type": "commandExecution", id: string,
 /**
  * The command to be executed.
  */
@@ -84,18 +86,31 @@ senderThreadId: string,
  */
 receiverThreadIds: Array<string>,
 /**
+ * Optional nickname/role metadata for the receiving agents when available on the
+ * originating core event.
+ */
+receiverAgents: Array<CollabAgentRef>,
+/**
  * Prompt text sent as part of the collab tool call, when available.
  */
 prompt: string | null,
 /**
- * Model requested for the spawned agent, when applicable.
+ * Optional config profile selected for the spawned agent, when applicable.
+ */
+profile: string | null,
+/**
+ * Effective model used by the spawned agent, when applicable.
  */
 model: string | null,
 /**
- * Reasoning effort requested for the spawned agent, when applicable.
+ * Effective reasoning effort used by the spawned agent, when applicable.
  */
 reasoningEffort: ReasoningEffort | null,
 /**
  * Last known status of the target agents, when available.
  */
-agentsStates: { [key in string]?: CollabAgentState }, } | { "type": "webSearch", id: string, query: string, action: WebSearchAction | null, } | { "type": "imageView", id: string, path: AbsolutePathBuf, } | { "type": "imageGeneration", id: string, status: string, revisedPrompt: string | null, result: string, savedPath?: AbsolutePathBuf, } | { "type": "enteredReviewMode", id: string, review: string, } | { "type": "exitedReviewMode", id: string, review: string, } | { "type": "contextCompaction", id: string, };
+agentsStates: { [key in string]?: CollabAgentState },
+/**
+ * Null when the collab tool call is not `wait`.
+ */
+waitState: CollabWaitState | null, } | { "type": "webSearch", id: string, query: string, action: WebSearchAction | null, } | { "type": "imageView", id: string, path: AbsolutePathBuf, } | { "type": "imageGeneration", id: string, status: string, revisedPrompt: string | null, result: string, savedPath?: AbsolutePathBuf, } | { "type": "enteredReviewMode", id: string, review: string, } | { "type": "exitedReviewMode", id: string, review: string, } | { "type": "contextCompaction", id: string, };

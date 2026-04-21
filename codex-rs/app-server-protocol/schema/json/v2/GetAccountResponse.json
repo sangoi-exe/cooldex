@@ -80,6 +80,12 @@
         }
       ]
     },
+    "activeChatgptStoreAccountId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "requiresOpenaiAuth": {
       "type": "boolean"
     }

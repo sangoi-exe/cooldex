@@ -16,9 +16,10 @@ chatgptAccountId: string,
 /**
  * Optional plan type supplied by the client.
  *
- * When present, this value remains authoritative over JWT-derived plan
- * claims. When `null`, Codex attempts to derive the plan type from the
- * access-token claims. If the effective plan is missing, `unknown`, or
- * unsupported, the login request is rejected.
+ * When present, Codex verifies this value against the JWT plan claim
+ * and rejects the login if the token is missing that claim or the
+ * values disagree. When `null`, Codex attempts to derive the plan type
+ * from the access-token claims. If the effective plan is missing,
+ * `unknown`, or unsupported, the login request is rejected.
  */
 chatgptPlanType?: string | null, };

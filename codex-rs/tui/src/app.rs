@@ -2229,7 +2229,10 @@ impl App {
 
         // Merge-safety anchor: `/accounts` UX depends on this refresh gate to avoid stale account
         // usage data before `chat_widget.open_accounts_popup()`.
-        if self.auth_manager.get_auth_mode() != Some(AuthMode::Chatgpt) {
+        if !matches!(
+            self.auth_manager.get_auth_mode(),
+            Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)
+        ) {
             self.pending_forced_accounts_status_refresh = false;
             self.accounts_status_cache_expires_at = None;
             if self.open_accounts_popup_when_cache_ready {
@@ -2568,16 +2571,70 @@ impl App {
         previous_account_id: Option<&str>,
     ) -> std::result::Result<ChatgptAuthTokensRefreshResponse, ThreadlessChatgptAuthRefreshError>
     {
+        let previous_active_store_account_id = self.active_store_account_id_from_auth_manager();
         self.select_local_chatgpt_account_for_threadless_refresh(previous_account_id)
             .map_err(ThreadlessChatgptAuthRefreshError::Other)?;
         let refresh_result = self.auth_manager.refresh_token().await;
+        self.finish_threadless_chatgpt_auth_refresh_response(
+            refresh_result,
+            previous_active_store_account_id.as_deref(),
+        )
+    }
+
+    fn restore_local_chatgpt_account_after_threadless_refresh_failure(
+        &mut self,
+        previous_active_store_account_id: Option<&str>,
+    ) -> std::result::Result<(), String> {
+        let Some(previous_active_store_account_id) = previous_active_store_account_id else {
+            return Ok(());
+        };
+        if self.active_store_account_id_from_auth_manager().as_deref()
+            == Some(previous_active_store_account_id)
+        {
+            return Ok(());
+        }
+        self.auth_manager
+            .set_active_account(previous_active_store_account_id)
+            .map_err(|err| {
+                format!(
+                    "failed to restore previously active local ChatGPT account {previous_active_store_account_id:?}: {err}"
+                )
+            })?;
+        self.maybe_reconcile_active_account_from_auth_manager();
+        Ok(())
+    }
+
+    fn finish_threadless_chatgpt_auth_refresh_response(
+        &mut self,
+        refresh_result: std::result::Result<(), RefreshTokenError>,
+        previous_active_store_account_id: Option<&str>,
+    ) -> std::result::Result<ChatgptAuthTokensRefreshResponse, ThreadlessChatgptAuthRefreshError>
+    {
         self.maybe_reconcile_active_account_from_auth_manager();
         match refresh_result {
             Ok(()) => {}
             Err(RefreshTokenError::Permanent(error)) => {
+                if let Err(restore_err) = self
+                    .restore_local_chatgpt_account_after_threadless_refresh_failure(
+                        previous_active_store_account_id,
+                    )
+                {
+                    return Err(ThreadlessChatgptAuthRefreshError::Other(format!(
+                        "failed to refresh local ChatGPT auth: {error}; {restore_err}"
+                    )));
+                }
                 return Err(ThreadlessChatgptAuthRefreshError::RefreshFailed(error));
             }
             Err(err) => {
+                if let Err(restore_err) = self
+                    .restore_local_chatgpt_account_after_threadless_refresh_failure(
+                        previous_active_store_account_id,
+                    )
+                {
+                    return Err(ThreadlessChatgptAuthRefreshError::Other(format!(
+                        "failed to refresh local ChatGPT auth: {err}; {restore_err}"
+                    )));
+                }
                 return Err(ThreadlessChatgptAuthRefreshError::Other(format!(
                     "failed to refresh local ChatGPT auth: {err}"
                 )));
@@ -2927,10 +2984,12 @@ impl App {
         visible_followers: &VisibleAccountProjectionFollowers,
         projection: &AppServerAccountProjection,
     ) -> bool {
-        !status_account_displays_match(
-            visible_followers.status_account_display.as_ref(),
-            projection.status_account_display.as_ref(),
-        ) || visible_followers.plan_type != projection.plan_type
+        visible_followers.active_store_account_id != projection.active_store_account_id
+            || !status_account_displays_match(
+                visible_followers.status_account_display.as_ref(),
+                projection.status_account_display.as_ref(),
+            )
+            || visible_followers.plan_type != projection.plan_type
             || visible_followers.has_chatgpt_account != projection.has_chatgpt_account
             || visible_followers.feedback_audience != projection.feedback_audience
             || visible_followers.default_model != projection.default_model
@@ -2943,10 +3002,18 @@ impl App {
         projection: &AppServerAccountProjection,
         expectation: AccountProjectionRefreshExpectation,
     ) -> bool {
+        let active_store_account_changed = expectation
+            == AccountProjectionRefreshExpectation::RequireChangeFromBaseline
+            && stale_projection_baseline.active_store_account_id
+                != expected_projection_followers.active_store_account_id;
+        if active_store_account_changed
+            && projection.active_store_account_id
+                != expected_projection_followers.active_store_account_id
+        {
+            return false;
+        }
         Self::app_server_projection_changes_followers_from(stale_projection_baseline, projection)
-            || (expectation == AccountProjectionRefreshExpectation::RequireChangeFromBaseline
-                && stale_projection_baseline.active_store_account_id
-                    != expected_projection_followers.active_store_account_id
+            || (active_store_account_changed
                 && !Self::app_server_projection_changes_followers_from(
                     expected_projection_followers,
                     projection,
@@ -10104,6 +10171,9 @@ mod tests {
             ..expected_projection_followers.clone()
         };
         let projection = AppServerAccountProjection {
+            active_store_account_id: expected_projection_followers
+                .active_store_account_id
+                .clone(),
             account_email: match expected_projection_followers
                 .status_account_display
                 .as_ref()
@@ -10162,6 +10232,53 @@ mod tests {
                 plan: None,
             }) if label == "Secondary" && email == "secondary@example.com"
         ));
+    }
+
+    #[test]
+    fn app_server_projection_rejects_stale_old_account_even_when_other_followers_changed() {
+        let stale_projection_baseline = VisibleAccountProjectionFollowers {
+            active_store_account_id: Some("store-account-a".to_string()),
+            status_account_display: Some(StatusAccountDisplay::ChatGpt {
+                label: Some("Primary".to_string()),
+                email: Some("primary@example.com".to_string()),
+                plan: Some("Pro".to_string()),
+            }),
+            plan_type: Some(PlanType::Pro),
+            has_chatgpt_account: true,
+            feedback_audience: FeedbackAudience::External,
+            default_model: "gpt-5".to_string(),
+            available_models: all_model_presets(),
+        };
+        let expected_projection_followers = VisibleAccountProjectionFollowers {
+            active_store_account_id: Some("store-account-b".to_string()),
+            status_account_display: Some(StatusAccountDisplay::ChatGpt {
+                label: Some("Secondary".to_string()),
+                email: Some("secondary@example.com".to_string()),
+                plan: Some("Pro".to_string()),
+            }),
+            ..stale_projection_baseline.clone()
+        };
+        let stale_projection = AppServerAccountProjection {
+            active_store_account_id: Some("store-account-a".to_string()),
+            account_email: Some("primary@example.com".to_string()),
+            auth_mode: Some(codex_otel::TelemetryAuthMode::Chatgpt),
+            status_account_display: stale_projection_baseline.status_account_display.clone(),
+            plan_type: stale_projection_baseline.plan_type,
+            requires_openai_auth: true,
+            default_model: "gpt-5.1".to_string(),
+            feedback_audience: FeedbackAudience::OpenAiEmployee,
+            has_chatgpt_account: true,
+            available_models: expected_projection_followers.available_models.clone(),
+        };
+
+        assert!(
+            !App::app_server_projection_is_acceptable_after_local_auth_change(
+                &stale_projection_baseline,
+                &expected_projection_followers,
+                &stale_projection,
+                AccountProjectionRefreshExpectation::RequireChangeFromBaseline,
+            )
+        );
     }
 
     #[tokio::test]
@@ -10302,6 +10419,7 @@ mod tests {
         let default_model = available_models[0].model.clone();
         let attempts = Arc::new(Mutex::new(VecDeque::from(vec![Ok(
             AppServerAccountProjection {
+                active_store_account_id: None,
                 account_email: None,
                 auth_mode: None,
                 status_account_display: None,
@@ -10485,6 +10603,7 @@ mod tests {
             async move {
                 projection_polled.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(AppServerAccountProjection {
+                    active_store_account_id: None,
                     account_email: None,
                     auth_mode: None,
                     status_account_display: None,
@@ -11154,6 +11273,47 @@ mod tests {
             app.auth_manager
                 .active_chatgpt_account_summary()
                 .map(|summary| summary.store_account_id),
+            Some(secondary_store_account_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_threadless_chatgpt_auth_refresh_response_restores_previous_active_account_on_refresh_failure()
+     {
+        let mut app = make_test_app().await;
+        let (_primary_store_account_id, secondary_store_account_id) =
+            seed_canonical_chatgpt_accounts(&mut app, "account-b");
+
+        app.select_local_chatgpt_account_for_threadless_refresh(Some("account-a"))
+            .expect("requested workspace should select the matching saved account");
+        assert_eq!(
+            app.auth_manager
+                .active_chatgpt_account_summary()
+                .map(|summary| summary.store_account_id),
+            Some(canonical_chatgpt_store_account_id("account-a"))
+        );
+
+        let err = app
+            .finish_threadless_chatgpt_auth_refresh_response(
+                Err(RefreshTokenError::Transient(std::io::Error::other(
+                    "refresh transport failure",
+                ))),
+                Some(secondary_store_account_id.as_str()),
+            )
+            .expect_err("refresh failure should surface");
+
+        assert_eq!(
+            err.to_string(),
+            "failed to refresh local ChatGPT auth: refresh transport failure"
+        );
+        assert_eq!(
+            app.auth_manager
+                .active_chatgpt_account_summary()
+                .map(|summary| summary.store_account_id),
+            Some(secondary_store_account_id.clone())
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
             Some(secondary_store_account_id)
         );
     }
@@ -16208,6 +16368,7 @@ guardian_approval = true
         default_model: String,
     ) -> AppServerAccountProjection {
         AppServerAccountProjection {
+            active_store_account_id: None,
             account_email: Some(email.to_string()),
             auth_mode: Some(codex_otel::TelemetryAuthMode::Chatgpt),
             status_account_display: Some(StatusAccountDisplay::ChatGpt {

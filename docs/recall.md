@@ -21,7 +21,7 @@
 - If no lower boundary marker exists, scan starts at rollout index `0`.
 - If rollout parsing encounters malformed JSONL lines, `recall` skips those lines and continues from the remaining valid rollout items.
 - If no upper boundary marker exists after malformed lines are skipped, the tool fails with `stop_reason = "no_compaction_marker"`.
-- Merge-safety note: this boundary behavior must stay aligned with `codex-rs/core/src/tools/handlers/recall.rs` and compaction paths that persist `replacement_history`.
+- Merge-safety anchor: this boundary behavior must stay aligned with `codex-rs/core/src/tools/handlers/recall.rs` and compaction paths that persist `replacement_history`.
 
 ### Filtering and Size Budget
 

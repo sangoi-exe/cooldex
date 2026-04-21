@@ -6,7 +6,7 @@ import Database from "better-sqlite3";
 
 import { resolveBridgeStateDbPath } from "../config.js";
 
-// Merge anchor: these aliases define the persisted session shape consumed by
+// Merge-safety anchor: these aliases define the persisted session shape consumed by
 // runtime/session APIs; keep names aligned with runtime + README contracts.
 const SESSION_SELECT_COLUMNS = [
   "session_id AS sessionId",
@@ -707,7 +707,7 @@ export function createBridgeStore(options = {}) {
       throw new Error(`Cannot update unknown sessionId ${session.sessionId}.`);
     }
 
-    // Merge anchor: this allowlist is the fail-loud contract for mutable session
+    // Merge-safety anchor: this allowlist is the fail-loud contract for mutable session
     // fields across runtime handlers and persisted storage.
     const supportedUpdateFields = new Set([
       "title",

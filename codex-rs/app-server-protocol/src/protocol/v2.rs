@@ -1700,10 +1700,11 @@ pub enum LoginAccountParams {
         chatgpt_account_id: String,
         /// Optional plan type supplied by the client.
         ///
-        /// When present, this value remains authoritative over JWT-derived plan
-        /// claims. When `null`, Codex attempts to derive the plan type from the
-        /// access-token claims. If the effective plan is missing, `unknown`, or
-        /// unsupported, the login request is rejected.
+        /// When present, Codex verifies this value against the JWT plan claim
+        /// and rejects the login if the token is missing that claim or the
+        /// values disagree. When `null`, Codex attempts to derive the plan type
+        /// from the access-token claims. If the effective plan is missing,
+        /// `unknown`, or unsupported, the login request is rejected.
         #[ts(optional = nullable)]
         chatgpt_plan_type: Option<String>,
     },
@@ -1863,6 +1864,9 @@ pub struct GetAccountParams {
 pub struct GetAccountResponse {
     pub account: Option<Account>,
     pub requires_openai_auth: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub active_chatgpt_store_account_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]

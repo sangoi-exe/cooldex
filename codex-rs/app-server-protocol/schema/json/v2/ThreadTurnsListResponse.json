@@ -160,8 +160,90 @@
         }
       ]
     },
+    "CollabAgentActivity": {
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/CollabAgentActivityKind"
+        },
+        "occurredAt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "occurredAt",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "CollabAgentActivityKind": {
+      "enum": [
+        "message",
+        "reasoning",
+        "command",
+        "edit",
+        "task",
+        "status"
+      ],
+      "type": "string"
+    },
+    "CollabAgentRef": {
+      "properties": {
+        "agentNickname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
     "CollabAgentState": {
       "properties": {
+        "agentNickname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agentRole": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lastActivity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CollabAgentActivity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "message": {
           "type": [
             "string",
@@ -170,6 +252,12 @@
         },
         "status": {
           "$ref": "#/definitions/CollabAgentStatus"
+        },
+        "taskName": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -193,6 +281,8 @@
       "enum": [
         "spawnAgent",
         "sendInput",
+        "sendMessage",
+        "followupTask",
         "resumeAgent",
         "wait",
         "closeAgent"
@@ -206,6 +296,40 @@
         "failed"
       ],
       "type": "string"
+    },
+    "CollabWaitReturnWhen": {
+      "enum": [
+        "anyFinal",
+        "allFinal"
+      ],
+      "type": "string"
+    },
+    "CollabWaitState": {
+      "properties": {
+        "conditionEnabled": {
+          "type": "boolean"
+        },
+        "disableTimeout": {
+          "type": "boolean"
+        },
+        "returnWhen": {
+          "$ref": "#/definitions/CollabWaitReturnWhen"
+        },
+        "timedOut": {
+          "description": "Null until the wait call finishes.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "conditionEnabled",
+        "disableTimeout",
+        "returnWhen",
+        "timedOut"
+      ],
+      "type": "object"
     },
     "CommandAction": {
       "oneOf": [
@@ -524,7 +648,8 @@
     "NonSteerableTurnKind": {
       "enum": [
         "review",
-        "compact"
+        "compact",
+        "sanitize"
       ],
       "type": "string"
     },
@@ -730,6 +855,30 @@
             "type"
           ],
           "title": "AgentMessageThreadItem",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "warning"
+              ],
+              "title": "WarningThreadItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "message",
+            "type"
+          ],
+          "title": "WarningThreadItem",
           "type": "object"
         },
         {
@@ -1041,7 +1190,14 @@
               "type": "string"
             },
             "model": {
-              "description": "Model requested for the spawned agent, when applicable.",
+              "description": "Effective model used by the spawned agent, when applicable.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "profile": {
+              "description": "Optional config profile selected for the spawned agent, when applicable.",
               "type": [
                 "string",
                 "null"
@@ -1063,7 +1219,14 @@
                   "type": "null"
                 }
               ],
-              "description": "Reasoning effort requested for the spawned agent, when applicable."
+              "description": "Effective reasoning effort used by the spawned agent, when applicable."
+            },
+            "receiverAgents": {
+              "description": "Optional nickname/role metadata for the receiving agents when available on the originating core event.",
+              "items": {
+                "$ref": "#/definitions/CollabAgentRef"
+              },
+              "type": "array"
             },
             "receiverThreadIds": {
               "description": "Thread ID of the receiving agent, when applicable. In case of spawn operation, this corresponds to the newly spawned agent.",
@@ -1098,16 +1261,29 @@
               ],
               "title": "CollabAgentToolCallThreadItemType",
               "type": "string"
+            },
+            "waitState": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/CollabWaitState"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Null when the collab tool call is not `wait`."
             }
           },
           "required": [
             "agentsStates",
             "id",
+            "receiverAgents",
             "receiverThreadIds",
             "senderThreadId",
             "status",
             "tool",
-            "type"
+            "type",
+            "waitState"
           ],
           "title": "CollabAgentToolCallThreadItem",
           "type": "object"

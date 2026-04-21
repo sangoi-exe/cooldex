@@ -25,7 +25,7 @@ Hard constraints:
   - `chunk_id`
   - `tool_context`
   - `reasoning_context`
-- Merge-safety note: these contract rules are fail-loud in `codex-rs/core/src/tools/handlers/manage_context.rs`; keep prompt and handler behavior aligned.
+- Merge-safety anchor: these contract rules are fail-loud in `codex-rs/core/src/tools/handlers/manage_context.rs`; keep prompt and handler behavior aligned.
 - See `~/.codex/manage_context.md` for the full contract.
 
 Runtime policy:

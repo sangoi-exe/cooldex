@@ -240,6 +240,32 @@ fn chatgpt_auth_store_for_manager_logout(
     }
 }
 
+fn external_chatgpt_auth_store(store_account_id: &str, workspace_id: &str) -> AuthStore {
+    AuthStore {
+        active_account_id: Some(store_account_id.to_string()),
+        accounts: vec![StoredAccount {
+            id: store_account_id.to_string(),
+            label: Some("External".to_string()),
+            tokens: TokenData {
+                id_token: IdTokenInfo {
+                    email: Some("external@example.com".to_string()),
+                    chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                    chatgpt_user_id: Some("user-12345".to_string()),
+                    chatgpt_account_id: Some(workspace_id.to_string()),
+                    chatgpt_account_is_fedramp: false,
+                    raw_jwt: "external.header.payload".to_string(),
+                },
+                access_token: "external-access-token".to_string(),
+                refresh_token: "external-refresh-token".to_string(),
+                account_id: Some(workspace_id.to_string()),
+            },
+            last_refresh: None,
+            usage: None,
+        }],
+        ..AuthStore::default()
+    }
+}
+
 #[test]
 fn auth_manager_logout_releases_runtime_active_account_lease() {
     let dir = tempdir().unwrap();
@@ -359,6 +385,159 @@ fn chatgpt_auth_persists_agent_identity_for_workspace() {
     assert_eq!(auth.get_agent_identity("account-123"), Some(record.clone()));
     assert_eq!(auth.get_agent_identity("other-account"), None);
     let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let persisted = storage
+        .load()
+        .expect("load auth")
+        .expect("auth should exist");
+    assert_eq!(persisted.agent_identity, Some(record));
+
+    assert!(auth.remove_agent_identity().expect("remove agent identity"));
+    assert_eq!(auth.get_agent_identity("account-123"), None);
+}
+
+#[test]
+fn external_chatgpt_token_auth_loads_from_ephemeral_store() {
+    let codex_home = tempdir().unwrap();
+    save_auth(
+        codex_home.path(),
+        &external_chatgpt_auth_store("store-account-1", "account-123"),
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("save external ChatGPT token auth store");
+
+    let auth = CodexAuth::from_auth_storage(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("load auth")
+        .expect("external auth should be available");
+
+    assert_eq!(auth.auth_mode(), AuthMode::ChatgptAuthTokens);
+    assert_eq!(auth.api_auth_mode(), ApiAuthMode::ChatgptAuthTokens);
+    assert_eq!(
+        auth.active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id),
+        Some("store-account-1".to_string())
+    );
+}
+
+#[tokio::test]
+async fn external_chatgpt_token_auth_manager_reload_and_resolution_stay_constructible() {
+    let codex_home = tempdir().unwrap();
+    save_auth(
+        codex_home.path(),
+        &external_chatgpt_auth_store("store-account-1", "account-123"),
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("save external ChatGPT token auth store");
+
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+    let cached_auth = manager
+        .auth_cached()
+        .expect("cached auth should be available");
+    assert_eq!(cached_auth.api_auth_mode(), ApiAuthMode::ChatgptAuthTokens);
+
+    manager.reload();
+    let resolution = manager
+        .resolve_chatgpt_auth_for_store_account_id(
+            "store-account-1",
+            ChatgptAccountRefreshMode::Never,
+        )
+        .await
+        .expect("external auth account should resolve");
+
+    let ChatgptAccountAuthResolution::Auth(auth) = resolution else {
+        panic!("external auth account should resolve without removal");
+    };
+    assert_eq!(auth.api_auth_mode(), ApiAuthMode::ChatgptAuthTokens);
+}
+
+#[test]
+fn auth_manager_prefers_external_chatgpt_tokens_over_persisted_auth() {
+    let codex_home = tempdir().unwrap();
+    save_auth(
+        codex_home.path(),
+        &chatgpt_auth_store_for_manager_logout(
+            "persistent-store-account",
+            "persistent-workspace",
+            "persistent-access-token",
+            "persistent-refresh-token",
+        ),
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save persistent auth store");
+    save_auth(
+        codex_home.path(),
+        &external_chatgpt_auth_store("external-store-account", "external-workspace"),
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("save external auth store");
+
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+    let auth = manager
+        .auth_cached()
+        .expect("external auth should be cached");
+
+    assert_eq!(auth.api_auth_mode(), ApiAuthMode::ChatgptAuthTokens);
+    assert_eq!(
+        auth.active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id),
+        Some("external-store-account".to_string())
+    );
+
+    manager.reload();
+    let reloaded_auth = manager
+        .auth_cached()
+        .expect("external auth should still be cached after reload");
+    assert_eq!(
+        reloaded_auth.api_auth_mode(),
+        ApiAuthMode::ChatgptAuthTokens
+    );
+    assert_eq!(
+        reloaded_auth
+            .active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id),
+        Some("external-store-account".to_string())
+    );
+}
+
+#[test]
+fn external_chatgpt_token_auth_persists_agent_identity_for_workspace() {
+    let codex_home = tempdir().unwrap();
+    save_auth(
+        codex_home.path(),
+        &external_chatgpt_auth_store("store-account-1", "account-123"),
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("save external ChatGPT token auth store");
+    let auth = super::load_auth(
+        codex_home.path(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("load auth")
+    .expect("auth available");
+    let record = AgentIdentityAuthRecord {
+        workspace_id: "account-123".to_string(),
+        chatgpt_user_id: Some("user-123".to_string()),
+        agent_runtime_id: "agent_123".to_string(),
+        agent_private_key: "pkcs8-base64".to_string(),
+        registered_at: "2026-04-13T12:00:00Z".to_string(),
+    };
+
+    auth.set_agent_identity(record.clone())
+        .expect("set agent identity");
+
+    assert_eq!(auth.get_agent_identity("account-123"), Some(record.clone()));
+    let storage = create_auth_storage(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::Ephemeral,
+    );
     let persisted = storage
         .load()
         .expect("load auth")
@@ -715,8 +894,8 @@ async fn auth_manager_notifies_when_auth_state_changes() {
     .expect("save updated auth");
 
     assert!(
-        !manager.reload(),
-        "reload remains mode-stable even when the underlying credentials change"
+        manager.reload(),
+        "reload should report changed auth when the underlying credentials change"
     );
     timeout(Duration::from_secs(1), auth_state_rx.changed())
         .await
