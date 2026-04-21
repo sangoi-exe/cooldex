@@ -1662,6 +1662,7 @@ pub enum Account {
     #[serde(rename = "chatgpt", rename_all = "camelCase")]
     #[ts(rename = "chatgpt", rename_all = "camelCase")]
     Chatgpt {
+        #[schemars(required, schema_with = "required_nullable_string_schema")]
         label: Option<String>,
         email: String,
         plan_type: PlanType,
@@ -1811,6 +1812,10 @@ pub struct GetAccountRateLimitsResponse {
     /// Backward-compatible single-bucket view; mirrors the historical payload.
     pub rate_limits: RateLimitSnapshot,
     /// Multi-bucket view keyed by metered `limit_id` (for example, `codex`).
+    #[schemars(
+        required,
+        schema_with = "required_nullable_rate_limits_by_limit_id_schema"
+    )]
     pub rate_limits_by_limit_id: Option<HashMap<String, RateLimitSnapshot>>,
 }
 
@@ -1862,10 +1867,14 @@ pub struct GetAccountParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct GetAccountResponse {
+    #[schemars(required, schema_with = "required_nullable_account_schema")]
     pub account: Option<Account>,
+    #[schemars(required, schema_with = "required_nullable_auth_mode_schema")]
+    pub auth_mode: Option<AuthMode>,
     pub requires_openai_auth: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional = nullable)]
+    #[schemars(required, schema_with = "required_nullable_string_schema")]
+    #[ts(optional = false)]
+    #[ts(type = "string | null")]
     pub active_chatgpt_store_account_id: Option<String>,
 }
 
@@ -4017,8 +4026,11 @@ pub struct Thread {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct AccountUpdatedNotification {
+    #[schemars(required, schema_with = "required_nullable_auth_mode_schema")]
     pub auth_mode: Option<AuthMode>,
+    #[schemars(required, schema_with = "required_nullable_string_schema")]
     pub label: Option<String>,
+    #[schemars(required, schema_with = "required_nullable_plan_type_schema")]
     pub plan_type: Option<PlanType>,
 }
 
@@ -5589,6 +5601,26 @@ fn required_nullable_collab_wait_state_schema(schema_gen: &mut SchemaGenerator) 
 
 fn required_nullable_bool_schema(schema_gen: &mut SchemaGenerator) -> Schema {
     schema_gen.subschema_for::<Option<bool>>()
+}
+
+fn required_nullable_string_schema(schema_gen: &mut SchemaGenerator) -> Schema {
+    schema_gen.subschema_for::<Option<String>>()
+}
+
+fn required_nullable_account_schema(schema_gen: &mut SchemaGenerator) -> Schema {
+    schema_gen.subschema_for::<Option<Account>>()
+}
+
+fn required_nullable_auth_mode_schema(schema_gen: &mut SchemaGenerator) -> Schema {
+    schema_gen.subschema_for::<Option<AuthMode>>()
+}
+
+fn required_nullable_plan_type_schema(schema_gen: &mut SchemaGenerator) -> Schema {
+    schema_gen.subschema_for::<Option<PlanType>>()
+}
+
+fn required_nullable_rate_limits_by_limit_id_schema(schema_gen: &mut SchemaGenerator) -> Schema {
+    schema_gen.subschema_for::<Option<HashMap<String, RateLimitSnapshot>>>()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

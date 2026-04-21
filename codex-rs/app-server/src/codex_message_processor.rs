@@ -1919,6 +1919,7 @@ impl CodexMessageProcessor {
         if !requires_openai_auth {
             let response = GetAccountResponse {
                 account: None,
+                auth_mode: None,
                 requires_openai_auth,
                 active_chatgpt_store_account_id: None,
             };
@@ -1930,6 +1931,11 @@ impl CodexMessageProcessor {
             .auth_manager
             .active_chatgpt_account_summary()
             .map(|summary| summary.store_account_id);
+        let auth_mode = self
+            .auth_manager
+            .auth_cached()
+            .as_ref()
+            .map(CodexAuth::api_auth_mode);
         let account = match self.auth_manager.auth_cached() {
             Some(auth) => match auth.auth_mode() {
                 CoreAuthMode::ApiKey => Some(Account::ApiKey {}),
@@ -1973,6 +1979,7 @@ impl CodexMessageProcessor {
 
         let response = GetAccountResponse {
             account,
+            auth_mode,
             requires_openai_auth,
             active_chatgpt_store_account_id,
         };

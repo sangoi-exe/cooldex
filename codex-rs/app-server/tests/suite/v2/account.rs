@@ -284,6 +284,7 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
                 email: "embedded@example.com".to_string(),
                 plan_type: AccountPlanType::Pro,
             }),
+            auth_mode: Some(AuthMode::ChatgptAuthTokens),
             requires_openai_auth: true,
             active_chatgpt_store_account_id: Some("org-embedded".to_string()),
         }
@@ -353,6 +354,7 @@ async fn account_read_refresh_token_is_noop_in_external_mode() -> Result<()> {
                 email: "embedded@example.com".to_string(),
                 plan_type: AccountPlanType::Pro,
             }),
+            auth_mode: Some(AuthMode::ChatgptAuthTokens),
             requires_openai_auth: true,
             active_chatgpt_store_account_id: Some("org-embedded".to_string()),
         }
@@ -1511,6 +1513,7 @@ async fn get_account_with_api_key() -> Result<()> {
 
     let expected = GetAccountResponse {
         account: Some(Account::ApiKey {}),
+        auth_mode: Some(AuthMode::ApiKey),
         requires_openai_auth: true,
         active_chatgpt_store_account_id: None,
     };
@@ -1546,6 +1549,7 @@ async fn get_account_when_auth_not_required() -> Result<()> {
 
     let expected = GetAccountResponse {
         account: None,
+        auth_mode: None,
         requires_openai_auth: false,
         active_chatgpt_store_account_id: None,
     };
@@ -1594,6 +1598,7 @@ async fn get_account_with_chatgpt() -> Result<()> {
             email: "user@example.com".to_string(),
             plan_type: AccountPlanType::Pro,
         }),
+        auth_mode: Some(AuthMode::Chatgpt),
         requires_openai_auth: true,
         active_chatgpt_store_account_id: Some(
             "chatgpt-user:user-123:workspace:account-123".to_string(),
@@ -1642,6 +1647,7 @@ async fn get_account_with_chatgpt_missing_plan_claim_returns_unknown() -> Result
             email: "user@example.com".to_string(),
             plan_type: AccountPlanType::Unknown,
         }),
+        auth_mode: Some(AuthMode::Chatgpt),
         requires_openai_auth: true,
         active_chatgpt_store_account_id: Some("chatgpt-user:user-123".to_string()),
     };

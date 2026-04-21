@@ -1,10 +1,13 @@
 # Authentication
 
-Codex supports three authentication modes:
+Codex supports two stable authentication modes:
 
 - **API key**: set `OPENAI_API_KEY` (or use `codex login --with-api-key`). This is the default for API-key workflows.
 - **ChatGPT managed (OAuth)**: use `codex login` (browser) or `codex login --device-code` (headless). This uses Codex-managed ChatGPT credentials.
-- **ChatGPT external tokens (`chatgptAuthTokens`)**: the app-server auth surface can accept caller-supplied ChatGPT tokens and keep them in the external ephemeral store instead of the saved-account store.
+
+Experimental/internal-only app-server surface:
+
+- **ChatGPT external tokens (`chatgptAuthTokens`)**: the app-server auth surface can accept caller-supplied ChatGPT tokens and keep them in the external ephemeral store instead of the saved-account store. This path is intentionally excluded from the stable generated app-server schema unless `experimentalApi` is enabled.
 
 ## Where credentials are stored
 

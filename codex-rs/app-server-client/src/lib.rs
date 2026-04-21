@@ -1391,7 +1391,9 @@ mod tests {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
                         account: None,
+                        auth_mode: None,
                         requires_openai_auth: false,
+                        active_chatgpt_store_account_id: None,
                     })
                     .expect("response should serialize"),
                 }),
@@ -1499,7 +1501,9 @@ mod tests {
                     id: request.id,
                     result: serde_json::to_value(GetAccountResponse {
                         account: None,
+                        auth_mode: None,
                         requires_openai_auth: false,
+                        active_chatgpt_store_account_id: None,
                     })
                     .expect("response should serialize"),
                 }),
@@ -1552,7 +1556,9 @@ mod tests {
             first_response,
             GetAccountResponse {
                 account: None,
+                auth_mode: None,
                 requires_openai_auth: false,
+                active_chatgpt_store_account_id: None,
             }
         );
 
@@ -2020,7 +2026,7 @@ mod tests {
             cloud_requirements: CloudRequirementsLoader::default(),
             feedback: CodexFeedback::new(),
             log_db: None,
-            environment_manager: environment_manager.clone(),
+            environment_manager,
             config_warnings: Vec::new(),
             session_source: SessionSource::Exec,
             enable_codex_api_key_env: false,
@@ -2049,7 +2055,7 @@ mod tests {
 
         let runtime_args = InProcessClientStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
-            auth_manager: auth_manager.clone(),
+            auth_manager,
             config: config.clone(),
             cli_overrides: Vec::new(),
             loader_overrides: LoaderOverrides::default(),

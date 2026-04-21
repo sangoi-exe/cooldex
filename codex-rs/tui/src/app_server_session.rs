@@ -878,6 +878,12 @@ fn build_account_projection(
     account: GetAccountResponse,
     available_models: Vec<ModelPreset>,
 ) -> Result<AppServerAccountProjection> {
+    let GetAccountResponse {
+        account,
+        auth_mode: exact_auth_mode,
+        requires_openai_auth,
+        active_chatgpt_store_account_id,
+    } = account;
     let default_model = available_models
         .iter()
         .find(|model| model.is_default)
@@ -891,10 +897,12 @@ fn build_account_projection(
         plan_type,
         feedback_audience,
         has_chatgpt_account,
-    ) = match account.account {
+    ) = match account {
         Some(Account::ApiKey {}) => (
             None,
-            Some(TelemetryAuthMode::ApiKey),
+            exact_auth_mode
+                .map(TelemetryAuthMode::from)
+                .or(Some(TelemetryAuthMode::ApiKey)),
             Some(StatusAccountDisplay::ApiKey),
             None,
             FeedbackAudience::External,
@@ -906,7 +914,9 @@ fn build_account_projection(
             plan_type,
         }) => (
             Some(email.clone()),
-            Some(TelemetryAuthMode::Chatgpt),
+            exact_auth_mode
+                .map(TelemetryAuthMode::from)
+                .or(Some(TelemetryAuthMode::Chatgpt)),
             Some(StatusAccountDisplay::ChatGpt {
                 label,
                 email: Some(email.clone()),
@@ -919,12 +929,12 @@ fn build_account_projection(
         None => (None, None, None, None, FeedbackAudience::External, false),
     };
     Ok(AppServerAccountProjection {
-        active_store_account_id: account.active_chatgpt_store_account_id,
+        active_store_account_id: active_chatgpt_store_account_id,
         account_email,
         auth_mode,
         status_account_display,
         plan_type,
-        requires_openai_auth: account.requires_openai_auth,
+        requires_openai_auth,
         default_model,
         feedback_audience,
         has_chatgpt_account,
@@ -2130,6 +2140,7 @@ mod tests {
                     email: "alice@openai.com".to_string(),
                     plan_type: codex_protocol::account::PlanType::Pro,
                 }),
+                auth_mode: Some(AuthMode::Chatgpt),
                 requires_openai_auth: true,
                 active_chatgpt_store_account_id: Some("store-alice".to_string()),
             },
@@ -2177,6 +2188,7 @@ mod tests {
         let err = build_account_projection(
             GetAccountResponse {
                 account: Some(Account::ApiKey {}),
+                auth_mode: Some(AuthMode::ApiKey),
                 requires_openai_auth: false,
                 active_chatgpt_store_account_id: None,
             },

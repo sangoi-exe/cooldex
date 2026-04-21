@@ -68,6 +68,11 @@
           ]
         }
       },
+      "required": [
+        "authMode",
+        "label",
+        "planType"
+      ],
       "type": "object"
     },
     "AgentMessageDeltaNotification": {

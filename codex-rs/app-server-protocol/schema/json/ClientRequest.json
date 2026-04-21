@@ -1226,40 +1226,6 @@
           ],
           "title": "ChatgptDeviceCodeLoginAccountParams",
           "type": "object"
-        },
-        {
-          "description": "[UNSTABLE] FOR OPENAI INTERNAL USE ONLY - DO NOT USE. The access token must contain the same scopes that Codex-managed ChatGPT auth tokens have.",
-          "properties": {
-            "accessToken": {
-              "description": "Access token (JWT) supplied by the client. This token is used for backend API requests and email extraction. Malformed tokens are rejected as invalid input.",
-              "type": "string"
-            },
-            "chatgptAccountId": {
-              "description": "Workspace/account identifier supplied by the client.",
-              "type": "string"
-            },
-            "chatgptPlanType": {
-              "description": "Optional plan type supplied by the client.\n\nWhen present, Codex verifies this value against the JWT plan claim and rejects the login if the token is missing that claim or the values disagree. When `null`, Codex attempts to derive the plan type from the access-token claims. If the effective plan is missing, `unknown`, or unsupported, the login request is rejected.",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "type": {
-              "enum": [
-                "chatgptAuthTokens"
-              ],
-              "title": "ChatgptAuthTokensLoginAccountParamsType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "accessToken",
-            "chatgptAccountId",
-            "type"
-          ],
-          "title": "ChatgptAuthTokensLoginAccountParams",
-          "type": "object"
         }
       ]
     },

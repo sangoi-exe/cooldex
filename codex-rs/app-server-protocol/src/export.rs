@@ -50,6 +50,26 @@ const V1_CLIENT_REQUEST_METHODS: &[&str] =
     &["getConversationSummary", "gitDiffToRemote", "getAuthStatus"];
 const EXCLUDED_SERVER_NOTIFICATION_METHODS_FOR_JSON: &[&str] = &["rawResponseItem/completed"];
 
+#[derive(Clone, Copy)]
+struct ExperimentalTaggedVariant {
+    type_name: &'static str,
+    tag_field: &'static str,
+    tag_value: &'static str,
+}
+
+const EXPERIMENTAL_TAGGED_VARIANTS: &[ExperimentalTaggedVariant] = &[
+    ExperimentalTaggedVariant {
+        type_name: "LoginAccountParams",
+        tag_field: "type",
+        tag_value: "chatgptAuthTokens",
+    },
+    ExperimentalTaggedVariant {
+        type_name: "LoginAccountResponse",
+        tag_field: "type",
+        tag_value: "chatgptAuthTokens",
+    },
+];
+
 #[derive(Clone)]
 pub struct GeneratedSchema {
     namespace: Option<String>,
@@ -253,6 +273,7 @@ fn filter_experimental_ts(out_dir: &Path) -> Result<()> {
     // file-local unions/interfaces.
     filter_client_request_ts(out_dir, EXPERIMENTAL_CLIENT_METHODS)?;
     filter_experimental_type_fields_ts(out_dir, &registered_fields)?;
+    filter_experimental_type_variants_ts(out_dir, EXPERIMENTAL_TAGGED_VARIANTS)?;
     remove_generated_type_files(out_dir, &experimental_method_types, "ts")?;
     Ok(())
 }
@@ -284,6 +305,22 @@ pub(crate) fn filter_experimental_ts_tree(tree: &mut BTreeMap<PathBuf, String>) 
         let filtered = filter_experimental_type_fields_ts_contents(
             std::mem::take(content),
             experimental_field_names,
+        );
+        *content = filtered;
+    }
+
+    let variants_by_type_name =
+        experimental_tagged_variants_by_type_name(EXPERIMENTAL_TAGGED_VARIANTS);
+    for (path, content) in tree.iter_mut() {
+        let Some(type_name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Some(experimental_variants) = variants_by_type_name.get(type_name) else {
+            continue;
+        };
+        let filtered = filter_experimental_type_variants_ts_contents(
+            std::mem::take(content),
+            experimental_variants,
         );
         *content = filtered;
     }
@@ -371,6 +408,68 @@ fn filter_experimental_fields_in_ts_file(
     Ok(())
 }
 
+fn experimental_tagged_variants_by_type_name(
+    experimental_variants: &[ExperimentalTaggedVariant],
+) -> HashMap<String, Vec<ExperimentalTaggedVariant>> {
+    let mut variants_by_type_name: HashMap<String, Vec<ExperimentalTaggedVariant>> = HashMap::new();
+    for variant in experimental_variants {
+        variants_by_type_name
+            .entry(variant.type_name.to_string())
+            .or_default()
+            .push(*variant);
+    }
+    variants_by_type_name
+}
+
+fn filter_experimental_type_variants_ts(
+    out_dir: &Path,
+    experimental_variants: &[ExperimentalTaggedVariant],
+) -> Result<()> {
+    let variants_by_type_name = experimental_tagged_variants_by_type_name(experimental_variants);
+    if variants_by_type_name.is_empty() {
+        return Ok(());
+    }
+
+    for path in ts_files_in_recursive(out_dir)? {
+        let Some(type_name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Some(type_variants) = variants_by_type_name.get(type_name) else {
+            continue;
+        };
+        let mut content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        content = filter_experimental_type_variants_ts_contents(content, type_variants);
+        fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn filter_experimental_type_variants_ts_contents(
+    mut content: String,
+    experimental_variants: &[ExperimentalTaggedVariant],
+) -> String {
+    let Some((prefix, body, suffix)) = split_type_alias(&content) else {
+        return content;
+    };
+    let filtered_arms: Vec<String> = split_top_level(&body, '|')
+        .into_iter()
+        .filter(|arm| {
+            experimental_variants.iter().all(|variant| {
+                extract_tag_from_arm(arm, variant.tag_field)
+                    .is_none_or(|value| value != variant.tag_value)
+            })
+        })
+        .collect();
+    let new_body = filtered_arms.join(" | ");
+    content = format!("{prefix}{new_body}{suffix}");
+    let import_usage_scope = split_type_alias(&content)
+        .map(|(_, filtered_body, _)| filtered_body)
+        .unwrap_or_else(|| new_body.clone());
+    prune_unused_type_imports(content, &import_usage_scope)
+}
+
 fn filter_experimental_type_fields_ts_contents(
     mut content: String,
     experimental_field_names: &HashSet<String>,
@@ -403,6 +502,7 @@ fn filter_experimental_schema(bundle: &mut Value) -> Result<()> {
     filter_experimental_fields_in_root(bundle, &registered_fields);
     filter_experimental_fields_in_definitions(bundle, &registered_fields);
     prune_experimental_methods(bundle, EXPERIMENTAL_CLIENT_METHODS);
+    prune_experimental_tagged_variants(bundle, EXPERIMENTAL_TAGGED_VARIANTS);
     remove_experimental_method_type_definitions(bundle);
     Ok(())
 }
@@ -541,6 +641,64 @@ fn is_experimental_method_variant(value: &Value, experimental_methods: &HashSet<
     }
 
     false
+}
+
+fn prune_experimental_tagged_variants(
+    value: &mut Value,
+    experimental_variants: &[ExperimentalTaggedVariant],
+) {
+    match value {
+        Value::Array(items) => {
+            items.retain(|item| !is_experimental_tagged_variant(item, experimental_variants));
+            for item in items {
+                prune_experimental_tagged_variants(item, experimental_variants);
+            }
+        }
+        Value::Object(map) => {
+            for entry in map.values_mut() {
+                prune_experimental_tagged_variants(entry, experimental_variants);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn is_experimental_tagged_variant(
+    value: &Value,
+    experimental_variants: &[ExperimentalTaggedVariant],
+) -> bool {
+    let Value::Object(map) = value else {
+        return false;
+    };
+    let Some(title) = map.get("title").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(properties) = map.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+
+    experimental_variants.iter().any(|variant| {
+        tagged_variant_title_matches_type(title, variant.type_name)
+            && properties
+                .get(variant.tag_field)
+                .is_some_and(|schema| schema_has_single_tag_value(schema, variant.tag_value))
+    })
+}
+
+fn tagged_variant_title_matches_type(title: &str, type_name: &str) -> bool {
+    definition_matches_type(title, type_name) || title.ends_with(type_name)
+}
+
+fn schema_has_single_tag_value(schema: &Value, expected_value: &str) -> bool {
+    let Value::Object(map) = schema else {
+        return false;
+    };
+    if map.get("const").and_then(Value::as_str) == Some(expected_value) {
+        return true;
+    }
+    map.get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.len() == 1 && values[0].as_str() == Some(expected_value))
 }
 
 fn filter_experimental_json_files(out_dir: &Path) -> Result<()> {
@@ -781,13 +939,17 @@ fn split_top_level_multi(input: &str, delimiters: &[char]) -> Vec<String> {
 }
 
 fn extract_method_from_arm(arm: &str) -> Option<String> {
+    extract_tag_from_arm(arm, "method")
+}
+
+fn extract_tag_from_arm(arm: &str, tag_field: &str) -> Option<String> {
     let (open, close) = find_top_level_brace_span(arm)?;
     let inner = &arm[open + 1..close];
     for field in split_top_level(inner, ',') {
         let Some((name, value)) = parse_property(field.as_str()) else {
             continue;
         };
-        if name != "method" {
+        if name != tag_field {
             continue;
         }
         let value = value.trim_start();
@@ -2116,6 +2278,21 @@ mod tests {
             fixture_tree.contains_key(Path::new("v2/MockExperimentalMethodResponse.ts")),
             false
         );
+        let login_account_params_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("v2/LoginAccountParams.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing v2/LoginAccountParams.ts fixture"))?,
+        )?;
+        assert_eq!(login_account_params_ts.contains("chatgptAuthTokens"), false);
+        let login_account_response_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("v2/LoginAccountResponse.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing v2/LoginAccountResponse.ts fixture"))?,
+        )?;
+        assert_eq!(
+            login_account_response_ts.contains("chatgptAuthTokens"),
+            false
+        );
 
         let mut undefined_offenders = Vec::new();
         let mut optional_nullable_offenders = BTreeSet::new();
@@ -2737,6 +2914,18 @@ export type Config = { stableField: Keep, unstableField: string | null } & ({ [k
         let thread_start_json =
             fs::read_to_string(output_dir.join("v2").join("ThreadStartParams.json"))?;
         assert_eq!(thread_start_json.contains("mockExperimentalField"), false);
+        let login_account_params_json =
+            fs::read_to_string(output_dir.join("v2").join("LoginAccountParams.json"))?;
+        assert_eq!(
+            login_account_params_json.contains("chatgptAuthTokens"),
+            false
+        );
+        let login_account_response_json =
+            fs::read_to_string(output_dir.join("v2").join("LoginAccountResponse.json"))?;
+        assert_eq!(
+            login_account_response_json.contains("chatgptAuthTokens"),
+            false
+        );
         let command_execution_request_approval_json =
             fs::read_to_string(output_dir.join("CommandExecutionRequestApprovalParams.json"))?;
         assert_eq!(
@@ -2749,12 +2938,24 @@ export type Config = { stableField: Keep, unstableField: string | null } & ({ [k
             client_request_json.contains("mock/experimentalMethod"),
             false
         );
+        assert_eq!(
+            client_request_json.contains("ChatgptAuthTokensLoginAccountParams"),
+            false
+        );
         assert_eq!(output_dir.join("EventMsg.json").exists(), false);
 
         let bundle_json =
             fs::read_to_string(output_dir.join("codex_app_server_protocol.schemas.json"))?;
         assert_eq!(bundle_json.contains("mockExperimentalField"), false);
         assert_eq!(bundle_json.contains("additionalPermissions"), false);
+        assert_eq!(
+            bundle_json.contains("ChatgptAuthTokensLoginAccountParams"),
+            false
+        );
+        assert_eq!(
+            bundle_json.contains("ChatgptAuthTokensv2::LoginAccountResponse"),
+            false
+        );
         assert_eq!(bundle_json.contains("MockExperimentalMethodParams"), false);
         assert_eq!(
             bundle_json.contains("MockExperimentalMethodResponse"),
@@ -2764,6 +2965,14 @@ export type Config = { stableField: Keep, unstableField: string | null } & ({ [k
             fs::read_to_string(output_dir.join("codex_app_server_protocol.v2.schemas.json"))?;
         assert_eq!(flat_v2_bundle_json.contains("mockExperimentalField"), false);
         assert_eq!(flat_v2_bundle_json.contains("additionalPermissions"), false);
+        assert_eq!(
+            flat_v2_bundle_json.contains("ChatgptAuthTokensLoginAccountParams"),
+            false
+        );
+        assert_eq!(
+            flat_v2_bundle_json.contains("ChatgptAuthTokensv2::LoginAccountResponse"),
+            false
+        );
         assert_eq!(
             flat_v2_bundle_json.contains("MockExperimentalMethodParams"),
             false

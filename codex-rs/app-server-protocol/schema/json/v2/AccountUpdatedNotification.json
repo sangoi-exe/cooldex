@@ -73,6 +73,11 @@
       ]
     }
   },
+  "required": [
+    "authMode",
+    "label",
+    "planType"
+  ],
   "title": "AccountUpdatedNotification",
   "type": "object"
 }
