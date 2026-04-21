@@ -65,7 +65,7 @@ Backpressure behavior:
 
 ## Message Schema
 
-Currently, you can dump a TypeScript version of the schema using `codex app-server generate-ts`, or a JSON Schema bundle via `codex app-server generate-json-schema`. Each output is specific to the version of Codex you used to run the command, so the generated artifacts are guaranteed to match that version.
+Currently, you can dump a TypeScript version of the schema using `codex app-server generate-ts`, or a JSON Schema bundle via `codex app-server generate-json-schema`. Each output is specific to the version of Codex you used to run the command. The TypeScript output mirrors the exported Rust owners for that version; the JSON Schema bundle is generated from the same owners via `schemars`, but it can be structurally looser around always-present nullable fields.
 
 ```
 codex app-server generate-ts --out DIR
@@ -1028,13 +1028,15 @@ Today both notifications carry an empty `items` array even when item events were
 `ThreadItem` is the tagged union carried in turn responses and `item/*` notifications. Currently we support events for the following items:
 
 - `userMessage` — `{id, content}` where `content` is a list of user inputs (`text`, `image`, or `localImage`).
+- `hookPrompt` — `{id, fragments}` describing hook-generated prompt fragments that were shown to the model.
 - `agentMessage` — `{id, text}` containing the accumulated agent reply.
+- `warning` — `{id, message}` for non-fatal runtime warnings emitted into thread history.
 - `plan` — `{id, text}` emitted for plan-mode turns; plan text can stream via `item/plan/delta` (experimental).
 - `reasoning` — `{id, summary, content}` where `summary` holds streamed reasoning summaries (applicable for most OpenAI models) and `content` holds raw reasoning blocks (applicable for e.g. open source models).
 - `commandExecution` — `{id, command, cwd, status, commandActions, aggregatedOutput?, exitCode?, durationMs?}` for sandboxed commands; `status` is `inProgress`, `completed`, `failed`, or `declined`.
 - `fileChange` — `{id, changes, status}` describing proposed edits; `changes` list `{path, kind, diff}` and `status` is `inProgress`, `completed`, `failed`, or `declined`.
 - `mcpToolCall` — `{id, server, tool, status, arguments, result?, error?}` describing MCP calls; `status` is `inProgress`, `completed`, or `failed`.
-- `collabToolCall` — `{id, tool, status, senderThreadId, receiverThreadId?, newThreadId?, prompt?, agentStatus?}` describing collab tool calls (`spawn_agent`, `send_input`, `resume_agent`, `wait`, `close_agent`); `status` is `inProgress`, `completed`, or `failed`.
+- `collabAgentToolCall` — `{id, tool, status, senderThreadId, receiverThreadIds, receiverAgents, prompt?, profile?, model?, reasoningEffort?, agentsStates, waitState}` describing collab tool calls (`spawnAgent`, `sendInput`, `sendMessage`, `followupTask`, `resumeAgent`, `wait`, `closeAgent`); `status` is `inProgress`, `completed`, or `failed`, and `waitState` is non-null only for `wait`.
 - `webSearch` — `{id, query, action?}` for a web search request issued by the agent; `action` mirrors the Responses API web_search action payload (`search`, `open_page`, `find_in_page`) and may be omitted until completion.
 - `imageView` — `{id, path}` emitted when the agent invokes the image viewer tool.
 - `enteredReviewMode` — `{id, review}` sent when the reviewer starts; `review` is a short user-facing label such as `"current changes"` or the requested target description.
