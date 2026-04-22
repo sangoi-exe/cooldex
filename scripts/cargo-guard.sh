@@ -9,6 +9,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 CODEX_RS_DIR="${REPO_ROOT}/codex-rs"
 CALLER_CWD="$(pwd)"
 MIN_FREE_GIB="${CARGO_GUARD_MIN_FREE_GIB:-5}"
+MAX_CARGO_BUILD_JOBS=4
 
 log() {
     local level="$1"
@@ -26,6 +27,8 @@ Runs Cargo with a deterministic free-space guardrail for build-like commands:
   - runs from ./codex-rs by default
   - preserves the caller cwd when `--manifest-path` is supplied so Cargo resolves that manifest/config context truthfully
   - derives the effective `target_directory` and `build_directory` from `cargo metadata`
+  - caps guarded Cargo build parallelism at 4 jobs by default
+  - rejects explicit `-j/--jobs` requests above 4
   - requires at least 5 GiB free before starting a guarded build-like command
   - runs `cargo clean` only when the lowest free-space filesystem across the derived target/build dirs is below the floor
   - never runs `cargo clean` solely because the guarded Cargo command failed or was interrupted
@@ -214,6 +217,7 @@ cargo_chdir_values=()
 manifest_path_raw=""
 explicit_target_dir_raw=""
 cargo_subcommand=""
+explicit_jobs_raw=""
 
 index=0
 while (( index < ${#cargo_args[@]} )); do
@@ -307,6 +311,27 @@ while (( index < ${#cargo_args[@]} )); do
             ;;
         --target-dir=*)
             explicit_target_dir_raw="${arg#--target-dir=}"
+            ;;
+        --)
+            if [[ -n "${cargo_subcommand}" ]]; then
+                break
+            fi
+            ;;
+        -j|--jobs)
+            (( index + 1 < ${#cargo_args[@]} )) || {
+                log error "${arg} requires a value"
+                exit 2
+            }
+            ((index += 1))
+            explicit_jobs_raw="${cargo_args[$index]}"
+            ;;
+        -j*)
+            if [[ "${arg}" != "-j" ]]; then
+                explicit_jobs_raw="${arg#-j}"
+            fi
+            ;;
+        --jobs=*)
+            explicit_jobs_raw="${arg#--jobs=}"
             ;;
         -p|--package|--target|--profile)
             (( index + 1 < ${#cargo_args[@]} )) || {
@@ -408,6 +433,19 @@ if (( guard_enabled == 0 )); then
     exit $?
 fi
 
+resolved_cargo_build_jobs="${MAX_CARGO_BUILD_JOBS}"
+if [[ -n "${explicit_jobs_raw}" ]]; then
+    if ! [[ "${explicit_jobs_raw}" =~ ^[0-9]+$ ]] || (( explicit_jobs_raw <= 0 )); then
+        log error "explicit Cargo job count must be a positive integer; got ${explicit_jobs_raw}"
+        exit 2
+    fi
+    if (( explicit_jobs_raw > MAX_CARGO_BUILD_JOBS )); then
+        log error "explicit Cargo job count ${explicit_jobs_raw} exceeds wrapper cap ${MAX_CARGO_BUILD_JOBS}; rerun with -j ${MAX_CARGO_BUILD_JOBS} or lower"
+        exit 2
+    fi
+    resolved_cargo_build_jobs="${explicit_jobs_raw}"
+fi
+
 resolve_metadata_dirs
 
 guard_paths=()
@@ -418,6 +456,7 @@ log info "workspace: ${CODEX_RS_DIR}"
 log info "execution cwd: ${cargo_workdir}"
 log info "target-dir: ${resolved_target_dir}"
 log info "build-dir: ${resolved_build_dir}"
+log info "cargo-build-jobs: ${resolved_cargo_build_jobs} (wrapper cap ${MAX_CARGO_BUILD_JOBS})"
 measure_guard_paths
 log info "pre-run lowest free space: ${lowest_guard_gib} GiB at ${lowest_guard_path}"
 
@@ -436,5 +475,5 @@ trap cleanup_on_exit EXIT
 
 (
     cd -- "${cargo_workdir}"
-    cargo "${cargo_args[@]}"
+    env CARGO_BUILD_JOBS="${resolved_cargo_build_jobs}" cargo "${cargo_args[@]}"
 )

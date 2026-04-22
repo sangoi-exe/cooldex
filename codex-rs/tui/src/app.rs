@@ -9985,6 +9985,78 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn remote_accounts_popup_select_active_account_via_real_request_path() -> Result<()> {
+        let mut harness = RemoteAccountsTestHarness::new("account-a").await?;
+
+        assert_eq!(
+            harness.app.observed_active_store_account_id,
+            Some(harness.primary_store_account_id.clone())
+        );
+
+        harness.open_remote_accounts_popup().await?;
+
+        harness.press_key(KeyEvent::from(KeyCode::Down)).await?;
+        harness.press_key(KeyEvent::from(KeyCode::Enter)).await?;
+        let set_active_event = harness.next_app_event().await;
+        assert_matches!(
+            &set_active_event,
+            AppEvent::SetActiveAccount { account_id }
+                if account_id == &harness.secondary_store_account_id
+        );
+
+        let control = harness.handle_event(set_active_event).await?;
+        assert!(matches!(control, AppRunControl::Continue));
+
+        harness.pump_next_app_server_event().await;
+
+        let refresh_after_account_update_event = harness
+            .next_app_event_matching("notification-driven refresh trigger", |event| {
+                matches!(
+                    event,
+                    AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate
+                )
+            })
+            .await;
+        let control = harness
+            .handle_event(refresh_after_account_update_event)
+            .await?;
+        assert!(matches!(control, AppRunControl::Continue));
+        let projection_refreshed_event = harness
+            .next_app_event_matching("notification-driven projection refresh", |event| {
+                matches!(event, AppEvent::AppServerAccountProjectionRefreshed { .. })
+            })
+            .await;
+        assert_matches!(
+            &projection_refreshed_event,
+            AppEvent::AppServerAccountProjectionRefreshed { result: Ok(_), .. }
+        );
+        let control = harness.handle_event(projection_refreshed_event).await?;
+        assert!(matches!(control, AppRunControl::Continue));
+
+        let remote_accounts = harness.app_server.list_accounts().await?;
+        assert!(remote_accounts.iter().any(|account| {
+            account.id == harness.secondary_store_account_id && account.is_active
+        }));
+        assert_eq!(
+            harness.app.observed_active_store_account_id,
+            Some(harness.secondary_store_account_id.clone())
+        );
+        let status_account_display = harness.app.chat_widget.status_account_display().cloned();
+        assert!(
+            matches!(
+                status_account_display.as_ref(),
+                Some(StatusAccountDisplay::ChatGpt {
+                    label: Some(label),
+                    email: Some(email),
+                    ..
+                }) if label == "Secondary" && email == "secondary@example.com"
+            ),
+            "unexpected status account display after remote set-active: {status_account_display:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn active_account_display_from_remote_accounts_uses_remote_active_entry() {
         let display = active_account_display_from_remote_accounts(&[
@@ -15988,6 +16060,169 @@ guardian_approval = true
         )
     }
 
+    fn make_test_tui() -> crate::tui::Tui {
+        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+        let terminal = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
+        crate::tui::Tui::new(terminal)
+    }
+
+    fn seed_canonical_chatgpt_accounts_for_config(
+        config: &Config,
+        active_account_id: &str,
+    ) -> (Arc<AuthManager>, String, String) {
+        let primary_store_account_id = canonical_chatgpt_store_account_id("account-a");
+        let secondary_store_account_id = canonical_chatgpt_store_account_id("account-b");
+        let active_store_account_id = match active_account_id {
+            "account-a" => primary_store_account_id.clone(),
+            "account-b" => secondary_store_account_id.clone(),
+            other => panic!("unexpected canonical active account {other}"),
+        };
+        let store = AuthStore {
+            active_account_id: Some(active_store_account_id),
+            accounts: vec![
+                canonical_chatgpt_account("account-a", "primary@example.com", Some("Primary")),
+                canonical_chatgpt_account("account-b", "secondary@example.com", Some("Secondary")),
+            ],
+            ..AuthStore::default()
+        };
+        save_auth(
+            &config.codex_home,
+            &store,
+            config.cli_auth_credentials_store_mode,
+        )
+        .expect("save canonical auth store");
+        let auth_manager = auth_manager_from_config(config);
+        auth_manager
+            .reload_strict()
+            .expect("reload canonical auth store");
+        (
+            auth_manager,
+            primary_store_account_id,
+            secondary_store_account_id,
+        )
+    }
+
+    struct RemoteAccountsTestHarness {
+        app: App,
+        app_event_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+        tui: crate::tui::Tui,
+        app_server: crate::app_server_session::AppServerSession,
+        primary_store_account_id: String,
+        secondary_store_account_id: String,
+        _remote_codex_home: tempfile::TempDir,
+    }
+
+    impl RemoteAccountsTestHarness {
+        async fn new(active_remote_account_id: &str) -> Result<Self> {
+            let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+            let remote_codex_home = tempdir()?;
+            let mut remote_config = app.config.clone();
+            remote_config.codex_home = remote_codex_home.path().to_path_buf().abs();
+            remote_config.sqlite_home = remote_codex_home.path().to_path_buf();
+            let (remote_auth_manager, primary_store_account_id, secondary_store_account_id) =
+                seed_canonical_chatgpt_accounts_for_config(
+                    &remote_config,
+                    active_remote_account_id,
+                );
+
+            let mut app_server = crate::start_app_server_for_picker_with_auth_manager(
+                &remote_config,
+                &crate::AppServerTarget::Embedded,
+                remote_auth_manager,
+                app.environment_manager.clone(),
+            )
+            .await?;
+            app.remote_app_server_url = Some("ws://127.0.0.1:8765".to_string());
+            let projection = app_server.load_account_projection().await?;
+            app.finish_app_server_account_projection_refresh(projection);
+            while app_event_rx.try_recv().is_ok() {}
+
+            Ok(Self {
+                app,
+                app_event_rx,
+                tui: make_test_tui(),
+                app_server,
+                primary_store_account_id,
+                secondary_store_account_id,
+                _remote_codex_home: remote_codex_home,
+            })
+        }
+
+        async fn handle_event(&mut self, event: AppEvent) -> Result<AppRunControl> {
+            self.app
+                .handle_event(&mut self.tui, &mut self.app_server, event)
+                .await
+        }
+
+        async fn press_key(&mut self, key_event: KeyEvent) -> Result<()> {
+            let control = self
+                .app
+                .handle_tui_event(
+                    &mut self.tui,
+                    &mut self.app_server,
+                    TuiEvent::Key(key_event),
+                )
+                .await?;
+            assert!(matches!(control, AppRunControl::Continue));
+            Ok(())
+        }
+
+        async fn next_app_event(&mut self) -> AppEvent {
+            time::timeout(std::time::Duration::from_secs(1), self.app_event_rx.recv())
+                .await
+                .expect("timed out waiting for emitted app event")
+                .expect("app event channel closed")
+        }
+
+        async fn next_app_event_matching<F>(&mut self, label: &str, mut predicate: F) -> AppEvent
+        where
+            F: FnMut(&AppEvent) -> bool,
+        {
+            let deadline = time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut skipped_events = Vec::new();
+            loop {
+                let event = time::timeout_at(deadline, self.app_event_rx.recv())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "timed out waiting for matching emitted app event ({label}); skipped events: {skipped_events:?}"
+                        )
+                    })
+                    .expect("app event channel closed");
+                if predicate(&event) {
+                    return event;
+                }
+                skipped_events.push(format!("{event:?}"));
+            }
+        }
+
+        async fn pump_next_app_server_event(&mut self) {
+            let event = time::timeout(
+                std::time::Duration::from_secs(3),
+                self.app_server.next_event(),
+            )
+            .await
+            .expect("timed out waiting for app-server event")
+            .expect("app-server event stream closed");
+            self.app
+                .handle_app_server_event(&mut self.app_server, event)
+                .await;
+        }
+
+        async fn open_remote_accounts_popup(&mut self) -> Result<()> {
+            let control = self.handle_event(AppEvent::StartOpenAccountsPopup).await?;
+            assert!(matches!(control, AppRunControl::Continue));
+            let popup_loaded_event = self.next_app_event().await;
+            assert!(matches!(
+                popup_loaded_event,
+                AppEvent::RemoteAccountsPopupLoaded { .. }
+            ));
+            let control = self.handle_event(popup_loaded_event).await?;
+            assert!(matches!(control, AppRunControl::Continue));
+            Ok(())
+        }
+    }
+
     fn seed_chatgpt_account_cache(app: &mut App) {
         let header = serde_json::json!({"alg":"none","typ":"JWT"});
         let payload = serde_json::json!({
@@ -16135,31 +16370,9 @@ guardian_approval = true
     }
 
     fn seed_canonical_chatgpt_accounts(app: &mut App, active_account_id: &str) -> (String, String) {
-        let primary_store_account_id = canonical_chatgpt_store_account_id("account-a");
-        let secondary_store_account_id = canonical_chatgpt_store_account_id("account-b");
-        let active_store_account_id = match active_account_id {
-            "account-a" => primary_store_account_id.clone(),
-            "account-b" => secondary_store_account_id.clone(),
-            other => panic!("unexpected canonical active account {other}"),
-        };
-        let store = AuthStore {
-            active_account_id: Some(active_store_account_id),
-            accounts: vec![
-                canonical_chatgpt_account("account-a", "primary@example.com", Some("Primary")),
-                canonical_chatgpt_account("account-b", "secondary@example.com", Some("Secondary")),
-            ],
-            ..AuthStore::default()
-        };
-        save_auth(
-            &app.config.codex_home,
-            &store,
-            app.config.cli_auth_credentials_store_mode,
-        )
-        .expect("save canonical auth store");
-        app.auth_manager = auth_manager_from_config(&app.config);
-        app.auth_manager
-            .reload_strict()
-            .expect("reload canonical auth store");
+        let (auth_manager, primary_store_account_id, secondary_store_account_id) =
+            seed_canonical_chatgpt_accounts_for_config(&app.config, active_account_id);
+        app.auth_manager = auth_manager;
         (primary_store_account_id, secondary_store_account_id)
     }
 

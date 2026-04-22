@@ -70,7 +70,7 @@ For commentless customization-adjacent seams such as JSON schema artifacts, the 
 - Run every Cargo validation rung through `./scripts/cargo-guard.sh` from the workspace root; do not run raw `cargo check`, `cargo test --no-run`, or `cargo test` directly in this workspace.
 - Cargo validation precedence is strict: exhaust the lighter/faster checks first, escalate only when they are green, and do not skip ahead to a heavier step when a lighter one can still answer the same question.
 - Batch clearly same-class mechanical fallout before escalating to a heavier validation rung; rerun only when the batch is ready or fresh diagnostics are needed.
-- `./scripts/cargo-guard.sh` asks Cargo itself for the effective `target_directory`/`build_directory` under the exact wrapper context, enforces the binary 5 GiB free-space floor, and runs `cargo clean` only when the lowest-free-space filesystem across those directories is below that floor before or after a guarded build-like command; failure/interruption alone must not trigger cleanup.
+- `./scripts/cargo-guard.sh` asks Cargo itself for the effective `target_directory`/`build_directory` under the exact wrapper context, caps guarded Cargo parallelism at 4 jobs by default, rejects explicit `-j/--jobs` requests above that cap, enforces the binary 5 GiB free-space floor, and runs `cargo clean` only when the lowest-free-space filesystem across those directories is below that floor before or after a guarded build-like command; failure/interruption alone must not trigger cleanup.
 - Lightweight compile-first default: start with the relevant fast checks, preferring `./scripts/cargo-guard.sh cargo check -p <project>` first and escalating to `--tests` only when test targets, fixtures, macros, or integration surfaces are in play.
 - Only after the relevant lightweight checks are green, run `./scripts/cargo-guard.sh cargo test -p <project> --no-run` for test-target build/link coverage.
 - Only after `./scripts/cargo-guard.sh cargo test -p <project> --no-run` is green, run real `./scripts/cargo-guard.sh cargo test -p <project>` for runtime/behavior validation when behavior actually needs to be proven.
@@ -131,7 +131,7 @@ Run `just fmt` (in `codex-rs` directory) automatically after you have finished m
 
 For Rust validation in `codex-rs`, use this light-first ladder:
 
-0. Before each rung below, invoke it via `./scripts/cargo-guard.sh cargo ...`; the wrapper asks Cargo for the effective `target_directory`/`build_directory`, checks the 5 GiB floor across those directories, and runs `cargo clean` only when low free space violates that guardrail.
+0. Before each rung below, invoke it via `./scripts/cargo-guard.sh cargo ...`; the wrapper asks Cargo for the effective `target_directory`/`build_directory`, caps guarded Cargo parallelism at 4 jobs unless you explicitly request a lower count, rejects explicit higher `-j/--jobs` requests, checks the 5 GiB floor across those directories, and runs `cargo clean` only when low free space violates that guardrail.
 1. Run the relevant quick/light Cargo checks first, with `./scripts/cargo-guard.sh cargo check -p <project>` as the default starting point.
 2. Escalate to `./scripts/cargo-guard.sh cargo check -p <project> --tests` only when test targets, fixtures, macros, or integration surfaces are part of the touched scope.
 3. Only if the relevant `cargo check` rung(s) are green, run `./scripts/cargo-guard.sh cargo test -p <project> --no-run`.
@@ -359,7 +359,7 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
 - `justfile`
   - Canonical human-facing command entrypoints. Treat this as the first build/test command map.
 - `scripts/cargo-guard.sh`
-  - Mandatory Cargo wrapper for this workspace. Cargo validation rules in this AGENTS file assume this wrapper, not raw `cargo`.
+  - Mandatory Cargo wrapper for this workspace. Cargo validation rules in this AGENTS file assume this wrapper, not raw `cargo`; it also hard-caps guarded Cargo parallelism at 4 jobs unless a lower explicit job count is requested.
 - `codex-cli/`
   - Packaging/distribution wrapper for the native CLI artifacts. Adjacent shipped surface, not the Rust runtime owner.
 - `BUILD.bazel`, `MODULE.bazel`, `codex-rs/cli/BUILD.bazel`
