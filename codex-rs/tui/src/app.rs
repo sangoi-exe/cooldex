@@ -15,14 +15,18 @@ use crate::app_server_session::AppServerAccountProjection;
 use crate::app_server_session::AppServerSession;
 use crate::app_server_session::AppServerStartedThread;
 use crate::app_server_session::ThreadSessionState;
+use crate::app_server_session::app_server_rate_limit_snapshot_to_core;
 use crate::app_server_session::app_server_rate_limit_snapshots_to_core;
 use crate::app_server_session::load_account_projection_from_request_handle;
+use crate::app_server_session::load_accounts_from_request_handle;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::FeedbackAudience;
 use crate::bottom_pane::McpServerElicitationFormRequest;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
+use crate::chatwidget::AccountsPopupEntry;
+use crate::chatwidget::AccountsPopupLeaseState;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
 use crate::chatwidget::ReplayKind;
@@ -81,10 +85,12 @@ use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
 use crate::version::CODEX_CLI_VERSION;
 use chrono::DateTime;
+use chrono::Local;
 use chrono::Utc;
 use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
+use codex_app_server_protocol::AccountListEntry;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ChatgptAuthTokensRefreshResponse;
 use codex_app_server_protocol::ClientRequest;
@@ -95,6 +101,7 @@ use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::FeedbackUploadParams;
 use codex_app_server_protocol::FeedbackUploadResponse;
+use codex_app_server_protocol::ForceReleaseAccountLeaseStatus;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::ListMcpServerStatusParams;
 use codex_app_server_protocol::ListMcpServerStatusResponse;
@@ -222,6 +229,38 @@ fn format_account_display(label: Option<&str>, email: Option<&str>, fallback: &s
         (None, Some(email)) => email.to_string(),
         (None, None) => fallback.to_string(),
     }
+}
+
+fn popup_accounts_from_remote_entries(accounts: Vec<AccountListEntry>) -> Vec<AccountsPopupEntry> {
+    accounts
+        .into_iter()
+        .map(|account| AccountsPopupEntry {
+            id: account.id,
+            label: account.label,
+            email: account.email,
+            is_active: account.is_active,
+            exhausted_until: account
+                .exhausted_until_unix_seconds
+                .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0)),
+            last_rate_limits: account
+                .last_rate_limits
+                .map(app_server_rate_limit_snapshot_to_core),
+            lease_state: match account.lease_state {
+                codex_app_server_protocol::AccountLeaseState::NotLeased => {
+                    AccountsPopupLeaseState::NotLeased
+                }
+                codex_app_server_protocol::AccountLeaseState::LeasedByCurrentSession => {
+                    AccountsPopupLeaseState::LeasedByCurrentSession
+                }
+                codex_app_server_protocol::AccountLeaseState::LeasedByOtherSession => {
+                    AccountsPopupLeaseState::LeasedByOtherSession
+                }
+                codex_app_server_protocol::AccountLeaseState::Unavailable => {
+                    AccountsPopupLeaseState::Unavailable
+                }
+            },
+        })
+        .collect()
 }
 
 fn build_chatgpt_add_account_success_outcome(
@@ -2438,6 +2477,18 @@ impl App {
             .map(|summary| summary.store_account_id)
     }
 
+    fn observed_active_store_account_id_for_projection_owner(
+        remote_app_server_url: Option<&str>,
+        auth_manager_active_store_account_id: Option<String>,
+        app_server_active_store_account_id: Option<String>,
+    ) -> Option<String> {
+        if remote_app_server_url.is_some() {
+            app_server_active_store_account_id
+        } else {
+            auth_manager_active_store_account_id
+        }
+    }
+
     fn refresh_observed_active_store_account_id(&mut self) -> bool {
         let next_active_store_account_id = self.active_store_account_id_from_auth_manager();
         let changed = next_active_store_account_id != self.observed_active_store_account_id;
@@ -2512,6 +2563,7 @@ impl App {
         &mut self,
         projection: AppServerAccountProjection,
     ) {
+        let projection_active_store_account_id = projection.active_store_account_id.clone();
         let model_catalog = Self::build_model_catalog(&self.config, projection.available_models);
         self.live_account_state_owner = LiveAccountStateOwner::AppServerProjection;
         self.feedback_audience = projection.feedback_audience;
@@ -2523,7 +2575,12 @@ impl App {
             projection.plan_type,
             projection.has_chatgpt_account,
         );
-        self.refresh_observed_active_store_account_id();
+        self.observed_active_store_account_id =
+            Self::observed_active_store_account_id_for_projection_owner(
+                self.remote_app_server_url.as_deref(),
+                self.active_store_account_id_from_auth_manager(),
+                projection_active_store_account_id,
+            );
         self.recompute_accounts_status_cache_expiry(Utc::now());
     }
 
@@ -5937,9 +5994,14 @@ impl App {
         let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
-        let observed_active_store_account_id = auth_manager
-            .active_chatgpt_account_summary()
-            .map(|summary| summary.store_account_id);
+        let observed_active_store_account_id =
+            Self::observed_active_store_account_id_for_projection_owner(
+                remote_app_server_url.as_deref(),
+                auth_manager
+                    .active_chatgpt_account_summary()
+                    .map(|summary| summary.store_account_id),
+                bootstrap.active_store_account_id.clone(),
+            );
 
         let mut app = Self {
             model_catalog,
@@ -6855,6 +6917,18 @@ impl App {
                 self.on_update_personality(personality);
             }
             AppEvent::StartOpenAccountsPopup => {
+                if self.remote_app_server_url.is_some() {
+                    self.chat_widget.open_accounts_loading_popup_unchecked();
+                    let request_handle = app_server.request_handle();
+                    let app_event_tx = self.app_event_tx.clone();
+                    tokio::spawn(async move {
+                        let result = load_accounts_from_request_handle(request_handle)
+                            .await
+                            .map_err(|err| err.to_string());
+                        app_event_tx.send(AppEvent::RemoteAccountsPopupLoaded { result });
+                    });
+                    return Ok(AppRunControl::Continue);
+                }
                 if let Err(err) = self.auth_manager.reload_strict() {
                     self.chat_widget
                         .add_error_message(format!("Failed to reload auth store: {err}"));
@@ -6867,11 +6941,26 @@ impl App {
                 );
             }
             AppEvent::PollAccountsStatusCache => {
+                if self.remote_app_server_url.is_some() {
+                    return Ok(AppRunControl::Continue);
+                }
                 self.maybe_start_accounts_status_refresh(
                     /*force*/ false, /*open_popup_when_ready*/ false,
                     /*show_loading_popup*/ false,
                 );
             }
+            AppEvent::RemoteAccountsPopupLoaded { result } => match result {
+                Ok(accounts) => {
+                    self.chat_widget.open_accounts_popup_with_entries_at(
+                        Local::now(),
+                        popup_accounts_from_remote_entries(accounts),
+                        /*allow_add_account*/ false,
+                    );
+                }
+                Err(error_message) => {
+                    self.chat_widget.open_accounts_error_popup(error_message);
+                }
+            },
             AppEvent::AccountsStatusCacheFetched {
                 updated_accounts,
                 cache_fully_refreshed,
@@ -6910,6 +6999,43 @@ impl App {
                 }
             }
             AppEvent::SetActiveAccount { account_id } => {
+                if self.remote_app_server_url.is_some() {
+                    match app_server.set_active_account(account_id.clone()).await {
+                        Ok(()) => {
+                            let display = app_server
+                                .list_accounts()
+                                .await
+                                .ok()
+                                .and_then(|accounts| {
+                                    accounts
+                                        .into_iter()
+                                        .find(|account| account.id == account_id)
+                                        .map(|account| {
+                                            format_account_display(
+                                                account.label.as_deref(),
+                                                account.email.as_deref(),
+                                                &account_id,
+                                            )
+                                        })
+                                })
+                                .unwrap_or_else(|| account_id.clone());
+                            self.refresh_app_server_account_projection_after_manual_auth_change(
+                                app_server,
+                                AccountProjectionRefreshTrigger::ManualSetActiveAccount,
+                            );
+                            self.chat_widget.add_info_message(
+                                format!("Active account: {display}"),
+                                /*hint*/ None,
+                            );
+                        }
+                        Err(err) => {
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to set remote active account: {err}"
+                            ));
+                        }
+                    }
+                    return Ok(AppRunControl::Continue);
+                }
                 match self.auth_manager.set_active_account(&account_id) {
                     Ok(()) => {
                         let accounts = self.auth_manager.list_accounts();
@@ -6939,21 +7065,56 @@ impl App {
                     }
                 }
             }
-            AppEvent::OpenForceReleaseAccountPopup { account_id } => {
-                let Some(account) = self
-                    .auth_manager
-                    .list_accounts()
-                    .into_iter()
-                    .find(|account| account.id == account_id)
-                else {
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to open force-release popup: account '{account_id}' not found"
-                    ));
-                    return Ok(AppRunControl::Continue);
-                };
-                self.chat_widget.open_force_release_account_popup(&account);
+            AppEvent::OpenForceReleaseAccountPopup {
+                account_id,
+                display,
+            } => {
+                self.chat_widget
+                    .open_force_release_account_popup(display, account_id);
             }
-            AppEvent::ForceReleaseAccountLease { account_id } => {
+            AppEvent::ForceReleaseAccountLease {
+                account_id,
+                display,
+            } => {
+                if self.remote_app_server_url.is_some() {
+                    match app_server
+                        .force_release_account_lease(account_id.clone())
+                        .await
+                    {
+                        Ok(ForceReleaseAccountLeaseStatus::Released) => {
+                            match app_server.list_accounts().await {
+                                Ok(accounts) => {
+                                    self.chat_widget.open_accounts_popup_with_entries_at(
+                                        Local::now(),
+                                        popup_accounts_from_remote_entries(accounts),
+                                        /*allow_add_account*/ false,
+                                    );
+                                }
+                                Err(err) => {
+                                    self.chat_widget.open_accounts_error_popup(format!(
+                                        "Failed to reload remote accounts after force-release: {err}"
+                                    ));
+                                }
+                            }
+                            self.chat_widget.add_info_message(
+                                format!("Released lease for {display}."),
+                                /*hint*/ None,
+                            );
+                        }
+                        Ok(ForceReleaseAccountLeaseStatus::NotFound) => {
+                            self.chat_widget
+                                .add_error_message(format!("No live lease found for {display}."));
+                            self.app_event_tx.send(AppEvent::StartOpenAccountsPopup);
+                        }
+                        Err(err) => {
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to force-release remote account lease: {err}"
+                            ));
+                            self.app_event_tx.send(AppEvent::StartOpenAccountsPopup);
+                        }
+                    }
+                    return Ok(AppRunControl::Continue);
+                }
                 let display = self
                     .auth_manager
                     .list_accounts()
@@ -6966,7 +7127,7 @@ impl App {
                             &account_id,
                         )
                     })
-                    .unwrap_or_else(|| account_id.clone());
+                    .unwrap_or(display);
                 match self.auth_manager.force_release_account(&account_id) {
                     Ok(codex_login::ForceReleaseAccountOutcome::Released(_)) => {
                         self.refresh_account_mutation_bookkeeping();
@@ -9580,6 +9741,108 @@ mod tests {
         assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
         assert_eq!(app.chat_widget.current_model(), initial_default_model);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_auth_manager_account_projection_load_converges_observed_active_store_account_id()
+    -> Result<()> {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let (_primary_store_account_id, secondary_store_account_id) =
+            seed_canonical_chatgpt_accounts(&mut app, "account-a");
+        app.handle_active_account_changed();
+
+        let mut app_server = crate::start_app_server_for_picker_with_auth_manager(
+            app.chat_widget.config_ref(),
+            &crate::AppServerTarget::Embedded,
+            app.auth_manager.clone(),
+            app.environment_manager.clone(),
+        )
+        .await
+        .expect("embedded app server sharing app auth manager");
+
+        app.auth_manager
+            .set_active_account(&secondary_store_account_id)
+            .expect("switch active account on shared auth manager");
+
+        let projection = app_server.load_account_projection().await?;
+
+        app.finish_app_server_account_projection_refresh(projection);
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(secondary_store_account_id)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn observed_active_store_account_id_for_projection_owner_prefers_projection_for_remote() {
+        assert_eq!(
+            App::observed_active_store_account_id_for_projection_owner(
+                Some("ws://127.0.0.1:8765"),
+                Some("local-store-account-a".to_string()),
+                Some("remote-store-account-b".to_string()),
+            ),
+            Some("remote-store-account-b".to_string())
+        );
+    }
+
+    #[test]
+    fn observed_active_store_account_id_for_projection_owner_prefers_auth_manager_for_embedded() {
+        assert_eq!(
+            App::observed_active_store_account_id_for_projection_owner(
+                None,
+                Some("local-store-account-a".to_string()),
+                Some("remote-store-account-b".to_string()),
+            ),
+            Some("local-store-account-a".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_projection_refresh_uses_projection_active_store_account_id_instead_of_local_auth_manager()
+     {
+        let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let (primary_store_account_id, _secondary_store_account_id) =
+            seed_canonical_chatgpt_accounts(&mut app, "account-a");
+        app.remote_app_server_url = Some("ws://127.0.0.1:8765".to_string());
+        app.handle_active_account_changed();
+
+        let available_models = all_model_presets();
+        let default_model = available_models
+            .iter()
+            .find(|model| model.is_default)
+            .unwrap_or(&available_models[0])
+            .model
+            .clone();
+        let remote_store_account_id = "remote-store-account-b".to_string();
+
+        app.finish_app_server_account_projection_refresh(AppServerAccountProjection {
+            active_store_account_id: Some(remote_store_account_id.clone()),
+            account_email: Some("remote@example.com".to_string()),
+            auth_mode: Some(codex_otel::TelemetryAuthMode::Chatgpt),
+            status_account_display: Some(StatusAccountDisplay::ChatGpt {
+                label: Some("Remote Account".to_string()),
+                email: Some("remote@example.com".to_string()),
+                plan: Some("Plus".to_string()),
+            }),
+            plan_type: Some(PlanType::Plus),
+            requires_openai_auth: true,
+            default_model,
+            feedback_audience: FeedbackAudience::External,
+            has_chatgpt_account: true,
+            available_models,
+        });
+
+        assert_eq!(
+            app.auth_manager
+                .active_chatgpt_account_summary()
+                .map(|summary| summary.store_account_id),
+            Some(primary_store_account_id)
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(remote_store_account_id)
+        );
     }
 
     #[tokio::test]

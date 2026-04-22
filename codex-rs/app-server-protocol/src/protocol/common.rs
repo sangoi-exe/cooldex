@@ -525,6 +525,21 @@ client_request_definitions! {
         response: v2::LogoutAccountResponse,
     },
 
+    AccountList => "account/list" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        response: v2::AccountListResponse,
+    },
+
+    SetActiveAccount => "account/active/set" {
+        params: v2::SetActiveAccountParams,
+        response: v2::SetActiveAccountResponse,
+    },
+
+    ForceReleaseAccountLease => "account/lease/forceRelease" {
+        params: v2::ForceReleaseAccountLeaseParams,
+        response: v2::ForceReleaseAccountLeaseResponse,
+    },
+
     GetAccountRateLimits => "account/rateLimits/read" {
         params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
         response: v2::GetAccountRateLimitsResponse,
@@ -1587,6 +1602,64 @@ mod tests {
             json!({
                 "method": "account/logout",
                 "id": 5,
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_account_list() -> Result<()> {
+        let request = ClientRequest::AccountList {
+            request_id: RequestId::Integer(6),
+            params: None,
+        };
+        assert_eq!(
+            json!({
+                "method": "account/list",
+                "id": 6,
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_set_active_account() -> Result<()> {
+        let request = ClientRequest::SetActiveAccount {
+            request_id: RequestId::Integer(7),
+            params: v2::SetActiveAccountParams {
+                account_id: "account-123".to_string(),
+            },
+        };
+        assert_eq!(
+            json!({
+                "method": "account/active/set",
+                "id": 7,
+                "params": {
+                    "accountId": "account-123"
+                }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_force_release_account_lease() -> Result<()> {
+        let request = ClientRequest::ForceReleaseAccountLease {
+            request_id: RequestId::Integer(8),
+            params: v2::ForceReleaseAccountLeaseParams {
+                account_id: "account-123".to_string(),
+            },
+        };
+        assert_eq!(
+            json!({
+                "method": "account/lease/forceRelease",
+                "id": 8,
+                "params": {
+                    "accountId": "account-123"
+                }
             }),
             serde_json::to_value(&request)?,
         );

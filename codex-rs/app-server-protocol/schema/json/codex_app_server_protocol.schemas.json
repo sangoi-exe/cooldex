@@ -1472,6 +1472,77 @@
             },
             "method": {
               "enum": [
+                "account/list"
+              ],
+              "title": "Account/listRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "id",
+            "method"
+          ],
+          "title": "Account/listRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "account/active/set"
+              ],
+              "title": "Account/active/setRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/SetActiveAccountParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Account/active/setRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "account/lease/forceRelease"
+              ],
+              "title": "Account/lease/forceReleaseRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ForceReleaseAccountLeaseParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Account/lease/forceReleaseRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "account/rateLimits/read"
               ],
               "title": "Account/rateLimits/readRequestMethod",
@@ -5117,6 +5188,83 @@
           }
         ]
       },
+      "AccountLeaseState": {
+        "enum": [
+          "notLeased",
+          "leasedByCurrentSession",
+          "leasedByOtherSession",
+          "unavailable"
+        ],
+        "type": "string"
+      },
+      "AccountListEntry": {
+        "properties": {
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exhaustedUntilUnixSeconds": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lastRateLimits": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/RateLimitSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "leaseState": {
+            "$ref": "#/definitions/v2/AccountLeaseState"
+          }
+        },
+        "required": [
+          "email",
+          "exhaustedUntilUnixSeconds",
+          "id",
+          "isActive",
+          "label",
+          "lastRateLimits",
+          "leaseState"
+        ],
+        "type": "object"
+      },
+      "AccountListResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "accounts": {
+            "items": {
+              "$ref": "#/definitions/v2/AccountListEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "accounts"
+        ],
+        "title": "AccountListResponse",
+        "type": "object"
+      },
       "AccountLoginCompletedNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -7951,6 +8099,39 @@
           "path"
         ],
         "type": "object"
+      },
+      "ForceReleaseAccountLeaseParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "accountId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "accountId"
+        ],
+        "title": "ForceReleaseAccountLeaseParams",
+        "type": "object"
+      },
+      "ForceReleaseAccountLeaseResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "status": {
+            "$ref": "#/definitions/v2/ForceReleaseAccountLeaseStatus"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "ForceReleaseAccountLeaseResponse",
+        "type": "object"
+      },
+      "ForceReleaseAccountLeaseStatus": {
+        "enum": [
+          "released",
+          "notFound"
+        ],
+        "type": "string"
       },
       "ForcedLoginMethod": {
         "enum": [
@@ -12603,6 +12784,24 @@
             "type": "object"
           }
         ]
+      },
+      "SetActiveAccountParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "accountId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "accountId"
+        ],
+        "title": "SetActiveAccountParams",
+        "type": "object"
+      },
+      "SetActiveAccountResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "SetActiveAccountResponse",
+        "type": "object"
       },
       "Settings": {
         "description": "Settings for a collaboration mode.",

@@ -3,10 +3,13 @@ use crate::auth::storage::FileAuthStorage;
 use crate::auth::storage::get_auth_file;
 use crate::token_data::IdTokenInfo;
 use chrono::Utc;
+use codex_account_state::AccountUsageState;
 use codex_app_server_protocol::AuthMode;
 use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::auth::KnownPlan as InternalKnownPlan;
 use codex_protocol::auth::PlanType as InternalPlanType;
+use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::RateLimitWindow;
 
 use base64::Engine;
 use codex_protocol::config_types::ForcedLoginMethod;
@@ -14,6 +17,7 @@ use codex_protocol::config_types::ModelProviderAuthInfo;
 use pretty_assertions::assert_eq;
 use serde::Serialize;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tempfile::tempdir;
@@ -362,6 +366,228 @@ async fn auth_manager_logout_with_revoke_releases_runtime_active_account_lease()
             .account_is_leased_by_other("other-session", None, store_account_id, Utc::now())
             .expect("lease lookup should succeed")
     );
+}
+
+#[tokio::test]
+async fn resolve_chatgpt_auth_for_store_account_id_reads_latest_persisted_tokens() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let store_account_id = "store-account-a";
+    let workspace_id = "workspace-a";
+    let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("plus".to_string()),
+        chatgpt_account_id: Some(workspace_id.to_string()),
+    })
+    .expect("create test jwt");
+    let make_store = |access_token: &str, refresh_token: &str| AuthStore {
+        active_account_id: Some(store_account_id.to_string()),
+        accounts: vec![StoredAccount {
+            id: store_account_id.to_string(),
+            label: Some("Primary".to_string()),
+            tokens: TokenData {
+                id_token: IdTokenInfo {
+                    email: Some("primary@example.com".to_string()),
+                    chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                    chatgpt_user_id: Some("user-12345".to_string()),
+                    chatgpt_account_id: Some(workspace_id.to_string()),
+                    chatgpt_account_is_fedramp: false,
+                    raw_jwt: raw_jwt.clone(),
+                },
+                access_token: access_token.to_string(),
+                refresh_token: refresh_token.to_string(),
+                account_id: Some(workspace_id.to_string()),
+            },
+            last_refresh: Some(Utc::now()),
+            usage: None,
+        }],
+        ..AuthStore::default()
+    };
+    save_auth(
+        codex_home.path(),
+        &make_store("old-access-token", "old-refresh-token"),
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save initial auth store");
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+    let cached_auth = manager.auth_cached().expect("cached auth should exist");
+    assert_eq!(
+        cached_auth
+            .get_token_data()
+            .expect("cached token data should exist")
+            .access_token,
+        "old-access-token"
+    );
+
+    save_auth(
+        codex_home.path(),
+        &make_store("new-access-token", "new-refresh-token"),
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("overwrite auth store with refreshed tokens");
+
+    let resolution = manager
+        .resolve_chatgpt_auth_for_store_account_id(
+            store_account_id,
+            ChatgptAccountRefreshMode::Never,
+        )
+        .await
+        .expect("stored account should still resolve");
+    let ChatgptAccountAuthResolution::Auth(auth) = resolution else {
+        panic!("stored account should resolve without removal");
+    };
+    let token_data = auth
+        .get_token_data()
+        .expect("resolved token data should exist");
+    assert_eq!(token_data.access_token, "new-access-token");
+    assert_eq!(token_data.refresh_token, "new-refresh-token");
+}
+
+#[test]
+fn public_auto_switch_selector_reads_sqlite_usage_truth_after_manager_construction() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let workspace_id = "workspace-a";
+    let primary_store_account_id = "store-account-a";
+    let fallback_store_account_id = "store-account-b";
+    let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("plus".to_string()),
+        chatgpt_account_id: Some(workspace_id.to_string()),
+    })
+    .expect("create test jwt");
+    let make_account = |store_account_id: &str, label: &str| StoredAccount {
+        id: store_account_id.to_string(),
+        label: Some(label.to_string()),
+        tokens: TokenData {
+            id_token: IdTokenInfo {
+                email: Some(format!("{store_account_id}@example.com")),
+                chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                chatgpt_user_id: Some(format!("user-{store_account_id}")),
+                chatgpt_account_id: Some(workspace_id.to_string()),
+                chatgpt_account_is_fedramp: false,
+                raw_jwt: raw_jwt.clone(),
+            },
+            access_token: format!("{store_account_id}-access-token"),
+            refresh_token: format!("{store_account_id}-refresh-token"),
+            account_id: Some(workspace_id.to_string()),
+        },
+        last_refresh: None,
+        usage: None,
+    };
+    save_auth(
+        codex_home.path(),
+        &AuthStore {
+            active_account_id: Some(primary_store_account_id.to_string()),
+            accounts: vec![
+                make_account(primary_store_account_id, "Primary"),
+                make_account(fallback_store_account_id, "Fallback"),
+            ],
+            ..AuthStore::default()
+        },
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store");
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    manager
+        .account_state_store
+        .as_ref()
+        .expect("account-state store should open")
+        .upsert_usage_states(&HashMap::from([(
+            fallback_store_account_id.to_string(),
+            AccountUsageState {
+                last_rate_limits: Some(RateLimitSnapshot {
+                    limit_id: Some("codex".to_string()),
+                    limit_name: None,
+                    primary: Some(RateLimitWindow {
+                        remaining_percent: 80.0,
+                        window_minutes: Some(15),
+                        resets_at: Some((Utc::now() + chrono::Duration::minutes(15)).timestamp()),
+                    }),
+                    secondary: None,
+                    credits: None,
+                    plan_type: None,
+                    rate_limit_reached_type: None,
+                }),
+                exhausted_until: None,
+                last_seen_at: Some(Utc::now()),
+            },
+        )]))
+        .expect("persist sqlite usage truth");
+
+    assert_eq!(
+        manager.select_account_for_auto_switch(None, None),
+        Some(fallback_store_account_id.to_string())
+    );
+}
+
+#[test]
+fn has_saved_chatgpt_accounts_reads_latest_persisted_store_after_manager_construction() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let store_account_id = "store-account-a";
+    let workspace_id = "workspace-a";
+    let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("plus".to_string()),
+        chatgpt_account_id: Some(workspace_id.to_string()),
+    })
+    .expect("create test jwt");
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+    assert!(
+        !manager.has_saved_chatgpt_accounts(),
+        "fresh manager should start with no saved accounts"
+    );
+
+    save_auth(
+        codex_home.path(),
+        &AuthStore {
+            active_account_id: Some(store_account_id.to_string()),
+            accounts: vec![StoredAccount {
+                id: store_account_id.to_string(),
+                label: Some("Primary".to_string()),
+                tokens: TokenData {
+                    id_token: IdTokenInfo {
+                        email: Some("primary@example.com".to_string()),
+                        chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                        chatgpt_user_id: Some("user-12345".to_string()),
+                        chatgpt_account_id: Some(workspace_id.to_string()),
+                        chatgpt_account_is_fedramp: false,
+                        raw_jwt,
+                    },
+                    access_token: "access-token".to_string(),
+                    refresh_token: "refresh-token".to_string(),
+                    account_id: Some(workspace_id.to_string()),
+                },
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            }],
+            ..AuthStore::default()
+        },
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store after manager construction");
+
+    assert!(manager.has_saved_chatgpt_accounts());
 }
 
 #[test]

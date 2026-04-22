@@ -1878,6 +1878,76 @@ pub struct GetAccountResponse {
     pub active_chatgpt_store_account_id: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum AccountLeaseState {
+    NotLeased,
+    LeasedByCurrentSession,
+    LeasedByOtherSession,
+    Unavailable,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountListEntry {
+    pub id: String,
+    #[schemars(required, schema_with = "required_nullable_string_schema")]
+    pub label: Option<String>,
+    #[schemars(required, schema_with = "required_nullable_string_schema")]
+    pub email: Option<String>,
+    pub is_active: bool,
+    #[schemars(required, schema_with = "required_nullable_i64_schema")]
+    #[ts(optional = false)]
+    #[ts(type = "number | null")]
+    pub exhausted_until_unix_seconds: Option<i64>,
+    #[schemars(required, schema_with = "required_nullable_rate_limit_snapshot_schema")]
+    pub last_rate_limits: Option<RateLimitSnapshot>,
+    pub lease_state: AccountLeaseState,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountListResponse {
+    pub accounts: Vec<AccountListEntry>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct SetActiveAccountParams {
+    pub account_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct SetActiveAccountResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ForceReleaseAccountLeaseParams {
+    pub account_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ForceReleaseAccountLeaseStatus {
+    Released,
+    NotFound,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ForceReleaseAccountLeaseResponse {
+    pub status: ForceReleaseAccountLeaseStatus,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -5607,6 +5677,10 @@ fn required_nullable_string_schema(schema_gen: &mut SchemaGenerator) -> Schema {
     schema_gen.subschema_for::<Option<String>>()
 }
 
+fn required_nullable_i64_schema(schema_gen: &mut SchemaGenerator) -> Schema {
+    schema_gen.subschema_for::<Option<i64>>()
+}
+
 fn required_nullable_account_schema(schema_gen: &mut SchemaGenerator) -> Schema {
     schema_gen.subschema_for::<Option<Account>>()
 }
@@ -5617,6 +5691,10 @@ fn required_nullable_auth_mode_schema(schema_gen: &mut SchemaGenerator) -> Schem
 
 fn required_nullable_plan_type_schema(schema_gen: &mut SchemaGenerator) -> Schema {
     schema_gen.subschema_for::<Option<PlanType>>()
+}
+
+fn required_nullable_rate_limit_snapshot_schema(schema_gen: &mut SchemaGenerator) -> Schema {
+    schema_gen.subschema_for::<Option<RateLimitSnapshot>>()
 }
 
 fn required_nullable_rate_limits_by_limit_id_schema(schema_gen: &mut SchemaGenerator) -> Schema {

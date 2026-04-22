@@ -778,6 +778,48 @@ enum AccountAvailabilityStatus {
     WeeklyLimitReached,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AccountsPopupEntry {
+    pub(crate) id: String,
+    pub(crate) label: Option<String>,
+    pub(crate) email: Option<String>,
+    pub(crate) is_active: bool,
+    pub(crate) exhausted_until: Option<DateTime<Utc>>,
+    pub(crate) last_rate_limits: Option<RateLimitSnapshot>,
+    pub(crate) lease_state: AccountsPopupLeaseState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccountsPopupLeaseState {
+    NotLeased,
+    LeasedByCurrentSession,
+    LeasedByOtherSession,
+    Unavailable,
+}
+
+impl From<codex_login::AccountSummary> for AccountsPopupEntry {
+    fn from(value: codex_login::AccountSummary) -> Self {
+        Self {
+            id: value.id,
+            label: value.label,
+            email: value.email,
+            is_active: value.is_active,
+            exhausted_until: value.exhausted_until,
+            last_rate_limits: value.last_rate_limits,
+            lease_state: match value.lease_state {
+                codex_login::AccountLeaseState::NotLeased => AccountsPopupLeaseState::NotLeased,
+                codex_login::AccountLeaseState::LeasedByCurrentSession => {
+                    AccountsPopupLeaseState::LeasedByCurrentSession
+                }
+                codex_login::AccountLeaseState::LeasedByOtherSession => {
+                    AccountsPopupLeaseState::LeasedByOtherSession
+                }
+                codex_login::AccountLeaseState::Unavailable => AccountsPopupLeaseState::Unavailable,
+            },
+        }
+    }
+}
+
 impl AccountAvailabilityStatus {
     fn label_foreground(self) -> Color {
         match self {
@@ -9771,7 +9813,10 @@ impl ChatWidget {
             );
             return;
         }
+        self.open_accounts_loading_popup_unchecked();
+    }
 
+    pub(crate) fn open_accounts_loading_popup_unchecked(&mut self) {
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Accounts".bold()));
         header.push(Line::from("Loading account usage data...".dim()));
@@ -9782,6 +9827,24 @@ impl ChatWidget {
             items: vec![SelectionItem {
                 name: "⏳ Fetching account status...".to_string(),
                 description: Some("Please wait a moment.".to_string()),
+                dismiss_on_select: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn open_accounts_error_popup(&mut self, message: String) {
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from("Accounts".bold()));
+        header.push(Line::from("Failed to load account data.".red()));
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items: vec![SelectionItem {
+                name: "Error".to_string(),
+                description: Some(message),
                 dismiss_on_select: false,
                 ..Default::default()
             }],
@@ -10002,7 +10065,7 @@ impl ChatWidget {
 
     fn account_popup_description_parts(
         now_local: DateTime<Local>,
-        account: &codex_login::AccountSummary,
+        account: &AccountsPopupEntry,
         include_current_marker: bool,
     ) -> Vec<String> {
         let now = now_local.with_timezone(&Utc);
@@ -10018,14 +10081,13 @@ impl ChatWidget {
             description_parts.push("currently active".to_string());
         }
         match account.lease_state {
-            codex_login::AccountLeaseState::LeasedByCurrentSession => {
+            AccountsPopupLeaseState::LeasedByCurrentSession => {
                 description_parts.push("lease: current session".to_string());
             }
-            codex_login::AccountLeaseState::LeasedByOtherSession => {
+            AccountsPopupLeaseState::LeasedByOtherSession => {
                 description_parts.push("lease: another live session".to_string());
             }
-            codex_login::AccountLeaseState::NotLeased
-            | codex_login::AccountLeaseState::Unavailable => {}
+            AccountsPopupLeaseState::NotLeased | AccountsPopupLeaseState::Unavailable => {}
         }
         if let Some(status) = status {
             description_parts
@@ -10060,9 +10122,9 @@ impl ChatWidget {
 
     fn account_availability_status(
         now_local: DateTime<Local>,
-        account: &codex_login::AccountSummary,
+        account: &AccountsPopupEntry,
     ) -> AccountAvailabilityStatus {
-        if account.lease_state == codex_login::AccountLeaseState::LeasedByOtherSession {
+        if account.lease_state == AccountsPopupLeaseState::LeasedByOtherSession {
             return AccountAvailabilityStatus::LeasedByOtherSession;
         }
         let snapshot = account.last_rate_limits.as_ref();
@@ -10084,16 +10146,47 @@ impl ChatWidget {
             return;
         }
 
-        // Merge-safety anchor: `/accounts` descriptions depend on `AccountSummary` cache semantics from
-        // `AuthManager::list_accounts()` (active flag, exhausted_until, last_rate_limits).
-        let accounts = self.auth_manager.list_accounts();
+        // Merge-safety anchor: `/accounts` descriptions depend on the popup entry view model
+        // preserving the popup-relevant `AuthManager::list_accounts()` semantics (active flag,
+        // exhausted_until, last_rate_limits, lease state) across local and remote owners.
+        let accounts = self
+            .auth_manager
+            .list_accounts()
+            .into_iter()
+            .map(AccountsPopupEntry::from)
+            .collect();
+        self.open_accounts_popup_with_entries_at(
+            now_local, accounts, /*allow_add_account*/ true,
+        );
+    }
 
+    pub(crate) fn open_accounts_popup_with_entries_at(
+        &mut self,
+        now_local: DateTime<Local>,
+        accounts: Vec<AccountsPopupEntry>,
+        allow_add_account: bool,
+    ) {
+        self.show_accounts_popup_from_entries(now_local, accounts, allow_add_account);
+    }
+
+    fn show_accounts_popup_from_entries(
+        &mut self,
+        now_local: DateTime<Local>,
+        accounts: Vec<AccountsPopupEntry>,
+        allow_add_account: bool,
+    ) {
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Accounts".bold()));
         header.push(Line::from(if accounts.is_empty() {
-            "No ChatGPT accounts are saved yet. Add one to continue.".dim()
-        } else {
+            if allow_add_account {
+                "No ChatGPT accounts are saved yet. Add one to continue.".dim()
+            } else {
+                "No remote ChatGPT accounts are available.".dim()
+            }
+        } else if allow_add_account {
             "Select an account to make it active, or add a new one.".dim()
+        } else {
+            "Select an account to make it active.".dim()
         }));
 
         let mut items = accounts
@@ -10112,21 +10205,22 @@ impl ChatWidget {
                     (!description_parts.is_empty()).then(|| description_parts.join(" • "));
 
                 let account_id = account.id;
-                let actions: Vec<SelectionAction> = if account.lease_state
-                    == codex_login::AccountLeaseState::LeasedByOtherSession
-                {
-                    vec![Box::new(move |tx| {
-                        tx.send(AppEvent::OpenForceReleaseAccountPopup {
-                            account_id: account_id.clone(),
-                        });
-                    })]
-                } else {
-                    vec![Box::new(move |tx| {
-                        tx.send(AppEvent::SetActiveAccount {
-                            account_id: account_id.clone(),
-                        });
-                    })]
-                };
+                let display = name.clone();
+                let actions: Vec<SelectionAction> =
+                    if account.lease_state == AccountsPopupLeaseState::LeasedByOtherSession {
+                        vec![Box::new(move |tx| {
+                            tx.send(AppEvent::OpenForceReleaseAccountPopup {
+                                account_id: account_id.clone(),
+                                display: display.clone(),
+                            });
+                        })]
+                    } else {
+                        vec![Box::new(move |tx| {
+                            tx.send(AppEvent::SetActiveAccount {
+                                account_id: account_id.clone(),
+                            });
+                        })]
+                    };
                 SelectionItem {
                     name,
                     name_foreground: Some(status.label_foreground()),
@@ -10139,15 +10233,17 @@ impl ChatWidget {
             })
             .collect::<Vec<_>>();
 
-        items.push(SelectionItem {
-            name: "Add account...".to_string(),
-            description: Some("sign in to add another ChatGPT account".to_string()),
-            actions: vec![Box::new(|tx| {
-                tx.send(AppEvent::StartChatGptAddAccount);
-            })],
-            dismiss_on_select: true,
-            ..Default::default()
-        });
+        if allow_add_account {
+            items.push(SelectionItem {
+                name: "Add account...".to_string(),
+                description: Some("sign in to add another ChatGPT account".to_string()),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::StartChatGptAddAccount);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
             header: Box::new(header),
@@ -10157,17 +10253,7 @@ impl ChatWidget {
         });
     }
 
-    pub(crate) fn open_force_release_account_popup(
-        &mut self,
-        account: &codex_login::AccountSummary,
-    ) {
-        let display = account
-            .label
-            .clone()
-            .or_else(|| account.email.clone())
-            .unwrap_or_else(|| account.id.clone());
-        let account_id = account.id.clone();
-
+    pub(crate) fn open_force_release_account_popup(&mut self, display: String, account_id: String) {
         let mut header = ColumnRenderable::new();
         header.push(Line::from("Force release account lease?").bold());
         header.push(Line::from(format!(
@@ -10181,6 +10267,7 @@ impl ChatWidget {
                 actions: vec![Box::new(move |tx| {
                     tx.send(AppEvent::ForceReleaseAccountLease {
                         account_id: account_id.clone(),
+                        display: display.clone(),
                     });
                 })],
                 dismiss_on_select: true,

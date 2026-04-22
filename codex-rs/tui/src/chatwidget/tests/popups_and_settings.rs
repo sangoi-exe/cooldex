@@ -2144,6 +2144,89 @@ async fn single_reasoning_option_skips_selection() {
 }
 
 #[tokio::test]
+async fn remote_accounts_popup_snapshot_omits_add_account_row() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.open_accounts_popup_with_entries_at(
+        Local::now(),
+        vec![AccountsPopupEntry {
+            id: "acct-remote-1".to_string(),
+            label: Some("Remote Primary".to_string()),
+            email: Some("remote-primary@example.com".to_string()),
+            is_active: true,
+            exhausted_until: None,
+            last_rate_limits: None,
+            lease_state: AccountsPopupLeaseState::NotLeased,
+        }],
+        /*allow_add_account*/ false,
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("remote_accounts_popup", popup);
+    assert!(
+        !popup.contains("Add account..."),
+        "expected remote popup to omit the local add-account action, got:\n{popup}"
+    );
+    assert!(
+        popup.contains("Select an account to make it active."),
+        "expected remote popup copy to describe the read-only roster action, got:\n{popup}"
+    );
+}
+
+#[tokio::test]
+async fn remote_accounts_popup_selects_active_account() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.open_accounts_popup_with_entries_at(
+        Local::now(),
+        vec![AccountsPopupEntry {
+            id: "acct-remote-1".to_string(),
+            label: Some("Remote Primary".to_string()),
+            email: Some("remote-primary@example.com".to_string()),
+            is_active: false,
+            exhausted_until: None,
+            last_rate_limits: None,
+            lease_state: AccountsPopupLeaseState::NotLeased,
+        }],
+        /*allow_add_account*/ false,
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::SetActiveAccount { account_id }) if account_id == "acct-remote-1"
+    );
+}
+
+#[tokio::test]
+async fn remote_accounts_popup_leased_account_opens_force_release_confirmation() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.open_accounts_popup_with_entries_at(
+        Local::now(),
+        vec![AccountsPopupEntry {
+            id: "acct-remote-leased".to_string(),
+            label: Some("Remote Lease".to_string()),
+            email: Some("remote-lease@example.com".to_string()),
+            is_active: false,
+            exhausted_until: None,
+            last_rate_limits: None,
+            lease_state: AccountsPopupLeaseState::LeasedByOtherSession,
+        }],
+        /*allow_add_account*/ false,
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::OpenForceReleaseAccountPopup { account_id, display })
+            if account_id == "acct-remote-leased" && display == "Remote Lease"
+    );
+}
+
+#[tokio::test]
 async fn feedback_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

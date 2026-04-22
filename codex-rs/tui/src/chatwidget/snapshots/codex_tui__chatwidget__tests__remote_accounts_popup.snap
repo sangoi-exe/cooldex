@@ -1,0 +1,11 @@
+---
+source: tui/src/chatwidget/tests/popups_and_settings.rs
+expression: popup
+---
+  Accounts
+  Select an account to make it active.
+
+› 1. Remote Primary (current)  status: available • email: remote-
+                               primary@example.com
+
+  Press enter to confirm or esc to go back

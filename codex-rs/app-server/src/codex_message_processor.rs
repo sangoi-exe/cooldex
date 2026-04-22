@@ -26,6 +26,9 @@ use codex_analytics::AnalyticsJsonRpcError;
 use codex_analytics::InputError;
 use codex_analytics::TurnSteerRequestError;
 use codex_app_server_protocol::Account;
+use codex_app_server_protocol::AccountLeaseState as ApiAccountLeaseState;
+use codex_app_server_protocol::AccountListEntry;
+use codex_app_server_protocol::AccountListResponse;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
 use codex_app_server_protocol::AccountUpdatedNotification;
 use codex_app_server_protocol::AddCreditsNudgeCreditType;
@@ -57,6 +60,9 @@ use codex_app_server_protocol::ExperimentalFeatureListResponse;
 use codex_app_server_protocol::ExperimentalFeatureStage as ApiExperimentalFeatureStage;
 use codex_app_server_protocol::FeedbackUploadParams;
 use codex_app_server_protocol::FeedbackUploadResponse;
+use codex_app_server_protocol::ForceReleaseAccountLeaseParams;
+use codex_app_server_protocol::ForceReleaseAccountLeaseResponse;
+use codex_app_server_protocol::ForceReleaseAccountLeaseStatus;
 use codex_app_server_protocol::FuzzyFileSearchParams;
 use codex_app_server_protocol::FuzzyFileSearchResponse;
 use codex_app_server_protocol::FuzzyFileSearchSessionStartParams;
@@ -124,6 +130,8 @@ use codex_app_server_protocol::SendAddCreditsNudgeEmailParams;
 use codex_app_server_protocol::SendAddCreditsNudgeEmailResponse;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequestResolvedNotification;
+use codex_app_server_protocol::SetActiveAccountParams;
+use codex_app_server_protocol::SetActiveAccountResponse;
 use codex_app_server_protocol::SkillSummary;
 use codex_app_server_protocol::SkillsConfigWriteParams;
 use codex_app_server_protocol::SkillsConfigWriteResponse;
@@ -278,6 +286,7 @@ use codex_login::CodexAuth;
 use codex_login::EXTERNAL_INVALID_ACCESS_TOKEN_MESSAGE;
 use codex_login::EXTERNAL_SUPPORTED_CHATGPT_PLAN_REQUIRED_MESSAGE;
 use codex_login::ExternalAuthLoginError;
+use codex_login::ForceReleaseAccountOutcome;
 use codex_login::LoginSuccess;
 use codex_login::ServerOptions as LoginServerOptions;
 use codex_login::ShutdownHandle;
@@ -1139,6 +1148,21 @@ impl CodexMessageProcessor {
                 params: _,
             } => {
                 self.logout_v2(to_connection_request_id(request_id)).await;
+            }
+            ClientRequest::AccountList {
+                request_id,
+                params: _,
+            } => {
+                self.list_accounts_v2(to_connection_request_id(request_id))
+                    .await;
+            }
+            ClientRequest::SetActiveAccount { request_id, params } => {
+                self.set_active_account_v2(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::ForceReleaseAccountLease { request_id, params } => {
+                self.force_release_account_lease_v2(to_connection_request_id(request_id), params)
+                    .await;
             }
             ClientRequest::CancelLoginAccount { request_id, params } => {
                 self.cancel_login_v2(to_connection_request_id(request_id), params)
@@ -2002,6 +2026,96 @@ impl CodexMessageProcessor {
             }
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
+            }
+        }
+    }
+
+    async fn list_accounts_v2(&self, request_id: ConnectionRequestId) {
+        let response = AccountListResponse {
+            accounts: self
+                .auth_manager
+                .list_accounts()
+                .into_iter()
+                .map(account_list_entry_from_summary)
+                .collect(),
+        };
+        self.outgoing.send_response(request_id, response).await;
+    }
+
+    async fn set_active_account_v2(
+        &self,
+        request_id: ConnectionRequestId,
+        params: SetActiveAccountParams,
+    ) {
+        match self.auth_manager.set_active_account(&params.account_id) {
+            Ok(()) => {
+                self.outgoing
+                    .send_response(request_id, SetActiveAccountResponse {})
+                    .await;
+                self.outgoing
+                    .send_server_notification(ServerNotification::AccountUpdated(
+                        self.current_account_updated_notification(),
+                    ))
+                    .await;
+            }
+            Err(err) => {
+                self.outgoing
+                    .send_error(
+                        request_id,
+                        JSONRPCErrorError {
+                            code: INVALID_REQUEST_ERROR_CODE,
+                            message: format!(
+                                "failed to set active account '{}': {err}",
+                                params.account_id
+                            ),
+                            data: None,
+                        },
+                    )
+                    .await;
+            }
+        }
+    }
+
+    async fn force_release_account_lease_v2(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ForceReleaseAccountLeaseParams,
+    ) {
+        match self.auth_manager.force_release_account(&params.account_id) {
+            Ok(ForceReleaseAccountOutcome::Released(_)) => {
+                self.outgoing
+                    .send_response(
+                        request_id,
+                        ForceReleaseAccountLeaseResponse {
+                            status: ForceReleaseAccountLeaseStatus::Released,
+                        },
+                    )
+                    .await;
+            }
+            Ok(ForceReleaseAccountOutcome::NotFound) => {
+                self.outgoing
+                    .send_response(
+                        request_id,
+                        ForceReleaseAccountLeaseResponse {
+                            status: ForceReleaseAccountLeaseStatus::NotFound,
+                        },
+                    )
+                    .await;
+            }
+            Err(err) => {
+                self.outgoing
+                    .send_error(
+                        request_id,
+                        JSONRPCErrorError {
+                            code: INVALID_REQUEST_ERROR_CODE,
+                            message: format!(
+                                "failed to force-release account lease '{}': {err}",
+                                params.account_id
+                            ),
+                            data: None,
+                        },
+                    )
+                    .await;
             }
         }
     }
@@ -10530,6 +10644,27 @@ fn normalize_thread_turns_status(
         if matches!(turn.status, TurnStatus::InProgress) {
             turn.status = TurnStatus::Interrupted;
         }
+    }
+}
+
+fn account_list_entry_from_summary(summary: codex_login::AccountSummary) -> AccountListEntry {
+    AccountListEntry {
+        id: summary.id,
+        label: summary.label,
+        email: summary.email,
+        is_active: summary.is_active,
+        exhausted_until_unix_seconds: summary.exhausted_until.map(|value| value.timestamp()),
+        last_rate_limits: summary.last_rate_limits.map(Into::into),
+        lease_state: match summary.lease_state {
+            codex_login::AccountLeaseState::NotLeased => ApiAccountLeaseState::NotLeased,
+            codex_login::AccountLeaseState::LeasedByCurrentSession => {
+                ApiAccountLeaseState::LeasedByCurrentSession
+            }
+            codex_login::AccountLeaseState::LeasedByOtherSession => {
+                ApiAccountLeaseState::LeasedByOtherSession
+            }
+            codex_login::AccountLeaseState::Unavailable => ApiAccountLeaseState::Unavailable,
+        },
     }
 }
 

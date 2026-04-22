@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ForceReleaseAccountLeaseStatus": {
+      "enum": [
+        "released",
+        "notFound"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "status": {
+      "$ref": "#/definitions/ForceReleaseAccountLeaseStatus"
+    }
+  },
+  "required": [
+    "status"
+  ],
+  "title": "ForceReleaseAccountLeaseResponse",
+  "type": "object"
+}

@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 
+use codex_app_server_protocol::AccountListEntry;
 use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::PluginInstallResponse;
@@ -430,6 +431,11 @@ pub(crate) enum AppEvent {
         projection_refresh_needed: bool,
     },
 
+    /// Result of loading the remote app-server owned `/accounts` roster.
+    RemoteAccountsPopupLoaded {
+        result: Result<Vec<AccountListEntry>, String>,
+    },
+
     /// Refresh the bounded app-server account projection after a live account
     /// update notification.
     RefreshAppServerAccountProjectionAfterAccountUpdate,
@@ -450,11 +456,13 @@ pub(crate) enum AppEvent {
     /// Open the confirmation popup for force-releasing a foreign account lease.
     OpenForceReleaseAccountPopup {
         account_id: String,
+        display: String,
     },
 
     /// Force-release a foreign account lease from the local account-state owner.
     ForceReleaseAccountLease {
         account_id: String,
+        display: String,
     },
 
     /// Start a ChatGPT login flow to add another stored account.

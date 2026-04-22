@@ -15,6 +15,8 @@ use codex_app_server_client::AppServerEvent;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::Account;
+use codex_app_server_protocol::AccountListEntry;
+use codex_app_server_protocol::AccountListResponse;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigBatchWriteParams;
@@ -25,6 +27,9 @@ use codex_app_server_protocol::ExternalAgentConfigDetectResponse;
 use codex_app_server_protocol::ExternalAgentConfigImportParams;
 use codex_app_server_protocol::ExternalAgentConfigImportResponse;
 use codex_app_server_protocol::ExternalAgentConfigMigrationItem;
+use codex_app_server_protocol::ForceReleaseAccountLeaseParams;
+use codex_app_server_protocol::ForceReleaseAccountLeaseResponse;
+use codex_app_server_protocol::ForceReleaseAccountLeaseStatus;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountResponse;
@@ -38,6 +43,8 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewDelivery;
 use codex_app_server_protocol::ReviewStartParams;
 use codex_app_server_protocol::ReviewStartResponse;
+use codex_app_server_protocol::SetActiveAccountParams;
+use codex_app_server_protocol::SetActiveAccountResponse;
 use codex_app_server_protocol::SkillsConfigWriteParams;
 use codex_app_server_protocol::SkillsConfigWriteResponse;
 use codex_app_server_protocol::SkillsListParams;
@@ -120,6 +127,7 @@ use uuid::Uuid;
 /// fetched asynchronously after bootstrap returns so that the TUI can render
 /// its first frame without waiting for the rate-limit round-trip.
 pub(crate) struct AppServerBootstrap {
+    pub(crate) active_store_account_id: Option<String>,
     pub(crate) account_email: Option<String>,
     pub(crate) auth_mode: Option<TelemetryAuthMode>,
     pub(crate) status_account_display: Option<StatusAccountDisplay>,
@@ -228,6 +236,7 @@ impl AppServerSession {
             .clone()
             .unwrap_or_else(|| projection.default_model.clone());
         Ok(AppServerBootstrap {
+            active_store_account_id: projection.active_store_account_id,
             account_email: projection.account_email,
             auth_mode: projection.auth_mode,
             status_account_display: projection.status_account_display,
@@ -563,6 +572,48 @@ impl AppServerSession {
         Ok(())
     }
 
+    pub(crate) async fn list_accounts(&mut self) -> Result<Vec<AccountListEntry>> {
+        let request_id = self.next_request_id();
+        let response: AccountListResponse = self
+            .client
+            .request_typed(ClientRequest::AccountList {
+                request_id,
+                params: None,
+            })
+            .await
+            .wrap_err("account/list failed in TUI")?;
+        Ok(response.accounts)
+    }
+
+    pub(crate) async fn set_active_account(&mut self, account_id: String) -> Result<()> {
+        let request_id = self.next_request_id();
+        let _: SetActiveAccountResponse = self
+            .client
+            .request_typed(ClientRequest::SetActiveAccount {
+                request_id,
+                params: SetActiveAccountParams { account_id },
+            })
+            .await
+            .wrap_err("account/active/set failed in TUI")?;
+        Ok(())
+    }
+
+    pub(crate) async fn force_release_account_lease(
+        &mut self,
+        account_id: String,
+    ) -> Result<ForceReleaseAccountLeaseStatus> {
+        let request_id = self.next_request_id();
+        let response: ForceReleaseAccountLeaseResponse = self
+            .client
+            .request_typed(ClientRequest::ForceReleaseAccountLease {
+                request_id,
+                params: ForceReleaseAccountLeaseParams { account_id },
+            })
+            .await
+            .wrap_err("account/lease/forceRelease failed in TUI")?;
+        Ok(response.status)
+    }
+
     pub(crate) async fn thread_unsubscribe(&mut self, thread_id: ThreadId) -> Result<()> {
         let request_id = self.next_request_id();
         let _: ThreadUnsubscribeResponse = self
@@ -872,6 +923,20 @@ pub(crate) async fn load_account_projection_from_request_handle(
         .map(model_preset_from_api_model)
         .collect::<Vec<_>>();
     build_account_projection(account, available_models)
+}
+
+pub(crate) async fn load_accounts_from_request_handle(
+    request_handle: AppServerRequestHandle,
+) -> Result<Vec<AccountListEntry>> {
+    let request_id = RequestId::String(format!("account-list-{}", Uuid::new_v4()));
+    let response: AccountListResponse = request_handle
+        .request_typed(ClientRequest::AccountList {
+            request_id,
+            params: None,
+        })
+        .await
+        .wrap_err("account/list failed while loading TUI accounts popup")?;
+    Ok(response.accounts)
 }
 
 fn build_account_projection(

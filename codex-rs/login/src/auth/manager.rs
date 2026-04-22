@@ -2308,15 +2308,12 @@ impl AuthManager {
     }
 
     fn chatgpt_auth_for_store_account_id(&self, store_account_id: &str) -> Option<CodexAuth> {
-        let (store, store_origin) = {
-            let guard = self.inner.read().ok()?;
-            (guard.store.clone(), guard.store_origin)
-        };
+        let loaded = self.load_store_from_storage();
         Self::derive_chatgpt_auth_from_store_account(
-            &store,
+            &loaded.store,
             store_account_id,
-            Self::storage_for_store_origin(&self.codex_home, &self.storage, store_origin),
-            store_origin,
+            Self::storage_for_store_origin(&self.codex_home, &self.storage, loaded.store_origin),
+            loaded.store_origin,
         )
     }
 
@@ -3045,7 +3042,9 @@ impl AuthManager {
         if !self.has_saved_chatgpt_accounts() {
             return None;
         }
-        let store = self.inner.read().ok()?.store.clone();
+        let store = self
+            .clone_cached_store_with_runtime_active_account()
+            .unwrap_or_else(|| self.load_store_from_storage().store);
         self.select_account_for_auto_switch_with_leases(
             &store,
             required_workspace_id,
@@ -4256,10 +4255,7 @@ impl AuthManager {
     }
 
     pub fn has_saved_chatgpt_accounts(&self) -> bool {
-        self.inner
-            .read()
-            .ok()
-            .is_some_and(|cached| !cached.store.accounts.is_empty())
+        !self.load_store_from_storage().store.accounts.is_empty()
     }
 
     pub fn runtime_session_id(&self) -> &str {
