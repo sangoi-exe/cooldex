@@ -34,6 +34,8 @@ use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::LoginAccountParams;
+use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::LogoutAccountResponse;
 use codex_app_server_protocol::MemoryResetResponse;
 use codex_app_server_protocol::Model as ApiModel;
@@ -154,6 +156,12 @@ pub(crate) struct AppServerAccountProjection {
     pub(crate) feedback_audience: FeedbackAudience,
     pub(crate) has_chatgpt_account: bool,
     pub(crate) available_models: Vec<ModelPreset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChatGptAddAccountLoginStart {
+    pub(crate) login_id: String,
+    pub(crate) auth_url: String,
 }
 
 pub(crate) struct AppServerSession {
@@ -612,6 +620,28 @@ impl AppServerSession {
             .await
             .wrap_err("account/lease/forceRelease failed in TUI")?;
         Ok(response.status)
+    }
+
+    pub(crate) async fn start_chatgpt_add_account_login(
+        &mut self,
+    ) -> Result<ChatGptAddAccountLoginStart> {
+        let request_id = self.next_request_id();
+        let response: LoginAccountResponse = self
+            .client
+            .request_typed(ClientRequest::LoginAccount {
+                request_id,
+                params: LoginAccountParams::Chatgpt,
+            })
+            .await
+            .wrap_err("account/login/start failed in TUI")?;
+        match response {
+            LoginAccountResponse::Chatgpt { login_id, auth_url } => {
+                Ok(ChatGptAddAccountLoginStart { login_id, auth_url })
+            }
+            other => Err(color_eyre::eyre::eyre!(
+                "unexpected account/login/start response in TUI: {other:?}"
+            )),
+        }
     }
 
     pub(crate) async fn thread_unsubscribe(&mut self, thread_id: ThreadId) -> Result<()> {

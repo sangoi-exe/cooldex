@@ -155,6 +155,7 @@ use crate::bottom_pane::prompt_args::parse_slash_name;
 pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::ChatComposerConfig;
 pub(crate) use chat_composer::InputResult;
+pub(crate) use chatgpt_add_account_view::ChatGptAddAccountControl;
 pub(crate) use chatgpt_add_account_view::ChatGptAddAccountSharedState;
 pub(crate) use chatgpt_add_account_view::ChatGptAddAccountView;
 

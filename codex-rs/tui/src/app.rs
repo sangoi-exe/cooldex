@@ -14,6 +14,7 @@ use crate::app_server_approval_conversions::network_approval_context_to_core;
 use crate::app_server_session::AppServerAccountProjection;
 use crate::app_server_session::AppServerSession;
 use crate::app_server_session::AppServerStartedThread;
+use crate::app_server_session::ChatGptAddAccountLoginStart;
 use crate::app_server_session::ThreadSessionState;
 use crate::app_server_session::app_server_rate_limit_snapshot_to_core;
 use crate::app_server_session::app_server_rate_limit_snapshots_to_core;
@@ -91,6 +92,7 @@ use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::AccountListEntry;
+use codex_app_server_protocol::AccountLoginCompletedNotification;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ChatgptAuthTokensRefreshResponse;
 use codex_app_server_protocol::ClientRequest;
@@ -293,6 +295,19 @@ fn build_chatgpt_add_account_success_outcome(
             ChatGptAddAccountOutcome::Failed { message }
         }
     }
+}
+
+fn active_account_display_from_remote_accounts(accounts: &[AccountListEntry]) -> Option<String> {
+    accounts
+        .iter()
+        .find(|account| account.is_active)
+        .map(|account| {
+            format_account_display(
+                account.label.as_deref(),
+                account.email.as_deref(),
+                &account.id,
+            )
+        })
 }
 
 fn status_account_displays_match(
@@ -1475,6 +1490,7 @@ pub(crate) struct App {
     live_account_state_owner: LiveAccountStateOwner,
     next_account_projection_refresh_request_id: u64,
     pending_account_projection_refresh_request_id: Option<u64>,
+    pending_remote_chatgpt_add_account: Option<PendingRemoteChatGptAddAccount>,
     suppress_ambiguous_rate_limit_notifications_generation: Option<u64>,
     pending_app_server_requests: PendingAppServerRequests,
     // Serialize plugin enablement writes per plugin so stale completions cannot
@@ -1525,6 +1541,11 @@ struct VisibleAccountProjectionFollowers {
     feedback_audience: FeedbackAudience,
     default_model: String,
     available_models: Vec<ModelPreset>,
+}
+
+struct PendingRemoteChatGptAddAccount {
+    login_id: String,
+    shared_state: Arc<crate::bottom_pane::ChatGptAddAccountSharedState>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6053,6 +6074,7 @@ impl App {
             live_account_state_owner: LiveAccountStateOwner::AppServerProjection,
             next_account_projection_refresh_request_id: 0,
             pending_account_projection_refresh_request_id: None,
+            pending_remote_chatgpt_add_account: None,
             suppress_ambiguous_rate_limit_notifications_generation: None,
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_plugin_enabled_writes: HashMap::new(),
@@ -6918,6 +6940,15 @@ impl App {
             }
             AppEvent::StartOpenAccountsPopup => {
                 if self.remote_app_server_url.is_some() {
+                    if !self.chat_widget.has_chatgpt_account()
+                        && !self.config.model_provider.requires_openai_auth
+                    {
+                        self.chat_widget.add_error_message(
+                            "'/accounts' needs saved ChatGPT accounts or an OpenAI-auth provider."
+                                .to_string(),
+                        );
+                        return Ok(AppRunControl::Continue);
+                    }
                     self.chat_widget.open_accounts_loading_popup_unchecked();
                     let request_handle = app_server.request_handle();
                     let app_event_tx = self.app_event_tx.clone();
@@ -6954,7 +6985,7 @@ impl App {
                     self.chat_widget.open_accounts_popup_with_entries_at(
                         Local::now(),
                         popup_accounts_from_remote_entries(accounts),
-                        /*allow_add_account*/ false,
+                        /*allow_add_account*/ true,
                     );
                 }
                 Err(error_message) => {
@@ -7087,7 +7118,7 @@ impl App {
                                     self.chat_widget.open_accounts_popup_with_entries_at(
                                         Local::now(),
                                         popup_accounts_from_remote_entries(accounts),
-                                        /*allow_add_account*/ false,
+                                        /*allow_add_account*/ true,
                                     );
                                 }
                                 Err(err) => {
@@ -7153,6 +7184,47 @@ impl App {
                 }
             }
             AppEvent::StartChatGptAddAccount => {
+                if self.remote_app_server_url.is_some() {
+                    if !self.chat_widget.has_chatgpt_account()
+                        && !self.config.model_provider.requires_openai_auth
+                    {
+                        self.chat_widget.add_error_message(
+                            "'/accounts' add needs saved ChatGPT accounts or an OpenAI-auth provider."
+                                .to_string(),
+                        );
+                        return Ok(AppRunControl::Continue);
+                    }
+
+                    let ChatGptAddAccountLoginStart { login_id, auth_url } =
+                        match app_server.start_chatgpt_add_account_login().await {
+                            Ok(login) => login,
+                            Err(err) => {
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to start remote ChatGPT login: {err}"
+                                ));
+                                return Ok(AppRunControl::Continue);
+                            }
+                        };
+
+                    let shared_state =
+                        Arc::new(crate::bottom_pane::ChatGptAddAccountSharedState::new());
+                    self.pending_remote_chatgpt_add_account =
+                        Some(PendingRemoteChatGptAddAccount {
+                            login_id: login_id.clone(),
+                            shared_state: Arc::clone(&shared_state),
+                        });
+                    self.chat_widget.open_chatgpt_add_account_view(
+                        auth_url,
+                        shared_state,
+                        crate::bottom_pane::ChatGptAddAccountControl::Remote {
+                            request_handle: app_server.request_handle(),
+                            login_id,
+                            app_event_tx: self.app_event_tx.clone(),
+                        },
+                    );
+                    return Ok(AppRunControl::Continue);
+                }
+
                 if !self.auth_manager.has_saved_chatgpt_accounts()
                     && !self.config.model_provider.requires_openai_auth
                 {
@@ -7184,7 +7256,7 @@ impl App {
                 self.chat_widget.open_chatgpt_add_account_view(
                     auth_url,
                     Arc::clone(&shared_state),
-                    child.cancel_handle(),
+                    crate::bottom_pane::ChatGptAddAccountControl::Local(child.cancel_handle()),
                 );
 
                 let frame_requester = tui.frame_requester();
@@ -7212,6 +7284,74 @@ impl App {
                     frame_requester.schedule_frame();
                     app_event_tx.send(AppEvent::ChatGptAddAccountFinished(outcome));
                 });
+            }
+            AppEvent::RemoteChatGptAddAccountLoginCompleted(
+                AccountLoginCompletedNotification {
+                    login_id,
+                    success,
+                    error,
+                },
+            ) => {
+                let Some(login_id) = login_id else {
+                    return Ok(AppRunControl::Continue);
+                };
+                if self
+                    .pending_remote_chatgpt_add_account
+                    .as_ref()
+                    .map(|pending| pending.login_id.as_str())
+                    != Some(login_id.as_str())
+                {
+                    return Ok(AppRunControl::Continue);
+                }
+                let pending = self
+                    .pending_remote_chatgpt_add_account
+                    .take()
+                    .expect("checked pending remote add-account state");
+                let outcome = if success {
+                    let active_account_display = match app_server.list_accounts().await {
+                        Ok(accounts) => active_account_display_from_remote_accounts(&accounts),
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                login_id,
+                                "failed to reload remote account roster after add-account login"
+                            );
+                            None
+                        }
+                    };
+                    pending
+                        .shared_state
+                        .set_success(active_account_display.clone());
+                    ChatGptAddAccountOutcome::Success {
+                        active_account_display,
+                    }
+                } else {
+                    let message = error.unwrap_or_else(|| {
+                        "remote ChatGPT login finished without a success result".to_string()
+                    });
+                    pending.shared_state.set_failed(message.clone());
+                    ChatGptAddAccountOutcome::Failed { message }
+                };
+                self.app_event_tx
+                    .send(AppEvent::ChatGptAddAccountFinished(outcome));
+            }
+            AppEvent::RemoteChatGptAddAccountCancelled { login_id } => {
+                if self
+                    .pending_remote_chatgpt_add_account
+                    .as_ref()
+                    .map(|pending| pending.login_id.as_str())
+                    != Some(login_id.as_str())
+                {
+                    return Ok(AppRunControl::Continue);
+                }
+                let pending = self
+                    .pending_remote_chatgpt_add_account
+                    .take()
+                    .expect("checked pending remote add-account state");
+                pending.shared_state.set_cancelled();
+                self.app_event_tx.send(AppEvent::ChatGptAddAccountFinished(
+                    ChatGptAddAccountOutcome::Cancelled,
+                ));
             }
             AppEvent::ChatGptAddAccountFinished(outcome) => match outcome {
                 ChatGptAddAccountOutcome::Success {
@@ -9843,6 +9983,47 @@ mod tests {
             app.observed_active_store_account_id,
             Some(remote_store_account_id)
         );
+    }
+
+    #[test]
+    fn active_account_display_from_remote_accounts_uses_remote_active_entry() {
+        let display = active_account_display_from_remote_accounts(&[
+            AccountListEntry {
+                id: "acct-a".to_string(),
+                label: Some("Primary".to_string()),
+                email: Some("primary@example.com".to_string()),
+                is_active: false,
+                exhausted_until_unix_seconds: None,
+                last_rate_limits: None,
+                lease_state: codex_app_server_protocol::AccountLeaseState::NotLeased,
+            },
+            AccountListEntry {
+                id: "acct-b".to_string(),
+                label: Some("Remote New".to_string()),
+                email: Some("new@example.com".to_string()),
+                is_active: true,
+                exhausted_until_unix_seconds: None,
+                last_rate_limits: None,
+                lease_state: codex_app_server_protocol::AccountLeaseState::NotLeased,
+            },
+        ]);
+
+        assert_eq!(display.as_deref(), Some("Remote New — new@example.com"));
+    }
+
+    #[test]
+    fn active_account_display_from_remote_accounts_returns_none_without_active_entry() {
+        let display = active_account_display_from_remote_accounts(&[AccountListEntry {
+            id: "acct-a".to_string(),
+            label: Some("Primary".to_string()),
+            email: Some("primary@example.com".to_string()),
+            is_active: false,
+            exhausted_until_unix_seconds: None,
+            last_rate_limits: None,
+            lease_state: codex_app_server_protocol::AccountLeaseState::NotLeased,
+        }]);
+
+        assert_eq!(display, None);
     }
 
     #[tokio::test]
@@ -15726,6 +15907,7 @@ guardian_approval = true
             live_account_state_owner: LiveAccountStateOwner::AppServerProjection,
             next_account_projection_refresh_request_id: 0,
             pending_account_projection_refresh_request_id: None,
+            pending_remote_chatgpt_add_account: None,
             suppress_ambiguous_rate_limit_notifications_generation: None,
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_plugin_enabled_writes: HashMap::new(),
@@ -15796,6 +15978,7 @@ guardian_approval = true
                 live_account_state_owner: LiveAccountStateOwner::AppServerProjection,
                 next_account_projection_refresh_request_id: 0,
                 pending_account_projection_refresh_request_id: None,
+                pending_remote_chatgpt_add_account: None,
                 suppress_ambiguous_rate_limit_notifications_generation: None,
                 pending_app_server_requests: PendingAppServerRequests::default(),
                 pending_plugin_enabled_writes: HashMap::new(),

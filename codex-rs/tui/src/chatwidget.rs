@@ -2630,10 +2630,9 @@ impl ChatWidget {
         &mut self,
         auth_url: String,
         shared_state: Arc<crate::bottom_pane::ChatGptAddAccountSharedState>,
-        shutdown_handle: codex_login::ShutdownHandle,
+        control: crate::bottom_pane::ChatGptAddAccountControl,
     ) {
-        let view =
-            crate::bottom_pane::ChatGptAddAccountView::new(auth_url, shared_state, shutdown_handle);
+        let view = crate::bottom_pane::ChatGptAddAccountView::new(auth_url, shared_state, control);
         self.bottom_pane.show_view(Box::new(view));
         self.request_redraw();
     }

@@ -2174,6 +2174,32 @@ async fn remote_accounts_popup_snapshot_omits_add_account_row() {
 }
 
 #[tokio::test]
+async fn remote_accounts_popup_snapshot_includes_add_account_row_when_enabled() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.open_accounts_popup_with_entries_at(
+        Local::now(),
+        vec![AccountsPopupEntry {
+            id: "acct-remote-1".to_string(),
+            label: Some("Remote Primary".to_string()),
+            email: Some("remote-primary@example.com".to_string()),
+            is_active: true,
+            exhausted_until: None,
+            last_rate_limits: None,
+            lease_state: AccountsPopupLeaseState::NotLeased,
+        }],
+        /*allow_add_account*/ true,
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("remote_accounts_popup_with_add_account", popup);
+    assert!(
+        popup.contains("Add account..."),
+        "expected enabled remote popup to expose add-account, got:\n{popup}"
+    );
+}
+
+#[tokio::test]
 async fn remote_accounts_popup_selects_active_account() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -2197,6 +2223,30 @@ async fn remote_accounts_popup_selects_active_account() {
         rx.try_recv(),
         Ok(AppEvent::SetActiveAccount { account_id }) if account_id == "acct-remote-1"
     );
+}
+
+#[tokio::test]
+async fn remote_accounts_popup_add_account_row_emits_start_event() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.open_accounts_popup_with_entries_at(
+        Local::now(),
+        vec![AccountsPopupEntry {
+            id: "acct-remote-1".to_string(),
+            label: Some("Remote Primary".to_string()),
+            email: Some("remote-primary@example.com".to_string()),
+            is_active: false,
+            exhausted_until: None,
+            last_rate_limits: None,
+            lease_state: AccountsPopupLeaseState::NotLeased,
+        }],
+        /*allow_add_account*/ true,
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::StartChatGptAddAccount));
 }
 
 #[tokio::test]

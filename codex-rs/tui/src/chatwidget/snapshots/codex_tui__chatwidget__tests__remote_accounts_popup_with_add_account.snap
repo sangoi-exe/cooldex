@@ -1,0 +1,12 @@
+---
+source: tui/src/chatwidget/tests/popups_and_settings.rs
+expression: popup
+---
+  Accounts
+  Select an account to make it active, or add a new one.
+
+› 1. Remote Primary (current)  status: available • email: remote-
+                               primary@example.com
+  2. Add account...            sign in to add another ChatGPT account
+
+  Press enter to confirm or esc to go back

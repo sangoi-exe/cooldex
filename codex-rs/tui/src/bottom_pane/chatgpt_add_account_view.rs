@@ -3,6 +3,10 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use codex_app_server_client::AppServerRequestHandle;
+use codex_app_server_protocol::CancelLoginAccountParams;
+use codex_app_server_protocol::CancelLoginAccountResponse;
+use codex_app_server_protocol::ClientRequest;
 use codex_login::ShutdownHandle;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -19,6 +23,8 @@ use textwrap::wrap;
 
 use super::CancellationEvent;
 use super::bottom_pane_view::BottomPaneView;
+use crate::app_event::AppEvent;
+use crate::app_event_sender::AppEventSender;
 use crate::key_hint;
 use crate::render::Insets;
 use crate::render::RectExt as _;
@@ -91,20 +97,29 @@ impl ChatGptAddAccountSharedState {
 pub(crate) struct ChatGptAddAccountView {
     auth_url: String,
     shared_state: Arc<ChatGptAddAccountSharedState>,
-    shutdown_handle: ShutdownHandle,
+    control: ChatGptAddAccountControl,
     complete: bool,
+}
+
+pub(crate) enum ChatGptAddAccountControl {
+    Local(ShutdownHandle),
+    Remote {
+        request_handle: AppServerRequestHandle,
+        login_id: String,
+        app_event_tx: AppEventSender,
+    },
 }
 
 impl ChatGptAddAccountView {
     pub(crate) fn new(
         auth_url: String,
         shared_state: Arc<ChatGptAddAccountSharedState>,
-        shutdown_handle: ShutdownHandle,
+        control: ChatGptAddAccountControl,
     ) -> Self {
         Self {
             auth_url,
             shared_state,
-            shutdown_handle,
+            control,
             complete: false,
         }
     }
@@ -184,7 +199,35 @@ impl BottomPaneView for ChatGptAddAccountView {
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         if matches!(self.shared_state.status(), ChatGptAddAccountStatus::Pending) {
             self.shared_state.mark_cancelled_by_user();
-            self.shutdown_handle.shutdown();
+            match &self.control {
+                ChatGptAddAccountControl::Local(shutdown_handle) => {
+                    shutdown_handle.shutdown();
+                }
+                ChatGptAddAccountControl::Remote {
+                    request_handle,
+                    login_id,
+                    app_event_tx,
+                } => {
+                    let request_handle = request_handle.clone();
+                    let login_id = login_id.clone();
+                    let app_event_tx = app_event_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = request_handle
+                            .request_typed::<CancelLoginAccountResponse>(
+                                ClientRequest::CancelLoginAccount {
+                                    request_id: codex_app_server_protocol::RequestId::String(
+                                        uuid::Uuid::new_v4().to_string(),
+                                    ),
+                                    params: CancelLoginAccountParams {
+                                        login_id: login_id.clone(),
+                                    },
+                                },
+                            )
+                            .await;
+                        app_event_tx.send(AppEvent::RemoteChatGptAddAccountCancelled { login_id });
+                    });
+                }
+            }
         }
 
         self.complete = true;

@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use codex_app_server_protocol::AccountListEntry;
+use codex_app_server_protocol::AccountLoginCompletedNotification;
 use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::PluginInstallResponse;
@@ -467,6 +468,15 @@ pub(crate) enum AppEvent {
 
     /// Start a ChatGPT login flow to add another stored account.
     StartChatGptAddAccount,
+
+    /// Completion notification for a remote ChatGPT add-account flow.
+    RemoteChatGptAddAccountLoginCompleted(AccountLoginCompletedNotification),
+
+    /// Local acknowledgement that the active remote add-account flow was
+    /// cancelled by the user.
+    RemoteChatGptAddAccountCancelled {
+        login_id: String,
+    },
 
     /// Result of running the ChatGPT add-account login flow.
     ChatGptAddAccountFinished(ChatGptAddAccountOutcome),

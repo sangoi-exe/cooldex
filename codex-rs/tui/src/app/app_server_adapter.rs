@@ -190,6 +190,13 @@ impl App {
                     .send(AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate);
                 return;
             }
+            ServerNotification::AccountLoginCompleted(notification) => {
+                self.app_event_tx
+                    .send(AppEvent::RemoteChatGptAddAccountLoginCompleted(
+                        notification.clone(),
+                    ));
+                return;
+            }
             ServerNotification::ExternalAgentConfigImportCompleted(_) => {
                 let cwd = self.chat_widget.config_ref().cwd.to_path_buf();
                 if let Err(err) = self.refresh_in_memory_config_from_disk().await {
