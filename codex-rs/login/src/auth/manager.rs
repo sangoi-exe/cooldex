@@ -2211,6 +2211,36 @@ impl AccountManager {
         }
     }
 
+    fn prepare_strict_loaded_store(
+        &self,
+        mut store: AuthStore,
+        persist_storage: &dyn AuthStorageBackend,
+        admission_policy: ChatgptAuthAdmissionPolicy,
+    ) -> std::io::Result<AuthStore> {
+        // Merge-safety anchor: strict reload keeps AuthManager as the
+        // lock/load/cache owner while AccountManager owns persisted-account
+        // runtime prep, current-runtime hydration, and fail-loud persistence.
+        let loaded_had_persisted_active_account = store.active_account_id.is_some();
+        let removed_account_ids = enforce_chatgpt_auth_accounts(&mut store, admission_policy);
+        let mut sync_outcome = UsageStateSyncOutcome::default();
+        if let Some(account_state_store) = self.account_state_store.as_ref() {
+            sync_outcome =
+                synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store)?;
+        }
+        self.hydrate_runtime_active_account(&mut store)?;
+        if sync_outcome.strip_persisted_auth_store
+            || !removed_account_ids.is_empty()
+            || (self.has_account_state_store() && loaded_had_persisted_active_account)
+        {
+            persist_auth_store(
+                persist_storage,
+                &store,
+                sync_outcome.strip_persisted_auth_store,
+            )?;
+        }
+        Ok(store)
+    }
+
     fn clone_store_with_runtime_active_account(&self, store: &AuthStore) -> Option<AuthStore> {
         let mut store = store.clone();
         if let Err(error) = self.hydrate_runtime_active_account(&mut store) {
@@ -3464,28 +3494,12 @@ impl AuthManager {
     pub fn reload_strict(&self) -> std::io::Result<bool> {
         tracing::info!("Reloading auth (strict)");
         let _lock = storage::lock_auth_store(&self.codex_home)?;
-        let mut store = self.storage.load()?.unwrap_or_default();
-        let loaded_had_persisted_active_account = store.active_account_id.is_some();
-        let removed_account_ids =
-            enforce_chatgpt_auth_accounts(&mut store, ChatgptAuthAdmissionPolicy::Persisted);
-        let mut sync_outcome = UsageStateSyncOutcome::default();
-        if let Some(account_state_store) = self.account_manager.account_state_store.as_ref() {
-            sync_outcome =
-                synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store)?;
-        }
-        self.account_manager
-            .hydrate_runtime_active_account(&mut store)?;
-        if sync_outcome.strip_persisted_auth_store
-            || !removed_account_ids.is_empty()
-            || (self.account_manager.has_account_state_store()
-                && loaded_had_persisted_active_account)
-        {
-            persist_auth_store(
-                &*self.storage,
-                &store,
-                sync_outcome.strip_persisted_auth_store,
-            )?;
-        }
+        let store = self.storage.load()?.unwrap_or_default();
+        let store = self.account_manager.prepare_strict_loaded_store(
+            store,
+            &*self.storage,
+            ChatgptAuthAdmissionPolicy::Persisted,
+        )?;
         Ok(self.set_cached(store))
     }
 
