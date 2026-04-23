@@ -839,6 +839,49 @@ fn chatgpt_auth_persists_agent_identity_for_workspace() {
     assert_eq!(auth.get_agent_identity("account-123"), None);
 }
 
+#[tokio::test]
+async fn chatgpt_authorization_header_helpers_return_bearer_for_chatgpt_auth() {
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    let manager = AuthManager::from_auth_for_testing(auth.clone());
+
+    assert_eq!(
+        manager.chatgpt_authorization_header().await.as_deref(),
+        Some("Bearer Access Token")
+    );
+    assert_eq!(
+        manager
+            .chatgpt_authorization_header_for_auth(&auth)
+            .await
+            .as_deref(),
+        Some("Bearer Access Token")
+    );
+    assert_eq!(
+        AuthManager::chatgpt_bearer_token_for_auth(&auth).as_deref(),
+        Some("Access Token")
+    );
+    assert_eq!(
+        AuthManager::chatgpt_bearer_authorization_header_for_auth(&auth).as_deref(),
+        Some("Bearer Access Token")
+    );
+}
+
+#[tokio::test]
+async fn chatgpt_authorization_header_helpers_ignore_api_key_auth() {
+    let auth = CodexAuth::from_api_key("sk-test");
+    let manager = AuthManager::from_auth_for_testing(auth.clone());
+
+    assert_eq!(manager.chatgpt_authorization_header().await, None);
+    assert_eq!(
+        manager.chatgpt_authorization_header_for_auth(&auth).await,
+        None
+    );
+    assert_eq!(AuthManager::chatgpt_bearer_token_for_auth(&auth), None);
+    assert_eq!(
+        AuthManager::chatgpt_bearer_authorization_header_for_auth(&auth),
+        None
+    );
+}
+
 #[test]
 fn external_chatgpt_token_auth_loads_from_ephemeral_store() {
     let codex_home = tempdir().unwrap();

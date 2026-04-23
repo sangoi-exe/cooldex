@@ -17,6 +17,7 @@ const REMOTE_CONTROL_RESPONSE_BODY_MAX_BYTES: usize = 4096;
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const OAI_REQUEST_ID_HEADER: &str = "x-oai-request-id";
 const CF_RAY_HEADER: &str = "cf-ray";
+pub(super) const REMOTE_CONTROL_FEDRAMP_HEADER: &str = "X-OpenAI-Fedramp";
 pub(super) const REMOTE_CONTROL_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,8 +30,12 @@ pub(super) struct RemoteControlEnrollment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RemoteControlConnectionAuth {
-    pub(super) bearer_token: String,
+    // Merge-safety anchor: remote-control enrollment and websocket connect must
+    // share one richer auth carrier so auth-header and FedRAMP routing stay
+    // aligned across both request surfaces.
+    pub(super) authorization_header_value: String,
     pub(super) account_id: String,
+    pub(super) is_fedramp_account: bool,
 }
 
 pub(super) async fn load_persisted_remote_control_enrollment(
@@ -199,12 +204,15 @@ pub(super) async fn enroll_remote_control_server(
         app_server_version: env!("CARGO_PKG_VERSION"),
     };
     let client = build_reqwest_client();
-    let http_request = client
+    let mut http_request = client
         .post(enroll_url)
         .timeout(REMOTE_CONTROL_ENROLL_TIMEOUT)
-        .bearer_auth(&auth.bearer_token)
+        .header("authorization", &auth.authorization_header_value)
         .header(REMOTE_CONTROL_ACCOUNT_ID_HEADER, &auth.account_id)
         .json(&request);
+    if auth.is_fedramp_account {
+        http_request = http_request.header(REMOTE_CONTROL_FEDRAMP_HEADER, "true");
+    }
 
     let response = http_request.send().await.map_err(|err| {
         io::Error::other(format!(
@@ -256,6 +264,7 @@ mod tests {
     use codex_state::StateRuntime;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::io::AsyncBufReadExt;
@@ -445,8 +454,9 @@ mod tests {
         let err = enroll_remote_control_server(
             &remote_control_target,
             &RemoteControlConnectionAuth {
-                bearer_token: "Access Token".to_string(),
+                authorization_header_value: "Bearer Access Token".to_string(),
                 account_id: "account_id".to_string(),
+                is_fedramp_account: false,
             },
         )
         .await
@@ -460,6 +470,61 @@ mod tests {
                 expected_body.len()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn enroll_remote_control_server_includes_fedramp_header() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let remote_control_url = format!(
+            "http://127.0.0.1:{}/backend-api/",
+            listener
+                .local_addr()
+                .expect("listener should have a local addr")
+                .port()
+        );
+        let remote_control_target =
+            normalize_remote_control_url(&remote_control_url).expect("target should parse");
+        let server_task = tokio::spawn(async move {
+            let request = accept_http_request_with_headers(&listener).await;
+            assert_eq!(
+                request.request_line,
+                "POST /backend-api/wham/remote/control/server/enroll HTTP/1.1"
+            );
+            assert_eq!(
+                request.headers.get("authorization"),
+                Some(&"Bearer Access Token".to_string())
+            );
+            assert_eq!(
+                request.headers.get(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+                Some(&"account_id".to_string())
+            );
+            assert_eq!(
+                request.headers.get("x-openai-fedramp"),
+                Some(&"true".to_string())
+            );
+            respond_with_json(
+                request.stream,
+                json!({ "server_id": "srv_e_test", "environment_id": "env_test" }),
+            )
+            .await;
+        });
+
+        let enrollment = enroll_remote_control_server(
+            &remote_control_target,
+            &RemoteControlConnectionAuth {
+                authorization_header_value: "Bearer Access Token".to_string(),
+                account_id: "account_id".to_string(),
+                is_fedramp_account: true,
+            },
+        )
+        .await
+        .expect("enrollment should succeed");
+
+        server_task.await.expect("server task should succeed");
+        assert_eq!(enrollment.server_id, "srv_e_test");
+        assert_eq!(enrollment.environment_id, "env_test");
     }
 
     async fn accept_http_request(listener: &TcpListener) -> TcpStream {
@@ -486,6 +551,48 @@ mod tests {
         }
 
         reader.into_inner()
+    }
+
+    struct CapturedHttpRequest {
+        request_line: String,
+        headers: HashMap<String, String>,
+        stream: TcpStream,
+    }
+
+    async fn accept_http_request_with_headers(listener: &TcpListener) -> CapturedHttpRequest {
+        let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("HTTP request should arrive in time")
+            .expect("listener accept should succeed");
+        let mut reader = BufReader::new(stream);
+
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .await
+            .expect("request line should read");
+
+        let mut headers = HashMap::new();
+        loop {
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("header line should read");
+            if line == "\r\n" {
+                break;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+
+        CapturedHttpRequest {
+            request_line: request_line.trim_end().to_string(),
+            headers,
+            stream: reader.into_inner(),
+        }
     }
 
     async fn respond_with_json(mut stream: TcpStream, body: serde_json::Value) {

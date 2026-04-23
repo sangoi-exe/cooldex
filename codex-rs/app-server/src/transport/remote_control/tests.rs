@@ -63,7 +63,7 @@ fn remote_control_auth_manager_with_home(codex_home: &TempDir) -> Arc<AuthManage
     )
 }
 
-fn remote_control_auth_dot_json(account_id: Option<&str>) -> AuthDotJson {
+fn remote_control_auth_dot_json(account_id: Option<&str>, is_fedramp_account: bool) -> AuthDotJson {
     #[derive(serde::Serialize)]
     struct Header {
         alg: &'static str,
@@ -79,7 +79,8 @@ fn remote_control_auth_dot_json(account_id: Option<&str>) -> AuthDotJson {
         "https://api.openai.com/auth": {
             "chatgpt_user_id": "user-12345",
             "user_id": "user-12345",
-            "chatgpt_account_id": "account_id"
+            "chatgpt_account_id": "account_id",
+            "chatgpt_account_is_fedramp": is_fedramp_account
         }
     });
     let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
@@ -1070,7 +1071,7 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
     save_auth(
         codex_home.path(),
         &codex_login::AuthStore::from_legacy(remote_control_auth_dot_json(
-            /*account_id*/ None,
+            /*account_id*/ None, /*is_fedramp_account*/ false,
         )),
         AuthCredentialsStoreMode::File,
     )
@@ -1110,7 +1111,10 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
 
     save_auth(
         codex_home.path(),
-        &codex_login::AuthStore::from_legacy(remote_control_auth_dot_json(Some("account_id"))),
+        &codex_login::AuthStore::from_legacy(remote_control_auth_dot_json(
+            Some("account_id"),
+            /*is_fedramp_account*/ false,
+        )),
         AuthCredentialsStoreMode::File,
     )
     .expect("auth with account id should save");

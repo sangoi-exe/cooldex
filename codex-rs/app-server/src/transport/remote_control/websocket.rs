@@ -1,6 +1,7 @@
 use crate::transport::TransportEvent;
 use crate::transport::remote_control::client_tracker::ClientTracker;
 use crate::transport::remote_control::client_tracker::REMOTE_CONTROL_IDLE_SWEEP_INTERVAL;
+use crate::transport::remote_control::enroll::REMOTE_CONTROL_FEDRAMP_HEADER;
 use crate::transport::remote_control::enroll::RemoteControlConnectionAuth;
 use crate::transport::remote_control::enroll::RemoteControlEnrollment;
 use crate::transport::remote_control::enroll::enroll_remote_control_server;
@@ -668,12 +669,13 @@ fn build_remote_control_websocket_request(
         "x-codex-protocol-version",
         REMOTE_CONTROL_PROTOCOL_VERSION,
     )?;
-    set_remote_control_header(
-        headers,
-        "authorization",
-        &format!("Bearer {}", auth.bearer_token),
-    )?;
+    // Merge-safety anchor: remote-control websocket auth must consume the same
+    // resolved header/FedRAMP carrier as enrollment.
+    set_remote_control_header(headers, "authorization", &auth.authorization_header_value)?;
     set_remote_control_header(headers, REMOTE_CONTROL_ACCOUNT_ID_HEADER, &auth.account_id)?;
+    if auth.is_fedramp_account {
+        set_remote_control_header(headers, REMOTE_CONTROL_FEDRAMP_HEADER, "true")?;
+    }
     if let Some(subscribe_cursor) = subscribe_cursor {
         set_remote_control_header(
             headers,
@@ -718,14 +720,25 @@ pub(crate) async fn load_remote_control_auth(
         ));
     }
 
+    let authorization_header_value = auth_manager
+        .chatgpt_authorization_header_for_auth(&auth)
+        .await
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::WouldBlock,
+                "remote control enrollment is waiting for a ChatGPT authorization header",
+            )
+        })?;
+
     Ok(RemoteControlConnectionAuth {
-        bearer_token: auth.get_token().map_err(io::Error::other)?,
+        authorization_header_value,
         account_id: auth.get_account_id().ok_or_else(|| {
             io::Error::new(
                 ErrorKind::WouldBlock,
                 "remote control enrollment is waiting for a ChatGPT account id",
             )
         })?,
+        is_fedramp_account: auth.is_fedramp_account(),
     })
 }
 
@@ -913,6 +926,8 @@ mod tests {
     use super::*;
     use crate::outgoing_message::OutgoingMessage;
     use crate::transport::remote_control::ServerEvent;
+    use crate::transport::remote_control::enroll::REMOTE_CONTROL_ACCOUNT_ID_HEADER;
+    use crate::transport::remote_control::enroll::REMOTE_CONTROL_FEDRAMP_HEADER;
     use crate::transport::remote_control::protocol::StreamId;
     use crate::transport::remote_control::protocol::normalize_remote_control_url;
     use chrono::Utc;
@@ -1198,6 +1213,48 @@ mod tests {
                 .get_token()
                 .expect("token should be readable"),
             "fresh-token"
+        );
+    }
+
+    #[test]
+    fn build_remote_control_websocket_request_includes_fedramp_header() {
+        let request = build_remote_control_websocket_request(
+            "ws://127.0.0.1/backend-api/wham/remote/control/server",
+            &RemoteControlEnrollment {
+                account_id: "account_id".to_string(),
+                environment_id: "env_test".to_string(),
+                server_id: "srv_e_test".to_string(),
+                server_name: "test-server".to_string(),
+            },
+            &RemoteControlConnectionAuth {
+                authorization_header_value: "Bearer Access Token".to_string(),
+                account_id: "account_id".to_string(),
+                is_fedramp_account: true,
+            },
+            /*subscribe_cursor*/ None,
+        )
+        .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer Access Token")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(REMOTE_CONTROL_ACCOUNT_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("account_id")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(REMOTE_CONTROL_FEDRAMP_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
         );
     }
 

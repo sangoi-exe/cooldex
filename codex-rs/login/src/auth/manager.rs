@@ -2313,6 +2313,33 @@ impl AuthManager {
             .and_then(|auth| auth.active_chatgpt_account_summary())
     }
 
+    // Merge-safety anchor: first-party ChatGPT backend callers must resolve one
+    // canonical Authorization header owner here so analytics and remote-control
+    // stay aligned on auth-header and FedRAMP behavior.
+    pub async fn chatgpt_authorization_header(&self) -> Option<String> {
+        let auth = self.auth().await?;
+        self.chatgpt_authorization_header_for_auth(&auth).await
+    }
+
+    pub async fn chatgpt_authorization_header_for_auth(&self, auth: &CodexAuth) -> Option<String> {
+        if !auth.is_chatgpt_auth() {
+            return None;
+        }
+
+        Self::chatgpt_bearer_authorization_header_for_auth(auth)
+    }
+
+    pub fn chatgpt_bearer_token_for_auth(auth: &CodexAuth) -> Option<String> {
+        if !auth.is_chatgpt_auth() {
+            return None;
+        }
+        auth.get_token().ok().filter(|token| !token.is_empty())
+    }
+
+    pub fn chatgpt_bearer_authorization_header_for_auth(auth: &CodexAuth) -> Option<String> {
+        Self::chatgpt_bearer_token_for_auth(auth).map(|token| format!("Bearer {token}"))
+    }
+
     fn chatgpt_auth_for_store_account_id(&self, store_account_id: &str) -> Option<CodexAuth> {
         let loaded = self.load_store_from_storage();
         Self::derive_chatgpt_auth_from_store_account(
