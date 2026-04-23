@@ -1574,6 +1574,11 @@ struct LoadedStoreCandidate {
     store_origin: CachedStoreOrigin,
 }
 
+struct AccountRuntimeContext {
+    linked_codex_session_id: Option<String>,
+    forced_chatgpt_workspace_id: Option<String>,
+}
+
 #[derive(Clone)]
 struct AuthScopedRefreshFailure {
     auth: CodexAuth,
@@ -1882,6 +1887,13 @@ impl AccountManager {
         self.runtime_session_id.as_str()
     }
 
+    fn runtime_context(&self) -> AccountRuntimeContext {
+        AccountRuntimeContext {
+            linked_codex_session_id: self.linked_codex_session_id(),
+            forced_chatgpt_workspace_id: self.forced_chatgpt_workspace_id(),
+        }
+    }
+
     fn bootstrap_runtime_active_account_candidates(
         store: &AuthStore,
         required_workspace_id: Option<&str>,
@@ -2133,6 +2145,70 @@ impl AccountManager {
         }
 
         store
+    }
+
+    fn prepare_loaded_store_candidate(
+        &self,
+        mut store: AuthStore,
+        persist_storage: Arc<dyn AuthStorageBackend>,
+        store_origin: CachedStoreOrigin,
+        admission_policy: ChatgptAuthAdmissionPolicy,
+        runtime_context: &AccountRuntimeContext,
+    ) -> LoadedStoreCandidate {
+        let loaded_had_active_account = store.active_account_id.is_some();
+        let removed_account_ids = enforce_chatgpt_auth_accounts(&mut store, admission_policy);
+        let mut sync_outcome = UsageStateSyncOutcome::default();
+        if let Some(account_state_store) = self.account_state_store.as_ref() {
+            match synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store) {
+                Ok(outcome) => {
+                    sync_outcome = outcome;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to synchronize saved-account usage truth while loading auth store"
+                    );
+                }
+            }
+        }
+        if !removed_account_ids.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_account_ids,
+                "removed accounts with unsupported ChatGPT plans while loading auth store"
+            );
+        }
+        if let Err(error) = Self::hydrate_runtime_active_account_for_runtime(
+            self.account_state_store.as_ref(),
+            self.runtime_session_id(),
+            runtime_context.linked_codex_session_id.as_deref(),
+            runtime_context.forced_chatgpt_workspace_id.as_deref(),
+            &mut store,
+        ) {
+            tracing::warn!(
+                error = %error,
+                "failed to hydrate runtime active-account state while loading auth store"
+            );
+            store.active_account_id = None;
+        }
+        if (sync_outcome.strip_persisted_auth_store
+            || !removed_account_ids.is_empty()
+            || (self.account_state_store.is_some() && loaded_had_active_account))
+            && let Err(error) = persist_auth_store(
+                &*persist_storage,
+                &store,
+                sync_outcome.strip_persisted_auth_store,
+            )
+        {
+            tracing::warn!(
+                error = %error,
+                "failed to persist auth store while loading store"
+            );
+        }
+
+        LoadedStoreCandidate {
+            store,
+            store_origin,
+        }
     }
 
     fn clone_store_with_runtime_active_account(&self, store: &AuthStore) -> Option<AuthStore> {
@@ -2756,14 +2832,12 @@ impl AuthManager {
         let storage = create_auth_storage(codex_home.clone(), auth_credentials_store_mode);
         let account_state_store = open_account_state_store(sqlite_home.as_path());
         let runtime_session_id = uuid::Uuid::new_v4().to_string();
+        let account_manager = AccountManager::new(account_state_store, runtime_session_id);
         let loaded = Self::load_store_from_storage_impl(
             &codex_home,
             &storage,
             auth_credentials_store_mode,
-            account_state_store.as_ref(),
-            runtime_session_id.as_str(),
-            None,
-            None,
+            &account_manager,
         );
         let store = loaded.store;
         let store_origin = loaded.store_origin;
@@ -2777,7 +2851,7 @@ impl AuthManager {
         Self {
             codex_home,
             storage,
-            account_manager: AccountManager::new(account_state_store, runtime_session_id),
+            account_manager,
             inner: RwLock::new(CachedAuth {
                 store,
                 store_origin,
@@ -3692,12 +3766,7 @@ impl AuthManager {
             &self.codex_home,
             &self.storage,
             self.auth_credentials_store_mode,
-            self.account_manager.account_state_store.as_ref(),
-            self.account_manager.runtime_session_id.as_str(),
-            self.account_manager.linked_codex_session_id().as_deref(),
-            self.account_manager
-                .forced_chatgpt_workspace_id()
-                .as_deref(),
+            &self.account_manager,
         )
     }
 
@@ -3705,11 +3774,9 @@ impl AuthManager {
         codex_home: &Path,
         storage: &Arc<dyn AuthStorageBackend>,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
-        account_state_store: Option<&AccountStateStore>,
-        runtime_session_id: &str,
-        linked_codex_session_id: Option<&str>,
-        required_workspace_id: Option<&str>,
+        account_manager: &AccountManager,
     ) -> LoadedCachedStore {
+        let runtime_context = account_manager.runtime_context();
         let external_storage = (auth_credentials_store_mode != AuthCredentialsStoreMode::Ephemeral)
             .then(|| {
                 create_auth_storage(
@@ -3754,14 +3821,12 @@ impl AuthManager {
                 }
             }
         }
-        let selected = Self::prepare_loaded_store_candidate(
+        let selected = account_manager.prepare_loaded_store_candidate(
             selected_store,
             selected_storage,
             selected_origin,
-            account_state_store,
-            runtime_session_id,
-            linked_codex_session_id,
-            required_workspace_id,
+            Self::chatgpt_auth_admission_policy_for_store_origin(selected_origin),
+            &runtime_context,
         );
 
         LoadedCachedStore {
@@ -3801,74 +3866,6 @@ impl AuthManager {
 
     fn store_has_selectable_auth_material(store: &AuthStore) -> bool {
         !store.accounts.is_empty() || store.openai_api_key.is_some()
-    }
-
-    fn prepare_loaded_store_candidate(
-        mut store: AuthStore,
-        persist_storage: Arc<dyn AuthStorageBackend>,
-        store_origin: CachedStoreOrigin,
-        account_state_store: Option<&AccountStateStore>,
-        runtime_session_id: &str,
-        linked_codex_session_id: Option<&str>,
-        required_workspace_id: Option<&str>,
-    ) -> LoadedStoreCandidate {
-        let loaded_had_active_account = store.active_account_id.is_some();
-        let removed_account_ids = enforce_chatgpt_auth_accounts(
-            &mut store,
-            Self::chatgpt_auth_admission_policy_for_store_origin(store_origin),
-        );
-        let mut sync_outcome = UsageStateSyncOutcome::default();
-        if let Some(account_state_store) = account_state_store {
-            match synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store) {
-                Ok(outcome) => {
-                    sync_outcome = outcome;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "failed to synchronize saved-account usage truth while loading auth store"
-                    );
-                }
-            }
-        }
-        if !removed_account_ids.is_empty() {
-            tracing::info!(
-                removed_account_ids = ?removed_account_ids,
-                "removed accounts with unsupported ChatGPT plans while loading auth store"
-            );
-        }
-        if let Err(error) = AccountManager::hydrate_runtime_active_account_for_runtime(
-            account_state_store,
-            runtime_session_id,
-            linked_codex_session_id,
-            required_workspace_id,
-            &mut store,
-        ) {
-            tracing::warn!(
-                error = %error,
-                "failed to hydrate runtime active-account state while loading auth store"
-            );
-            store.active_account_id = None;
-        }
-        if (sync_outcome.strip_persisted_auth_store
-            || !removed_account_ids.is_empty()
-            || (account_state_store.is_some() && loaded_had_active_account))
-            && let Err(error) = persist_auth_store(
-                &*persist_storage,
-                &store,
-                sync_outcome.strip_persisted_auth_store,
-            )
-        {
-            tracing::warn!(
-                error = %error,
-                "failed to persist auth store while loading store"
-            );
-        }
-
-        LoadedStoreCandidate {
-            store,
-            store_origin,
-        }
     }
 
     /// Records a permanent refresh failure only if the failed refresh was
