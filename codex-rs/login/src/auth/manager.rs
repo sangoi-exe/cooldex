@@ -1574,6 +1574,11 @@ struct LoadedStoreCandidate {
     store_origin: CachedStoreOrigin,
 }
 
+struct GuardedReloadStorePreparation {
+    loaded_had_persisted_active_account: bool,
+    removed_account_ids: Vec<String>,
+}
+
 struct AccountRuntimeContext {
     linked_codex_session_id: Option<String>,
     forced_chatgpt_workspace_id: Option<String>,
@@ -2239,6 +2244,29 @@ impl AccountManager {
             )?;
         }
         Ok(store)
+    }
+
+    fn prepare_guarded_reload_store(
+        &self,
+        store: &mut AuthStore,
+    ) -> std::io::Result<GuardedReloadStorePreparation> {
+        // Merge-safety anchor: guarded reload keeps AuthManager as the
+        // load/persist/cache owner while AccountManager owns persisted-account
+        // filtering and current-runtime active-account hydration.
+        let loaded_had_persisted_active_account = store.active_account_id.is_some();
+        let removed_account_ids =
+            enforce_chatgpt_auth_accounts(store, ChatgptAuthAdmissionPolicy::Persisted);
+        if !removed_account_ids.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_account_ids,
+                "removed accounts with unsupported ChatGPT plans during guarded auth reload"
+            );
+        }
+        self.hydrate_runtime_active_account(store)?;
+        Ok(GuardedReloadStorePreparation {
+            loaded_had_persisted_active_account,
+            removed_account_ids,
+        })
     }
 
     fn mutate_loaded_store<T>(
@@ -3570,26 +3598,21 @@ impl AuthManager {
                 return ReloadOutcome::Skipped;
             }
         };
-        let loaded_had_persisted_active_account = store.active_account_id.is_some();
-        let removed_account_ids =
-            enforce_chatgpt_auth_accounts(&mut store, ChatgptAuthAdmissionPolicy::Persisted);
-        if !removed_account_ids.is_empty() {
-            tracing::info!(
-                removed_account_ids = ?removed_account_ids,
-                "removed accounts with unsupported ChatGPT plans during guarded auth reload"
-            );
-        }
-        if let Err(error) = self
+        let prepared = match self
             .account_manager
-            .hydrate_runtime_active_account(&mut store)
+            .prepare_guarded_reload_store(&mut store)
         {
-            tracing::warn!(
-                error = %error,
-                "skipping guarded auth reload because runtime active-account state could not be hydrated"
-            );
-            return ReloadOutcome::Skipped;
-        }
-        if loaded_had_persisted_active_account || !removed_account_ids.is_empty() {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "skipping guarded auth reload because runtime active-account state could not be hydrated"
+                );
+                return ReloadOutcome::Skipped;
+            }
+        };
+        if prepared.loaded_had_persisted_active_account || !prepared.removed_account_ids.is_empty()
+        {
             let persist_result = if self.account_manager.has_account_state_store() {
                 let mut stripped_store = store.clone();
                 strip_runtime_active_account_from_store(&mut stripped_store);
@@ -3623,7 +3646,8 @@ impl AuthManager {
             .map(|summary| summary.store_account_id);
 
         if new_store_account_id.as_deref() != Some(expected_store_account_id) {
-            if removed_account_ids
+            if prepared
+                .removed_account_ids
                 .iter()
                 .any(|id| id == expected_store_account_id)
             {
