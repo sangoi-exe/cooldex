@@ -2332,6 +2332,22 @@ impl AccountManager {
         }
     }
 
+    fn has_saved_chatgpt_accounts(
+        &self,
+        codex_home: &Path,
+        storage: &Arc<dyn AuthStorageBackend>,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> bool {
+        // Merge-safety anchor: saved-account presence checks must read the same
+        // runtime-prepared store snapshot owner as `/accounts` and autoswitch,
+        // not a stale auth/cache follower.
+        !self
+            .load_store_from_storage(codex_home, storage, auth_credentials_store_mode)
+            .store
+            .accounts
+            .is_empty()
+    }
+
     fn prepare_strict_loaded_store(
         &self,
         mut store: AuthStore,
@@ -4565,7 +4581,11 @@ impl AuthManager {
     }
 
     pub fn has_saved_chatgpt_accounts(&self) -> bool {
-        !self.load_store_from_storage().store.accounts.is_empty()
+        self.account_manager.has_saved_chatgpt_accounts(
+            &self.codex_home,
+            &self.storage,
+            self.auth_credentials_store_mode,
+        )
     }
 
     pub fn current_auth_from_storage(&self) -> Option<CodexAuth> {
