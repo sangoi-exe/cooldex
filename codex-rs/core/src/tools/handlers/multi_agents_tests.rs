@@ -32,6 +32,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CollabAgentActivityKind;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileSystemSandboxPolicy;
 use codex_protocol::protocol::InitialHistory;
@@ -2458,7 +2459,7 @@ async fn wait_agent_rejects_non_positive_timeout() {
         Arc::new(turn),
         "wait_agent",
         function_payload(json!({
-            "targets": [ThreadId::new().to_string()],
+            "ids": [ThreadId::new().to_string()],
             "timeout_ms": 0
         })),
     );
@@ -2472,13 +2473,13 @@ async fn wait_agent_rejects_non_positive_timeout() {
 }
 
 #[tokio::test]
-async fn wait_agent_rejects_invalid_target() {
+async fn wait_agent_rejects_invalid_id() {
     let (session, turn) = make_session_and_context().await;
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
         "wait_agent",
-        function_payload(json!({"targets": ["invalid"]})),
+        function_payload(json!({"ids": ["invalid"]})),
     );
     let Err(err) = WaitAgentHandler.handle(invocation).await else {
         panic!("invalid id should be rejected");
@@ -2490,20 +2491,87 @@ async fn wait_agent_rejects_invalid_target() {
 }
 
 #[tokio::test]
-async fn wait_agent_rejects_empty_targets() {
+async fn wait_agent_rejects_empty_ids() {
     let (session, turn) = make_session_and_context().await;
     let invocation = invocation(
         Arc::new(session),
         Arc::new(turn),
         "wait_agent",
-        function_payload(json!({"targets": []})),
+        function_payload(json!({"ids": []})),
     );
     let Err(err) = WaitAgentHandler.handle(invocation).await else {
         panic!("empty ids should be rejected");
     };
     assert_eq!(
         err,
-        FunctionCallError::RespondToModel("agent ids must be non-empty".to_string())
+        FunctionCallError::RespondToModel("ids must be non-empty".to_string())
+    );
+}
+
+#[tokio::test]
+async fn wait_agent_rejects_return_when_without_disable_timeout() {
+    let (session, turn) = make_session_and_context().await;
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "wait_agent",
+        function_payload(json!({
+            "ids": [ThreadId::new().to_string()],
+            "return_when": "any_final"
+        })),
+    );
+    let Err(err) = WaitAgentHandler.handle(invocation).await else {
+        panic!("return_when without disable_timeout should be rejected");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel("return_when requires disable_timeout=true".to_string())
+    );
+}
+
+#[tokio::test]
+async fn wait_agent_rejects_disable_timeout_without_return_when() {
+    let (session, turn) = make_session_and_context().await;
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "wait_agent",
+        function_payload(json!({
+            "ids": [ThreadId::new().to_string()],
+            "disable_timeout": true
+        })),
+    );
+    let Err(err) = WaitAgentHandler.handle(invocation).await else {
+        panic!("disable_timeout without return_when should be rejected");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel("disable_timeout requires return_when".to_string())
+    );
+}
+
+#[tokio::test]
+async fn wait_agent_rejects_disable_timeout_with_timeout_ms() {
+    let (session, turn) = make_session_and_context().await;
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "wait_agent",
+        function_payload(json!({
+            "ids": [ThreadId::new().to_string()],
+            "disable_timeout": true,
+            "return_when": "all_final",
+            "timeout_ms": 1000
+        })),
+    );
+    let Err(err) = WaitAgentHandler.handle(invocation).await else {
+        panic!("disable_timeout with timeout_ms should be rejected");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "disable_timeout cannot be combined with timeout_ms".to_string()
+        )
     );
 }
 
@@ -2605,7 +2673,7 @@ async fn wait_agent_returns_not_found_for_missing_agents() {
         Arc::new(turn),
         "wait_agent",
         function_payload(json!({
-            "targets": [id_a.to_string(), id_b.to_string()],
+            "ids": [id_a.to_string(), id_b.to_string()],
             "timeout_ms": 1000
         })),
     );
@@ -2648,7 +2716,7 @@ async fn wait_agent_times_out_when_status_is_not_final() {
         Arc::new(turn),
         "wait_agent",
         function_payload(json!({
-            "targets": [agent_id.to_string()],
+            "ids": [agent_id.to_string()],
             "timeout_ms": MIN_WAIT_TIMEOUT_MS
         })),
     );
@@ -2690,7 +2758,7 @@ async fn wait_agent_clamps_short_timeouts_to_minimum() {
         Arc::new(turn),
         "wait_agent",
         function_payload(json!({
-            "targets": [agent_id.to_string()],
+            "ids": [agent_id.to_string()],
             "timeout_ms": 10
         })),
     );
@@ -2740,7 +2808,7 @@ async fn wait_agent_returns_final_status_without_timeout() {
         Arc::new(turn),
         "wait_agent",
         function_payload(json!({
-            "targets": [agent_id.to_string()],
+            "ids": [agent_id.to_string()],
             "timeout_ms": 1000
         })),
     );
@@ -2752,14 +2820,99 @@ async fn wait_agent_returns_final_status_without_timeout() {
     let result: wait::WaitResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
     assert!(!result.timed_out);
-    assert_eq!(
-        result.agents.get(&agent_id),
-        Some(&crate::agent::status::AgentRuntimeState {
-            status: AgentStatus::Shutdown,
-            last_activity: None,
-        })
+    assert!(
+        matches!(
+            result.agents.get(&agent_id),
+            Some(crate::agent::status::AgentRuntimeState {
+                status: AgentStatus::Shutdown,
+                last_activity: Some(activity),
+            }) if activity.kind == CollabAgentActivityKind::Status
+                && activity.summary == "Shutdown complete"
+        ),
+        "unexpected shutdown state: {:?}",
+        result.agents.get(&agent_id)
     );
     assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn wait_agent_any_final_returns_immediately_when_one_agent_is_already_final() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let config = turn.config.as_ref().clone();
+    let completed_thread = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start completed thread");
+    let running_thread = manager
+        .start_thread(config)
+        .await
+        .expect("start running thread");
+    let completed_agent_id = completed_thread.thread_id;
+    let running_agent_id = running_thread.thread_id;
+    let mut completed_status_rx = manager
+        .agent_control()
+        .subscribe_status(completed_agent_id)
+        .await
+        .expect("subscribe should succeed");
+
+    let _ = completed_thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
+    let _ = timeout(Duration::from_secs(1), completed_status_rx.changed())
+        .await
+        .expect("shutdown status should arrive");
+
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "wait_agent",
+        function_payload(json!({
+            "ids": [completed_agent_id.to_string(), running_agent_id.to_string()],
+            "return_when": "any_final",
+            "disable_timeout": true
+        })),
+    );
+    let output = timeout(
+        Duration::from_millis(250),
+        WaitAgentHandler.handle(invocation),
+    )
+    .await
+    .expect("any_final wait should return immediately when one agent is already final")
+    .expect("wait_agent should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: wait::WaitResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert!(!result.timed_out);
+    assert!(
+        matches!(
+            result.agents.get(&completed_agent_id),
+            Some(crate::agent::status::AgentRuntimeState {
+                status: AgentStatus::Shutdown,
+                last_activity: Some(activity),
+            }) if activity.kind == CollabAgentActivityKind::Status
+                && activity.summary == "Shutdown complete"
+        ),
+        "unexpected completed-agent shutdown state: {:?}",
+        result.agents.get(&completed_agent_id)
+    );
+    assert!(matches!(
+        result
+            .agents
+            .get(&running_agent_id)
+            .map(|state| state.status.clone()),
+        Some(AgentStatus::PendingInit | AgentStatus::Running)
+    ));
+    assert_eq!(success, None);
+
+    let _ = running_thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
 }
 
 #[tokio::test]
