@@ -2241,6 +2241,48 @@ impl AccountManager {
         Ok(store)
     }
 
+    fn mutate_loaded_store<T>(
+        &self,
+        store: &mut AuthStore,
+        persist_storage: &dyn AuthStorageBackend,
+        mutator: impl FnOnce(&mut AuthStore) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        // Merge-safety anchor: account mutations keep AuthManager as the
+        // lock/load/cache owner while AccountManager owns saved-account runtime
+        // prep, active-lease reconciliation, validation, and persistence.
+        let removed_before_mutation =
+            enforce_chatgpt_auth_accounts(store, ChatgptAuthAdmissionPolicy::Persisted);
+        if !removed_before_mutation.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_before_mutation,
+                "removed accounts with unsupported ChatGPT plans before auth store mutation"
+            );
+        }
+        if let Some(account_state_store) = self.account_state_store.as_ref() {
+            synchronize_store_usage_from_legacy_and_sqlite(account_state_store, store)?;
+        }
+        self.hydrate_runtime_active_account(store)?;
+
+        let out = mutator(store)?;
+        let removed_after_mutation =
+            enforce_chatgpt_auth_accounts(store, ChatgptAuthAdmissionPolicy::Persisted);
+        if !removed_after_mutation.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_after_mutation,
+                "removed accounts with unsupported ChatGPT plans after auth store mutation"
+            );
+        }
+        self.reconcile_runtime_active_account(store)?;
+        store.validate()?;
+        if let Some(account_state_store) = self.account_state_store.as_ref() {
+            persist_usage_state_from_store(account_state_store, store)?;
+            persist_stripped_auth_store(persist_storage, store)?;
+        } else {
+            persist_storage.save(store)?;
+        }
+        Ok(out)
+    }
+
     fn clone_store_with_runtime_active_account(&self, store: &AuthStore) -> Option<AuthStore> {
         let mut store = store.clone();
         if let Err(error) = self.hydrate_runtime_active_account(&mut store) {
@@ -3969,37 +4011,9 @@ impl AuthManager {
                 }
             }
         };
-        let removed_before_mutation =
-            enforce_chatgpt_auth_accounts(&mut store, ChatgptAuthAdmissionPolicy::Persisted);
-        if !removed_before_mutation.is_empty() {
-            tracing::info!(
-                removed_account_ids = ?removed_before_mutation,
-                "removed accounts with unsupported ChatGPT plans before auth store mutation"
-            );
-        }
-        if let Some(account_state_store) = self.account_manager.account_state_store.as_ref() {
-            synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store)?;
-        }
-        self.account_manager
-            .hydrate_runtime_active_account(&mut store)?;
-
-        let out = mutator(&mut store)?;
-        let removed_after_mutation =
-            enforce_chatgpt_auth_accounts(&mut store, ChatgptAuthAdmissionPolicy::Persisted);
-        if !removed_after_mutation.is_empty() {
-            tracing::info!(
-                removed_account_ids = ?removed_after_mutation,
-                "removed accounts with unsupported ChatGPT plans after auth store mutation"
-            );
-        }
-        self.reconcile_runtime_active_account(&store)?;
-        store.validate()?;
-        if let Some(account_state_store) = self.account_manager.account_state_store.as_ref() {
-            persist_usage_state_from_store(account_state_store, &store)?;
-            persist_stripped_auth_store(&*self.storage, &store)?;
-        } else {
-            self.storage.save(&store)?;
-        }
+        let out = self
+            .account_manager
+            .mutate_loaded_store(&mut store, &*self.storage, mutator)?;
         self.set_cached(store);
         Ok(out)
     }
