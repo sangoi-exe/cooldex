@@ -756,6 +756,120 @@ fn remove_account_reselects_unleased_fallback_account() {
     );
 }
 
+// Merge-safety anchor: terminal refresh-token eviction must keep the
+// active-account removal path skipping foreign-leased fallbacks while updating
+// cached and persisted active-account truth together.
+#[test]
+fn terminal_refresh_failure_removes_active_account_and_switches_to_unleased_fallback() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let workspace_id = "workspace-a";
+    let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("plus".to_string()),
+        chatgpt_account_id: Some(workspace_id.to_string()),
+    })
+    .expect("create test jwt");
+    let make_account = |store_account_id: &str, label: &str| StoredAccount {
+        id: store_account_id.to_string(),
+        label: Some(label.to_string()),
+        tokens: TokenData {
+            id_token: IdTokenInfo {
+                email: Some(format!("{store_account_id}@example.com")),
+                chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                chatgpt_user_id: Some(format!("user-{store_account_id}")),
+                chatgpt_account_id: Some(workspace_id.to_string()),
+                chatgpt_account_is_fedramp: false,
+                raw_jwt: raw_jwt.clone(),
+            },
+            access_token: format!("{store_account_id}-access-token"),
+            refresh_token: format!("{store_account_id}-refresh-token"),
+            account_id: Some(workspace_id.to_string()),
+        },
+        last_refresh: None,
+        usage: None,
+    };
+    save_auth(
+        codex_home.path(),
+        &AuthStore {
+            active_account_id: Some("store-account-a".to_string()),
+            accounts: vec![
+                make_account("store-account-a", "Primary"),
+                make_account("store-account-b", "Leased elsewhere"),
+                make_account("store-account-c", "Fallback"),
+            ],
+            ..AuthStore::default()
+        },
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store");
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+    manager
+        .account_manager
+        .account_state_store
+        .as_ref()
+        .expect("account-state store should open")
+        .set_session_active_account(
+            "other-session",
+            None,
+            "store-account-b",
+            Utc::now(),
+            ACTIVE_ACCOUNT_LEASE_TTL_SECONDS,
+        )
+        .expect("foreign lease should persist");
+
+    let removal = manager
+        .remove_chatgpt_store_account_for_terminal_refresh_failure(
+            "store-account-a",
+            &RefreshTokenFailedError::new(
+                RefreshTokenFailedReason::Exhausted,
+                "refresh token exhausted",
+            ),
+        )
+        .expect("terminal refresh failure should remove the active account");
+    assert_eq!(
+        removal,
+        TerminalRefreshFailureAccountRemoval::Removed {
+            switched_to_store_account_id: Some("store-account-c".to_string())
+        }
+    );
+
+    let cached_store = manager
+        .inner
+        .read()
+        .expect("cached auth should stay readable")
+        .store
+        .clone();
+    assert_eq!(
+        cached_store.active_account_id,
+        Some("store-account-c".to_string())
+    );
+    assert!(
+        cached_store
+            .accounts
+            .iter()
+            .all(|account| account.id != "store-account-a")
+    );
+    assert_eq!(
+        manager
+            .active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id),
+        Some("store-account-c".to_string())
+    );
+    assert_eq!(
+        manager
+            .persisted_active_store_account_id()
+            .expect("load persisted active account"),
+        None
+    );
+}
+
 #[test]
 fn reconcile_account_rate_limit_refresh_outcomes_updates_cached_usage_truth() {
     let codex_home = tempdir().expect("create auth tempdir");

@@ -1579,6 +1579,11 @@ struct GuardedReloadStorePreparation {
     removed_account_ids: Vec<String>,
 }
 
+struct TerminalRefreshFailureStoreMutation {
+    was_active: bool,
+    switched_to_store_account_id: Option<String>,
+}
+
 struct AccountRuntimeContext {
     linked_codex_session_id: Option<String>,
     forced_chatgpt_workspace_id: Option<String>,
@@ -2311,6 +2316,157 @@ impl AccountManager {
         Ok(out)
     }
 
+    fn remove_store_account_after_terminal_refresh_failure(
+        &self,
+        store: &mut AuthStore,
+        persist_storage: &dyn AuthStorageBackend,
+        store_account_id: &str,
+    ) -> std::io::Result<Option<TerminalRefreshFailureStoreMutation>> {
+        // Merge-safety anchor: terminal refresh-token eviction keeps AuthManager
+        // as the lock/load/cache/auth owner while AccountManager owns saved-account
+        // eviction mutation, fallback selection, lease diagnostics, and persistence.
+        let removed_before_mutation =
+            enforce_chatgpt_auth_accounts(store, ChatgptAuthAdmissionPolicy::Persisted);
+        if !removed_before_mutation.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_before_mutation,
+                "removed accounts with unsupported ChatGPT plans before terminal refresh-token eviction"
+            );
+        }
+        self.hydrate_runtime_active_account(store)?;
+
+        let was_active = store.active_account_id.as_deref() == Some(store_account_id);
+        let previous_account_count = store.accounts.len();
+        store
+            .accounts
+            .retain(|account| account.id != store_account_id);
+        if store.accounts.len() == previous_account_count {
+            return Ok(None);
+        }
+
+        let required_workspace_id = self.forced_chatgpt_workspace_id();
+        let switched_to_store_account_id = if was_active {
+            let selection_now = Utc::now();
+            let next_store_account_id = self.select_account_for_auto_switch_with_leases(
+                store,
+                required_workspace_id.as_deref(),
+                /*exclude_store_account_id*/ None,
+                selection_now,
+                UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+            );
+            if next_store_account_id.is_none() {
+                let fallback_workspace_candidate_count = store
+                    .accounts
+                    .iter()
+                    .filter(|account| {
+                        account_matches_required_workspace(
+                            account,
+                            required_workspace_id.as_deref(),
+                        )
+                    })
+                    .count();
+                let fallback_selectable_candidate_count = store
+                    .accounts
+                    .iter()
+                    .filter(|account| {
+                        account_selectable_for_auto_switch(
+                            account,
+                            required_workspace_id.as_deref(),
+                            selection_now,
+                            UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+                        )
+                    })
+                    .count();
+                let fallback_exhausted_candidate_count = store
+                    .accounts
+                    .iter()
+                    .filter(|account| {
+                        account_matches_required_workspace(
+                            account,
+                            required_workspace_id.as_deref(),
+                        ) && account
+                            .usage
+                            .as_ref()
+                            .and_then(|usage| usage.exhausted_until)
+                            .is_some_and(|until| until > selection_now)
+                    })
+                    .count();
+                let (fallback_leased_by_other_count, fallback_lease_state_unavailable_count) =
+                    if let Some(account_state_store) = self.account_state_store.as_ref() {
+                        store
+                            .accounts
+                            .iter()
+                            .filter(|account| {
+                                account_matches_required_workspace(
+                                    account,
+                                    required_workspace_id.as_deref(),
+                                )
+                            })
+                            .fold((0usize, 0usize), |(leased, unavailable), account| {
+                                match account_state_store.account_is_leased_by_other(
+                                    self.runtime_session_id.as_str(),
+                                    self.linked_codex_session_id().as_deref(),
+                                    account.id.as_str(),
+                                    selection_now,
+                                ) {
+                                    Ok(true) => (leased + 1, unavailable),
+                                    Ok(false) => (leased, unavailable),
+                                    Err(_) => (leased, unavailable + 1),
+                                }
+                            })
+                    } else {
+                        (0usize, fallback_workspace_candidate_count)
+                    };
+                tracing::warn!(
+                    failed_store_account_id = store_account_id,
+                    runtime_session_id = self.runtime_session_id,
+                    linked_codex_session_id = ?self.linked_codex_session_id().as_deref(),
+                    required_workspace_id = ?required_workspace_id,
+                    remaining_saved_account_count = store.accounts.len(),
+                    fallback_workspace_candidate_count,
+                    fallback_selectable_candidate_count,
+                    fallback_exhausted_candidate_count,
+                    fallback_leased_by_other_count,
+                    fallback_lease_state_unavailable_count,
+                    "terminal refresh-token failure removed the active account without selecting a fallback; auth will become bearerless"
+                );
+            }
+            store.active_account_id = next_store_account_id.clone();
+            next_store_account_id
+        } else {
+            store.active_account_id = store.active_account_id.clone().filter(|active_account_id| {
+                store
+                    .accounts
+                    .iter()
+                    .any(|account| &account.id == active_account_id)
+            });
+            None
+        };
+
+        let removed_after_mutation =
+            enforce_chatgpt_auth_accounts(store, ChatgptAuthAdmissionPolicy::Persisted);
+        if !removed_after_mutation.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_after_mutation,
+                "removed accounts with unsupported ChatGPT plans after terminal refresh-token eviction"
+            );
+        }
+
+        self.reconcile_runtime_active_account(store)?;
+        store.validate()?;
+        if let Some(account_state_store) = self.account_state_store.as_ref() {
+            persist_usage_state_from_store(account_state_store, store)?;
+            persist_stripped_auth_store(persist_storage, store)?;
+        } else {
+            persist_storage.save(store)?;
+        }
+
+        Ok(Some(TerminalRefreshFailureStoreMutation {
+            was_active,
+            switched_to_store_account_id,
+        }))
+    }
+
     fn clone_store_with_runtime_active_account(&self, store: &AuthStore) -> Option<AuthStore> {
         let mut store = store.clone();
         if let Err(error) = self.hydrate_runtime_active_account(&mut store) {
@@ -2899,10 +3055,6 @@ impl Drop for AuthManager {
 }
 
 impl AuthManager {
-    fn reconcile_runtime_active_account(&self, store: &AuthStore) -> std::io::Result<()> {
-        self.account_manager.reconcile_runtime_active_account(store)
-    }
-
     /// Create a new manager loading the initial auth using the provided
     /// preferred auth method. Errors loading auth or opening the WS12
     /// account-state store are swallowed; `auth()` will simply return `None`
@@ -4330,179 +4482,47 @@ impl AuthManager {
                 }
             }
         };
-        let removed_before_mutation =
-            enforce_chatgpt_auth_accounts(&mut store, ChatgptAuthAdmissionPolicy::Persisted);
-        if !removed_before_mutation.is_empty() {
-            tracing::info!(
-                removed_account_ids = ?removed_before_mutation,
-                "removed accounts with unsupported ChatGPT plans before terminal refresh-token eviction"
-            );
-        }
-        self.account_manager
-            .hydrate_runtime_active_account(&mut store)
-            .map_err(RefreshTokenError::Transient)?;
-
-        let was_active = store.active_account_id.as_deref() == Some(store_account_id);
-        let previous_account_count = store.accounts.len();
-        store
-            .accounts
-            .retain(|account| account.id != store_account_id);
-        if store.accounts.len() == previous_account_count {
+        let Some(mutation) = self
+            .account_manager
+            .remove_store_account_after_terminal_refresh_failure(
+                &mut store,
+                &*self.storage,
+                store_account_id,
+            )
+            .map_err(RefreshTokenError::Transient)?
+        else {
             return Ok(TerminalRefreshFailureAccountRemoval::NotRemoved);
-        }
-
-        let required_workspace_id = self.account_manager.forced_chatgpt_workspace_id();
-        let switched_to_store_account_id = if was_active {
-            let selection_now = Utc::now();
-            let next_store_account_id = self.select_account_for_auto_switch_with_leases(
-                &store,
-                required_workspace_id.as_deref(),
-                /*exclude_store_account_id*/ None,
-                selection_now,
-                UsageLimitAutoSwitchSelectionScope::PersistedTruth,
-            );
-            if next_store_account_id.is_none() {
-                let fallback_workspace_candidate_count = store
-                    .accounts
-                    .iter()
-                    .filter(|account| {
-                        account_matches_required_workspace(
-                            account,
-                            required_workspace_id.as_deref(),
-                        )
-                    })
-                    .count();
-                let fallback_selectable_candidate_count = store
-                    .accounts
-                    .iter()
-                    .filter(|account| {
-                        account_selectable_for_auto_switch(
-                            account,
-                            required_workspace_id.as_deref(),
-                            selection_now,
-                            UsageLimitAutoSwitchSelectionScope::PersistedTruth,
-                        )
-                    })
-                    .count();
-                let fallback_exhausted_candidate_count = store
-                    .accounts
-                    .iter()
-                    .filter(|account| {
-                        account_matches_required_workspace(
-                            account,
-                            required_workspace_id.as_deref(),
-                        ) && account
-                            .usage
-                            .as_ref()
-                            .and_then(|usage| usage.exhausted_until)
-                            .is_some_and(|until| until > selection_now)
-                    })
-                    .count();
-                let (fallback_leased_by_other_count, fallback_lease_state_unavailable_count) =
-                    if let Some(account_state_store) =
-                        self.account_manager.account_state_store.as_ref()
-                    {
-                        store
-                            .accounts
-                            .iter()
-                            .filter(|account| {
-                                account_matches_required_workspace(
-                                    account,
-                                    required_workspace_id.as_deref(),
-                                )
-                            })
-                            .fold((0usize, 0usize), |(leased, unavailable), account| {
-                                match account_state_store.account_is_leased_by_other(
-                                    self.account_manager.runtime_session_id.as_str(),
-                                    self.account_manager.linked_codex_session_id().as_deref(),
-                                    account.id.as_str(),
-                                    selection_now,
-                                ) {
-                                    Ok(true) => (leased + 1, unavailable),
-                                    Ok(false) => (leased, unavailable),
-                                    Err(_) => (leased, unavailable + 1),
-                                }
-                            })
-                    } else {
-                        (0usize, fallback_workspace_candidate_count)
-                    };
-                tracing::warn!(
-                    failed_store_account_id = store_account_id,
-                    runtime_session_id = self.account_manager.runtime_session_id,
-                    linked_codex_session_id = ?self.account_manager.linked_codex_session_id().as_deref(),
-                    required_workspace_id = ?required_workspace_id,
-                    remaining_saved_account_count = store.accounts.len(),
-                    fallback_workspace_candidate_count,
-                    fallback_selectable_candidate_count,
-                    fallback_exhausted_candidate_count,
-                    fallback_leased_by_other_count,
-                    fallback_lease_state_unavailable_count,
-                    "terminal refresh-token failure removed the active account without selecting a fallback; auth will become bearerless"
-                );
-            }
-            store.active_account_id = next_store_account_id.clone();
-            next_store_account_id
-        } else {
-            store.active_account_id = store.active_account_id.clone().filter(|active_account_id| {
-                store
-                    .accounts
-                    .iter()
-                    .any(|account| &account.id == active_account_id)
-            });
-            None
         };
 
-        let removed_after_mutation =
-            enforce_chatgpt_auth_accounts(&mut store, ChatgptAuthAdmissionPolicy::Persisted);
-        if !removed_after_mutation.is_empty() {
-            tracing::info!(
-                removed_account_ids = ?removed_after_mutation,
-                "removed accounts with unsupported ChatGPT plans after terminal refresh-token eviction"
-            );
-        }
-
-        self.reconcile_runtime_active_account(&store)
-            .map_err(RefreshTokenError::Transient)?;
-        store.validate().map_err(RefreshTokenError::Transient)?;
-        if let Some(account_state_store) = self.account_manager.account_state_store.as_ref() {
-            persist_usage_state_from_store(account_state_store, &store)
-                .map_err(RefreshTokenError::Transient)?;
-            persist_stripped_auth_store(&*self.storage, &store)
-                .map_err(RefreshTokenError::Transient)?;
+        let cached_auth = if let Some(switched_to_store_account_id) =
+            mutation.switched_to_store_account_id.as_deref()
+        {
+            Self::derive_chatgpt_auth_from_store_account(
+                &store,
+                switched_to_store_account_id,
+                Arc::clone(&self.storage),
+                CachedStoreOrigin::Persistent,
+            )
+        } else if mutation.was_active {
+            None
         } else {
-            self.storage
-                .save(&store)
-                .map_err(RefreshTokenError::Transient)?;
-        }
-
-        let cached_auth =
-            if let Some(switched_to_store_account_id) = switched_to_store_account_id.as_deref() {
-                Self::derive_chatgpt_auth_from_store_account(
-                    &store,
-                    switched_to_store_account_id,
-                    Arc::clone(&self.storage),
-                    CachedStoreOrigin::Persistent,
-                )
-            } else if was_active {
-                None
-            } else {
-                Self::derive_auth_from_store(
-                    &store,
-                    &self.codex_home,
-                    Arc::clone(&self.storage),
-                    self.enable_codex_api_key_env,
-                    CachedStoreOrigin::Persistent,
-                )
-            };
+            Self::derive_auth_from_store(
+                &store,
+                &self.codex_home,
+                Arc::clone(&self.storage),
+                self.enable_codex_api_key_env,
+                CachedStoreOrigin::Persistent,
+            )
+        };
         self.set_cached_with_auth(store, cached_auth, CachedStoreOrigin::Persistent);
         tracing::warn!(
             store_account_id,
             failed_reason = ?error.reason,
-            switched_to_store_account_id,
+            switched_to_store_account_id = mutation.switched_to_store_account_id,
             "removed saved ChatGPT account after terminal refresh-token failure"
         );
         Ok(TerminalRefreshFailureAccountRemoval::Removed {
-            switched_to_store_account_id,
+            switched_to_store_account_id: mutation.switched_to_store_account_id,
         })
     }
 
