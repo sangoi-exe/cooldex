@@ -2221,6 +2221,117 @@ impl AccountManager {
         }
     }
 
+    fn chatgpt_auth_admission_policy_for_store_origin(
+        store_origin: CachedStoreOrigin,
+    ) -> ChatgptAuthAdmissionPolicy {
+        match store_origin {
+            CachedStoreOrigin::Persistent => ChatgptAuthAdmissionPolicy::Persisted,
+            CachedStoreOrigin::ExternalEphemeral => ChatgptAuthAdmissionPolicy::ExternalStrict,
+        }
+    }
+
+    fn preflight_loaded_store_candidate(
+        mut store: AuthStore,
+        persist_storage: Arc<dyn AuthStorageBackend>,
+        store_origin: CachedStoreOrigin,
+    ) -> LoadedStoreCandidate {
+        let removed_account_ids = enforce_chatgpt_auth_accounts(
+            &mut store,
+            Self::chatgpt_auth_admission_policy_for_store_origin(store_origin),
+        );
+        if !removed_account_ids.is_empty() {
+            tracing::info!(
+                removed_account_ids = ?removed_account_ids,
+                ?store_origin,
+                "removed accounts with unsupported ChatGPT plans while preflighting auth store"
+            );
+            if let Err(error) = persist_storage.save(&store) {
+                tracing::warn!(
+                    error = %error,
+                    ?store_origin,
+                    "failed to persist stripped auth store after preflighting unsupported plans"
+                );
+            }
+        }
+        LoadedStoreCandidate {
+            store,
+            store_origin,
+        }
+    }
+
+    fn store_has_selectable_auth_material(store: &AuthStore) -> bool {
+        !store.accounts.is_empty() || store.openai_api_key.is_some()
+    }
+
+    fn load_store_from_storage(
+        &self,
+        codex_home: &Path,
+        storage: &Arc<dyn AuthStorageBackend>,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> LoadedCachedStore {
+        // Merge-safety anchor: live store loading keeps AccountManager as the
+        // owner of auth-store selection, admission filtering, sqlite-backed
+        // usage/runtime hydration, and persisted-active stripping; AuthManager
+        // remains a delegation seam for auth materialization only.
+        let runtime_context = self.runtime_context();
+        let external_storage = (auth_credentials_store_mode != AuthCredentialsStoreMode::Ephemeral)
+            .then(|| {
+                create_auth_storage(
+                    codex_home.to_path_buf(),
+                    AuthCredentialsStoreMode::Ephemeral,
+                )
+            });
+        let persistent_store = match storage.load() {
+            Ok(Some(store)) => store,
+            Ok(None) => AuthStore::default(),
+            Err(err) => {
+                tracing::warn!("Failed to load auth store: {err}");
+                AuthStore::default()
+            }
+        };
+        let persistent_origin =
+            if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
+                CachedStoreOrigin::ExternalEphemeral
+            } else {
+                CachedStoreOrigin::Persistent
+            };
+        let mut selected_store = persistent_store;
+        let mut selected_storage = Arc::clone(storage);
+        let mut selected_origin = persistent_origin;
+        if let Some(external_storage) = external_storage.as_ref() {
+            match external_storage.load() {
+                Ok(Some(store)) if !store.accounts.is_empty() || store.openai_api_key.is_some() => {
+                    let external_candidate = Self::preflight_loaded_store_candidate(
+                        store,
+                        Arc::clone(external_storage),
+                        CachedStoreOrigin::ExternalEphemeral,
+                    );
+                    if Self::store_has_selectable_auth_material(&external_candidate.store) {
+                        selected_store = external_candidate.store;
+                        selected_storage = Arc::clone(external_storage);
+                        selected_origin = external_candidate.store_origin;
+                    }
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!("Failed to load external auth store: {err}");
+                }
+            }
+        }
+        let selected = self.prepare_loaded_store_candidate(
+            selected_store,
+            selected_storage,
+            selected_origin,
+            Self::chatgpt_auth_admission_policy_for_store_origin(selected_origin),
+            &runtime_context,
+        );
+
+        LoadedCachedStore {
+            store: selected.store,
+            store_origin: selected.store_origin,
+        }
+    }
+
     fn prepare_strict_loaded_store(
         &self,
         mut store: AuthStore,
@@ -3085,11 +3196,10 @@ impl AuthManager {
         let account_state_store = open_account_state_store(sqlite_home.as_path());
         let runtime_session_id = uuid::Uuid::new_v4().to_string();
         let account_manager = AccountManager::new(account_state_store, runtime_session_id);
-        let loaded = Self::load_store_from_storage_impl(
+        let loaded = account_manager.load_store_from_storage(
             &codex_home,
             &storage,
             auth_credentials_store_mode,
-            &account_manager,
         );
         let store = loaded.store;
         let store_origin = loaded.store_origin;
@@ -3907,15 +4017,6 @@ impl AuthManager {
         None
     }
 
-    fn chatgpt_auth_admission_policy_for_store_origin(
-        store_origin: CachedStoreOrigin,
-    ) -> ChatgptAuthAdmissionPolicy {
-        match store_origin {
-            CachedStoreOrigin::Persistent => ChatgptAuthAdmissionPolicy::Persisted,
-            CachedStoreOrigin::ExternalEphemeral => ChatgptAuthAdmissionPolicy::ExternalStrict,
-        }
-    }
-
     fn chatgpt_api_auth_mode_for_store_origin(store_origin: CachedStoreOrigin) -> ApiAuthMode {
         match store_origin {
             CachedStoreOrigin::Persistent => ApiAuthMode::Chatgpt,
@@ -3994,110 +4095,14 @@ impl AuthManager {
     }
 
     fn load_store_from_storage(&self) -> LoadedCachedStore {
-        Self::load_store_from_storage_impl(
+        // Merge-safety anchor: live auth readers must delegate store snapshot
+        // loading to AccountManager so runtime-active/usage truth comes from one
+        // owner while AuthManager stays on auth derivation and cache refresh.
+        self.account_manager.load_store_from_storage(
             &self.codex_home,
             &self.storage,
             self.auth_credentials_store_mode,
-            &self.account_manager,
         )
-    }
-
-    fn load_store_from_storage_impl(
-        codex_home: &Path,
-        storage: &Arc<dyn AuthStorageBackend>,
-        auth_credentials_store_mode: AuthCredentialsStoreMode,
-        account_manager: &AccountManager,
-    ) -> LoadedCachedStore {
-        let runtime_context = account_manager.runtime_context();
-        let external_storage = (auth_credentials_store_mode != AuthCredentialsStoreMode::Ephemeral)
-            .then(|| {
-                create_auth_storage(
-                    codex_home.to_path_buf(),
-                    AuthCredentialsStoreMode::Ephemeral,
-                )
-            });
-        let persistent_store = match storage.load() {
-            Ok(Some(store)) => store,
-            Ok(None) => AuthStore::default(),
-            Err(err) => {
-                tracing::warn!("Failed to load auth store: {err}");
-                AuthStore::default()
-            }
-        };
-        let persistent_origin =
-            if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
-                CachedStoreOrigin::ExternalEphemeral
-            } else {
-                CachedStoreOrigin::Persistent
-            };
-        let mut selected_store = persistent_store;
-        let mut selected_storage = Arc::clone(storage);
-        let mut selected_origin = persistent_origin;
-        if let Some(external_storage) = external_storage.as_ref() {
-            match external_storage.load() {
-                Ok(Some(store)) if !store.accounts.is_empty() || store.openai_api_key.is_some() => {
-                    let external_candidate = Self::preflight_loaded_store_candidate(
-                        store,
-                        Arc::clone(external_storage),
-                        CachedStoreOrigin::ExternalEphemeral,
-                    );
-                    if Self::store_has_selectable_auth_material(&external_candidate.store) {
-                        selected_store = external_candidate.store;
-                        selected_storage = Arc::clone(external_storage);
-                        selected_origin = external_candidate.store_origin;
-                    }
-                }
-                Ok(Some(_)) | Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!("Failed to load external auth store: {err}");
-                }
-            }
-        }
-        let selected = account_manager.prepare_loaded_store_candidate(
-            selected_store,
-            selected_storage,
-            selected_origin,
-            Self::chatgpt_auth_admission_policy_for_store_origin(selected_origin),
-            &runtime_context,
-        );
-
-        LoadedCachedStore {
-            store: selected.store,
-            store_origin: selected.store_origin,
-        }
-    }
-
-    fn preflight_loaded_store_candidate(
-        mut store: AuthStore,
-        persist_storage: Arc<dyn AuthStorageBackend>,
-        store_origin: CachedStoreOrigin,
-    ) -> LoadedStoreCandidate {
-        let removed_account_ids = enforce_chatgpt_auth_accounts(
-            &mut store,
-            Self::chatgpt_auth_admission_policy_for_store_origin(store_origin),
-        );
-        if !removed_account_ids.is_empty() {
-            tracing::info!(
-                removed_account_ids = ?removed_account_ids,
-                ?store_origin,
-                "removed accounts with unsupported ChatGPT plans while preflighting auth store"
-            );
-            if let Err(error) = persist_storage.save(&store) {
-                tracing::warn!(
-                    error = %error,
-                    ?store_origin,
-                    "failed to persist stripped auth store after preflighting unsupported plans"
-                );
-            }
-        }
-        LoadedStoreCandidate {
-            store,
-            store_origin,
-        }
-    }
-
-    fn store_has_selectable_auth_material(store: &AuthStore) -> bool {
-        !store.accounts.is_empty() || store.openai_api_key.is_some()
     }
 
     /// Records a permanent refresh failure only if the failed refresh was
