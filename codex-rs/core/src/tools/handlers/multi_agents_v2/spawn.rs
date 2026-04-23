@@ -1,7 +1,3 @@
-// Merge-safety anchor: MultiAgentV2 spawn owns the canonical task-name contract
-// for spawned children; keep the runtime handler aligned with the V2 tool spec,
-// task-path metadata, and inherited child-instruction behavior.
-
 use super::*;
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
@@ -12,10 +8,7 @@ use crate::agent::role::apply_role_to_config;
 use crate::tools::handlers::multi_agents::collab_spawn_error;
 use crate::tools::handlers::multi_agents_common::apply_requested_spawn_agent_model_overrides;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_overrides;
-use crate::tools::handlers::multi_agents_common::apply_spawn_agent_runtime_overrides;
-use crate::tools::handlers::multi_agents_common::apply_spawn_agent_subagent_overrides;
 use crate::tools::handlers::multi_agents_common::build_agent_spawn_config;
-use crate::tools::handlers::multi_agents_common::finalize_spawn_agent_prompt_config;
 use crate::tools::handlers::multi_agents_common::parse_collab_input;
 use crate::tools::handlers::multi_agents_common::reject_full_fork_spawn_overrides;
 use crate::tools::handlers::multi_agents_common::thread_spawn_source;
@@ -58,7 +51,6 @@ impl ToolHandler for Handler {
             .as_deref()
             .map(str::trim)
             .filter(|role| !role.is_empty());
-        let requested_task_name = args.task_name.clone();
         let initial_operation: Op = parse_collab_input(Some(args.message), /*items*/ None)?.into();
         let prompt = render_input_preview(&initial_operation);
 
@@ -71,7 +63,6 @@ impl ToolHandler for Handler {
             ));
         }
         let mut config = build_agent_spawn_config(turn.as_ref())?;
-        let subagent_file_mutation_mode = config.subagent_file_mutation_mode;
         if matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)) {
             reject_full_fork_spawn_overrides(
                 role_name,
@@ -91,14 +82,6 @@ impl ToolHandler for Handler {
                 .await
                 .map_err(FunctionCallError::RespondToModel)?;
         }
-        apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
-        apply_spawn_agent_subagent_overrides(&mut config, subagent_file_mutation_mode)?;
-        finalize_spawn_agent_prompt_config(
-            &mut config,
-            turn.as_ref(),
-            session.services.models_manager.as_ref(),
-        )
-        .await;
         apply_spawn_agent_overrides(&mut config, child_depth);
         config.developer_instructions = Some(
             if let Some(existing_instructions) = config.developer_instructions.take() {
@@ -111,12 +94,6 @@ impl ToolHandler for Handler {
                 DeveloperInstructions::new(SPAWN_AGENT_DEVELOPER_INSTRUCTIONS).into_text()
             },
         );
-        let configured_model = config
-            .model
-            .clone()
-            .unwrap_or_else(|| turn.model_info.slug.clone());
-        let configured_reasoning_effort = config.model_reasoning_effort;
-        let configured_profile = config.active_profile.clone();
         session
             .send_event(
                 &turn,
@@ -124,9 +101,9 @@ impl ToolHandler for Handler {
                     call_id: call_id.clone(),
                     sender_thread_id: session.conversation_id,
                     prompt: prompt.clone(),
-                    profile: configured_profile.clone(),
-                    model: configured_model.clone(),
-                    reasoning_effort: configured_reasoning_effort,
+                    profile: None,
+                    model: args.model.clone().unwrap_or_default(),
+                    reasoning_effort: args.reasoning_effort,
                 }
                 .into(),
             )
@@ -137,7 +114,7 @@ impl ToolHandler for Handler {
             &turn.session_source,
             child_depth,
             role_name,
-            Some(requested_task_name.clone()),
+            Some(args.task_name.clone()),
         )?;
         let spawn_operation = if let (Some(recipient), Op::UserInput { items, .. }) =
             (spawn_source.get_agent_path(), &initial_operation)
@@ -208,11 +185,11 @@ impl ToolHandler for Handler {
         let effective_model = agent_snapshot
             .as_ref()
             .map(|snapshot| snapshot.model.clone())
-            .unwrap_or_else(|| configured_model.clone());
+            .unwrap_or_else(|| args.model.clone().unwrap_or_default());
         let effective_reasoning_effort = agent_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.reasoning_effort)
-            .or(configured_reasoning_effort);
+            .or(args.reasoning_effort);
         let nickname = new_agent_nickname.clone();
         session
             .send_event(
@@ -223,9 +200,9 @@ impl ToolHandler for Handler {
                     new_thread_id,
                     new_agent_nickname,
                     new_agent_role,
-                    new_agent_task_name: new_agent_path.clone(),
+                    new_agent_task_name: None,
                     prompt,
-                    profile: configured_profile,
+                    profile: None,
                     model: effective_model,
                     reasoning_effort: effective_reasoning_effort,
                     status,

@@ -1,9 +1,7 @@
 //! Shared argument parsing and dispatch for the v2 text-only agent messaging tools.
 //!
-//! `send_message` and `followup_task` intentionally expose the same input shape and differ only in
-//! whether the resulting `InterAgentCommunication` should wake the target immediately.
-// Merge-safety anchor: the workspace-local send_message/followup_task V2 contract
-// shares one text-only parser and fail-loud dispatch owner here.
+//! `send_message` and `followup_task` share the same submission path and differ only in whether the
+//! resulting `InterAgentCommunication` should wake the target immediately.
 
 use super::*;
 use crate::tools::context::FunctionToolOutput;
@@ -106,7 +104,6 @@ async fn handle_message_submission(
     let receiver_agent_path = receiver_agent.agent_path.clone().ok_or_else(|| {
         FunctionCallError::RespondToModel("target agent is missing an agent_path".to_string())
     })?;
-    let receiver_agent_task_name = Some(receiver_agent_path.to_string());
     if mode == MessageDeliveryMode::TriggerTurn && receiver_agent_path.is_root() {
         return Err(FunctionCallError::RespondToModel(
             "Tasks can't be assigned to the root agent".to_string(),
@@ -128,7 +125,7 @@ async fn handle_message_submission(
                 tool: mode.tool(),
                 sender_thread_id: session.conversation_id,
                 receiver_thread_id,
-                receiver_agent_task_name: receiver_agent_task_name.clone(),
+                receiver_agent_task_name: None,
                 prompt: prompt.clone(),
             }
             .into(),
@@ -164,7 +161,7 @@ async fn handle_message_submission(
                 receiver_thread_id,
                 receiver_agent_nickname: receiver_agent.agent_nickname,
                 receiver_agent_role: receiver_agent.agent_role,
-                receiver_agent_task_name,
+                receiver_agent_task_name: None,
                 prompt,
                 status,
             }
