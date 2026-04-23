@@ -1463,6 +1463,126 @@ fn switch_account_on_usage_limit_respects_cooldown_but_still_marks_failing_accou
     assert!(usage.last_seen_at.is_some());
 }
 
+// Merge-safety anchor: usage-limit auto-switch cooldown ownership must keep
+// starting the cooldown only after a real persisted fallback switch succeeds.
+#[test]
+fn switch_account_on_usage_limit_starts_cooldown_after_switching_to_fallback() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let workspace_id = "workspace-a";
+    let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("plus".to_string()),
+        chatgpt_account_id: Some(workspace_id.to_string()),
+    })
+    .expect("create test jwt");
+    let make_account = |store_account_id: &str, label: &str| StoredAccount {
+        id: store_account_id.to_string(),
+        label: Some(label.to_string()),
+        tokens: TokenData {
+            id_token: IdTokenInfo {
+                email: Some(format!("{store_account_id}@example.com")),
+                chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                chatgpt_user_id: Some(format!("user-{store_account_id}")),
+                chatgpt_account_id: Some(workspace_id.to_string()),
+                chatgpt_account_is_fedramp: false,
+                raw_jwt: raw_jwt.clone(),
+            },
+            access_token: format!("{store_account_id}-access-token"),
+            refresh_token: format!("{store_account_id}-refresh-token"),
+            account_id: Some(workspace_id.to_string()),
+        },
+        last_refresh: None,
+        usage: None,
+    };
+
+    save_auth(
+        codex_home.path(),
+        &AuthStore {
+            active_account_id: Some("store-account-a".to_string()),
+            accounts: vec![
+                make_account("store-account-a", "Primary"),
+                make_account("store-account-b", "Fallback"),
+            ],
+            ..AuthStore::default()
+        },
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store");
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    let reset_at = Utc::now() + chrono::Duration::minutes(9);
+    let snapshot = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            remaining_percent: 0.0,
+            window_minutes: Some(15),
+            resets_at: Some(reset_at.timestamp()),
+        }),
+        secondary: None,
+        credits: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
+    };
+
+    assert_eq!(
+        manager
+            .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
+                required_workspace_id: None,
+                failing_store_account_id: Some("store-account-a"),
+                resets_at: Some(reset_at),
+                snapshot: Some(snapshot.clone()),
+                freshly_unsupported_store_account_ids: &HashSet::new(),
+                protected_store_account_id: None,
+                selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+                fallback_selection_mode:
+                    UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
+            })
+            .expect("autoswitch should succeed"),
+        Some("store-account-b".to_string())
+    );
+
+    let cached_store = manager
+        .inner
+        .read()
+        .expect("cached auth should stay readable")
+        .store
+        .clone();
+    assert_eq!(
+        cached_store.active_account_id,
+        Some("store-account-b".to_string())
+    );
+    assert!(
+        manager
+            .account_manager
+            .usage_limit_auto_switch_cooldown_until
+            .lock()
+            .expect("cooldown mutex should stay writable")
+            .is_some(),
+        "successful autoswitch should start cooldown"
+    );
+
+    let failing_account = cached_store
+        .accounts
+        .iter()
+        .find(|account| account.id == "store-account-a")
+        .expect("failing account should still exist");
+    let usage = failing_account
+        .usage
+        .as_ref()
+        .expect("failing account usage should be written");
+    assert_eq!(usage.last_rate_limits, Some(snapshot));
+    assert_eq!(usage.exhausted_until, Some(reset_at));
+    assert!(usage.last_seen_at.is_some());
+}
+
 #[test]
 fn has_saved_chatgpt_accounts_reads_latest_persisted_store_after_manager_construction() {
     let codex_home = tempdir().expect("create auth tempdir");
