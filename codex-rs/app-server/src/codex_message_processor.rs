@@ -482,6 +482,7 @@ pub(crate) struct CodexMessageProcessor {
     auth_manager: Arc<AuthManager>,
     thread_manager: Arc<ThreadManager>,
     outgoing: Arc<OutgoingMessageSender>,
+    last_sent_account_updated_notification: Arc<Mutex<Option<AccountUpdatedNotificationState>>>,
     analytics_events_client: AnalyticsEventsClient,
     arg0_paths: Arg0DispatchPaths,
     config: Arc<Config>,
@@ -499,6 +500,13 @@ pub(crate) struct CodexMessageProcessor {
     background_tasks: TaskTracker,
     feedback: CodexFeedback,
     log_db: Option<LogDbLayer>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AccountUpdatedNotificationState {
+    notification: AccountUpdatedNotification,
+    active_chatgpt_store_account_id: Option<String>,
+    account_email: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -669,20 +677,76 @@ impl CodexMessageProcessor {
         self.thread_manager.skills_manager().clear_cache();
     }
 
-    fn current_account_updated_notification(&self) -> AccountUpdatedNotification {
+    fn current_account_updated_notification(&self) -> AccountUpdatedNotificationState {
         Self::account_updated_notification_from_auth_manager(self.auth_manager.as_ref())
+    }
+
+    async fn send_account_updated_notification_if_changed(
+        outgoing: &OutgoingMessageSender,
+        last_sent_account_updated_notification: &Mutex<Option<AccountUpdatedNotificationState>>,
+        payload: AccountUpdatedNotificationState,
+    ) {
+        let mut last_sent = last_sent_account_updated_notification.lock().await;
+        if last_sent.as_ref() == Some(&payload) {
+            return;
+        }
+        *last_sent = Some(payload.clone());
+        outgoing
+            .send_server_notification(ServerNotification::AccountUpdated(payload.notification))
+            .await;
+    }
+
+    async fn send_current_account_updated_notification_if_changed(&self) {
+        Self::send_account_updated_notification_if_changed(
+            self.outgoing.as_ref(),
+            self.last_sent_account_updated_notification.as_ref(),
+            self.current_account_updated_notification(),
+        )
+        .await;
+    }
+
+    fn start_auth_state_notification_listener(&self) {
+        let mut auth_state_rx = self.auth_manager.subscribe_auth_state();
+        let auth_manager = Arc::clone(&self.auth_manager);
+        let outgoing = Arc::clone(&self.outgoing);
+        let last_sent_account_updated_notification =
+            Arc::clone(&self.last_sent_account_updated_notification);
+        self.background_tasks.spawn(async move {
+            loop {
+                if auth_state_rx.changed().await.is_err() {
+                    return;
+                }
+                Self::send_account_updated_notification_if_changed(
+                    outgoing.as_ref(),
+                    last_sent_account_updated_notification.as_ref(),
+                    Self::account_updated_notification_from_auth_manager(auth_manager.as_ref()),
+                )
+                .await;
+            }
+        });
     }
 
     fn account_updated_notification_from_auth_manager(
         auth_manager: &AuthManager,
-    ) -> AccountUpdatedNotification {
-        let auth = auth_manager.auth_cached();
-        AccountUpdatedNotification {
-            auth_mode: auth.as_ref().map(CodexAuth::api_auth_mode),
-            label: auth_manager
-                .active_chatgpt_account_summary()
-                .and_then(|summary| summary.label),
-            plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
+    ) -> AccountUpdatedNotificationState {
+        let auth = auth_manager.current_auth_from_storage();
+        let active_chatgpt_account_summary = auth
+            .as_ref()
+            .and_then(CodexAuth::active_chatgpt_account_summary);
+        AccountUpdatedNotificationState {
+            notification: AccountUpdatedNotification {
+                auth_mode: auth.as_ref().map(CodexAuth::api_auth_mode),
+                label: active_chatgpt_account_summary
+                    .as_ref()
+                    .and_then(|summary| summary.label.clone()),
+                plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
+            },
+            active_chatgpt_store_account_id: active_chatgpt_account_summary
+                .as_ref()
+                .map(|summary| summary.store_account_id.clone()),
+            account_email: active_chatgpt_account_summary
+                .as_ref()
+                .and_then(|summary| summary.email.clone()),
         }
     }
 
@@ -746,10 +810,15 @@ impl CodexMessageProcessor {
             feedback,
             log_db,
         } = args;
-        Self {
+        let initial_account_updated_notification =
+            Self::account_updated_notification_from_auth_manager(auth_manager.as_ref());
+        let processor = Self {
             auth_manager,
             thread_manager,
             outgoing: outgoing.clone(),
+            last_sent_account_updated_notification: Arc::new(Mutex::new(Some(
+                initial_account_updated_notification,
+            ))),
             analytics_events_client,
             arg0_paths,
             thread_store: LocalThreadStore::new(codex_rollout::RolloutConfig::from_view(&config)),
@@ -767,7 +836,9 @@ impl CodexMessageProcessor {
             background_tasks: TaskTracker::new(),
             feedback,
             log_db,
-        }
+        };
+        processor.start_auth_state_notification_listener();
+        processor
     }
 
     async fn load_latest_config(
@@ -1352,10 +1423,7 @@ impl CodexMessageProcessor {
                     ))
                     .await;
 
-                self.outgoing
-                    .send_server_notification(ServerNotification::AccountUpdated(
-                        self.current_account_updated_notification(),
-                    ))
+                self.send_current_account_updated_notification_if_changed()
                     .await;
             }
             Err(error) => {
@@ -1445,6 +1513,8 @@ impl CodexMessageProcessor {
                     let outgoing_clone = self.outgoing.clone();
                     let active_login = self.active_login.clone();
                     let auth_manager = self.auth_manager.clone();
+                    let last_sent_account_updated_notification =
+                        Arc::clone(&self.last_sent_account_updated_notification);
                     let cloud_requirements = self.cloud_requirements.clone();
                     let chatgpt_base_url = self.config.chatgpt_base_url.clone();
                     let codex_home = self.config.codex_home.to_path_buf();
@@ -1506,11 +1576,12 @@ impl CodexMessageProcessor {
                             let payload_v2 = Self::account_updated_notification_from_auth_manager(
                                 auth_manager.as_ref(),
                             );
-                            outgoing_clone
-                                .send_server_notification(ServerNotification::AccountUpdated(
-                                    payload_v2,
-                                ))
-                                .await;
+                            Self::send_account_updated_notification_if_changed(
+                                outgoing_clone.as_ref(),
+                                last_sent_account_updated_notification.as_ref(),
+                                payload_v2,
+                            )
+                            .await;
                         }
 
                         // Clear the active login if it matches this attempt. It may have been replaced or cancelled.
@@ -1572,6 +1643,8 @@ impl CodexMessageProcessor {
                     let outgoing_clone = self.outgoing.clone();
                     let active_login = self.active_login.clone();
                     let auth_manager = self.auth_manager.clone();
+                    let last_sent_account_updated_notification =
+                        Arc::clone(&self.last_sent_account_updated_notification);
                     let cloud_requirements = self.cloud_requirements.clone();
                     let chatgpt_base_url = self.config.chatgpt_base_url.clone();
                     let codex_home = self.config.codex_home.to_path_buf();
@@ -1629,11 +1702,12 @@ impl CodexMessageProcessor {
                             let payload_v2 = Self::account_updated_notification_from_auth_manager(
                                 auth_manager.as_ref(),
                             );
-                            outgoing_clone
-                                .send_server_notification(ServerNotification::AccountUpdated(
-                                    payload_v2,
-                                ))
-                                .await;
+                            Self::send_account_updated_notification_if_changed(
+                                outgoing_clone.as_ref(),
+                                last_sent_account_updated_notification.as_ref(),
+                                payload_v2,
+                            )
+                            .await;
                         }
 
                         let mut guard = active_login.lock().await;
@@ -1796,10 +1870,7 @@ impl CodexMessageProcessor {
             ))
             .await;
 
-        self.outgoing
-            .send_server_notification(ServerNotification::AccountUpdated(
-                self.current_account_updated_notification(),
-            ))
+        self.send_current_account_updated_notification_if_changed()
             .await;
     }
 
@@ -1833,18 +1904,11 @@ impl CodexMessageProcessor {
 
     async fn logout_v2(&self, request_id: ConnectionRequestId) {
         match self.logout_common().await {
-            Ok(current_auth_method) => {
+            Ok(_current_auth_method) => {
                 self.outgoing
                     .send_response(request_id, LogoutAccountResponse {})
                     .await;
-
-                let payload_v2 = AccountUpdatedNotification {
-                    auth_mode: current_auth_method,
-                    label: None,
-                    plan_type: None,
-                };
-                self.outgoing
-                    .send_server_notification(ServerNotification::AccountUpdated(payload_v2))
+                self.send_current_account_updated_notification_if_changed()
                     .await;
             }
             Err(error) => {
@@ -1951,23 +2015,20 @@ impl CodexMessageProcessor {
             return;
         }
 
-        let active_chatgpt_store_account_id = self
-            .auth_manager
-            .active_chatgpt_account_summary()
-            .map(|summary| summary.store_account_id);
-        let auth_mode = self
-            .auth_manager
-            .auth_cached()
+        let auth = self.auth_manager.current_auth_from_storage();
+        let active_chatgpt_summary = auth
             .as_ref()
-            .map(CodexAuth::api_auth_mode);
-        let account = match self.auth_manager.auth_cached() {
+            .and_then(CodexAuth::active_chatgpt_account_summary);
+        let active_chatgpt_store_account_id = active_chatgpt_summary
+            .as_ref()
+            .map(|summary| summary.store_account_id.clone());
+        let auth_mode = auth.as_ref().map(CodexAuth::api_auth_mode);
+        let account = match auth {
             Some(auth) => match auth.auth_mode() {
                 CoreAuthMode::ApiKey => Some(Account::ApiKey {}),
                 CoreAuthMode::Chatgpt | CoreAuthMode::ChatgptAuthTokens => {
                     let plan_type = auth.account_plan_type();
-                    let summary = self.auth_manager.active_chatgpt_account_summary();
-
-                    match (summary, plan_type) {
+                    match (active_chatgpt_summary, plan_type) {
                         (Some(summary), Some(plan_type)) => match summary.email {
                             Some(email) => Some(Account::Chatgpt {
                                 label: summary.label,
@@ -2052,10 +2113,7 @@ impl CodexMessageProcessor {
                 self.outgoing
                     .send_response(request_id, SetActiveAccountResponse {})
                     .await;
-                self.outgoing
-                    .send_server_notification(ServerNotification::AccountUpdated(
-                        self.current_account_updated_notification(),
-                    ))
+                self.send_current_account_updated_notification_if_changed()
                     .await;
             }
             Err(err) => {

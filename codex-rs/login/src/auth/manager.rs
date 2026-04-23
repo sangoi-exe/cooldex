@@ -1557,6 +1557,12 @@ enum CachedStoreOrigin {
     ExternalEphemeral,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AuthStateNotificationMode {
+    Notify,
+    Silent,
+}
+
 #[derive(Clone)]
 struct LoadedCachedStore {
     store: AuthStore,
@@ -2303,7 +2309,7 @@ impl AuthManager {
     }
 
     pub fn active_chatgpt_account_summary(&self) -> Option<ActiveChatgptAccountSummary> {
-        self.auth_cached()
+        self.current_auth_from_storage()
             .and_then(|auth| auth.active_chatgpt_account_summary())
     }
 
@@ -3413,6 +3419,35 @@ impl AuthManager {
         new_auth: Option<CodexAuth>,
         store_origin: CachedStoreOrigin,
     ) -> bool {
+        self.set_cached_with_auth_notification_mode(
+            store,
+            new_auth,
+            store_origin,
+            AuthStateNotificationMode::Notify,
+        )
+    }
+
+    fn set_cached_with_auth_silent(
+        &self,
+        store: AuthStore,
+        new_auth: Option<CodexAuth>,
+        store_origin: CachedStoreOrigin,
+    ) -> bool {
+        self.set_cached_with_auth_notification_mode(
+            store,
+            new_auth,
+            store_origin,
+            AuthStateNotificationMode::Silent,
+        )
+    }
+
+    fn set_cached_with_auth_notification_mode(
+        &self,
+        store: AuthStore,
+        new_auth: Option<CodexAuth>,
+        store_origin: CachedStoreOrigin,
+        notification_mode: AuthStateNotificationMode,
+    ) -> bool {
         if let Ok(mut guard) = self.inner.write() {
             let previous = guard.auth.as_ref();
             let changed = !AuthManager::auths_equal(previous, new_auth.as_ref());
@@ -3425,7 +3460,9 @@ impl AuthManager {
             guard.store = store;
             guard.store_origin = store_origin;
             guard.auth = new_auth;
-            self.auth_state_tx.send_replace(());
+            if notification_mode == AuthStateNotificationMode::Notify && changed {
+                self.auth_state_tx.send_replace(());
+            }
             changed
         } else {
             false
@@ -4247,7 +4284,9 @@ impl AuthManager {
         if self.has_external_api_key_auth() {
             return Some(ApiAuthMode::ApiKey);
         }
-        self.auth_cached().as_ref().map(CodexAuth::api_auth_mode)
+        self.current_auth_from_storage()
+            .as_ref()
+            .map(CodexAuth::api_auth_mode)
     }
 
     pub fn get_auth_mode(&self) -> Option<ApiAuthMode> {
@@ -4256,6 +4295,19 @@ impl AuthManager {
 
     pub fn has_saved_chatgpt_accounts(&self) -> bool {
         !self.load_store_from_storage().store.accounts.is_empty()
+    }
+
+    pub fn current_auth_from_storage(&self) -> Option<CodexAuth> {
+        let loaded = self.load_store_from_storage();
+        let auth = Self::derive_auth_from_store(
+            &loaded.store,
+            &self.codex_home,
+            Arc::clone(&self.storage),
+            self.enable_codex_api_key_env,
+            loaded.store_origin,
+        );
+        self.set_cached_with_auth_silent(loaded.store, auth.clone(), loaded.store_origin);
+        auth
     }
 
     pub fn runtime_session_id(&self) -> &str {
