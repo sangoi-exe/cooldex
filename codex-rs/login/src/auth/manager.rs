@@ -2083,6 +2083,141 @@ impl AccountManager {
         )
     }
 
+    fn set_active_account(&self, store: &mut AuthStore, id: &str) -> std::io::Result<()> {
+        let required_workspace_id = self.forced_chatgpt_workspace_id();
+        let Some(account) = store.accounts.iter().find(|account| account.id == id) else {
+            return Err(std::io::Error::other(format!("account '{id}' not found")));
+        };
+        if !account_matches_required_workspace(account, required_workspace_id.as_deref())
+            && let Some(required_workspace_id) = required_workspace_id.as_deref()
+        {
+            return Err(std::io::Error::other(format!(
+                "account '{id}' does not match required workspace {required_workspace_id:?}"
+            )));
+        }
+        store.active_account_id = Some(id.to_string());
+        if let Some(account) = store.accounts.iter_mut().find(|account| account.id == id) {
+            let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
+            usage.last_seen_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    fn remove_account(&self, store: &mut AuthStore, id: &str) -> std::io::Result<bool> {
+        let required_workspace_id = self.forced_chatgpt_workspace_id();
+        let prev_len = store.accounts.len();
+        store.accounts.retain(|account| account.id != id);
+        let removed = store.accounts.len() != prev_len;
+        if !removed {
+            return Ok(false);
+        }
+        if store.active_account_id.as_deref() == Some(id) {
+            store.active_account_id = self.select_account_for_auto_switch_with_leases(
+                store,
+                required_workspace_id.as_deref(),
+                /*exclude_store_account_id*/ None,
+                Utc::now(),
+                UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+            );
+        }
+        Ok(true)
+    }
+
+    fn list_accounts(&self, store: &AuthStore) -> Vec<AccountSummary> {
+        let active_account_id = store.active_account_id.as_deref();
+        let lease_states = self.account_lease_states(store);
+        store
+            .accounts
+            .iter()
+            .map(|account| {
+                let lease_state = lease_states
+                    .get(account.id.as_str())
+                    .copied()
+                    .unwrap_or(AccountLeaseState::Unavailable);
+                AccountSummary::from_stored(account, active_account_id, lease_state)
+            })
+            .collect()
+    }
+
+    fn reconcile_account_rate_limit_refresh_outcomes(
+        &self,
+        store: &mut AuthStore,
+        outcomes: &mut HashMap<String, AccountRateLimitRefreshOutcome>,
+    ) -> usize {
+        let now = Utc::now();
+        let mut updated = 0usize;
+        for account in &mut store.accounts {
+            if let Some(outcome) = outcomes.remove(&account.id) {
+                let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
+                apply_rate_limit_refresh_outcome(usage, outcome, now);
+                updated = updated.saturating_add(1);
+            }
+        }
+        updated
+    }
+
+    fn mark_usage_limit_reached(
+        &self,
+        store: &mut AuthStore,
+        resets_at: Option<DateTime<Utc>>,
+        snapshot: Option<RateLimitSnapshot>,
+    ) -> std::io::Result<()> {
+        let Some(active_id) = store.active_account_id.clone() else {
+            return Ok(());
+        };
+        let Some(account) = store
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == active_id)
+        else {
+            return Err(std::io::Error::other("active account id not found"));
+        };
+
+        let now = Utc::now();
+        let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
+        usage.last_seen_at = Some(now);
+        if let Some(snapshot) = snapshot.or_else(|| usage.last_rate_limits.clone()) {
+            usage.last_rate_limits = Some(clamp_usage_limit_snapshot(snapshot, resets_at, now));
+        }
+
+        let exhausted_until = exhausted_until(resets_at, usage.last_rate_limits.as_ref(), now);
+        usage.exhausted_until = Some(exhausted_until);
+        Ok(())
+    }
+
+    fn accounts_rate_limits_cache_expires_at(
+        &self,
+        store: &AuthStore,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let next_release_at = store
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                account
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.exhausted_until)
+            })
+            .filter(|until| *until > now)
+            .min();
+        if next_release_at.is_some() {
+            return next_release_at;
+        }
+
+        store
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                account
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.last_rate_limits.as_ref())
+            })
+            .filter_map(|snapshot| snapshot_next_reset_at(snapshot, now))
+            .min()
+    }
+
     fn release_runtime_active_account(&self) -> std::io::Result<()> {
         let Some(account_state_store) = self.account_state_store.as_ref() else {
             return Ok(());
@@ -2674,19 +2809,7 @@ impl AuthManager {
 
     pub fn list_accounts(&self) -> Vec<AccountSummary> {
         let store = self.load_store_from_storage().store;
-        let active_account_id = store.active_account_id.clone();
-        let lease_states = self.account_manager.account_lease_states(&store);
-        store
-            .accounts
-            .iter()
-            .map(|account| {
-                let lease_state = lease_states
-                    .get(account.id.as_str())
-                    .copied()
-                    .unwrap_or(AccountLeaseState::Unavailable);
-                AccountSummary::from_stored(account, active_account_id.as_deref(), lease_state)
-            })
-            .collect()
+        self.account_manager.list_accounts(&store)
     }
 
     pub fn force_release_account(&self, id: &str) -> std::io::Result<ForceReleaseAccountOutcome> {
@@ -2735,25 +2858,7 @@ impl AuthManager {
     }
 
     pub fn set_active_account(&self, id: &str) -> std::io::Result<()> {
-        let required_workspace_id = self.account_manager.forced_chatgpt_workspace_id();
-        self.update_store(|store| {
-            let Some(account) = store.accounts.iter().find(|account| account.id == id) else {
-                return Err(std::io::Error::other(format!("account '{id}' not found")));
-            };
-            if !account_matches_required_workspace(account, required_workspace_id.as_deref())
-                && let Some(required_workspace_id) = required_workspace_id.as_deref()
-            {
-                return Err(std::io::Error::other(format!(
-                    "account '{id}' does not match required workspace {required_workspace_id:?}"
-                )));
-            }
-            store.active_account_id = Some(id.to_string());
-            if let Some(account) = store.accounts.iter_mut().find(|account| account.id == id) {
-                let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
-                usage.last_seen_at = Some(Utc::now());
-            }
-            Ok(())
-        })
+        self.update_store(|store| self.account_manager.set_active_account(store, id))
     }
 
     pub fn reload_strict_and_set_active_account(
@@ -2805,25 +2910,7 @@ impl AuthManager {
     }
 
     pub fn remove_account(&self, id: &str) -> std::io::Result<bool> {
-        self.update_store(|store| {
-            let required_workspace_id = self.account_manager.forced_chatgpt_workspace_id();
-            let prev_len = store.accounts.len();
-            store.accounts.retain(|account| account.id != id);
-            let removed = store.accounts.len() != prev_len;
-            if !removed {
-                return Ok(false);
-            }
-            if store.active_account_id.as_deref() == Some(id) {
-                store.active_account_id = self.select_account_for_auto_switch_with_leases(
-                    store,
-                    required_workspace_id.as_deref(),
-                    /*exclude_store_account_id*/ None,
-                    Utc::now(),
-                    UsageLimitAutoSwitchSelectionScope::PersistedTruth,
-                );
-            }
-            Ok(true)
-        })
+        self.update_store(|store| self.account_manager.remove_account(store, id))
     }
 
     pub fn update_usage_for_active(&self, snapshot: RateLimitSnapshot) -> std::io::Result<()> {
@@ -2928,16 +3015,9 @@ impl AuthManager {
         }
 
         self.update_store(|store| {
-            let now = Utc::now();
-            let mut updated = 0usize;
-            for account in &mut store.accounts {
-                if let Some(outcome) = outcomes.remove(&account.id) {
-                    let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
-                    apply_rate_limit_refresh_outcome(usage, outcome, now);
-                    updated = updated.saturating_add(1);
-                }
-            }
-            Ok(updated)
+            Ok(self
+                .account_manager
+                .reconcile_account_rate_limit_refresh_outcomes(store, &mut outcomes))
         })
     }
 
@@ -2950,27 +3030,8 @@ impl AuthManager {
             return Ok(());
         }
         self.update_store(|store| {
-            let Some(active_id) = store.active_account_id.clone() else {
-                return Ok(());
-            };
-            let Some(account) = store
-                .accounts
-                .iter_mut()
-                .find(|account| account.id == active_id)
-            else {
-                return Err(std::io::Error::other("active account id not found"));
-            };
-
-            let now = Utc::now();
-            let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
-            usage.last_seen_at = Some(now);
-            if let Some(snapshot) = snapshot.or_else(|| usage.last_rate_limits.clone()) {
-                usage.last_rate_limits = Some(clamp_usage_limit_snapshot(snapshot, resets_at, now));
-            }
-
-            let exhausted_until = exhausted_until(resets_at, usage.last_rate_limits.as_ref(), now);
-            usage.exhausted_until = Some(exhausted_until);
-            Ok(())
+            self.account_manager
+                .mark_usage_limit_reached(store, resets_at, snapshot)
         })
     }
 
@@ -3217,33 +3278,8 @@ impl AuthManager {
         }
 
         let store = self.clone_cached_store_with_sqlite_usage_truth()?;
-
-        let next_release_at = store
-            .accounts
-            .iter()
-            .filter_map(|account| {
-                account
-                    .usage
-                    .as_ref()
-                    .and_then(|usage| usage.exhausted_until)
-            })
-            .filter(|until| *until > now)
-            .min();
-        if next_release_at.is_some() {
-            return next_release_at;
-        }
-
-        store
-            .accounts
-            .iter()
-            .filter_map(|account| {
-                account
-                    .usage
-                    .as_ref()
-                    .and_then(|usage| usage.last_rate_limits.as_ref())
-            })
-            .filter_map(|snapshot| snapshot_next_reset_at(snapshot, now))
-            .min()
+        self.account_manager
+            .accounts_rate_limits_cache_expires_at(&store, now)
     }
 
     pub fn refresh_failure_for_auth(&self, auth: &CodexAuth) -> Option<RefreshTokenFailedError> {

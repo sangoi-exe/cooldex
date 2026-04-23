@@ -540,6 +540,451 @@ fn public_auto_switch_selector_reads_sqlite_usage_truth_after_manager_constructi
 }
 
 #[test]
+fn set_active_account_respects_forced_workspace_and_updates_last_seen() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let workspace_a = "workspace-a";
+    let workspace_b = "workspace-b";
+    let make_account = |store_account_id: &str, workspace_id: &str, label: &str| {
+        let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("plus".to_string()),
+            chatgpt_account_id: Some(workspace_id.to_string()),
+        })
+        .expect("create test jwt");
+        StoredAccount {
+            id: store_account_id.to_string(),
+            label: Some(label.to_string()),
+            tokens: TokenData {
+                id_token: IdTokenInfo {
+                    email: Some(format!("{store_account_id}@example.com")),
+                    chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                    chatgpt_user_id: Some(format!("user-{store_account_id}")),
+                    chatgpt_account_id: Some(workspace_id.to_string()),
+                    chatgpt_account_is_fedramp: false,
+                    raw_jwt: raw_jwt.clone(),
+                },
+                access_token: format!("{store_account_id}-access-token"),
+                refresh_token: format!("{store_account_id}-refresh-token"),
+                account_id: Some(workspace_id.to_string()),
+            },
+            last_refresh: None,
+            usage: None,
+        }
+    };
+    save_auth(
+        codex_home.path(),
+        &AuthStore {
+            active_account_id: Some("store-account-a".to_string()),
+            accounts: vec![
+                make_account("store-account-a", workspace_a, "Primary"),
+                make_account("store-account-b", workspace_a, "Secondary"),
+                make_account("store-account-c", workspace_b, "Blocked"),
+            ],
+            ..AuthStore::default()
+        },
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store");
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+    manager.set_forced_chatgpt_workspace_id(Some(workspace_a.to_string()));
+
+    let err = manager
+        .set_active_account("store-account-c")
+        .expect_err("workspace-mismatched account should fail");
+    assert!(
+        err.to_string()
+            .contains("does not match required workspace"),
+        "unexpected error: {err}"
+    );
+
+    manager
+        .set_active_account("store-account-b")
+        .expect("workspace-matching account should become active");
+
+    assert_eq!(
+        manager
+            .active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id),
+        Some("store-account-b".to_string())
+    );
+    assert_eq!(
+        manager
+            .persisted_active_store_account_id()
+            .expect("load persisted active account"),
+        None
+    );
+
+    let cached_store = manager
+        .inner
+        .read()
+        .expect("cached auth should stay readable")
+        .store
+        .clone();
+    let account = cached_store
+        .accounts
+        .iter()
+        .find(|account| account.id == "store-account-b")
+        .expect("secondary account should still exist");
+    assert!(
+        account
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.last_seen_at)
+            .is_some(),
+        "selected account should record last_seen_at"
+    );
+}
+
+#[test]
+fn remove_account_reselects_unleased_fallback_account() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let workspace_id = "workspace-a";
+    let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("plus".to_string()),
+        chatgpt_account_id: Some(workspace_id.to_string()),
+    })
+    .expect("create test jwt");
+    let make_account = |store_account_id: &str, label: &str| StoredAccount {
+        id: store_account_id.to_string(),
+        label: Some(label.to_string()),
+        tokens: TokenData {
+            id_token: IdTokenInfo {
+                email: Some(format!("{store_account_id}@example.com")),
+                chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                chatgpt_user_id: Some(format!("user-{store_account_id}")),
+                chatgpt_account_id: Some(workspace_id.to_string()),
+                chatgpt_account_is_fedramp: false,
+                raw_jwt: raw_jwt.clone(),
+            },
+            access_token: format!("{store_account_id}-access-token"),
+            refresh_token: format!("{store_account_id}-refresh-token"),
+            account_id: Some(workspace_id.to_string()),
+        },
+        last_refresh: None,
+        usage: None,
+    };
+    save_auth(
+        codex_home.path(),
+        &AuthStore {
+            active_account_id: Some("store-account-a".to_string()),
+            accounts: vec![
+                make_account("store-account-a", "Primary"),
+                make_account("store-account-b", "Fallback"),
+                make_account("store-account-c", "Leased elsewhere"),
+            ],
+            ..AuthStore::default()
+        },
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store");
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+    manager
+        .account_manager
+        .account_state_store
+        .as_ref()
+        .expect("account-state store should open")
+        .set_session_active_account(
+            "other-session",
+            None,
+            "store-account-c",
+            Utc::now(),
+            ACTIVE_ACCOUNT_LEASE_TTL_SECONDS,
+        )
+        .expect("foreign lease should persist");
+
+    assert!(
+        manager
+            .remove_account("store-account-a")
+            .expect("active account removal should succeed")
+    );
+
+    let cached_store = manager
+        .inner
+        .read()
+        .expect("cached auth should stay readable")
+        .store
+        .clone();
+    assert_eq!(
+        cached_store.active_account_id,
+        Some("store-account-b".to_string())
+    );
+
+    assert_eq!(
+        manager
+            .active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id),
+        Some("store-account-b".to_string())
+    );
+    assert_eq!(
+        manager
+            .persisted_active_store_account_id()
+            .expect("load persisted active account"),
+        None
+    );
+
+    let accounts = manager.list_accounts();
+    assert_eq!(accounts.len(), 2);
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.id == "store-account-b")
+            .map(|account| account.is_active),
+        Some(true)
+    );
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.id == "store-account-c")
+            .map(|account| account.lease_state),
+        Some(AccountLeaseState::LeasedByOtherSession)
+    );
+}
+
+#[test]
+fn reconcile_account_rate_limit_refresh_outcomes_updates_cached_usage_truth() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let workspace_id = "workspace-a";
+    let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("plus".to_string()),
+        chatgpt_account_id: Some(workspace_id.to_string()),
+    })
+    .expect("create test jwt");
+    let make_account = |store_account_id: &str, label: &str| StoredAccount {
+        id: store_account_id.to_string(),
+        label: Some(label.to_string()),
+        tokens: TokenData {
+            id_token: IdTokenInfo {
+                email: Some(format!("{store_account_id}@example.com")),
+                chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                chatgpt_user_id: Some(format!("user-{store_account_id}")),
+                chatgpt_account_id: Some(workspace_id.to_string()),
+                chatgpt_account_is_fedramp: false,
+                raw_jwt: raw_jwt.clone(),
+            },
+            access_token: format!("{store_account_id}-access-token"),
+            refresh_token: format!("{store_account_id}-refresh-token"),
+            account_id: Some(workspace_id.to_string()),
+        },
+        last_refresh: None,
+        usage: None,
+    };
+    save_auth(
+        codex_home.path(),
+        &AuthStore {
+            active_account_id: Some("store-account-a".to_string()),
+            accounts: vec![
+                make_account("store-account-a", "Primary"),
+                make_account("store-account-b", "Secondary"),
+            ],
+            ..AuthStore::default()
+        },
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store");
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    let reset_at = Utc::now() + chrono::Duration::minutes(12);
+    let snapshot = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            remaining_percent: 0.0,
+            window_minutes: Some(15),
+            resets_at: Some(reset_at.timestamp()),
+        }),
+        secondary: None,
+        credits: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
+    };
+    let expected_reset_at =
+        DateTime::<Utc>::from_timestamp(reset_at.timestamp(), 0).expect("valid reset timestamp");
+
+    assert_eq!(
+        manager
+            .reconcile_account_rate_limit_refresh_outcomes([
+                (
+                    "store-account-a".to_string(),
+                    AccountRateLimitRefreshOutcome::Snapshot(snapshot.clone()),
+                ),
+                (
+                    "store-account-b".to_string(),
+                    AccountRateLimitRefreshOutcome::NoUsableSnapshot,
+                ),
+            ])
+            .expect("rate-limit refresh outcomes should apply"),
+        2
+    );
+
+    let cached_store = manager
+        .inner
+        .read()
+        .expect("cached auth should stay readable")
+        .store
+        .clone();
+    let primary_account = cached_store
+        .accounts
+        .iter()
+        .find(|account| account.id == "store-account-a")
+        .expect("primary account should still exist");
+    let primary_usage = primary_account
+        .usage
+        .as_ref()
+        .expect("primary account usage should be set");
+    assert_eq!(primary_usage.last_rate_limits, Some(snapshot));
+    assert_eq!(primary_usage.exhausted_until, Some(expected_reset_at));
+    assert!(primary_usage.last_seen_at.is_some());
+
+    let secondary_account = cached_store
+        .accounts
+        .iter()
+        .find(|account| account.id == "store-account-b")
+        .expect("secondary account should still exist");
+    let secondary_usage = secondary_account
+        .usage
+        .as_ref()
+        .expect("secondary account usage should be set");
+    assert_eq!(secondary_usage.last_rate_limits, None);
+    assert_eq!(secondary_usage.exhausted_until, None);
+    assert!(secondary_usage.last_seen_at.is_some());
+}
+
+#[test]
+fn mark_usage_limit_reached_updates_active_usage_and_cache_expiry_uses_sqlite_truth() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let workspace_id = "workspace-a";
+    let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("plus".to_string()),
+        chatgpt_account_id: Some(workspace_id.to_string()),
+    })
+    .expect("create test jwt");
+    let make_account = |store_account_id: &str, label: &str| StoredAccount {
+        id: store_account_id.to_string(),
+        label: Some(label.to_string()),
+        tokens: TokenData {
+            id_token: IdTokenInfo {
+                email: Some(format!("{store_account_id}@example.com")),
+                chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                chatgpt_user_id: Some(format!("user-{store_account_id}")),
+                chatgpt_account_id: Some(workspace_id.to_string()),
+                chatgpt_account_is_fedramp: false,
+                raw_jwt: raw_jwt.clone(),
+            },
+            access_token: format!("{store_account_id}-access-token"),
+            refresh_token: format!("{store_account_id}-refresh-token"),
+            account_id: Some(workspace_id.to_string()),
+        },
+        last_refresh: None,
+        usage: None,
+    };
+    save_auth(
+        codex_home.path(),
+        &AuthStore {
+            active_account_id: Some("store-account-a".to_string()),
+            accounts: vec![
+                make_account("store-account-a", "Primary"),
+                make_account("store-account-b", "Secondary"),
+            ],
+            ..AuthStore::default()
+        },
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store");
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    let now = Utc::now();
+    let reset_at = now + chrono::Duration::minutes(7);
+    let snapshot = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            remaining_percent: 0.0,
+            window_minutes: Some(15),
+            resets_at: Some(reset_at.timestamp()),
+        }),
+        secondary: None,
+        credits: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
+    };
+    let expected_reset_at =
+        DateTime::<Utc>::from_timestamp(reset_at.timestamp(), 0).expect("valid reset timestamp");
+
+    manager
+        .mark_usage_limit_reached(Some(reset_at), Some(snapshot.clone()))
+        .expect("usage-limit mark should succeed");
+
+    let cached_store = manager
+        .inner
+        .read()
+        .expect("cached auth should stay readable")
+        .store
+        .clone();
+    let active_account = cached_store
+        .accounts
+        .iter()
+        .find(|account| account.id == "store-account-a")
+        .expect("active account should still exist");
+    let active_usage = active_account
+        .usage
+        .as_ref()
+        .expect("active account usage should be set");
+    assert_eq!(active_usage.last_rate_limits, Some(snapshot.clone()));
+    assert_eq!(active_usage.exhausted_until, Some(reset_at));
+    assert!(active_usage.last_seen_at.is_some());
+
+    {
+        let mut guard = manager
+            .inner
+            .write()
+            .expect("cached auth should stay writable");
+        let account = guard
+            .store
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == "store-account-a")
+            .expect("active account should stay cached");
+        account.usage = None;
+    }
+
+    assert_eq!(
+        manager.accounts_rate_limits_cache_expires_at(now),
+        Some(expected_reset_at)
+    );
+}
+
+#[test]
 fn has_saved_chatgpt_accounts_reads_latest_persisted_store_after_manager_construction() {
     let codex_home = tempdir().expect("create auth tempdir");
     let sqlite_home = tempdir().expect("create sqlite tempdir");
