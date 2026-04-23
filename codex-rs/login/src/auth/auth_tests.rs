@@ -306,6 +306,7 @@ fn auth_manager_logout_releases_runtime_active_account_lease() {
 
     assert!(
         manager
+            .account_manager
             .account_state_store
             .as_ref()
             .expect("account-state store should open")
@@ -317,6 +318,7 @@ fn auth_manager_logout_releases_runtime_active_account_lease() {
 
     assert!(
         !manager
+            .account_manager
             .account_state_store
             .as_ref()
             .expect("account-state store should remain open")
@@ -344,6 +346,7 @@ async fn auth_manager_logout_with_revoke_releases_runtime_active_account_lease()
 
     assert!(
         manager
+            .account_manager
             .account_state_store
             .as_ref()
             .expect("account-state store should open")
@@ -360,6 +363,7 @@ async fn auth_manager_logout_with_revoke_releases_runtime_active_account_lease()
 
     assert!(
         !manager
+            .account_manager
             .account_state_store
             .as_ref()
             .expect("account-state store should remain open")
@@ -503,6 +507,7 @@ fn public_auto_switch_selector_reads_sqlite_usage_truth_after_manager_constructi
     );
 
     manager
+        .account_manager
         .account_state_store
         .as_ref()
         .expect("account-state store should open")
@@ -1035,7 +1040,7 @@ fn auth_manager_falls_back_to_persisted_auth_when_external_store_is_not_admitted
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
     );
-    assert!(manager.account_state_store.is_some());
+    assert!(manager.account_manager.account_state_store.is_some());
     let cached_store = manager
         .inner
         .read()
