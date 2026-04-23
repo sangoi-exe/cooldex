@@ -1686,6 +1686,64 @@ fn live_auth_readers_do_not_emit_auth_state_notifications() {
     );
 }
 
+// Merge-safety anchor: env API-key override must suppress the active ChatGPT
+// summary even when the runtime-prepared saved-account snapshot still has an
+// active ChatGPT account.
+#[test]
+#[serial(codex_api_key)]
+fn active_summary_returns_none_when_env_api_key_override_is_enabled() {
+    let _guard = EnvVarGuard::set(CODEX_API_KEY_ENV_VAR, "sk-env");
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let store_account_id = "store-account-a";
+    let workspace_id = "workspace-a";
+    let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("plus".to_string()),
+        chatgpt_account_id: Some(workspace_id.to_string()),
+    })
+    .expect("create test jwt");
+
+    save_auth(
+        codex_home.path(),
+        &AuthStore {
+            active_account_id: Some(store_account_id.to_string()),
+            accounts: vec![StoredAccount {
+                id: store_account_id.to_string(),
+                label: Some("Primary".to_string()),
+                tokens: TokenData {
+                    id_token: IdTokenInfo {
+                        email: Some("primary@example.com".to_string()),
+                        chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                        chatgpt_user_id: Some("user-12345".to_string()),
+                        chatgpt_account_id: Some(workspace_id.to_string()),
+                        chatgpt_account_is_fedramp: false,
+                        raw_jwt,
+                    },
+                    access_token: "access-token".to_string(),
+                    refresh_token: "refresh-token".to_string(),
+                    account_id: Some(workspace_id.to_string()),
+                },
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            }],
+            ..AuthStore::default()
+        },
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store before manager construction");
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ true,
+        AuthCredentialsStoreMode::File,
+    );
+
+    assert_eq!(manager.get_api_auth_mode(), Some(ApiAuthMode::ApiKey));
+    assert_eq!(manager.active_chatgpt_account_summary(), None);
+}
+
 #[test]
 fn idempotent_reload_does_not_emit_auth_state_notifications() {
     let codex_home = tempdir().expect("create auth tempdir");

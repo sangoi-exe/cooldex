@@ -2348,6 +2348,22 @@ impl AccountManager {
             .is_empty()
     }
 
+    fn active_chatgpt_account_summary(
+        &self,
+        store: &AuthStore,
+        store_origin: CachedStoreOrigin,
+    ) -> Option<ActiveChatgptAccountSummary> {
+        // Merge-safety anchor: active ChatGPT account summaries must come from
+        // the same runtime-prepared store snapshot owner as saved-account
+        // presence and autoswitch, not a stale auth-cache follower.
+        let active_account = store.active_account()?;
+        let auth_mode = match store_origin {
+            CachedStoreOrigin::Persistent => ApiAuthMode::Chatgpt,
+            CachedStoreOrigin::ExternalEphemeral => ApiAuthMode::ChatgptAuthTokens,
+        };
+        Some(ActiveChatgptAccountSnapshot::from_stored_account(active_account, auth_mode).summary())
+    }
+
     fn prepare_strict_loaded_store(
         &self,
         mut store: AuthStore,
@@ -3381,8 +3397,18 @@ impl AuthManager {
     }
 
     pub fn active_chatgpt_account_summary(&self) -> Option<ActiveChatgptAccountSummary> {
-        self.current_auth_from_storage()
-            .and_then(|auth| auth.active_chatgpt_account_summary())
+        let (loaded, auth) = self.load_auth_from_storage_for_live_reader();
+        let summary = if matches!(
+            auth.as_ref().map(CodexAuth::api_auth_mode),
+            Some(ApiAuthMode::ApiKey)
+        ) {
+            None
+        } else {
+            self.account_manager
+                .active_chatgpt_account_summary(&loaded.store, loaded.store_origin)
+        };
+        self.set_cached_with_auth_silent(loaded.store, auth, loaded.store_origin);
+        summary
     }
 
     // Merge-safety anchor: first-party ChatGPT backend callers must resolve one
@@ -4589,6 +4615,12 @@ impl AuthManager {
     }
 
     pub fn current_auth_from_storage(&self) -> Option<CodexAuth> {
+        let (loaded, auth) = self.load_auth_from_storage_for_live_reader();
+        self.set_cached_with_auth_silent(loaded.store, auth.clone(), loaded.store_origin);
+        auth
+    }
+
+    fn load_auth_from_storage_for_live_reader(&self) -> (LoadedCachedStore, Option<CodexAuth>) {
         let loaded = self.load_store_from_storage();
         let auth = Self::derive_auth_from_store(
             &loaded.store,
@@ -4597,8 +4629,7 @@ impl AuthManager {
             self.enable_codex_api_key_env,
             loaded.store_origin,
         );
-        self.set_cached_with_auth_silent(loaded.store, auth.clone(), loaded.store_origin);
-        auth
+        (loaded, auth)
     }
 
     pub fn runtime_session_id(&self) -> &str {
