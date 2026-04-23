@@ -2750,6 +2750,45 @@ impl AccountManager {
         Ok(())
     }
 
+    fn upsert_account(
+        &self,
+        store: &mut AuthStore,
+        tokens: TokenData,
+        label: Option<String>,
+        make_active: bool,
+    ) -> String {
+        let account_id = tokens
+            .preferred_store_account_id()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let now = Utc::now();
+        let existing = store
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id);
+        match existing {
+            Some(account) => {
+                account.tokens = tokens;
+                account.last_refresh = Some(now);
+                if label.is_some() {
+                    account.label = label;
+                }
+            }
+            None => {
+                store.accounts.push(StoredAccount {
+                    id: account_id.clone(),
+                    label,
+                    tokens,
+                    last_refresh: Some(now),
+                    usage: None,
+                });
+            }
+        }
+        if make_active {
+            store.active_account_id = Some(account_id.clone());
+        }
+        account_id
+    }
+
     fn remove_account(&self, store: &mut AuthStore, id: &str) -> std::io::Result<bool> {
         let required_workspace_id = self.forced_chatgpt_workspace_id();
         let prev_len = store.accounts.len();
@@ -3631,37 +3670,10 @@ impl AuthManager {
         label: Option<String>,
         make_active: bool,
     ) -> std::io::Result<String> {
-        let account_id = tokens
-            .preferred_store_account_id()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.update_store(|store| {
-            let now = Utc::now();
-            let existing = store
-                .accounts
-                .iter_mut()
-                .find(|account| account.id == account_id);
-            match existing {
-                Some(account) => {
-                    account.tokens = tokens;
-                    account.last_refresh = Some(now);
-                    if label.is_some() {
-                        account.label = label;
-                    }
-                }
-                None => {
-                    store.accounts.push(StoredAccount {
-                        id: account_id.clone(),
-                        label,
-                        tokens,
-                        last_refresh: Some(now),
-                        usage: None,
-                    });
-                }
-            }
-            if make_active {
-                store.active_account_id = Some(account_id.clone());
-            }
-            Ok(account_id.clone())
+            Ok(self
+                .account_manager
+                .upsert_account(store, tokens, label, make_active))
         })
     }
 

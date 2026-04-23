@@ -719,6 +719,85 @@ fn set_active_account_respects_forced_workspace_and_updates_last_seen() {
     );
 }
 
+// Merge-safety anchor: account upsert mutation belongs to AccountManager while
+// AuthManager remains the persistence/cache wrapper for saved ChatGPT accounts.
+#[test]
+fn upsert_account_inserts_updates_and_preserves_existing_label_without_new_label() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let workspace_id = "workspace-a";
+    let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("plus".to_string()),
+        chatgpt_account_id: Some(workspace_id.to_string()),
+    })
+    .expect("create test jwt");
+    let make_tokens = |access_token: &str, refresh_token: &str| TokenData {
+        id_token: IdTokenInfo {
+            email: Some("primary@example.com".to_string()),
+            chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+            chatgpt_user_id: Some("user-12345".to_string()),
+            chatgpt_account_id: Some(workspace_id.to_string()),
+            chatgpt_account_is_fedramp: false,
+            raw_jwt: raw_jwt.clone(),
+        },
+        access_token: access_token.to_string(),
+        refresh_token: refresh_token.to_string(),
+        account_id: Some(workspace_id.to_string()),
+    };
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+    let expected_account_id = "chatgpt-user:user-12345:workspace:workspace-a";
+
+    assert_eq!(
+        manager
+            .upsert_account(
+                make_tokens("first-access-token", "first-refresh-token"),
+                Some("Primary".to_string()),
+                true,
+            )
+            .expect("initial account upsert should persist"),
+        expected_account_id
+    );
+
+    assert_eq!(
+        manager
+            .upsert_account(
+                make_tokens("updated-access-token", "updated-refresh-token"),
+                None,
+                false,
+            )
+            .expect("second account upsert should persist"),
+        expected_account_id
+    );
+
+    let cached_store = manager
+        .inner
+        .read()
+        .expect("cached auth should stay readable")
+        .store
+        .clone();
+    assert_eq!(
+        cached_store.active_account_id.as_deref(),
+        Some(expected_account_id)
+    );
+    assert_eq!(cached_store.accounts.len(), 1);
+    let account = cached_store
+        .accounts
+        .first()
+        .expect("upserted account should stay cached");
+    assert_eq!(account.id, expected_account_id);
+    assert_eq!(account.label.as_deref(), Some("Primary"));
+    assert_eq!(account.tokens.access_token, "updated-access-token");
+    assert_eq!(account.tokens.refresh_token, "updated-refresh-token");
+    assert!(account.last_refresh.is_some());
+}
+
 #[test]
 fn remove_account_reselects_unleased_fallback_account() {
     let codex_home = tempdir().expect("create auth tempdir");
