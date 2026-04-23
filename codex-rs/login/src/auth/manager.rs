@@ -2042,6 +2042,47 @@ impl AccountManager {
         lease_states
     }
 
+    fn select_account_for_auto_switch_with_leases(
+        &self,
+        store: &AuthStore,
+        required_workspace_id: Option<&str>,
+        exclude_store_account_id: Option<&str>,
+        now: DateTime<Utc>,
+        selection_scope: UsageLimitAutoSwitchSelectionScope,
+    ) -> Option<String> {
+        let account_state_store = self.account_state_store.as_ref()?;
+        let mut filtered_store = store.clone();
+        filtered_store.accounts.retain(|account| {
+            if Some(account.id.as_str()) == exclude_store_account_id {
+                return false;
+            }
+            match account_state_store.account_is_leased_by_other(
+                self.runtime_session_id(),
+                self.linked_codex_session_id().as_deref(),
+                account.id.as_str(),
+                now,
+            ) {
+                Ok(false) => true,
+                Ok(true) => false,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        account_id = account.id,
+                        "failed to evaluate active-account lease conflict while selecting an auto-switch candidate"
+                    );
+                    false
+                }
+            }
+        });
+        select_account_for_auto_switch_from_store(
+            &filtered_store,
+            required_workspace_id,
+            exclude_store_account_id,
+            now,
+            selection_scope,
+        )
+    }
+
     fn release_runtime_active_account(&self) -> std::io::Result<()> {
         let Some(account_state_store) = self.account_state_store.as_ref() else {
             return Ok(());
@@ -3089,13 +3130,16 @@ impl AuthManager {
                 return Ok(None);
             }
 
-            let Some(next_account_id) = self.select_account_for_auto_switch_with_leases(
-                store,
-                required_workspace_id,
-                Some(failing_store_account_id.as_str()),
-                mutation_now,
-                selection_scope,
-            ) else {
+            let Some(next_account_id) = self
+                .account_manager
+                .select_account_for_auto_switch_with_leases(
+                    store,
+                    required_workspace_id,
+                    Some(failing_store_account_id.as_str()),
+                    mutation_now,
+                    selection_scope,
+                )
+            else {
                 return Ok(None);
             };
 
@@ -3134,37 +3178,14 @@ impl AuthManager {
         now: DateTime<Utc>,
         selection_scope: UsageLimitAutoSwitchSelectionScope,
     ) -> Option<String> {
-        let account_state_store = self.account_manager.account_state_store.as_ref()?;
-        let mut filtered_store = store.clone();
-        filtered_store.accounts.retain(|account| {
-            if Some(account.id.as_str()) == exclude_store_account_id {
-                return false;
-            }
-            match account_state_store.account_is_leased_by_other(
-                self.account_manager.runtime_session_id.as_str(),
-                self.account_manager.linked_codex_session_id().as_deref(),
-                account.id.as_str(),
+        self.account_manager
+            .select_account_for_auto_switch_with_leases(
+                store,
+                required_workspace_id,
+                exclude_store_account_id,
                 now,
-            ) {
-                Ok(false) => true,
-                Ok(true) => false,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        account_id = account.id,
-                        "failed to evaluate active-account lease conflict while selecting an auto-switch candidate"
-                    );
-                    false
-                }
-            }
-        });
-        select_account_for_auto_switch_from_store(
-            &filtered_store,
-            required_workspace_id,
-            exclude_store_account_id,
-            now,
-            selection_scope,
-        )
+                selection_scope,
+            )
     }
 
     pub fn select_account_for_auto_switch(
