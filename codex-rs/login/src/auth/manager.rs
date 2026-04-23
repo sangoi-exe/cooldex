@@ -1882,8 +1882,164 @@ impl AccountManager {
         self.runtime_session_id.as_str()
     }
 
+    fn bootstrap_runtime_active_account_candidates(
+        store: &AuthStore,
+        required_workspace_id: Option<&str>,
+    ) -> Vec<String> {
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        if let Some(legacy_active_account_id) = store.active_account_id.as_deref()
+            && store
+                .account(legacy_active_account_id)
+                .is_some_and(|account| {
+                    account_matches_required_workspace(account, required_workspace_id)
+                })
+        {
+            candidates.push(legacy_active_account_id.to_string());
+            seen.insert(legacy_active_account_id.to_string());
+        }
+        for account in &store.accounts {
+            if !account_matches_required_workspace(account, required_workspace_id) {
+                continue;
+            }
+            if seen.insert(account.id.clone()) {
+                candidates.push(account.id.clone());
+            }
+        }
+        candidates
+    }
+
+    fn hydrate_runtime_active_account_for_runtime(
+        account_state_store: Option<&AccountStateStore>,
+        runtime_session_id: &str,
+        linked_codex_session_id: Option<&str>,
+        required_workspace_id: Option<&str>,
+        store: &mut AuthStore,
+    ) -> std::io::Result<()> {
+        if store.accounts.is_empty() {
+            store.active_account_id = None;
+            return Ok(());
+        }
+        let Some(account_state_store) = account_state_store else {
+            store.active_account_id = None;
+            return Ok(());
+        };
+
+        let now = Utc::now();
+        // Merge-safety anchor: WS12 missing-bearer fail-loud only stays honest when a foreign
+        // lease takeover blocks the stolen account itself, not the whole bootstrap pass; this
+        // session must still try every other eligible saved account before surfacing no bearer.
+        let mut blocked_bootstrap_account_id = None;
+        let mut current_active_account_id = match account_state_store
+            .refresh_session_active_account(
+                runtime_session_id,
+                linked_codex_session_id,
+                now,
+                ACTIVE_ACCOUNT_LEASE_TTL_SECONDS,
+            ) {
+            Ok(SessionActiveAccountRefresh::Active(account_id)) => Some(account_id),
+            Ok(SessionActiveAccountRefresh::None) => None,
+            Ok(SessionActiveAccountRefresh::LostToOtherSession {
+                account_id,
+                owner_session_id,
+                owner_codex_session_id,
+                lease_until,
+            }) => {
+                tracing::info!(
+                    account_id,
+                    owner_session_id,
+                    owner_codex_session_id,
+                    lease_until = ?lease_until,
+                    "runtime session lost its active-account lease to another live session"
+                );
+                blocked_bootstrap_account_id = Some(account_id);
+                None
+            }
+            Err(error) => {
+                return Err(std::io::Error::other(format!(
+                    "failed to refresh runtime active-account lease: {error}"
+                )));
+            }
+        };
+
+        if let Some(active_account_id) = current_active_account_id.as_deref()
+            && !store.account(active_account_id).is_some_and(|account| {
+                account_matches_required_workspace(account, required_workspace_id)
+            })
+        {
+            account_state_store
+                .clear_session_active_account(runtime_session_id)
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to clear invalid runtime active-account row: {error}"
+                    ))
+                })?;
+            current_active_account_id = None;
+        }
+
+        if current_active_account_id.is_none() {
+            let bootstrap_candidate_ids =
+                Self::bootstrap_runtime_active_account_candidates(store, required_workspace_id);
+            let bootstrap_candidate_count = bootstrap_candidate_ids.len();
+            let mut bootstrap_conflict_count = 0usize;
+            let mut bootstrap_skipped_lost_lease_count = 0usize;
+            for candidate_account_id in bootstrap_candidate_ids {
+                if blocked_bootstrap_account_id.as_deref() == Some(candidate_account_id.as_str()) {
+                    bootstrap_skipped_lost_lease_count += 1;
+                    tracing::debug!(
+                        candidate_account_id,
+                        "skipping runtime active-account bootstrap candidate that was just lost to another live session"
+                    );
+                    continue;
+                }
+                match account_state_store.set_session_active_account(
+                    runtime_session_id,
+                    linked_codex_session_id,
+                    candidate_account_id.as_str(),
+                    now,
+                    ACTIVE_ACCOUNT_LEASE_TTL_SECONDS,
+                ) {
+                    Ok(SessionActiveAccountSetOutcome::Assigned) => {
+                        current_active_account_id = Some(candidate_account_id);
+                        break;
+                    }
+                    Ok(SessionActiveAccountSetOutcome::Conflict(conflict)) => {
+                        bootstrap_conflict_count += 1;
+                        tracing::debug!(
+                            candidate_account_id,
+                            owner_session_id = conflict.owner_session_id,
+                            lease_until = ?conflict.lease_until,
+                            "skipping runtime active-account bootstrap candidate leased by another live session"
+                        );
+                    }
+                    Err(error) => {
+                        return Err(std::io::Error::other(format!(
+                            "failed to bootstrap runtime active-account row: {error}"
+                        )));
+                    }
+                }
+            }
+            if current_active_account_id.is_none() {
+                tracing::warn!(
+                    runtime_session_id,
+                    linked_codex_session_id,
+                    required_workspace_id,
+                    saved_account_count = store.accounts.len(),
+                    bootstrap_candidate_count,
+                    bootstrap_conflict_count,
+                    bootstrap_skipped_lost_lease_count,
+                    blocked_bootstrap_account_id,
+                    "runtime active-account hydration found no eligible saved account; auth will remain bearerless for this runtime"
+                );
+            }
+        }
+
+        store.active_account_id = current_active_account_id;
+        Ok(())
+    }
+
     fn hydrate_runtime_active_account(&self, store: &mut AuthStore) -> std::io::Result<()> {
-        AuthManager::hydrate_runtime_active_account(
+        Self::hydrate_runtime_active_account_for_runtime(
             self.account_state_store.as_ref(),
             self.runtime_session_id(),
             self.linked_codex_session_id().as_deref(),
@@ -2185,6 +2341,78 @@ impl AccountManager {
         Ok(())
     }
 
+    fn update_usage_for_active(
+        &self,
+        store: &mut AuthStore,
+        snapshot: RateLimitSnapshot,
+    ) -> std::io::Result<()> {
+        let Some(active_id) = store.active_account_id.clone() else {
+            return Ok(());
+        };
+        let Some(account) = store
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == active_id)
+        else {
+            return Err(std::io::Error::other("active account id not found"));
+        };
+
+        let now = Utc::now();
+        let exhausted_until = exhausted_until_from_snapshot(&snapshot, now);
+        let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
+        usage.last_rate_limits = Some(snapshot);
+        usage.exhausted_until = exhausted_until;
+        usage.last_seen_at = Some(now);
+        Ok(())
+    }
+
+    fn update_rate_limits_for_account(
+        &self,
+        store: &mut AuthStore,
+        store_account_id: &str,
+        snapshot: RateLimitSnapshot,
+    ) -> std::io::Result<()> {
+        let Some(account) = store
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == store_account_id)
+        else {
+            return Err(std::io::Error::other(format!(
+                "account '{store_account_id}' not found"
+            )));
+        };
+
+        let now = Utc::now();
+        let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
+        apply_rate_limit_refresh_outcome(
+            usage,
+            AccountRateLimitRefreshOutcome::Snapshot(snapshot),
+            now,
+        );
+        Ok(())
+    }
+
+    fn update_rate_limits_for_accounts(
+        &self,
+        store: &mut AuthStore,
+        updates: &mut HashMap<String, RateLimitSnapshot>,
+    ) -> usize {
+        let now = Utc::now();
+        let mut updated = 0usize;
+        for account in &mut store.accounts {
+            if let Some(snapshot) = updates.remove(&account.id) {
+                let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
+                apply_rate_limit_refresh_outcome(
+                    usage,
+                    AccountRateLimitRefreshOutcome::Snapshot(snapshot),
+                    now,
+                );
+                updated = updated.saturating_add(1);
+            }
+        }
+        updated
+    }
+
     fn accounts_rate_limits_cache_expires_at(
         &self,
         store: &AuthStore,
@@ -2482,162 +2710,6 @@ impl Drop for AuthManager {
 }
 
 impl AuthManager {
-    fn bootstrap_runtime_active_account_candidates(
-        store: &AuthStore,
-        required_workspace_id: Option<&str>,
-    ) -> Vec<String> {
-        let mut candidates = Vec::new();
-        let mut seen = HashSet::new();
-        if let Some(legacy_active_account_id) = store.active_account_id.as_deref()
-            && store
-                .account(legacy_active_account_id)
-                .is_some_and(|account| {
-                    account_matches_required_workspace(account, required_workspace_id)
-                })
-        {
-            candidates.push(legacy_active_account_id.to_string());
-            seen.insert(legacy_active_account_id.to_string());
-        }
-        for account in &store.accounts {
-            if !account_matches_required_workspace(account, required_workspace_id) {
-                continue;
-            }
-            if seen.insert(account.id.clone()) {
-                candidates.push(account.id.clone());
-            }
-        }
-        candidates
-    }
-
-    fn hydrate_runtime_active_account(
-        account_state_store: Option<&AccountStateStore>,
-        runtime_session_id: &str,
-        linked_codex_session_id: Option<&str>,
-        required_workspace_id: Option<&str>,
-        store: &mut AuthStore,
-    ) -> std::io::Result<()> {
-        if store.accounts.is_empty() {
-            store.active_account_id = None;
-            return Ok(());
-        }
-        let Some(account_state_store) = account_state_store else {
-            store.active_account_id = None;
-            return Ok(());
-        };
-
-        let now = Utc::now();
-        // Merge-safety anchor: WS12 missing-bearer fail-loud only stays honest when a foreign
-        // lease takeover blocks the stolen account itself, not the whole bootstrap pass; this
-        // session must still try every other eligible saved account before surfacing no bearer.
-        let mut blocked_bootstrap_account_id = None;
-        let mut current_active_account_id = match account_state_store
-            .refresh_session_active_account(
-                runtime_session_id,
-                linked_codex_session_id,
-                now,
-                ACTIVE_ACCOUNT_LEASE_TTL_SECONDS,
-            ) {
-            Ok(SessionActiveAccountRefresh::Active(account_id)) => Some(account_id),
-            Ok(SessionActiveAccountRefresh::None) => None,
-            Ok(SessionActiveAccountRefresh::LostToOtherSession {
-                account_id,
-                owner_session_id,
-                owner_codex_session_id,
-                lease_until,
-            }) => {
-                tracing::info!(
-                    account_id,
-                    owner_session_id,
-                    owner_codex_session_id,
-                    lease_until = ?lease_until,
-                    "runtime session lost its active-account lease to another live session"
-                );
-                blocked_bootstrap_account_id = Some(account_id);
-                None
-            }
-            Err(error) => {
-                return Err(std::io::Error::other(format!(
-                    "failed to refresh runtime active-account lease: {error}"
-                )));
-            }
-        };
-
-        if let Some(active_account_id) = current_active_account_id.as_deref()
-            && !store.account(active_account_id).is_some_and(|account| {
-                account_matches_required_workspace(account, required_workspace_id)
-            })
-        {
-            account_state_store
-                .clear_session_active_account(runtime_session_id)
-                .map_err(|error| {
-                    std::io::Error::other(format!(
-                        "failed to clear invalid runtime active-account row: {error}"
-                    ))
-                })?;
-            current_active_account_id = None;
-        }
-
-        if current_active_account_id.is_none() {
-            let bootstrap_candidate_ids =
-                Self::bootstrap_runtime_active_account_candidates(store, required_workspace_id);
-            let bootstrap_candidate_count = bootstrap_candidate_ids.len();
-            let mut bootstrap_conflict_count = 0usize;
-            let mut bootstrap_skipped_lost_lease_count = 0usize;
-            for candidate_account_id in bootstrap_candidate_ids {
-                if blocked_bootstrap_account_id.as_deref() == Some(candidate_account_id.as_str()) {
-                    bootstrap_skipped_lost_lease_count += 1;
-                    tracing::debug!(
-                        candidate_account_id,
-                        "skipping runtime active-account bootstrap candidate that was just lost to another live session"
-                    );
-                    continue;
-                }
-                match account_state_store.set_session_active_account(
-                    runtime_session_id,
-                    linked_codex_session_id,
-                    candidate_account_id.as_str(),
-                    now,
-                    ACTIVE_ACCOUNT_LEASE_TTL_SECONDS,
-                ) {
-                    Ok(SessionActiveAccountSetOutcome::Assigned) => {
-                        current_active_account_id = Some(candidate_account_id);
-                        break;
-                    }
-                    Ok(SessionActiveAccountSetOutcome::Conflict(conflict)) => {
-                        bootstrap_conflict_count += 1;
-                        tracing::debug!(
-                            candidate_account_id,
-                            owner_session_id = conflict.owner_session_id,
-                            lease_until = ?conflict.lease_until,
-                            "skipping runtime active-account bootstrap candidate leased by another live session"
-                        );
-                    }
-                    Err(error) => {
-                        return Err(std::io::Error::other(format!(
-                            "failed to bootstrap runtime active-account row: {error}"
-                        )));
-                    }
-                }
-            }
-            if current_active_account_id.is_none() {
-                tracing::warn!(
-                    runtime_session_id,
-                    linked_codex_session_id,
-                    required_workspace_id,
-                    saved_account_count = store.accounts.len(),
-                    bootstrap_candidate_count,
-                    bootstrap_conflict_count,
-                    bootstrap_skipped_lost_lease_count,
-                    blocked_bootstrap_account_id,
-                    "runtime active-account hydration found no eligible saved account; auth will remain bearerless for this runtime"
-                );
-            }
-        }
-
-        store.active_account_id = current_active_account_id;
-        Ok(())
-    }
-
     fn reconcile_runtime_active_account(&self, store: &AuthStore) -> std::io::Result<()> {
         self.account_manager.reconcile_runtime_active_account(store)
     }
@@ -3083,24 +3155,8 @@ impl AuthManager {
             return Ok(());
         }
         self.update_store(|store| {
-            let Some(active_id) = store.active_account_id.clone() else {
-                return Ok(());
-            };
-            let Some(account) = store
-                .accounts
-                .iter_mut()
-                .find(|account| account.id == active_id)
-            else {
-                return Err(std::io::Error::other("active account id not found"));
-            };
-
-            let now = Utc::now();
-            let exhausted_until = exhausted_until_from_snapshot(&snapshot, now);
-            let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
-            usage.last_rate_limits = Some(snapshot);
-            usage.exhausted_until = exhausted_until;
-            usage.last_seen_at = Some(now);
-            Ok(())
+            self.account_manager
+                .update_usage_for_active(store, snapshot)
         })
     }
 
@@ -3114,24 +3170,8 @@ impl AuthManager {
         }
 
         self.update_store(|store| {
-            let Some(account) = store
-                .accounts
-                .iter_mut()
-                .find(|account| account.id == store_account_id)
-            else {
-                return Err(std::io::Error::other(format!(
-                    "account '{store_account_id}' not found"
-                )));
-            };
-
-            let now = Utc::now();
-            let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
-            apply_rate_limit_refresh_outcome(
-                usage,
-                AccountRateLimitRefreshOutcome::Snapshot(snapshot),
-                now,
-            );
-            Ok(())
+            self.account_manager
+                .update_rate_limits_for_account(store, store_account_id, snapshot)
         })
     }
 
@@ -3149,20 +3189,9 @@ impl AuthManager {
         }
 
         self.update_store(|store| {
-            let now = Utc::now();
-            let mut updated = 0usize;
-            for account in &mut store.accounts {
-                if let Some(snapshot) = updates.remove(&account.id) {
-                    let usage = account.usage.get_or_insert_with(AccountUsageCache::default);
-                    apply_rate_limit_refresh_outcome(
-                        usage,
-                        AccountRateLimitRefreshOutcome::Snapshot(snapshot),
-                        now,
-                    );
-                    updated = updated.saturating_add(1);
-                }
-            }
-            Ok(updated)
+            Ok(self
+                .account_manager
+                .update_rate_limits_for_accounts(store, &mut updates))
         })
     }
 
@@ -3804,7 +3833,7 @@ impl AuthManager {
                 "removed accounts with unsupported ChatGPT plans while loading auth store"
             );
         }
-        if let Err(error) = Self::hydrate_runtime_active_account(
+        if let Err(error) = AccountManager::hydrate_runtime_active_account_for_runtime(
             account_state_store,
             runtime_session_id,
             linked_codex_session_id,
@@ -3936,15 +3965,8 @@ impl AuthManager {
         if let Some(account_state_store) = self.account_manager.account_state_store.as_ref() {
             synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store)?;
         }
-        Self::hydrate_runtime_active_account(
-            self.account_manager.account_state_store.as_ref(),
-            self.account_manager.runtime_session_id.as_str(),
-            self.account_manager.linked_codex_session_id().as_deref(),
-            self.account_manager
-                .forced_chatgpt_workspace_id()
-                .as_deref(),
-            &mut store,
-        )?;
+        self.account_manager
+            .hydrate_runtime_active_account(&mut store)?;
 
         let out = mutator(&mut store)?;
         let removed_after_mutation =
@@ -4263,16 +4285,9 @@ impl AuthManager {
                 "removed accounts with unsupported ChatGPT plans before terminal refresh-token eviction"
             );
         }
-        Self::hydrate_runtime_active_account(
-            self.account_manager.account_state_store.as_ref(),
-            self.account_manager.runtime_session_id.as_str(),
-            self.account_manager.linked_codex_session_id().as_deref(),
-            self.account_manager
-                .forced_chatgpt_workspace_id()
-                .as_deref(),
-            &mut store,
-        )
-        .map_err(RefreshTokenError::Transient)?;
+        self.account_manager
+            .hydrate_runtime_active_account(&mut store)
+            .map_err(RefreshTokenError::Transient)?;
 
         let was_active = store.active_account_id.as_deref() == Some(store_account_id);
         let previous_account_count = store.accounts.len();
