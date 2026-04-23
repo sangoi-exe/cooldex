@@ -2122,6 +2122,19 @@ impl AccountManager {
             .map_err(std::io::Error::other)
     }
 
+    fn with_sqlite_usage_truth(&self, mut store: AuthStore) -> AuthStore {
+        if let Some(account_state_store) = self.account_state_store.as_ref()
+            && let Err(error) = hydrate_store_usage_from_sqlite(account_state_store, &mut store)
+        {
+            tracing::warn!(
+                error = %error,
+                "failed to refresh saved-account usage truth from sqlite"
+            );
+        }
+
+        store
+    }
+
     fn clone_store_with_runtime_active_account(&self, store: &AuthStore) -> Option<AuthStore> {
         let mut store = store.clone();
         if let Err(error) = self.hydrate_runtime_active_account(&mut store) {
@@ -3079,19 +3092,10 @@ impl AuthManager {
     // in-memory auth-store usage while `list_accounts()` is already showing refreshed data.
     fn clone_cached_store_with_sqlite_usage_truth(&self) -> Option<AuthStore> {
         let guard = self.inner.read().ok()?;
-        let mut store = guard.store.clone();
+        let store = guard.store.clone();
         drop(guard);
 
-        if let Some(account_state_store) = self.account_manager.account_state_store.as_ref()
-            && let Err(error) = hydrate_store_usage_from_sqlite(account_state_store, &mut store)
-        {
-            tracing::warn!(
-                error = %error,
-                "failed to refresh saved-account usage truth from sqlite"
-            );
-        }
-
-        Some(store)
+        Some(self.account_manager.with_sqlite_usage_truth(store))
     }
 
     pub fn set_active_account(&self, id: &str) -> std::io::Result<()> {
