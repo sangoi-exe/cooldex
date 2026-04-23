@@ -2218,6 +2218,171 @@ impl AccountManager {
             .min()
     }
 
+    fn switch_account_on_usage_limit(
+        &self,
+        store: &mut AuthStore,
+        request: &UsageLimitAutoSwitchRequest<'_>,
+        cooldown_active: bool,
+    ) -> std::io::Result<Option<String>> {
+        let UsageLimitAutoSwitchRequest {
+            required_workspace_id,
+            failing_store_account_id,
+            resets_at,
+            snapshot,
+            freshly_unsupported_store_account_ids,
+            protected_store_account_id,
+            selection_scope,
+            fallback_selection_mode,
+        } = request;
+
+        let mutation_now = Utc::now();
+        let failing_store_account_id = match failing_store_account_id {
+            Some(store_account_id) => {
+                if store
+                    .accounts
+                    .iter()
+                    .any(|account| account.id == *store_account_id)
+                {
+                    Some((*store_account_id).to_string())
+                } else {
+                    return Ok(None);
+                }
+            }
+            None => store.active_account_id.clone(),
+        };
+
+        let Some(failing_store_account_id) = failing_store_account_id else {
+            return Ok(None);
+        };
+
+        let Some(failing_account) = store
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == failing_store_account_id)
+        else {
+            return Ok(None);
+        };
+
+        let usage = failing_account
+            .usage
+            .get_or_insert_with(AccountUsageCache::default);
+        usage.last_seen_at = Some(mutation_now);
+        if let Some(snapshot) = snapshot.clone() {
+            usage.last_rate_limits = Some(snapshot);
+        }
+        usage.exhausted_until = Some(exhausted_until(
+            *resets_at,
+            usage.last_rate_limits.as_ref(),
+            mutation_now,
+        ));
+
+        // Merge-safety anchor: usage-limit auto-switch must purge fallback accounts only when
+        // the shared pre-refresh fan-in already proved an explicit unsupported plan; ambiguous
+        // `Unknown` accounts must stay fail-soft in saved accounts instead of being erased.
+        let removed_fallback_account_ids = store
+            .accounts
+            .iter()
+            .filter(|account| {
+                account.id != failing_store_account_id
+                    && Some(account.id.as_str()) != *protected_store_account_id
+                    && freshly_unsupported_store_account_ids.contains(&account.id)
+                    && account_matches_required_workspace(account, *required_workspace_id)
+            })
+            .map(|account| account.id.clone())
+            .collect::<Vec<_>>();
+        if !removed_fallback_account_ids.is_empty() {
+            store.accounts.retain(|account| {
+                account.id == failing_store_account_id
+                    || Some(account.id.as_str()) == *protected_store_account_id
+                    || !freshly_unsupported_store_account_ids.contains(&account.id)
+                    || !account_matches_required_workspace(account, *required_workspace_id)
+            });
+            let active_account_still_present =
+                store
+                    .active_account_id
+                    .as_ref()
+                    .is_some_and(|active_account_id| {
+                        store
+                            .accounts
+                            .iter()
+                            .any(|account| &account.id == active_account_id)
+                    });
+            if !active_account_still_present {
+                store.active_account_id = Some(failing_store_account_id.clone())
+                    .filter(|active_account_id| {
+                        store
+                            .accounts
+                            .iter()
+                            .any(|account| &account.id == active_account_id)
+                    })
+                    .or_else(|| store.accounts.first().map(|account| account.id.clone()));
+            }
+            tracing::info!(
+                removed_account_ids = ?removed_fallback_account_ids,
+                "removed freshly unsupported fallback accounts during usage-limit auto-switch"
+            );
+        }
+
+        if cooldown_active {
+            return Ok(None);
+        }
+
+        if let Some(protected_store_account_id) = protected_store_account_id
+            && store.accounts.iter().any(|account| {
+                account.id == *protected_store_account_id
+                    && account_selectable_for_auto_switch(
+                        account,
+                        *required_workspace_id,
+                        mutation_now,
+                        *selection_scope,
+                    )
+            })
+        {
+            store.active_account_id = Some((*protected_store_account_id).to_string());
+            if let Some(next_account) = store
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == *protected_store_account_id)
+            {
+                let usage = next_account
+                    .usage
+                    .get_or_insert_with(AccountUsageCache::default);
+                usage.last_seen_at = Some(mutation_now);
+            }
+            return Ok(Some((*protected_store_account_id).to_string()));
+        }
+
+        if *fallback_selection_mode
+            == UsageLimitAutoSwitchFallbackSelectionMode::CancelStaleRequestFallbackSelection
+        {
+            return Ok(None);
+        }
+
+        let Some(next_account_id) = self.select_account_for_auto_switch_with_leases(
+            store,
+            *required_workspace_id,
+            Some(failing_store_account_id.as_str()),
+            mutation_now,
+            *selection_scope,
+        ) else {
+            return Ok(None);
+        };
+
+        store.active_account_id = Some(next_account_id.clone());
+        if let Some(next_account) = store
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == next_account_id)
+        {
+            let usage = next_account
+                .usage
+                .get_or_insert_with(AccountUsageCache::default);
+            usage.last_seen_at = Some(mutation_now);
+        }
+
+        Ok(Some(next_account_id))
+    }
+
     fn release_runtime_active_account(&self) -> std::io::Result<()> {
         let Some(account_state_store) = self.account_state_store.as_ref() else {
             return Ok(());
@@ -3039,16 +3204,6 @@ impl AuthManager {
         &self,
         request: UsageLimitAutoSwitchRequest<'_>,
     ) -> std::io::Result<Option<String>> {
-        let UsageLimitAutoSwitchRequest {
-            required_workspace_id,
-            failing_store_account_id,
-            resets_at,
-            snapshot,
-            freshly_unsupported_store_account_ids,
-            protected_store_account_id,
-            selection_scope,
-            fallback_selection_mode,
-        } = request;
         if !self.has_saved_chatgpt_accounts() {
             return Ok(None);
         }
@@ -3068,159 +3223,12 @@ impl AuthManager {
         }
 
         let switched_to = self.update_store(|store| {
-            let mutation_now = Utc::now();
-            let failing_store_account_id = match failing_store_account_id {
-                Some(store_account_id) => {
-                    if store
-                        .accounts
-                        .iter()
-                        .any(|account| account.id == store_account_id)
-                    {
-                        Some(store_account_id.to_string())
-                    } else {
-                        return Ok(None);
-                    }
-                }
-                _ => store.active_account_id.clone(),
-            };
-
-            let Some(failing_store_account_id) = failing_store_account_id else {
-                return Ok(None);
-            };
-
-            let Some(failing_account) = store
-                .accounts
-                .iter_mut()
-                .find(|account| account.id == failing_store_account_id)
-            else {
-                return Ok(None);
-            };
-
-            let usage = failing_account
-                .usage
-                .get_or_insert_with(AccountUsageCache::default);
-            usage.last_seen_at = Some(mutation_now);
-            if let Some(snapshot) = snapshot.clone() {
-                usage.last_rate_limits = Some(snapshot);
-            }
-            usage.exhausted_until = Some(exhausted_until(
-                resets_at,
-                usage.last_rate_limits.as_ref(),
-                mutation_now,
-            ));
-
-            // Merge-safety anchor: usage-limit auto-switch must purge fallback accounts only when
-            // the shared pre-refresh fan-in already proved an explicit unsupported plan; ambiguous
-            // `Unknown` accounts must stay fail-soft in saved accounts instead of being erased.
-            let removed_fallback_account_ids = store
-                .accounts
-                .iter()
-                .filter(|account| {
-                    account.id != failing_store_account_id
-                        && Some(account.id.as_str()) != protected_store_account_id
-                        && freshly_unsupported_store_account_ids.contains(&account.id)
-                        && account_matches_required_workspace(account, required_workspace_id)
-                })
-                .map(|account| account.id.clone())
-                .collect::<Vec<_>>();
-            if !removed_fallback_account_ids.is_empty() {
-                store.accounts.retain(|account| {
-                    account.id == failing_store_account_id
-                        || Some(account.id.as_str()) == protected_store_account_id
-                        || !freshly_unsupported_store_account_ids.contains(&account.id)
-                        || !account_matches_required_workspace(account, required_workspace_id)
-                });
-                let active_account_still_present =
-                    store
-                        .active_account_id
-                        .as_ref()
-                        .is_some_and(|active_account_id| {
-                            store
-                                .accounts
-                                .iter()
-                                .any(|account| &account.id == active_account_id)
-                        });
-                if !active_account_still_present {
-                    store.active_account_id = Some(failing_store_account_id.clone())
-                        .filter(|active_account_id| {
-                            store
-                                .accounts
-                                .iter()
-                                .any(|account| &account.id == active_account_id)
-                        })
-                        .or_else(|| store.accounts.first().map(|account| account.id.clone()));
-                }
-                tracing::info!(
-                    removed_account_ids = ?removed_fallback_account_ids,
-                    "removed freshly unsupported fallback accounts during usage-limit auto-switch"
-                );
-            }
-
-            if cooldown_active {
-                return Ok(None);
-            }
-
-            if let Some(protected_store_account_id) = protected_store_account_id
-                && store.accounts.iter().any(|account| {
-                    account.id == protected_store_account_id
-                        && account_selectable_for_auto_switch(
-                            account,
-                            required_workspace_id,
-                            mutation_now,
-                            selection_scope,
-                        )
-                })
-            {
-                store.active_account_id = Some(protected_store_account_id.to_string());
-                if let Some(next_account) = store
-                    .accounts
-                    .iter_mut()
-                    .find(|account| account.id == protected_store_account_id)
-                {
-                    let usage = next_account
-                        .usage
-                        .get_or_insert_with(AccountUsageCache::default);
-                    usage.last_seen_at = Some(mutation_now);
-                }
-                return Ok(Some(protected_store_account_id.to_string()));
-            }
-
-            if fallback_selection_mode
-                == UsageLimitAutoSwitchFallbackSelectionMode::CancelStaleRequestFallbackSelection
-            {
-                return Ok(None);
-            }
-
-            let Some(next_account_id) = self
-                .account_manager
-                .select_account_for_auto_switch_with_leases(
-                    store,
-                    required_workspace_id,
-                    Some(failing_store_account_id.as_str()),
-                    mutation_now,
-                    selection_scope,
-                )
-            else {
-                return Ok(None);
-            };
-
-            store.active_account_id = Some(next_account_id.clone());
-            if let Some(next_account) = store
-                .accounts
-                .iter_mut()
-                .find(|account| account.id == next_account_id)
-            {
-                let usage = next_account
-                    .usage
-                    .get_or_insert_with(AccountUsageCache::default);
-                usage.last_seen_at = Some(mutation_now);
-            }
-
-            Ok(Some(next_account_id))
+            self.account_manager
+                .switch_account_on_usage_limit(store, &request, cooldown_active)
         })?;
         let should_start_cooldown = switched_to
             .as_deref()
-            .is_some_and(|switched_to| Some(switched_to) != protected_store_account_id);
+            .is_some_and(|switched_to| Some(switched_to) != request.protected_store_account_id);
         if should_start_cooldown {
             let cooldown_started_at = Utc::now();
             *cooldown_until = Some(
