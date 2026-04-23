@@ -540,6 +540,82 @@ fn public_auto_switch_selector_reads_sqlite_usage_truth_after_manager_constructi
     );
 }
 
+// Merge-safety anchor: rate-limit refresh rosters must use the same
+// AccountManager-owned cached runtime snapshot as autoswitch readers, including
+// lease-aware exclusion of accounts held by another session.
+#[test]
+fn rate_limit_refresh_roster_excludes_foreign_leased_accounts_from_cached_snapshot() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let workspace_id = "workspace-a";
+    let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("plus".to_string()),
+        chatgpt_account_id: Some(workspace_id.to_string()),
+    })
+    .expect("create test jwt");
+    let make_account = |store_account_id: &str, label: &str| StoredAccount {
+        id: store_account_id.to_string(),
+        label: Some(label.to_string()),
+        tokens: TokenData {
+            id_token: IdTokenInfo {
+                email: Some(format!("{store_account_id}@example.com")),
+                chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                chatgpt_user_id: Some(format!("user-{store_account_id}")),
+                chatgpt_account_id: Some(workspace_id.to_string()),
+                chatgpt_account_is_fedramp: false,
+                raw_jwt: raw_jwt.clone(),
+            },
+            access_token: format!("{store_account_id}-access-token"),
+            refresh_token: format!("{store_account_id}-refresh-token"),
+            account_id: Some(workspace_id.to_string()),
+        },
+        last_refresh: None,
+        usage: None,
+    };
+    save_auth(
+        codex_home.path(),
+        &AuthStore {
+            active_account_id: Some("store-account-a".to_string()),
+            accounts: vec![
+                make_account("store-account-a", "Primary"),
+                make_account("store-account-b", "Fallback"),
+            ],
+            ..AuthStore::default()
+        },
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store");
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+    manager
+        .account_manager
+        .account_state_store
+        .as_ref()
+        .expect("account-state store should open")
+        .set_session_active_account(
+            "other-session",
+            None,
+            "store-account-b",
+            Utc::now(),
+            ACTIVE_ACCOUNT_LEASE_TTL_SECONDS,
+        )
+        .expect("foreign lease should persist");
+
+    assert_eq!(
+        manager.account_rate_limit_refresh_roster(),
+        AccountRateLimitRefreshRoster {
+            store_account_ids: vec!["store-account-a".to_string()],
+            status: AccountRateLimitRefreshRosterStatus::LeaseManaged,
+        }
+    );
+}
+
 #[test]
 fn set_active_account_respects_forced_workspace_and_updates_last_seen() {
     let codex_home = tempdir().expect("create auth tempdir");

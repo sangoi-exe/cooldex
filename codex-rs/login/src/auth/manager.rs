@@ -2144,7 +2144,10 @@ impl AccountManager {
             .map_err(std::io::Error::other)
     }
 
-    fn with_sqlite_usage_truth(&self, mut store: AuthStore) -> AuthStore {
+    fn cached_usage_store_snapshot(&self, mut store: AuthStore) -> AuthStore {
+        // Merge-safety anchor: cached account-runtime readers must share this
+        // AccountManager-owned SQLite-backed saved-account usage truth
+        // hydration step.
         if let Some(account_state_store) = self.account_state_store.as_ref()
             && let Err(error) = hydrate_store_usage_from_sqlite(account_state_store, &mut store)
         {
@@ -2154,6 +2157,18 @@ impl AccountManager {
             );
         }
 
+        store
+    }
+
+    fn cached_runtime_store_snapshot(&self, store: AuthStore) -> AuthStore {
+        let mut store = self.cached_usage_store_snapshot(store);
+        if let Err(error) = self.hydrate_runtime_active_account(&mut store) {
+            tracing::warn!(
+                error = %error,
+                "failed to hydrate runtime active-account state before loading account truth"
+            );
+            store.active_account_id = None;
+        }
         store
     }
 
@@ -2608,18 +2623,6 @@ impl AccountManager {
             was_active,
             switched_to_store_account_id,
         }))
-    }
-
-    fn clone_store_with_runtime_active_account(&self, store: &AuthStore) -> Option<AuthStore> {
-        let mut store = store.clone();
-        if let Err(error) = self.hydrate_runtime_active_account(&mut store) {
-            tracing::warn!(
-                error = %error,
-                "failed to hydrate runtime active-account state before loading account truth"
-            );
-            store.active_account_id = None;
-        }
-        Some(store)
     }
 
     fn account_rate_limit_refresh_roster(
@@ -3590,7 +3593,7 @@ impl AuthManager {
     }
 
     pub fn account_rate_limit_refresh_roster(&self) -> AccountRateLimitRefreshRoster {
-        let Some(store) = self.clone_cached_store_with_runtime_active_account() else {
+        let Some(store) = self.clone_cached_store() else {
             tracing::warn!(
                 "failed to snapshot auth store before listing rate-limit refresh candidates"
             );
@@ -3599,26 +3602,15 @@ impl AuthManager {
                 status: AccountRateLimitRefreshRosterStatus::LeaseReadFailed,
             };
         };
+        let store = self.account_manager.cached_runtime_store_snapshot(store);
 
         self.account_manager
             .account_rate_limit_refresh_roster(&store)
     }
 
-    fn clone_cached_store_with_runtime_active_account(&self) -> Option<AuthStore> {
-        let store = self.clone_cached_store_with_sqlite_usage_truth()?;
-        self.account_manager
-            .clone_store_with_runtime_active_account(&store)
-    }
-
-    // Merge-safety anchor: `/accounts` rows and the popup cache-expiry gate must share this one
-    // SQLite-backed saved-account usage truth read so TUI polling never falls back to stale
-    // in-memory auth-store usage while `list_accounts()` is already showing refreshed data.
-    fn clone_cached_store_with_sqlite_usage_truth(&self) -> Option<AuthStore> {
+    fn clone_cached_store(&self) -> Option<AuthStore> {
         let guard = self.inner.read().ok()?;
-        let store = guard.store.clone();
-        drop(guard);
-
-        Some(self.account_manager.with_sqlite_usage_truth(store))
+        Some(guard.store.clone())
     }
 
     pub fn set_active_account(&self, id: &str) -> std::io::Result<()> {
@@ -3785,24 +3777,6 @@ impl AuthManager {
         Ok(switched_to)
     }
 
-    fn select_account_for_auto_switch_with_leases(
-        &self,
-        store: &AuthStore,
-        required_workspace_id: Option<&str>,
-        exclude_store_account_id: Option<&str>,
-        now: DateTime<Utc>,
-        selection_scope: UsageLimitAutoSwitchSelectionScope,
-    ) -> Option<String> {
-        self.account_manager
-            .select_account_for_auto_switch_with_leases(
-                store,
-                required_workspace_id,
-                exclude_store_account_id,
-                now,
-                selection_scope,
-            )
-    }
-
     pub fn select_account_for_auto_switch(
         &self,
         required_workspace_id: Option<&str>,
@@ -3812,15 +3786,17 @@ impl AuthManager {
             return None;
         }
         let store = self
-            .clone_cached_store_with_runtime_active_account()
+            .clone_cached_store()
+            .map(|store| self.account_manager.cached_runtime_store_snapshot(store))
             .unwrap_or_else(|| self.load_store_from_storage().store);
-        self.select_account_for_auto_switch_with_leases(
-            &store,
-            required_workspace_id,
-            exclude_store_account_id,
-            Utc::now(),
-            UsageLimitAutoSwitchSelectionScope::PersistedTruth,
-        )
+        self.account_manager
+            .select_account_for_auto_switch_with_leases(
+                &store,
+                required_workspace_id,
+                exclude_store_account_id,
+                Utc::now(),
+                UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+            )
     }
 
     pub fn accounts_rate_limits_cache_expires_at(
@@ -3831,7 +3807,9 @@ impl AuthManager {
             return None;
         }
 
-        let store = self.clone_cached_store_with_sqlite_usage_truth()?;
+        let store = self
+            .clone_cached_store()
+            .map(|store| self.account_manager.cached_usage_store_snapshot(store))?;
         self.account_manager
             .accounts_rate_limits_cache_expires_at(&store, now)
     }
