@@ -1,5 +1,6 @@
-// Merge-safety anchor: MultiAgentV2 close-agent output must stay aligned with
-// the workspace-local runtime status contract used by reviewable operator surfaces.
+// Merge-safety anchor: MultiAgentV2 close-agent keeps task-path target resolution
+// in this workspace, but close begin/end events no longer export extra receiver
+// task-name metadata beyond the shared protocol contract.
 
 use super::*;
 use crate::tools::handlers::multi_agents_common::collab_agent_error;
@@ -49,7 +50,7 @@ impl ToolHandler for Handler {
                     call_id: call_id.clone(),
                     sender_thread_id: session.conversation_id,
                     receiver_thread_id: agent_id,
-                    receiver_agent_task_name: receiver_agent.agent_path.clone().map(String::from),
+                    receiver_agent_task_name: None,
                 }
                 .into(),
             )
@@ -72,10 +73,7 @@ impl ToolHandler for Handler {
                             receiver_thread_id: agent_id,
                             receiver_agent_nickname: receiver_agent.agent_nickname.clone(),
                             receiver_agent_role: receiver_agent.agent_role.clone(),
-                            receiver_agent_task_name: receiver_agent
-                                .agent_path
-                                .clone()
-                                .map(String::from),
+                            receiver_agent_task_name: None,
                             status,
                         }
                         .into(),
@@ -100,7 +98,7 @@ impl ToolHandler for Handler {
                     receiver_thread_id: agent_id,
                     receiver_agent_nickname: receiver_agent.agent_nickname,
                     receiver_agent_role: receiver_agent.agent_role,
-                    receiver_agent_task_name: receiver_agent.agent_path.map(String::from),
+                    receiver_agent_task_name: None,
                     status: status.clone(),
                 }
                 .into(),
