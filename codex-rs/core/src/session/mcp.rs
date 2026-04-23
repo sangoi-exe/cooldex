@@ -1,4 +1,6 @@
 use super::*;
+use codex_mcp::McpRuntimeEnvironment;
+use std::sync::Arc;
 
 impl Session {
     pub async fn request_mcp_server_elicitation(
@@ -205,6 +207,13 @@ impl Session {
             turn_context.sub_id.clone(),
             self.get_tx_event(),
             turn_context.sandbox_policy.get().clone(),
+            McpRuntimeEnvironment::new(
+                turn_context
+                    .environment
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(codex_exec_server::Environment::default())),
+                turn_context.cwd.to_path_buf(),
+            ),
             config.codex_home.to_path_buf(),
             codex_apps_tools_cache_key(auth.as_ref()),
             tool_plugin_provenance,

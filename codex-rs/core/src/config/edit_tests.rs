@@ -1,5 +1,6 @@
 use super::*;
 use codex_config::types::AppToolApproval;
+use codex_config::types::McpServerEnvVar;
 use codex_config::types::McpServerToolConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -656,7 +657,7 @@ fn blocking_replace_mcp_servers_round_trips() {
                     .into_iter()
                     .collect(),
                 ),
-                env_vars: vec!["FOO".to_string()],
+                env_vars: vec![McpServerEnvVar::Name("FOO".to_string())],
                 cwd: None,
             },
             experimental_environment: None,
