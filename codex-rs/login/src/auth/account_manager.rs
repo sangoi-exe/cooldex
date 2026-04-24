@@ -635,9 +635,14 @@ struct LoadedStoreCandidate {
     store_origin: LoadedStoreOrigin,
 }
 
-pub(super) struct GuardedReloadStorePreparation {
-    pub(super) loaded_had_persisted_active_account: bool,
+pub(super) struct GuardedReloadLoadedStore {
+    pub(super) loaded: LoadedAuthStore,
     pub(super) removed_account_ids: Vec<String>,
+}
+
+struct GuardedReloadStorePreparation {
+    loaded_had_persisted_active_account: bool,
+    removed_account_ids: Vec<String>,
 }
 
 pub(super) struct TerminalRefreshFailureStoreMutation {
@@ -1187,15 +1192,32 @@ impl AccountManager {
         })
     }
 
-    pub(super) fn prepare_strict_loaded_store(
+    pub(super) fn load_store_for_strict_reload(&self) -> std::io::Result<LoadedAuthStore> {
+        // Merge-safety anchor: strict reload lock/load/account-runtime
+        // prep/persist belongs to AccountManager; AuthManager may only derive
+        // and cache auth from the returned snapshot.
+        let _lock = lock_auth_store(&self.codex_home)?;
+        let store = self.storage.load()?.unwrap_or_default();
+        let store = self.prepare_strict_loaded_store(
+            store,
+            &*self.storage,
+            ChatgptAuthAdmissionPolicy::Persisted,
+        )?;
+        Ok(LoadedAuthStore {
+            store,
+            store_origin: self.configured_store_origin(),
+        })
+    }
+
+    fn prepare_strict_loaded_store(
         &self,
         mut store: AuthStore,
         persist_storage: &dyn AuthStorageBackend,
         admission_policy: ChatgptAuthAdmissionPolicy,
     ) -> std::io::Result<AuthStore> {
-        // Merge-safety anchor: strict reload keeps AuthManager as the
-        // lock/load/cache owner while AccountManager owns persisted-account
-        // runtime prep, current-runtime hydration, and fail-loud persistence.
+        // Merge-safety anchor: strict reload persisted-account prep,
+        // current-runtime hydration, and fail-loud persistence stay owned by
+        // AccountManager instead of the AuthManager cache facade.
         let loaded_had_persisted_active_account = store.active_account_id.is_some();
         let removed_account_ids = enforce_chatgpt_auth_accounts(&mut store, admission_policy);
         let mut sync_outcome = UsageStateSyncOutcome::default();
@@ -1217,13 +1239,79 @@ impl AccountManager {
         Ok(store)
     }
 
-    pub(super) fn prepare_guarded_reload_store(
+    pub(super) fn load_store_for_guarded_reload(&self) -> Option<GuardedReloadLoadedStore> {
+        // Merge-safety anchor: guarded reload lock/load/account-runtime
+        // prep/persist belongs to AccountManager; AuthManager may only compare,
+        // derive, and cache auth from the returned snapshot.
+        let _lock = match lock_auth_store(&self.codex_home) {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!(
+                    "Skipping auth reload because auth store lock could not be acquired: {error}"
+                );
+                return None;
+            }
+        };
+        let mut store = match self.storage.load() {
+            Ok(Some(store)) => store,
+            Ok(None) => {
+                tracing::info!("Skipping auth reload because auth store is missing.");
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Skipping auth reload because auth store could not be loaded: {error}"
+                );
+                return None;
+            }
+        };
+        let prepared = match self.prepare_guarded_reload_store(&mut store) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "skipping guarded auth reload because runtime active-account state could not be hydrated"
+                );
+                return None;
+            }
+        };
+        if (prepared.loaded_had_persisted_active_account
+            || !prepared.removed_account_ids.is_empty())
+            && let Err(error) = self.persist_guarded_reload_store(&store)
+        {
+            tracing::warn!(
+                error = %error,
+                "failed to persist auth store during guarded auth reload"
+            );
+            return None;
+        }
+        Some(GuardedReloadLoadedStore {
+            loaded: LoadedAuthStore {
+                store,
+                store_origin: self.configured_store_origin(),
+            },
+            removed_account_ids: prepared.removed_account_ids,
+        })
+    }
+
+    fn persist_guarded_reload_store(&self, store: &AuthStore) -> std::io::Result<()> {
+        store.validate()?;
+        if self.has_account_state_store() {
+            let mut stripped_store = store.clone();
+            strip_runtime_active_account_from_store(&mut stripped_store);
+            self.storage.save(&stripped_store)
+        } else {
+            self.storage.save(store)
+        }
+    }
+
+    fn prepare_guarded_reload_store(
         &self,
         store: &mut AuthStore,
     ) -> std::io::Result<GuardedReloadStorePreparation> {
-        // Merge-safety anchor: guarded reload keeps AuthManager as the
-        // load/persist/cache owner while AccountManager owns persisted-account
-        // filtering and current-runtime active-account hydration.
+        // Merge-safety anchor: guarded reload persisted-account filtering and
+        // current-runtime active-account hydration stay owned by AccountManager
+        // instead of the AuthManager cache facade.
         let loaded_had_persisted_active_account = store.active_account_id.is_some();
         let removed_account_ids =
             enforce_chatgpt_auth_accounts(store, ChatgptAuthAdmissionPolicy::Persisted);

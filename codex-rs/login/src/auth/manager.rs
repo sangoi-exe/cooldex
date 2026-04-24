@@ -35,6 +35,7 @@ use super::account_manager::AccountRateLimitRefreshRosterStatus;
 use super::account_manager::AccountSummary;
 use super::account_manager::ActiveChatgptAccountSummary;
 use super::account_manager::ChatgptAuthAdmissionPolicy;
+use super::account_manager::GuardedReloadLoadedStore;
 use super::account_manager::LoadedAuthStore;
 use super::account_manager::LoadedStoreOrigin;
 #[cfg(test)]
@@ -2173,14 +2174,8 @@ impl AuthManager {
     /// Like `reload()`, but fails loudly if the auth store cannot be loaded.
     pub fn reload_strict(&self) -> std::io::Result<bool> {
         tracing::info!("Reloading auth (strict)");
-        let _lock = storage::lock_auth_store(&self.codex_home)?;
-        let store = self.storage.load()?.unwrap_or_default();
-        let store = self.account_manager.prepare_strict_loaded_store(
-            store,
-            &*self.storage,
-            ChatgptAuthAdmissionPolicy::Persisted,
-        )?;
-        Ok(self.set_cached(store, self.account_manager.configured_store_origin()))
+        let loaded = self.account_manager.load_store_for_strict_reload()?;
+        Ok(self.set_cached(loaded.store, loaded.store_origin))
     }
 
     fn reload_if_store_account_id_matches(
@@ -2195,55 +2190,18 @@ impl AuthManager {
             }
         };
 
-        let mut store = match self.storage.load() {
-            Ok(Some(store)) => store,
-            Ok(None) => {
-                tracing::info!("Skipping auth reload because auth store is missing.");
-                return ReloadOutcome::Skipped;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "Skipping auth reload because auth store could not be loaded: {err}"
-                );
-                return ReloadOutcome::Skipped;
-            }
+        let Some(guarded_store) = self.account_manager.load_store_for_guarded_reload() else {
+            return ReloadOutcome::Skipped;
         };
-        let prepared = match self
-            .account_manager
-            .prepare_guarded_reload_store(&mut store)
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "skipping guarded auth reload because runtime active-account state could not be hydrated"
-                );
-                return ReloadOutcome::Skipped;
-            }
-        };
-        if prepared.loaded_had_persisted_active_account || !prepared.removed_account_ids.is_empty()
-        {
-            let persist_result = if self.account_manager.has_account_state_store() {
-                let mut stripped_store = store.clone();
-                strip_runtime_active_account_from_store(&mut stripped_store);
-                save_auth(
-                    &self.codex_home,
-                    &stripped_store,
-                    self.auth_credentials_store_mode,
-                )
-            } else {
-                save_auth(&self.codex_home, &store, self.auth_credentials_store_mode)
-            };
-            if let Err(error) = persist_result {
-                tracing::warn!(
-                    error = %error,
-                    "failed to persist auth store during guarded auth reload"
-                );
-                return ReloadOutcome::Skipped;
-            }
-        }
+        let GuardedReloadLoadedStore {
+            loaded,
+            removed_account_ids,
+        } = guarded_store;
+        let LoadedAuthStore {
+            store,
+            store_origin,
+        } = loaded;
 
-        let store_origin = self.account_manager.configured_store_origin();
         let new_auth = Self::derive_auth_from_store(
             &store,
             &self.codex_home,
@@ -2257,8 +2215,7 @@ impl AuthManager {
             .map(|summary| summary.store_account_id);
 
         if new_store_account_id.as_deref() != Some(expected_store_account_id) {
-            if prepared
-                .removed_account_ids
+            if removed_account_ids
                 .iter()
                 .any(|id| id == expected_store_account_id)
             {
