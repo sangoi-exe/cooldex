@@ -3652,6 +3652,21 @@ impl AuthManager {
         Some(guard.store.clone())
     }
 
+    fn update_saved_account_store<T>(
+        &self,
+        default: T,
+        mutator: impl FnOnce(&AccountManager, &mut AuthStore) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        // Merge-safety anchor: saved-account runtime mutations must keep this
+        // no-saved-accounts early return outside `update_store(...)` so API-key
+        // or empty stores are not loaded, persisted, or cache-refreshed by
+        // account-runtime follower updates.
+        if !self.has_saved_chatgpt_accounts() {
+            return Ok(default);
+        }
+        self.update_store(|store| mutator(&self.account_manager, store))
+    }
+
     pub fn set_active_account(&self, id: &str) -> std::io::Result<()> {
         self.update_store(|store| self.account_manager.set_active_account(store, id))
     }
@@ -3682,12 +3697,8 @@ impl AuthManager {
     }
 
     pub fn update_usage_for_active(&self, snapshot: RateLimitSnapshot) -> std::io::Result<()> {
-        if !self.has_saved_chatgpt_accounts() {
-            return Ok(());
-        }
-        self.update_store(|store| {
-            self.account_manager
-                .update_usage_for_active(store, snapshot)
+        self.update_saved_account_store((), |account_manager, store| {
+            account_manager.update_usage_for_active(store, snapshot)
         })
     }
 
@@ -3696,13 +3707,8 @@ impl AuthManager {
         store_account_id: &str,
         snapshot: RateLimitSnapshot,
     ) -> std::io::Result<()> {
-        if !self.has_saved_chatgpt_accounts() {
-            return Ok(());
-        }
-
-        self.update_store(|store| {
-            self.account_manager
-                .update_rate_limits_for_account(store, store_account_id, snapshot)
+        self.update_saved_account_store((), |account_manager, store| {
+            account_manager.update_rate_limits_for_account(store, store_account_id, snapshot)
         })
     }
 
@@ -3751,12 +3757,8 @@ impl AuthManager {
         resets_at: Option<DateTime<Utc>>,
         snapshot: Option<RateLimitSnapshot>,
     ) -> std::io::Result<()> {
-        if !self.has_saved_chatgpt_accounts() {
-            return Ok(());
-        }
-        self.update_store(|store| {
-            self.account_manager
-                .mark_usage_limit_reached(store, resets_at, snapshot)
+        self.update_saved_account_store((), |account_manager, store| {
+            account_manager.mark_usage_limit_reached(store, resets_at, snapshot)
         })
     }
 

@@ -1254,6 +1254,49 @@ fn mark_usage_limit_reached_updates_active_usage_and_cache_expiry_uses_sqlite_tr
     );
 }
 
+// Merge-safety anchor: saved-account follower updates must keep the no-account
+// early return outside the persistence path so empty/API-key auth stores are not
+// materialized just because account-runtime telemetry arrived.
+#[test]
+fn saved_account_runtime_updates_skip_empty_store_without_persisting_auth() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+    let snapshot = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            remaining_percent: 0.0,
+            window_minutes: Some(15),
+            resets_at: Some((Utc::now() + chrono::Duration::minutes(7)).timestamp()),
+        }),
+        secondary: None,
+        credits: None,
+        plan_type: None,
+        rate_limit_reached_type: None,
+    };
+
+    manager
+        .update_usage_for_active(snapshot.clone())
+        .expect("usage update without saved accounts should be a no-op");
+    manager
+        .update_rate_limits_for_account("missing-account", snapshot.clone())
+        .expect("targeted rate-limit update without saved accounts should be a no-op");
+    manager
+        .mark_usage_limit_reached(Some(Utc::now()), Some(snapshot))
+        .expect("usage-limit mark without saved accounts should be a no-op");
+
+    assert!(
+        !get_auth_file(codex_home.path()).exists(),
+        "no-op saved-account follower updates must not materialize auth.json"
+    );
+}
+
 #[test]
 fn update_usage_for_active_updates_cached_active_usage() {
     let codex_home = tempdir().expect("create auth tempdir");
