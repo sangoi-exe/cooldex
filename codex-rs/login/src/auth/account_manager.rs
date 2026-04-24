@@ -6,6 +6,7 @@ use codex_account_state::AccountUsageState;
 use codex_account_state::ForceReleaseAccountOutcome;
 use codex_account_state::SessionActiveAccountRefresh;
 use codex_account_state::SessionActiveAccountSetOutcome;
+use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_protocol::account::PlanType as AccountPlanType;
@@ -19,8 +20,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
-use super::manager::ActiveChatgptAccountSummary;
-use super::manager::CachedStoreOrigin;
 use crate::auth::storage::AccountUsageCache;
 use crate::auth::storage::AuthStorageBackend;
 use crate::auth::storage::AuthStore;
@@ -30,6 +29,27 @@ use crate::token_data::TokenData;
 
 const USAGE_LIMIT_AUTO_SWITCH_COOLDOWN_SECONDS: i64 = 2;
 pub(super) const ACTIVE_ACCOUNT_LEASE_TTL_SECONDS: i64 = 5 * 60;
+
+// Merge-safety anchor: active account projections belong to AccountManager
+// because it owns runtime-active account selection, saved-account roster truth,
+// and auth-store-origin interpretation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveChatgptAccountSummary {
+    pub store_account_id: String,
+    pub label: Option<String>,
+    pub email: Option<String>,
+    pub auth_mode: AuthMode,
+}
+
+// Merge-safety anchor: loaded-store origin is the AccountManager loader
+// contract; AuthManager consumes the selected store snapshot but does not own
+// origin selection or external-ephemeral admission semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LoadedStoreOrigin {
+    Persistent,
+    ExternalEphemeral,
+}
+
 fn account_usage_state_from_cache(cache: &AccountUsageCache) -> AccountUsageState {
     AccountUsageState {
         last_rate_limits: cache.last_rate_limits.clone(),
@@ -604,14 +624,14 @@ fn parse_credits_balance(raw: &str) -> Option<i64> {
 }
 
 #[derive(Clone)]
-pub(super) struct LoadedCachedStore {
+pub(super) struct LoadedAuthStore {
     pub(super) store: AuthStore,
-    pub(super) store_origin: CachedStoreOrigin,
+    pub(super) store_origin: LoadedStoreOrigin,
 }
 
 struct LoadedStoreCandidate {
     store: AuthStore,
-    store_origin: CachedStoreOrigin,
+    store_origin: LoadedStoreOrigin,
 }
 
 pub(super) struct GuardedReloadStorePreparation {
@@ -963,7 +983,7 @@ impl AccountManager {
         &self,
         mut store: AuthStore,
         persist_storage: Arc<dyn AuthStorageBackend>,
-        store_origin: CachedStoreOrigin,
+        store_origin: LoadedStoreOrigin,
         admission_policy: ChatgptAuthAdmissionPolicy,
         runtime_context: &AccountRuntimeContext,
     ) -> LoadedStoreCandidate {
@@ -1024,18 +1044,18 @@ impl AccountManager {
     }
 
     pub(super) fn chatgpt_auth_admission_policy_for_store_origin(
-        store_origin: CachedStoreOrigin,
+        store_origin: LoadedStoreOrigin,
     ) -> ChatgptAuthAdmissionPolicy {
         match store_origin {
-            CachedStoreOrigin::Persistent => ChatgptAuthAdmissionPolicy::Persisted,
-            CachedStoreOrigin::ExternalEphemeral => ChatgptAuthAdmissionPolicy::ExternalStrict,
+            LoadedStoreOrigin::Persistent => ChatgptAuthAdmissionPolicy::Persisted,
+            LoadedStoreOrigin::ExternalEphemeral => ChatgptAuthAdmissionPolicy::ExternalStrict,
         }
     }
 
     fn preflight_loaded_store_candidate(
         mut store: AuthStore,
         persist_storage: Arc<dyn AuthStorageBackend>,
-        store_origin: CachedStoreOrigin,
+        store_origin: LoadedStoreOrigin,
     ) -> LoadedStoreCandidate {
         let removed_account_ids = enforce_chatgpt_auth_accounts(
             &mut store,
@@ -1070,7 +1090,7 @@ impl AccountManager {
         codex_home: &Path,
         storage: &Arc<dyn AuthStorageBackend>,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
-    ) -> LoadedCachedStore {
+    ) -> LoadedAuthStore {
         // Merge-safety anchor: live store loading keeps AccountManager as the
         // owner of auth-store selection, admission filtering, sqlite-backed
         // usage/runtime hydration, and persisted-active stripping; AuthManager
@@ -1093,9 +1113,9 @@ impl AccountManager {
         };
         let persistent_origin =
             if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
-                CachedStoreOrigin::ExternalEphemeral
+                LoadedStoreOrigin::ExternalEphemeral
             } else {
-                CachedStoreOrigin::Persistent
+                LoadedStoreOrigin::Persistent
             };
         let mut selected_store = persistent_store;
         let mut selected_storage = Arc::clone(storage);
@@ -1106,7 +1126,7 @@ impl AccountManager {
                     let external_candidate = Self::preflight_loaded_store_candidate(
                         store,
                         Arc::clone(external_storage),
-                        CachedStoreOrigin::ExternalEphemeral,
+                        LoadedStoreOrigin::ExternalEphemeral,
                     );
                     if Self::store_has_selectable_auth_material(&external_candidate.store) {
                         selected_store = external_candidate.store;
@@ -1128,7 +1148,7 @@ impl AccountManager {
             &runtime_context,
         );
 
-        LoadedCachedStore {
+        LoadedAuthStore {
             store: selected.store,
             store_origin: selected.store_origin,
         }
@@ -1153,15 +1173,15 @@ impl AccountManager {
     pub(super) fn active_chatgpt_account_summary(
         &self,
         store: &AuthStore,
-        store_origin: CachedStoreOrigin,
+        store_origin: LoadedStoreOrigin,
     ) -> Option<ActiveChatgptAccountSummary> {
         // Merge-safety anchor: active ChatGPT account summaries must come from
         // the same runtime-prepared store snapshot owner as saved-account
         // presence and autoswitch, not a stale auth-cache follower.
         let active_account = store.active_account()?;
         let auth_mode = match store_origin {
-            CachedStoreOrigin::Persistent => ApiAuthMode::Chatgpt,
-            CachedStoreOrigin::ExternalEphemeral => ApiAuthMode::ChatgptAuthTokens,
+            LoadedStoreOrigin::Persistent => ApiAuthMode::Chatgpt,
+            LoadedStoreOrigin::ExternalEphemeral => ApiAuthMode::ChatgptAuthTokens,
         };
         Some(ActiveChatgptAccountSummary {
             store_account_id: active_account.id.clone(),

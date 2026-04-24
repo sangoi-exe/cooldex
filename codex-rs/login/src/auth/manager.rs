@@ -33,8 +33,10 @@ use super::account_manager::AccountRateLimitRefreshRoster;
 #[cfg(test)]
 use super::account_manager::AccountRateLimitRefreshRosterStatus;
 use super::account_manager::AccountSummary;
+use super::account_manager::ActiveChatgptAccountSummary;
 use super::account_manager::ChatgptAuthAdmissionPolicy;
-use super::account_manager::LoadedCachedStore;
+use super::account_manager::LoadedAuthStore;
+use super::account_manager::LoadedStoreOrigin;
 #[cfg(test)]
 use super::account_manager::UsageLimitAutoSwitchFallbackSelectionMode;
 use super::account_manager::UsageLimitAutoSwitchRequest;
@@ -106,14 +108,6 @@ struct ActiveChatgptAccountSnapshot {
     tokens: TokenData,
     last_refresh: Option<DateTime<Utc>>,
     auth_mode: ApiAuthMode,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveChatgptAccountSummary {
-    pub store_account_id: String,
-    pub label: Option<String>,
-    pub email: Option<String>,
-    pub auth_mode: AuthMode,
 }
 
 impl PartialEq for CodexAuth {
@@ -1285,17 +1279,11 @@ impl AuthDotJson {
 #[derive(Clone)]
 struct CachedAuth {
     store: AuthStore,
-    store_origin: CachedStoreOrigin,
+    store_origin: LoadedStoreOrigin,
     auth: Option<CodexAuth>,
     /// Permanent refresh failure cached for the current auth snapshot so
     /// later refresh attempts for the same credentials fail fast without network.
     permanent_refresh_failure: Option<AuthScopedRefreshFailure>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum CachedStoreOrigin {
-    Persistent,
-    ExternalEphemeral,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1687,7 +1675,7 @@ impl AuthManager {
         let (auth_state_tx, _) = watch::channel(());
         let cached = CachedAuth {
             store,
-            store_origin: CachedStoreOrigin::Persistent,
+            store_origin: LoadedStoreOrigin::Persistent,
             auth: Some(auth),
             permanent_refresh_failure: None,
         };
@@ -1717,7 +1705,7 @@ impl AuthManager {
         let (auth_state_tx, _) = watch::channel(());
         let cached = CachedAuth {
             store,
-            store_origin: CachedStoreOrigin::Persistent,
+            store_origin: LoadedStoreOrigin::Persistent,
             auth: Some(auth),
             permanent_refresh_failure: None,
         };
@@ -1748,7 +1736,7 @@ impl AuthManager {
             account_manager: AccountManager::new(None, uuid::Uuid::new_v4().to_string()),
             inner: RwLock::new(CachedAuth {
                 store: AuthStore::default(),
-                store_origin: CachedStoreOrigin::Persistent,
+                store_origin: LoadedStoreOrigin::Persistent,
                 auth: None,
                 permanent_refresh_failure: None,
             }),
@@ -2265,7 +2253,7 @@ impl AuthManager {
             &self.codex_home,
             Arc::clone(&self.storage),
             self.enable_codex_api_key_env,
-            CachedStoreOrigin::Persistent,
+            LoadedStoreOrigin::Persistent,
         );
         let new_store_account_id = new_auth
             .as_ref()
@@ -2339,7 +2327,7 @@ impl AuthManager {
         codex_home: &Path,
         storage: Arc<dyn AuthStorageBackend>,
         enable_codex_api_key_env: bool,
-        store_origin: CachedStoreOrigin,
+        store_origin: LoadedStoreOrigin,
     ) -> Option<CodexAuth> {
         if enable_codex_api_key_env && let Some(api_key) = read_codex_api_key_from_env() {
             return Some(CodexAuth::from_api_key(&api_key));
@@ -2359,10 +2347,10 @@ impl AuthManager {
                     )),
                 )
                 .unwrap_or_else(|error| match store_origin {
-                    CachedStoreOrigin::Persistent => {
+                    LoadedStoreOrigin::Persistent => {
                         panic!("persisted ChatGPT auth should always have a backing store: {error}")
                     }
-                    CachedStoreOrigin::ExternalEphemeral => {
+                    LoadedStoreOrigin::ExternalEphemeral => {
                         panic!(
                             "external ephemeral ChatGPT token auth should always have a backing store: {error}"
                         )
@@ -2382,21 +2370,21 @@ impl AuthManager {
         None
     }
 
-    fn chatgpt_api_auth_mode_for_store_origin(store_origin: CachedStoreOrigin) -> ApiAuthMode {
+    fn chatgpt_api_auth_mode_for_store_origin(store_origin: LoadedStoreOrigin) -> ApiAuthMode {
         match store_origin {
-            CachedStoreOrigin::Persistent => ApiAuthMode::Chatgpt,
-            CachedStoreOrigin::ExternalEphemeral => ApiAuthMode::ChatgptAuthTokens,
+            LoadedStoreOrigin::Persistent => ApiAuthMode::Chatgpt,
+            LoadedStoreOrigin::ExternalEphemeral => ApiAuthMode::ChatgptAuthTokens,
         }
     }
 
     fn storage_for_store_origin(
         codex_home: &Path,
         persistent_storage: &Arc<dyn AuthStorageBackend>,
-        store_origin: CachedStoreOrigin,
+        store_origin: LoadedStoreOrigin,
     ) -> Arc<dyn AuthStorageBackend> {
         match store_origin {
-            CachedStoreOrigin::Persistent => Arc::clone(persistent_storage),
-            CachedStoreOrigin::ExternalEphemeral => create_auth_storage(
+            LoadedStoreOrigin::Persistent => Arc::clone(persistent_storage),
+            LoadedStoreOrigin::ExternalEphemeral => create_auth_storage(
                 codex_home.to_path_buf(),
                 AuthCredentialsStoreMode::Ephemeral,
             ),
@@ -2407,7 +2395,7 @@ impl AuthManager {
         &self,
         store: AuthStore,
         new_auth: Option<CodexAuth>,
-        store_origin: CachedStoreOrigin,
+        store_origin: LoadedStoreOrigin,
     ) -> bool {
         self.set_cached_with_auth_notification_mode(
             store,
@@ -2421,7 +2409,7 @@ impl AuthManager {
         &self,
         store: AuthStore,
         new_auth: Option<CodexAuth>,
-        store_origin: CachedStoreOrigin,
+        store_origin: LoadedStoreOrigin,
     ) -> bool {
         self.set_cached_with_auth_notification_mode(
             store,
@@ -2435,7 +2423,7 @@ impl AuthManager {
         &self,
         store: AuthStore,
         new_auth: Option<CodexAuth>,
-        store_origin: CachedStoreOrigin,
+        store_origin: LoadedStoreOrigin,
         notification_mode: AuthStateNotificationMode,
     ) -> bool {
         if let Ok(mut guard) = self.inner.write() {
@@ -2459,7 +2447,7 @@ impl AuthManager {
         }
     }
 
-    fn load_store_from_storage(&self) -> LoadedCachedStore {
+    fn load_store_from_storage(&self) -> LoadedAuthStore {
         // Merge-safety anchor: live auth readers must delegate store snapshot
         // loading to AccountManager so runtime-active/usage truth comes from one
         // owner while AuthManager stays on auth derivation and cache refresh.
@@ -2507,7 +2495,7 @@ impl AuthManager {
             .read()
             .ok()
             .map(|guard| guard.store_origin)
-            .unwrap_or(CachedStoreOrigin::Persistent);
+            .unwrap_or(LoadedStoreOrigin::Persistent);
         let new_auth = Self::derive_auth_from_store(
             &store,
             &self.codex_home,
@@ -2522,7 +2510,7 @@ impl AuthManager {
         store: &AuthStore,
         store_account_id: &str,
         storage: Arc<dyn AuthStorageBackend>,
-        store_origin: CachedStoreOrigin,
+        store_origin: LoadedStoreOrigin,
     ) -> Option<CodexAuth> {
         let account = store.account(store_account_id)?;
         Some(
@@ -2534,10 +2522,10 @@ impl AuthManager {
                 Some(storage),
             )
             .unwrap_or_else(|error| match store_origin {
-                CachedStoreOrigin::Persistent => {
+                LoadedStoreOrigin::Persistent => {
                     panic!("stored ChatGPT account lookup should always have a backing store: {error}")
                 }
-                CachedStoreOrigin::ExternalEphemeral => {
+                LoadedStoreOrigin::ExternalEphemeral => {
                     panic!(
                         "external ephemeral ChatGPT account lookup should always have a backing store: {error}"
                     )
@@ -2883,7 +2871,7 @@ impl AuthManager {
                 &store,
                 switched_to_store_account_id,
                 Arc::clone(&self.storage),
-                CachedStoreOrigin::Persistent,
+                LoadedStoreOrigin::Persistent,
             )
         } else if mutation.was_active {
             None
@@ -2893,10 +2881,10 @@ impl AuthManager {
                 &self.codex_home,
                 Arc::clone(&self.storage),
                 self.enable_codex_api_key_env,
-                CachedStoreOrigin::Persistent,
+                LoadedStoreOrigin::Persistent,
             )
         };
-        self.set_cached_with_auth(store, cached_auth, CachedStoreOrigin::Persistent);
+        self.set_cached_with_auth(store, cached_auth, LoadedStoreOrigin::Persistent);
         tracing::warn!(
             store_account_id,
             failed_reason = ?error.reason,
@@ -2955,7 +2943,7 @@ impl AuthManager {
         auth
     }
 
-    fn load_auth_from_storage_for_live_reader(&self) -> (LoadedCachedStore, Option<CodexAuth>) {
+    fn load_auth_from_storage_for_live_reader(&self) -> (LoadedAuthStore, Option<CodexAuth>) {
         let loaded = self.load_store_from_storage();
         let auth = Self::derive_auth_from_store(
             &loaded.store,
