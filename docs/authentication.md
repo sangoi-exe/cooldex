@@ -35,7 +35,7 @@ When using ChatGPT authentication, `auth.json` (or the keyring entry) stores a *
 - `codex logout` deletes the stored credentials (removes the `auth.json` file and the keyring entry, if present).
 - In the TUIs, use `/accounts` to switch the active account, add additional accounts, inspect whether an account is leased by the current or another live session, and force-release a foreign live lease when you need to recover from a crashed/stuck session. When multiple accounts are stored, `/logout` lets you choose between logging out all accounts or removing a single account (then exits). `/accounts` status refresh also prunes saved accounts that hit a terminal refresh-token failure while their usage data is being refreshed, and it does not advance cache freshness when account resolution fails transiently before usage fetch starts.
 - Keep this aligned with `AuthManager::list_accounts()` and TUI account popups: `/accounts` renders only the summary fields exposed there.
-- This multi-account management surface is currently a TUI feature. App-server account APIs expose the current account and current-account rate limits, not the full list/switch/remove workflow used by `/accounts`.
+- The app-server account APIs expose the same saved-account roster/switch/lease-recovery surface used by remote `/accounts`: `account/list`, `account/active/set`, and `account/lease/forceRelease`.
 
 ## Auto-switch on usage limit
 

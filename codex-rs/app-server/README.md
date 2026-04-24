@@ -1437,7 +1437,7 @@ $demo-app Pull the latest updates from the team.
 
 ## Auth endpoints
 
-The JSON-RPC auth/account surface exposes request/response methods plus server-initiated notifications (no `id`). Use these to determine auth state, start or cancel logins, logout, and inspect ChatGPT rate limits.
+The JSON-RPC auth/account surface exposes request/response methods plus server-initiated notifications (no `id`). Use these to determine auth state, start or cancel logins, logout, list/switch saved ChatGPT accounts, recover account leases, and inspect ChatGPT rate limits.
 
 ### Authentication modes
 
@@ -1457,6 +1457,9 @@ Experimental/internal-only surface:
 - `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
 - `account/login/cancel` — cancel a pending managed ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated`.
+- `account/list` — list saved ChatGPT accounts with active, usage, and lease-state followers.
+- `account/active/set` — select the active saved ChatGPT account by `accountId`; triggers `account/updated`.
+- `account/lease/forceRelease` — force-release a stale live-session lease for a saved ChatGPT account.
 - `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, `chatgptAuthTokens`, or `null`) and includes the current ChatGPT `label` and `planType` when available.
 - `account/rateLimits/read` — fetch ChatGPT rate limits; updates arrive via `account/rateLimits/updated` (notify).
 - `account/rateLimits/updated` (notify) — emitted whenever a user's ChatGPT rate limits change.
@@ -1489,7 +1492,33 @@ Field notes:
 - `authMode` (`apikey` | `chatgpt` | `chatgptAuthTokens` | `null`): the exact current auth owner. The experimental/internal `chatgptAuthTokens` value appears only when that auth path is active.
 - `activeChatgptStoreAccountId` (`string | null`): carries the stable store/workspace identity for the currently selected ChatGPT auth context. It can be non-null for saved-account ChatGPT auth and external `chatgptAuthTokens` auth, and is `null` when the current auth does not expose a ChatGPT store/workspace identity.
 
-### 2) Log in with an API key
+### 2) Manage saved ChatGPT accounts
+
+List the remote saved-account roster:
+
+```json
+{ "method": "account/list", "id": 2 }
+{ "id": 2, "result": { "accounts": [ { "id": "chatgpt-user:user-123:workspace:account-123", "label": "Primary", "email": "user@example.com", "isActive": true, "exhaustedUntilUnixSeconds": null, "lastRateLimits": null, "leaseState": "leasedByCurrentSession" } ] } }
+```
+
+Select an active saved ChatGPT account:
+
+```json
+{ "method": "account/active/set", "id": 3, "params": { "accountId": "chatgpt-user:user-456:workspace:account-456" } }
+{ "id": 3, "result": {} }
+{ "method": "account/updated", "params": { "authMode": "chatgpt", "label": "Secondary", "planType": "pro" } }
+```
+
+Force-release a stale account lease:
+
+```json
+{ "method": "account/lease/forceRelease", "id": 4, "params": { "accountId": "chatgpt-user:user-456:workspace:account-456" } }
+{ "id": 4, "result": { "status": "released" } }
+```
+
+`status` is `released` when a lease was cleared and `notFound` when no live lease matched.
+
+### 3) Log in with an API key
 
 1. Send:
    ```json
@@ -1509,7 +1538,7 @@ Field notes:
    { "method": "account/updated", "params": { "authMode": "apikey", "label": null, "planType": null } }
    ```
 
-### 3) Log in with ChatGPT (browser flow)
+### 4) Log in with ChatGPT (browser flow)
 
 1. Start:
    ```json
@@ -1523,7 +1552,7 @@ Field notes:
    { "method": "account/updated", "params": { "authMode": "chatgpt", "label": null, "planType": "plus" } }
    ```
 
-### 4) Log in with ChatGPT (device code flow)
+### 5) Log in with ChatGPT (device code flow)
 
 1. Start:
    ```json
@@ -1537,14 +1566,14 @@ Field notes:
    { "method": "account/updated", "params": { "authMode": "chatgpt", "label": null, "planType": "plus" } }
    ```
 
-### 5) Cancel a ChatGPT login
+### 6) Cancel a ChatGPT login
 
 ```json
 { "method": "account/login/cancel", "id": 5, "params": { "loginId": "<uuid>" } }
 { "method": "account/login/completed", "params": { "loginId": "<uuid>", "success": false, "error": "…" } }
 ```
 
-### 6) Logout
+### 7) Logout
 
 ```json
 { "method": "account/logout", "id": 6 }
@@ -1552,7 +1581,7 @@ Field notes:
 { "method": "account/updated", "params": { "authMode": null, "label": null, "planType": null } }
 ```
 
-### 7) Rate limits (ChatGPT)
+### 8) Rate limits (ChatGPT)
 
 ```json
 { "method": "account/rateLimits/read", "id": 7 }
@@ -1567,7 +1596,7 @@ Field notes:
 - `resetsAt` is a Unix timestamp (seconds) for the next reset.
 - `rateLimitReachedType` identifies the backend-classified limit state when one has been reached.
 
-### 8) Notify a workspace owner about a limit
+### 9) Notify a workspace owner about a limit
 
 ```json
 { "method": "account/sendAddCreditsNudgeEmail", "id": 8, "params": { "creditType": "credits" } }
