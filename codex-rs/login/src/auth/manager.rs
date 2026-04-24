@@ -2125,7 +2125,16 @@ impl AuthManager {
             return Some(auth);
         }
 
-        let auth = self.auth_cached()?;
+        let auth = match self.auth_cached() {
+            Some(auth) => auth,
+            None => {
+                // Merge-safety anchor: after terminal saved-account eviction,
+                // `auth()` must let AccountManager reload current store truth
+                // instead of treating an empty cache as a permanent no-auth
+                // owner.
+                return self.current_auth_from_storage();
+            }
+        };
         if Self::is_stale_for_proactive_refresh(&auth)
             && let Err(err) = self.refresh_token().await
         {
