@@ -15,7 +15,7 @@ use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -651,6 +651,9 @@ struct AccountRuntimeContext {
 
 #[derive(Debug)]
 pub(super) struct AccountManager {
+    codex_home: PathBuf,
+    storage: Arc<dyn AuthStorageBackend>,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
     pub(super) account_state_store: Option<AccountStateStore>,
     runtime_session_id: String,
     linked_codex_session_id: RwLock<Option<String>>,
@@ -660,10 +663,16 @@ pub(super) struct AccountManager {
 
 impl AccountManager {
     pub(super) fn new(
+        codex_home: PathBuf,
+        storage: Arc<dyn AuthStorageBackend>,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
         account_state_store: Option<AccountStateStore>,
         runtime_session_id: String,
     ) -> Self {
         Self {
+            codex_home,
+            storage,
+            auth_credentials_store_mode,
             account_state_store,
             runtime_session_id,
             linked_codex_session_id: RwLock::new(None),
@@ -1085,25 +1094,17 @@ impl AccountManager {
         !store.accounts.is_empty() || store.openai_api_key.is_some()
     }
 
-    pub(super) fn load_store_from_storage(
-        &self,
-        codex_home: &Path,
-        storage: &Arc<dyn AuthStorageBackend>,
-        auth_credentials_store_mode: AuthCredentialsStoreMode,
-    ) -> LoadedAuthStore {
+    pub(super) fn load_store_from_storage(&self) -> LoadedAuthStore {
         // Merge-safety anchor: live store loading keeps AccountManager as the
         // owner of auth-store selection, admission filtering, sqlite-backed
         // usage/runtime hydration, and persisted-active stripping; AuthManager
         // remains a delegation seam for auth materialization only.
         let runtime_context = self.runtime_context();
-        let external_storage = (auth_credentials_store_mode != AuthCredentialsStoreMode::Ephemeral)
-            .then(|| {
-                create_auth_storage(
-                    codex_home.to_path_buf(),
-                    AuthCredentialsStoreMode::Ephemeral,
-                )
+        let external_storage =
+            (self.auth_credentials_store_mode != AuthCredentialsStoreMode::Ephemeral).then(|| {
+                create_auth_storage(self.codex_home.clone(), AuthCredentialsStoreMode::Ephemeral)
             });
-        let persistent_store = match storage.load() {
+        let persistent_store = match self.storage.load() {
             Ok(Some(store)) => store,
             Ok(None) => AuthStore::default(),
             Err(err) => {
@@ -1112,13 +1113,13 @@ impl AccountManager {
             }
         };
         let persistent_origin =
-            if auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
+            if self.auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
                 LoadedStoreOrigin::ExternalEphemeral
             } else {
                 LoadedStoreOrigin::Persistent
             };
         let mut selected_store = persistent_store;
-        let mut selected_storage = Arc::clone(storage);
+        let mut selected_storage = Arc::clone(&self.storage);
         let mut selected_origin = persistent_origin;
         if let Some(external_storage) = external_storage.as_ref() {
             match external_storage.load() {
@@ -1154,20 +1155,11 @@ impl AccountManager {
         }
     }
 
-    pub(super) fn has_saved_chatgpt_accounts(
-        &self,
-        codex_home: &Path,
-        storage: &Arc<dyn AuthStorageBackend>,
-        auth_credentials_store_mode: AuthCredentialsStoreMode,
-    ) -> bool {
+    pub(super) fn has_saved_chatgpt_accounts(&self) -> bool {
         // Merge-safety anchor: saved-account presence checks must read the same
         // runtime-prepared store snapshot owner as `/accounts` and autoswitch,
         // not a stale auth/cache follower.
-        !self
-            .load_store_from_storage(codex_home, storage, auth_credentials_store_mode)
-            .store
-            .accounts
-            .is_empty()
+        !self.load_store_from_storage().store.accounts.is_empty()
     }
 
     pub(super) fn active_chatgpt_account_summary(

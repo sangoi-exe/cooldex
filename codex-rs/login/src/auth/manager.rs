@@ -1631,12 +1631,14 @@ impl AuthManager {
         let storage = create_auth_storage(codex_home.clone(), auth_credentials_store_mode);
         let account_state_store = open_account_state_store(sqlite_home.as_path());
         let runtime_session_id = uuid::Uuid::new_v4().to_string();
-        let account_manager = AccountManager::new(account_state_store, runtime_session_id);
-        let loaded = account_manager.load_store_from_storage(
-            &codex_home,
-            &storage,
+        let account_manager = AccountManager::new(
+            codex_home.clone(),
+            Arc::clone(&storage),
             auth_credentials_store_mode,
+            account_state_store,
+            runtime_session_id,
         );
+        let loaded = account_manager.load_store_from_storage();
         let store = loaded.store;
         let store_origin = loaded.store_origin;
         let auth = Self::derive_auth_from_store(
@@ -1679,14 +1681,18 @@ impl AuthManager {
             auth: Some(auth),
             permanent_refresh_failure: None,
         };
+        let account_manager = AccountManager::new(
+            codex_home.clone(),
+            Arc::clone(&storage),
+            AuthCredentialsStoreMode::File,
+            account_state_store,
+            uuid::Uuid::new_v4().to_string(),
+        );
 
         Arc::new(Self {
             codex_home,
             storage,
-            account_manager: AccountManager::new(
-                account_state_store,
-                uuid::Uuid::new_v4().to_string(),
-            ),
+            account_manager,
             inner: RwLock::new(cached),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
@@ -1709,13 +1715,17 @@ impl AuthManager {
             auth: Some(auth),
             permanent_refresh_failure: None,
         };
+        let account_manager = AccountManager::new(
+            codex_home.clone(),
+            Arc::clone(&storage),
+            AuthCredentialsStoreMode::File,
+            account_state_store,
+            uuid::Uuid::new_v4().to_string(),
+        );
         Arc::new(Self {
             codex_home,
             storage,
-            account_manager: AccountManager::new(
-                account_state_store,
-                uuid::Uuid::new_v4().to_string(),
-            ),
+            account_manager,
             inner: RwLock::new(cached),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
@@ -1730,10 +1740,17 @@ impl AuthManager {
         let codex_home = PathBuf::from("non-existent");
         let storage = create_auth_storage(codex_home.clone(), AuthCredentialsStoreMode::File);
         let (auth_state_tx, _) = watch::channel(());
+        let account_manager = AccountManager::new(
+            codex_home.clone(),
+            Arc::clone(&storage),
+            AuthCredentialsStoreMode::File,
+            /*account_state_store*/ None,
+            uuid::Uuid::new_v4().to_string(),
+        );
         Arc::new(Self {
             codex_home,
             storage,
-            account_manager: AccountManager::new(None, uuid::Uuid::new_v4().to_string()),
+            account_manager,
             inner: RwLock::new(CachedAuth {
                 store: AuthStore::default(),
                 store_origin: LoadedStoreOrigin::Persistent,
@@ -2451,11 +2468,7 @@ impl AuthManager {
         // Merge-safety anchor: live auth readers must delegate store snapshot
         // loading to AccountManager so runtime-active/usage truth comes from one
         // owner while AuthManager stays on auth derivation and cache refresh.
-        self.account_manager.load_store_from_storage(
-            &self.codex_home,
-            &self.storage,
-            self.auth_credentials_store_mode,
-        )
+        self.account_manager.load_store_from_storage()
     }
 
     fn load_saved_account_store(&self) -> Option<AuthStore> {
@@ -2930,11 +2943,7 @@ impl AuthManager {
     }
 
     pub fn has_saved_chatgpt_accounts(&self) -> bool {
-        self.account_manager.has_saved_chatgpt_accounts(
-            &self.codex_home,
-            &self.storage,
-            self.auth_credentials_store_mode,
-        )
+        self.account_manager.has_saved_chatgpt_accounts()
     }
 
     pub fn current_auth_from_storage(&self) -> Option<CodexAuth> {
