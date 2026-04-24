@@ -68,7 +68,7 @@ For commentless customization-adjacent seams such as JSON schema artifacts, the 
 
 <!-- Merge-safety anchor: main-repo commits in this workspace should preserve Codex co-author attribution when Codex materially participates in the change. -->
 
-- For commits to the main repository `https://github.com/sangoi-exe/codex/`, include `Co-authored-by: Codex <codex@openai.com>` in the commit message unless the user explicitly asks not to.
+- For commits to the main repository `https://github.com/sangoi-exe/cooldex/`, include `Co-authored-by: Codex <codex@openai.com>` in the commit message unless the user explicitly asks not to.
 
 ## Workspace Test Safety
 
