@@ -7,7 +7,6 @@ use serde::Serialize;
 #[cfg(test)]
 use serial_test::serial;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::env;
 use std::fmt::Debug;
 use std::path::Path;
@@ -31,11 +30,17 @@ use super::account_manager::ACTIVE_ACCOUNT_LEASE_TTL_SECONDS;
 #[cfg(test)]
 use super::account_manager::AccountLeaseState;
 use super::account_manager::AccountManager;
+use super::account_manager::AccountRateLimitRefreshOutcome;
 use super::account_manager::AccountRateLimitRefreshRoster;
 #[cfg(test)]
 use super::account_manager::AccountRateLimitRefreshRosterStatus;
 use super::account_manager::AccountSummary;
 use super::account_manager::LoadedCachedStore;
+#[cfg(test)]
+use super::account_manager::UsageLimitAutoSwitchFallbackSelectionMode;
+use super::account_manager::UsageLimitAutoSwitchRequest;
+use super::account_manager::UsageLimitAutoSwitchSelectionScope;
+use super::account_manager::account_matches_required_workspace;
 use super::external_bearer::BearerTokenRefresher;
 use super::revoke::revoke_auth_tokens;
 pub use crate::auth::storage::AccountUsageCache;
@@ -59,7 +64,6 @@ use codex_protocol::auth::PlanType as InternalPlanType;
 use codex_protocol::auth::RefreshTokenFailedError;
 use codex_protocol::auth::RefreshTokenFailedReason;
 use codex_protocol::protocol::RateLimitSnapshot;
-use codex_protocol::protocol::RateLimitWindow;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -238,35 +242,6 @@ pub enum ChatgptAccountAuthResolution {
     Missing,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum AccountRateLimitRefreshOutcome {
-    Snapshot(RateLimitSnapshot),
-    NoUsableSnapshot,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UsageLimitAutoSwitchSelectionScope<'a> {
-    PersistedTruth,
-    FreshlySelectable(&'a HashSet<String>),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UsageLimitAutoSwitchFallbackSelectionMode {
-    AllowFallbackSelection,
-    CancelStaleRequestFallbackSelection,
-}
-
-pub struct UsageLimitAutoSwitchRequest<'a> {
-    pub required_workspace_id: Option<&'a str>,
-    pub failing_store_account_id: Option<&'a str>,
-    pub resets_at: Option<DateTime<Utc>>,
-    pub snapshot: Option<RateLimitSnapshot>,
-    pub freshly_unsupported_store_account_ids: &'a HashSet<String>,
-    pub protected_store_account_id: Option<&'a str>,
-    pub selection_scope: UsageLimitAutoSwitchSelectionScope<'a>,
-    pub fallback_selection_mode: UsageLimitAutoSwitchFallbackSelectionMode,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TerminalRefreshFailureAccountRemoval {
     NotRemoved,
@@ -303,124 +278,6 @@ impl RefreshTokenError {
             Self::Permanent(error) => Some(error.reason),
             Self::Transient(_) => None,
         }
-    }
-}
-
-pub(super) fn apply_rate_limit_refresh_outcome(
-    usage: &mut AccountUsageCache,
-    outcome: AccountRateLimitRefreshOutcome,
-    now: DateTime<Utc>,
-) {
-    match outcome {
-        AccountRateLimitRefreshOutcome::Snapshot(snapshot) => {
-            let exhausted_until = exhausted_until_from_snapshot(&snapshot, now);
-            usage.last_rate_limits = Some(snapshot);
-            usage.exhausted_until = exhausted_until;
-        }
-        AccountRateLimitRefreshOutcome::NoUsableSnapshot => {
-            usage.last_rate_limits = None;
-            usage.exhausted_until = None;
-        }
-    }
-    usage.last_seen_at = Some(now);
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UsageLimitWindowSlot {
-    Primary,
-    Secondary,
-}
-
-pub(super) fn clamp_usage_limit_snapshot(
-    mut snapshot: RateLimitSnapshot,
-    resets_at: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> RateLimitSnapshot {
-    if clamp_matched_usage_limit_window(&mut snapshot, resets_at) {
-        return snapshot;
-    }
-
-    if clamp_depleted_usage_limit_windows(&mut snapshot, now) {
-        return snapshot;
-    }
-
-    match usage_limit_default_window_slot(&snapshot) {
-        Some(UsageLimitWindowSlot::Primary) => clamp_rate_limit_window(snapshot.primary.as_mut()),
-        Some(UsageLimitWindowSlot::Secondary) => {
-            clamp_rate_limit_window(snapshot.secondary.as_mut());
-        }
-        None => {}
-    }
-
-    snapshot
-}
-
-fn clamp_matched_usage_limit_window(
-    snapshot: &mut RateLimitSnapshot,
-    resets_at: Option<DateTime<Utc>>,
-) -> bool {
-    let Some(resets_at) = resets_at else {
-        return false;
-    };
-
-    let resets_at = resets_at.timestamp();
-    let primary_matches = snapshot
-        .primary
-        .as_ref()
-        .is_some_and(|window| window.resets_at == Some(resets_at));
-    let secondary_matches = snapshot
-        .secondary
-        .as_ref()
-        .is_some_and(|window| window.resets_at == Some(resets_at));
-
-    if primary_matches {
-        clamp_rate_limit_window(snapshot.primary.as_mut());
-    }
-    if secondary_matches {
-        clamp_rate_limit_window(snapshot.secondary.as_mut());
-    }
-
-    primary_matches || secondary_matches
-}
-
-fn clamp_depleted_usage_limit_windows(
-    snapshot: &mut RateLimitSnapshot,
-    now: DateTime<Utc>,
-) -> bool {
-    let mut clamped = false;
-    if snapshot
-        .primary
-        .as_ref()
-        .is_some_and(|window| window.is_depleted_at(now.timestamp()))
-    {
-        clamp_rate_limit_window(snapshot.primary.as_mut());
-        clamped = true;
-    }
-    if snapshot
-        .secondary
-        .as_ref()
-        .is_some_and(|window| window.is_depleted_at(now.timestamp()))
-    {
-        clamp_rate_limit_window(snapshot.secondary.as_mut());
-        clamped = true;
-    }
-    clamped
-}
-
-fn usage_limit_default_window_slot(snapshot: &RateLimitSnapshot) -> Option<UsageLimitWindowSlot> {
-    if snapshot.primary.is_some() {
-        return Some(UsageLimitWindowSlot::Primary);
-    }
-
-    snapshot
-        .secondary
-        .as_ref()
-        .map(|_| UsageLimitWindowSlot::Secondary)
-}
-
-fn clamp_rate_limit_window(window: Option<&mut RateLimitWindow>) {
-    if let Some(window) = window {
-        window.remaining_percent = 0.0;
     }
 }
 
@@ -3554,260 +3411,6 @@ pub(super) fn enforce_chatgpt_auth_accounts(
     }
 
     removed_account_ids
-}
-
-pub(super) fn exhausted_until(
-    resets_at: Option<DateTime<Utc>>,
-    snapshot: Option<&RateLimitSnapshot>,
-    now: DateTime<Utc>,
-) -> DateTime<Utc> {
-    let from_snapshot = snapshot.and_then(|snapshot| {
-        exhausted_until_from_snapshot(snapshot, now)
-            .or_else(|| snapshot_next_reset_at(snapshot, now))
-    });
-    resets_at
-        .or(from_snapshot)
-        .unwrap_or_else(|| now + chrono::Duration::minutes(15))
-}
-
-pub(super) fn exhausted_until_from_snapshot(
-    snapshot: &RateLimitSnapshot,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
-    if rate_limit_window_blocked(snapshot.secondary.as_ref(), now) {
-        return Some(
-            rate_limit_window_reset_at(snapshot.secondary.as_ref())
-                .unwrap_or_else(|| now + chrono::Duration::minutes(15)),
-        );
-    }
-    if rate_limit_window_blocked(snapshot.primary.as_ref(), now) {
-        return Some(
-            rate_limit_window_reset_at(snapshot.primary.as_ref())
-                .unwrap_or_else(|| now + chrono::Duration::minutes(15)),
-        );
-    }
-    None
-}
-
-fn rate_limit_window_blocked(window: Option<&RateLimitWindow>, now: DateTime<Utc>) -> bool {
-    let Some(window) = window else {
-        return false;
-    };
-
-    window.is_depleted_at(now.timestamp())
-}
-
-fn rate_limit_window_reset_at(window: Option<&RateLimitWindow>) -> Option<DateTime<Utc>> {
-    let window = window?;
-    let resets_at_seconds = window.resets_at?;
-    DateTime::<Utc>::from_timestamp(resets_at_seconds, 0)
-}
-
-pub(super) fn snapshot_next_reset_at(
-    snapshot: &RateLimitSnapshot,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
-    [
-        rate_limit_window_reset_at(snapshot.primary.as_ref()),
-        rate_limit_window_reset_at(snapshot.secondary.as_ref()),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|reset_at| *reset_at > now)
-    .min()
-}
-
-pub(super) fn account_matches_required_workspace(
-    account: &StoredAccount,
-    required_workspace_id: Option<&str>,
-) -> bool {
-    if let Some(required) = required_workspace_id
-        && account.tokens.id_token.chatgpt_account_id.as_deref() != Some(required)
-    {
-        return false;
-    }
-
-    true
-}
-
-pub fn usage_limit_auto_switch_removes_plan_type(plan_type: Option<&AccountPlanType>) -> bool {
-    matches!(plan_type, Some(AccountPlanType::Free))
-}
-
-fn account_selectable(
-    account: &StoredAccount,
-    required_workspace_id: Option<&str>,
-    now: DateTime<Utc>,
-) -> bool {
-    if !account_matches_required_workspace(account, required_workspace_id) {
-        return false;
-    }
-
-    if let Some(until) = account.usage.as_ref().and_then(|u| u.exhausted_until)
-        && until > now
-    {
-        return false;
-    }
-
-    true
-}
-
-pub(super) fn account_selectable_for_auto_switch(
-    account: &StoredAccount,
-    required_workspace_id: Option<&str>,
-    now: DateTime<Utc>,
-    selection_scope: UsageLimitAutoSwitchSelectionScope<'_>,
-) -> bool {
-    if !account_selectable(account, required_workspace_id, now) {
-        return false;
-    }
-
-    match selection_scope {
-        UsageLimitAutoSwitchSelectionScope::PersistedTruth => true,
-        UsageLimitAutoSwitchSelectionScope::FreshlySelectable(selectable_store_account_ids) => {
-            selectable_store_account_ids.contains(&account.id)
-        }
-    }
-}
-
-pub(super) fn select_account_for_auto_switch_from_store(
-    store: &AuthStore,
-    required_workspace_id: Option<&str>,
-    exclude_store_account_id: Option<&str>,
-    now: DateTime<Utc>,
-    selection_scope: UsageLimitAutoSwitchSelectionScope<'_>,
-) -> Option<String> {
-    let mut candidates = store
-        .accounts
-        .iter()
-        .filter(|account| {
-            Some(account.id.as_str()) != exclude_store_account_id
-                && account_selectable_for_auto_switch(
-                    account,
-                    required_workspace_id,
-                    now,
-                    selection_scope,
-                )
-        })
-        .collect::<Vec<_>>();
-
-    candidates.sort_by(|a, b| compare_auto_switch_candidates(a, b));
-    candidates.first().map(|account| account.id.clone())
-}
-
-// Merge-safety anchor: saved-account usage-limit auto-switch ranking must prefer the fallback
-// most likely to survive the immediate retry: primary-window headroom first, then weekly
-// headroom, then bounded tie-breakers.
-fn compare_auto_switch_candidates(a: &StoredAccount, b: &StoredAccount) -> std::cmp::Ordering {
-    let a_snapshot = a.usage.as_ref().and_then(|u| u.last_rate_limits.as_ref());
-    let b_snapshot = b.usage.as_ref().and_then(|u| u.last_rate_limits.as_ref());
-
-    let (a_primary_kind, a_primary_remaining) = primary_remaining_percent_rank(a_snapshot);
-    let (b_primary_kind, b_primary_remaining) = primary_remaining_percent_rank(b_snapshot);
-
-    let (a_weekly_kind, a_weekly_remaining) = weekly_remaining_percent_rank(a_snapshot);
-    let (b_weekly_kind, b_weekly_remaining) = weekly_remaining_percent_rank(b_snapshot);
-
-    let (a_credit_kind, a_balance) = credits_balance_rank(a_snapshot);
-    let (b_credit_kind, b_balance) = credits_balance_rank(b_snapshot);
-
-    let a_last_seen = a
-        .usage
-        .as_ref()
-        .and_then(|u| u.last_seen_at)
-        .map_or(i64::MIN, |dt| dt.timestamp());
-    let b_last_seen = b
-        .usage
-        .as_ref()
-        .and_then(|u| u.last_seen_at)
-        .map_or(i64::MIN, |dt| dt.timestamp());
-
-    (
-        a_primary_kind,
-        a_primary_remaining,
-        a_weekly_kind,
-        a_weekly_remaining,
-        a_credit_kind,
-        a_balance,
-        a_last_seen,
-        a.id.as_str(),
-    )
-        .cmp(&(
-            b_primary_kind,
-            b_primary_remaining,
-            b_weekly_kind,
-            b_weekly_remaining,
-            b_credit_kind,
-            b_balance,
-            b_last_seen,
-            b.id.as_str(),
-        ))
-}
-
-fn credits_balance_rank(snapshot: Option<&RateLimitSnapshot>) -> (u8, i64) {
-    let Some(snapshot) = snapshot else {
-        return (1, i64::MAX);
-    };
-    let Some(credits) = snapshot.credits.as_ref() else {
-        return (1, i64::MAX);
-    };
-    if !credits.has_credits {
-        return (1, i64::MAX);
-    }
-    if credits.unlimited {
-        return (2, i64::MAX);
-    }
-    let Some(raw) = credits.balance.as_deref() else {
-        return (1, i64::MAX);
-    };
-    match parse_credits_balance(raw) {
-        Some(balance) => (0, balance),
-        None => (1, i64::MAX),
-    }
-}
-
-fn weekly_remaining_percent_rank(snapshot: Option<&RateLimitSnapshot>) -> (u8, i64) {
-    let Some(snapshot) = snapshot else {
-        return (1, 0);
-    };
-    let Some(window) = snapshot.secondary.as_ref() else {
-        return (1, 0);
-    };
-    if window.window_minutes.is_some() {
-        return (1, 0);
-    }
-    (0, -percent_basis_points(window.remaining_percent))
-}
-
-fn primary_remaining_percent_rank(snapshot: Option<&RateLimitSnapshot>) -> (u8, i64) {
-    let Some(snapshot) = snapshot else {
-        return (1, 0);
-    };
-    let Some(window) = snapshot.primary.as_ref() else {
-        return (1, 0);
-    };
-    (0, -percent_basis_points(window.remaining_percent))
-}
-
-fn percent_basis_points(percent: f64) -> i64 {
-    let clamped = percent.clamp(0.0, 100.0);
-    (clamped * 100.0).round() as i64
-}
-
-fn parse_credits_balance(raw: &str) -> Option<i64> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Ok(value) = trimmed.parse::<i64>() {
-        return Some(value);
-    }
-    if let Ok(value) = trimmed.parse::<f64>()
-        && value.is_finite()
-    {
-        return Some(value.round() as i64);
-    }
-    None
 }
 
 #[cfg(test)]
