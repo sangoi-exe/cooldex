@@ -25,6 +25,7 @@ use crate::auth::storage::AuthStorageBackend;
 use crate::auth::storage::AuthStore;
 use crate::auth::storage::StoredAccount;
 use crate::auth::storage::create_auth_storage;
+use crate::auth::storage::lock_auth_store;
 use crate::token_data::TokenData;
 
 const USAGE_LIMIT_AUTO_SWITCH_COOLDOWN_SECONDS: i64 = 2;
@@ -1094,6 +1095,14 @@ impl AccountManager {
         !store.accounts.is_empty() || store.openai_api_key.is_some()
     }
 
+    pub(super) fn configured_store_origin(&self) -> LoadedStoreOrigin {
+        if self.auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
+            LoadedStoreOrigin::ExternalEphemeral
+        } else {
+            LoadedStoreOrigin::Persistent
+        }
+    }
+
     pub(super) fn load_store_from_storage(&self) -> LoadedAuthStore {
         // Merge-safety anchor: live store loading keeps AccountManager as the
         // owner of auth-store selection, admission filtering, sqlite-backed
@@ -1112,12 +1121,7 @@ impl AccountManager {
                 AuthStore::default()
             }
         };
-        let persistent_origin =
-            if self.auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral {
-                LoadedStoreOrigin::ExternalEphemeral
-            } else {
-                LoadedStoreOrigin::Persistent
-            };
+        let persistent_origin = self.configured_store_origin();
         let mut selected_store = persistent_store;
         let mut selected_storage = Arc::clone(&self.storage);
         let mut selected_origin = persistent_origin;
@@ -1236,15 +1240,34 @@ impl AccountManager {
         })
     }
 
+    pub(super) fn mutate_store<T>(
+        &self,
+        mutator: impl FnOnce(&mut AuthStore) -> std::io::Result<T>,
+    ) -> std::io::Result<(T, LoadedAuthStore)> {
+        // Merge-safety anchor: account-runtime mutations own the auth-store
+        // lock/load/persist transaction here; AuthManager may only refresh its
+        // derived auth cache from the returned selected store snapshot.
+        let _lock = lock_auth_store(&self.codex_home)?;
+        let mut store = self.storage.load()?.unwrap_or_default();
+        let out = self.mutate_loaded_store(&mut store, &*self.storage, mutator)?;
+        Ok((
+            out,
+            LoadedAuthStore {
+                store,
+                store_origin: self.configured_store_origin(),
+            },
+        ))
+    }
+
     pub(super) fn mutate_loaded_store<T>(
         &self,
         store: &mut AuthStore,
         persist_storage: &dyn AuthStorageBackend,
         mutator: impl FnOnce(&mut AuthStore) -> std::io::Result<T>,
     ) -> std::io::Result<T> {
-        // Merge-safety anchor: account mutations keep AuthManager as the
-        // lock/load/cache owner while AccountManager owns saved-account runtime
-        // prep, active-lease reconciliation, validation, and persistence.
+        // Merge-safety anchor: AccountManager owns saved-account mutation prep,
+        // active-lease reconciliation, validation, and persistence for any
+        // caller-provided loaded store.
         let removed_before_mutation =
             enforce_chatgpt_auth_accounts(store, ChatgptAuthAdmissionPolicy::Persisted);
         if !removed_before_mutation.is_empty() {

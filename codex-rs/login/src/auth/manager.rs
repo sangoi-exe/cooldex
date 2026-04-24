@@ -1659,6 +1659,9 @@ impl AuthManager {
         let storage = create_auth_storage(codex_home.clone(), AuthCredentialsStoreMode::File);
         let account_state_store = open_account_state_store(codex_home.as_path());
         let store = store_from_auth_for_testing(&auth);
+        storage
+            .save(&store)
+            .unwrap_or_else(|error| panic!("seed test auth store: {error}"));
         let (auth_state_tx, _) = watch::channel(());
         let cached = CachedAuth {
             store,
@@ -1693,6 +1696,9 @@ impl AuthManager {
         let storage = create_auth_storage(codex_home.clone(), AuthCredentialsStoreMode::File);
         let account_state_store = open_account_state_store(codex_home.as_path());
         let store = store_from_auth_for_testing(&auth);
+        storage
+            .save(&store)
+            .unwrap_or_else(|error| panic!("seed test auth store: {error}"));
         let (auth_state_tx, _) = watch::channel(());
         let cached = CachedAuth {
             store,
@@ -2180,7 +2186,7 @@ impl AuthManager {
             &*self.storage,
             ChatgptAuthAdmissionPolicy::Persisted,
         )?;
-        Ok(self.set_cached(store))
+        Ok(self.set_cached(store, self.account_manager.configured_store_origin()))
     }
 
     fn reload_if_store_account_id_matches(
@@ -2243,12 +2249,13 @@ impl AuthManager {
             }
         }
 
+        let store_origin = self.account_manager.configured_store_origin();
         let new_auth = Self::derive_auth_from_store(
             &store,
             &self.codex_home,
             Arc::clone(&self.storage),
             self.enable_codex_api_key_env,
-            LoadedStoreOrigin::Persistent,
+            store_origin,
         );
         let new_store_account_id = new_auth
             .as_ref()
@@ -2265,7 +2272,7 @@ impl AuthManager {
                     expected_store_account_id,
                     "Reloading auth after expected saved account was removed by supported-plan policy"
                 );
-                self.set_cached(store);
+                self.set_cached(store, store_origin);
                 return ReloadOutcome::ReloadedChanged;
             }
             let found_store_account_id = new_store_account_id.as_deref().unwrap_or("unknown");
@@ -2279,7 +2286,7 @@ impl AuthManager {
         let cached_before_reload = self.auth_cached();
         let auth_changed =
             !Self::auths_equal_for_refresh(cached_before_reload.as_ref(), new_auth.as_ref());
-        self.set_cached(store);
+        self.set_cached(store, store_origin);
         if auth_changed {
             ReloadOutcome::ReloadedChanged
         } else {
@@ -2480,13 +2487,7 @@ impl AuthManager {
         }
     }
 
-    fn set_cached(&self, store: AuthStore) -> bool {
-        let store_origin = self
-            .inner
-            .read()
-            .ok()
-            .map(|guard| guard.store_origin)
-            .unwrap_or(LoadedStoreOrigin::Persistent);
+    fn set_cached(&self, store: AuthStore, store_origin: LoadedStoreOrigin) -> bool {
         let new_auth = Self::derive_auth_from_store(
             &store,
             &self.codex_home,
@@ -2529,29 +2530,8 @@ impl AuthManager {
         &self,
         mutator: impl FnOnce(&mut AuthStore) -> std::io::Result<T>,
     ) -> std::io::Result<T> {
-        let _lock = storage::lock_auth_store(&self.codex_home)?;
-
-        let mut store = match self.storage.load()? {
-            Some(store) => store,
-            None => {
-                // `from_auth_for_testing` seeds an in-memory store without writing auth.json.
-                // In that mode, treat the cached store as the source of truth if no stored
-                // auth exists yet.
-                if self._test_home_guard.is_some() {
-                    self.inner
-                        .read()
-                        .ok()
-                        .map(|cached| cached.store.clone())
-                        .unwrap_or_default()
-                } else {
-                    AuthStore::default()
-                }
-            }
-        };
-        let out = self
-            .account_manager
-            .mutate_loaded_store(&mut store, &*self.storage, mutator)?;
-        self.set_cached(store);
+        let (out, loaded) = self.account_manager.mutate_store(mutator)?;
+        self.set_cached(loaded.store, loaded.store_origin);
         Ok(out)
     }
 
