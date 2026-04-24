@@ -1,12 +1,15 @@
 use chrono::DateTime;
 use chrono::Utc;
+use codex_account_state::AccountLeaseConflict;
 use codex_account_state::AccountStateStore;
+use codex_account_state::AccountUsageState;
 use codex_account_state::ForceReleaseAccountOutcome;
 use codex_account_state::SessionActiveAccountRefresh;
 use codex_account_state::SessionActiveAccountSetOutcome;
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_protocol::account::PlanType as AccountPlanType;
+use codex_protocol::auth::PlanType as InternalPlanType;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use std::collections::HashMap;
@@ -18,14 +21,6 @@ use std::sync::RwLock;
 
 use super::manager::ActiveChatgptAccountSummary;
 use super::manager::CachedStoreOrigin;
-use super::manager::ChatgptAuthAdmissionPolicy;
-use super::manager::UsageStateSyncOutcome;
-use super::manager::enforce_chatgpt_auth_accounts;
-use super::manager::lease_conflict_error;
-use super::manager::persist_auth_store;
-use super::manager::persist_stripped_auth_store;
-use super::manager::persist_usage_state_from_store;
-use super::manager::synchronize_store_usage_from_legacy_and_sqlite;
 use crate::auth::storage::AccountUsageCache;
 use crate::auth::storage::AuthStorageBackend;
 use crate::auth::storage::AuthStore;
@@ -35,6 +30,178 @@ use crate::token_data::TokenData;
 
 const USAGE_LIMIT_AUTO_SWITCH_COOLDOWN_SECONDS: i64 = 2;
 pub(super) const ACTIVE_ACCOUNT_LEASE_TTL_SECONDS: i64 = 5 * 60;
+fn account_usage_state_from_cache(cache: &AccountUsageCache) -> AccountUsageState {
+    AccountUsageState {
+        last_rate_limits: cache.last_rate_limits.clone(),
+        exhausted_until: cache.exhausted_until,
+        last_seen_at: cache.last_seen_at,
+    }
+}
+
+fn account_usage_cache_from_state(state: &AccountUsageState) -> AccountUsageCache {
+    AccountUsageCache {
+        last_rate_limits: state.last_rate_limits.clone(),
+        exhausted_until: state.exhausted_until,
+        last_seen_at: state.last_seen_at,
+    }
+}
+
+fn legacy_usage_states_from_store(store: &AuthStore) -> HashMap<String, AccountUsageState> {
+    store
+        .accounts
+        .iter()
+        .filter_map(|account| {
+            account
+                .usage
+                .as_ref()
+                .map(|usage| (account.id.clone(), account_usage_state_from_cache(usage)))
+        })
+        .collect()
+}
+
+fn strip_usage_from_store(store: &mut AuthStore) {
+    for account in &mut store.accounts {
+        account.usage = None;
+    }
+}
+
+pub(super) fn strip_runtime_active_account_from_store(store: &mut AuthStore) {
+    store.active_account_id = None;
+}
+
+fn persist_stripped_auth_store(
+    storage: &dyn AuthStorageBackend,
+    store: &AuthStore,
+) -> std::io::Result<()> {
+    let mut stripped_store = store.clone();
+    strip_usage_from_store(&mut stripped_store);
+    strip_runtime_active_account_from_store(&mut stripped_store);
+    storage.save(&stripped_store)
+}
+
+fn persist_auth_store(
+    storage: &dyn AuthStorageBackend,
+    store: &AuthStore,
+    strip_usage: bool,
+) -> std::io::Result<()> {
+    let mut persisted_store = store.clone();
+    strip_runtime_active_account_from_store(&mut persisted_store);
+    if strip_usage {
+        strip_usage_from_store(&mut persisted_store);
+    }
+    storage.save(&persisted_store)
+}
+
+fn persist_usage_state_from_store(
+    account_state_store: &AccountStateStore,
+    store: &AuthStore,
+) -> std::io::Result<()> {
+    let usage_by_account = legacy_usage_states_from_store(store);
+    account_state_store
+        .replace_usage_states(&usage_by_account)
+        .map_err(std::io::Error::other)
+}
+
+fn hydrate_store_usage_from_sqlite(
+    account_state_store: &AccountStateStore,
+    store: &mut AuthStore,
+) -> std::io::Result<()> {
+    let account_ids = store
+        .accounts
+        .iter()
+        .map(|account| account.id.clone())
+        .collect::<Vec<_>>();
+    let usage_by_account = account_state_store
+        .load_usage_states_for_accounts(account_ids.as_slice())
+        .map_err(std::io::Error::other)?;
+    for account in &mut store.accounts {
+        account.usage = usage_by_account
+            .get(&account.id)
+            .map(account_usage_cache_from_state);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UsageStateSyncOutcome {
+    strip_persisted_auth_store: bool,
+}
+
+fn synchronize_store_usage_from_legacy_and_sqlite(
+    account_state_store: &AccountStateStore,
+    store: &mut AuthStore,
+) -> std::io::Result<UsageStateSyncOutcome> {
+    let legacy_usage_by_account = legacy_usage_states_from_store(store);
+    let strip_persisted_auth_store = !legacy_usage_by_account.is_empty();
+    if strip_persisted_auth_store {
+        tracing::info!(
+            legacy_usage_accounts = legacy_usage_by_account.len(),
+            "skipping legacy auth-store usage backfill during sqlite usage-truth cutover"
+        );
+    }
+    hydrate_store_usage_from_sqlite(account_state_store, store)?;
+    Ok(UsageStateSyncOutcome {
+        strip_persisted_auth_store,
+    })
+}
+
+fn lease_conflict_error(account_id: &str, conflict: &AccountLeaseConflict) -> std::io::Error {
+    std::io::Error::other(format!(
+        "account '{account_id}' is currently leased by another live session until {}",
+        conflict.lease_until
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ChatgptAuthAdmissionPolicy {
+    Persisted,
+    ExternalStrict,
+}
+
+fn is_admitted_chatgpt_auth_account(
+    account: &StoredAccount,
+    admission_policy: ChatgptAuthAdmissionPolicy,
+) -> bool {
+    match admission_policy {
+        ChatgptAuthAdmissionPolicy::Persisted => match account.tokens.id_token.chatgpt_plan_type {
+            None | Some(InternalPlanType::Unknown(_)) => true,
+            Some(_) => account.tokens.id_token.is_supported_chatgpt_auth_plan(),
+        },
+        ChatgptAuthAdmissionPolicy::ExternalStrict => {
+            account.tokens.id_token.is_supported_chatgpt_auth_plan()
+        }
+    }
+}
+
+pub(super) fn enforce_chatgpt_auth_accounts(
+    store: &mut AuthStore,
+    admission_policy: ChatgptAuthAdmissionPolicy,
+) -> Vec<String> {
+    let mut removed_account_ids = Vec::new();
+    store.accounts.retain(|account| {
+        let keep_account = is_admitted_chatgpt_auth_account(account, admission_policy);
+        if !keep_account {
+            removed_account_ids.push(account.id.clone());
+        }
+        keep_account
+    });
+
+    if store
+        .active_account_id
+        .as_ref()
+        .is_some_and(|active_account_id| {
+            !store
+                .accounts
+                .iter()
+                .any(|account| &account.id == active_account_id)
+        })
+    {
+        store.active_account_id = None;
+    }
+
+    removed_account_ids
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum AccountRateLimitRefreshOutcome {
     Snapshot(RateLimitSnapshot),
