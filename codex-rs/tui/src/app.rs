@@ -2554,7 +2554,16 @@ impl App {
             if self.live_account_state_owner == LiveAccountStateOwner::AuthManager {
                 self.sync_chat_widget_account_state_from_auth_manager();
             } else {
-                self.invalidate_rate_limit_state_for_account_change();
+                // Merge-safety anchor: while app-server projection owns visible
+                // account state, AuthManager active-id drift must invalidate
+                // rate-limit generation without clearing the projected
+                // account/plan followers. The next projection refresh remains
+                // responsible for replacing that visible account truth.
+                self.apply_chat_widget_account_state(
+                    self.chat_widget.status_account_display().cloned(),
+                    self.chat_widget.current_plan_type(),
+                    self.chat_widget.has_chatgpt_account(),
+                );
             }
             return true;
         }
@@ -10878,7 +10887,7 @@ mod tests {
             }) if label == "Server Account" && email == "server@openai.com" && plan == "Plus"
         ));
         assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
-        assert_eq!(app.feedback_audience, FeedbackAudience::External);
+        assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
         assert_eq!(app.chat_widget.rate_limit_account_generation(), 2);
         assert_eq!(app.chat_widget.rate_limit_snapshot_count(), 0);
         assert_matches!(
