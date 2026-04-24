@@ -64,6 +64,12 @@ For commentless customization-adjacent seams such as JSON schema artifacts, the 
 - When a task changes `.sangoi/**`, review and commit those changes from the `.sangoi` repo itself.
 - Apply the same commit-discipline rule inside `.sangoi`: when a clean split is possible, keep code/config/script changes separate from docs/instructions/logs/reports changes instead of mixing them into one commit.
 
+## Commit Attribution
+
+<!-- Merge-safety anchor: main-repo commits in this workspace should preserve Codex co-author attribution when Codex materially participates in the change. -->
+
+- For commits to the main repository `https://github.com/sangoi-exe/codex/`, include `Co-authored-by: Codex <codex@openai.com>` in the commit message unless the user explicitly asks not to.
+
 ## Workspace Test Safety
 
 - Do not delegate Cargo validation to sub-agents in this workspace. That includes `cargo check`, `cargo test --no-run`, and `cargo test`.
