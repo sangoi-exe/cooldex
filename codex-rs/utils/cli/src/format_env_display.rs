@@ -1,6 +1,12 @@
 use std::collections::HashMap;
 
-pub fn format_env_display(env: Option<&HashMap<String, String>>, env_vars: &[String]) -> String {
+// Merge-safety anchor: MCP env display must accept stored string env-var
+// names and typed MCP env-var wrappers through the same masking path while
+// preserving sorted inline env pairs and caller-ordered sourced env vars.
+pub fn format_env_display<T: AsRef<str>>(
+    env: Option<&HashMap<String, String>>,
+    env_vars: &[T],
+) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     if let Some(map) = env {
@@ -10,7 +16,10 @@ pub fn format_env_display(env: Option<&HashMap<String, String>>, env_vars: &[Str
     }
 
     if !env_vars.is_empty() {
-        parts.extend(env_vars.iter().map(|var| format!("{var}=*****")));
+        parts.extend(env_vars.iter().map(|var| {
+            let var = var.as_ref();
+            format!("{var}=*****")
+        }));
     }
 
     if parts.is_empty() {
@@ -26,10 +35,11 @@ mod tests {
 
     #[test]
     fn returns_dash_when_empty() {
-        assert_eq!(format_env_display(/*env*/ None, &[]), "-");
+        let empty_env_vars: &[String] = &[];
+        assert_eq!(format_env_display(/*env*/ None, empty_env_vars), "-");
 
         let empty_map = HashMap::new();
-        assert_eq!(format_env_display(Some(&empty_map), &[]), "-");
+        assert_eq!(format_env_display(Some(&empty_map), empty_env_vars), "-");
     }
 
     #[test]
@@ -37,8 +47,12 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("B".to_string(), "two".to_string());
         env.insert("A".to_string(), "one".to_string());
+        let empty_env_vars: &[String] = &[];
 
-        assert_eq!(format_env_display(Some(&env), &[]), "A=*****, B=*****");
+        assert_eq!(
+            format_env_display(Some(&env), empty_env_vars),
+            "A=*****, B=*****"
+        );
     }
 
     #[test]

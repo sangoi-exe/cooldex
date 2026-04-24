@@ -755,7 +755,11 @@ impl CodexMessageProcessor {
         auth_manager: &AuthManager,
         login_success: &LoginSuccess,
     ) -> std::io::Result<()> {
-        auth_manager.reload_strict_and_set_active_account(&login_success.store_account_id)
+        // Merge-safety anchor: login completion must keep strict auth reload as
+        // AuthManager cache/storage work, then run the active-account mutation
+        // through the AccountManager-owned set-active path.
+        auth_manager.reload_strict()?;
+        auth_manager.set_active_account(&login_success.store_account_id)
     }
 
     fn track_error_response(

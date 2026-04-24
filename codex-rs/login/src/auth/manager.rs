@@ -3647,15 +3647,10 @@ impl AuthManager {
     }
 
     pub fn set_active_account(&self, id: &str) -> std::io::Result<()> {
+        // Merge-safety anchor: active-account mutation belongs to
+        // AccountManager; AuthManager may only lock/load/persist the auth store
+        // and delegate the runtime mutation.
         self.update_store(|store| self.account_manager.set_active_account(store, id))
-    }
-
-    pub fn reload_strict_and_set_active_account(
-        &self,
-        store_account_id: &str,
-    ) -> std::io::Result<()> {
-        self.reload_strict()?;
-        self.set_active_account(store_account_id)
     }
 
     pub fn upsert_account(

@@ -270,7 +270,13 @@ fn build_chatgpt_add_account_success_outcome(
     shared_state: &crate::bottom_pane::ChatGptAddAccountSharedState,
     login_success: &codex_login::LoginSuccess,
 ) -> ChatGptAddAccountOutcome {
-    match auth_manager.reload_strict_and_set_active_account(&login_success.store_account_id) {
+    // Merge-safety anchor: add-account completion must reload freshly persisted
+    // auth through AuthManager, then activate the account through the
+    // AccountManager-owned set-active path.
+    let activation_result = auth_manager
+        .reload_strict()
+        .and_then(|_| auth_manager.set_active_account(&login_success.store_account_id));
+    match activation_result {
         Ok(()) => {
             let active_account_display = auth_manager
                 .list_accounts()
@@ -10335,10 +10341,17 @@ mod tests {
             harness.remote_config.cli_auth_credentials_store_mode,
         )
         .expect("save updated remote auth store after add-account login");
+        // Merge-safety anchor: remote harness mirrors app-server login
+        // finalization: strict auth reload first, then AccountManager-owned
+        // active-account mutation.
         harness
             .remote_auth_manager
-            .reload_strict_and_set_active_account(&new_store_account_id)
-            .expect("reload and activate the newly added remote account");
+            .reload_strict()
+            .expect("reload newly added remote account");
+        harness
+            .remote_auth_manager
+            .set_active_account(&new_store_account_id)
+            .expect("activate the newly added remote account");
 
         harness
             .inject_server_notification(ServerNotification::AccountLoginCompleted(
@@ -11064,7 +11077,7 @@ mod tests {
             }) if label == "Server Account" && email == "server@openai.com" && plan == "Plus"
         ));
         assert_eq!(app.chat_widget.current_plan_type(), Some(PlanType::Plus));
-        assert_eq!(app.feedback_audience, FeedbackAudience::External);
+        assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
         assert_eq!(app.chat_widget.rate_limit_snapshot_count(), 0);
         assert_matches!(
             app_event_rx.try_recv(),
@@ -11184,13 +11197,16 @@ mod tests {
         let refreshed_default_model = refreshed_models[0].model.clone();
         let attempts = Arc::new(Mutex::new(VecDeque::from(vec![
             Ok(stale_projection),
-            Ok(test_chatgpt_account_projection(
-                "Switched Account",
-                "switched@openai.com",
-                PlanType::Pro,
-                refreshed_models,
-                refreshed_default_model.clone(),
-            )),
+            Ok(AppServerAccountProjection {
+                active_store_account_id: Some(secondary_store_account_id.clone()),
+                ..test_chatgpt_account_projection(
+                    "Switched Account",
+                    "switched@openai.com",
+                    PlanType::Pro,
+                    refreshed_models,
+                    refreshed_default_model.clone(),
+                )
+            }),
         ])));
         let attempts_clone = Arc::clone(&attempts);
 
@@ -11412,13 +11428,16 @@ mod tests {
         let refreshed_models = vec![all_model_presets()[1].clone()];
         let refreshed_default_model = refreshed_models[0].model.clone();
         let attempts = Arc::new(Mutex::new(VecDeque::from(vec![Ok(
-            test_chatgpt_account_projection(
-                "Fallback Account",
-                "fallback@openai.com",
-                PlanType::Business,
-                refreshed_models,
-                refreshed_default_model.clone(),
-            ),
+            AppServerAccountProjection {
+                active_store_account_id: Some(secondary_store_account_id.clone()),
+                ..test_chatgpt_account_projection(
+                    "Fallback Account",
+                    "fallback@openai.com",
+                    PlanType::Business,
+                    refreshed_models,
+                    refreshed_default_model.clone(),
+                )
+            },
         )])));
         let attempts_clone = Arc::clone(&attempts);
 
@@ -12019,13 +12038,16 @@ mod tests {
         let refreshed_models = vec![all_model_presets()[1].clone()];
         let refreshed_default_model = refreshed_models[0].model.clone();
         let attempts = Arc::new(Mutex::new(VecDeque::from(vec![Ok(
-            test_chatgpt_account_projection(
-                "New",
-                "new@openai.com",
-                PlanType::Business,
-                refreshed_models,
-                refreshed_default_model.clone(),
-            ),
+            AppServerAccountProjection {
+                active_store_account_id: Some(active_store_account_id.clone()),
+                ..test_chatgpt_account_projection(
+                    "New",
+                    "new@openai.com",
+                    PlanType::Business,
+                    refreshed_models,
+                    refreshed_default_model.clone(),
+                )
+            },
         )])));
         let attempts_clone = Arc::clone(&attempts);
 
@@ -12193,7 +12215,7 @@ mod tests {
             }) if label == "Secondary" && email == "secondary@example.com"
         ));
         assert_eq!(app.chat_widget.current_plan_type(), None);
-        assert_eq!(app.feedback_audience, FeedbackAudience::OpenAiEmployee);
+        assert_eq!(app.feedback_audience, FeedbackAudience::External);
         assert!(Arc::ptr_eq(&app.model_catalog, &original_model_catalog));
         assert_eq!(app.chat_widget.current_model(), original_model);
 
