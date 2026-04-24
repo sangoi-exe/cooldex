@@ -1942,8 +1942,7 @@ impl AuthManager {
     }
 
     pub fn list_accounts(&self) -> Vec<AccountSummary> {
-        let store = self.load_store_from_storage().store;
-        self.account_manager.list_accounts(&store)
+        self.account_manager.list_accounts()
     }
 
     pub fn force_release_account(&self, id: &str) -> std::io::Result<ForceReleaseAccountOutcome> {
@@ -1951,12 +1950,7 @@ impl AuthManager {
     }
 
     pub fn account_rate_limit_refresh_roster(&self) -> AccountRateLimitRefreshRoster {
-        // Merge-safety anchor: rate-limit refresh rosters must use the current
-        // AccountManager-loaded runtime snapshot, not the AuthManager cache, so
-        // pre-refresh candidates track live saved accounts and leases.
-        let store = self.load_store_from_storage().store;
-        self.account_manager
-            .account_rate_limit_refresh_roster(&store)
+        self.account_manager.account_rate_limit_refresh_roster()
     }
 
     fn update_saved_account_store<T>(
@@ -2109,9 +2103,8 @@ impl AuthManager {
         &self,
         now: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
-        let store = self.load_saved_account_store()?;
         self.account_manager
-            .accounts_rate_limits_cache_expires_at(&store, now)
+            .accounts_rate_limits_cache_expires_at(now)
     }
 
     pub fn refresh_failure_for_auth(&self, auth: &CodexAuth) -> Option<RefreshTokenFailedError> {

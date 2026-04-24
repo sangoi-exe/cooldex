@@ -1429,13 +1429,14 @@ impl AccountManager {
         }))
     }
 
-    pub(super) fn account_rate_limit_refresh_roster(
-        &self,
-        store: &AuthStore,
-    ) -> AccountRateLimitRefreshRoster {
+    pub(super) fn account_rate_limit_refresh_roster(&self) -> AccountRateLimitRefreshRoster {
+        // Merge-safety anchor: rate-limit refresh rosters must use the current
+        // AccountManager-loaded runtime snapshot, not the AuthManager cache, so
+        // pre-refresh candidates track live saved accounts and leases.
+        let store = self.load_store_from_storage().store;
         let required_workspace_id = self.forced_chatgpt_workspace_id();
         let workspace_filtered_store_account_ids =
-            workspace_filtered_store_account_ids(store, required_workspace_id.as_deref());
+            workspace_filtered_store_account_ids(&store, required_workspace_id.as_deref());
 
         match self.account_ids_leased_by_other(&workspace_filtered_store_account_ids, Utc::now()) {
             Ok(Some(leased_by_other_store_account_ids)) => {
@@ -1620,9 +1621,10 @@ impl AccountManager {
         Ok(true)
     }
 
-    pub(super) fn list_accounts(&self, store: &AuthStore) -> Vec<AccountSummary> {
+    pub(super) fn list_accounts(&self) -> Vec<AccountSummary> {
+        let store = self.load_store_from_storage().store;
         let active_account_id = store.active_account_id.as_deref();
-        let lease_states = self.account_lease_states(store);
+        let lease_states = self.account_lease_states(&store);
         store
             .accounts
             .iter()
@@ -1756,9 +1758,9 @@ impl AccountManager {
 
     pub(super) fn accounts_rate_limits_cache_expires_at(
         &self,
-        store: &AuthStore,
         now: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
+        let store = self.load_store_from_storage().store;
         let next_release_at = store
             .accounts
             .iter()
