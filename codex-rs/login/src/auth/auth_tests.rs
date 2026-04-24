@@ -454,8 +454,11 @@ async fn resolve_chatgpt_auth_for_store_account_id_reads_latest_persisted_tokens
     assert_eq!(token_data.refresh_token, "new-refresh-token");
 }
 
+// Merge-safety anchor: public autoswitch selection must read the current
+// AccountManager-loaded saved-account snapshot plus SQLite usage truth, not the
+// AuthManager cache captured when the manager was constructed.
 #[test]
-fn public_auto_switch_selector_reads_sqlite_usage_truth_after_manager_construction() {
+fn public_auto_switch_selector_reads_live_storage_and_sqlite_usage_truth() {
     let codex_home = tempdir().expect("create auth tempdir");
     let sqlite_home = tempdir().expect("create sqlite tempdir");
     let workspace_id = "workspace-a";
@@ -486,6 +489,15 @@ fn public_auto_switch_selector_reads_sqlite_usage_truth_after_manager_constructi
         last_refresh: None,
         usage: None,
     };
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    assert_eq!(manager.select_account_for_auto_switch(None, None), None);
+
     save_auth(
         codex_home.path(),
         &AuthStore {
@@ -499,13 +511,6 @@ fn public_auto_switch_selector_reads_sqlite_usage_truth_after_manager_constructi
         AuthCredentialsStoreMode::File,
     )
     .expect("save auth store");
-
-    let manager = AuthManager::new_with_sqlite_home(
-        codex_home.path().to_path_buf(),
-        sqlite_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-    );
 
     manager
         .account_manager

@@ -3801,13 +3801,7 @@ impl AuthManager {
         required_workspace_id: Option<&str>,
         exclude_store_account_id: Option<&str>,
     ) -> Option<String> {
-        if !self.has_saved_chatgpt_accounts() {
-            return None;
-        }
-        let store = self
-            .clone_cached_store()
-            .map(|store| self.account_manager.cached_runtime_store_snapshot(store))
-            .unwrap_or_else(|| self.load_store_from_storage().store);
+        let store = self.load_saved_account_store()?;
         self.account_manager
             .select_account_for_auto_switch_with_leases(
                 &store,
@@ -3822,13 +3816,7 @@ impl AuthManager {
         &self,
         now: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
-        if !self.has_saved_chatgpt_accounts() {
-            return None;
-        }
-
-        let store = self
-            .clone_cached_store()
-            .map(|store| self.account_manager.cached_usage_store_snapshot(store))?;
+        let store = self.load_saved_account_store()?;
         self.account_manager
             .accounts_rate_limits_cache_expires_at(&store, now)
     }
@@ -4177,6 +4165,18 @@ impl AuthManager {
             &self.storage,
             self.auth_credentials_store_mode,
         )
+    }
+
+    fn load_saved_account_store(&self) -> Option<AuthStore> {
+        // Merge-safety anchor: account-runtime readers must select from the same
+        // live AccountManager-loaded snapshot used for saved-account presence
+        // checks; do not gate on live storage and then read from stale
+        // AuthManager cache.
+        let store = self.load_store_from_storage().store;
+        if store.accounts.is_empty() {
+            return None;
+        }
+        Some(store)
     }
 
     /// Records a permanent refresh failure only if the failed refresh was
