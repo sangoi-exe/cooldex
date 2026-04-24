@@ -1852,14 +1852,18 @@ impl AuthManager {
         Self::chatgpt_bearer_token_for_auth(auth).map(|token| format!("Bearer {token}"))
     }
 
-    fn chatgpt_auth_for_store_account_id(&self, store_account_id: &str) -> Option<CodexAuth> {
+    fn chatgpt_auth_for_store_account_id(
+        &self,
+        store_account_id: &str,
+    ) -> Option<(CodexAuth, LoadedStoreOrigin)> {
         let loaded = self.load_store_from_storage();
-        Self::derive_chatgpt_auth_from_store_account(
+        let auth = Self::derive_chatgpt_auth_from_store_account(
             &loaded.store,
             store_account_id,
             Self::storage_for_store_origin(&self.codex_home, &self.storage, loaded.store_origin),
             loaded.store_origin,
-        )
+        )?;
+        Some((auth, loaded.store_origin))
     }
 
     // Merge-safety anchor: `/accounts`, usage-limit auto-switch, and active auth recovery must use
@@ -1869,7 +1873,8 @@ impl AuthManager {
         store_account_id: &str,
         refresh_mode: ChatgptAccountRefreshMode,
     ) -> Result<ChatgptAccountAuthResolution, RefreshTokenError> {
-        let Some(auth) = self.chatgpt_auth_for_store_account_id(store_account_id) else {
+        let Some((auth, store_origin)) = self.chatgpt_auth_for_store_account_id(store_account_id)
+        else {
             return Ok(ChatgptAccountAuthResolution::Missing);
         };
         let CodexAuth::Chatgpt(chatgpt_auth) = &auth else {
@@ -1894,6 +1899,7 @@ impl AuthManager {
                 switched_to_store_account_id,
             } = self.remove_chatgpt_store_account_for_terminal_refresh_failure(
                 chatgpt_auth.store_account_id(),
+                store_origin,
                 &error,
             )? {
                 Ok(ChatgptAccountAuthResolution::Removed {
@@ -1926,6 +1932,7 @@ impl AuthManager {
                 self.reload();
                 Ok(self
                     .chatgpt_auth_for_store_account_id(store_account_id)
+                    .map(|(auth, _store_origin)| auth)
                     .map(Box::new)
                     .map(ChatgptAccountAuthResolution::Auth)
                     .unwrap_or(ChatgptAccountAuthResolution::Missing))
@@ -1935,6 +1942,7 @@ impl AuthManager {
                     switched_to_store_account_id,
                 } = self.remove_chatgpt_store_account_for_terminal_refresh_failure(
                     chatgpt_auth.store_account_id(),
+                    store_origin,
                     &error,
                 )? {
                     Ok(ChatgptAccountAuthResolution::Removed {
@@ -2746,6 +2754,7 @@ impl AuthManager {
     fn remove_chatgpt_store_account_for_terminal_refresh_failure(
         &self,
         store_account_id: &str,
+        store_origin: LoadedStoreOrigin,
         error: &RefreshTokenFailedError,
     ) -> Result<TerminalRefreshFailureAccountRemoval, RefreshTokenError> {
         if !matches!(
@@ -2759,7 +2768,10 @@ impl AuthManager {
 
         let Some((mutation, loaded)) = self
             .account_manager
-            .remove_store_account_after_terminal_refresh_failure_from_storage(store_account_id)
+            .remove_store_account_after_terminal_refresh_failure_from_store_origin(
+                store_account_id,
+                store_origin,
+            )
             .map_err(RefreshTokenError::Transient)?
         else {
             return Ok(TerminalRefreshFailureAccountRemoval::NotRemoved);
@@ -2772,19 +2784,23 @@ impl AuthManager {
         let cached_auth = if let Some(switched_to_store_account_id) =
             mutation.switched_to_store_account_id.as_deref()
         {
+            let storage =
+                Self::storage_for_store_origin(&self.codex_home, &self.storage, store_origin);
             Self::derive_chatgpt_auth_from_store_account(
                 &store,
                 switched_to_store_account_id,
-                Arc::clone(&self.storage),
+                storage,
                 store_origin,
             )
         } else if mutation.was_active {
             None
         } else {
+            let storage =
+                Self::storage_for_store_origin(&self.codex_home, &self.storage, store_origin);
             Self::derive_auth_from_store(
                 &store,
                 &self.codex_home,
-                Arc::clone(&self.storage),
+                storage,
                 self.enable_codex_api_key_env,
                 store_origin,
             )
@@ -2925,15 +2941,20 @@ impl AuthManager {
             )));
         };
         let forced_chatgpt_workspace_id = self.account_manager.forced_chatgpt_workspace_id();
-        let previous_account_id = self
-            .auth_cached()
-            .as_ref()
-            .and_then(CodexAuth::get_account_id);
-        let active_store_account_id = self
-            .auth_cached()
-            .as_ref()
-            .and_then(CodexAuth::active_chatgpt_account_summary)
-            .map(|summary| summary.store_account_id);
+        let (previous_account_id, active_store_account_id, active_store_origin) =
+            if let Ok(guard) = self.inner.read() {
+                (
+                    guard.auth.as_ref().and_then(CodexAuth::get_account_id),
+                    guard
+                        .auth
+                        .as_ref()
+                        .and_then(CodexAuth::active_chatgpt_account_summary)
+                        .map(|summary| summary.store_account_id),
+                    guard.store_origin,
+                )
+            } else {
+                (None, None, self.account_manager.configured_store_origin())
+            };
         let context = ExternalAuthRefreshContext {
             reason,
             previous_account_id,
@@ -2944,6 +2965,7 @@ impl AuthManager {
             Err(error) => {
                 return self.finish_external_auth_refresh_failure(
                     active_store_account_id.as_deref(),
+                    active_store_origin,
                     Self::map_external_auth_refresh_error(error),
                 );
             }
@@ -3023,6 +3045,7 @@ impl AuthManager {
     fn finish_external_auth_refresh_failure(
         &self,
         active_store_account_id: Option<&str>,
+        active_store_origin: LoadedStoreOrigin,
         error: RefreshTokenError,
     ) -> Result<(), RefreshTokenError> {
         let RefreshTokenError::Permanent(error) = error else {
@@ -3033,6 +3056,7 @@ impl AuthManager {
         };
         match self.remove_chatgpt_store_account_for_terminal_refresh_failure(
             active_store_account_id,
+            active_store_origin,
             &error,
         )? {
             TerminalRefreshFailureAccountRemoval::Removed {

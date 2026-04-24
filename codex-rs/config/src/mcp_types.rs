@@ -63,8 +63,24 @@ pub enum McpServerEnvVar {
     Config {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        source: Option<String>,
+        source: Option<McpServerEnvVarSource>,
     },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum McpServerEnvVarSource {
+    Local,
+    Remote,
+}
+
+impl McpServerEnvVarSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+        }
+    }
 }
 
 impl McpServerEnvVar {
@@ -78,21 +94,18 @@ impl McpServerEnvVar {
     pub fn source(&self) -> Option<&str> {
         match self {
             McpServerEnvVar::Name(_) => None,
-            McpServerEnvVar::Config { source, .. } => source.as_deref(),
+            McpServerEnvVar::Config { source, .. } => source.as_ref().map(|source| source.as_str()),
         }
     }
 
     pub fn is_remote_source(&self) -> bool {
-        self.source() == Some("remote")
-    }
-
-    pub fn validate_source(&self) -> Result<(), String> {
-        match self.source() {
-            None | Some("local") | Some("remote") => Ok(()),
-            Some(source) => Err(format!(
-                "unsupported env_vars source `{source}`; expected `local` or `remote`"
-            )),
-        }
+        matches!(
+            self,
+            McpServerEnvVar::Config {
+                source: Some(McpServerEnvVarSource::Remote),
+                ..
+            }
+        )
     }
 }
 
@@ -294,9 +307,6 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             throw_if_set("stdio", "env_http_headers", env_http_headers.as_ref())?;
             throw_if_set("stdio", "oauth_resource", oauth_resource.as_ref())?;
             let env_vars = env_vars.unwrap_or_default();
-            for env_var in &env_vars {
-                env_var.validate_source()?;
-            }
             McpServerTransportConfig::Stdio {
                 command,
                 args: args.unwrap_or_default(),

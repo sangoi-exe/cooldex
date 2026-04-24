@@ -121,11 +121,11 @@ fn deserialize_stdio_command_server_config_with_env_var_sources() {
                 McpServerEnvVar::Name("LEGACY_TOKEN".to_string()),
                 McpServerEnvVar::Config {
                     name: "LOCAL_TOKEN".to_string(),
-                    source: Some("local".to_string()),
+                    source: Some(McpServerEnvVarSource::Local),
                 },
                 McpServerEnvVar::Config {
                     name: "REMOTE_TOKEN".to_string(),
-                    source: Some("remote".to_string()),
+                    source: Some(McpServerEnvVarSource::Remote),
                 },
             ],
             cwd: None,
@@ -145,7 +145,7 @@ fn deserialize_stdio_command_server_config_rejects_unknown_env_var_source() {
 
     assert!(
         err.to_string()
-            .contains("unsupported env_vars source `elsewhere`"),
+            .contains("data did not match any variant of untagged enum McpServerEnvVar"),
         "unexpected error: {err}"
     );
 }

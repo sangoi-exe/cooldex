@@ -33,6 +33,7 @@ use codex_config::types::BundledSkillsConfig;
 use codex_config::types::FeedbackConfigToml;
 use codex_config::types::HistoryPersistence;
 use codex_config::types::McpServerEnvVar;
+use codex_config::types::McpServerEnvVarSource;
 use codex_config::types::McpServerToolConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_config::types::MemoriesConfig;
@@ -2567,11 +2568,11 @@ async fn replace_mcp_servers_serializes_sourced_env_vars() -> anyhow::Result<()>
                     McpServerEnvVar::Name("LEGACY".to_string()),
                     McpServerEnvVar::Config {
                         name: "LOCAL_TOKEN".to_string(),
-                        source: Some("local".to_string()),
+                        source: Some(McpServerEnvVarSource::Local),
                     },
                     McpServerEnvVar::Config {
                         name: "REMOTE_TOKEN".to_string(),
-                        source: Some("remote".to_string()),
+                        source: Some(McpServerEnvVarSource::Remote),
                     },
                 ],
                 cwd: None,

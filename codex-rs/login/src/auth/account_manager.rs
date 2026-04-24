@@ -1108,6 +1108,23 @@ impl AccountManager {
         }
     }
 
+    fn storage_for_store_origin(
+        &self,
+        store_origin: LoadedStoreOrigin,
+    ) -> Arc<dyn AuthStorageBackend> {
+        match store_origin {
+            LoadedStoreOrigin::Persistent => Arc::clone(&self.storage),
+            LoadedStoreOrigin::ExternalEphemeral
+                if self.auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral =>
+            {
+                Arc::clone(&self.storage)
+            }
+            LoadedStoreOrigin::ExternalEphemeral => {
+                create_auth_storage(self.codex_home.clone(), AuthCredentialsStoreMode::Ephemeral)
+            }
+        }
+    }
+
     pub(super) fn load_store_from_storage(&self) -> LoadedAuthStore {
         // Merge-safety anchor: live store loading keeps AccountManager as the
         // owner of auth-store selection, admission filtering, sqlite-backed
@@ -1347,19 +1364,21 @@ impl AccountManager {
         ))
     }
 
-    pub(super) fn remove_store_account_after_terminal_refresh_failure_from_storage(
+    pub(super) fn remove_store_account_after_terminal_refresh_failure_from_store_origin(
         &self,
         store_account_id: &str,
+        store_origin: LoadedStoreOrigin,
     ) -> std::io::Result<Option<(TerminalRefreshFailureStoreMutation, LoadedAuthStore)>> {
         // Merge-safety anchor: terminal refresh-token account eviction is an
-        // account-runtime mutation transaction; keep auth-store lock/load/persist
-        // here and let AuthManager only refresh derived auth from the returned
-        // snapshot.
+        // account-runtime mutation transaction against the selected store origin;
+        // keep auth-store lock/load/persist here and let AuthManager only refresh
+        // derived auth from the returned snapshot.
+        let storage = self.storage_for_store_origin(store_origin);
         let _lock = lock_auth_store(&self.codex_home)?;
-        let mut store = self.storage.load()?.unwrap_or_default();
+        let mut store = storage.load()?.unwrap_or_default();
         let Some(mutation) = self.remove_store_account_after_terminal_refresh_failure(
             &mut store,
-            &*self.storage,
+            &*storage,
             store_account_id,
         )?
         else {
@@ -1369,7 +1388,7 @@ impl AccountManager {
             mutation,
             LoadedAuthStore {
                 store,
-                store_origin: self.configured_store_origin(),
+                store_origin,
             },
         )))
     }

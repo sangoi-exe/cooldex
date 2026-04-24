@@ -2823,6 +2823,33 @@ impl App {
         );
     }
 
+    fn refresh_app_server_account_projection_after_remote_active_account_change(
+        &mut self,
+        app_server_client: &AppServerSession,
+        active_store_account_id: String,
+    ) {
+        // Merge-safety anchor: remote account mutations must keep visible
+        // followers under the app-server projection owner; do not bounce through
+        // local AuthManager state after an app-server set-active request.
+        let stale_projection_baseline = self.visible_account_projection_followers();
+        let mut expected_projection_followers = stale_projection_baseline.clone();
+        expected_projection_followers.active_store_account_id = Some(active_store_account_id);
+        let expectation = if stale_projection_baseline.active_store_account_id
+            == expected_projection_followers.active_store_account_id
+        {
+            AccountProjectionRefreshExpectation::AcceptBaselineAfterRetries
+        } else {
+            AccountProjectionRefreshExpectation::RequireChangeFromBaseline
+        };
+        self.refresh_app_server_account_projection_after_account_change_from_baseline(
+            app_server_client,
+            AccountProjectionRefreshTrigger::ManualSetActiveAccount,
+            stale_projection_baseline,
+            expected_projection_followers,
+            expectation,
+        );
+    }
+
     fn refresh_app_server_account_projection_after_local_auth_change_from_baseline(
         &mut self,
         app_server_client: &AppServerSession,
@@ -2830,10 +2857,27 @@ impl App {
         stale_projection_baseline: VisibleAccountProjectionFollowers,
         expectation: AccountProjectionRefreshExpectation,
     ) {
+        let expected_projection_followers = self.visible_account_projection_followers();
+        self.refresh_app_server_account_projection_after_account_change_from_baseline(
+            app_server_client,
+            trigger,
+            stale_projection_baseline,
+            expected_projection_followers,
+            expectation,
+        );
+    }
+
+    fn refresh_app_server_account_projection_after_account_change_from_baseline(
+        &mut self,
+        app_server_client: &AppServerSession,
+        trigger: AccountProjectionRefreshTrigger,
+        stale_projection_baseline: VisibleAccountProjectionFollowers,
+        expected_projection_followers: VisibleAccountProjectionFollowers,
+        expectation: AccountProjectionRefreshExpectation,
+    ) {
         let request_id = self.next_account_projection_refresh_request_id;
         self.next_account_projection_refresh_request_id += 1;
         self.pending_account_projection_refresh_request_id = Some(request_id);
-        let expected_projection_followers = self.visible_account_projection_followers();
 
         let request_handle = app_server_client.request_handle();
         let app_event_tx = self.app_event_tx.clone();
@@ -2857,7 +2901,7 @@ impl App {
                 match load_account_projection_from_request_handle(request_handle.clone()).await {
                     Ok(projection) => {
                         saw_successful_projection = true;
-                        if App::app_server_projection_is_acceptable_after_local_auth_change(
+                        if App::app_server_projection_is_acceptable_after_account_change(
                             &stale_projection_baseline,
                             &expected_projection_followers,
                             &projection,
@@ -2880,7 +2924,7 @@ impl App {
                         tracing::warn!(
                             error = %err,
                             trigger = trigger_description,
-                            "failed to refresh app-server account projection after local auth change"
+                            "failed to refresh app-server account projection after account change"
                         );
                         last_error_message = Some(err.to_string());
                     }
@@ -2899,7 +2943,7 @@ impl App {
                     }
                     AccountProjectionRefreshExpectation::RequireChangeFromBaseline => {
                         if saw_successful_projection {
-                            "app-server account projection stayed stale after the local account change"
+                            "app-server account projection stayed stale after the account change"
                                 .to_string()
                         } else {
                             last_error_message.unwrap_or_else(|| {
@@ -3004,7 +3048,7 @@ impl App {
             match load_projection().await {
                 Ok(projection) => {
                     saw_successful_projection = true;
-                    if Self::app_server_projection_is_acceptable_after_local_auth_change(
+                    if Self::app_server_projection_is_acceptable_after_account_change(
                         &stale_projection_baseline,
                         &expected_projection_followers,
                         &projection,
@@ -3023,7 +3067,7 @@ impl App {
                     tracing::warn!(
                         error = %err,
                         trigger = trigger.description(),
-                        "failed to refresh app-server account projection after local auth change"
+                        "failed to refresh app-server account projection after account change"
                     );
                     last_error_message = Some(err.to_string());
                 }
@@ -3040,7 +3084,7 @@ impl App {
             AccountProjectionRefreshExpectation::RequireChangeFromBaseline => {
                 if saw_successful_projection {
                     Some(
-                        "app-server account projection stayed stale after the local account change"
+                        "app-server account projection stayed stale after the account change"
                             .to_string(),
                     )
                 } else {
@@ -3089,7 +3133,7 @@ impl App {
             || visible_followers.available_models != projection.available_models
     }
 
-    fn app_server_projection_is_acceptable_after_local_auth_change(
+    fn app_server_projection_is_acceptable_after_account_change(
         stale_projection_baseline: &VisibleAccountProjectionFollowers,
         expected_projection_followers: &VisibleAccountProjectionFollowers,
         projection: &AppServerAccountProjection,
@@ -6955,15 +6999,6 @@ impl App {
             }
             AppEvent::StartOpenAccountsPopup => {
                 if self.remote_app_server_url.is_some() {
-                    if !self.chat_widget.has_chatgpt_account()
-                        && !self.config.model_provider.requires_openai_auth
-                    {
-                        self.chat_widget.add_error_message(
-                            "'/accounts' needs saved ChatGPT accounts or an OpenAI-auth provider."
-                                .to_string(),
-                        );
-                        return Ok(AppRunControl::Continue);
-                    }
                     self.chat_widget.open_accounts_loading_popup_unchecked();
                     let request_handle = app_server.request_handle();
                     let app_event_tx = self.app_event_tx.clone();
@@ -7065,9 +7100,9 @@ impl App {
                                         })
                                 })
                                 .unwrap_or_else(|| account_id.clone());
-                            self.refresh_app_server_account_projection_after_manual_auth_change(
+                            self.refresh_app_server_account_projection_after_remote_active_account_change(
                                 app_server,
-                                AccountProjectionRefreshTrigger::ManualSetActiveAccount,
+                                account_id,
                             );
                             self.chat_widget.add_info_message(
                                 format!("Active account: {display}"),
@@ -7200,16 +7235,6 @@ impl App {
             }
             AppEvent::StartChatGptAddAccount => {
                 if self.remote_app_server_url.is_some() {
-                    if !self.chat_widget.has_chatgpt_account()
-                        && !self.config.model_provider.requires_openai_auth
-                    {
-                        self.chat_widget.add_error_message(
-                            "'/accounts' add needs saved ChatGPT accounts or an OpenAI-auth provider."
-                                .to_string(),
-                        );
-                        return Ok(AppRunControl::Continue);
-                    }
-
                     let ChatGptAddAccountLoginStart { login_id, auth_url } =
                         match app_server.start_chatgpt_add_account_login().await {
                             Ok(login) => login,
@@ -7318,10 +7343,16 @@ impl App {
                 {
                     return Ok(AppRunControl::Continue);
                 }
-                let pending = self
-                    .pending_remote_chatgpt_add_account
-                    .take()
-                    .expect("checked pending remote add-account state");
+                let Some(pending) = self.pending_remote_chatgpt_add_account.take() else {
+                    tracing::error!(
+                        login_id,
+                        "pending remote add-account state disappeared after login-id match"
+                    );
+                    self.chat_widget.add_error_message(
+                        "Remote ChatGPT login state was lost before completion.".to_string(),
+                    );
+                    return Ok(AppRunControl::Continue);
+                };
                 let outcome = if success {
                     let active_account_display = match app_server.list_accounts().await {
                         Ok(accounts) => active_account_display_from_remote_accounts(&accounts),
@@ -7359,10 +7390,16 @@ impl App {
                 {
                     return Ok(AppRunControl::Continue);
                 }
-                let pending = self
-                    .pending_remote_chatgpt_add_account
-                    .take()
-                    .expect("checked pending remote add-account state");
+                let Some(pending) = self.pending_remote_chatgpt_add_account.take() else {
+                    tracing::error!(
+                        login_id,
+                        "pending remote add-account state disappeared after cancellation login-id match"
+                    );
+                    self.chat_widget.add_error_message(
+                        "Remote ChatGPT login state was lost before cancellation.".to_string(),
+                    );
+                    return Ok(AppRunControl::Continue);
+                };
                 pending.shared_state.set_cancelled();
                 self.app_event_tx.send(AppEvent::ChatGptAddAccountFinished(
                     ChatGptAddAccountOutcome::Cancelled,
@@ -10005,6 +10042,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_accounts_popup_queries_server_when_visible_projection_has_no_account()
+    -> Result<()> {
+        let mut harness = RemoteAccountsTestHarness::new("account-a").await?;
+        harness.app.config.model_provider.requires_openai_auth = false;
+        harness.app.apply_chat_widget_account_state(
+            /*status_account_display*/ None, /*plan_type*/ None,
+            /*has_chatgpt_account*/ false,
+        );
+
+        harness.open_remote_accounts_popup().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn remote_accounts_popup_select_active_account_via_real_request_path() -> Result<()> {
         let mut harness = RemoteAccountsTestHarness::new("account-a").await?;
 
@@ -10032,39 +10084,26 @@ mod tests {
         .expect("timed out handling remote set-active app event")?;
         assert!(matches!(control, AppRunControl::Continue));
 
-        harness.pump_next_app_server_event().await;
-
-        let refresh_after_account_update_event = harness
-            .next_app_event_matching("notification-driven refresh trigger", |event| {
-                matches!(
-                    event,
-                    AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate
-                )
-            })
-            .await;
-        let control = time::timeout(
-            std::time::Duration::from_secs(5),
-            harness.handle_event(refresh_after_account_update_event),
-        )
-        .await
-        .expect("timed out handling notification-driven projection refresh trigger")?;
-        assert!(matches!(control, AppRunControl::Continue));
-        let projection_refreshed_event = harness
-            .next_app_event_matching("notification-driven projection refresh", |event| {
+        let manual_projection_refreshed_event = harness
+            .next_app_event_matching("manual remote set-active projection refresh", |event| {
                 matches!(event, AppEvent::AppServerAccountProjectionRefreshed { .. })
             })
             .await;
         assert_matches!(
-            &projection_refreshed_event,
+            &manual_projection_refreshed_event,
             AppEvent::AppServerAccountProjectionRefreshed { result: Ok(_), .. }
         );
         let control = time::timeout(
             std::time::Duration::from_secs(5),
-            harness.handle_event(projection_refreshed_event),
+            harness.handle_event(manual_projection_refreshed_event),
         )
         .await
-        .expect("timed out applying notification-driven projection refresh result")?;
+        .expect("timed out applying manual remote set-active projection refresh result")?;
         assert!(matches!(control, AppRunControl::Continue));
+        assert_eq!(
+            harness.app.observed_active_store_account_id,
+            Some(harness.secondary_store_account_id.clone())
+        );
 
         let remote_accounts = time::timeout(
             std::time::Duration::from_secs(5),
@@ -10135,55 +10174,11 @@ mod tests {
         .expect("timed out handling same-visible remote set-active app event")?;
         assert!(matches!(control, AppRunControl::Continue));
 
-        harness.pump_next_app_server_event().await;
-        assert!(
-            matches!(
-                time::timeout(
-                    std::time::Duration::from_millis(50),
-                    harness.app_server.next_event(),
-                )
-                .await,
-                Err(_) | Ok(None)
-            ),
-            "expected exactly one app-server event for same-visible remote set-active"
-        );
-
-        let refresh_after_account_update_event = harness
-            .next_app_event_matching(
-                "same-visible notification-driven refresh trigger",
-                |event| {
-                    matches!(
-                        event,
-                        AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate
-                    )
-                },
+        harness
+            .handle_next_projection_refreshed_event(
+                "same-visible manual remote set-active projection refresh",
             )
-            .await;
-        let control = time::timeout(
-            std::time::Duration::from_secs(5),
-            harness.handle_event(refresh_after_account_update_event),
-        )
-        .await
-        .expect("timed out handling same-visible notification-driven projection refresh trigger")?;
-        assert!(matches!(control, AppRunControl::Continue));
-
-        let projection_refreshed_event = harness
-            .next_app_event_matching(
-                "same-visible notification-driven projection refresh",
-                |event| matches!(event, AppEvent::AppServerAccountProjectionRefreshed { .. }),
-            )
-            .await;
-        assert_matches!(
-            &projection_refreshed_event,
-            AppEvent::AppServerAccountProjectionRefreshed { result: Ok(_), .. }
-        );
-        let control = time::timeout(
-            std::time::Duration::from_secs(5),
-            harness.handle_event(projection_refreshed_event),
-        )
-        .await
-        .expect("timed out applying same-visible projection refresh result")?;
-        assert!(matches!(control, AppRunControl::Continue));
+            .await?;
 
         assert_eq!(
             harness.app.observed_active_store_account_id,
@@ -10245,52 +10240,11 @@ mod tests {
         .expect("timed out handling same-email remote set-active app event")?;
         assert!(matches!(control, AppRunControl::Continue));
 
-        harness.pump_next_app_server_event().await;
-        assert!(
-            matches!(
-                time::timeout(
-                    std::time::Duration::from_millis(50),
-                    harness.app_server.next_event(),
-                )
-                .await,
-                Err(_) | Ok(None)
-            ),
-            "expected exactly one app-server event for same-email remote set-active"
-        );
-
-        let refresh_after_account_update_event = harness
-            .next_app_event_matching("same-email notification-driven refresh trigger", |event| {
-                matches!(
-                    event,
-                    AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate
-                )
-            })
-            .await;
-        let control = time::timeout(
-            std::time::Duration::from_secs(5),
-            harness.handle_event(refresh_after_account_update_event),
-        )
-        .await
-        .expect("timed out handling same-email notification-driven projection refresh trigger")?;
-        assert!(matches!(control, AppRunControl::Continue));
-
-        let projection_refreshed_event = harness
-            .next_app_event_matching(
-                "same-email notification-driven projection refresh",
-                |event| matches!(event, AppEvent::AppServerAccountProjectionRefreshed { .. }),
+        harness
+            .handle_next_projection_refreshed_event(
+                "same-email manual remote set-active projection refresh",
             )
-            .await;
-        assert_matches!(
-            &projection_refreshed_event,
-            AppEvent::AppServerAccountProjectionRefreshed { result: Ok(_), .. }
-        );
-        let control = time::timeout(
-            std::time::Duration::from_secs(5),
-            harness.handle_event(projection_refreshed_event),
-        )
-        .await
-        .expect("timed out applying same-email projection refresh result")?;
-        assert!(matches!(control, AppRunControl::Continue));
+            .await?;
 
         assert_eq!(
             harness.app.observed_active_store_account_id,
@@ -10469,51 +10423,14 @@ mod tests {
         );
 
         harness.app_server.logout_account().await?;
-        harness.pump_next_app_server_event().await;
-        assert!(
-            matches!(
-                time::timeout(
-                    std::time::Duration::from_millis(50),
-                    harness.app_server.next_event(),
-                )
-                .await,
-                Err(_) | Ok(None)
-            ),
-            "expected exactly one post-logout app-server event in the stale-manager startup scenario"
-        );
-
-        let refresh_after_account_update_event = harness
-            .next_app_event_matching("post-logout projection refresh trigger", |event| {
-                matches!(
-                    event,
-                    AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate
-                )
-            })
-            .await;
-        let control = time::timeout(
-            std::time::Duration::from_secs(5),
-            harness.handle_event(refresh_after_account_update_event),
-        )
-        .await
-        .expect("timed out handling post-logout projection refresh trigger")?;
-        assert!(matches!(control, AppRunControl::Continue));
-
-        let projection_refreshed_event = harness
-            .next_app_event_matching("post-logout projection refresh result", |event| {
-                matches!(event, AppEvent::AppServerAccountProjectionRefreshed { .. })
-            })
-            .await;
-        assert_matches!(
-            &projection_refreshed_event,
-            AppEvent::AppServerAccountProjectionRefreshed { result: Ok(_), .. }
-        );
-        let control = time::timeout(
-            std::time::Duration::from_secs(5),
-            harness.handle_event(projection_refreshed_event),
-        )
-        .await
-        .expect("timed out applying post-logout projection refresh result")?;
-        assert!(matches!(control, AppRunControl::Continue));
+        harness
+            .handle_projection_refresh_trigger_after_pumping_server(
+                "post-logout projection refresh trigger",
+            )
+            .await?;
+        harness
+            .handle_next_projection_refreshed_event("post-logout projection refresh result")
+            .await?;
 
         assert_eq!(harness.app.observed_active_store_account_id, None);
         assert!(
@@ -10575,49 +10492,21 @@ mod tests {
             Some(harness.secondary_store_account_id.clone())
         );
 
-        harness.pump_next_app_server_event().await;
+        harness
+            .handle_projection_refresh_trigger_after_pumping_server(
+                "autoswitch notification-driven refresh trigger",
+            )
+            .await?;
         let projection = harness.app_server.load_account_projection().await?;
         assert_eq!(
             projection.active_store_account_id,
             Some(harness.secondary_store_account_id.clone())
         );
-
-        let refresh_after_account_update_event = harness
-            .next_app_event_matching("autoswitch notification-driven refresh trigger", |event| {
-                matches!(
-                    event,
-                    AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate
-                )
-            })
-            .await;
-        assert_matches!(
-            refresh_after_account_update_event,
-            AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate
-        );
-        let control = time::timeout(
-            std::time::Duration::from_secs(5),
-            harness.handle_event(refresh_after_account_update_event),
-        )
-        .await
-        .expect("timed out handling autoswitch notification-driven projection refresh trigger")?;
-        assert!(matches!(control, AppRunControl::Continue));
-        let projection_refreshed_event = harness
-            .next_app_event_matching(
+        harness
+            .handle_next_projection_refreshed_event(
                 "autoswitch notification-driven projection refresh",
-                |event| matches!(event, AppEvent::AppServerAccountProjectionRefreshed { .. }),
             )
-            .await;
-        assert_matches!(
-            &projection_refreshed_event,
-            AppEvent::AppServerAccountProjectionRefreshed { result: Ok(_), .. }
-        );
-        let control = time::timeout(
-            std::time::Duration::from_secs(5),
-            harness.handle_event(projection_refreshed_event),
-        )
-        .await
-        .expect("timed out applying autoswitch projection refresh result")?;
-        assert!(matches!(control, AppRunControl::Continue));
+            .await?;
 
         assert_eq!(
             harness.app.observed_active_store_account_id,
@@ -11391,7 +11280,7 @@ mod tests {
         };
 
         assert!(
-            !App::app_server_projection_is_acceptable_after_local_auth_change(
+            !App::app_server_projection_is_acceptable_after_account_change(
                 &stale_projection_baseline,
                 &expected_projection_followers,
                 &stale_projection,
@@ -16931,17 +16820,91 @@ guardian_approval = true
             }
         }
 
-        async fn pump_next_app_server_event(&mut self) {
-            let event = time::timeout(
-                std::time::Duration::from_secs(3),
-                self.app_server.next_event(),
+        async fn pump_app_server_events_until_app_event_matching<F>(
+            &mut self,
+            label: &str,
+            mut predicate: F,
+        ) -> AppEvent
+        where
+            F: FnMut(&AppEvent) -> bool,
+        {
+            let deadline = time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut skipped_app_events = Vec::new();
+            let mut pumped_app_server_events = Vec::new();
+            loop {
+                match self.app_event_rx.try_recv() {
+                    Ok(event) => {
+                        if predicate(&event) {
+                            return event;
+                        }
+                        skipped_app_events.push(format!("{event:?}"));
+                        continue;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        panic!("app event channel closed while waiting for {label}");
+                    }
+                }
+
+                let app_server_event = time::timeout_at(deadline, self.app_server.next_event())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "timed out waiting for matching emitted app event ({label}); skipped app events: {skipped_app_events:?}; pumped app-server events: {pumped_app_server_events:?}"
+                        )
+                    })
+                    .expect("app-server event stream closed while waiting for matching app event");
+                pumped_app_server_events.push(format!("{app_server_event:?}"));
+                self.app
+                    .handle_app_server_event(&mut self.app_server, app_server_event)
+                    .await;
+            }
+        }
+
+        async fn handle_next_projection_refreshed_event(&mut self, label: &str) -> Result<()> {
+            let projection_refreshed_event = self
+                .next_app_event_matching(label, |event| {
+                    matches!(event, AppEvent::AppServerAccountProjectionRefreshed { .. })
+                })
+                .await;
+            assert_matches!(
+                &projection_refreshed_event,
+                AppEvent::AppServerAccountProjectionRefreshed { result: Ok(_), .. }
+            );
+            let control = time::timeout(
+                std::time::Duration::from_secs(5),
+                self.handle_event(projection_refreshed_event),
             )
             .await
-            .expect("timed out waiting for app-server event")
-            .expect("app-server event stream closed");
-            self.app
-                .handle_app_server_event(&mut self.app_server, event)
+            .unwrap_or_else(|_| panic!("timed out applying projection refresh result ({label})"))?;
+            assert!(matches!(control, AppRunControl::Continue));
+            Ok(())
+        }
+
+        async fn handle_projection_refresh_trigger_after_pumping_server(
+            &mut self,
+            label: &str,
+        ) -> Result<()> {
+            let refresh_after_account_update_event = self
+                .pump_app_server_events_until_app_event_matching(label, |event| {
+                    matches!(
+                        event,
+                        AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate
+                    )
+                })
                 .await;
+            let control = time::timeout(
+                std::time::Duration::from_secs(5),
+                self.handle_event(refresh_after_account_update_event),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out handling notification-driven projection refresh trigger ({label})"
+                )
+            })?;
+            assert!(matches!(control, AppRunControl::Continue));
+            Ok(())
         }
 
         async fn pump_app_server_events_until_idle(&mut self) {

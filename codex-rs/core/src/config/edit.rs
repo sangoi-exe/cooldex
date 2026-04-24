@@ -361,7 +361,7 @@ mod document_helpers {
                     let mut table = InlineTable::new();
                     table.insert("name", name.clone().into());
                     if let Some(source) = source {
-                        table.insert("source", source.clone().into());
+                        table.insert("source", source.as_str().into());
                     }
                     array.push(table);
                 }

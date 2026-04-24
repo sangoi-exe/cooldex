@@ -936,7 +936,7 @@
               "type": "string"
             },
             "source": {
-              "type": "string"
+              "$ref": "#/definitions/McpServerEnvVarSource"
             }
           },
           "required": [
@@ -945,6 +945,13 @@
           "type": "object"
         }
       ]
+    },
+    "McpServerEnvVarSource": {
+      "enum": [
+        "local",
+        "remote"
+      ],
+      "type": "string"
     },
     "McpServerToolConfig": {
       "additionalProperties": false,

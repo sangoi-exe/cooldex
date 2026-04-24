@@ -3,6 +3,10 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+// Merge-safety anchor: remote `/accounts` add-account UI is an app-server
+// follower surface; cancellation/completion must stay aligned with remote
+// account login request ownership instead of local AuthManager-only flows.
+
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_protocol::CancelLoginAccountParams;
 use codex_app_server_protocol::CancelLoginAccountResponse;

@@ -92,6 +92,24 @@ append_unique_path() {
     guard_paths+=("${candidate}")
 }
 
+extract_build_jobs_config_value() {
+    local config_value="$1"
+    local compact_config
+    compact_config="$(printf '%s' "${config_value}" | tr -d '[:space:]')"
+    if [[ "${compact_config}" =~ (^|[;,])build\.jobs=\"?([0-9]+)\"?($|[;,]) ]]; then
+        printf '%s\n' "${BASH_REMATCH[2]}"
+    fi
+}
+
+record_config_build_jobs() {
+    local config_value="$1"
+    local config_jobs
+    config_jobs="$(extract_build_jobs_config_value "${config_value}")"
+    if [[ -n "${config_jobs}" ]]; then
+        explicit_config_jobs_raw="${config_jobs}"
+    fi
+}
+
 measure_guard_paths() {
     lowest_guard_gib=""
     lowest_guard_path=""
@@ -218,6 +236,7 @@ manifest_path_raw=""
 explicit_target_dir_raw=""
 cargo_subcommand=""
 explicit_jobs_raw=""
+explicit_config_jobs_raw=""
 
 index=0
 while (( index < ${#cargo_args[@]} )); do
@@ -234,10 +253,12 @@ while (( index < ${#cargo_args[@]} )); do
                 exit 2
             }
             ((index += 1))
+            record_config_build_jobs "${cargo_args[$index]}"
             metadata_context_args+=("--config" "${cargo_args[$index]}")
             clean_context_args+=("--config" "${cargo_args[$index]}")
             ;;
         --config=*)
+            record_config_build_jobs "${arg#--config=}"
             metadata_context_args+=("${arg}")
             clean_context_args+=("${arg}")
             ;;
@@ -444,6 +465,15 @@ if [[ -n "${explicit_jobs_raw}" ]]; then
         exit 2
     fi
     resolved_cargo_build_jobs="${explicit_jobs_raw}"
+fi
+if [[ -n "${explicit_config_jobs_raw}" ]]; then
+    if (( explicit_config_jobs_raw > MAX_CARGO_BUILD_JOBS )); then
+        log error "Cargo build.jobs config ${explicit_config_jobs_raw} exceeds wrapper cap ${MAX_CARGO_BUILD_JOBS}; rerun with build.jobs=${MAX_CARGO_BUILD_JOBS} or lower"
+        exit 2
+    fi
+    if [[ -z "${explicit_jobs_raw}" ]]; then
+        resolved_cargo_build_jobs="${explicit_config_jobs_raw}"
+    fi
 fi
 
 resolve_metadata_dirs

@@ -257,7 +257,7 @@ fn array_from_env_vars(env_vars: &[McpServerEnvVar]) -> TomlItem {
                 let mut table = toml_edit::InlineTable::new();
                 table.insert("name", name.clone().into());
                 if let Some(source) = source {
-                    table.insert("source", source.clone().into());
+                    table.insert("source", source.as_str().into());
                 }
                 array.push(table);
             }

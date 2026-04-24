@@ -2,6 +2,10 @@
 //!
 //! `send_message` and `followup_task` share the same submission path and differ only in whether the
 //! resulting `InterAgentCommunication` should wake the target immediately.
+//!
+//! Merge-safety anchor: MultiAgentV2 messaging is default-off local divergence;
+//! keep target resolution and emitted task-path metadata aligned with the V2
+//! protocol without leaking V2 semantics into the active legacy collab surface.
 
 use super::*;
 use crate::tools::context::FunctionToolOutput;

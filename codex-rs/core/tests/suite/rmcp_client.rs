@@ -18,6 +18,7 @@ use std::time::UNIX_EPOCH;
 
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerEnvVar;
+use codex_config::types::McpServerEnvVarSource;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::config::Config;
 use codex_exec_server::CreateDirectoryOptions;
@@ -1629,7 +1630,7 @@ async fn stdio_server_propagates_explicit_local_env_var_source() -> anyhow::Resu
                     /*env*/ None,
                     vec![McpServerEnvVar::Config {
                         name: env_name.to_string(),
-                        source: Some("local".to_string()),
+                        source: Some(McpServerEnvVarSource::Local),
                     }],
                 ),
                 TestMcpServerOptions {
@@ -1738,7 +1739,7 @@ async fn remote_stdio_env_var_source_does_not_copy_local_env() -> anyhow::Result
                     /*env*/ None,
                     vec![McpServerEnvVar::Config {
                         name: env_name.to_string(),
-                        source: Some("remote".to_string()),
+                        source: Some(McpServerEnvVarSource::Remote),
                     }],
                 ),
                 TestMcpServerOptions {

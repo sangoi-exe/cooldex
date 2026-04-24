@@ -175,6 +175,7 @@ pub(crate) const DEFAULT_ENV_VARS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_config::types::McpServerEnvVarSource;
     use pretty_assertions::assert_eq;
 
     use serial_test::serial;
@@ -268,11 +269,11 @@ mod tests {
             &[
                 McpServerEnvVar::Config {
                     name: remote_var.to_string(),
-                    source: Some("remote".to_string()),
+                    source: Some(McpServerEnvVarSource::Remote),
                 },
                 McpServerEnvVar::Config {
                     name: local_var.to_string(),
-                    source: Some("local".to_string()),
+                    source: Some(McpServerEnvVarSource::Local),
                 },
             ],
         );
@@ -289,11 +290,11 @@ mod tests {
             "LEGACY".into(),
             McpServerEnvVar::Config {
                 name: "LOCAL".to_string(),
-                source: Some("local".to_string()),
+                source: Some(McpServerEnvVarSource::Local),
             },
             McpServerEnvVar::Config {
                 name: "REMOTE".to_string(),
-                source: Some("remote".to_string()),
+                source: Some(McpServerEnvVarSource::Remote),
             },
         ]);
 
@@ -306,7 +307,7 @@ mod tests {
             /*extra_env*/ None,
             &[McpServerEnvVar::Config {
                 name: "REMOTE".to_string(),
-                source: Some("remote".to_string()),
+                source: Some(McpServerEnvVarSource::Remote),
             }],
         )
         .expect_err("remote source should require remote stdio");

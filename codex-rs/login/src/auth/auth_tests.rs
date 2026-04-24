@@ -995,6 +995,7 @@ fn terminal_refresh_failure_removes_active_account_and_switches_to_unleased_fall
     let removal = manager
         .remove_chatgpt_store_account_for_terminal_refresh_failure(
             "store-account-a",
+            LoadedStoreOrigin::Persistent,
             &RefreshTokenFailedError::new(
                 RefreshTokenFailedReason::Exhausted,
                 "refresh token exhausted",
@@ -2356,6 +2357,79 @@ fn auth_manager_prefers_external_chatgpt_tokens_over_persisted_auth() {
             .active_chatgpt_account_summary()
             .map(|summary| summary.store_account_id),
         Some("external-store-account".to_string())
+    );
+}
+
+#[test]
+fn terminal_refresh_failure_removes_external_account_from_external_store() {
+    let codex_home = tempdir().unwrap();
+    save_auth(
+        codex_home.path(),
+        &chatgpt_auth_store_for_manager_logout(
+            "persistent-store-account",
+            "persistent-workspace",
+            "persistent-access-token",
+            "persistent-refresh-token",
+        ),
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save persistent auth store");
+    save_auth(
+        codex_home.path(),
+        &external_chatgpt_auth_store("external-store-account", "external-workspace"),
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("save external auth store");
+
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+    assert_eq!(
+        manager
+            .auth_cached()
+            .and_then(|auth| auth.active_chatgpt_account_summary())
+            .map(|summary| summary.store_account_id),
+        Some("external-store-account".to_string())
+    );
+    let persistent_store_before_removal = std::fs::read_to_string(get_auth_file(codex_home.path()))
+        .expect("persistent auth file should remain readable before removal");
+
+    let removal = manager
+        .remove_chatgpt_store_account_for_terminal_refresh_failure(
+            "external-store-account",
+            LoadedStoreOrigin::ExternalEphemeral,
+            &RefreshTokenFailedError::new(
+                RefreshTokenFailedReason::Exhausted,
+                "external refresh token exhausted",
+            ),
+        )
+        .expect("terminal refresh failure should remove external account");
+    assert_eq!(
+        removal,
+        TerminalRefreshFailureAccountRemoval::Removed {
+            switched_to_store_account_id: None
+        }
+    );
+
+    let external_storage = create_auth_storage(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::Ephemeral,
+    );
+    let external_store = external_storage
+        .load()
+        .expect("load external auth store")
+        .unwrap_or_default();
+    assert!(
+        external_store.accounts.is_empty(),
+        "terminal removal should evict the external account from the external store"
+    );
+    assert_eq!(
+        std::fs::read_to_string(get_auth_file(codex_home.path()))
+            .expect("persistent auth file should remain readable after removal"),
+        persistent_store_before_removal,
+        "terminal external removal must not mutate the persistent fallback store"
     );
 }
 
