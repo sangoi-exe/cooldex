@@ -2005,8 +2005,9 @@ impl AuthManager {
 
     pub fn set_active_account(&self, id: &str) -> std::io::Result<()> {
         // Merge-safety anchor: active-account mutation belongs to
-        // AccountManager; AuthManager may only lock/load/persist the auth store
-        // and delegate the runtime mutation.
+        // AccountManager; AuthManager may only pass through the request and
+        // refresh its derived auth cache from the returned account-runtime
+        // mutation snapshot.
         self.update_store(|store| self.account_manager.set_active_account(store, id))
     }
 
