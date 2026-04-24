@@ -1259,6 +1259,33 @@ impl AccountManager {
         ))
     }
 
+    pub(super) fn remove_store_account_after_terminal_refresh_failure_from_storage(
+        &self,
+        store_account_id: &str,
+    ) -> std::io::Result<Option<(TerminalRefreshFailureStoreMutation, LoadedAuthStore)>> {
+        // Merge-safety anchor: terminal refresh-token account eviction is an
+        // account-runtime mutation transaction; keep auth-store lock/load/persist
+        // here and let AuthManager only refresh derived auth from the returned
+        // snapshot.
+        let _lock = lock_auth_store(&self.codex_home)?;
+        let mut store = self.storage.load()?.unwrap_or_default();
+        let Some(mutation) = self.remove_store_account_after_terminal_refresh_failure(
+            &mut store,
+            &*self.storage,
+            store_account_id,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            mutation,
+            LoadedAuthStore {
+                store,
+                store_origin: self.configured_store_origin(),
+            },
+        )))
+    }
+
     pub(super) fn mutate_loaded_store<T>(
         &self,
         store: &mut AuthStore,
@@ -1561,6 +1588,21 @@ impl AccountManager {
         )
     }
 
+    pub(super) fn select_account_for_auto_switch(
+        &self,
+        required_workspace_id: Option<&str>,
+        exclude_store_account_id: Option<&str>,
+    ) -> Option<String> {
+        let store = self.load_store_from_storage().store;
+        self.select_account_for_auto_switch_with_leases(
+            &store,
+            required_workspace_id,
+            exclude_store_account_id,
+            Utc::now(),
+            UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+        )
+    }
+
     pub(super) fn set_active_account(
         &self,
         store: &mut AuthStore,
@@ -1819,7 +1861,8 @@ impl AccountManager {
     ) -> std::io::Result<Option<String>> {
         // Merge-safety anchor: usage-limit auto-switch cooldown orchestration
         // belongs to AccountManager, and this method must keep the historical
-        // lock order of cooldown mutex before AuthManager's `update_store(...)`.
+        // lock order of cooldown mutex before the account-store mutation
+        // transaction.
         let cooldown_check_now = Utc::now();
         let mut cooldown_until = self
             .usage_limit_auto_switch_cooldown_until

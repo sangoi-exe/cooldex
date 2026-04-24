@@ -40,6 +40,7 @@ use super::account_manager::LoadedStoreOrigin;
 #[cfg(test)]
 use super::account_manager::UsageLimitAutoSwitchFallbackSelectionMode;
 use super::account_manager::UsageLimitAutoSwitchRequest;
+#[cfg(test)]
 use super::account_manager::UsageLimitAutoSwitchSelectionScope;
 use super::account_manager::account_matches_required_workspace;
 use super::account_manager::enforce_chatgpt_auth_accounts;
@@ -2094,15 +2095,8 @@ impl AuthManager {
         required_workspace_id: Option<&str>,
         exclude_store_account_id: Option<&str>,
     ) -> Option<String> {
-        let store = self.load_saved_account_store()?;
         self.account_manager
-            .select_account_for_auto_switch_with_leases(
-                &store,
-                required_workspace_id,
-                exclude_store_account_id,
-                Utc::now(),
-                UsageLimitAutoSwitchSelectionScope::PersistedTruth,
-            )
+            .select_account_for_auto_switch(required_workspace_id, exclude_store_account_id)
     }
 
     pub fn accounts_rate_limits_cache_expires_at(
@@ -2456,18 +2450,6 @@ impl AuthManager {
         self.account_manager.load_store_from_storage()
     }
 
-    fn load_saved_account_store(&self) -> Option<AuthStore> {
-        // Merge-safety anchor: account-runtime readers must select from the same
-        // live AccountManager-loaded snapshot used for saved-account presence
-        // checks; do not gate on live storage and then read from stale
-        // AuthManager cache.
-        let store = self.load_store_from_storage().store;
-        if store.accounts.is_empty() {
-            return None;
-        }
-        Some(store)
-    }
-
     /// Records a permanent refresh failure only if the failed refresh was
     /// attempted against the auth snapshot that is still cached.
     fn record_permanent_refresh_failure_if_unchanged(
@@ -2808,32 +2790,17 @@ impl AuthManager {
             return Ok(TerminalRefreshFailureAccountRemoval::NotRemoved);
         }
 
-        let _lock = storage::lock_auth_store(&self.codex_home)?;
-        let mut store = match self.storage.load().map_err(RefreshTokenError::Transient)? {
-            Some(store) => store,
-            None => {
-                if self._test_home_guard.is_some() {
-                    self.inner
-                        .read()
-                        .ok()
-                        .map(|cached| cached.store.clone())
-                        .unwrap_or_default()
-                } else {
-                    AuthStore::default()
-                }
-            }
-        };
-        let Some(mutation) = self
+        let Some((mutation, loaded)) = self
             .account_manager
-            .remove_store_account_after_terminal_refresh_failure(
-                &mut store,
-                &*self.storage,
-                store_account_id,
-            )
+            .remove_store_account_after_terminal_refresh_failure_from_storage(store_account_id)
             .map_err(RefreshTokenError::Transient)?
         else {
             return Ok(TerminalRefreshFailureAccountRemoval::NotRemoved);
         };
+        let LoadedAuthStore {
+            store,
+            store_origin,
+        } = loaded;
 
         let cached_auth = if let Some(switched_to_store_account_id) =
             mutation.switched_to_store_account_id.as_deref()
@@ -2842,7 +2809,7 @@ impl AuthManager {
                 &store,
                 switched_to_store_account_id,
                 Arc::clone(&self.storage),
-                LoadedStoreOrigin::Persistent,
+                store_origin,
             )
         } else if mutation.was_active {
             None
@@ -2852,10 +2819,10 @@ impl AuthManager {
                 &self.codex_home,
                 Arc::clone(&self.storage),
                 self.enable_codex_api_key_env,
-                LoadedStoreOrigin::Persistent,
+                store_origin,
             )
         };
-        self.set_cached_with_auth(store, cached_auth, LoadedStoreOrigin::Persistent);
+        self.set_cached_with_auth(store, cached_auth, store_origin);
         tracing::warn!(
             store_account_id,
             failed_reason = ?error.reason,
