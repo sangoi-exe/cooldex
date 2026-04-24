@@ -1290,6 +1290,37 @@ fn saved_account_runtime_updates_skip_empty_store_without_persisting_auth() {
     manager
         .mark_usage_limit_reached(Some(Utc::now()), Some(snapshot))
         .expect("usage-limit mark without saved accounts should be a no-op");
+    let bulk_resets_at = (Utc::now() + chrono::Duration::minutes(11)).timestamp();
+    assert_eq!(
+        manager
+            .update_rate_limits_for_accounts([(
+                "missing-account".to_string(),
+                RateLimitSnapshot {
+                    limit_id: Some("bulk".to_string()),
+                    limit_name: None,
+                    primary: Some(RateLimitWindow {
+                        remaining_percent: 10.0,
+                        window_minutes: Some(15),
+                        resets_at: Some(bulk_resets_at),
+                    }),
+                    secondary: None,
+                    credits: None,
+                    plan_type: None,
+                    rate_limit_reached_type: None,
+                },
+            )])
+            .expect("bulk rate-limit update without saved accounts should be a no-op"),
+        0
+    );
+    assert_eq!(
+        manager
+            .reconcile_account_rate_limit_refresh_outcomes([(
+                "missing-account".to_string(),
+                AccountRateLimitRefreshOutcome::NoUsableSnapshot,
+            )])
+            .expect("rate-limit outcome reconcile without saved accounts should be a no-op"),
+        0
+    );
 
     assert!(
         !get_auth_file(codex_home.path()).exists(),

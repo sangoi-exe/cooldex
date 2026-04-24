@@ -3667,6 +3667,33 @@ impl AuthManager {
         self.update_store(|store| mutator(&self.account_manager, store))
     }
 
+    fn update_saved_account_store_from_map<T, V>(
+        &self,
+        default: T,
+        entries: impl IntoIterator<Item = (String, V)>,
+        mutator: impl FnOnce(
+            &AccountManager,
+            &mut AuthStore,
+            &mut HashMap<String, V>,
+        ) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        // Merge-safety anchor: collection-backed saved-account runtime
+        // mutations must keep the no-saved-accounts early return before
+        // consuming the caller's iterator; API-key or empty stores must not be
+        // loaded, persisted, cache-refreshed, or drained by account-runtime
+        // telemetry updates.
+        if !self.has_saved_chatgpt_accounts() {
+            return Ok(default);
+        }
+
+        let mut entries = entries.into_iter().collect::<HashMap<_, _>>();
+        if entries.is_empty() {
+            return Ok(default);
+        }
+
+        self.update_store(|store| mutator(&self.account_manager, store, &mut entries))
+    }
+
     pub fn set_active_account(&self, id: &str) -> std::io::Result<()> {
         self.update_store(|store| self.account_manager.set_active_account(store, id))
     }
@@ -3716,19 +3743,8 @@ impl AuthManager {
         &self,
         updates: impl IntoIterator<Item = (String, RateLimitSnapshot)>,
     ) -> std::io::Result<usize> {
-        if !self.has_saved_chatgpt_accounts() {
-            return Ok(0);
-        }
-
-        let mut updates = updates.into_iter().collect::<HashMap<_, _>>();
-        if updates.is_empty() {
-            return Ok(0);
-        }
-
-        self.update_store(|store| {
-            Ok(self
-                .account_manager
-                .update_rate_limits_for_accounts(store, &mut updates))
+        self.update_saved_account_store_from_map(0, updates, |account_manager, store, updates| {
+            Ok(account_manager.update_rate_limits_for_accounts(store, updates))
         })
     }
 
@@ -3736,19 +3752,8 @@ impl AuthManager {
         &self,
         outcomes: impl IntoIterator<Item = (String, AccountRateLimitRefreshOutcome)>,
     ) -> std::io::Result<usize> {
-        if !self.has_saved_chatgpt_accounts() {
-            return Ok(0);
-        }
-
-        let mut outcomes = outcomes.into_iter().collect::<HashMap<_, _>>();
-        if outcomes.is_empty() {
-            return Ok(0);
-        }
-
-        self.update_store(|store| {
-            Ok(self
-                .account_manager
-                .reconcile_account_rate_limit_refresh_outcomes(store, &mut outcomes))
+        self.update_saved_account_store_from_map(0, outcomes, |account_manager, store, outcomes| {
+            Ok(account_manager.reconcile_account_rate_limit_refresh_outcomes(store, outcomes))
         })
     }
 
