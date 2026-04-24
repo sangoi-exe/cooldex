@@ -2948,22 +2948,19 @@ impl AccountManager {
             .min()
     }
 
-    // Merge-safety anchor: usage-limit auto-switch cooldown state belongs to
-    // AccountManager because the runtime account owner, not AuthManager, is
-    // responsible for deciding when autoswitch may run again.
-    fn lock_usage_limit_auto_switch_cooldown(
+    fn switch_account_on_usage_limit_with_cooldown(
         &self,
-    ) -> std::io::Result<std::sync::MutexGuard<'_, Option<DateTime<Utc>>>> {
-        self.usage_limit_auto_switch_cooldown_until
+        request: &UsageLimitAutoSwitchRequest<'_>,
+        switch_store: impl FnOnce(bool) -> std::io::Result<Option<String>>,
+    ) -> std::io::Result<Option<String>> {
+        // Merge-safety anchor: usage-limit auto-switch cooldown orchestration
+        // belongs to AccountManager, and this method must keep the historical
+        // lock order of cooldown mutex before AuthManager's `update_store(...)`.
+        let cooldown_check_now = Utc::now();
+        let mut cooldown_until = self
+            .usage_limit_auto_switch_cooldown_until
             .lock()
-            .map_err(|_| std::io::Error::other("auto-switch cooldown lock poisoned"))
-    }
-
-    fn usage_limit_auto_switch_cooldown_active(
-        &self,
-        cooldown_until: &Option<DateTime<Utc>>,
-        cooldown_check_now: DateTime<Utc>,
-    ) -> bool {
+            .map_err(|_| std::io::Error::other("auto-switch cooldown lock poisoned"))?;
         let cooldown_active = cooldown_until.is_some_and(|until| until > cooldown_check_now);
         if cooldown_active {
             tracing::debug!(
@@ -2971,19 +2968,13 @@ impl AccountManager {
                 "skipping usage-limit auto-switch during cooldown"
             );
         }
-        cooldown_active
-    }
 
-    fn start_usage_limit_auto_switch_cooldown_if_needed(
-        &self,
-        cooldown_until: &mut Option<DateTime<Utc>>,
-        switched_to_store_account_id: Option<&str>,
-        protected_store_account_id: Option<&str>,
-    ) {
-        let should_start_cooldown = switched_to_store_account_id
-            .is_some_and(|switched_to| Some(switched_to) != protected_store_account_id);
+        let switched_to = switch_store(cooldown_active)?;
+        let should_start_cooldown = switched_to
+            .as_deref()
+            .is_some_and(|switched_to| Some(switched_to) != request.protected_store_account_id);
         if !should_start_cooldown {
-            return;
+            return Ok(switched_to);
         }
 
         let cooldown_started_at = Utc::now();
@@ -2991,6 +2982,7 @@ impl AccountManager {
             cooldown_started_at
                 + chrono::Duration::seconds(USAGE_LIMIT_AUTO_SWITCH_COOLDOWN_SECONDS),
         );
+        Ok(switched_to)
     }
 
     fn switch_account_on_usage_limit(
@@ -3735,25 +3727,16 @@ impl AuthManager {
             return Ok(None);
         }
 
-        let cooldown_check_now = Utc::now();
-        let mut cooldown_until = self
-            .account_manager
-            .lock_usage_limit_auto_switch_cooldown()?;
-        let cooldown_active = self
-            .account_manager
-            .usage_limit_auto_switch_cooldown_active(&cooldown_until, cooldown_check_now);
-
-        let switched_to = self.update_store(|store| {
-            self.account_manager
-                .switch_account_on_usage_limit(store, &request, cooldown_active)
-        })?;
         self.account_manager
-            .start_usage_limit_auto_switch_cooldown_if_needed(
-                &mut cooldown_until,
-                switched_to.as_deref(),
-                request.protected_store_account_id,
-            );
-        Ok(switched_to)
+            .switch_account_on_usage_limit_with_cooldown(&request, |cooldown_active| {
+                self.update_store(|store| {
+                    self.account_manager.switch_account_on_usage_limit(
+                        store,
+                        &request,
+                        cooldown_active,
+                    )
+                })
+            })
     }
 
     pub fn select_account_for_auto_switch(

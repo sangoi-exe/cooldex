@@ -1334,6 +1334,23 @@ fn saved_account_runtime_updates_skip_empty_store_without_persisting_auth() {
             .expect("rate-limit outcome reconcile without saved accounts should be a no-op"),
         0
     );
+    let unsupported_store_account_ids = HashSet::new();
+    assert_eq!(
+        manager
+            .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
+                required_workspace_id: None,
+                failing_store_account_id: Some("missing-account"),
+                resets_at: Some(Utc::now()),
+                snapshot: None,
+                freshly_unsupported_store_account_ids: &unsupported_store_account_ids,
+                protected_store_account_id: None,
+                selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+                fallback_selection_mode:
+                    UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
+            })
+            .expect("autoswitch without saved accounts should be a no-op"),
+        None
+    );
 
     assert!(
         !get_auth_file(codex_home.path()).exists(),
