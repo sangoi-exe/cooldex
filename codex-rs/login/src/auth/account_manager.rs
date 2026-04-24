@@ -2000,8 +2000,24 @@ impl AccountManager {
     }
 }
 
-/// Merge-safety anchor: `/accounts` and `/logout` render this exact summary from
-/// `AuthManager::list_accounts`; keep field semantics aligned with TUI account flows.
+impl Drop for AccountManager {
+    fn drop(&mut self) {
+        // Merge-safety anchor: WS12 runtime session leases are AccountManager-owned
+        // runtime state and must be released with the account-runtime owner, not
+        // with the auth/token facade.
+        if let Err(error) = self.release_runtime_active_account() {
+            tracing::warn!(
+                error = %error,
+                runtime_session_id = self.runtime_session_id(),
+                "failed to clear runtime active-account state while dropping account manager"
+            );
+        }
+    }
+}
+
+/// Merge-safety anchor: `/accounts` and `/logout` render this exact
+/// AccountManager-owned summary through the current AuthManager facade; keep
+/// field semantics aligned with TUI account flows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountSummary {
     pub id: String,

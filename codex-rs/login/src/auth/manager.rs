@@ -1586,21 +1586,6 @@ impl Debug for AuthManager {
     }
 }
 
-impl Drop for AuthManager {
-    fn drop(&mut self) {
-        // Merge-safety anchor: WS12 runtime session leases must be released when a live manager
-        // shuts down cleanly, or one-shot login/status processes leave fresh foreign-lease rows
-        // that block the next prompt send for the full TTL.
-        if let Err(error) = self.release_runtime_active_account() {
-            tracing::warn!(
-                error = %error,
-                runtime_session_id = self.account_manager.runtime_session_id(),
-                "failed to clear runtime active-account state while dropping auth manager"
-            );
-        }
-    }
-}
-
 impl AuthManager {
     /// Create a new manager loading the initial auth using the provided
     /// preferred auth method. Errors loading auth or opening the WS12
