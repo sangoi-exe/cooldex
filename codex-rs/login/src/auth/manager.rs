@@ -2144,34 +2144,6 @@ impl AccountManager {
             .map_err(std::io::Error::other)
     }
 
-    fn cached_usage_store_snapshot(&self, mut store: AuthStore) -> AuthStore {
-        // Merge-safety anchor: cached account-runtime readers must share this
-        // AccountManager-owned SQLite-backed saved-account usage truth
-        // hydration step.
-        if let Some(account_state_store) = self.account_state_store.as_ref()
-            && let Err(error) = hydrate_store_usage_from_sqlite(account_state_store, &mut store)
-        {
-            tracing::warn!(
-                error = %error,
-                "failed to refresh saved-account usage truth from sqlite"
-            );
-        }
-
-        store
-    }
-
-    fn cached_runtime_store_snapshot(&self, store: AuthStore) -> AuthStore {
-        let mut store = self.cached_usage_store_snapshot(store);
-        if let Err(error) = self.hydrate_runtime_active_account(&mut store) {
-            tracing::warn!(
-                error = %error,
-                "failed to hydrate runtime active-account state before loading account truth"
-            );
-            store.active_account_id = None;
-        }
-        store
-    }
-
     fn prepare_loaded_store_candidate(
         &self,
         mut store: AuthStore,
@@ -3632,24 +3604,12 @@ impl AuthManager {
     }
 
     pub fn account_rate_limit_refresh_roster(&self) -> AccountRateLimitRefreshRoster {
-        let Some(store) = self.clone_cached_store() else {
-            tracing::warn!(
-                "failed to snapshot auth store before listing rate-limit refresh candidates"
-            );
-            return AccountRateLimitRefreshRoster {
-                store_account_ids: Vec::new(),
-                status: AccountRateLimitRefreshRosterStatus::LeaseReadFailed,
-            };
-        };
-        let store = self.account_manager.cached_runtime_store_snapshot(store);
-
+        // Merge-safety anchor: rate-limit refresh rosters must use the current
+        // AccountManager-loaded runtime snapshot, not the AuthManager cache, so
+        // pre-refresh candidates track live saved accounts and leases.
+        let store = self.load_store_from_storage().store;
         self.account_manager
             .account_rate_limit_refresh_roster(&store)
-    }
-
-    fn clone_cached_store(&self) -> Option<AuthStore> {
-        let guard = self.inner.read().ok()?;
-        Some(guard.store.clone())
     }
 
     fn update_saved_account_store<T>(

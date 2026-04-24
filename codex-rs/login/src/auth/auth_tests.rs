@@ -545,11 +545,11 @@ fn public_auto_switch_selector_reads_live_storage_and_sqlite_usage_truth() {
     );
 }
 
-// Merge-safety anchor: rate-limit refresh rosters must use the same
-// AccountManager-owned cached runtime snapshot as autoswitch readers, including
+// Merge-safety anchor: rate-limit refresh rosters must use the same live
+// AccountManager-owned runtime snapshot as autoswitch readers, including
 // lease-aware exclusion of accounts held by another session.
 #[test]
-fn rate_limit_refresh_roster_excludes_foreign_leased_accounts_from_cached_snapshot() {
+fn rate_limit_refresh_roster_reads_live_storage_and_excludes_foreign_leases() {
     let codex_home = tempdir().expect("create auth tempdir");
     let sqlite_home = tempdir().expect("create sqlite tempdir");
     let workspace_id = "workspace-a";
@@ -578,6 +578,20 @@ fn rate_limit_refresh_roster_excludes_foreign_leased_accounts_from_cached_snapsh
         last_refresh: None,
         usage: None,
     };
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+    assert_eq!(
+        manager.account_rate_limit_refresh_roster(),
+        AccountRateLimitRefreshRoster {
+            store_account_ids: Vec::new(),
+            status: AccountRateLimitRefreshRosterStatus::LeaseManaged,
+        }
+    );
+
     save_auth(
         codex_home.path(),
         &AuthStore {
@@ -592,12 +606,6 @@ fn rate_limit_refresh_roster_excludes_foreign_leased_accounts_from_cached_snapsh
     )
     .expect("save auth store");
 
-    let manager = AuthManager::new_with_sqlite_home(
-        codex_home.path().to_path_buf(),
-        sqlite_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-    );
     manager
         .account_manager
         .account_state_store
