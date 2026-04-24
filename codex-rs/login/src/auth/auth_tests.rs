@@ -652,7 +652,7 @@ fn set_active_account_respects_forced_workspace_and_updates_last_seen() {
                     chatgpt_user_id: Some(format!("user-{store_account_id}")),
                     chatgpt_account_id: Some(workspace_id.to_string()),
                     chatgpt_account_is_fedramp: false,
-                    raw_jwt: raw_jwt.clone(),
+                    raw_jwt,
                 },
                 access_token: format!("{store_account_id}-access-token"),
                 refresh_token: format!("{store_account_id}-refresh-token"),
@@ -1243,7 +1243,7 @@ fn mark_usage_limit_reached_updates_active_usage_and_cache_expiry_uses_sqlite_tr
         .usage
         .as_ref()
         .expect("active account usage should be set");
-    assert_eq!(active_usage.last_rate_limits, Some(snapshot.clone()));
+    assert_eq!(active_usage.last_rate_limits, Some(snapshot));
     assert_eq!(active_usage.exhausted_until, Some(reset_at));
     assert!(active_usage.last_seen_at.is_some());
 
