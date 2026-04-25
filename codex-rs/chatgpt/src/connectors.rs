@@ -1,9 +1,8 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use crate::chatgpt_client::chatgpt_get_request_with_timeout;
-use crate::chatgpt_token::get_chatgpt_token_data;
-use crate::chatgpt_token::init_chatgpt_token_from_auth;
+use crate::chatgpt_client::chatgpt_get_request_with_token;
+use crate::chatgpt_token::load_chatgpt_token_data_from_auth;
 
 use codex_app_server_protocol::AppInfo;
 use codex_connectors::AllConnectorsCacheKey;
@@ -65,12 +64,9 @@ pub async fn list_cached_all_connectors(config: &Config) -> Option<Vec<AppInfo>>
     }
 
     // Merge-safety anchor: cached connector reads use the same config-aware
-    // token owner as network connector fetches; do not reintroduce a separate
-    // token/bootstrap path that ignores forced workspace.
-    if init_chatgpt_token_from_auth(config).await.is_err() {
-        return None;
-    }
-    let token_data = get_chatgpt_token_data()?;
+    // token snapshot as network connector fetches; do not reintroduce a
+    // process-global token/bootstrap path that ignores forced workspace.
+    let token_data = load_chatgpt_token_data_from_auth(config).await.ok()??;
     let cache_key = all_connectors_cache_key(config, &token_data);
     let connectors = codex_connectors::cached_all_connectors(&cache_key)?;
     let connectors = merge_plugin_connectors(
@@ -94,24 +90,28 @@ pub async fn list_all_connectors_with_options(
         return Ok(Vec::new());
     }
     // Merge-safety anchor: connector network fetches must keep ChatGPT token
-    // bootstrap aligned with AuthManagerConfig so account-state leases and
-    // forced workspace do not split across connector surfaces.
-    init_chatgpt_token_from_auth(config).await?;
-
-    let token_data =
-        get_chatgpt_token_data().ok_or_else(|| anyhow::anyhow!("ChatGPT token not available"))?;
+    // snapshots aligned with AuthManagerConfig so account-state leases, cache
+    // keys, and request headers do not split across connector surfaces.
+    let token_data = load_chatgpt_token_data_from_auth(config)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("ChatGPT token not available"))?;
     let cache_key = all_connectors_cache_key(config, &token_data);
+    let request_token_data = token_data.clone();
     let connectors = codex_connectors::list_all_connectors_with_options(
         cache_key,
         token_data.id_token.is_workspace_account(),
         force_refetch,
-        |path| async move {
-            chatgpt_get_request_with_timeout::<DirectoryListResponse>(
-                config,
-                path,
-                Some(DIRECTORY_CONNECTORS_TIMEOUT),
-            )
-            .await
+        |path| {
+            let token_data = request_token_data.clone();
+            async move {
+                chatgpt_get_request_with_token::<DirectoryListResponse>(
+                    config,
+                    path,
+                    Some(DIRECTORY_CONNECTORS_TIMEOUT),
+                    token_data,
+                )
+                .await
+            }
         },
     )
     .await?;

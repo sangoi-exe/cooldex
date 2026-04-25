@@ -6,7 +6,6 @@ use codex_git_utils::ApplyGitRequest;
 use codex_git_utils::apply_git_patch;
 use codex_utils_cli::CliConfigOverrides;
 
-use crate::chatgpt_token::init_chatgpt_token_from_auth;
 use crate::get_task::GetTaskResponse;
 use crate::get_task::OutputItem;
 use crate::get_task::PrOutputItem;
@@ -32,11 +31,9 @@ pub async fn run_apply_command(
     )
     .await?;
 
-    // Merge-safety anchor: ChatGPT task apply must initialize tokens through
-    // the config-aware AuthManager path so sqlite_home and forced workspace stay
-    // bundled before account-state hydration.
-    init_chatgpt_token_from_auth(&config).await?;
-
+    // Merge-safety anchor: ChatGPT task apply delegates request auth to
+    // `chatgpt_get_request`, the per-call token snapshot owner; do not
+    // reintroduce a process-global token bootstrap here.
     let task_response = get_task(&config, apply_cli.task_id).await?;
     apply_diff_from_task(task_response, cwd).await
 }

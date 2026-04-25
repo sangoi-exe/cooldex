@@ -9,6 +9,7 @@ use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::ConfigOverrides;
 use crate::legacy_core::config::find_codex_home;
 use crate::legacy_core::config::load_config_as_toml_with_cli_overrides;
+use crate::legacy_core::config::resolve_cli_auth_credentials_store_mode_for_config_toml;
 use crate::legacy_core::config::resolve_forced_chatgpt_workspace_id_for_config_toml;
 use crate::legacy_core::config::resolve_oss_provider;
 use crate::legacy_core::config::resolve_sqlite_home_for_config_toml;
@@ -855,7 +856,7 @@ pub async fn run_main(
         startup_sqlite_home,
         startup_forced_chatgpt_workspace_id,
         /*enable_codex_api_key_env*/ false,
-        config_toml.cli_auth_credentials_store.unwrap_or_default(),
+        resolve_cli_auth_credentials_store_mode_for_config_toml(&config_toml),
     );
     let cloud_requirements = cloud_requirements_loader(
         startup_auth_manager.clone(),
@@ -1469,16 +1470,39 @@ async fn run_ratatui_app(
         None => None,
     };
 
+    let mut auth_manager = startup_auth_manager.clone();
+    let mut restart_embedded_app_server_after_target_reload = false;
     let mut config = match &session_selection {
         resume_picker::SessionSelection::Resume(_) | resume_picker::SessionSelection::Fork(_) => {
-            load_config_or_exit_with_fallback_cwd(
-                cli_kv_overrides.clone(),
-                overrides.clone(),
-                cloud_requirements.clone(),
-                fallback_cwd,
-                target_config_path,
-            )
-            .await
+            // Merge-safety anchor: resume/fork target config reloads can change
+            // forced workspace and sqlite_home, so target cloud requirements must
+            // be rebuilt from the target AuthManager before final Config loading.
+            let (target_config, target_auth_manager, target_cloud_requirements) =
+                load_resume_or_fork_config_with_fresh_cloud_requirements(
+                    config.codex_home.as_path(),
+                    cli_kv_overrides.clone(),
+                    overrides.clone(),
+                    loader_overrides.clone(),
+                    fallback_cwd,
+                    target_config_path,
+                )
+                .await;
+            if let Some((_, target_session)) = action_and_target_session_if_resume_or_fork
+                && let Err(error) = target_auth_manager
+                    .set_linked_codex_session_id(Some(target_session.thread_id.to_string()))
+            {
+                warn!(
+                    error = %error,
+                    runtime_session_id = target_auth_manager.runtime_session_id(),
+                    thread_id = %target_session.thread_id,
+                    "failed to link target auth runtime before resume/fork config reload"
+                );
+            }
+            cloud_requirements = target_cloud_requirements;
+            auth_manager = target_auth_manager;
+            restart_embedded_app_server_after_target_reload =
+                matches!(app_server_target, AppServerTarget::Embedded);
+            target_config
         }
         _ => config,
     };
@@ -1509,9 +1533,17 @@ async fn run_ratatui_app(
 
     let use_alt_screen = determine_alt_screen_mode(no_alt_screen, config.tui_alternate_screen);
     tui.set_alt_screen_enabled(use_alt_screen);
-    startup_auth_manager
-        .set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
-    let auth_manager = startup_auth_manager.clone();
+    auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
+    let app_server = if let Some(existing_app_server) = app_server {
+        if restart_embedded_app_server_after_target_reload {
+            shutdown_app_server_if_present(Some(existing_app_server)).await;
+            None
+        } else {
+            Some(existing_app_server)
+        }
+    } else {
+        None
+    };
     let app_server = match app_server {
         Some(app_server) => app_server,
         None => match start_app_server(
@@ -1804,6 +1836,44 @@ async fn get_login_status(
     })
 }
 
+async fn load_resume_or_fork_config_with_fresh_cloud_requirements(
+    codex_home: &Path,
+    cli_kv_overrides: Vec<(String, toml::Value)>,
+    overrides: ConfigOverrides,
+    loader_overrides: LoaderOverrides,
+    fallback_cwd: Option<PathBuf>,
+    target_config_path: Option<PathBuf>,
+) -> (Config, Arc<AuthManager>, CloudRequirementsLoader) {
+    let bootstrap_config = load_config_or_exit_with_fallback_cwd_for_codex_home(
+        Some(codex_home.to_path_buf()),
+        cli_kv_overrides.clone(),
+        overrides.clone(),
+        loader_overrides.clone(),
+        CloudRequirementsLoader::default(),
+        fallback_cwd.clone(),
+        target_config_path.clone(),
+    )
+    .await;
+    let auth_manager =
+        AuthManager::shared_from_config(&bootstrap_config, /*enable_codex_api_key_env*/ false);
+    let cloud_requirements = cloud_requirements_loader(
+        auth_manager.clone(),
+        bootstrap_config.chatgpt_base_url.clone(),
+        bootstrap_config.codex_home.to_path_buf(),
+    );
+    let config = load_config_or_exit_with_fallback_cwd_for_codex_home(
+        Some(codex_home.to_path_buf()),
+        cli_kv_overrides,
+        overrides,
+        loader_overrides,
+        cloud_requirements.clone(),
+        fallback_cwd,
+        target_config_path,
+    )
+    .await;
+    (config, auth_manager, cloud_requirements)
+}
+
 async fn load_config_or_exit(
     cli_kv_overrides: Vec<(String, toml::Value)>,
     overrides: ConfigOverrides,
@@ -1826,16 +1896,40 @@ async fn load_config_or_exit_with_fallback_cwd(
     fallback_cwd: Option<PathBuf>,
     fallback_config_path: Option<PathBuf>,
 ) -> Config {
-    #[allow(clippy::print_stderr)]
-    match ConfigBuilder::default()
+    load_config_or_exit_with_fallback_cwd_for_codex_home(
+        /*codex_home*/ None,
+        cli_kv_overrides,
+        overrides,
+        LoaderOverrides::default(),
+        cloud_requirements,
+        fallback_cwd,
+        fallback_config_path,
+    )
+    .await
+}
+
+async fn load_config_or_exit_with_fallback_cwd_for_codex_home(
+    codex_home: Option<PathBuf>,
+    cli_kv_overrides: Vec<(String, toml::Value)>,
+    overrides: ConfigOverrides,
+    loader_overrides: LoaderOverrides,
+    cloud_requirements: CloudRequirementsLoader,
+    fallback_cwd: Option<PathBuf>,
+    fallback_config_path: Option<PathBuf>,
+) -> Config {
+    let mut config_builder = ConfigBuilder::default()
         .cli_overrides(cli_kv_overrides)
         .harness_overrides(overrides)
+        .loader_overrides(loader_overrides)
         .cloud_requirements(cloud_requirements)
         .fallback_cwd(fallback_cwd)
-        .user_config_path(fallback_config_path)
-        .build()
-        .await
-    {
+        .user_config_path(fallback_config_path);
+    if let Some(codex_home) = codex_home {
+        config_builder = config_builder.codex_home(codex_home);
+    }
+
+    #[allow(clippy::print_stderr)]
+    match config_builder.build().await {
         Ok(config) => config,
         Err(err) => {
             eprintln!("Error loading configuration: {err}");
@@ -1917,6 +2011,40 @@ mod tests {
             environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn reload_resume_or_fork_config_uses_target_auth_inputs() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let codex_home = temp_dir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home)?;
+        let target_config_path = temp_dir.path().join("target-config.toml");
+        std::fs::write(
+            &target_config_path,
+            r#"forced_chatgpt_workspace_id = " target-workspace "
+"#,
+        )?;
+
+        let (config, auth_manager, _cloud_requirements) =
+            load_resume_or_fork_config_with_fresh_cloud_requirements(
+                &codex_home,
+                Vec::new(),
+                ConfigOverrides::default(),
+                LoaderOverrides::without_managed_config_for_tests(),
+                Some(temp_dir.path().to_path_buf()),
+                Some(target_config_path),
+            )
+            .await;
+
+        assert_eq!(
+            config.forced_chatgpt_workspace_id.as_deref(),
+            Some("target-workspace")
+        );
+        assert_eq!(
+            auth_manager.forced_chatgpt_workspace_id().as_deref(),
+            Some("target-workspace")
+        );
+        Ok(())
     }
 
     #[test]

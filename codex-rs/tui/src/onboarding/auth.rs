@@ -962,8 +962,7 @@ mod tests {
     use codex_app_server_client::InProcessAppServerClient;
     use codex_app_server_client::InProcessClientStartArgs;
     use codex_arg0::Arg0DispatchPaths;
-    use codex_cloud_requirements::cloud_requirements_loader_for_storage;
-    use codex_config::types::AuthCredentialsStoreMode;
+    use codex_cloud_requirements::cloud_requirements_loader;
     use codex_login::AuthManager;
 
     use codex_protocol::protocol::SessionSource;
@@ -979,21 +978,18 @@ mod tests {
             .build()
             .await
             .unwrap();
+        let auth_manager =
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
         let client = InProcessAppServerClient::start(InProcessClientStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
-            auth_manager: AuthManager::shared_from_config(
-                &config, /*enable_codex_api_key_env*/ false,
-            ),
+            auth_manager: auth_manager.clone(),
             config: Arc::new(config),
             cli_overrides: Vec::new(),
             loader_overrides: Default::default(),
-            cloud_requirements: cloud_requirements_loader_for_storage(
-                codex_home_path.clone(),
-                codex_home_path.clone(),
-                /*forced_chatgpt_workspace_id*/ None,
-                /*enable_codex_api_key_env*/ false,
-                AuthCredentialsStoreMode::File,
+            cloud_requirements: cloud_requirements_loader(
+                auth_manager,
                 "https://chatgpt.com/backend-api/".to_string(),
+                codex_home_path.clone(),
             ),
             feedback: codex_feedback::CodexFeedback::new(),
             log_db: None,

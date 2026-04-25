@@ -198,6 +198,18 @@ fn resolve_cli_auth_credentials_store_mode(
     }
 }
 
+// Merge-safety anchor: pre-Config auth/bootstrap paths must resolve credential
+// store mode with the same local-dev fallback semantics as full Config loading,
+// or shared AuthManager owners can silently read different auth stores.
+pub fn resolve_cli_auth_credentials_store_mode_for_config_toml(
+    cfg: &ConfigToml,
+) -> AuthCredentialsStoreMode {
+    resolve_cli_auth_credentials_store_mode(
+        cfg.cli_auth_credentials_store.unwrap_or_default(),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
 fn resolve_mcp_oauth_credentials_store_mode(
     configured: OAuthCredentialsStoreMode,
     package_version: &str,
@@ -1948,6 +1960,8 @@ impl Config {
         let multi_agent_v2 = resolve_multi_agent_v2_config(&cfg, &config_profile);
         let forced_chatgpt_workspace_id =
             resolve_forced_chatgpt_workspace_id_for_config_toml(&cfg);
+        let cli_auth_credentials_store_mode =
+            resolve_cli_auth_credentials_store_mode_for_config_toml(&cfg);
 
         let agent_roles =
             agent_roles::load_agent_roles(fs, &cfg, &config_layer_stack, &mut startup_warnings)
@@ -2385,10 +2399,7 @@ impl Config {
             include_environment_context,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.
-            cli_auth_credentials_store_mode: resolve_cli_auth_credentials_store_mode(
-                cfg.cli_auth_credentials_store.unwrap_or_default(),
-                env!("CARGO_PKG_VERSION"),
-            ),
+            cli_auth_credentials_store_mode,
             mcp_servers,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.
