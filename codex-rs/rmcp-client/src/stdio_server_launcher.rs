@@ -296,6 +296,8 @@ impl Drop for ProcessGroupGuard {
 }
 
 // Remote public implementation.
+// Merge-safety anchor: remote MCP stdio must launch through the executor
+// while preserving local-sourced env overlays and remote-sourced env requests.
 
 /// Starts MCP stdio servers through the executor process API.
 ///

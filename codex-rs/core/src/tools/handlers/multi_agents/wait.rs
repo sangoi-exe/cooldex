@@ -301,7 +301,7 @@ fn wait_condition_already_met(
         return true;
     }
     match return_when {
-        CollabWaitReturnWhen::AnyFinal => final_status_count > 0,
+        CollabWaitReturnWhen::AnyFinal => final_status_count == total_status_count,
         CollabWaitReturnWhen::AllFinal => final_status_count == total_status_count,
     }
 }

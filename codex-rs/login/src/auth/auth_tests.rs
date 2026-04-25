@@ -284,6 +284,22 @@ fn external_chatgpt_auth_store_with_plan(
 }
 
 #[test]
+#[should_panic(expected = "failed to open required account state store")]
+fn auth_manager_new_fails_loud_when_account_state_store_cannot_open() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_parent = tempdir().expect("create sqlite tempdir");
+    let sqlite_home = sqlite_parent.path().join("not-a-directory");
+    std::fs::write(&sqlite_home, b"not a directory").expect("seed sqlite path blocker");
+
+    let _ = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home,
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    );
+}
+
+#[test]
 fn auth_manager_logout_releases_runtime_active_account_lease() {
     let dir = tempdir().unwrap();
     let store_account_id = "store-account-a";

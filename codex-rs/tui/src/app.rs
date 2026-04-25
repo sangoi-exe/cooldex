@@ -7447,6 +7447,9 @@ impl App {
                     active_store_account_id,
                 } => {
                     if self.remote_app_server_url.is_some() {
+                        // Merge-safety anchor: remote add-account completion must refresh
+                        // app-server-owned projection only; local `/accounts` status
+                        // refresh would mix the orchestrator AuthManager into remote truth.
                         self.refresh_app_server_account_projection_after_remote_account_change(
                             app_server,
                             AccountProjectionRefreshTrigger::ManualAddAccount,
@@ -7457,11 +7460,11 @@ impl App {
                             app_server,
                             AccountProjectionRefreshTrigger::ManualAddAccount,
                         );
+                        self.maybe_start_accounts_status_refresh(
+                            /*force*/ true, /*open_popup_when_ready*/ false,
+                            /*show_loading_popup*/ false,
+                        );
                     }
-                    self.maybe_start_accounts_status_refresh(
-                        /*force*/ true, /*open_popup_when_ready*/ false,
-                        /*show_loading_popup*/ false,
-                    );
                     if let Some(display) = active_account_display {
                         self.chat_widget.add_info_message(
                             format!("Active account: {display}"),

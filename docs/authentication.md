@@ -34,12 +34,12 @@ When using ChatGPT authentication, `auth.json` (or the keyring entry) stores a *
 - Terminal refresh-token failures (`expired`, `reused`, or `invalidated`) evict the matching saved ChatGPT account instead of leaving it in the store with a sticky dead refresh state. If that account was active and another saved ChatGPT account is eligible, Codex switches to the fallback immediately; otherwise the current runtime becomes unauthenticated until you select or sign in to another account.
 - `codex logout` deletes the stored credentials (removes the `auth.json` file and the keyring entry, if present).
 - In the TUIs, use `/accounts` to switch the active account, add additional accounts, inspect whether an account is leased by the current or another live session, and force-release a foreign live lease when you need to recover from a crashed/stuck session. When multiple accounts are stored, `/logout` lets you choose between logging out all accounts or removing a single account (then exits). `/accounts` status refresh also prunes saved accounts that hit a terminal refresh-token failure while their usage data is being refreshed, and it does not advance cache freshness when account resolution fails transiently before usage fetch starts.
-- Keep this aligned with `AuthManager::list_accounts()` and TUI account popups: `/accounts` renders only the summary fields exposed there.
+- Keep this aligned with the AccountManager-owned account summary projection surfaced through `AuthManager::list_accounts()` and TUI account popups: `/accounts` renders only the summary fields exposed there.
 - The app-server account APIs expose the same saved-account roster/switch/lease-recovery surface used by remote `/accounts`: `account/list`, `account/active/set`, and `account/lease/forceRelease`.
 
 ## Auto-switch on usage limit
 
-<!-- Merge-safety anchor: usage-limit auto-switch behavior must stay aligned with the pre-refresh fallback-selection path in `codex-rs/core/src/session/turn.rs` and the auth-store eviction path in `codex-rs/login/src/auth/manager.rs`. -->
+<!-- Merge-safety anchor: usage-limit auto-switch behavior must stay aligned with the pre-refresh fallback-selection path in `codex-rs/core/src/session/turn.rs` and the AccountManager-owned saved-account eviction/mutation path in `codex-rs/login/src/auth/account_manager.rs`. -->
 When the backend returns `usage_limit_reached` (HTTP 429) for the active **ChatGPT** account, Codex will:
 
 1) mark the active account as exhausted until its reset time (when available),

@@ -2836,7 +2836,7 @@ async fn wait_agent_returns_final_status_without_timeout() {
 }
 
 #[tokio::test]
-async fn wait_agent_any_final_returns_immediately_when_one_agent_is_already_final() {
+async fn wait_agent_any_final_waits_for_non_final_agent_when_another_is_already_final() {
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();
     session.services.agent_control = manager.agent_control();
@@ -2866,9 +2866,11 @@ async fn wait_agent_any_final_returns_immediately_when_one_agent_is_already_fina
         .await
         .expect("shutdown status should arrive");
 
-    let invocation = invocation(
-        Arc::new(session),
-        Arc::new(turn),
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let early_invocation = invocation(
+        Arc::clone(&session),
+        Arc::clone(&turn),
         "wait_agent",
         function_payload(json!({
             "ids": [completed_agent_id.to_string(), running_agent_id.to_string()],
@@ -2876,13 +2878,45 @@ async fn wait_agent_any_final_returns_immediately_when_one_agent_is_already_fina
             "disable_timeout": true
         })),
     );
-    let output = timeout(
-        Duration::from_millis(250),
-        WaitAgentHandler.handle(invocation),
+
+    let early = timeout(
+        Duration::from_millis(50),
+        WaitAgentHandler.handle(early_invocation),
     )
-    .await
-    .expect("any_final wait should return immediately when one agent is already final")
-    .expect("wait_agent should succeed");
+    .await;
+    assert!(
+        early.is_err(),
+        "any_final should wait for a requested agent that was not final at wait start"
+    );
+
+    let mut running_status_rx = manager
+        .agent_control()
+        .subscribe_status(running_agent_id)
+        .await
+        .expect("subscribe should succeed");
+    let _ = running_thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
+    let _ = timeout(Duration::from_secs(1), running_status_rx.changed())
+        .await
+        .expect("running shutdown status should arrive");
+
+    let invocation = invocation(
+        session,
+        turn,
+        "wait_agent",
+        function_payload(json!({
+            "ids": [completed_agent_id.to_string(), running_agent_id.to_string()],
+            "return_when": "any_final",
+            "disable_timeout": true
+        })),
+    );
+    let output = timeout(Duration::from_secs(1), WaitAgentHandler.handle(invocation))
+        .await
+        .expect("any_final should return once every requested agent is already final")
+        .expect("wait_agent should succeed");
     let (content, success) = expect_text_output(output);
     let result: wait::WaitResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
@@ -2900,19 +2934,14 @@ async fn wait_agent_any_final_returns_immediately_when_one_agent_is_already_fina
         result.agents.get(&completed_agent_id)
     );
     assert!(matches!(
-        result
-            .agents
-            .get(&running_agent_id)
-            .map(|state| state.status.clone()),
-        Some(AgentStatus::PendingInit | AgentStatus::Running)
+        result.agents.get(&running_agent_id),
+        Some(crate::agent::status::AgentRuntimeState {
+            status: AgentStatus::Shutdown,
+            last_activity: Some(activity),
+        }) if activity.kind == CollabAgentActivityKind::Status
+            && activity.summary == "Shutdown complete"
     ));
     assert_eq!(success, None);
-
-    let _ = running_thread
-        .thread
-        .submit(Op::Shutdown {})
-        .await
-        .expect("shutdown should submit");
 }
 
 #[tokio::test]

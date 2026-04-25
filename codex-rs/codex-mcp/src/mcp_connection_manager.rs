@@ -1559,6 +1559,9 @@ async fn make_rmcp_client(
                     .map(|(key, value)| (key.into(), value.into()))
                     .collect::<HashMap<_, _>>()
             });
+            // Merge-safety anchor: remote-aware MCP stdio routing must select
+            // the executor launcher only for explicitly remote MCP servers and
+            // must keep local stdio on the local launcher.
             let launcher = if remote_environment {
                 let exec_environment = runtime_environment.environment();
                 if !exec_environment.is_remote() {

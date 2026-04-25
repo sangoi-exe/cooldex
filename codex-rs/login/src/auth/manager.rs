@@ -278,18 +278,18 @@ impl RefreshTokenError {
     }
 }
 
-fn open_account_state_store(sqlite_home: &Path) -> Option<AccountStateStore> {
-    match AccountStateStore::open(sqlite_home.to_path_buf()) {
-        Ok(account_state_store) => Some(account_state_store),
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                sqlite_home = %sqlite_home.display(),
-                "failed to open account state store; preserving legacy auth-store usage truth"
-            );
-            None
-        }
-    }
+fn open_account_state_store(sqlite_home: &Path) -> AccountStateStore {
+    AccountStateStore::open(sqlite_home.to_path_buf()).unwrap_or_else(|error| {
+        tracing::error!(
+            error = %error,
+            sqlite_home = %sqlite_home.display(),
+            "failed to open required account state store"
+        );
+        panic!(
+            "failed to open required account state store at {}: {error}",
+            sqlite_home.display()
+        );
+    })
 }
 
 impl From<RefreshTokenError> for std::io::Error {
@@ -1531,14 +1531,13 @@ impl UnauthorizedRecovery {
     }
 }
 
-/// Central manager providing a single source of truth for auth.json derived
-/// authentication data. It loads once (or on preference change) and then
-/// hands out cloned `CodexAuth` values so the rest of the program has a
-/// consistent snapshot.
+/// Auth facade for auth.json-derived authentication data.
 ///
-/// External modifications to `auth.json` will NOT be observed until
-/// `reload()` is called explicitly. This matches the design goal of avoiding
-/// different parts of the program seeing inconsistent auth data mid‑run.
+/// `AuthManager` owns auth derivation and cached `CodexAuth` handoff, while
+/// saved-account roster, runtime-active account state, leases, and usage truth
+/// stay under [`AccountManager`]. Live account readers reload through
+/// `AccountManager` so external account-store changes can update the cache at
+/// explicit account-state boundaries.
 pub struct AuthManager {
     codex_home: PathBuf,
     storage: Arc<dyn AuthStorageBackend>,
@@ -1590,11 +1589,9 @@ impl Debug for AuthManager {
 
 impl AuthManager {
     /// Create a new manager loading the initial auth using the provided
-    /// preferred auth method. Errors loading auth or opening the WS12
-    /// account-state store are swallowed; `auth()` will simply return `None`
-    /// in that case so callers can treat it as an unauthenticated state, and
-    /// saved-account usage truth falls back to the legacy auth-store cache
-    /// until SQLite ownership becomes available again.
+    /// preferred auth method. Errors loading auth are treated as an
+    /// unauthenticated state; opening the account-state store is required
+    /// because AccountManager owns saved-account runtime truth.
     pub fn new(
         codex_home: PathBuf,
         enable_codex_api_key_env: bool,
@@ -1616,7 +1613,7 @@ impl AuthManager {
     ) -> Self {
         let (auth_state_tx, _) = watch::channel(());
         let storage = create_auth_storage(codex_home.clone(), auth_credentials_store_mode);
-        let account_state_store = open_account_state_store(sqlite_home.as_path());
+        let account_state_store = Some(open_account_state_store(sqlite_home.as_path()));
         let runtime_session_id = uuid::Uuid::new_v4().to_string();
         let account_manager = AccountManager::new(
             codex_home.clone(),
@@ -1659,7 +1656,7 @@ impl AuthManager {
         let temp_dir = tempfile::tempdir().unwrap_or_else(|err| panic!("temp codex home: {err}"));
         let codex_home = temp_dir.path().to_path_buf();
         let storage = create_auth_storage(codex_home.clone(), AuthCredentialsStoreMode::File);
-        let account_state_store = open_account_state_store(codex_home.as_path());
+        let account_state_store = Some(open_account_state_store(codex_home.as_path()));
         let store = store_from_auth_for_testing(&auth);
         storage
             .save(&store)
@@ -1696,7 +1693,7 @@ impl AuthManager {
     /// Create an AuthManager with a specific CodexAuth and codex home, for testing only.
     pub fn from_auth_for_testing_with_home(auth: CodexAuth, codex_home: PathBuf) -> Arc<Self> {
         let storage = create_auth_storage(codex_home.clone(), AuthCredentialsStoreMode::File);
-        let account_state_store = open_account_state_store(codex_home.as_path());
+        let account_state_store = Some(open_account_state_store(codex_home.as_path()));
         let store = store_from_auth_for_testing(&auth);
         storage
             .save(&store)
@@ -2126,9 +2123,9 @@ impl AuthManager {
                 .map(|failure| failure.error.clone())
         })
     }
-    /// Current cached auth (clone). May be `None` if not logged in or load failed.
-    /// For stale managed ChatGPT auth, first performs a guarded reload and then
-    /// refreshes only if the on-disk auth is unchanged.
+    /// Current request auth. Uses cached auth on the hot path, reloads through
+    /// AccountManager when the cache is empty, and refreshes stale managed
+    /// ChatGPT auth only if the on-disk auth is unchanged.
     pub async fn auth(&self) -> Option<CodexAuth> {
         if let Some(auth) = self.resolve_external_api_key_auth().await {
             return Some(auth);

@@ -1,5 +1,8 @@
 //! rmcp transport adapter for an executor-managed MCP stdio process.
 //!
+//! Merge-safety anchor: remote MCP stdio framing must stay byte-for-byte
+//! owned by this executor transport after the launcher starts the process.
+//!
 //! This module owns the lower-level byte translation after
 //! `stdio_server_launcher` has already started a process through
 //! `ExecBackend::start`. It does not choose where the MCP server runs and it

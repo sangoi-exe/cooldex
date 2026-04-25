@@ -207,6 +207,9 @@ impl Session {
             turn_context.sub_id.clone(),
             self.get_tx_event(),
             turn_context.sandbox_policy.get().clone(),
+            // Merge-safety anchor: MCP startup must pass the turn runtime
+            // environment into the connection manager so remote stdio servers
+            // can run through the executor instead of the orchestrator.
             McpRuntimeEnvironment::new(
                 turn_context
                     .environment
