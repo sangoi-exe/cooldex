@@ -1437,9 +1437,11 @@ impl AccountManager {
         store_account_id: &str,
         admission_policy: ChatgptAuthAdmissionPolicy,
     ) -> std::io::Result<Option<TerminalRefreshFailureStoreMutation>> {
-        // Merge-safety anchor: terminal refresh-token eviction keeps AuthManager
-        // as the lock/load/cache/auth owner while AccountManager owns saved-account
-        // eviction mutation, fallback selection, lease diagnostics, and persistence.
+        // Merge-safety anchor: terminal refresh-token eviction is AccountManager-owned
+        // for the caller-provided store; keep admission-policy enforcement, fallback
+        // selection, lease diagnostics, validation, and persistence here. The selected
+        // store-origin wrapper owns lock/load and AuthManager only consumes its returned
+        // snapshot for derived auth/cache refresh.
         let removed_before_mutation = enforce_chatgpt_auth_accounts(store, admission_policy);
         if !removed_before_mutation.is_empty() {
             tracing::info!(
