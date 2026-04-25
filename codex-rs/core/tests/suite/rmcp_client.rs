@@ -1585,6 +1585,8 @@ async fn stdio_server_propagates_whitelisted_env_vars() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial(mcp_env_source)]
 async fn stdio_server_propagates_explicit_local_env_var_source() -> anyhow::Result<()> {
+    // Merge-safety anchor: remote-aware stdio MCP tests prove `source = "local"`
+    // stays local-orchestrator-owned while `source = "remote"` stays executor-owned.
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1692,6 +1694,8 @@ async fn stdio_server_propagates_explicit_local_env_var_source() -> anyhow::Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial(mcp_env_source)]
 async fn remote_stdio_env_var_source_does_not_copy_local_env() -> anyhow::Result<()> {
+    // Merge-safety anchor: remote-aware stdio MCP tests prove `source = "remote"`
+    // never leaks local orchestrator env into the remote executor payload.
     skip_if_no_network!(Ok(()));
     if std::env::var_os(remote_env_env_var()).is_none() {
         return Ok(());

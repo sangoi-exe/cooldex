@@ -28,7 +28,8 @@ Runs Cargo with a deterministic free-space guardrail for build-like commands:
   - preserves the caller cwd when `--manifest-path` is supplied so Cargo resolves that manifest/config context truthfully
   - derives the effective `target_directory` and `build_directory` from `cargo metadata`
   - caps guarded Cargo build parallelism at 4 jobs by default
-  - rejects explicit `-j/--jobs` requests above 4
+  - rejects explicit `-j/--jobs` or `--config build.jobs=...` requests outside 1..=4
+  - rejects path-style `--config <PATH>` for guarded build-like commands because it can override build.jobs
   - requires at least 5 GiB free before starting a guarded build-like command
   - runs `cargo clean` only when the lowest free-space filesystem across the derived target/build dirs is below the floor
   - never runs `cargo clean` solely because the guarded Cargo command failed or was interrupted
@@ -38,7 +39,7 @@ Guarded build-like subcommands:
 
 Supported Cargo context inputs:
   - `+toolchain`
-  - `--config <KEY=VALUE|PATH>` / `--config=<KEY=VALUE|PATH>`
+  - `--config <KEY=VALUE>` / `--config=<KEY=VALUE>`; path-style config is rejected for guarded build-like commands
   - `--manifest-path <path>` / `--manifest-path=<path>`
   - `--lockfile-path <path>` / `--lockfile-path=<path>`
   - `--target-dir <path>` / `--target-dir=<path>`
@@ -92,21 +93,24 @@ append_unique_path() {
     guard_paths+=("${candidate}")
 }
 
-extract_build_jobs_config_value() {
+record_config_build_jobs() {
     local config_value="$1"
     local compact_config
     compact_config="$(printf '%s' "${config_value}" | tr -d '[:space:]')"
-    if [[ "${compact_config}" =~ (^|[;,])build\.jobs=\"?([0-9]+)\"?($|[;,]) ]]; then
-        printf '%s\n' "${BASH_REMATCH[2]}"
+    if [[ "${compact_config}" != *=* ]]; then
+        explicit_config_jobs_error="path-style --config ${config_value} is rejected for guarded build-like commands because it may override build.jobs"
+        return
     fi
-}
-
-record_config_build_jobs() {
-    local config_value="$1"
-    local config_jobs
-    config_jobs="$(extract_build_jobs_config_value "${config_value}")"
-    if [[ -n "${config_jobs}" ]]; then
-        explicit_config_jobs_raw="${config_jobs}"
+    if [[ "${compact_config}" =~ (^|[;,])build\.jobs=([^;,]+)($|[;,]) ]]; then
+        explicit_config_jobs_raw="${BASH_REMATCH[2]}"
+        return
+    fi
+    if [[ "${compact_config}" =~ (^|[;,])build=\{[^}]*jobs=([^,}\;]+)[^}]*\}($|[;,]) ]]; then
+        explicit_config_jobs_raw="${BASH_REMATCH[2]}"
+        return
+    fi
+    if [[ "${compact_config}" == *"build.jobs"* ]] || [[ "${compact_config}" == *"build={"*"jobs="* ]]; then
+        explicit_config_jobs_error="unsupported Cargo build.jobs config form: ${config_value}"
     fi
 }
 
@@ -237,6 +241,7 @@ explicit_target_dir_raw=""
 cargo_subcommand=""
 explicit_jobs_raw=""
 explicit_config_jobs_raw=""
+explicit_config_jobs_error=""
 
 index=0
 while (( index < ${#cargo_args[@]} )); do
@@ -467,6 +472,14 @@ if [[ -n "${explicit_jobs_raw}" ]]; then
     resolved_cargo_build_jobs="${explicit_jobs_raw}"
 fi
 if [[ -n "${explicit_config_jobs_raw}" ]]; then
+    explicit_config_jobs_raw="${explicit_config_jobs_raw%\"}"
+    explicit_config_jobs_raw="${explicit_config_jobs_raw#\"}"
+    explicit_config_jobs_raw="${explicit_config_jobs_raw%\'}"
+    explicit_config_jobs_raw="${explicit_config_jobs_raw#\'}"
+    if ! [[ "${explicit_config_jobs_raw}" =~ ^[0-9]+$ ]] || (( explicit_config_jobs_raw <= 0 )); then
+        log error "Cargo build.jobs config must be a positive integer not greater than ${MAX_CARGO_BUILD_JOBS}; got ${explicit_config_jobs_raw}"
+        exit 2
+    fi
     if (( explicit_config_jobs_raw > MAX_CARGO_BUILD_JOBS )); then
         log error "Cargo build.jobs config ${explicit_config_jobs_raw} exceeds wrapper cap ${MAX_CARGO_BUILD_JOBS}; rerun with build.jobs=${MAX_CARGO_BUILD_JOBS} or lower"
         exit 2
@@ -474,6 +487,10 @@ if [[ -n "${explicit_config_jobs_raw}" ]]; then
     if [[ -z "${explicit_jobs_raw}" ]]; then
         resolved_cargo_build_jobs="${explicit_config_jobs_raw}"
     fi
+fi
+if [[ -n "${explicit_config_jobs_error}" ]]; then
+    log error "${explicit_config_jobs_error}"
+    exit 2
 fi
 
 resolve_metadata_dirs

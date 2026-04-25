@@ -249,6 +249,8 @@ fn array_from_strings(values: &[String]) -> TomlItem {
 }
 
 fn array_from_env_vars(env_vars: &[McpServerEnvVar]) -> TomlItem {
+    // Merge-safety anchor: MCP env-var `source` serialization must stay in lockstep with
+    // `McpServerEnvVarSource` so remote-aware stdio config round-trips only local/remote.
     let mut array = toml_edit::Array::new();
     for env_var in env_vars {
         match env_var {

@@ -99,6 +99,8 @@ fn deserialize_stdio_command_server_config_with_env_vars() {
 
 #[test]
 fn deserialize_stdio_command_server_config_with_env_var_sources() {
+    // Merge-safety anchor: MCP config tests lock the local/remote `env_vars.source`
+    // contract that generated schema and runtime stdio routing must preserve.
     let cfg: McpServerConfig = toml::from_str(
         r#"
             command = "echo"

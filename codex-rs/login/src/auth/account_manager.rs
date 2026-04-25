@@ -1108,23 +1108,6 @@ impl AccountManager {
         }
     }
 
-    fn storage_for_store_origin(
-        &self,
-        store_origin: LoadedStoreOrigin,
-    ) -> Arc<dyn AuthStorageBackend> {
-        match store_origin {
-            LoadedStoreOrigin::Persistent => Arc::clone(&self.storage),
-            LoadedStoreOrigin::ExternalEphemeral
-                if self.auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral =>
-            {
-                Arc::clone(&self.storage)
-            }
-            LoadedStoreOrigin::ExternalEphemeral => {
-                create_auth_storage(self.codex_home.clone(), AuthCredentialsStoreMode::Ephemeral)
-            }
-        }
-    }
-
     pub(super) fn load_store_from_storage(&self) -> LoadedAuthStore {
         // Merge-safety anchor: live store loading keeps AccountManager as the
         // owner of auth-store selection, admission filtering, sqlite-backed
@@ -1373,13 +1356,25 @@ impl AccountManager {
         // account-runtime mutation transaction against the selected store origin;
         // keep auth-store lock/load/persist here and let AuthManager only refresh
         // derived auth from the returned snapshot.
-        let storage = self.storage_for_store_origin(store_origin);
+        let storage = match store_origin {
+            LoadedStoreOrigin::Persistent => Arc::clone(&self.storage),
+            LoadedStoreOrigin::ExternalEphemeral
+                if self.auth_credentials_store_mode == AuthCredentialsStoreMode::Ephemeral =>
+            {
+                Arc::clone(&self.storage)
+            }
+            LoadedStoreOrigin::ExternalEphemeral => {
+                create_auth_storage(self.codex_home.clone(), AuthCredentialsStoreMode::Ephemeral)
+            }
+        };
+        let admission_policy = Self::chatgpt_auth_admission_policy_for_store_origin(store_origin);
         let _lock = lock_auth_store(&self.codex_home)?;
         let mut store = storage.load()?.unwrap_or_default();
         let Some(mutation) = self.remove_store_account_after_terminal_refresh_failure(
             &mut store,
             &*storage,
             store_account_id,
+            admission_policy,
         )?
         else {
             return Ok(None);
@@ -1440,12 +1435,12 @@ impl AccountManager {
         store: &mut AuthStore,
         persist_storage: &dyn AuthStorageBackend,
         store_account_id: &str,
+        admission_policy: ChatgptAuthAdmissionPolicy,
     ) -> std::io::Result<Option<TerminalRefreshFailureStoreMutation>> {
         // Merge-safety anchor: terminal refresh-token eviction keeps AuthManager
         // as the lock/load/cache/auth owner while AccountManager owns saved-account
         // eviction mutation, fallback selection, lease diagnostics, and persistence.
-        let removed_before_mutation =
-            enforce_chatgpt_auth_accounts(store, ChatgptAuthAdmissionPolicy::Persisted);
+        let removed_before_mutation = enforce_chatgpt_auth_accounts(store, admission_policy);
         if !removed_before_mutation.is_empty() {
             tracing::info!(
                 removed_account_ids = ?removed_before_mutation,
@@ -1562,8 +1557,7 @@ impl AccountManager {
             None
         };
 
-        let removed_after_mutation =
-            enforce_chatgpt_auth_accounts(store, ChatgptAuthAdmissionPolicy::Persisted);
+        let removed_after_mutation = enforce_chatgpt_auth_accounts(store, admission_policy);
         if !removed_after_mutation.is_empty() {
             tracing::info!(
                 removed_account_ids = ?removed_after_mutation,

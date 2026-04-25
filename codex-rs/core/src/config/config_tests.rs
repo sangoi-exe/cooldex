@@ -2555,6 +2555,8 @@ async fn replace_mcp_servers_serializes_env_vars() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn replace_mcp_servers_serializes_sourced_env_vars() -> anyhow::Result<()> {
+    // Merge-safety anchor: config-edit tests lock MCP env-var source serialization
+    // as a follower of the typed local/remote config contract.
     let codex_home = TempDir::new()?;
 
     let servers = BTreeMap::from([(

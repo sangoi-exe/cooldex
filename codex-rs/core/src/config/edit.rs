@@ -353,6 +353,8 @@ mod document_helpers {
     }
 
     fn array_from_env_vars(env_vars: &[McpServerEnvVar]) -> TomlItem {
+        // Merge-safety anchor: core config edits are a follower of the typed MCP
+        // env-var `source` contract; keep local/remote serialization identical to codex-config.
         let mut array = TomlArray::new();
         for env_var in env_vars {
             match env_var {

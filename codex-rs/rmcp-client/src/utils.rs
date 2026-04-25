@@ -28,6 +28,8 @@ pub(crate) fn create_env_overlay_for_remote_mcp_server(
     extra_env: Option<HashMap<OsString, OsString>>,
     env_vars: &[McpServerEnvVar],
 ) -> HashMap<OsString, OsString> {
+    // Merge-safety anchor: remote-aware stdio MCP env routing treats `source = "remote"`
+    // as executor-owned input and must not copy that variable from the local orchestrator.
     // Remote stdio should inherit PATH/HOME/etc. from the executor side, not
     // from the orchestrator process. Only forward variables explicitly named
     // by the MCP config plus literal env overrides from that config.

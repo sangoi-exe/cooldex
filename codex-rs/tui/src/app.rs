@@ -292,6 +292,7 @@ fn build_chatgpt_add_account_success_outcome(
             shared_state.set_success(active_account_display.clone());
             ChatGptAddAccountOutcome::Success {
                 active_account_display,
+                active_store_account_id: Some(login_success.store_account_id.clone()),
             }
         }
         Err(err) => {
@@ -303,15 +304,18 @@ fn build_chatgpt_add_account_success_outcome(
     }
 }
 
-fn active_account_display_from_remote_accounts(accounts: &[AccountListEntry]) -> Option<String> {
+fn active_account_from_remote_accounts(accounts: &[AccountListEntry]) -> Option<(String, String)> {
     accounts
         .iter()
         .find(|account| account.is_active)
         .map(|account| {
-            format_account_display(
-                account.label.as_deref(),
-                account.email.as_deref(),
-                &account.id,
+            (
+                account.id.clone(),
+                format_account_display(
+                    account.label.as_deref(),
+                    account.email.as_deref(),
+                    &account.id,
+                ),
             )
         })
 }
@@ -2823,27 +2827,32 @@ impl App {
         );
     }
 
-    fn refresh_app_server_account_projection_after_remote_active_account_change(
+    fn refresh_app_server_account_projection_after_remote_account_change(
         &mut self,
         app_server_client: &AppServerSession,
-        active_store_account_id: String,
+        trigger: AccountProjectionRefreshTrigger,
+        active_store_account_id: Option<String>,
     ) {
         // Merge-safety anchor: remote account mutations must keep visible
         // followers under the app-server projection owner; do not bounce through
-        // local AuthManager state after an app-server set-active request.
+        // local AuthManager state after an app-server account mutation request.
         let stale_projection_baseline = self.visible_account_projection_followers();
         let mut expected_projection_followers = stale_projection_baseline.clone();
-        expected_projection_followers.active_store_account_id = Some(active_store_account_id);
-        let expectation = if stale_projection_baseline.active_store_account_id
-            == expected_projection_followers.active_store_account_id
-        {
-            AccountProjectionRefreshExpectation::AcceptBaselineAfterRetries
+        let expectation = if let Some(active_store_account_id) = active_store_account_id {
+            expected_projection_followers.active_store_account_id = Some(active_store_account_id);
+            if stale_projection_baseline.active_store_account_id
+                == expected_projection_followers.active_store_account_id
+            {
+                AccountProjectionRefreshExpectation::AcceptBaselineAfterRetries
+            } else {
+                AccountProjectionRefreshExpectation::RequireChangeFromBaseline
+            }
         } else {
-            AccountProjectionRefreshExpectation::RequireChangeFromBaseline
+            AccountProjectionRefreshExpectation::AcceptBaselineAfterRetries
         };
         self.refresh_app_server_account_projection_after_account_change_from_baseline(
             app_server_client,
-            AccountProjectionRefreshTrigger::ManualSetActiveAccount,
+            trigger,
             stale_projection_baseline,
             expected_projection_followers,
             expectation,
@@ -7100,9 +7109,10 @@ impl App {
                                         })
                                 })
                                 .unwrap_or_else(|| account_id.clone());
-                            self.refresh_app_server_account_projection_after_remote_active_account_change(
+                            self.refresh_app_server_account_projection_after_remote_account_change(
                                 app_server,
-                                account_id,
+                                AccountProjectionRefreshTrigger::ManualSetActiveAccount,
+                                Some(account_id),
                             );
                             self.chat_widget.add_info_message(
                                 format!("Active account: {display}"),
@@ -7354,22 +7364,28 @@ impl App {
                     return Ok(AppRunControl::Continue);
                 };
                 let outcome = if success {
-                    let active_account_display = match app_server.list_accounts().await {
-                        Ok(accounts) => active_account_display_from_remote_accounts(&accounts),
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                login_id,
-                                "failed to reload remote account roster after add-account login"
-                            );
-                            None
-                        }
-                    };
+                    let (active_store_account_id, active_account_display) =
+                        match app_server.list_accounts().await {
+                            Ok(accounts) => active_account_from_remote_accounts(&accounts)
+                                .map(|(active_store_account_id, active_account_display)| {
+                                    (Some(active_store_account_id), Some(active_account_display))
+                                })
+                                .unwrap_or((None, None)),
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    login_id,
+                                    "failed to reload remote account roster after add-account login"
+                                );
+                                (None, None)
+                            }
+                        };
                     pending
                         .shared_state
                         .set_success(active_account_display.clone());
                     ChatGptAddAccountOutcome::Success {
                         active_account_display,
+                        active_store_account_id,
                     }
                 } else {
                     let message = error.unwrap_or_else(|| {
@@ -7408,11 +7424,20 @@ impl App {
             AppEvent::ChatGptAddAccountFinished(outcome) => match outcome {
                 ChatGptAddAccountOutcome::Success {
                     active_account_display,
+                    active_store_account_id,
                 } => {
-                    self.refresh_app_server_account_projection_after_manual_auth_change(
-                        app_server,
-                        AccountProjectionRefreshTrigger::ManualAddAccount,
-                    );
+                    if self.remote_app_server_url.is_some() {
+                        self.refresh_app_server_account_projection_after_remote_account_change(
+                            app_server,
+                            AccountProjectionRefreshTrigger::ManualAddAccount,
+                            active_store_account_id,
+                        );
+                    } else {
+                        self.refresh_app_server_account_projection_after_manual_auth_change(
+                            app_server,
+                            AccountProjectionRefreshTrigger::ManualAddAccount,
+                        );
+                    }
                     self.maybe_start_accounts_status_refresh(
                         /*force*/ true, /*open_popup_when_ready*/ false,
                         /*show_loading_popup*/ false,
@@ -10349,7 +10374,9 @@ mod tests {
                     event,
                     AppEvent::ChatGptAddAccountFinished(ChatGptAddAccountOutcome::Success {
                         active_account_display: Some(display),
+                        active_store_account_id: Some(active_store_account_id),
                     }) if display == "New — new@example.com"
+                        && active_store_account_id == &new_store_account_id
                 )
             })
             .await;
@@ -10374,16 +10401,54 @@ mod tests {
                 .any(|account| account.id == new_store_account_id && account.is_active),
             "remote roster should show the newly added account as active"
         );
-        assert!(matches!(
-            harness
-                .next_app_event_matching("add-account success info message", |event| {
-                    matches!(event, AppEvent::InsertHistoryCell(_))
-                })
-                .await,
-            AppEvent::InsertHistoryCell(cell)
-                if lines_to_single_string(&cell.display_lines(/*width*/ 120))
-                    .contains("Active account: New — new@example.com")
-        ));
+        let mut saw_success_info_message = false;
+        let mut applied_projection_refresh = false;
+        for _ in 0..6 {
+            if saw_success_info_message && applied_projection_refresh {
+                break;
+            }
+            match harness.next_app_event().await {
+                AppEvent::InsertHistoryCell(cell)
+                    if lines_to_single_string(&cell.display_lines(/*width*/ 120))
+                        .contains("Active account: New — new@example.com") =>
+                {
+                    saw_success_info_message = true;
+                }
+                event @ AppEvent::AppServerAccountProjectionRefreshed { result: Ok(_), .. } => {
+                    let control = harness.handle_event(event).await?;
+                    assert!(matches!(control, AppRunControl::Continue));
+                    applied_projection_refresh = true;
+                }
+                AppEvent::AppServerAccountProjectionRefreshed {
+                    result: Err(error), ..
+                } => panic!("remote add-account projection refresh failed: {error}"),
+                event => panic!(
+                    "unexpected event while waiting for remote add-account convergence: {event:?}"
+                ),
+            }
+        }
+        assert!(saw_success_info_message);
+        assert!(applied_projection_refresh);
+        assert_eq!(
+            harness.app.live_account_state_owner,
+            LiveAccountStateOwner::AppServerProjection
+        );
+        assert_eq!(
+            harness.app.observed_active_store_account_id,
+            Some(new_store_account_id.clone())
+        );
+        let status_account_display = harness.app.chat_widget.status_account_display().cloned();
+        assert!(
+            matches!(
+                status_account_display.as_ref(),
+                Some(StatusAccountDisplay::ChatGpt {
+                    label: Some(label),
+                    email: Some(email),
+                    ..
+                }) if label == "New" && email == "new@example.com"
+            ),
+            "remote add-account should apply the app-server projection, got {status_account_display:?}"
+        );
 
         Ok(())
     }
@@ -10547,8 +10612,8 @@ mod tests {
     }
 
     #[test]
-    fn active_account_display_from_remote_accounts_uses_remote_active_entry() {
-        let display = active_account_display_from_remote_accounts(&[
+    fn active_account_from_remote_accounts_uses_remote_active_entry() {
+        let active_account = active_account_from_remote_accounts(&[
             AccountListEntry {
                 id: "acct-a".to_string(),
                 label: Some("Primary".to_string()),
@@ -10569,12 +10634,18 @@ mod tests {
             },
         ]);
 
-        assert_eq!(display.as_deref(), Some("Remote New — new@example.com"));
+        assert_eq!(
+            active_account,
+            Some((
+                "acct-b".to_string(),
+                "Remote New — new@example.com".to_string()
+            ))
+        );
     }
 
     #[test]
-    fn active_account_display_from_remote_accounts_returns_none_without_active_entry() {
-        let display = active_account_display_from_remote_accounts(&[AccountListEntry {
+    fn active_account_from_remote_accounts_returns_none_without_active_entry() {
+        let active_account = active_account_from_remote_accounts(&[AccountListEntry {
             id: "acct-a".to_string(),
             label: Some("Primary".to_string()),
             email: Some("primary@example.com".to_string()),
@@ -10584,7 +10655,7 @@ mod tests {
             lease_state: codex_app_server_protocol::AccountLeaseState::NotLeased,
         }]);
 
-        assert_eq!(display, None);
+        assert_eq!(active_account, None);
     }
 
     #[tokio::test]
@@ -11920,7 +11991,14 @@ mod tests {
         let active_account_display = match outcome {
             ChatGptAddAccountOutcome::Success {
                 active_account_display,
-            } => active_account_display,
+                active_store_account_id,
+            } => {
+                assert_eq!(
+                    active_store_account_id,
+                    Some(login_success.store_account_id)
+                );
+                active_account_display
+            }
             other => panic!("expected add-account success outcome, saw {other:?}"),
         };
         assert_eq!(
@@ -16820,21 +16898,20 @@ guardian_approval = true
             }
         }
 
-        async fn pump_app_server_events_until_app_event_matching<F>(
+        async fn pump_app_server_events_until_projection_refresh_trigger(
             &mut self,
             label: &str,
-            mut predicate: F,
-        ) -> AppEvent
-        where
-            F: FnMut(&AppEvent) -> bool,
-        {
+        ) -> AppEvent {
             let deadline = time::Instant::now() + std::time::Duration::from_secs(3);
             let mut skipped_app_events = Vec::new();
             let mut pumped_app_server_events = Vec::new();
             loop {
                 match self.app_event_rx.try_recv() {
                     Ok(event) => {
-                        if predicate(&event) {
+                        if matches!(
+                            event,
+                            AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate
+                        ) {
                             return event;
                         }
                         skipped_app_events.push(format!("{event:?}"));
@@ -16886,12 +16963,7 @@ guardian_approval = true
             label: &str,
         ) -> Result<()> {
             let refresh_after_account_update_event = self
-                .pump_app_server_events_until_app_event_matching(label, |event| {
-                    matches!(
-                        event,
-                        AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate
-                    )
-                })
+                .pump_app_server_events_until_projection_refresh_trigger(label)
                 .await;
             let control = time::timeout(
                 std::time::Duration::from_secs(5),

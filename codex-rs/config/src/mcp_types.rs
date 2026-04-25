@@ -56,6 +56,8 @@ pub struct McpServerToolConfig {
     pub approval_mode: Option<AppToolApproval>,
 }
 
+// Merge-safety anchor: remote-aware stdio MCP config keeps env var `source` typed as
+// local/remote here so runtime routing, TOML serialization, and generated schema stay aligned.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum McpServerEnvVar {
@@ -88,13 +90,6 @@ impl McpServerEnvVar {
         match self {
             McpServerEnvVar::Name(name) => name,
             McpServerEnvVar::Config { name, .. } => name,
-        }
-    }
-
-    pub fn source(&self) -> Option<&str> {
-        match self {
-            McpServerEnvVar::Name(_) => None,
-            McpServerEnvVar::Config { source, .. } => source.as_ref().map(|source| source.as_str()),
         }
     }
 

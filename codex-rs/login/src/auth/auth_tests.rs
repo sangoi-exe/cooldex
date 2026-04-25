@@ -2374,9 +2374,17 @@ fn terminal_refresh_failure_removes_external_account_from_external_store() {
         AuthCredentialsStoreMode::File,
     )
     .expect("save persistent auth store");
+    let mut external_store =
+        external_chatgpt_auth_store("external-store-account", "external-workspace");
+    let mut unknown_plan_fallback = external_store.accounts[0].clone();
+    unknown_plan_fallback.id = "external-unknown-plan-fallback".to_string();
+    unknown_plan_fallback.label = Some("Unknown fallback".to_string());
+    unknown_plan_fallback.tokens.id_token.chatgpt_plan_type =
+        Some(InternalPlanType::Unknown("mystery-tier".to_string()));
+    external_store.accounts.push(unknown_plan_fallback);
     save_auth(
         codex_home.path(),
-        &external_chatgpt_auth_store("external-store-account", "external-workspace"),
+        &external_store,
         AuthCredentialsStoreMode::Ephemeral,
     )
     .expect("save external auth store");
@@ -2423,7 +2431,7 @@ fn terminal_refresh_failure_removes_external_account_from_external_store() {
         .unwrap_or_default();
     assert!(
         external_store.accounts.is_empty(),
-        "terminal removal should evict the external account from the external store"
+        "terminal removal should evict the failed external account and strip unsupported external fallbacks"
     );
     assert_eq!(
         std::fs::read_to_string(get_auth_file(codex_home.path()))

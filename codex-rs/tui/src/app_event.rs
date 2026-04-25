@@ -92,6 +92,7 @@ pub(crate) struct ConnectorsSnapshot {
 pub(crate) enum ChatGptAddAccountOutcome {
     Success {
         active_account_display: Option<String>,
+        active_store_account_id: Option<String>,
     },
     Cancelled,
     Failed {
