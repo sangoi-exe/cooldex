@@ -2837,6 +2837,9 @@ async fn wait_agent_returns_final_status_without_timeout() {
 
 #[tokio::test]
 async fn wait_agent_any_final_waits_for_non_final_agent_when_another_is_already_final() {
+    // Merge-safety anchor: legacy wait_agent tests must keep any_final aligned
+    // with the public contract: wait for requested agents that were not final
+    // at wait start, while errored and all-final sets still short-circuit.
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();
     session.services.agent_control = manager.agent_control();
