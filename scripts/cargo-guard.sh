@@ -29,7 +29,7 @@ Runs Cargo with a deterministic free-space guardrail for build-like commands:
   - derives the effective `target_directory` and `build_directory` from `cargo metadata`
   - caps guarded Cargo build parallelism at 4 jobs by default
   - rejects explicit `-j/--jobs` or `--config build.jobs=...` requests outside 1..=4
-  - rejects path-style `--config <PATH>` for guarded build-like commands because it can override build.jobs
+  - rejects path-style or include-based `--config` for guarded build-like commands because they can override build.jobs
   - requires at least 5 GiB free before starting a guarded build-like command
   - runs `cargo clean` only when the lowest free-space filesystem across the derived target/build dirs is below the floor
   - never runs `cargo clean` solely because the guarded Cargo command failed or was interrupted
@@ -39,7 +39,7 @@ Guarded build-like subcommands:
 
 Supported Cargo context inputs:
   - `+toolchain`
-  - `--config <KEY=VALUE>` / `--config=<KEY=VALUE>`; path-style config is rejected for guarded build-like commands
+  - `--config <KEY=VALUE>` / `--config=<KEY=VALUE>`; path-style and include-based configs are rejected for guarded build-like commands
   - `--manifest-path <path>` / `--manifest-path=<path>`
   - `--lockfile-path <path>` / `--lockfile-path=<path>`
   - `--target-dir <path>` / `--target-dir=<path>`
@@ -96,20 +96,27 @@ append_unique_path() {
 record_config_build_jobs() {
     local config_value="$1"
     local compact_config
+    local normalized_config
     compact_config="$(printf '%s' "${config_value}" | tr -d '[:space:]')"
+    normalized_config="${compact_config//\"/}"
+    normalized_config="${normalized_config//\'/}"
     if [[ "${compact_config}" != *=* ]]; then
         explicit_config_jobs_error="path-style --config ${config_value} is rejected for guarded build-like commands because it may override build.jobs"
         return
     fi
-    if [[ "${compact_config}" =~ (^|[;,])build\.jobs=([^;,]+)($|[;,]) ]]; then
+    if [[ "${normalized_config}" =~ (^|[;,])include= ]]; then
+        explicit_config_jobs_error="include-based --config ${config_value} is rejected for guarded build-like commands because it may override build.jobs"
+        return
+    fi
+    if [[ "${normalized_config}" =~ (^|[;,])build\.jobs=([^;,]+)($|[;,]) ]]; then
         explicit_config_jobs_raw="${BASH_REMATCH[2]}"
         return
     fi
-    if [[ "${compact_config}" =~ (^|[;,])build=\{[^}]*jobs=([^,}\;]+)[^}]*\}($|[;,]) ]]; then
+    if [[ "${normalized_config}" =~ (^|[;,])build=\{[^}]*jobs=([^,}\;]+)[^}]*\}($|[;,]) ]]; then
         explicit_config_jobs_raw="${BASH_REMATCH[2]}"
         return
     fi
-    if [[ "${compact_config}" == *"build.jobs"* ]] || [[ "${compact_config}" == *"build={"*"jobs="* ]]; then
+    if [[ "${normalized_config}" == *"build.jobs"* ]] || [[ "${normalized_config}" == *"build={"*"jobs="* ]]; then
         explicit_config_jobs_error="unsupported Cargo build.jobs config form: ${config_value}"
     fi
 }

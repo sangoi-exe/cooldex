@@ -320,6 +320,30 @@ fn active_account_from_remote_accounts(accounts: &[AccountListEntry]) -> Option<
         })
 }
 
+fn build_remote_chatgpt_add_account_success_outcome(
+    active_account: Option<(String, String)>,
+    shared_state: &crate::bottom_pane::ChatGptAddAccountSharedState,
+    login_id: &str,
+) -> ChatGptAddAccountOutcome {
+    if let Some((active_store_account_id, active_account_display)) = active_account {
+        shared_state.set_success(Some(active_account_display.clone()));
+        ChatGptAddAccountOutcome::Success {
+            active_account_display: Some(active_account_display),
+            active_store_account_id: Some(active_store_account_id),
+        }
+    } else {
+        let message =
+            "remote ChatGPT login completed, but the app-server did not report an active account"
+                .to_string();
+        tracing::error!(
+            login_id,
+            "remote add-account login completed without an active account in the app-server roster"
+        );
+        shared_state.set_failed(message.clone());
+        ChatGptAddAccountOutcome::Failed { message }
+    }
+}
+
 fn status_account_displays_match(
     current: Option<&StatusAccountDisplay>,
     next: Option<&StatusAccountDisplay>,
@@ -7364,28 +7388,24 @@ impl App {
                     return Ok(AppRunControl::Continue);
                 };
                 let outcome = if success {
-                    let (active_store_account_id, active_account_display) =
-                        match app_server.list_accounts().await {
-                            Ok(accounts) => active_account_from_remote_accounts(&accounts)
-                                .map(|(active_store_account_id, active_account_display)| {
-                                    (Some(active_store_account_id), Some(active_account_display))
-                                })
-                                .unwrap_or((None, None)),
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    login_id,
-                                    "failed to reload remote account roster after add-account login"
-                                );
-                                (None, None)
-                            }
-                        };
-                    pending
-                        .shared_state
-                        .set_success(active_account_display.clone());
-                    ChatGptAddAccountOutcome::Success {
-                        active_account_display,
-                        active_store_account_id,
+                    match app_server.list_accounts().await {
+                        Ok(accounts) => build_remote_chatgpt_add_account_success_outcome(
+                            active_account_from_remote_accounts(&accounts),
+                            pending.shared_state.as_ref(),
+                            &login_id,
+                        ),
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                login_id,
+                                "failed to reload remote account roster after add-account login"
+                            );
+                            let message = format!(
+                                "remote ChatGPT login completed, but failed to reload remote account roster: {err}"
+                            );
+                            pending.shared_state.set_failed(message.clone());
+                            ChatGptAddAccountOutcome::Failed { message }
+                        }
                     }
                 } else {
                     let message = error.unwrap_or_else(|| {
@@ -10656,6 +10676,20 @@ mod tests {
         }]);
 
         assert_eq!(active_account, None);
+    }
+
+    #[test]
+    fn build_remote_chatgpt_add_account_success_outcome_fails_without_active_account() {
+        let shared_state = crate::bottom_pane::ChatGptAddAccountSharedState::new();
+
+        let outcome =
+            build_remote_chatgpt_add_account_success_outcome(None, &shared_state, "login-1");
+
+        assert!(matches!(
+            outcome,
+            ChatGptAddAccountOutcome::Failed { ref message }
+                if message.contains("did not report an active account")
+        ));
     }
 
     #[tokio::test]
