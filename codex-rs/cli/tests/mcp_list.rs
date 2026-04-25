@@ -56,6 +56,8 @@ async fn list_and_get_render_expected_output() -> Result<()> {
         .expect("docs server should exist after add");
     match &mut docs_entry.transport {
         McpServerTransportConfig::Stdio { env_vars, .. } => {
+            // Merge-safety anchor: `mcp list/get` test followers must keep env-var rendering
+            // aligned with the typed local/remote `McpServerEnvVar` contract, not raw strings.
             *env_vars = vec![
                 McpServerEnvVar::Name("APP_TOKEN".to_string()),
                 McpServerEnvVar::Name("WORKSPACE_ID".to_string()),

@@ -32,6 +32,9 @@ pub async fn run_apply_command(
     )
     .await?;
 
+    // Merge-safety anchor: ChatGPT task apply must initialize tokens through
+    // the config-aware AuthManager path so sqlite_home and forced workspace stay
+    // bundled before account-state hydration.
     init_chatgpt_token_from_auth(&config).await?;
 
     let task_response = get_task(&config, apply_cli.task_id).await?;

@@ -22,6 +22,9 @@ pub(crate) async fn chatgpt_get_request_with_timeout<T: DeserializeOwned>(
     timeout: Option<Duration>,
 ) -> anyhow::Result<T> {
     let chatgpt_base_url = &config.chatgpt_base_url;
+    // Merge-safety anchor: direct ChatGPT backend calls must use the
+    // config-aware token bootstrap so forced workspace and WS12 sqlite_home
+    // selection cannot drift from the request account.
     init_chatgpt_token_from_auth(config).await?;
 
     // Make direct HTTP request to ChatGPT backend API with the token

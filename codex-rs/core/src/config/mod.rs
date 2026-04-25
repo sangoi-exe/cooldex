@@ -171,6 +171,20 @@ pub fn resolve_sqlite_home_for_config_toml(
         .unwrap_or_else(|| codex_home.to_path_buf())
 }
 
+// Merge-safety anchor: pre-Config auth/bootstrap paths must trim forced
+// ChatGPT workspace with the same semantics as full Config loading, or startup
+// auth can hydrate the wrong saved account before Config exists.
+pub fn resolve_forced_chatgpt_workspace_id_for_config_toml(cfg: &ConfigToml) -> Option<String> {
+    cfg.forced_chatgpt_workspace_id.as_ref().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
 fn resolve_cli_auth_credentials_store_mode(
     configured: AuthCredentialsStoreMode,
     package_version: &str,
@@ -1932,6 +1946,8 @@ impl Config {
             .unwrap_or(WebSearchMode::Cached);
         let web_search_config = resolve_web_search_config(&cfg, &config_profile);
         let multi_agent_v2 = resolve_multi_agent_v2_config(&cfg, &config_profile);
+        let forced_chatgpt_workspace_id =
+            resolve_forced_chatgpt_workspace_id_for_config_toml(&cfg);
 
         let agent_roles =
             agent_roles::load_agent_roles(fs, &cfg, &config_layer_stack, &mut startup_warnings)
@@ -2083,16 +2099,6 @@ impl Config {
 
         let include_apply_patch_tool_flag = features.enabled(Feature::ApplyPatchFreeform);
         let use_experimental_unified_exec_tool = features.enabled(Feature::UnifiedExec);
-
-        let forced_chatgpt_workspace_id =
-            cfg.forced_chatgpt_workspace_id.as_ref().and_then(|value| {
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            });
 
         let forced_login_method = cfg.forced_login_method;
 

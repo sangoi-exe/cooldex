@@ -3,6 +3,7 @@ use chrono::DateTime;
 use chrono::Local;
 use chrono::Utc;
 use reqwest::header::HeaderMap;
+use std::sync::Arc;
 
 use codex_core::config::Config;
 use codex_login::AuthManager;
@@ -59,14 +60,14 @@ pub fn extract_chatgpt_account_id(token: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-pub async fn load_auth_manager() -> Option<AuthManager> {
+pub async fn load_auth_manager() -> Option<Arc<AuthManager>> {
     // TODO: pass in cli overrides once cloud tasks properly support them.
     let config = Config::load_with_cli_overrides(Vec::new()).await.ok()?;
-    Some(AuthManager::new_with_sqlite_home(
-        config.codex_home.to_path_buf(),
-        config.sqlite_home,
-        /*enable_codex_api_key_env*/ false,
-        config.cli_auth_credentials_store_mode,
+    // Merge-safety anchor: cloud-task ChatGPT headers are a config-aware
+    // production auth path, so AuthManager must receive sqlite_home and forced
+    // workspace together before cached auth or account-state leases hydrate.
+    Some(AuthManager::shared_from_config(
+        &config, /*enable_codex_api_key_env*/ false,
     ))
 }
 

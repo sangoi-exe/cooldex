@@ -1607,16 +1607,36 @@ impl AuthManager {
         enable_codex_api_key_env: bool,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
     ) -> Self {
+        Self::new_with_sqlite_home_and_forced_workspace(
+            codex_home,
+            sqlite_home,
+            /*forced_chatgpt_workspace_id*/ None,
+            enable_codex_api_key_env,
+            auth_credentials_store_mode,
+        )
+    }
+
+    fn new_with_sqlite_home_and_forced_workspace(
+        codex_home: PathBuf,
+        sqlite_home: PathBuf,
+        forced_chatgpt_workspace_id: Option<String>,
+        enable_codex_api_key_env: bool,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> Self {
         let (auth_state_tx, _) = watch::channel(());
         let storage = create_auth_storage(codex_home.clone(), auth_credentials_store_mode);
         let account_state_store = Some(open_account_state_store(sqlite_home.as_path()));
         let runtime_session_id = uuid::Uuid::new_v4().to_string();
+        // Merge-safety anchor: config-aware AuthManager construction must install
+        // forced ChatGPT workspace before AccountManager hydrates runtime-active
+        // account state; post-construction setters are too late for cached auth.
         let account_manager = AccountManager::new(
             codex_home.clone(),
             Arc::clone(&storage),
             auth_credentials_store_mode,
             account_state_store,
             runtime_session_id,
+            forced_chatgpt_workspace_id,
         );
         let loaded = account_manager.load_store_from_storage();
         let store = loaded.store;
@@ -1670,6 +1690,7 @@ impl AuthManager {
             AuthCredentialsStoreMode::File,
             account_state_store,
             uuid::Uuid::new_v4().to_string(),
+            /*forced_chatgpt_workspace_id*/ None,
         );
 
         Arc::new(Self {
@@ -1707,6 +1728,7 @@ impl AuthManager {
             AuthCredentialsStoreMode::File,
             account_state_store,
             uuid::Uuid::new_v4().to_string(),
+            /*forced_chatgpt_workspace_id*/ None,
         );
         Arc::new(Self {
             codex_home,
@@ -1732,6 +1754,7 @@ impl AuthManager {
             AuthCredentialsStoreMode::File,
             /*account_state_store*/ None,
             uuid::Uuid::new_v4().to_string(),
+            /*forced_chatgpt_workspace_id*/ None,
         );
         Arc::new(Self {
             codex_home,
@@ -2585,19 +2608,36 @@ impl AuthManager {
         ))
     }
 
+    /// Convenience constructor returning an `Arc` wrapper from explicit
+    /// pre-Config auth runtime values, including a forced ChatGPT workspace.
+    pub fn shared_with_sqlite_home_and_forced_workspace(
+        codex_home: PathBuf,
+        sqlite_home: PathBuf,
+        forced_chatgpt_workspace_id: Option<String>,
+        enable_codex_api_key_env: bool,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> Arc<Self> {
+        Arc::new(Self::new_with_sqlite_home_and_forced_workspace(
+            codex_home,
+            sqlite_home,
+            forced_chatgpt_workspace_id,
+            enable_codex_api_key_env,
+            auth_credentials_store_mode,
+        ))
+    }
+
     /// Convenience constructor returning an `Arc` wrapper from resolved config.
     pub fn shared_from_config(
         config: &impl AuthManagerConfig,
         enable_codex_api_key_env: bool,
     ) -> Arc<Self> {
-        let auth_manager = Self::shared_with_sqlite_home(
+        Self::shared_with_sqlite_home_and_forced_workspace(
             config.codex_home(),
             config.sqlite_home(),
+            config.forced_chatgpt_workspace_id(),
             enable_codex_api_key_env,
             config.cli_auth_credentials_store_mode(),
-        );
-        auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id());
-        auth_manager
+        )
     }
 
     pub fn unauthorized_recovery(self: &Arc<Self>) -> UnauthorizedRecovery {

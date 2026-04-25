@@ -990,6 +990,7 @@ mod tests {
             cloud_requirements: cloud_requirements_loader_for_storage(
                 codex_home_path.clone(),
                 codex_home_path.clone(),
+                /*forced_chatgpt_workspace_id*/ None,
                 /*enable_codex_api_key_env*/ false,
                 AuthCredentialsStoreMode::File,
                 "https://chatgpt.com/backend-api/".to_string(),

@@ -57,6 +57,7 @@ use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_as_toml_with_cli_overrides;
+use codex_core::config::resolve_forced_chatgpt_workspace_id_for_config_toml;
 use codex_core::config::resolve_oss_provider;
 use codex_core::config::resolve_sqlite_home_for_config_toml;
 use codex_core::config_loader::ConfigLoadError;
@@ -334,10 +335,16 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         config_cwd.as_path(),
         &config_toml,
     );
+    let forced_chatgpt_workspace_id =
+        resolve_forced_chatgpt_workspace_id_for_config_toml(&config_toml);
     // TODO(gt): Make cloud requirements failures blocking once we can fail-closed.
+    // Merge-safety anchor: codex exec cloud-requirements bootstrap runs before
+    // full Config exists, so it must still carry resolved sqlite_home and forced
+    // workspace into AuthManager before account-state hydration starts.
     let cloud_requirements = cloud_requirements_loader_for_storage(
         codex_home.to_path_buf(),
         sqlite_home,
+        forced_chatgpt_workspace_id,
         /*enable_codex_api_key_env*/ false,
         config_toml.cli_auth_credentials_store.unwrap_or_default(),
         chatgpt_base_url,

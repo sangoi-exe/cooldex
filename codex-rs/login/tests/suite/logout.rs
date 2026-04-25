@@ -1,6 +1,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
+use chrono::Utc;
 use codex_account_state::accounts_db_path;
 use codex_app_server_protocol::AuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
@@ -10,11 +11,14 @@ use codex_login::AuthManagerConfig;
 use codex_login::AuthStore;
 use codex_login::CLIENT_ID;
 use codex_login::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR;
+use codex_login::StoredAccount;
 use codex_login::login_with_api_key;
 use codex_login::logout_with_revoke;
 use codex_login::save_auth;
 use codex_login::token_data::IdTokenInfo;
 use codex_login::token_data::TokenData;
+use codex_protocol::auth::KnownPlan;
+use codex_protocol::auth::PlanType;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -144,6 +148,42 @@ async fn logout_with_revoke_uses_configured_sqlite_home() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn shared_from_config_applies_forced_workspace_before_cached_auth() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let sqlite_home = TempDir::new()?;
+    let workspace_a = "workspace-a";
+    let workspace_b = "workspace-b";
+    save_auth(
+        codex_home.path(),
+        &AuthStore {
+            active_account_id: Some("store-account-a".to_string()),
+            accounts: vec![
+                saved_chatgpt_account("store-account-a", workspace_a)?,
+                saved_chatgpt_account("store-account-b", workspace_b)?,
+            ],
+            ..AuthStore::default()
+        },
+        AuthCredentialsStoreMode::File,
+    )?;
+    let config = TestAuthManagerConfig::new(codex_home.path(), sqlite_home.path())
+        .with_forced_chatgpt_workspace_id(workspace_b);
+
+    let manager = AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+    let auth = manager
+        .auth()
+        .await
+        .expect("forced workspace should select matching saved account");
+
+    assert_eq!(auth.get_account_id().as_deref(), Some(workspace_b));
+    assert_eq!(
+        auth.active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id),
+        Some("store-account-b".to_string())
+    );
+    Ok(())
+}
+
 #[serial_test::serial(logout_revoke)]
 #[tokio::test]
 async fn auth_manager_logout_with_revoke_uses_cached_auth() -> Result<()> {
@@ -233,6 +273,47 @@ fn minimal_jwt() -> String {
     format!("{header_b64}.{payload_b64}.{signature_b64}")
 }
 
+fn chatgpt_jwt(store_account_id: &str, workspace_id: &str) -> Result<String> {
+    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+    let header_b64 = b64(br#"{"alg":"none","typ":"JWT"}"#);
+    let payload = json!({
+        "email": format!("{store_account_id}@example.com"),
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "plus",
+            "chatgpt_user_id": format!("user-{store_account_id}"),
+            "user_id": format!("user-{store_account_id}"),
+            "chatgpt_account_id": workspace_id,
+            "chatgpt_account_is_fedramp": false,
+        },
+    });
+    let payload_b64 = b64(&serde_json::to_vec(&payload)?);
+    let signature_b64 = b64(b"sig");
+    Ok(format!("{header_b64}.{payload_b64}.{signature_b64}"))
+}
+
+fn saved_chatgpt_account(store_account_id: &str, workspace_id: &str) -> Result<StoredAccount> {
+    let raw_jwt = chatgpt_jwt(store_account_id, workspace_id)?;
+    Ok(StoredAccount {
+        id: store_account_id.to_string(),
+        label: Some(store_account_id.to_string()),
+        tokens: TokenData {
+            id_token: IdTokenInfo {
+                email: Some(format!("{store_account_id}@example.com")),
+                chatgpt_plan_type: Some(PlanType::Known(KnownPlan::Plus)),
+                chatgpt_user_id: Some(format!("user-{store_account_id}")),
+                chatgpt_account_id: Some(workspace_id.to_string()),
+                chatgpt_account_is_fedramp: false,
+                raw_jwt,
+            },
+            access_token: format!("{store_account_id}-access-token"),
+            refresh_token: format!("{store_account_id}-refresh-token"),
+            account_id: Some(workspace_id.to_string()),
+        },
+        last_refresh: Some(Utc::now()),
+        usage: None,
+    })
+}
+
 fn save_legacy_auth(codex_home: &Path, auth_dot_json: &AuthDotJson) -> Result<()> {
     save_auth(
         codex_home,
@@ -273,6 +354,7 @@ impl Drop for EnvGuard {
 struct TestAuthManagerConfig {
     codex_home: PathBuf,
     sqlite_home: PathBuf,
+    forced_chatgpt_workspace_id: Option<String>,
 }
 
 impl TestAuthManagerConfig {
@@ -280,7 +362,13 @@ impl TestAuthManagerConfig {
         Self {
             codex_home: codex_home.to_path_buf(),
             sqlite_home: sqlite_home.to_path_buf(),
+            forced_chatgpt_workspace_id: None,
         }
+    }
+
+    fn with_forced_chatgpt_workspace_id(mut self, workspace_id: &str) -> Self {
+        self.forced_chatgpt_workspace_id = Some(workspace_id.to_string());
+        self
     }
 }
 
@@ -298,6 +386,6 @@ impl AuthManagerConfig for TestAuthManagerConfig {
     }
 
     fn forced_chatgpt_workspace_id(&self) -> Option<String> {
-        None
+        self.forced_chatgpt_workspace_id.clone()
     }
 }

@@ -27,6 +27,9 @@ use codex_login::token_data::TokenData;
 const DIRECTORY_CONNECTORS_TIMEOUT: Duration = Duration::from_secs(60);
 
 async fn apps_enabled(config: &Config) -> bool {
+    // Merge-safety anchor: connector availability is a config-aware ChatGPT
+    // auth gate, so it must construct AuthManager with resolved sqlite_home and
+    // forced workspace before probing current auth.
     let auth_manager =
         AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false);
     let auth = auth_manager.auth().await;
@@ -61,6 +64,9 @@ pub async fn list_cached_all_connectors(config: &Config) -> Option<Vec<AppInfo>>
         return Some(Vec::new());
     }
 
+    // Merge-safety anchor: cached connector reads use the same config-aware
+    // token owner as network connector fetches; do not reintroduce a separate
+    // token/bootstrap path that ignores forced workspace.
     if init_chatgpt_token_from_auth(config).await.is_err() {
         return None;
     }
@@ -87,6 +93,9 @@ pub async fn list_all_connectors_with_options(
     if !apps_enabled(config).await {
         return Ok(Vec::new());
     }
+    // Merge-safety anchor: connector network fetches must keep ChatGPT token
+    // bootstrap aligned with AuthManagerConfig so account-state leases and
+    // forced workspace do not split across connector surfaces.
     init_chatgpt_token_from_auth(config).await?;
 
     let token_data =

@@ -674,6 +674,7 @@ impl AccountManager {
         auth_credentials_store_mode: AuthCredentialsStoreMode,
         account_state_store: Option<AccountStateStore>,
         runtime_session_id: String,
+        forced_chatgpt_workspace_id: Option<String>,
     ) -> Self {
         Self {
             codex_home,
@@ -682,7 +683,7 @@ impl AccountManager {
             account_state_store,
             runtime_session_id,
             linked_codex_session_id: RwLock::new(None),
-            forced_chatgpt_workspace_id: RwLock::new(None),
+            forced_chatgpt_workspace_id: RwLock::new(forced_chatgpt_workspace_id),
             usage_limit_auto_switch_cooldown_until: Mutex::new(None),
         }
     }

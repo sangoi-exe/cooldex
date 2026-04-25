@@ -724,16 +724,18 @@ pub fn cloud_requirements_loader(
 pub fn cloud_requirements_loader_for_storage(
     codex_home: PathBuf,
     sqlite_home: PathBuf,
+    forced_chatgpt_workspace_id: Option<String>,
     enable_codex_api_key_env: bool,
     credentials_store_mode: AuthCredentialsStoreMode,
     chatgpt_base_url: String,
 ) -> CloudRequirementsLoader {
     // Merge-safety anchor: config/bootstrap callers that cannot yet build a
-    // full Config must still pass resolved sqlite_home explicitly so WS12 lease
-    // and usage truth do not fall back to codex_home during cloud requirements.
-    let auth_manager = AuthManager::shared_with_sqlite_home(
+    // full Config must still pass resolved sqlite_home and forced workspace so
+    // WS12 lease/usage truth does not hydrate from codex_home or the wrong account.
+    let auth_manager = AuthManager::shared_with_sqlite_home_and_forced_workspace(
         codex_home.clone(),
         sqlite_home,
+        forced_chatgpt_workspace_id,
         enable_codex_api_key_env,
         credentials_store_mode,
     );

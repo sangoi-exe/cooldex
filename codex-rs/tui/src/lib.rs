@@ -9,6 +9,7 @@ use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::ConfigOverrides;
 use crate::legacy_core::config::find_codex_home;
 use crate::legacy_core::config::load_config_as_toml_with_cli_overrides;
+use crate::legacy_core::config::resolve_forced_chatgpt_workspace_id_for_config_toml;
 use crate::legacy_core::config::resolve_oss_provider;
 use crate::legacy_core::config::resolve_sqlite_home_for_config_toml;
 use crate::legacy_core::config_loader::CloudRequirementsLoader;
@@ -844,12 +845,15 @@ pub async fn run_main(
         sqlite_home_cwd.as_path(),
         &config_toml,
     );
+    let startup_forced_chatgpt_workspace_id =
+        resolve_forced_chatgpt_workspace_id_for_config_toml(&config_toml);
     // Merge-safety anchor: TUI startup, cloud bootstrap, and post-login/onboarding rebuild must
-    // reuse one lease-bearing `AuthManager` with the resolved sqlite_home so one visible session
-    // does not mint hidden WS12 runtime owners through cloud-requirements bootstrap.
-    let startup_auth_manager = AuthManager::shared_with_sqlite_home(
+    // reuse one lease-bearing `AuthManager` with resolved sqlite_home and forced workspace before
+    // hydration so cloud-requirements bootstrap cannot mint a hidden WS12 owner on the wrong account.
+    let startup_auth_manager = AuthManager::shared_with_sqlite_home_and_forced_workspace(
         codex_home.to_path_buf(),
         startup_sqlite_home,
+        startup_forced_chatgpt_workspace_id,
         /*enable_codex_api_key_env*/ false,
         config_toml.cli_auth_credentials_store.unwrap_or_default(),
     );
