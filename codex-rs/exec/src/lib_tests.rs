@@ -412,6 +412,7 @@ fn session_configured_from_thread_response_uses_review_policy_from_response() {
         model_provider: "openai".to_string(),
         service_tier: None,
         cwd: test_path_buf("/tmp").abs(),
+        config_path: PathBuf::from("/tmp/config.toml"),
         instruction_sources: Vec::new(),
         approval_policy: codex_app_server_protocol::AskForApproval::OnRequest,
         approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::GuardianSubagent,

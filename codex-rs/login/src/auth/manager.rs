@@ -653,17 +653,13 @@ pub fn logout(
     storage.delete()
 }
 
-pub async fn logout_with_revoke(
-    codex_home: &Path,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-) -> std::io::Result<bool> {
-    AuthManager::new(
-        codex_home.to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        auth_credentials_store_mode,
-    )
-    .logout_with_revoke()
-    .await
+pub async fn logout_with_revoke(config: &impl AuthManagerConfig) -> std::io::Result<bool> {
+    // Merge-safety anchor: CLI logout-with-revoke is a config-aware production
+    // path and must construct AuthManager with resolved sqlite_home, not an
+    // implicit codex_home fallback that leaves WS12 leases in a foreign DB.
+    AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
+        .logout_with_revoke()
+        .await
 }
 
 /// Writes an `auth.json` that contains only the API key.

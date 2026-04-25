@@ -156,6 +156,21 @@ fn resolve_sqlite_home_env(resolved_cwd: &Path) -> Option<PathBuf> {
     }
 }
 
+// Merge-safety anchor: pre-Config bootstrap paths that need AuthManager must
+// resolve sqlite_home with the same config/env/default precedence as full
+// Config loading, or account leases and usage truth silently split by caller.
+pub fn resolve_sqlite_home_for_config_toml(
+    codex_home: &Path,
+    resolved_cwd: &Path,
+    cfg: &ConfigToml,
+) -> PathBuf {
+    cfg.sqlite_home
+        .as_ref()
+        .map(AbsolutePathBuf::to_path_buf)
+        .or_else(|| resolve_sqlite_home_env(resolved_cwd))
+        .unwrap_or_else(|| codex_home.to_path_buf())
+}
+
 fn resolve_cli_auth_credentials_store_mode(
     configured: AuthCredentialsStoreMode,
     package_version: &str,
@@ -1743,6 +1758,8 @@ impl Config {
                 }
             }
         }))?;
+        let sqlite_home =
+            resolve_sqlite_home_for_config_toml(codex_home.as_path(), &resolved_cwd, &cfg);
         let mut additional_writable_roots: Vec<AbsolutePathBuf> = additional_writable_roots
             .into_iter()
             .map(|path| AbsolutePathBuf::resolve_path_against_base(path, resolved_cwd.as_path()))
@@ -2208,12 +2225,6 @@ impl Config {
             .as_ref()
             .map(AbsolutePathBuf::to_path_buf)
             .unwrap_or_else(|| codex_home.join("log").to_path_buf());
-        let sqlite_home = cfg
-            .sqlite_home
-            .as_ref()
-            .map(AbsolutePathBuf::to_path_buf)
-            .or_else(|| resolve_sqlite_home_env(&resolved_cwd))
-            .unwrap_or_else(|| codex_home.to_path_buf());
         let original_sandbox_policy = sandbox_policy.clone();
 
         apply_requirement_constrained_value(

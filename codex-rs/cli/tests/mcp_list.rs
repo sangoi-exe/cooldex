@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use codex_config::McpServerEnvVar;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::load_global_mcp_servers;
@@ -55,7 +56,10 @@ async fn list_and_get_render_expected_output() -> Result<()> {
         .expect("docs server should exist after add");
     match &mut docs_entry.transport {
         McpServerTransportConfig::Stdio { env_vars, .. } => {
-            *env_vars = vec!["APP_TOKEN".to_string(), "WORKSPACE_ID".to_string()];
+            *env_vars = vec![
+                McpServerEnvVar::Name("APP_TOKEN".to_string()),
+                McpServerEnvVar::Name("WORKSPACE_ID".to_string()),
+            ];
         }
         other => panic!("unexpected transport: {other:?}"),
     }

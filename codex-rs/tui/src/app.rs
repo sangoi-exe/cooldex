@@ -2423,7 +2423,9 @@ impl App {
             );
         }
         if projection_refresh_needed {
-            self.refresh_observed_active_store_account_id();
+            if !self.remote_projection_owns_visible_account_state() {
+                self.refresh_observed_active_store_account_id();
+            }
             if self.live_account_state_owner == LiveAccountStateOwner::AppServerProjection {
                 self.invalidate_rate_limit_state_for_account_change();
             }
@@ -2551,6 +2553,11 @@ impl App {
         changed
     }
 
+    fn remote_projection_owns_visible_account_state(&self) -> bool {
+        self.remote_app_server_url.is_some()
+            && self.live_account_state_owner == LiveAccountStateOwner::AppServerProjection
+    }
+
     fn visible_account_projection_followers(&self) -> VisibleAccountProjectionFollowers {
         VisibleAccountProjectionFollowers {
             active_store_account_id: self.observed_active_store_account_id.clone(),
@@ -2577,6 +2584,12 @@ impl App {
     }
 
     fn maybe_reconcile_active_account_from_auth_manager(&mut self) -> bool {
+        if self.remote_projection_owns_visible_account_state() {
+            // Merge-safety anchor: remote app-server projection is the visible
+            // account owner; generic Codex/thread events must not rebase the
+            // projection baseline onto this client's local AuthManager state.
+            return false;
+        }
         if self.refresh_observed_active_store_account_id() {
             self.recompute_accounts_status_cache_expiry(Utc::now());
             if self.live_account_state_owner == LiveAccountStateOwner::AuthManager {
@@ -10046,7 +10059,7 @@ mod tests {
     async fn remote_projection_refresh_uses_projection_active_store_account_id_instead_of_local_auth_manager()
      {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        let (primary_store_account_id, _secondary_store_account_id) =
+        let (primary_store_account_id, secondary_store_account_id) =
             seed_canonical_chatgpt_accounts(&mut app, "account-a");
         app.remote_app_server_url = Some("ws://127.0.0.1:8765".to_string());
         app.handle_active_account_changed();
@@ -10085,7 +10098,26 @@ mod tests {
         );
         assert_eq!(
             app.observed_active_store_account_id,
-            Some(remote_store_account_id)
+            Some(remote_store_account_id.clone())
+        );
+
+        app.auth_manager
+            .set_active_account(&secondary_store_account_id)
+            .expect("switch local active account");
+        app.handle_thread_event_now(ThreadBufferedEvent::Notification(
+            turn_started_notification(ThreadId::new(), "turn-1"),
+        ));
+
+        assert_eq!(
+            app.auth_manager
+                .active_chatgpt_account_summary()
+                .map(|summary| summary.store_account_id),
+            Some(secondary_store_account_id)
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(remote_store_account_id),
+            "remote projection owner must not drift to local AuthManager state"
         );
     }
 

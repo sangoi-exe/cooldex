@@ -1,4 +1,7 @@
 use super::*;
+// Merge-safety anchor: session MCP startup owns the runtime cwd/environment
+// handoff into MCP so remote-aware stdio env-source filtering stays aligned
+// with config and rmcp-client contracts.
 use codex_mcp::McpRuntimeEnvironment;
 
 /// Context for an initialized model agent

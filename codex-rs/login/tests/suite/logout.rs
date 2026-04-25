@@ -1,13 +1,16 @@
 use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
+use codex_account_state::accounts_db_path;
 use codex_app_server_protocol::AuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::AuthDotJson;
 use codex_login::AuthManager;
+use codex_login::AuthManagerConfig;
 use codex_login::AuthStore;
 use codex_login::CLIENT_ID;
 use codex_login::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR;
+use codex_login::login_with_api_key;
 use codex_login::logout_with_revoke;
 use codex_login::save_auth;
 use codex_login::token_data::IdTokenInfo;
@@ -18,6 +21,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::ffi::OsString;
 use std::path::Path;
+use std::path::PathBuf;
 use tempfile::TempDir;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -53,7 +57,9 @@ async fn logout_with_revoke_revokes_refresh_token_then_removes_auth() -> Result<
     let codex_home = TempDir::new()?;
     save_legacy_auth(codex_home.path(), &chatgpt_auth())?;
 
-    let removed = logout_with_revoke(codex_home.path(), AuthCredentialsStoreMode::File).await?;
+    let config = TestAuthManagerConfig::new(codex_home.path(), codex_home.path());
+
+    let removed = logout_with_revoke(&config).await?;
 
     assert!(removed);
     assert!(!codex_home.path().join("auth.json").exists());
@@ -101,12 +107,40 @@ async fn logout_with_revoke_removes_auth_when_revoke_fails() -> Result<()> {
     let codex_home = TempDir::new()?;
     save_legacy_auth(codex_home.path(), &chatgpt_auth())?;
 
-    let removed = logout_with_revoke(codex_home.path(), AuthCredentialsStoreMode::File).await?;
+    let config = TestAuthManagerConfig::new(codex_home.path(), codex_home.path());
+
+    let removed = logout_with_revoke(&config).await?;
 
     assert!(removed);
     assert!(!codex_home.path().join("auth.json").exists());
 
     server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn logout_with_revoke_uses_configured_sqlite_home() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let sqlite_home = TempDir::new()?;
+    login_with_api_key(
+        codex_home.path(),
+        "sk-test-key",
+        AuthCredentialsStoreMode::File,
+    )?;
+    let config = TestAuthManagerConfig::new(codex_home.path(), sqlite_home.path());
+
+    let removed = logout_with_revoke(&config).await?;
+
+    assert!(removed);
+    assert!(!codex_home.path().join("auth.json").exists());
+    assert!(
+        accounts_db_path(sqlite_home.path()).exists(),
+        "configured sqlite_home should hold the account-state DB"
+    );
+    assert!(
+        !accounts_db_path(codex_home.path()).exists(),
+        "logout_with_revoke must not fall back to codex_home for account-state DB"
+    );
     Ok(())
 }
 
@@ -233,5 +267,37 @@ impl Drop for EnvGuard {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+}
+
+struct TestAuthManagerConfig {
+    codex_home: PathBuf,
+    sqlite_home: PathBuf,
+}
+
+impl TestAuthManagerConfig {
+    fn new(codex_home: &Path, sqlite_home: &Path) -> Self {
+        Self {
+            codex_home: codex_home.to_path_buf(),
+            sqlite_home: sqlite_home.to_path_buf(),
+        }
+    }
+}
+
+impl AuthManagerConfig for TestAuthManagerConfig {
+    fn codex_home(&self) -> PathBuf {
+        self.codex_home.clone()
+    }
+
+    fn sqlite_home(&self) -> PathBuf {
+        self.sqlite_home.clone()
+    }
+
+    fn cli_auth_credentials_store_mode(&self) -> AuthCredentialsStoreMode {
+        AuthCredentialsStoreMode::File
+    }
+
+    fn forced_chatgpt_workspace_id(&self) -> Option<String> {
+        None
     }
 }

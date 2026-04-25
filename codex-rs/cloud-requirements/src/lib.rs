@@ -723,12 +723,17 @@ pub fn cloud_requirements_loader(
 
 pub fn cloud_requirements_loader_for_storage(
     codex_home: PathBuf,
+    sqlite_home: PathBuf,
     enable_codex_api_key_env: bool,
     credentials_store_mode: AuthCredentialsStoreMode,
     chatgpt_base_url: String,
 ) -> CloudRequirementsLoader {
-    let auth_manager = AuthManager::shared(
+    // Merge-safety anchor: config/bootstrap callers that cannot yet build a
+    // full Config must still pass resolved sqlite_home explicitly so WS12 lease
+    // and usage truth do not fall back to codex_home during cloud requirements.
+    let auth_manager = AuthManager::shared_with_sqlite_home(
         codex_home.clone(),
+        sqlite_home,
         enable_codex_api_key_env,
         credentials_store_mode,
     );

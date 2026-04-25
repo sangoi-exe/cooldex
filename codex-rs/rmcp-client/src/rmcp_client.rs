@@ -13,6 +13,9 @@ use std::time::Instant;
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_client::build_reqwest_client_with_custom_ca;
+// Merge-safety anchor: rmcp-client receives typed MCP env vars so stdio
+// launchers can enforce local-vs-remote env-source boundaries without
+// reinterpreting arbitrary strings.
 use codex_config::types::McpServerEnvVar;
 use futures::FutureExt;
 use futures::StreamExt;

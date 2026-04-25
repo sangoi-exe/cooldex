@@ -35,6 +35,9 @@ use codex_protocol::protocol::SandboxPolicy;
 use serde_json::Value;
 
 use crate::mcp_connection_manager::McpConnectionManager;
+// Merge-safety anchor: MCP snapshot/status collection must carry the resolved
+// local/remote runtime environment into stdio launchers so remote-sourced env
+// vars never leak into local stdio execution.
 use crate::mcp_connection_manager::McpRuntimeEnvironment;
 use crate::mcp_connection_manager::codex_apps_tools_cache_key;
 pub type McpManager = McpConnectionManager;

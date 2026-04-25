@@ -38,6 +38,9 @@ pub use mcp_connection_manager::CodexAppsToolsCacheKey;
 pub use mcp_connection_manager::DEFAULT_STARTUP_TIMEOUT;
 pub use mcp_connection_manager::MCP_SANDBOX_STATE_META_CAPABILITY;
 pub use mcp_connection_manager::McpConnectionManager;
+// Merge-safety anchor: McpRuntimeEnvironment is the exported remote-aware
+// runtime contract consumed by core/session and must remain aligned with
+// rmcp-client stdio env-source filtering.
 pub use mcp_connection_manager::McpRuntimeEnvironment;
 pub use mcp_connection_manager::SandboxState;
 pub use mcp_connection_manager::ToolInfo;
