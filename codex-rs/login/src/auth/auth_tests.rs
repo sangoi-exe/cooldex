@@ -2,6 +2,9 @@ use super::*;
 use crate::auth::AccountRateLimitRefreshOutcome;
 use crate::auth::AccountRateLimitRefreshRoster;
 use crate::auth::AccountRateLimitRefreshRosterStatus;
+use crate::auth::UsageLimitAutoSwitchFallbackSelectionMode;
+use crate::auth::UsageLimitAutoSwitchRequest;
+use crate::auth::UsageLimitAutoSwitchSelectionScope;
 use crate::auth::storage::FileAuthStorage;
 use crate::auth::storage::get_auth_file;
 use crate::token_data::IdTokenInfo;
@@ -716,6 +719,7 @@ fn set_active_account_respects_forced_workspace_and_updates_last_seen() {
     manager.set_forced_chatgpt_workspace_id(Some(workspace_a.to_string()));
 
     let err = manager
+        .account_manager()
         .set_active_account("store-account-c")
         .expect_err("workspace-mismatched account should fail");
     assert!(
@@ -724,9 +728,11 @@ fn set_active_account_respects_forced_workspace_and_updates_last_seen() {
         "unexpected error: {err}"
     );
 
-    manager
+    let mutation = manager
+        .account_manager()
         .set_active_account("store-account-b")
         .expect("workspace-matching account should become active");
+    manager.refresh_auth_after_account_runtime_mutation(mutation);
 
     assert_eq!(
         manager
@@ -763,7 +769,8 @@ fn set_active_account_respects_forced_workspace_and_updates_last_seen() {
 }
 
 // Merge-safety anchor: account upsert mutation belongs to AccountManager while
-// AuthManager remains the persistence/cache wrapper for saved ChatGPT accounts.
+// AuthManager only consumes the returned mutation token to refresh derived
+// cached auth for saved ChatGPT accounts.
 #[test]
 fn upsert_account_inserts_updates_and_preserves_existing_label_without_new_label() {
     let codex_home = tempdir().expect("create auth tempdir");
@@ -798,24 +805,30 @@ fn upsert_account_inserts_updates_and_preserves_existing_label_without_new_label
     let expected_account_id = "chatgpt-user:user-12345:workspace:workspace-a";
 
     assert_eq!(
-        manager
-            .upsert_account(
-                make_tokens("first-access-token", "first-refresh-token"),
-                Some("Primary".to_string()),
-                true,
-            )
-            .expect("initial account upsert should persist"),
+        manager.refresh_auth_after_account_runtime_mutation(
+            manager
+                .account_manager()
+                .upsert_account(
+                    make_tokens("first-access-token", "first-refresh-token"),
+                    /*label*/ Some("Primary".to_string()),
+                    /*make_active*/ true,
+                )
+                .expect("initial account upsert should persist"),
+        ),
         expected_account_id
     );
 
     assert_eq!(
-        manager
-            .upsert_account(
-                make_tokens("updated-access-token", "updated-refresh-token"),
-                None,
-                false,
-            )
-            .expect("second account upsert should persist"),
+        manager.refresh_auth_after_account_runtime_mutation(
+            manager
+                .account_manager()
+                .upsert_account(
+                    make_tokens("updated-access-token", "updated-refresh-token"),
+                    /*label*/ None,
+                    /*make_active*/ false,
+                )
+                .expect("second account upsert should persist"),
+        ),
         expected_account_id
     );
 
@@ -906,11 +919,11 @@ fn remove_account_reselects_unleased_fallback_account() {
         )
         .expect("foreign lease should persist");
 
-    assert!(
-        manager
-            .remove_account("store-account-a")
-            .expect("active account removal should succeed")
-    );
+    let mutation = manager
+        .account_manager()
+        .remove_account("store-account-a")
+        .expect("active account removal should succeed");
+    assert!(manager.refresh_auth_after_account_runtime_mutation(mutation));
 
     let cached_store = manager
         .inner
@@ -1450,20 +1463,22 @@ fn saved_account_runtime_updates_skip_empty_store_without_persisting_auth() {
         0
     );
     let unsupported_store_account_ids = HashSet::new();
+    let mutation = manager
+        .account_manager()
+        .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
+            required_workspace_id: None,
+            failing_store_account_id: Some("missing-account"),
+            resets_at: Some(Utc::now()),
+            snapshot: None,
+            freshly_unsupported_store_account_ids: &unsupported_store_account_ids,
+            protected_store_account_id: None,
+            selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+            fallback_selection_mode:
+                UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
+        })
+        .expect("autoswitch without saved accounts should be a no-op");
     assert_eq!(
-        manager
-            .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
-                required_workspace_id: None,
-                failing_store_account_id: Some("missing-account"),
-                resets_at: Some(Utc::now()),
-                snapshot: None,
-                freshly_unsupported_store_account_ids: &unsupported_store_account_ids,
-                protected_store_account_id: None,
-                selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
-                fallback_selection_mode:
-                    UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
-            })
-            .expect("autoswitch without saved accounts should be a no-op"),
+        manager.refresh_auth_after_account_runtime_mutation(mutation),
         None
     );
 
@@ -1765,20 +1780,22 @@ fn switch_account_on_usage_limit_respects_cooldown_but_still_marks_failing_accou
         rate_limit_reached_type: None,
     };
 
+    let mutation = manager
+        .account_manager()
+        .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
+            required_workspace_id: None,
+            failing_store_account_id: Some("store-account-a"),
+            resets_at: Some(reset_at),
+            snapshot: Some(snapshot.clone()),
+            freshly_unsupported_store_account_ids: &HashSet::new(),
+            protected_store_account_id: None,
+            selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+            fallback_selection_mode:
+                UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
+        })
+        .expect("autoswitch under cooldown should not error");
     assert_eq!(
-        manager
-            .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
-                required_workspace_id: None,
-                failing_store_account_id: Some("store-account-a"),
-                resets_at: Some(reset_at),
-                snapshot: Some(snapshot.clone()),
-                freshly_unsupported_store_account_ids: &HashSet::new(),
-                protected_store_account_id: None,
-                selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
-                fallback_selection_mode:
-                    UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
-            })
-            .expect("autoswitch under cooldown should not error"),
+        manager.refresh_auth_after_account_runtime_mutation(mutation),
         None
     );
 
@@ -1875,20 +1892,22 @@ fn switch_account_on_usage_limit_starts_cooldown_after_switching_to_fallback() {
         rate_limit_reached_type: None,
     };
 
+    let mutation = manager
+        .account_manager()
+        .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
+            required_workspace_id: None,
+            failing_store_account_id: Some("store-account-a"),
+            resets_at: Some(reset_at),
+            snapshot: Some(snapshot.clone()),
+            freshly_unsupported_store_account_ids: &HashSet::new(),
+            protected_store_account_id: None,
+            selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+            fallback_selection_mode:
+                UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
+        })
+        .expect("autoswitch should succeed");
     assert_eq!(
-        manager
-            .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
-                required_workspace_id: None,
-                failing_store_account_id: Some("store-account-a"),
-                resets_at: Some(reset_at),
-                snapshot: Some(snapshot.clone()),
-                freshly_unsupported_store_account_ids: &HashSet::new(),
-                protected_store_account_id: None,
-                selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
-                fallback_selection_mode:
-                    UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
-            })
-            .expect("autoswitch should succeed"),
+        manager.refresh_auth_after_account_runtime_mutation(mutation),
         Some("store-account-b".to_string())
     );
 

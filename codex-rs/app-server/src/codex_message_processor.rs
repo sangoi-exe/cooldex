@@ -775,7 +775,11 @@ impl CodexMessageProcessor {
         // AuthManager cache/storage work, then run the active-account mutation
         // through the AccountManager-owned set-active path.
         auth_manager.reload_strict()?;
-        auth_manager.set_active_account(&login_success.store_account_id)
+        let mutation = auth_manager
+            .account_manager()
+            .set_active_account(&login_success.store_account_id)?;
+        auth_manager.refresh_auth_after_account_runtime_mutation(mutation);
+        Ok(())
     }
 
     fn track_error_response(
@@ -2142,8 +2146,14 @@ impl CodexMessageProcessor {
         request_id: ConnectionRequestId,
         params: SetActiveAccountParams,
     ) {
-        match self.auth_manager.set_active_account(&params.account_id) {
-            Ok(()) => {
+        match self
+            .auth_manager
+            .account_manager()
+            .set_active_account(&params.account_id)
+        {
+            Ok(mutation) => {
+                self.auth_manager
+                    .refresh_auth_after_account_runtime_mutation(mutation);
                 self.refresh_cloud_requirements_for_current_account().await;
                 self.outgoing
                     .send_response(request_id, SetActiveAccountResponse {})

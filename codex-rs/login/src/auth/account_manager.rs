@@ -631,6 +631,41 @@ pub(super) struct LoadedAuthStore {
     pub(super) store_origin: LoadedStoreOrigin,
 }
 
+/// Opaque result of an active account-runtime mutation.
+///
+/// Callers must pass this value to `AuthManager` so derived cached auth is
+/// refreshed after `AccountManager` changes the selected saved account.
+// Merge-safety anchor: active account-runtime mutations return an opaque
+// must-use token so AccountManager owns the mutation while AuthManager remains
+// the only public consumer that can refresh derived auth cache and extract the
+// mutation result.
+#[must_use = "active account-runtime mutations must be applied to AuthManager so cached auth stays current"]
+pub struct AccountRuntimeMutation<T> {
+    result: T,
+    loaded: Option<LoadedAuthStore>,
+}
+
+impl<T> AccountRuntimeMutation<T> {
+    fn from_loaded(result: T, loaded: LoadedAuthStore) -> Self {
+        Self {
+            result,
+            loaded: Some(loaded),
+        }
+    }
+
+    pub(super) fn into_parts(self) -> (T, Option<LoadedAuthStore>) {
+        (self.result, self.loaded)
+    }
+}
+
+impl<T> std::fmt::Debug for AccountRuntimeMutation<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AccountRuntimeMutation")
+            .finish_non_exhaustive()
+    }
+}
+
 struct LoadedStoreCandidate {
     store: AuthStore,
     store_origin: LoadedStoreOrigin,
@@ -1807,11 +1842,59 @@ impl AccountManager {
         })
     }
 
-    pub(super) fn set_active_account(
+    pub fn set_active_account(&self, id: &str) -> std::io::Result<AccountRuntimeMutation<()>> {
+        let (out, loaded) =
+            self.mutate_store(|store| self.set_active_account_in_store(store, id))?;
+        Ok(AccountRuntimeMutation::from_loaded(out, loaded))
+    }
+
+    pub fn upsert_account(
         &self,
-        store: &mut AuthStore,
-        id: &str,
-    ) -> std::io::Result<()> {
+        tokens: TokenData,
+        label: Option<String>,
+        make_active: bool,
+    ) -> std::io::Result<AccountRuntimeMutation<String>> {
+        let (out, loaded) = self.mutate_store(|store| {
+            Ok(self.upsert_account_in_store(store, tokens, label, make_active))
+        })?;
+        Ok(AccountRuntimeMutation::from_loaded(out, loaded))
+    }
+
+    pub fn remove_account(&self, id: &str) -> std::io::Result<AccountRuntimeMutation<bool>> {
+        let (out, loaded) = self.mutate_store(|store| self.remove_account_in_store(store, id))?;
+        Ok(AccountRuntimeMutation::from_loaded(out, loaded))
+    }
+
+    pub fn switch_account_on_usage_limit(
+        &self,
+        request: UsageLimitAutoSwitchRequest<'_>,
+    ) -> std::io::Result<AccountRuntimeMutation<Option<String>>> {
+        if !self.has_saved_chatgpt_accounts() {
+            // Merge-safety anchor: no saved-account autoswitch must remain a
+            // no-op that does not materialize auth.json just to satisfy the
+            // active-mutation refresh-token contract.
+            return Ok(AccountRuntimeMutation {
+                result: None,
+                loaded: None,
+            });
+        }
+
+        let mut loaded_store = None;
+        let switched_to =
+            self.switch_account_on_usage_limit_with_cooldown(&request, |cooldown_active| {
+                let (switched_to, loaded) = self.mutate_store(|store| {
+                    self.switch_account_on_usage_limit_in_store(store, &request, cooldown_active)
+                })?;
+                loaded_store = Some(loaded);
+                Ok(switched_to)
+            })?;
+        Ok(AccountRuntimeMutation {
+            result: switched_to,
+            loaded: loaded_store,
+        })
+    }
+
+    fn set_active_account_in_store(&self, store: &mut AuthStore, id: &str) -> std::io::Result<()> {
         let required_workspace_id = self.forced_chatgpt_workspace_id();
         let Some(account) = store.accounts.iter().find(|account| account.id == id) else {
             return Err(std::io::Error::other(format!("account '{id}' not found")));
@@ -1831,7 +1914,7 @@ impl AccountManager {
         Ok(())
     }
 
-    pub(super) fn upsert_account(
+    fn upsert_account_in_store(
         &self,
         store: &mut AuthStore,
         tokens: TokenData,
@@ -1870,7 +1953,7 @@ impl AccountManager {
         account_id
     }
 
-    pub(super) fn remove_account(&self, store: &mut AuthStore, id: &str) -> std::io::Result<bool> {
+    fn remove_account_in_store(&self, store: &mut AuthStore, id: &str) -> std::io::Result<bool> {
         let required_workspace_id = self.forced_chatgpt_workspace_id();
         let prev_len = store.accounts.len();
         store.accounts.retain(|account| account.id != id);
@@ -2091,7 +2174,7 @@ impl AccountManager {
         Ok(switched_to)
     }
 
-    pub(super) fn switch_account_on_usage_limit(
+    fn switch_account_on_usage_limit_in_store(
         &self,
         store: &mut AuthStore,
         request: &UsageLimitAutoSwitchRequest<'_>,

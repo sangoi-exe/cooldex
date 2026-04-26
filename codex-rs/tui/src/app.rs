@@ -2626,13 +2626,17 @@ impl App {
                 "failed to resolve local ChatGPT auth for workspace {previous_account_id:?}: {err}"
             )
         })?;
-        self.auth_manager
+        let mutation = self
+            .auth_manager
+            .account_manager()
             .set_active_account(&requested_auth.store_account_id)
             .map_err(|err| {
                 format!(
                     "failed to select local ChatGPT account for workspace {previous_account_id:?}: {err}"
                 )
             })?;
+        self.auth_manager
+            .refresh_auth_after_account_runtime_mutation(mutation);
         self.maybe_reconcile_active_account_from_auth_manager();
         Ok(())
     }
@@ -2672,13 +2676,17 @@ impl App {
         {
             return Ok(());
         }
-        self.auth_manager
+        let mutation = self
+            .auth_manager
+            .account_manager()
             .set_active_account(previous_active_store_account_id)
             .map_err(|err| {
                 format!(
                     "failed to restore previously active local ChatGPT account {previous_active_store_account_id:?}: {err}"
                 )
             })?;
+        self.auth_manager
+            .refresh_auth_after_account_runtime_mutation(mutation);
         self.maybe_reconcile_active_account_from_auth_manager();
         Ok(())
     }
@@ -10088,9 +10096,13 @@ mod tests {
         .await
         .expect("embedded app server sharing app auth manager");
 
-        app.auth_manager
+        let mutation = app
+            .auth_manager
+            .account_manager()
             .set_active_account(&secondary_store_account_id)
             .expect("switch active account on shared auth manager");
+        app.auth_manager
+            .refresh_auth_after_account_runtime_mutation(mutation);
 
         let projection = app_server.load_account_projection().await?;
 
@@ -10235,9 +10247,13 @@ mod tests {
             Some(remote_store_account_id.clone())
         );
 
-        app.auth_manager
+        let mutation = app
+            .auth_manager
+            .account_manager()
             .set_active_account(&secondary_store_account_id)
             .expect("switch local active account");
+        app.auth_manager
+            .refresh_auth_after_account_runtime_mutation(mutation);
         app.handle_thread_event_now(ThreadBufferedEvent::Notification(
             turn_started_notification(ThreadId::new(), "turn-1"),
         ));
@@ -10525,10 +10541,14 @@ mod tests {
             .remote_auth_manager
             .reload_strict()
             .expect("reload newly added remote account");
-        harness
+        let mutation = harness
             .remote_auth_manager
+            .account_manager()
             .set_active_account(&new_store_account_id)
             .expect("activate the newly added remote account");
+        harness
+            .remote_auth_manager
+            .refresh_auth_after_account_runtime_mutation(mutation);
 
         harness
             .inject_server_notification(ServerNotification::AccountLoginCompleted(
@@ -10717,8 +10737,10 @@ mod tests {
         assert_eq!(harness.app.chat_widget.rate_limit_snapshot_count(), 1);
 
         let freshly_unsupported_store_account_ids = HashSet::new();
-        let switched_to = harness.remote_auth_manager.switch_account_on_usage_limit(
-            UsageLimitAutoSwitchRequest {
+        let mutation = harness
+            .remote_auth_manager
+            .account_manager()
+            .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
                 required_workspace_id: None,
                 failing_store_account_id: Some(harness.primary_store_account_id.as_str()),
                 resets_at: Some(Utc::now() + chrono::Duration::minutes(15)),
@@ -10740,8 +10762,10 @@ mod tests {
                 selection_scope: UsageLimitAutoSwitchSelectionScope::PersistedTruth,
                 fallback_selection_mode:
                     UsageLimitAutoSwitchFallbackSelectionMode::AllowFallbackSelection,
-            },
-        )?;
+            })?;
+        let switched_to = harness
+            .remote_auth_manager
+            .refresh_auth_after_account_runtime_mutation(mutation);
         assert_eq!(
             switched_to,
             Some(harness.secondary_store_account_id.clone())
@@ -10965,9 +10989,13 @@ mod tests {
             .find(|account| account.label.as_deref() == Some("Secondary"))
             .map(|account| account.id)
             .expect("secondary account should exist");
-        app.auth_manager
+        let mutation = app
+            .auth_manager
+            .account_manager()
             .set_active_account(&switched_account_id)
             .expect("switch active account");
+        app.auth_manager
+            .refresh_auth_after_account_runtime_mutation(mutation);
         app.handle_thread_event_now(ThreadBufferedEvent::Notification(
             turn_started_notification(ThreadId::new(), "turn-1"),
         ));
@@ -11029,9 +11057,13 @@ mod tests {
             .find(|account| account.label.as_deref() == Some("Secondary"))
             .map(|account| account.id)
             .expect("secondary account should exist");
-        app.auth_manager
+        let mutation = app
+            .auth_manager
+            .account_manager()
             .set_active_account(&switched_account_id)
             .expect("switch active account");
+        app.auth_manager
+            .refresh_auth_after_account_runtime_mutation(mutation);
         app.handle_thread_event_now(ThreadBufferedEvent::Notification(
             turn_started_notification(ThreadId::new(), "turn-1"),
         ));
@@ -11101,9 +11133,13 @@ mod tests {
             .find(|account| account.label.as_deref() == Some("Secondary"))
             .map(|account| account.id)
             .expect("secondary account should exist");
-        app.auth_manager
+        let mutation = app
+            .auth_manager
+            .account_manager()
             .set_active_account(&switched_account_id)
             .expect("switch active account");
+        app.auth_manager
+            .refresh_auth_after_account_runtime_mutation(mutation);
         app.handle_thread_event_now(ThreadBufferedEvent::Notification(
             turn_started_notification(ThreadId::new(), "turn-1"),
         ));
@@ -11171,9 +11207,13 @@ mod tests {
             .find(|account| account.label.as_deref() == Some("Secondary"))
             .map(|account| account.id)
             .expect("secondary account should exist");
-        app.auth_manager
+        let mutation = app
+            .auth_manager
+            .account_manager()
             .set_active_account(&switched_account_id)
             .expect("switch active account");
+        app.auth_manager
+            .refresh_auth_after_account_runtime_mutation(mutation);
         app.handle_thread_event_now(ThreadBufferedEvent::Notification(
             turn_started_notification(ThreadId::new(), "turn-1"),
         ));
@@ -11367,9 +11407,13 @@ mod tests {
             .find(|account| account.label.as_deref() == Some("Secondary"))
             .map(|account| account.id)
             .expect("secondary account should exist");
-        app.auth_manager
+        let mutation = app
+            .auth_manager
+            .account_manager()
             .set_active_account(&secondary_store_account_id)
             .expect("switch active account");
+        app.auth_manager
+            .refresh_auth_after_account_runtime_mutation(mutation);
 
         let refreshed_models = vec![all_model_presets()[1].clone()];
         let refreshed_default_model = refreshed_models[0].model.clone();
@@ -11449,9 +11493,13 @@ mod tests {
             .find(|account| account.label.as_deref() == Some("Secondary"))
             .map(|account| account.id)
             .expect("secondary account should exist");
-        app.auth_manager
+        let mutation = app
+            .auth_manager
+            .account_manager()
             .set_active_account(&secondary_store_account_id)
             .expect("switch active account");
+        app.auth_manager
+            .refresh_auth_after_account_runtime_mutation(mutation);
         app.handle_active_account_changed();
 
         let expected_projection_followers = app.visible_account_projection_followers();
@@ -11597,10 +11645,14 @@ mod tests {
             .find(|account| !account.is_active)
             .map(|account| account.id.clone())
             .expect("secondary account should exist");
+        let mutation = app
+            .auth_manager
+            .account_manager()
+            .remove_account(&active_store_account_id)
+            .expect("remove active account");
         assert!(
             app.auth_manager
-                .remove_account(&active_store_account_id)
-                .expect("remove active account"),
+                .refresh_auth_after_account_runtime_mutation(mutation),
             "active account should be removed",
         );
 
@@ -11700,10 +11752,14 @@ mod tests {
         ));
         while app_event_rx.try_recv().is_ok() {}
 
+        let mutation = app
+            .auth_manager
+            .account_manager()
+            .remove_account(&active_store_account_id)
+            .expect("remove last account");
         assert!(
             app.auth_manager
-                .remove_account(&active_store_account_id)
-                .expect("remove last account"),
+                .refresh_auth_after_account_runtime_mutation(mutation),
             "last account should be removed",
         );
 
@@ -11779,10 +11835,14 @@ mod tests {
             .find(|account| !account.is_active)
             .map(|account| account.id.clone())
             .expect("secondary account should exist");
+        let mutation = app
+            .auth_manager
+            .account_manager()
+            .remove_account(&active_store_account_id)
+            .expect("remove active account");
         assert!(
             app.auth_manager
-                .remove_account(&active_store_account_id)
-                .expect("remove active account"),
+                .refresh_auth_after_account_runtime_mutation(mutation),
             "active account should be removed",
         );
 
@@ -11877,10 +11937,14 @@ mod tests {
         ));
         while app_event_rx.try_recv().is_ok() {}
 
+        let mutation = app
+            .auth_manager
+            .account_manager()
+            .remove_account(&active_store_account_id)
+            .expect("remove last account");
         assert!(
             app.auth_manager
-                .remove_account(&active_store_account_id)
-                .expect("remove last account"),
+                .refresh_auth_after_account_runtime_mutation(mutation),
             "last account should be removed",
         );
 
@@ -11951,10 +12015,14 @@ mod tests {
             .find(|account| !account.is_active)
             .map(|account| account.id.clone())
             .expect("secondary account should exist");
+        let mutation = app
+            .auth_manager
+            .account_manager()
+            .remove_account(&non_active_store_account_id)
+            .expect("remove non-active account");
         assert!(
             app.auth_manager
-                .remove_account(&non_active_store_account_id)
-                .expect("remove non-active account"),
+                .refresh_auth_after_account_runtime_mutation(mutation),
             "non-active account should be removed",
         );
 
@@ -12024,10 +12092,14 @@ mod tests {
             .find(|account| !account.is_active)
             .map(|account| account.id.clone())
             .expect("secondary account should exist");
+        let mutation = app
+            .auth_manager
+            .account_manager()
+            .remove_account(&active_store_account_id)
+            .expect("remove active account");
         assert!(
             app.auth_manager
-                .remove_account(&active_store_account_id)
-                .expect("remove active account"),
+                .refresh_auth_after_account_runtime_mutation(mutation),
             "active account should be removed",
         );
         let reset_at = Utc::now() + chrono::Duration::minutes(45);
@@ -12224,11 +12296,14 @@ mod tests {
             Some(login_success.store_account_id.clone()),
             "add-account outcome must not mutate active account before app-server owner runs"
         );
-        let active_store_account_id = app
+        let mutation = app
             .auth_manager
+            .account_manager()
             .set_active_account(&login_success.store_account_id)
-            .map(|_| login_success.store_account_id.clone())
             .expect("simulate embedded app-server active-account mutation");
+        app.auth_manager
+            .refresh_auth_after_account_runtime_mutation(mutation);
+        let active_store_account_id = login_success.store_account_id.clone();
 
         let refreshed_models = vec![all_model_presets()[1].clone()];
         let refreshed_default_model = refreshed_models[0].model.clone();
@@ -12469,9 +12544,13 @@ mod tests {
             .find(|account| account.label.as_deref() == Some("Secondary"))
             .map(|account| account.id)
             .expect("secondary account should exist");
-        app.auth_manager
+        let mutation = app
+            .auth_manager
+            .account_manager()
             .set_active_account(&secondary_store_account_id)
             .expect("switch active account");
+        app.auth_manager
+            .refresh_auth_after_account_runtime_mutation(mutation);
         let original_model_catalog = app.model_catalog.clone();
         let original_model = app.chat_widget.current_model().to_string();
 
@@ -17675,6 +17754,7 @@ guardian_approval = true
 
         let err = app
             .auth_manager
+            .account_manager()
             .set_active_account(&blocked_account_id)
             .expect_err("workspace-mismatched account should be rejected");
 

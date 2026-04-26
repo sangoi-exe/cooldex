@@ -991,22 +991,27 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit_with_refreshed_acco
     };
 
     let required_workspace_id = turn_context.config.forced_chatgpt_workspace_id.as_deref();
-    let switch_result =
-        sess.services
-            .auth_manager
-            .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
-                required_workspace_id,
-                failing_store_account_id: failing_store_account_id.as_deref(),
-                resets_at: usage_limit.resets_at,
-                snapshot: usage_limit.rate_limits.as_deref().cloned(),
-                freshly_unsupported_store_account_ids: &refresh_state
-                    .freshly_unsupported_store_account_ids,
-                protected_store_account_id,
-                selection_scope: UsageLimitAutoSwitchSelectionScope::FreshlySelectable(
-                    &refresh_state.freshly_selectable_store_account_ids,
-                ),
-                fallback_selection_mode,
-            })?;
+    let mutation = sess
+        .services
+        .auth_manager
+        .account_manager()
+        .switch_account_on_usage_limit(UsageLimitAutoSwitchRequest {
+            required_workspace_id,
+            failing_store_account_id: failing_store_account_id.as_deref(),
+            resets_at: usage_limit.resets_at,
+            snapshot: usage_limit.rate_limits.as_deref().cloned(),
+            freshly_unsupported_store_account_ids: &refresh_state
+                .freshly_unsupported_store_account_ids,
+            protected_store_account_id,
+            selection_scope: UsageLimitAutoSwitchSelectionScope::FreshlySelectable(
+                &refresh_state.freshly_selectable_store_account_ids,
+            ),
+            fallback_selection_mode,
+        })?;
+    let switch_result = sess
+        .services
+        .auth_manager
+        .refresh_auth_after_account_runtime_mutation(mutation);
     let Some(next_store_account_id) = switch_result else {
         let current_active_store_account_id = sess
             .services

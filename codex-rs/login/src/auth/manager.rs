@@ -26,16 +26,12 @@ use super::account_manager::ACTIVE_ACCOUNT_LEASE_TTL_SECONDS;
 #[cfg(test)]
 use super::account_manager::AccountLeaseState;
 use super::account_manager::AccountManager;
+use super::account_manager::AccountRuntimeMutation;
 use super::account_manager::ActiveChatgptAccountSummary;
 use super::account_manager::ChatgptAuthAdmissionPolicy;
 use super::account_manager::GuardedReloadLoadedStore;
 use super::account_manager::LoadedAuthStore;
 use super::account_manager::LoadedStoreOrigin;
-#[cfg(test)]
-use super::account_manager::UsageLimitAutoSwitchFallbackSelectionMode;
-use super::account_manager::UsageLimitAutoSwitchRequest;
-#[cfg(test)]
-use super::account_manager::UsageLimitAutoSwitchSelectionScope;
 use super::account_manager::account_matches_required_workspace;
 use super::account_manager::enforce_chatgpt_auth_accounts;
 use super::account_manager::strip_runtime_active_account_from_store;
@@ -2119,49 +2115,18 @@ impl AuthManager {
         }
     }
 
-    pub fn set_active_account(&self, id: &str) -> std::io::Result<()> {
-        // Merge-safety anchor: active-account mutation belongs to
-        // AccountManager; AuthManager may only pass through the request and
-        // refresh its derived auth cache from the returned account-runtime
-        // mutation snapshot.
-        self.update_store(|store| self.account_manager.set_active_account(store, id))
-    }
-
-    pub fn upsert_account(
+    pub fn refresh_auth_after_account_runtime_mutation<T>(
         &self,
-        tokens: TokenData,
-        label: Option<String>,
-        make_active: bool,
-    ) -> std::io::Result<String> {
-        self.update_store(|store| {
-            Ok(self
-                .account_manager
-                .upsert_account(store, tokens, label, make_active))
-        })
-    }
-
-    pub fn remove_account(&self, id: &str) -> std::io::Result<bool> {
-        self.update_store(|store| self.account_manager.remove_account(store, id))
-    }
-
-    pub fn switch_account_on_usage_limit(
-        &self,
-        request: UsageLimitAutoSwitchRequest<'_>,
-    ) -> std::io::Result<Option<String>> {
-        if !self.account_manager.has_saved_chatgpt_accounts() {
-            return Ok(None);
+        mutation: AccountRuntimeMutation<T>,
+    ) -> T {
+        // Merge-safety anchor: AuthManager only consumes AccountManager's
+        // opaque active-mutation token to refresh derived auth cache; it must
+        // not regain account-runtime mutation ownership.
+        let (out, loaded) = mutation.into_parts();
+        if let Some(loaded) = loaded {
+            self.set_cached(loaded.store, loaded.store_origin);
         }
-
-        self.account_manager
-            .switch_account_on_usage_limit_with_cooldown(&request, |cooldown_active| {
-                self.update_store(|store| {
-                    self.account_manager.switch_account_on_usage_limit(
-                        store,
-                        &request,
-                        cooldown_active,
-                    )
-                })
-            })
+        out
     }
 
     pub fn refresh_failure_for_auth(&self, auth: &CodexAuth) -> Option<RefreshTokenFailedError> {
@@ -2528,15 +2493,6 @@ impl AuthManager {
                 }
             }),
         )
-    }
-
-    fn update_store<T>(
-        &self,
-        mutator: impl FnOnce(&mut AuthStore) -> std::io::Result<T>,
-    ) -> std::io::Result<T> {
-        let (out, loaded) = self.account_manager.mutate_store(mutator)?;
-        self.set_cached(loaded.store, loaded.store_origin);
-        Ok(out)
     }
 
     pub fn set_external_auth(&self, external_auth: Arc<dyn ExternalAuth>) {

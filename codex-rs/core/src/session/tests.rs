@@ -2680,9 +2680,11 @@ async fn visible_usage_limit_core_pre_refresh_respects_foreign_leases_until_rele
         "phase-1 core auto-switch should emit exactly one warning event"
     );
 
-    manager_b
+    let mutation = manager_b
+        .account_manager()
         .set_active_account(&acc_0_store_account_id)
         .expect("secondary session should take the released primary account");
+    manager_b.refresh_auth_after_account_runtime_mutation(mutation);
     assert_eq!(
         manager_b
             .active_chatgpt_account_summary()
