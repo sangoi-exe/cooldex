@@ -626,12 +626,13 @@ mod tests {
             "fixture auth manager should expose acc-1 as the active cached auth"
         );
         assert_eq!(
-            auth_manager.list_accounts().len(),
+            auth_manager.account_manager().list_accounts().len(),
             2,
             "fixture auth manager should expose both stored accounts"
         );
         assert_eq!(
             auth_manager
+                .account_manager()
                 .select_account_for_auto_switch(None, Some("acc-1"))
                 .as_deref(),
             Some("acc-2"),
@@ -695,7 +696,7 @@ mod tests {
             ]
         );
 
-        let accounts = auth_manager.list_accounts();
+        let accounts = auth_manager.account_manager().list_accounts();
         assert_eq!(
             accounts
                 .iter()

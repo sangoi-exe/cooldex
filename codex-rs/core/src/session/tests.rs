@@ -2046,7 +2046,7 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
         false,
         crate::auth::AuthCredentialsStoreMode::File,
     );
-    let accounts = auth_manager.list_accounts();
+    let accounts = auth_manager.account_manager().list_accounts();
     assert_eq!(
         accounts.len(),
         3,
@@ -2112,7 +2112,7 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
         should_retry,
         "changed active account should stay retryable until its own usage-limit path runs"
     );
-    let accounts = auth_manager.list_accounts();
+    let accounts = auth_manager.account_manager().list_accounts();
     assert_eq!(
         accounts
             .iter()
@@ -2223,7 +2223,7 @@ async fn visible_usage_limit_retry_marks_failing_account_exhausted_even_when_sta
     .expect("stale request should still retry under the later active account");
 
     assert!(should_retry);
-    let accounts = auth_manager.list_accounts();
+    let accounts = auth_manager.account_manager().list_accounts();
     let failing_account = accounts
         .iter()
         .find(|account| account.id == acc_0_store_account_id)
@@ -2384,7 +2384,7 @@ async fn visible_usage_limit_retry_prefers_managed_auth_when_saved_fallbacks_and
     .expect("usage-limit retry should switch when the mixed roster stays on managed auth");
 
     assert!(should_retry);
-    let accounts = auth_manager.list_accounts();
+    let accounts = auth_manager.account_manager().list_accounts();
     assert_eq!(
         accounts
             .iter()
@@ -3189,6 +3189,7 @@ async fn prompt_gc_hidden_usage_limit_auto_switches_and_retries() {
     assert_eq!(status.blocked_reason, None);
     assert_eq!(
         auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .find(|account| account.is_active)

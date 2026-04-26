@@ -2128,6 +2128,7 @@ impl CodexMessageProcessor {
         let response = AccountListResponse {
             accounts: self
                 .auth_manager
+                .account_manager()
                 .list_accounts()
                 .into_iter()
                 .map(account_list_entry_from_summary)
@@ -2173,7 +2174,11 @@ impl CodexMessageProcessor {
         request_id: ConnectionRequestId,
         params: ForceReleaseAccountLeaseParams,
     ) {
-        match self.auth_manager.force_release_account(&params.account_id) {
+        match self
+            .auth_manager
+            .account_manager()
+            .force_release_account(&params.account_id)
+        {
             Ok(ForceReleaseAccountOutcome::Released(_)) => {
                 self.outgoing
                     .send_response(

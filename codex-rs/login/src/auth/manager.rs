@@ -17,7 +17,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::watch;
 
 use codex_account_state::AccountStateStore;
-use codex_account_state::ForceReleaseAccountOutcome;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_protocol::config_types::ForcedLoginMethod;
@@ -29,10 +28,6 @@ use super::account_manager::ACTIVE_ACCOUNT_LEASE_TTL_SECONDS;
 use super::account_manager::AccountLeaseState;
 use super::account_manager::AccountManager;
 use super::account_manager::AccountRateLimitRefreshOutcome;
-use super::account_manager::AccountRateLimitRefreshRoster;
-#[cfg(test)]
-use super::account_manager::AccountRateLimitRefreshRosterStatus;
-use super::account_manager::AccountSummary;
 use super::account_manager::ActiveChatgptAccountSummary;
 use super::account_manager::ChatgptAuthAdmissionPolicy;
 use super::account_manager::GuardedReloadLoadedStore;
@@ -2127,18 +2122,6 @@ impl AuthManager {
         }
     }
 
-    pub fn list_accounts(&self) -> Vec<AccountSummary> {
-        self.account_manager.list_accounts()
-    }
-
-    pub fn force_release_account(&self, id: &str) -> std::io::Result<ForceReleaseAccountOutcome> {
-        self.account_manager.force_release_account(id)
-    }
-
-    pub fn account_rate_limit_refresh_roster(&self) -> AccountRateLimitRefreshRoster {
-        self.account_manager.account_rate_limit_refresh_roster()
-    }
-
     fn update_saved_account_store<T>(
         &self,
         default: T,
@@ -2148,7 +2131,7 @@ impl AuthManager {
         // no-saved-accounts early return outside `update_store(...)` so API-key
         // or empty stores are not loaded, persisted, or cache-refreshed by
         // account-runtime follower updates.
-        if !self.has_saved_chatgpt_accounts() {
+        if !self.account_manager.has_saved_chatgpt_accounts() {
             return Ok(default);
         }
         self.update_store(|store| mutator(&self.account_manager, store))
@@ -2169,7 +2152,7 @@ impl AuthManager {
         // consuming the caller's iterator; API-key or empty stores must not be
         // loaded, persisted, cache-refreshed, or drained by account-runtime
         // telemetry updates.
-        if !self.has_saved_chatgpt_accounts() {
+        if !self.account_manager.has_saved_chatgpt_accounts() {
             return Ok(default);
         }
 
@@ -2254,7 +2237,7 @@ impl AuthManager {
         &self,
         request: UsageLimitAutoSwitchRequest<'_>,
     ) -> std::io::Result<Option<String>> {
-        if !self.has_saved_chatgpt_accounts() {
+        if !self.account_manager.has_saved_chatgpt_accounts() {
             return Ok(None);
         }
 
@@ -2268,23 +2251,6 @@ impl AuthManager {
                     )
                 })
             })
-    }
-
-    pub fn select_account_for_auto_switch(
-        &self,
-        required_workspace_id: Option<&str>,
-        exclude_store_account_id: Option<&str>,
-    ) -> Option<String> {
-        self.account_manager
-            .select_account_for_auto_switch(required_workspace_id, exclude_store_account_id)
-    }
-
-    pub fn accounts_rate_limits_cache_expires_at(
-        &self,
-        now: DateTime<Utc>,
-    ) -> Option<DateTime<Utc>> {
-        self.account_manager
-            .accounts_rate_limits_cache_expires_at(now)
     }
 
     pub fn refresh_failure_for_auth(&self, auth: &CodexAuth) -> Option<RefreshTokenFailedError> {
@@ -2323,10 +2289,10 @@ impl AuthManager {
                 let attempted_store_account_id = auth
                     .active_chatgpt_account_summary()
                     .map(|summary| summary.store_account_id);
-                let accounts = self.list_accounts();
+                let accounts = self.account_manager.list_accounts();
                 let active_saved_account_count =
                     accounts.iter().filter(|account| account.is_active).count();
-                let roster = self.account_rate_limit_refresh_roster();
+                let roster = self.account_manager.account_rate_limit_refresh_roster();
                 tracing::warn!(
                     runtime_session_id = self.account_manager.runtime_session_id(),
                     linked_codex_session_id = ?self.account_manager.linked_codex_session_id().as_deref(),
@@ -2683,6 +2649,10 @@ impl AuthManager {
         {
             self.auth_state_tx.send_replace(());
         }
+    }
+
+    pub fn account_manager(&self) -> &AccountManager {
+        &self.account_manager
     }
 
     pub fn set_linked_codex_session_id(
@@ -3043,10 +3013,6 @@ impl AuthManager {
         self.get_api_auth_mode()
     }
 
-    pub fn has_saved_chatgpt_accounts(&self) -> bool {
-        self.account_manager.has_saved_chatgpt_accounts()
-    }
-
     pub fn current_auth_from_storage(&self) -> Option<CodexAuth> {
         let (loaded, auth) = self.load_auth_from_storage_for_live_reader();
         self.set_cached_with_auth_silent(loaded.store, auth.clone(), loaded.store_origin);
@@ -3073,15 +3039,11 @@ impl AuthManager {
         // Merge-safety anchor: WS12 logout must clear the runtime active-account lease before the
         // live manager stays resident, or app-server/TUI logout leaves a foreign SQLite lease that
         // blocks the next session from claiming the saved account.
-        let release_result = self.release_runtime_active_account();
+        let release_result = self.account_manager.release_runtime_active_account();
         // Always reload to clear any cached auth (even if file absent).
         self.reload();
         release_result?;
         Ok(removed)
-    }
-
-    pub fn release_runtime_active_account(&self) -> std::io::Result<()> {
-        self.account_manager.release_runtime_active_account()
     }
 
     pub fn auth_mode(&self) -> Option<AuthMode> {

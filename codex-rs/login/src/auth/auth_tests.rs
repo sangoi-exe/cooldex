@@ -1,4 +1,6 @@
 use super::*;
+use crate::auth::AccountRateLimitRefreshRoster;
+use crate::auth::AccountRateLimitRefreshRosterStatus;
 use crate::auth::storage::FileAuthStorage;
 use crate::auth::storage::get_auth_file;
 use crate::token_data::IdTokenInfo;
@@ -512,7 +514,12 @@ fn public_auto_switch_selector_reads_live_storage_and_sqlite_usage_truth() {
         AuthCredentialsStoreMode::File,
     );
 
-    assert_eq!(manager.select_account_for_auto_switch(None, None), None);
+    assert_eq!(
+        manager
+            .account_manager()
+            .select_account_for_auto_switch(None, None),
+        None
+    );
 
     save_auth(
         codex_home.path(),
@@ -556,7 +563,9 @@ fn public_auto_switch_selector_reads_live_storage_and_sqlite_usage_truth() {
         .expect("persist sqlite usage truth");
 
     assert_eq!(
-        manager.select_account_for_auto_switch(None, None),
+        manager
+            .account_manager()
+            .select_account_for_auto_switch(None, None),
         Some(fallback_store_account_id.to_string())
     );
 }
@@ -601,7 +610,9 @@ fn rate_limit_refresh_roster_reads_live_storage_and_excludes_foreign_leases() {
         AuthCredentialsStoreMode::File,
     );
     assert_eq!(
-        manager.account_rate_limit_refresh_roster(),
+        manager
+            .account_manager()
+            .account_rate_limit_refresh_roster(),
         AccountRateLimitRefreshRoster {
             store_account_ids: Vec::new(),
             status: AccountRateLimitRefreshRosterStatus::LeaseManaged,
@@ -637,7 +648,9 @@ fn rate_limit_refresh_roster_reads_live_storage_and_excludes_foreign_leases() {
         .expect("foreign lease should persist");
 
     assert_eq!(
-        manager.account_rate_limit_refresh_roster(),
+        manager
+            .account_manager()
+            .account_rate_limit_refresh_roster(),
         AccountRateLimitRefreshRoster {
             store_account_ids: vec!["store-account-a".to_string()],
             status: AccountRateLimitRefreshRosterStatus::LeaseManaged,
@@ -922,7 +935,7 @@ fn remove_account_reselects_unleased_fallback_account() {
         None
     );
 
-    let accounts = manager.list_accounts();
+    let accounts = manager.account_manager().list_accounts();
     assert_eq!(accounts.len(), 2);
     assert_eq!(
         accounts
@@ -1396,7 +1409,9 @@ fn mark_usage_limit_reached_updates_active_usage_and_cache_expiry_uses_sqlite_tr
     }
 
     assert_eq!(
-        manager.accounts_rate_limits_cache_expires_at(now),
+        manager
+            .account_manager()
+            .accounts_rate_limits_cache_expires_at(now),
         Some(expected_reset_at)
     );
 }
@@ -1996,7 +2011,7 @@ fn has_saved_chatgpt_accounts_reads_latest_persisted_store_after_manager_constru
         AuthCredentialsStoreMode::File,
     );
     assert!(
-        !manager.has_saved_chatgpt_accounts(),
+        !manager.account_manager().has_saved_chatgpt_accounts(),
         "fresh manager should start with no saved accounts"
     );
 
@@ -2029,7 +2044,7 @@ fn has_saved_chatgpt_accounts_reads_latest_persisted_store_after_manager_constru
     )
     .expect("save auth store after manager construction");
 
-    assert!(manager.has_saved_chatgpt_accounts());
+    assert!(manager.account_manager().has_saved_chatgpt_accounts());
 }
 
 #[test]

@@ -9820,7 +9820,9 @@ impl ChatWidget {
     }
 
     fn can_manage_chatgpt_accounts(&self) -> bool {
-        self.auth_manager.has_saved_chatgpt_accounts()
+        self.auth_manager
+            .account_manager()
+            .has_saved_chatgpt_accounts()
             || self.config.model_provider.requires_openai_auth
     }
 
@@ -10165,10 +10167,11 @@ impl ChatWidget {
         }
 
         // Merge-safety anchor: `/accounts` descriptions depend on the popup entry view model
-        // preserving the popup-relevant `AuthManager::list_accounts()` semantics (active flag,
+        // preserving the popup-relevant `AccountManager::list_accounts()` semantics (active flag,
         // exhausted_until, last_rate_limits, lease state) across local and remote owners.
         let accounts = self
             .auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .map(AccountsPopupEntry::from)

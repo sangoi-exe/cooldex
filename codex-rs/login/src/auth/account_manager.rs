@@ -651,7 +651,7 @@ pub(super) struct TerminalRefreshFailureStoreMutation {
 }
 
 #[derive(Debug)]
-pub(super) struct AccountManager {
+pub struct AccountManager {
     codex_home: PathBuf,
     storage: Arc<dyn AuthStorageBackend>,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
@@ -703,7 +703,7 @@ impl AccountManager {
         }
     }
 
-    pub(super) fn linked_codex_session_id(&self) -> Option<String> {
+    pub fn linked_codex_session_id(&self) -> Option<String> {
         self.linked_codex_session_id
             .read()
             .ok()
@@ -728,7 +728,7 @@ impl AccountManager {
         }
     }
 
-    pub(super) fn forced_chatgpt_workspace_id(&self) -> Option<String> {
+    pub fn forced_chatgpt_workspace_id(&self) -> Option<String> {
         self.forced_chatgpt_workspace_id
             .read()
             .ok()
@@ -746,11 +746,11 @@ impl AccountManager {
         }
     }
 
-    pub(super) fn has_account_state_store(&self) -> bool {
+    pub fn has_account_state_store(&self) -> bool {
         self.account_state_store.is_some()
     }
 
-    pub(super) fn runtime_session_id(&self) -> &str {
+    pub fn runtime_session_id(&self) -> &str {
         self.runtime_session_id.as_str()
     }
 
@@ -977,10 +977,7 @@ impl AccountManager {
         }
     }
 
-    pub(super) fn force_release_account(
-        &self,
-        id: &str,
-    ) -> std::io::Result<ForceReleaseAccountOutcome> {
+    pub fn force_release_account(&self, id: &str) -> std::io::Result<ForceReleaseAccountOutcome> {
         let Some(account_state_store) = self.account_state_store.as_ref() else {
             return Err(std::io::Error::other(
                 "account lease management is unavailable in this auth mode",
@@ -1180,7 +1177,7 @@ impl AccountManager {
         }
     }
 
-    pub(super) fn has_saved_chatgpt_accounts(&self) -> bool {
+    pub fn has_saved_chatgpt_accounts(&self) -> bool {
         // Merge-safety anchor: saved-account presence checks must read the same
         // runtime-prepared store snapshot owner as `/accounts` and autoswitch,
         // not a stale auth/cache follower.
@@ -1597,7 +1594,7 @@ impl AccountManager {
         }))
     }
 
-    pub(super) fn account_rate_limit_refresh_roster(&self) -> AccountRateLimitRefreshRoster {
+    pub fn account_rate_limit_refresh_roster(&self) -> AccountRateLimitRefreshRoster {
         // Merge-safety anchor: rate-limit refresh rosters must use the current
         // AccountManager-loaded runtime snapshot, not the AuthManager cache, so
         // pre-refresh candidates track live saved accounts and leases.
@@ -1706,7 +1703,7 @@ impl AccountManager {
         )
     }
 
-    pub(super) fn select_account_for_auto_switch(
+    pub fn select_account_for_auto_switch(
         &self,
         required_workspace_id: Option<&str>,
         exclude_store_account_id: Option<&str>,
@@ -1804,7 +1801,7 @@ impl AccountManager {
         Ok(true)
     }
 
-    pub(super) fn list_accounts(&self) -> Vec<AccountSummary> {
+    pub fn list_accounts(&self) -> Vec<AccountSummary> {
         let store = self.load_store_from_storage().store;
         let active_account_id = store.active_account_id.as_deref();
         let lease_states = self.account_lease_states(&store);
@@ -1939,7 +1936,7 @@ impl AccountManager {
         updated
     }
 
-    pub(super) fn accounts_rate_limits_cache_expires_at(
+    pub fn accounts_rate_limits_cache_expires_at(
         &self,
         now: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
@@ -2175,7 +2172,7 @@ impl AccountManager {
         Ok(Some(next_account_id))
     }
 
-    pub(super) fn release_runtime_active_account(&self) -> std::io::Result<()> {
+    pub fn release_runtime_active_account(&self) -> std::io::Result<()> {
         let Some(account_state_store) = self.account_state_store.as_ref() else {
             return Ok(());
         };

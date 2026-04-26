@@ -951,7 +951,7 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit_with_refreshed_acco
     refresh_state: &AutoSwitchRefreshState,
     usage_limit_handling_policy: UsageLimitHandlingPolicy,
 ) -> CodexResult<bool> {
-    let accounts_before = sess.services.auth_manager.list_accounts();
+    let accounts_before = sess.services.auth_manager.account_manager().list_accounts();
     let account_display_name = |account: &crate::auth::AccountSummary| {
         account
             .label
@@ -1011,6 +1011,7 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit_with_refreshed_acco
         let current_active_store_account_id = sess
             .services
             .auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .find(|account| account.is_active)
@@ -1037,7 +1038,7 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit_with_refreshed_acco
         return Ok(false);
     }
 
-    let accounts_after = sess.services.auth_manager.list_accounts();
+    let accounts_after = sess.services.auth_manager.account_manager().list_accounts();
     let from_account_name = failing_store_account_id
         .as_ref()
         .and_then(|account_id| {
@@ -1177,6 +1178,7 @@ pub(crate) async fn refresh_accounts_rate_limits_before_auto_switch(
     let refresh_roster = sess
         .services
         .auth_manager
+        .account_manager()
         .account_rate_limit_refresh_roster();
     let Some(account_ids) = auto_switch_refresh_account_ids_from_roster(refresh_roster) else {
         warn!("failed to load lease-aware refresh roster before usage-limit auto-switch");

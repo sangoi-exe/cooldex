@@ -625,7 +625,9 @@ async fn fetch_accounts_rate_limit_updates(
     auth_manager: Arc<AuthManager>,
 ) -> AccountsRateLimitRefreshResult {
     const MAX_IN_FLIGHT: usize = 4;
-    let refresh_roster = auth_manager.account_rate_limit_refresh_roster();
+    let refresh_roster = auth_manager
+        .account_manager()
+        .account_rate_limit_refresh_roster();
     let Some(pending_store_account_ids) =
         accounts_rate_limit_refresh_pending_store_account_ids(refresh_roster.clone())
     else {
@@ -2232,8 +2234,10 @@ impl App {
     }
 
     fn recompute_accounts_status_cache_expiry(&mut self, now: DateTime<Utc>) {
-        self.accounts_status_cache_expires_at =
-            self.auth_manager.accounts_rate_limits_cache_expires_at(now);
+        self.accounts_status_cache_expires_at = self
+            .auth_manager
+            .account_manager()
+            .accounts_rate_limits_cache_expires_at(now);
     }
 
     fn accounts_status_cache_is_active(&self, now: DateTime<Utc>) -> bool {
@@ -2436,7 +2440,7 @@ impl App {
                 );
             }
             Some(AuthMode::Chatgpt) | Some(AuthMode::ChatgptAuthTokens) => {
-                let accounts = self.auth_manager.list_accounts();
+                let accounts = self.auth_manager.account_manager().list_accounts();
                 let status_account_display =
                     accounts
                         .iter()
@@ -7223,6 +7227,7 @@ impl App {
                 }
                 let display = self
                     .auth_manager
+                    .account_manager()
                     .list_accounts()
                     .into_iter()
                     .find(|account| account.id == account_id)
@@ -7234,7 +7239,11 @@ impl App {
                         )
                     })
                     .unwrap_or(display);
-                match self.auth_manager.force_release_account(&account_id) {
+                match self
+                    .auth_manager
+                    .account_manager()
+                    .force_release_account(&account_id)
+                {
                     Ok(codex_login::ForceReleaseAccountOutcome::Released(_)) => {
                         self.refresh_account_mutation_bookkeeping();
                         self.maybe_start_accounts_status_refresh(
@@ -7290,7 +7299,10 @@ impl App {
                     return Ok(AppRunControl::Continue);
                 }
 
-                if !self.auth_manager.has_saved_chatgpt_accounts()
+                if !self
+                    .auth_manager
+                    .account_manager()
+                    .has_saved_chatgpt_accounts()
                     && !self.config.model_provider.requires_openai_auth
                 {
                     self.chat_widget.add_error_message(
@@ -8619,7 +8631,11 @@ impl App {
     }
 
     fn release_runtime_auth_lease_for_exit(&self) {
-        if let Err(error) = self.auth_manager.release_runtime_active_account() {
+        if let Err(error) = self
+            .auth_manager
+            .account_manager()
+            .release_runtime_active_account()
+        {
             tracing::warn!(
                 error = %error,
                 runtime_session_id = self.auth_manager.runtime_session_id(),
@@ -9907,6 +9923,7 @@ mod tests {
         let reset_at = Utc::now() + chrono::Duration::minutes(45);
         let store_account_id = app
             .auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .map(|account| account.id)
@@ -9947,6 +9964,7 @@ mod tests {
 
         let store_account_id = app
             .auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .map(|account| account.id)
@@ -10938,6 +10956,7 @@ mod tests {
 
         let switched_account_id = app
             .auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .find(|account| account.label.as_deref() == Some("Secondary"))
@@ -11001,6 +11020,7 @@ mod tests {
 
         let switched_account_id = app
             .auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .find(|account| account.label.as_deref() == Some("Secondary"))
@@ -11072,6 +11092,7 @@ mod tests {
 
         let switched_account_id = app
             .auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .find(|account| account.label.as_deref() == Some("Secondary"))
@@ -11141,6 +11162,7 @@ mod tests {
 
         let switched_account_id = app
             .auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .find(|account| account.label.as_deref() == Some("Secondary"))
@@ -11336,6 +11358,7 @@ mod tests {
 
         let secondary_store_account_id = app
             .auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .find(|account| account.label.as_deref() == Some("Secondary"))
@@ -11417,6 +11440,7 @@ mod tests {
             .expect("primary account should be observed");
         let secondary_store_account_id = app
             .auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .find(|account| account.label.as_deref() == Some("Secondary"))
@@ -11559,7 +11583,7 @@ mod tests {
         ));
         while app_event_rx.try_recv().is_ok() {}
 
-        let accounts = app.auth_manager.list_accounts();
+        let accounts = app.auth_manager.account_manager().list_accounts();
         let active_store_account_id = accounts
             .iter()
             .find(|account| account.is_active)
@@ -11655,7 +11679,7 @@ mod tests {
         app.auth_manager
             .reload_strict()
             .expect("reload seeded auth store");
-        let accounts = app.auth_manager.list_accounts();
+        let accounts = app.auth_manager.account_manager().list_accounts();
         let active_store_account_id = accounts
             .iter()
             .find(|account| account.is_active)
@@ -11741,7 +11765,7 @@ mod tests {
         ));
         while app_event_rx.try_recv().is_ok() {}
 
-        let accounts = app.auth_manager.list_accounts();
+        let accounts = app.auth_manager.account_manager().list_accounts();
         let active_store_account_id = accounts
             .iter()
             .find(|account| account.is_active)
@@ -11832,6 +11856,7 @@ mod tests {
             .expect("reload seeded auth store");
         let active_store_account_id = app
             .auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .find(|account| account.is_active)
@@ -11912,7 +11937,7 @@ mod tests {
         ));
         while app_event_rx.try_recv().is_ok() {}
 
-        let accounts = app.auth_manager.list_accounts();
+        let accounts = app.auth_manager.account_manager().list_accounts();
         let active_store_account_id = accounts
             .iter()
             .find(|account| account.is_active)
@@ -11985,7 +12010,7 @@ mod tests {
         ));
         while app_event_rx.try_recv().is_ok() {}
 
-        let accounts = app.auth_manager.list_accounts();
+        let accounts = app.auth_manager.account_manager().list_accounts();
         let active_store_account_id = accounts
             .iter()
             .find(|account| account.is_active)
@@ -12087,6 +12112,7 @@ mod tests {
 
         let active_store_account_id = app
             .auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .find(|account| account.is_active)
@@ -12433,6 +12459,7 @@ mod tests {
 
         let secondary_store_account_id = app
             .auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .find(|account| account.label.as_deref() == Some("Secondary"))
@@ -16813,6 +16840,7 @@ guardian_approval = true
 
         assert!(
             competing_manager
+                .account_manager()
                 .list_accounts()
                 .into_iter()
                 .all(|account| !account.is_active),
@@ -16827,6 +16855,7 @@ guardian_approval = true
 
         assert!(
             competing_manager
+                .account_manager()
                 .list_accounts()
                 .into_iter()
                 .any(|account| account.is_active),
@@ -17632,6 +17661,7 @@ guardian_approval = true
             .store_account_id;
         let blocked_account_id = app
             .auth_manager
+            .account_manager()
             .list_accounts()
             .into_iter()
             .find(|account| !account.is_active)

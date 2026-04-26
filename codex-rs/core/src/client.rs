@@ -805,7 +805,7 @@ impl ModelClient {
             ));
         };
 
-        let accounts = auth_manager.list_accounts();
+        let accounts = auth_manager.account_manager().list_accounts();
         if accounts.is_empty() {
             return Err(CodexErr::InvalidRequest(
                 "OpenAI auth is required, but no saved ChatGPT account or API key is available for this session."
@@ -813,7 +813,9 @@ impl ModelClient {
             ));
         }
 
-        let roster = auth_manager.account_rate_limit_refresh_roster();
+        let roster = auth_manager
+            .account_manager()
+            .account_rate_limit_refresh_roster();
         if accounts.iter().all(|account| !account.is_active)
             && roster.status == AccountRateLimitRefreshRosterStatus::LeaseManaged
             && roster.store_account_ids.is_empty()
