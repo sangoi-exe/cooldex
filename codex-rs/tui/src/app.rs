@@ -2313,6 +2313,7 @@ impl App {
                 )
             } else {
                 match auth_manager
+                    .account_manager()
                     .reconcile_account_rate_limit_refresh_outcomes(refresh_result.outcomes)
                 {
                     Ok(updated_accounts) => (
@@ -9930,6 +9931,7 @@ mod tests {
             .next()
             .expect("cached account should exist");
         app.auth_manager
+            .account_manager()
             .update_rate_limits_for_accounts(vec![(
                 store_account_id,
                 RateLimitSnapshot {
@@ -9973,6 +9975,7 @@ mod tests {
         let writer = auth_manager_from_config(&app.config);
         let reset_at = Utc::now() + chrono::Duration::minutes(45);
         writer
+            .account_manager()
             .update_rate_limits_for_account(
                 &store_account_id,
                 RateLimitSnapshot {
@@ -12029,6 +12032,7 @@ mod tests {
         );
         let reset_at = Utc::now() + chrono::Duration::minutes(45);
         app.auth_manager
+            .account_manager()
             .update_rate_limits_for_account(
                 &fallback_store_account_id,
                 RateLimitSnapshot {

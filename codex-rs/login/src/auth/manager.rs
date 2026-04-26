@@ -6,7 +6,6 @@ use serde::Deserialize;
 use serde::Serialize;
 #[cfg(test)]
 use serial_test::serial;
-use std::collections::HashMap;
 use std::env;
 use std::fmt::Debug;
 use std::path::Path;
@@ -27,7 +26,6 @@ use super::account_manager::ACTIVE_ACCOUNT_LEASE_TTL_SECONDS;
 #[cfg(test)]
 use super::account_manager::AccountLeaseState;
 use super::account_manager::AccountManager;
-use super::account_manager::AccountRateLimitRefreshOutcome;
 use super::account_manager::ActiveChatgptAccountSummary;
 use super::account_manager::ChatgptAuthAdmissionPolicy;
 use super::account_manager::GuardedReloadLoadedStore;
@@ -63,7 +61,6 @@ use codex_protocol::auth::KnownPlan as InternalKnownPlan;
 use codex_protocol::auth::PlanType as InternalPlanType;
 use codex_protocol::auth::RefreshTokenFailedError;
 use codex_protocol::auth::RefreshTokenFailedReason;
-use codex_protocol::protocol::RateLimitSnapshot;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -2122,48 +2119,6 @@ impl AuthManager {
         }
     }
 
-    fn update_saved_account_store<T>(
-        &self,
-        default: T,
-        mutator: impl FnOnce(&AccountManager, &mut AuthStore) -> std::io::Result<T>,
-    ) -> std::io::Result<T> {
-        // Merge-safety anchor: saved-account runtime mutations must keep this
-        // no-saved-accounts early return outside `update_store(...)` so API-key
-        // or empty stores are not loaded, persisted, or cache-refreshed by
-        // account-runtime follower updates.
-        if !self.account_manager.has_saved_chatgpt_accounts() {
-            return Ok(default);
-        }
-        self.update_store(|store| mutator(&self.account_manager, store))
-    }
-
-    fn update_saved_account_store_from_map<T, V>(
-        &self,
-        default: T,
-        entries: impl IntoIterator<Item = (String, V)>,
-        mutator: impl FnOnce(
-            &AccountManager,
-            &mut AuthStore,
-            &mut HashMap<String, V>,
-        ) -> std::io::Result<T>,
-    ) -> std::io::Result<T> {
-        // Merge-safety anchor: collection-backed saved-account runtime
-        // mutations must keep the no-saved-accounts early return before
-        // consuming the caller's iterator; API-key or empty stores must not be
-        // loaded, persisted, cache-refreshed, or drained by account-runtime
-        // telemetry updates.
-        if !self.account_manager.has_saved_chatgpt_accounts() {
-            return Ok(default);
-        }
-
-        let mut entries = entries.into_iter().collect::<HashMap<_, _>>();
-        if entries.is_empty() {
-            return Ok(default);
-        }
-
-        self.update_store(|store| mutator(&self.account_manager, store, &mut entries))
-    }
-
     pub fn set_active_account(&self, id: &str) -> std::io::Result<()> {
         // Merge-safety anchor: active-account mutation belongs to
         // AccountManager; AuthManager may only pass through the request and
@@ -2187,50 +2142,6 @@ impl AuthManager {
 
     pub fn remove_account(&self, id: &str) -> std::io::Result<bool> {
         self.update_store(|store| self.account_manager.remove_account(store, id))
-    }
-
-    pub fn update_usage_for_active(&self, snapshot: RateLimitSnapshot) -> std::io::Result<()> {
-        self.update_saved_account_store((), |account_manager, store| {
-            account_manager.update_usage_for_active(store, snapshot)
-        })
-    }
-
-    pub fn update_rate_limits_for_account(
-        &self,
-        store_account_id: &str,
-        snapshot: RateLimitSnapshot,
-    ) -> std::io::Result<()> {
-        self.update_saved_account_store((), |account_manager, store| {
-            account_manager.update_rate_limits_for_account(store, store_account_id, snapshot)
-        })
-    }
-
-    pub fn update_rate_limits_for_accounts(
-        &self,
-        updates: impl IntoIterator<Item = (String, RateLimitSnapshot)>,
-    ) -> std::io::Result<usize> {
-        self.update_saved_account_store_from_map(0, updates, |account_manager, store, updates| {
-            Ok(account_manager.update_rate_limits_for_accounts(store, updates))
-        })
-    }
-
-    pub fn reconcile_account_rate_limit_refresh_outcomes(
-        &self,
-        outcomes: impl IntoIterator<Item = (String, AccountRateLimitRefreshOutcome)>,
-    ) -> std::io::Result<usize> {
-        self.update_saved_account_store_from_map(0, outcomes, |account_manager, store, outcomes| {
-            Ok(account_manager.reconcile_account_rate_limit_refresh_outcomes(store, outcomes))
-        })
-    }
-
-    pub fn mark_usage_limit_reached(
-        &self,
-        resets_at: Option<DateTime<Utc>>,
-        snapshot: Option<RateLimitSnapshot>,
-    ) -> std::io::Result<()> {
-        self.update_saved_account_store((), |account_manager, store| {
-            account_manager.mark_usage_limit_reached(store, resets_at, snapshot)
-        })
     }
 
     pub fn switch_account_on_usage_limit(

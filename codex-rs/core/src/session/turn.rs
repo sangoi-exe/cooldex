@@ -1332,6 +1332,7 @@ pub(crate) async fn refresh_accounts_rate_limits_before_auto_switch(
     match sess
         .services
         .auth_manager
+        .account_manager()
         .reconcile_account_rate_limit_refresh_outcomes(outcomes)
     {
         Ok(updated_accounts) => {

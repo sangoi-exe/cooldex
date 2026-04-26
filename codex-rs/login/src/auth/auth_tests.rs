@@ -1,4 +1,5 @@
 use super::*;
+use crate::auth::AccountRateLimitRefreshOutcome;
 use crate::auth::AccountRateLimitRefreshRoster;
 use crate::auth::AccountRateLimitRefreshRosterStatus;
 use crate::auth::storage::FileAuthStorage;
@@ -1186,7 +1187,7 @@ fn terminal_refresh_failure_without_fallback_preserves_env_api_key_cache() {
 }
 
 #[test]
-fn reconcile_account_rate_limit_refresh_outcomes_updates_cached_usage_truth() {
+fn reconcile_account_rate_limit_refresh_outcomes_updates_live_usage_truth() {
     let codex_home = tempdir().expect("create auth tempdir");
     let sqlite_home = tempdir().expect("create sqlite tempdir");
     let workspace_id = "workspace-a";
@@ -1255,6 +1256,7 @@ fn reconcile_account_rate_limit_refresh_outcomes_updates_cached_usage_truth() {
 
     assert_eq!(
         manager
+            .account_manager()
             .reconcile_account_rate_limit_refresh_outcomes([
                 (
                     "store-account-a".to_string(),
@@ -1269,37 +1271,20 @@ fn reconcile_account_rate_limit_refresh_outcomes_updates_cached_usage_truth() {
         2
     );
 
-    let cached_store = manager
-        .inner
-        .read()
-        .expect("cached auth should stay readable")
-        .store
-        .clone();
-    let primary_account = cached_store
-        .accounts
+    let accounts = manager.account_manager().list_accounts();
+    let primary_account = accounts
         .iter()
         .find(|account| account.id == "store-account-a")
         .expect("primary account should still exist");
-    let primary_usage = primary_account
-        .usage
-        .as_ref()
-        .expect("primary account usage should be set");
-    assert_eq!(primary_usage.last_rate_limits, Some(snapshot));
-    assert_eq!(primary_usage.exhausted_until, Some(expected_reset_at));
-    assert!(primary_usage.last_seen_at.is_some());
+    assert_eq!(primary_account.last_rate_limits, Some(snapshot));
+    assert_eq!(primary_account.exhausted_until, Some(expected_reset_at));
 
-    let secondary_account = cached_store
-        .accounts
+    let secondary_account = accounts
         .iter()
         .find(|account| account.id == "store-account-b")
         .expect("secondary account should still exist");
-    let secondary_usage = secondary_account
-        .usage
-        .as_ref()
-        .expect("secondary account usage should be set");
-    assert_eq!(secondary_usage.last_rate_limits, None);
-    assert_eq!(secondary_usage.exhausted_until, None);
-    assert!(secondary_usage.last_seen_at.is_some());
+    assert_eq!(secondary_account.last_rate_limits, None);
+    assert_eq!(secondary_account.exhausted_until, None);
 }
 
 #[test]
@@ -1372,41 +1357,17 @@ fn mark_usage_limit_reached_updates_active_usage_and_cache_expiry_uses_sqlite_tr
         DateTime::<Utc>::from_timestamp(reset_at.timestamp(), 0).expect("valid reset timestamp");
 
     manager
+        .account_manager()
         .mark_usage_limit_reached(Some(reset_at), Some(snapshot.clone()))
         .expect("usage-limit mark should succeed");
 
-    let cached_store = manager
-        .inner
-        .read()
-        .expect("cached auth should stay readable")
-        .store
-        .clone();
-    let active_account = cached_store
-        .accounts
+    let accounts = manager.account_manager().list_accounts();
+    let active_account = accounts
         .iter()
         .find(|account| account.id == "store-account-a")
         .expect("active account should still exist");
-    let active_usage = active_account
-        .usage
-        .as_ref()
-        .expect("active account usage should be set");
-    assert_eq!(active_usage.last_rate_limits, Some(snapshot));
-    assert_eq!(active_usage.exhausted_until, Some(reset_at));
-    assert!(active_usage.last_seen_at.is_some());
-
-    {
-        let mut guard = manager
-            .inner
-            .write()
-            .expect("cached auth should stay writable");
-        let account = guard
-            .store
-            .accounts
-            .iter_mut()
-            .find(|account| account.id == "store-account-a")
-            .expect("active account should stay cached");
-        account.usage = None;
-    }
+    assert_eq!(active_account.last_rate_limits, Some(snapshot));
+    assert_eq!(active_account.exhausted_until, Some(expected_reset_at));
 
     assert_eq!(
         manager
@@ -1444,17 +1405,21 @@ fn saved_account_runtime_updates_skip_empty_store_without_persisting_auth() {
     };
 
     manager
+        .account_manager()
         .update_usage_for_active(snapshot.clone())
         .expect("usage update without saved accounts should be a no-op");
     manager
+        .account_manager()
         .update_rate_limits_for_account("missing-account", snapshot.clone())
         .expect("targeted rate-limit update without saved accounts should be a no-op");
     manager
+        .account_manager()
         .mark_usage_limit_reached(Some(Utc::now()), Some(snapshot))
         .expect("usage-limit mark without saved accounts should be a no-op");
     let bulk_resets_at = (Utc::now() + chrono::Duration::minutes(11)).timestamp();
     assert_eq!(
         manager
+            .account_manager()
             .update_rate_limits_for_accounts([(
                 "missing-account".to_string(),
                 RateLimitSnapshot {
@@ -1476,6 +1441,7 @@ fn saved_account_runtime_updates_skip_empty_store_without_persisting_auth() {
     );
     assert_eq!(
         manager
+            .account_manager()
             .reconcile_account_rate_limit_refresh_outcomes([(
                 "missing-account".to_string(),
                 AccountRateLimitRefreshOutcome::NoUsableSnapshot,
@@ -1508,7 +1474,7 @@ fn saved_account_runtime_updates_skip_empty_store_without_persisting_auth() {
 }
 
 #[test]
-fn update_usage_for_active_updates_cached_active_usage() {
+fn update_usage_for_active_updates_live_active_usage() {
     let codex_home = tempdir().expect("create auth tempdir");
     let sqlite_home = tempdir().expect("create sqlite tempdir");
     let workspace_id = "workspace-a";
@@ -1576,34 +1542,24 @@ fn update_usage_for_active_updates_cached_active_usage() {
     };
 
     manager
+        .account_manager()
         .update_usage_for_active(snapshot.clone())
         .expect("active usage update should succeed");
 
-    let cached_store = manager
-        .inner
-        .read()
-        .expect("cached auth should stay readable")
-        .store
-        .clone();
-    let active_account = cached_store
-        .accounts
+    let accounts = manager.account_manager().list_accounts();
+    let active_account = accounts
         .iter()
         .find(|account| account.id == "store-account-a")
         .expect("active account should still exist");
-    let active_usage = active_account
-        .usage
-        .as_ref()
-        .expect("active account usage should be set");
-    assert_eq!(active_usage.last_rate_limits, Some(snapshot));
-    assert_eq!(active_usage.exhausted_until, Some(expected_reset_at));
-    assert!(active_usage.last_seen_at.is_some());
+    assert_eq!(active_account.last_rate_limits, Some(snapshot));
+    assert_eq!(active_account.exhausted_until, Some(expected_reset_at));
 
-    let inactive_account = cached_store
-        .accounts
+    let inactive_account = accounts
         .iter()
         .find(|account| account.id == "store-account-b")
         .expect("inactive account should still exist");
-    assert_eq!(inactive_account.usage, None);
+    assert_eq!(inactive_account.last_rate_limits, None);
+    assert_eq!(inactive_account.exhausted_until, None);
 }
 
 #[test]
@@ -1673,6 +1629,7 @@ fn update_rate_limits_for_account_and_accounts_update_targeted_usage() {
         rate_limit_reached_type: None,
     };
     manager
+        .account_manager()
         .update_rate_limits_for_account("store-account-b", single_snapshot.clone())
         .expect("single-account rate-limit update should succeed");
 
@@ -1706,6 +1663,7 @@ fn update_rate_limits_for_account_and_accounts_update_targeted_usage() {
     };
     assert_eq!(
         manager
+            .account_manager()
             .update_rate_limits_for_accounts(vec![
                 ("store-account-a".to_string(), bulk_a_snapshot.clone()),
                 ("store-account-c".to_string(), bulk_c_snapshot.clone()),
@@ -1714,48 +1672,25 @@ fn update_rate_limits_for_account_and_accounts_update_targeted_usage() {
         2
     );
 
-    let cached_store = manager
-        .inner
-        .read()
-        .expect("cached auth should stay readable")
-        .store
-        .clone();
+    let accounts = manager.account_manager().list_accounts();
 
-    let account_a = cached_store
-        .accounts
+    let account_a = accounts
         .iter()
         .find(|account| account.id == "store-account-a")
         .expect("account a should still exist");
-    let usage_a = account_a
-        .usage
-        .as_ref()
-        .expect("account a usage should be set");
-    assert_eq!(usage_a.last_rate_limits, Some(bulk_a_snapshot));
-    assert!(usage_a.last_seen_at.is_some());
+    assert_eq!(account_a.last_rate_limits, Some(bulk_a_snapshot));
 
-    let account_b = cached_store
-        .accounts
+    let account_b = accounts
         .iter()
         .find(|account| account.id == "store-account-b")
         .expect("account b should still exist");
-    let usage_b = account_b
-        .usage
-        .as_ref()
-        .expect("account b usage should be set");
-    assert_eq!(usage_b.last_rate_limits, Some(single_snapshot));
-    assert!(usage_b.last_seen_at.is_some());
+    assert_eq!(account_b.last_rate_limits, Some(single_snapshot));
 
-    let account_c = cached_store
-        .accounts
+    let account_c = accounts
         .iter()
         .find(|account| account.id == "store-account-c")
         .expect("account c should still exist");
-    let usage_c = account_c
-        .usage
-        .as_ref()
-        .expect("account c usage should be set");
-    assert_eq!(usage_c.last_rate_limits, Some(bulk_c_snapshot));
-    assert!(usage_c.last_seen_at.is_some());
+    assert_eq!(account_c.last_rate_limits, Some(bulk_c_snapshot));
 }
 
 #[test]
