@@ -10,11 +10,14 @@ pub use cli::Cli;
 use anyhow::anyhow;
 use chrono::Utc;
 use codex_cloud_tasks_client::TaskStatus;
+use codex_core::config::Config;
 use codex_git_utils::current_branch_name;
 use codex_git_utils::default_branch_name;
+use codex_login::AuthManager;
 use codex_login::default_client::get_codex_user_agent;
 use owo_colors::OwoColorize;
 use owo_colors::Stream;
+use reqwest::header::HeaderMap;
 use std::cmp::Ordering;
 use std::io::IsTerminal;
 use std::io::Read;
@@ -35,12 +38,16 @@ struct ApplyJob {
     diff_override: Option<String>,
 }
 
+// Merge-safety anchor: codex cloud owns one config-aware AuthManager for
+// backend headers and TUI helper requests; do not mint per-call auth owners.
 struct BackendContext {
     backend: Arc<dyn codex_cloud_tasks_client::CloudBackend>,
     base_url: String,
+    _auth_manager: Arc<AuthManager>,
+    headers: HeaderMap,
 }
 
-async fn init_backend(user_agent_suffix: &str) -> anyhow::Result<BackendContext> {
+async fn init_backend(user_agent_suffix: &str, config: &Config) -> anyhow::Result<BackendContext> {
     #[cfg(debug_assertions)]
     let use_mock = matches!(
         std::env::var("CODEX_CLOUD_TASKS_MODE").ok().as_deref(),
@@ -53,9 +60,12 @@ async fn init_backend(user_agent_suffix: &str) -> anyhow::Result<BackendContext>
 
     #[cfg(debug_assertions)]
     if use_mock {
+        let auth_manager = util::auth_manager_from_config(config);
         return Ok(BackendContext {
             backend: Arc::new(codex_cloud_tasks_mock_client::MockClient),
             base_url,
+            _auth_manager: auth_manager,
+            headers: HeaderMap::new(),
         });
     }
 
@@ -68,12 +78,8 @@ async fn init_backend(user_agent_suffix: &str) -> anyhow::Result<BackendContext>
     };
     append_error_log(format!("startup: base_url={base_url} path_style={style}"));
 
-    let auth_manager = util::load_auth_manager().await;
-    let auth = match auth_manager.as_ref() {
-        Some(manager) => manager.auth().await,
-        None => None,
-    };
-    let auth = match auth {
+    let auth_manager = util::auth_manager_from_config(config);
+    let request_auth = match auth_manager.chatgpt_request_auth().await {
         Some(auth) => auth,
         None => {
             eprintln!(
@@ -83,32 +89,40 @@ async fn init_backend(user_agent_suffix: &str) -> anyhow::Result<BackendContext>
         }
     };
 
-    if let Some(acc) = auth.get_account_id() {
-        append_error_log(format!("auth: mode=ChatGPT account_id={acc}"));
-    }
+    append_error_log(format!(
+        "auth: mode=ChatGPT account_id={}",
+        request_auth.account_id()
+    ));
 
-    let token = match auth.get_token() {
-        Ok(t) if !t.is_empty() => t,
-        _ => {
-            eprintln!(
-                "Not signed in. Please run 'codex login' to sign in with ChatGPT, then re-run 'codex cloud'."
-            );
-            std::process::exit(1);
-        }
+    let Some(token) = request_auth.authorization().strip_prefix("Bearer ") else {
+        eprintln!(
+            "Not signed in. Please run 'codex login' to sign in with ChatGPT, then re-run 'codex cloud'."
+        );
+        std::process::exit(1);
     };
-
-    http = http.with_bearer_token(token.clone());
-    if let Some(acc) = auth
-        .get_account_id()
-        .or_else(|| util::extract_chatgpt_account_id(&token))
-    {
-        append_error_log(format!("auth: set ChatGPT-Account-Id header: {acc}"));
-        http = http.with_chatgpt_account_id(acc);
+    if token.is_empty() {
+        eprintln!(
+            "Not signed in. Please run 'codex login' to sign in with ChatGPT, then re-run 'codex cloud'."
+        );
+        std::process::exit(1);
     }
+
+    http = http.with_bearer_token(token.to_string());
+    append_error_log(format!(
+        "auth: set ChatGPT-Account-Id header: {}",
+        request_auth.account_id()
+    ));
+    http = http.with_chatgpt_account_id(request_auth.account_id().to_string());
+    if request_auth.is_fedramp_account() {
+        http = http.with_fedramp_routing_header();
+    }
+    let headers = util::build_chatgpt_headers(&request_auth);
 
     Ok(BackendContext {
         backend: Arc::new(http),
         base_url,
+        _auth_manager: auth_manager,
+        headers,
     })
 }
 
@@ -160,14 +174,14 @@ async fn resolve_git_ref_with_git_info(
     }
 }
 
-async fn run_exec_command(args: crate::cli::ExecCommand) -> anyhow::Result<()> {
+async fn run_exec_command(args: crate::cli::ExecCommand, config: &Config) -> anyhow::Result<()> {
     let crate::cli::ExecCommand {
         query,
         environment,
         branch,
         attempts,
     } = args;
-    let ctx = init_backend("codex_cloud_tasks_exec").await?;
+    let ctx = init_backend("codex_cloud_tasks_exec", config).await?;
     let prompt = resolve_query_input(query)?;
     let env_id = resolve_environment_id(&ctx, &environment).await?;
     let git_ref = resolve_git_ref(branch.as_ref()).await;
@@ -191,8 +205,7 @@ async fn resolve_environment_id(ctx: &BackendContext, requested: &str) -> anyhow
         return Err(anyhow!("environment id must not be empty"));
     }
     let normalized = util::normalize_base_url(&ctx.base_url);
-    let headers = util::build_chatgpt_headers().await;
-    let environments = crate::env_detect::list_environments(&normalized, &headers).await?;
+    let environments = crate::env_detect::list_environments(&normalized, &ctx.headers).await?;
     if environments.is_empty() {
         return Err(anyhow!(
             "no cloud environments are available for this workspace"
@@ -496,8 +509,11 @@ fn format_task_list_lines(
     lines
 }
 
-async fn run_status_command(args: crate::cli::StatusCommand) -> anyhow::Result<()> {
-    let ctx = init_backend("codex_cloud_tasks_status").await?;
+async fn run_status_command(
+    args: crate::cli::StatusCommand,
+    config: &Config,
+) -> anyhow::Result<()> {
+    let ctx = init_backend("codex_cloud_tasks_status", config).await?;
     let task_id = parse_task_id(&args.task_id)?;
     let summary =
         codex_cloud_tasks_client::CloudBackend::get_task_summary(&*ctx.backend, task_id).await?;
@@ -512,8 +528,8 @@ async fn run_status_command(args: crate::cli::StatusCommand) -> anyhow::Result<(
     Ok(())
 }
 
-async fn run_list_command(args: crate::cli::ListCommand) -> anyhow::Result<()> {
-    let ctx = init_backend("codex_cloud_tasks_list").await?;
+async fn run_list_command(args: crate::cli::ListCommand, config: &Config) -> anyhow::Result<()> {
+    let ctx = init_backend("codex_cloud_tasks_list", config).await?;
     let env_filter = if let Some(env) = args.environment {
         Some(resolve_environment_id(&ctx, &env).await?)
     } else {
@@ -579,8 +595,8 @@ async fn run_list_command(args: crate::cli::ListCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_diff_command(args: crate::cli::DiffCommand) -> anyhow::Result<()> {
-    let ctx = init_backend("codex_cloud_tasks_diff").await?;
+async fn run_diff_command(args: crate::cli::DiffCommand, config: &Config) -> anyhow::Result<()> {
+    let ctx = init_backend("codex_cloud_tasks_diff", config).await?;
     let task_id = parse_task_id(&args.task_id)?;
     let attempts = collect_attempt_diffs(&*ctx.backend, &task_id).await?;
     let selected = select_attempt(&attempts, args.attempt)?;
@@ -588,8 +604,8 @@ async fn run_diff_command(args: crate::cli::DiffCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_apply_command(args: crate::cli::ApplyCommand) -> anyhow::Result<()> {
-    let ctx = init_backend("codex_cloud_tasks_apply").await?;
+async fn run_apply_command(args: crate::cli::ApplyCommand, config: &Config) -> anyhow::Result<()> {
+    let ctx = init_backend("codex_cloud_tasks_apply", config).await?;
     let task_id = parse_task_id(&args.task_id)?;
     let attempts = collect_attempt_diffs(&*ctx.backend, &task_id).await?;
     let selected = select_attempt(&attempts, args.attempt)?;
@@ -735,13 +751,18 @@ fn spawn_apply(
 
 /// Entry point for the `codex cloud` subcommand.
 pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
+    let cli_kv_overrides = cli
+        .config_overrides
+        .parse_overrides()
+        .map_err(anyhow::Error::msg)?;
+    let config = Config::load_with_cli_overrides(cli_kv_overrides).await?;
     if let Some(command) = cli.command {
         return match command {
-            crate::cli::Command::Exec(args) => run_exec_command(args).await,
-            crate::cli::Command::Status(args) => run_status_command(args).await,
-            crate::cli::Command::List(args) => run_list_command(args).await,
-            crate::cli::Command::Apply(args) => run_apply_command(args).await,
-            crate::cli::Command::Diff(args) => run_diff_command(args).await,
+            crate::cli::Command::Exec(args) => run_exec_command(args, &config).await,
+            crate::cli::Command::Status(args) => run_status_command(args, &config).await,
+            crate::cli::Command::List(args) => run_list_command(args, &config).await,
+            crate::cli::Command::Apply(args) => run_apply_command(args, &config).await,
+            crate::cli::Command::Diff(args) => run_diff_command(args, &config).await,
         };
     }
     let Cli { .. } = cli;
@@ -759,8 +780,14 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
         .try_init();
 
     info!("Launching Cloud Tasks list UI");
-    let BackendContext { backend, .. } = init_backend("codex_cloud_tasks_tui").await?;
+    let BackendContext {
+        backend,
+        base_url,
+        headers,
+        ..
+    } = init_backend("codex_cloud_tasks_tui", &config).await?;
     let backend = backend;
+    let normalized_base_url = util::normalize_base_url(&base_url);
 
     // Terminal setup
     use crossterm::ExecutableCommand;
@@ -842,12 +869,9 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
     // Fetch environment list in parallel so the header can show friendly names quickly.
     {
         let tx = tx.clone();
+        let base_url = normalized_base_url.clone();
+        let headers = headers.clone();
         tokio::spawn(async move {
-            let base_url = util::normalize_base_url(
-                &std::env::var("CODEX_CLOUD_TASKS_BASE_URL")
-                    .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string()),
-            );
-            let headers = util::build_chatgpt_headers().await;
             let res = crate::env_detect::list_environments(&base_url, &headers).await;
             let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
         });
@@ -857,14 +881,9 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
     // Do this concurrently so the initial list shows quickly; on success we refetch with filter.
     {
         let tx = tx.clone();
+        let base_url = normalized_base_url.clone();
+        let headers = headers.clone();
         tokio::spawn(async move {
-            let base_url = util::normalize_base_url(
-                &std::env::var("CODEX_CLOUD_TASKS_BASE_URL")
-                    .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string()),
-            );
-            // Build headers: UA + ChatGPT auth if available
-            let headers = util::build_chatgpt_headers().await;
-
             // Run autodetect. If it fails, we keep using "All".
             let res = crate::env_detect::autodetect_environment_id(
                 &base_url, &headers, /*desired_label*/ None,
@@ -1083,12 +1102,9 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                                     app.env_loading = true;
                                     {
                                         let tx = tx.clone();
+                                        let base_url = normalized_base_url.clone();
+                                        let headers = headers.clone();
                                         tokio::spawn(async move {
-                                            let base_url = crate::util::normalize_base_url(
-                                                &std::env::var("CODEX_CLOUD_TASKS_BASE_URL")
-                                                    .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string()),
-                                            );
-                                            let headers = crate::util::build_chatgpt_headers().await;
                                             let res = crate::env_detect::list_environments(&base_url, &headers).await;
                                             let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
                                         });
@@ -1469,9 +1485,9 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                             needs_redraw = true;
                             if should_fetch {
                                     let tx = tx.clone();
+                                    let base_url = normalized_base_url.clone();
+                                    let headers = headers.clone();
                                     tokio::spawn(async move {
-            let base_url = crate::util::normalize_base_url(&std::env::var("CODEX_CLOUD_TASKS_BASE_URL").unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string()));
-            let headers = crate::util::build_chatgpt_headers().await;
                                         let res = crate::env_detect::list_environments(&base_url, &headers).await;
                                         let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
                                     });
@@ -1655,12 +1671,9 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                                     needs_redraw = true;
                                     if app.environments.is_empty() {
                                         let tx = tx.clone();
+                                        let base_url = normalized_base_url.clone();
+                                        let headers = headers.clone();
                                         tokio::spawn(async move {
-                                            let base_url = crate::util::normalize_base_url(
-                                                &std::env::var("CODEX_CLOUD_TASKS_BASE_URL")
-                                                    .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string()),
-                                            );
-                                            let headers = crate::util::build_chatgpt_headers().await;
                                             let res = crate::env_detect::list_environments(&base_url, &headers).await;
                                             let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
                                         });
@@ -1834,9 +1847,9 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
                                     needs_redraw = true;
                                     if should_fetch {
                                     let tx = tx.clone();
+                                    let base_url = normalized_base_url.clone();
+                                    let headers = headers.clone();
                                     tokio::spawn(async move {
-                                        let base_url = crate::util::normalize_base_url(&std::env::var("CODEX_CLOUD_TASKS_BASE_URL").unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string()));
-                                        let headers = crate::util::build_chatgpt_headers().await;
                                         let res = crate::env_detect::list_environments(&base_url, &headers).await;
                                         let _ = tx.send(app::AppEvent::EnvironmentsLoaded(res));
                                     });
@@ -2020,8 +2033,6 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
     }
     Ok(())
 }
-
-// extract_chatgpt_account_id moved to util.rs
 
 /// Build plain-text conversation lines: a labeled user prompt followed by assistant messages.
 fn conversation_lines(prompt: Option<String>, messages: &[String]) -> Vec<String> {

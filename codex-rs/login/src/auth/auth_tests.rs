@@ -1055,6 +1055,123 @@ fn terminal_refresh_failure_removes_active_account_and_switches_to_unleased_fall
     );
 }
 
+// Merge-safety anchor: terminal ChatGPT refresh-token eviction must not let
+// ChatGPT-only fallback recovery become a peer writer for AuthManager's generic
+// cache when an environment API key owns the current runtime auth mode.
+#[test]
+#[serial(codex_api_key)]
+fn terminal_refresh_failure_with_fallback_preserves_env_api_key_cache() {
+    let _guard = EnvVarGuard::set(CODEX_API_KEY_ENV_VAR, "sk-env");
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    save_auth(
+        codex_home.path(),
+        &chatgpt_auth_store_for_terminal_cache_test(
+            "store-account-a",
+            &["store-account-a", "store-account-c"],
+        ),
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store");
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ true,
+        AuthCredentialsStoreMode::File,
+    );
+    let auth = manager
+        .auth_cached()
+        .expect("env API key should seed generic cache");
+    assert_eq!(auth.api_auth_mode(), ApiAuthMode::ApiKey);
+
+    let removal = manager
+        .remove_chatgpt_store_account_for_terminal_refresh_failure(
+            "store-account-a",
+            LoadedStoreOrigin::Persistent,
+            &RefreshTokenFailedError::new(
+                RefreshTokenFailedReason::Exhausted,
+                "refresh token exhausted",
+            ),
+        )
+        .expect("terminal refresh failure should remove active account");
+    assert_eq!(
+        removal,
+        TerminalRefreshFailureAccountRemoval::Removed {
+            switched_to_store_account_id: Some("store-account-c".to_string())
+        }
+    );
+
+    let cached = manager
+        .inner
+        .read()
+        .expect("cached auth should stay readable");
+    assert_eq!(
+        cached.auth.as_ref().map(CodexAuth::api_auth_mode),
+        Some(ApiAuthMode::ApiKey)
+    );
+    assert_eq!(
+        cached.store.active_account_id,
+        Some("store-account-c".to_string())
+    );
+}
+
+// Merge-safety anchor: removing the last active ChatGPT account must clear the
+// ChatGPT store selection without clearing or replacing the environment API-key
+// auth cache.
+#[test]
+#[serial(codex_api_key)]
+fn terminal_refresh_failure_without_fallback_preserves_env_api_key_cache() {
+    let _guard = EnvVarGuard::set(CODEX_API_KEY_ENV_VAR, "sk-env");
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    save_auth(
+        codex_home.path(),
+        &chatgpt_auth_store_for_terminal_cache_test("store-account-a", &["store-account-a"]),
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store");
+
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ true,
+        AuthCredentialsStoreMode::File,
+    );
+    let auth = manager
+        .auth_cached()
+        .expect("env API key should seed generic cache");
+    assert_eq!(auth.api_auth_mode(), ApiAuthMode::ApiKey);
+
+    let removal = manager
+        .remove_chatgpt_store_account_for_terminal_refresh_failure(
+            "store-account-a",
+            LoadedStoreOrigin::Persistent,
+            &RefreshTokenFailedError::new(
+                RefreshTokenFailedReason::Exhausted,
+                "refresh token exhausted",
+            ),
+        )
+        .expect("terminal refresh failure should remove active account");
+    assert_eq!(
+        removal,
+        TerminalRefreshFailureAccountRemoval::Removed {
+            switched_to_store_account_id: None
+        }
+    );
+
+    let cached = manager
+        .inner
+        .read()
+        .expect("cached auth should stay readable");
+    assert_eq!(
+        cached.auth.as_ref().map(CodexAuth::api_auth_mode),
+        Some(ApiAuthMode::ApiKey)
+    );
+    assert_eq!(cached.store.active_account_id, None);
+    assert!(cached.store.accounts.is_empty());
+}
+
 #[test]
 fn reconcile_account_rate_limit_refresh_outcomes_updates_cached_usage_truth() {
     let codex_home = tempdir().expect("create auth tempdir");
@@ -2140,6 +2257,104 @@ fn active_summary_returns_none_when_env_api_key_override_is_enabled() {
     assert_eq!(manager.active_chatgpt_account_summary(), None);
 }
 
+#[tokio::test]
+#[serial(codex_api_key)]
+async fn chatgpt_snapshot_reads_do_not_mutate_api_key_cache() {
+    let _guard = EnvVarGuard::set(CODEX_API_KEY_ENV_VAR, "sk-env");
+    let empty_codex_home = tempdir().expect("create empty auth tempdir");
+    let empty_sqlite_home = tempdir().expect("create empty sqlite tempdir");
+    let empty_manager = AuthManager::new_with_sqlite_home(
+        empty_codex_home.path().to_path_buf(),
+        empty_sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ true,
+        AuthCredentialsStoreMode::File,
+    );
+    assert_eq!(
+        empty_manager.auth_cached().map(|auth| auth.api_auth_mode()),
+        Some(ApiAuthMode::ApiKey)
+    );
+    assert_eq!(
+        empty_manager.chatgpt_request_auth().await,
+        None,
+        "empty ChatGPT store should not produce ChatGPT request auth"
+    );
+    assert_eq!(
+        empty_manager
+            .inner
+            .read()
+            .expect("empty manager cache should be readable")
+            .auth
+            .as_ref()
+            .map(CodexAuth::api_auth_mode),
+        Some(ApiAuthMode::ApiKey),
+        "ChatGPT snapshot miss must not clear the generic API-key cache"
+    );
+
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let workspace_id = "workspace-a";
+    let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("plus".to_string()),
+        chatgpt_account_id: Some(workspace_id.to_string()),
+    })
+    .expect("create test jwt");
+    save_auth(
+        codex_home.path(),
+        &AuthStore {
+            active_account_id: Some("store-account-a".to_string()),
+            accounts: vec![StoredAccount {
+                id: "store-account-a".to_string(),
+                label: Some("Primary".to_string()),
+                tokens: TokenData {
+                    id_token: IdTokenInfo {
+                        email: Some("primary@example.com".to_string()),
+                        chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                        chatgpt_user_id: Some("user-12345".to_string()),
+                        chatgpt_account_id: Some(workspace_id.to_string()),
+                        chatgpt_account_is_fedramp: false,
+                        raw_jwt,
+                    },
+                    access_token: "access-token".to_string(),
+                    refresh_token: "refresh-token".to_string(),
+                    account_id: Some(workspace_id.to_string()),
+                },
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            }],
+            ..AuthStore::default()
+        },
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save auth store before manager construction");
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ true,
+        AuthCredentialsStoreMode::File,
+    );
+    assert_eq!(
+        manager.auth_cached().map(|auth| auth.api_auth_mode()),
+        Some(ApiAuthMode::ApiKey)
+    );
+    let request_auth = manager
+        .chatgpt_request_auth()
+        .await
+        .expect("ChatGPT snapshot should be available from saved account");
+    assert_eq!(request_auth.account_id(), workspace_id);
+    assert_eq!(
+        manager
+            .inner
+            .read()
+            .expect("manager cache should be readable")
+            .auth
+            .as_ref()
+            .map(CodexAuth::api_auth_mode),
+        Some(ApiAuthMode::ApiKey),
+        "ChatGPT snapshot hit must not replace the generic API-key cache"
+    );
+}
+
 #[test]
 fn idempotent_reload_does_not_emit_auth_state_notifications() {
     let codex_home = tempdir().expect("create auth tempdir");
@@ -2944,6 +3159,47 @@ async fn auth_manager_notifies_when_auth_state_changes() {
         .await
         .expect("workspace change notification should arrive")
         .expect("auth state watch should remain open");
+}
+
+fn chatgpt_auth_store_for_terminal_cache_test(
+    active_account_id: &str,
+    account_ids: &[&str],
+) -> AuthStore {
+    let workspace_id = "workspace-a";
+    let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("plus".to_string()),
+        chatgpt_account_id: Some(workspace_id.to_string()),
+    })
+    .expect("create test jwt");
+    let accounts = account_ids
+        .iter()
+        .map(|store_account_id| StoredAccount {
+            id: (*store_account_id).to_string(),
+            label: Some((*store_account_id).to_string()),
+            tokens: TokenData {
+                id_token: IdTokenInfo {
+                    email: Some(format!("{store_account_id}@example.com")),
+                    chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                    chatgpt_user_id: Some(format!("user-{store_account_id}")),
+                    chatgpt_account_id: Some(workspace_id.to_string()),
+                    chatgpt_account_is_fedramp: false,
+                    raw_jwt: raw_jwt.clone(),
+                },
+                access_token: format!("{store_account_id}-access-token"),
+                refresh_token: format!("{store_account_id}-refresh-token"),
+                account_id: Some(workspace_id.to_string()),
+            },
+            last_refresh: None,
+            usage: None,
+        })
+        .collect();
+
+    AuthStore {
+        active_account_id: Some(active_account_id.to_string()),
+        accounts,
+        ..AuthStore::default()
+    }
 }
 
 struct AuthFileParams {

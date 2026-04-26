@@ -9,6 +9,7 @@ use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::ConfigOverrides;
 use crate::legacy_core::config::find_codex_home;
 use crate::legacy_core::config::load_config_as_toml_with_cli_overrides;
+use crate::legacy_core::config::resolve_chatgpt_base_url_for_config_toml;
 use crate::legacy_core::config::resolve_cli_auth_credentials_store_mode_for_config_toml;
 use crate::legacy_core::config::resolve_forced_chatgpt_workspace_id_for_config_toml;
 use crate::legacy_core::config::resolve_oss_provider;
@@ -82,6 +83,7 @@ use uuid::Uuid;
 
 pub(crate) use codex_app_server_client::legacy_core;
 
+mod account_projection;
 mod additional_dirs;
 mod app;
 mod app_backtrack;
@@ -833,10 +835,8 @@ pub async fn run_main(
         tracing::warn!(error = %err, "failed to run personality migration");
     }
 
-    let chatgpt_base_url = config_toml
-        .chatgpt_base_url
-        .clone()
-        .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
+    let chatgpt_base_url =
+        resolve_chatgpt_base_url_for_config_toml(&config_toml, cli.config_profile.clone())?;
     let sqlite_home_cwd = config_cwd
         .as_deref()
         .map(Path::to_path_buf)
@@ -1152,8 +1152,6 @@ async fn run_ratatui_app(
     // Initialize high-fidelity session event logging if enabled.
     session_log::maybe_init(&initial_config);
 
-    startup_auth_manager
-        .set_forced_chatgpt_workspace_id(initial_config.forced_chatgpt_workspace_id.clone());
     let mut app_server = Some(
         match start_app_server(
             &app_server_target,
@@ -1477,6 +1475,8 @@ async fn run_ratatui_app(
             // Merge-safety anchor: resume/fork target config reloads can change
             // forced workspace and sqlite_home, so target cloud requirements must
             // be rebuilt from the target AuthManager before final Config loading.
+            let target_thread_id = action_and_target_session_if_resume_or_fork
+                .map(|(_, target_session)| target_session.thread_id.to_string());
             let (target_config, target_auth_manager, target_cloud_requirements) =
                 load_resume_or_fork_config_with_fresh_cloud_requirements(
                     config.codex_home.as_path(),
@@ -1485,19 +1485,9 @@ async fn run_ratatui_app(
                     loader_overrides.clone(),
                     fallback_cwd,
                     target_config_path,
+                    target_thread_id,
                 )
                 .await;
-            if let Some((_, target_session)) = action_and_target_session_if_resume_or_fork
-                && let Err(error) = target_auth_manager
-                    .set_linked_codex_session_id(Some(target_session.thread_id.to_string()))
-            {
-                warn!(
-                    error = %error,
-                    runtime_session_id = target_auth_manager.runtime_session_id(),
-                    thread_id = %target_session.thread_id,
-                    "failed to link target auth runtime before resume/fork config reload"
-                );
-            }
             cloud_requirements = target_cloud_requirements;
             auth_manager = target_auth_manager;
             restart_embedded_app_server_after_target_reload =
@@ -1533,7 +1523,6 @@ async fn run_ratatui_app(
 
     let use_alt_screen = determine_alt_screen_mode(no_alt_screen, config.tui_alternate_screen);
     tui.set_alt_screen_enabled(use_alt_screen);
-    auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
     let app_server = if let Some(existing_app_server) = app_server {
         if restart_embedded_app_server_after_target_reload {
             shutdown_app_server_if_present(Some(existing_app_server)).await;
@@ -1843,6 +1832,7 @@ async fn load_resume_or_fork_config_with_fresh_cloud_requirements(
     loader_overrides: LoaderOverrides,
     fallback_cwd: Option<PathBuf>,
     target_config_path: Option<PathBuf>,
+    linked_codex_session_id: Option<String>,
 ) -> (Config, Arc<AuthManager>, CloudRequirementsLoader) {
     let bootstrap_config = load_config_or_exit_with_fallback_cwd_for_codex_home(
         Some(codex_home.to_path_buf()),
@@ -1854,8 +1844,14 @@ async fn load_resume_or_fork_config_with_fresh_cloud_requirements(
         target_config_path.clone(),
     )
     .await;
-    let auth_manager =
-        AuthManager::shared_from_config(&bootstrap_config, /*enable_codex_api_key_env*/ false);
+    let auth_manager = AuthManager::shared_with_sqlite_home_workspace_and_linked_session(
+        bootstrap_config.codex_home.to_path_buf(),
+        bootstrap_config.sqlite_home.clone(),
+        bootstrap_config.forced_chatgpt_workspace_id.clone(),
+        linked_codex_session_id,
+        /*enable_codex_api_key_env*/ false,
+        bootstrap_config.cli_auth_credentials_store_mode,
+    );
     let cloud_requirements = cloud_requirements_loader(
         auth_manager.clone(),
         bootstrap_config.chatgpt_base_url.clone(),
@@ -2033,6 +2029,7 @@ mod tests {
                 LoaderOverrides::without_managed_config_for_tests(),
                 Some(temp_dir.path().to_path_buf()),
                 Some(target_config_path),
+                Some("target-thread".to_string()),
             )
             .await;
 
@@ -2043,6 +2040,10 @@ mod tests {
         assert_eq!(
             auth_manager.forced_chatgpt_workspace_id().as_deref(),
             Some("target-workspace")
+        );
+        assert_eq!(
+            auth_manager.linked_codex_session_id().as_deref(),
+            Some("target-thread")
         );
         Ok(())
     }

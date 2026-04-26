@@ -186,6 +186,12 @@ impl App {
                 return;
             }
             ServerNotification::AccountUpdated(_) => {
+                if self.pending_local_chatgpt_add_account_completion.is_some() {
+                    tracing::debug!(
+                        "suppressed account-updated projection refresh while local add-account completion owns convergence"
+                    );
+                    return;
+                }
                 self.app_event_tx
                     .send(AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate);
                 return;

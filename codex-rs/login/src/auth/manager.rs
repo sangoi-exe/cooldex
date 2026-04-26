@@ -97,6 +97,61 @@ pub struct ChatgptAuthTokens {
     storage: Arc<dyn AuthStorageBackend>,
 }
 
+/// Request-auth snapshot for first-party ChatGPT backend calls.
+///
+/// This is a value snapshot derived by [`AuthManager`] from the AccountManager-owned
+/// runtime account. Network/cache leaf helpers should consume this type instead of
+/// constructing their own AuthManager or treating raw token data as a request owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatGptRequestAuth {
+    authorization: String,
+    account_id: String,
+    chatgpt_user_id: Option<String>,
+    is_workspace_account: bool,
+    is_fedramp_account: bool,
+}
+
+impl ChatGptRequestAuth {
+    pub fn from_auth(auth: &CodexAuth) -> Option<Self> {
+        if !auth.is_chatgpt_auth() {
+            return None;
+        }
+        let token_data = auth.get_token_data().ok()?;
+        let access_token = token_data.access_token.trim();
+        if access_token.is_empty() {
+            return None;
+        }
+        let account_id = token_data.account_id.clone().filter(|id| !id.is_empty())?;
+        Some(Self {
+            authorization: format!("Bearer {access_token}"),
+            account_id,
+            chatgpt_user_id: token_data.id_token.chatgpt_user_id.clone(),
+            is_workspace_account: token_data.id_token.is_workspace_account(),
+            is_fedramp_account: token_data.id_token.is_fedramp_account(),
+        })
+    }
+
+    pub fn authorization(&self) -> &str {
+        self.authorization.as_str()
+    }
+
+    pub fn account_id(&self) -> &str {
+        self.account_id.as_str()
+    }
+
+    pub fn chatgpt_user_id(&self) -> Option<&str> {
+        self.chatgpt_user_id.as_deref()
+    }
+
+    pub fn is_workspace_account(&self) -> bool {
+        self.is_workspace_account
+    }
+
+    pub fn is_fedramp_account(&self) -> bool {
+        self.is_fedramp_account
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ChatgptAuthState {
     active_account: ActiveChatgptAccountSnapshot,
@@ -1623,19 +1678,39 @@ impl AuthManager {
         enable_codex_api_key_env: bool,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
     ) -> Self {
+        Self::new_with_sqlite_home_workspace_and_linked_session(
+            codex_home,
+            sqlite_home,
+            forced_chatgpt_workspace_id,
+            /*linked_codex_session_id*/ None,
+            enable_codex_api_key_env,
+            auth_credentials_store_mode,
+        )
+    }
+
+    fn new_with_sqlite_home_workspace_and_linked_session(
+        codex_home: PathBuf,
+        sqlite_home: PathBuf,
+        forced_chatgpt_workspace_id: Option<String>,
+        linked_codex_session_id: Option<String>,
+        enable_codex_api_key_env: bool,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> Self {
         let (auth_state_tx, _) = watch::channel(());
         let storage = create_auth_storage(codex_home.clone(), auth_credentials_store_mode);
         let account_state_store = Some(open_account_state_store(sqlite_home.as_path()));
         let runtime_session_id = uuid::Uuid::new_v4().to_string();
         // Merge-safety anchor: config-aware AuthManager construction must install
-        // forced ChatGPT workspace before AccountManager hydrates runtime-active
-        // account state; post-construction setters are too late for cached auth.
-        let account_manager = AccountManager::new(
+        // forced ChatGPT workspace and linked Codex session before AccountManager
+        // hydrates runtime-active account state; post-construction setters are too
+        // late for cached auth and cloud-requirements bootstrap.
+        let account_manager = AccountManager::new_with_runtime_context(
             codex_home.clone(),
             Arc::clone(&storage),
             auth_credentials_store_mode,
             account_state_store,
             runtime_session_id,
+            linked_codex_session_id,
             forced_chatgpt_workspace_id,
         );
         let loaded = account_manager.load_store_from_storage();
@@ -1868,6 +1943,62 @@ impl AuthManager {
         Self::chatgpt_bearer_token_for_auth(auth).map(|token| format!("Bearer {token}"))
     }
 
+    pub async fn chatgpt_auth(&self) -> Option<CodexAuth> {
+        let auth = self.current_chatgpt_auth_from_storage()?;
+        if !Self::is_stale_for_proactive_refresh(&auth) {
+            return Some(auth);
+        }
+
+        let Some(store_account_id) = auth
+            .active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id)
+        else {
+            return Some(auth);
+        };
+
+        match self
+            .resolve_chatgpt_auth_for_store_account_id(
+                &store_account_id,
+                ChatgptAccountRefreshMode::IfStale,
+            )
+            .await
+        {
+            Ok(ChatgptAccountAuthResolution::Auth(auth)) => Some(*auth),
+            Ok(ChatgptAccountAuthResolution::Removed { error, .. }) => {
+                tracing::error!("Failed to refresh ChatGPT request token: {}", error);
+                self.current_chatgpt_auth_from_storage()
+            }
+            Ok(ChatgptAccountAuthResolution::Missing) => None,
+            Err(err) => {
+                tracing::error!("Failed to refresh ChatGPT request token: {}", err);
+                self.current_chatgpt_auth_from_storage()
+            }
+        }
+    }
+
+    pub async fn chatgpt_request_auth(&self) -> Option<ChatGptRequestAuth> {
+        self.chatgpt_auth()
+            .await
+            .as_ref()
+            .and_then(ChatGptRequestAuth::from_auth)
+    }
+
+    fn current_chatgpt_auth_from_storage(&self) -> Option<CodexAuth> {
+        let loaded = self.load_store_from_storage();
+        // Merge-safety anchor: ChatGPT-only request snapshots are allowed to
+        // load AccountManager-owned store truth, but they must not overwrite the
+        // generic AuthManager cache used by API-key-capable callers that share
+        // this runtime owner, such as `codex exec` plus cloud requirements.
+        Self::derive_auth_from_store(
+            &loaded.store,
+            &self.codex_home,
+            Arc::clone(&self.storage),
+            /*enable_codex_api_key_env*/ false,
+            loaded.store_origin,
+        )
+        .filter(CodexAuth::is_chatgpt_auth)
+    }
+
     fn chatgpt_auth_for_store_account_id(
         &self,
         store_account_id: &str,
@@ -1885,6 +2016,29 @@ impl AuthManager {
     // Merge-safety anchor: `/accounts`, usage-limit auto-switch, and active auth recovery must use
     // one canonical owner for per-account refresh failure eviction.
     pub async fn resolve_chatgpt_auth_for_store_account_id(
+        &self,
+        store_account_id: &str,
+        refresh_mode: ChatgptAccountRefreshMode,
+    ) -> Result<ChatgptAccountAuthResolution, RefreshTokenError> {
+        if matches!(
+            refresh_mode,
+            ChatgptAccountRefreshMode::IfStale | ChatgptAccountRefreshMode::Force
+        ) {
+            // Merge-safety anchor: every ChatGPT account refresh path, including
+            // caller-owned request snapshots, must share the same serialization
+            // boundary as `refresh_token()` so concurrent stale snapshots do not
+            // submit the same rotating refresh token in parallel.
+            let _refresh_guard = self.refresh_lock.lock().await;
+            return self
+                .resolve_chatgpt_auth_for_store_account_id_unlocked(store_account_id, refresh_mode)
+                .await;
+        }
+
+        self.resolve_chatgpt_auth_for_store_account_id_unlocked(store_account_id, refresh_mode)
+            .await
+    }
+
+    async fn resolve_chatgpt_auth_for_store_account_id_unlocked(
         &self,
         store_account_id: &str,
         refresh_mode: ChatgptAccountRefreshMode,
@@ -2626,6 +2780,24 @@ impl AuthManager {
         ))
     }
 
+    pub fn shared_with_sqlite_home_workspace_and_linked_session(
+        codex_home: PathBuf,
+        sqlite_home: PathBuf,
+        forced_chatgpt_workspace_id: Option<String>,
+        linked_codex_session_id: Option<String>,
+        enable_codex_api_key_env: bool,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> Arc<Self> {
+        Arc::new(Self::new_with_sqlite_home_workspace_and_linked_session(
+            codex_home,
+            sqlite_home,
+            forced_chatgpt_workspace_id,
+            linked_codex_session_id,
+            enable_codex_api_key_env,
+            auth_credentials_store_mode,
+        ))
+    }
+
     /// Convenience constructor returning an `Arc` wrapper from resolved config.
     pub fn shared_from_config(
         config: &impl AuthManagerConfig,
@@ -2737,7 +2909,7 @@ impl AuthManager {
             }
             CodexAuth::Chatgpt(chatgpt_auth) => {
                 match self
-                    .resolve_chatgpt_auth_for_store_account_id(
+                    .resolve_chatgpt_auth_for_store_account_id_unlocked(
                         chatgpt_auth.store_account_id(),
                         ChatgptAccountRefreshMode::Force,
                     )
@@ -2814,30 +2986,18 @@ impl AuthManager {
             store_origin,
         } = loaded;
 
-        let cached_auth = if let Some(switched_to_store_account_id) =
-            mutation.switched_to_store_account_id.as_deref()
-        {
-            let storage =
-                Self::storage_for_store_origin(&self.codex_home, &self.storage, store_origin);
-            Self::derive_chatgpt_auth_from_store_account(
-                &store,
-                switched_to_store_account_id,
-                storage,
-                store_origin,
-            )
-        } else if mutation.was_active {
-            None
-        } else {
-            let storage =
-                Self::storage_for_store_origin(&self.codex_home, &self.storage, store_origin);
-            Self::derive_auth_from_store(
-                &store,
-                &self.codex_home,
-                storage,
-                self.enable_codex_api_key_env,
-                store_origin,
-            )
-        };
+        // Merge-safety anchor: terminal ChatGPT-account eviction mutates the
+        // AccountManager-owned store, but AuthManager's generic cache must still
+        // be re-derived by the normal auth owner so API-key runtimes are not
+        // overwritten by ChatGPT-only fallback snapshots.
+        let storage = Self::storage_for_store_origin(&self.codex_home, &self.storage, store_origin);
+        let cached_auth = Self::derive_auth_from_store(
+            &store,
+            &self.codex_home,
+            storage,
+            self.enable_codex_api_key_env,
+            store_origin,
+        );
         self.set_cached_with_auth(store, cached_auth, store_origin);
         tracing::warn!(
             store_account_id,

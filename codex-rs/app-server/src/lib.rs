@@ -574,7 +574,6 @@ pub async fn run_main_with_transport(
     let auth_manager = startup_auth_manager.unwrap_or_else(|| {
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
     });
-    auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
 
     let remote_control_enabled = config.features.enabled(Feature::RemoteControl);
     if transport_accept_handles.is_empty() && !remote_control_enabled {

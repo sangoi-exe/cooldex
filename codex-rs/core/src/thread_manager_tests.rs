@@ -1,24 +1,105 @@
 use super::*;
 use crate::config::test_config;
+use crate::config_loader::ConfigLayerEntry;
+use crate::config_loader::ConfigLayerStack;
+use crate::config_loader::ConfigRequirements;
+use crate::config_loader::ConfigRequirementsToml;
 use crate::rollout::RolloutRecorder;
 use crate::session::tests::make_session_and_context;
 use crate::tasks::interrupted_turn_history_marker;
+use codex_app_server_protocol::ConfigLayerSource;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
 use core_test_support::responses::mount_models_once;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use std::time::Duration;
 use tempfile::tempdir;
 use wiremock::MockServer;
+
+async fn reserved_thread_id_test_manager()
+-> (tempfile::TempDir, Config, Arc<AuthManager>, ThreadManager) {
+    reserved_thread_id_test_manager_with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .await
+}
+
+async fn reserved_thread_id_test_manager_with_auth(
+    auth: CodexAuth,
+) -> (tempfile::TempDir, Config, Arc<AuthManager>, ThreadManager) {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    config.config_layer_stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: AbsolutePathBuf::resolve_path_against_base("config.toml", temp_dir.path()),
+            },
+            toml::Value::Table(Default::default()),
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("config layer stack");
+
+    let auth_manager = AuthManager::from_auth_for_testing(auth);
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager.clone(),
+        SessionSource::Exec,
+        CollaborationModesConfig::default(),
+        Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
+        /*analytics_events_client*/ None,
+    );
+    (temp_dir, config, auth_manager, manager)
+}
+
+fn thread_manager_remote_model(
+    slug: &str,
+    display: &str,
+    priority: i32,
+    supported_in_api: bool,
+) -> ModelInfo {
+    serde_json::from_value(json!({
+        "slug": slug,
+        "display_name": display,
+        "description": format!("{display} desc"),
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [{"effort": "medium", "description": "medium"}],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "minimal_client_version": [0, 1, 0],
+        "supported_in_api": supported_in_api,
+        "priority": priority,
+        "upgrade": null,
+        "base_instructions": "base instructions",
+        "supports_reasoning_summaries": false,
+        "support_verbosity": false,
+        "default_verbosity": null,
+        "apply_patch_tool_type": null,
+        "truncation_policy": {"mode": "bytes", "limit": 10_000},
+        "supports_parallel_tool_calls": false,
+        "supports_image_detail_original": false,
+        "context_window": 272_000,
+        "max_context_window": 272_000,
+        "experimental_supported_tools": [],
+    }))
+    .expect("thread-manager model fixture")
+}
 
 fn user_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
@@ -41,6 +122,120 @@ fn assistant_msg(text: &str) -> ResponseItem {
         end_turn: None,
         phase: None,
     }
+}
+
+// Merge-safety anchor: app-server-derived auth/cloud bundles reserve the target
+// ThreadId before spawning; thread-manager spawn must preserve that id all the
+// way into SessionConfigured.
+#[tokio::test]
+async fn start_thread_with_auth_manager_uses_reserved_thread_id() {
+    let (_temp_dir, config, auth_manager, manager) = reserved_thread_id_test_manager().await;
+    let reserved_thread_id = ThreadId::new();
+
+    let new_thread = manager
+        .start_thread_with_tools_service_name_and_auth_manager(
+            config,
+            InitialHistory::New,
+            Some(reserved_thread_id),
+            auth_manager,
+            Vec::new(),
+            /*persist_extended_history*/ false,
+            /*metrics_service_name*/ None,
+            /*parent_trace*/ None,
+        )
+        .await
+        .expect("reserved-id thread should start");
+
+    assert_eq!(new_thread.thread_id, reserved_thread_id);
+    assert_eq!(new_thread.session_configured.session_id, reserved_thread_id);
+}
+
+// Merge-safety anchor: app-server target-config threads must not let the
+// startup ModelsManager decide ChatGPT-only model visibility for a target
+// AuthManager.
+#[tokio::test]
+async fn start_thread_with_auth_manager_uses_target_models_auth() {
+    let (_temp_dir, mut config, _startup_auth_manager, manager) =
+        reserved_thread_id_test_manager_with_auth(CodexAuth::from_api_key("startup-api-key")).await;
+    config.model = None;
+    config.model_catalog = Some(ModelsResponse {
+        models: vec![
+            thread_manager_remote_model(
+                "chatgpt-target-default",
+                "ChatGPT Target Default",
+                /*priority*/ 1,
+                /*supported_in_api*/ false,
+            ),
+            thread_manager_remote_model(
+                "api-startup-default",
+                "API Startup Default",
+                /*priority*/ 2,
+                /*supported_in_api*/ true,
+            ),
+        ],
+    });
+    let target_auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+
+    let new_thread = manager
+        .start_thread_with_tools_service_name_and_auth_manager(
+            config,
+            InitialHistory::New,
+            Some(ThreadId::new()),
+            target_auth_manager,
+            Vec::new(),
+            /*persist_extended_history*/ false,
+            /*metrics_service_name*/ None,
+            /*parent_trace*/ None,
+        )
+        .await
+        .expect("target-auth thread should start");
+
+    assert_eq!(
+        new_thread.session_configured.model,
+        "chatgpt-target-default"
+    );
+}
+
+// Merge-safety anchor: app-server fork derives AccountManager leases before core
+// spawn, so the reserved fork id must become the actual forked Session id.
+#[tokio::test]
+async fn fork_thread_with_auth_manager_uses_reserved_thread_id() {
+    let (_temp_dir, config, auth_manager, manager) = reserved_thread_id_test_manager().await;
+    let source = manager
+        .resume_thread_with_history(
+            config.clone(),
+            InitialHistory::Forked(vec![
+                RolloutItem::ResponseItem(user_msg("hello")),
+                RolloutItem::ResponseItem(assistant_msg("partial")),
+            ]),
+            auth_manager.clone(),
+            /*persist_extended_history*/ false,
+            /*parent_trace*/ None,
+        )
+        .await
+        .expect("create source thread");
+    let source_path = source
+        .thread
+        .rollout_path()
+        .expect("source rollout path should exist");
+    let reserved_thread_id = ThreadId::new();
+
+    let forked = manager
+        .fork_thread_with_auth_manager(
+            ForkSnapshot::Interrupted,
+            config,
+            source_path,
+            Some(reserved_thread_id),
+            auth_manager,
+            /*persist_extended_history*/ false,
+            /*parent_trace*/ None,
+        )
+        .await
+        .expect("fork with reserved thread id");
+
+    assert_eq!(forked.thread_id, reserved_thread_id);
+    assert_eq!(forked.session_configured.session_id, reserved_thread_id);
 }
 
 #[test]

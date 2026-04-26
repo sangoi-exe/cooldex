@@ -74,6 +74,7 @@ pub(crate) async fn run_codex_thread_interactive(
     let CodexSpawnOk { codex, .. } = Box::pin(Codex::spawn(CodexSpawnArgs {
         config,
         auth_manager,
+        reserved_thread_id: None,
         models_manager,
         environment_manager: Arc::new(EnvironmentManager::from_environment(
             parent_ctx.environment.as_deref(),

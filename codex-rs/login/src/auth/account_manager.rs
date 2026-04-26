@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
+use super::account_runtime_context::AccountRuntimeContext;
 use crate::auth::storage::AccountUsageCache;
 use crate::auth::storage::AuthStorageBackend;
 use crate::auth::storage::AuthStore;
@@ -646,13 +647,7 @@ struct GuardedReloadStorePreparation {
 }
 
 pub(super) struct TerminalRefreshFailureStoreMutation {
-    pub(super) was_active: bool,
     pub(super) switched_to_store_account_id: Option<String>,
-}
-
-struct AccountRuntimeContext {
-    linked_codex_session_id: Option<String>,
-    forced_chatgpt_workspace_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -676,13 +671,33 @@ impl AccountManager {
         runtime_session_id: String,
         forced_chatgpt_workspace_id: Option<String>,
     ) -> Self {
+        Self::new_with_runtime_context(
+            codex_home,
+            storage,
+            auth_credentials_store_mode,
+            account_state_store,
+            runtime_session_id,
+            /*linked_codex_session_id*/ None,
+            forced_chatgpt_workspace_id,
+        )
+    }
+
+    pub(super) fn new_with_runtime_context(
+        codex_home: PathBuf,
+        storage: Arc<dyn AuthStorageBackend>,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+        account_state_store: Option<AccountStateStore>,
+        runtime_session_id: String,
+        linked_codex_session_id: Option<String>,
+        forced_chatgpt_workspace_id: Option<String>,
+    ) -> Self {
         Self {
             codex_home,
             storage,
             auth_credentials_store_mode,
             account_state_store,
             runtime_session_id,
-            linked_codex_session_id: RwLock::new(None),
+            linked_codex_session_id: RwLock::new(linked_codex_session_id),
             forced_chatgpt_workspace_id: RwLock::new(forced_chatgpt_workspace_id),
             usage_limit_auto_switch_cooldown_until: Mutex::new(None),
         }
@@ -1578,7 +1593,6 @@ impl AccountManager {
         }
 
         Ok(Some(TerminalRefreshFailureStoreMutation {
-            was_active,
             switched_to_store_account_id,
         }))
     }

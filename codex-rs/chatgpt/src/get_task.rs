@@ -1,4 +1,5 @@
 use codex_core::config::Config;
+use codex_login::AuthManager;
 use serde::Deserialize;
 
 use crate::chatgpt_client::chatgpt_get_request;
@@ -34,7 +35,13 @@ pub struct OutputDiff {
     pub diff: String,
 }
 
-pub(crate) async fn get_task(config: &Config, task_id: String) -> anyhow::Result<GetTaskResponse> {
+// Merge-safety anchor: cloud task fetches must receive the caller's AuthManager
+// so request auth comes from the active AccountManager runtime owner.
+pub(crate) async fn get_task(
+    config: &Config,
+    auth_manager: &AuthManager,
+    task_id: String,
+) -> anyhow::Result<GetTaskResponse> {
     let path = format!("/wham/tasks/{task_id}");
-    chatgpt_get_request(config, path).await
+    chatgpt_get_request(config, auth_manager, path).await
 }

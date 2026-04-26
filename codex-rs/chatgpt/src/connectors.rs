@@ -1,8 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use crate::chatgpt_client::chatgpt_get_request_with_token;
-use crate::chatgpt_token::load_chatgpt_token_data_from_auth;
+use crate::chatgpt_client::chatgpt_get_request_with_auth;
 
 use codex_app_server_protocol::AppInfo;
 use codex_connectors::AllConnectorsCacheKey;
@@ -19,30 +18,60 @@ pub use codex_core::connectors::with_app_enabled_state;
 use codex_core::plugins::AppConnectorId;
 use codex_core::plugins::PluginsManager;
 use codex_login::AuthManager;
+use codex_login::ChatGptRequestAuth;
 use codex_login::CodexAuth;
 use codex_login::default_client::originator;
-use codex_login::token_data::TokenData;
 
 const DIRECTORY_CONNECTORS_TIMEOUT: Duration = Duration::from_secs(60);
 
-async fn apps_enabled(config: &Config) -> bool {
-    // Merge-safety anchor: connector availability is a config-aware ChatGPT
-    // auth gate, so it must construct AuthManager with resolved sqlite_home and
-    // forced workspace before probing current auth.
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false);
-    let auth = auth_manager.auth().await;
+#[derive(Clone)]
+pub struct ChatGptConnectorAuthSnapshot {
+    auth: CodexAuth,
+    request_auth: ChatGptRequestAuth,
+}
+
+impl ChatGptConnectorAuthSnapshot {
+    fn from_auth(auth: CodexAuth) -> Option<Self> {
+        let request_auth = ChatGptRequestAuth::from_auth(&auth)?;
+        Some(Self { auth, request_auth })
+    }
+
+    pub fn codex_auth(&self) -> &CodexAuth {
+        &self.auth
+    }
+
+    fn request_auth(&self) -> &ChatGptRequestAuth {
+        &self.request_auth
+    }
+}
+
+pub async fn load_connector_auth_snapshot(
+    auth_manager: &AuthManager,
+) -> Option<ChatGptConnectorAuthSnapshot> {
+    let auth = auth_manager.chatgpt_auth().await?;
+    ChatGptConnectorAuthSnapshot::from_auth(auth)
+}
+
+fn apps_enabled(config: &Config, auth_snapshot: Option<&ChatGptConnectorAuthSnapshot>) -> bool {
     config
         .features
-        .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::is_chatgpt_auth))
+        .apps_enabled_for_auth(auth_snapshot.is_some())
 }
-pub async fn list_connectors(config: &Config) -> anyhow::Result<Vec<AppInfo>> {
-    if !apps_enabled(config).await {
+
+pub async fn list_connectors(
+    config: &Config,
+    auth_manager: &AuthManager,
+) -> anyhow::Result<Vec<AppInfo>> {
+    let auth_snapshot = load_connector_auth_snapshot(auth_manager).await;
+    let auth = auth_snapshot
+        .as_ref()
+        .map(ChatGptConnectorAuthSnapshot::codex_auth);
+    if !apps_enabled(config, auth_snapshot.as_ref()) {
         return Ok(Vec::new());
     }
     let (connectors_result, accessible_result) = tokio::join!(
-        list_all_connectors(config),
-        list_accessible_connectors_from_mcp_tools(config),
+        list_all_connectors(config, auth_snapshot.as_ref()),
+        list_accessible_connectors_from_mcp_tools(config, auth),
     );
     let connectors = connectors_result?;
     let accessible = accessible_result?;
@@ -54,20 +83,26 @@ pub async fn list_connectors(config: &Config) -> anyhow::Result<Vec<AppInfo>> {
     ))
 }
 
-pub async fn list_all_connectors(config: &Config) -> anyhow::Result<Vec<AppInfo>> {
-    list_all_connectors_with_options(config, /*force_refetch*/ false).await
+pub async fn list_all_connectors(
+    config: &Config,
+    auth_snapshot: Option<&ChatGptConnectorAuthSnapshot>,
+) -> anyhow::Result<Vec<AppInfo>> {
+    list_all_connectors_with_options(config, auth_snapshot, /*force_refetch*/ false).await
 }
 
-pub async fn list_cached_all_connectors(config: &Config) -> Option<Vec<AppInfo>> {
-    if !apps_enabled(config).await {
+pub async fn list_cached_all_connectors(
+    config: &Config,
+    auth_snapshot: Option<&ChatGptConnectorAuthSnapshot>,
+) -> Option<Vec<AppInfo>> {
+    if !apps_enabled(config, auth_snapshot) {
         return Some(Vec::new());
     }
 
     // Merge-safety anchor: cached connector reads use the same config-aware
-    // token snapshot as network connector fetches; do not reintroduce a
-    // process-global token/bootstrap path that ignores forced workspace.
-    let token_data = load_chatgpt_token_data_from_auth(config).await.ok()??;
-    let cache_key = all_connectors_cache_key(config, &token_data);
+    // request-auth snapshot as network connector fetches; do not reintroduce a
+    // hidden AccountManager or process-global token/bootstrap path.
+    let request_auth = auth_snapshot?.request_auth();
+    let cache_key = all_connectors_cache_key(config, request_auth);
     let connectors = codex_connectors::cached_all_connectors(&cache_key)?;
     let connectors = merge_plugin_connectors(
         connectors,
@@ -84,31 +119,32 @@ pub async fn list_cached_all_connectors(config: &Config) -> Option<Vec<AppInfo>>
 
 pub async fn list_all_connectors_with_options(
     config: &Config,
+    auth_snapshot: Option<&ChatGptConnectorAuthSnapshot>,
     force_refetch: bool,
 ) -> anyhow::Result<Vec<AppInfo>> {
-    if !apps_enabled(config).await {
+    if !apps_enabled(config, auth_snapshot) {
         return Ok(Vec::new());
     }
     // Merge-safety anchor: connector network fetches must keep ChatGPT token
-    // snapshots aligned with AuthManagerConfig so account-state leases, cache
-    // keys, and request headers do not split across connector surfaces.
-    let token_data = load_chatgpt_token_data_from_auth(config)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("ChatGPT token not available"))?;
-    let cache_key = all_connectors_cache_key(config, &token_data);
-    let request_token_data = token_data.clone();
+    // snapshots aligned with the caller's AuthManager so account-state leases,
+    // cache keys, and request headers do not split across connector surfaces.
+    let request_auth = auth_snapshot
+        .ok_or_else(|| anyhow::anyhow!("ChatGPT connector auth snapshot not available"))?
+        .request_auth();
+    let cache_key = all_connectors_cache_key(config, request_auth);
+    let request_auth = request_auth.clone();
     let connectors = codex_connectors::list_all_connectors_with_options(
         cache_key,
-        token_data.id_token.is_workspace_account(),
+        request_auth.is_workspace_account(),
         force_refetch,
         |path| {
-            let token_data = request_token_data.clone();
+            let request_auth = request_auth.clone();
             async move {
-                chatgpt_get_request_with_token::<DirectoryListResponse>(
+                chatgpt_get_request_with_auth::<DirectoryListResponse>(
                     config,
                     path,
                     Some(DIRECTORY_CONNECTORS_TIMEOUT),
-                    token_data,
+                    request_auth,
                 )
                 .await
             }
@@ -128,12 +164,15 @@ pub async fn list_all_connectors_with_options(
     ))
 }
 
-fn all_connectors_cache_key(config: &Config, token_data: &TokenData) -> AllConnectorsCacheKey {
+fn all_connectors_cache_key(
+    config: &Config,
+    request_auth: &ChatGptRequestAuth,
+) -> AllConnectorsCacheKey {
     AllConnectorsCacheKey::new(
         config.chatgpt_base_url.clone(),
-        token_data.account_id.clone(),
-        token_data.id_token.chatgpt_user_id.clone(),
-        token_data.id_token.is_workspace_account(),
+        Some(request_auth.account_id().to_string()),
+        request_auth.chatgpt_user_id().map(str::to_string),
+        request_auth.is_workspace_account(),
     )
 }
 

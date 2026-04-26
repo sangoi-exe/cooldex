@@ -4,6 +4,7 @@ use clap::Parser;
 use codex_core::config::Config;
 use codex_git_utils::ApplyGitRequest;
 use codex_git_utils::apply_git_patch;
+use codex_login::AuthManager;
 use codex_utils_cli::CliConfigOverrides;
 
 use crate::get_task::GetTaskResponse;
@@ -31,10 +32,12 @@ pub async fn run_apply_command(
     )
     .await?;
 
-    // Merge-safety anchor: ChatGPT task apply delegates request auth to
-    // `chatgpt_get_request`, the per-call token snapshot owner; do not
-    // reintroduce a process-global token bootstrap here.
-    let task_response = get_task(&config, apply_cli.task_id).await?;
+    // Merge-safety anchor: ChatGPT task apply creates one command-boundary
+    // AuthManager and passes its request-auth snapshot down; do not reintroduce
+    // hidden leaf managers or a process-global token bootstrap here.
+    let auth_manager =
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+    let task_response = get_task(&config, auth_manager.as_ref(), apply_cli.task_id).await?;
     apply_diff_from_task(task_response, cwd).await
 }
 

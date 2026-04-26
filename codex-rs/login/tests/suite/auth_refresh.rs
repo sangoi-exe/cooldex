@@ -22,6 +22,7 @@ use serde_json::json;
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use tempfile::TempDir;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -212,6 +213,65 @@ async fn refresh_token_skips_refresh_when_auth_changed() -> Result<()> {
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(requests.is_empty(), "expected no refresh token requests");
 
+    Ok(())
+}
+
+#[serial_test::serial(auth_refresh)]
+#[tokio::test]
+async fn chatgpt_request_auth_serializes_stale_refresh() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(StdDuration::from_millis(200))
+                .set_body_json(json!({
+                    "access_token": "new-access-token",
+                    "refresh_token": "new-refresh-token"
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ctx = RefreshTokenTestContext::new(&server)?;
+    let stale_last_refresh = Utc::now() - Duration::days(9);
+    let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
+    let initial_auth = AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(initial_tokens.clone()),
+        last_refresh: Some(stale_last_refresh),
+        agent_identity: None,
+    };
+    ctx.write_auth(&initial_auth)?;
+
+    let first_manager = Arc::clone(&ctx.auth_manager);
+    let second_manager = Arc::clone(&ctx.auth_manager);
+    let (first, second) = tokio::join!(
+        first_manager.chatgpt_request_auth(),
+        second_manager.chatgpt_request_auth()
+    );
+
+    for snapshot in [
+        first.context("first request auth snapshot should resolve")?,
+        second.context("second request auth snapshot should resolve")?,
+    ] {
+        assert_eq!(snapshot.authorization(), "Bearer new-access-token");
+        assert_eq!(snapshot.account_id(), "account-id");
+    }
+
+    let stored = ctx.load_auth()?;
+    let refreshed_tokens = TokenData {
+        access_token: "new-access-token".to_string(),
+        refresh_token: "new-refresh-token".to_string(),
+        ..initial_tokens
+    };
+    let active_account = stored_account_for_tokens(&stored, &refreshed_tokens)?;
+    assert_eq!(&active_account.tokens, &refreshed_tokens);
+    server.verify().await;
     Ok(())
 }
 

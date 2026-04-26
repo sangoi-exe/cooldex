@@ -19,6 +19,7 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::TurnStatus;
 use codex_exec_server::EnvironmentManager;
+use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
@@ -228,11 +229,6 @@ impl ThreadManager {
     ) -> Self {
         let codex_home = config.codex_home.clone();
         let restriction_product = session_source.restriction_product();
-        let openai_models_provider = config
-            .model_providers
-            .get(OPENAI_PROVIDER_ID)
-            .cloned()
-            .unwrap_or_else(|| ModelProviderInfo::create_openai_provider(/*base_url*/ None));
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
         let plugins_manager = Arc::new(PluginsManager::new_with_restriction_product(
             codex_home.to_path_buf(),
@@ -240,7 +236,7 @@ impl ThreadManager {
         ));
         let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
         let skills_manager = Arc::new(SkillsManager::new_with_restriction_product(
-            codex_home.clone(),
+            codex_home,
             config.bundled_skills_enabled(),
             restriction_product,
         ));
@@ -249,13 +245,11 @@ impl ThreadManager {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
-                models_manager: Arc::new(ModelsManager::new_with_provider(
-                    codex_home.to_path_buf(),
+                models_manager: ThreadManagerState::models_manager_for_config(
+                    config,
                     auth_manager.clone(),
-                    config.model_catalog.clone(),
                     collaboration_modes_config,
-                    openai_models_provider,
-                )),
+                ),
                 environment_manager,
                 skills_manager,
                 plugins_manager,
@@ -501,10 +495,38 @@ impl ThreadManager {
         metrics_service_name: Option<String>,
         parent_trace: Option<W3cTraceContext>,
     ) -> CodexResult<NewThread> {
+        Box::pin(self.start_thread_with_tools_service_name_and_auth_manager(
+            config,
+            initial_history,
+            /*reserved_thread_id*/ None,
+            Arc::clone(&self.state.auth_manager),
+            dynamic_tools,
+            persist_extended_history,
+            metrics_service_name,
+            parent_trace,
+        ))
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    // Merge-safety anchor: app-server-created threads may need a per-thread
+    // AuthManager built from the target config path before cloud requirements.
+    pub async fn start_thread_with_tools_service_name_and_auth_manager(
+        &self,
+        config: Config,
+        initial_history: InitialHistory,
+        reserved_thread_id: Option<ThreadId>,
+        auth_manager: Arc<AuthManager>,
+        dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
+        persist_extended_history: bool,
+        metrics_service_name: Option<String>,
+        parent_trace: Option<W3cTraceContext>,
+    ) -> CodexResult<NewThread> {
         Box::pin(self.state.spawn_thread(
             config,
             initial_history,
-            Arc::clone(&self.state.auth_manager),
+            reserved_thread_id,
+            auth_manager,
             self.agent_control(),
             dynamic_tools,
             persist_extended_history,
@@ -544,6 +566,7 @@ impl ThreadManager {
         Box::pin(self.state.spawn_thread(
             config,
             initial_history,
+            /*reserved_thread_id*/ None,
             auth_manager,
             self.agent_control(),
             Vec::new(),
@@ -563,6 +586,7 @@ impl ThreadManager {
         Box::pin(self.state.spawn_thread(
             config,
             InitialHistory::New,
+            /*reserved_thread_id*/ None,
             Arc::clone(&self.state.auth_manager),
             self.agent_control(),
             Vec::new(),
@@ -585,6 +609,7 @@ impl ThreadManager {
         Box::pin(self.state.spawn_thread(
             config,
             initial_history,
+            /*reserved_thread_id*/ None,
             auth_manager,
             self.agent_control(),
             Vec::new(),
@@ -670,6 +695,31 @@ impl ThreadManager {
         S: Into<ForkSnapshot>,
     {
         let snapshot = snapshot.into();
+        self.fork_thread_with_auth_manager(
+            snapshot,
+            config,
+            path,
+            /*reserved_thread_id*/ None,
+            Arc::clone(&self.state.auth_manager),
+            persist_extended_history,
+            parent_trace,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    // Merge-safety anchor: forked app-server threads must carry the target
+    // config AuthManager instead of falling back to the startup owner.
+    pub async fn fork_thread_with_auth_manager(
+        &self,
+        snapshot: ForkSnapshot,
+        config: Config,
+        path: PathBuf,
+        reserved_thread_id: Option<ThreadId>,
+        auth_manager: Arc<AuthManager>,
+        persist_extended_history: bool,
+        parent_trace: Option<W3cTraceContext>,
+    ) -> CodexResult<NewThread> {
         let history = RolloutRecorder::get_rollout_history(&path).await?;
         let snapshot_state = snapshot_turn_state(&history);
         let history = match snapshot {
@@ -693,7 +743,8 @@ impl ThreadManager {
         Box::pin(self.state.spawn_thread(
             config,
             history,
-            Arc::clone(&self.state.auth_manager),
+            reserved_thread_id,
+            auth_manager,
             self.agent_control(),
             Vec::new(),
             persist_extended_history,
@@ -719,6 +770,25 @@ impl ThreadManager {
 }
 
 impl ThreadManagerState {
+    fn models_manager_for_config(
+        config: &Config,
+        auth_manager: Arc<AuthManager>,
+        collaboration_modes_config: CollaborationModesConfig,
+    ) -> Arc<ModelsManager> {
+        let openai_models_provider = config
+            .model_providers
+            .get(OPENAI_PROVIDER_ID)
+            .cloned()
+            .unwrap_or_else(|| ModelProviderInfo::create_openai_provider(/*base_url*/ None));
+        Arc::new(ModelsManager::new_with_provider(
+            config.codex_home.to_path_buf(),
+            auth_manager,
+            config.model_catalog.clone(),
+            collaboration_modes_config,
+            openai_models_provider,
+        ))
+    }
+
     pub(crate) async fn list_thread_ids(&self) -> Vec<ThreadId> {
         self.threads.read().await.keys().copied().collect()
     }
@@ -791,6 +861,7 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread_with_source(
             config,
             InitialHistory::New,
+            /*reserved_thread_id*/ None,
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
@@ -818,6 +889,7 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
+            /*reserved_thread_id*/ None,
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
@@ -846,6 +918,7 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
+            /*reserved_thread_id*/ None,
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
@@ -866,6 +939,7 @@ impl ThreadManagerState {
         &self,
         config: Config,
         initial_history: InitialHistory,
+        reserved_thread_id: Option<ThreadId>,
         auth_manager: Arc<AuthManager>,
         agent_control: AgentControl,
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
@@ -877,6 +951,7 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
+            reserved_thread_id,
             auth_manager,
             agent_control,
             self.session_source.clone(),
@@ -896,6 +971,7 @@ impl ThreadManagerState {
         &self,
         config: Config,
         initial_history: InitialHistory,
+        reserved_thread_id: Option<ThreadId>,
         auth_manager: Arc<AuthManager>,
         agent_control: AgentControl,
         session_source: SessionSource,
@@ -925,12 +1001,27 @@ impl ThreadManagerState {
             }
             Some(_) | None => crate::file_watcher::WatchRegistration::default(),
         };
+        let collaboration_modes_config = CollaborationModesConfig {
+            default_mode_request_user_input: config
+                .features
+                .enabled(Feature::DefaultModeRequestUserInput),
+        };
+        // Merge-safety anchor: app-server target-config spawns must bind the
+        // model catalog owner to the same target AuthManager used by the
+        // session/cloud requirements; startup model managers are not a safe
+        // request-auth owner for target-config threads.
+        let models_manager = Self::models_manager_for_config(
+            &config,
+            Arc::clone(&auth_manager),
+            collaboration_modes_config,
+        );
         let CodexSpawnOk {
             codex, thread_id, ..
         } = Codex::spawn(CodexSpawnArgs {
             config,
             auth_manager,
-            models_manager: Arc::clone(&self.models_manager),
+            reserved_thread_id,
+            models_manager,
             environment_manager: Arc::clone(&self.environment_manager),
             skills_manager: Arc::clone(&self.skills_manager),
             plugins_manager: Arc::clone(&self.plugins_manager),

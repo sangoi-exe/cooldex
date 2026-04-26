@@ -1084,17 +1084,25 @@ pub(crate) async fn lookup_mcp_tool_metadata(
         .into_values()
         .find(|tool_info| tool_info.server_name == server && tool_info.tool.name == tool_name)?;
     let connector_description = if server == CODEX_APPS_MCP_SERVER_NAME {
+        // Merge-safety anchor: Codex Apps MCP metadata may consult ChatGPT
+        // connector auth, but only through the turn's AccountManager owner.
+        let auth = match turn_context.auth_manager.as_deref() {
+            Some(auth_manager) => auth_manager.chatgpt_auth().await,
+            None => None,
+        };
         let connectors = match connectors::list_cached_accessible_connectors_from_mcp_tools(
             turn_context.config.as_ref(),
+            auth.as_ref(),
         )
         .await
         {
             Some(connectors) => Some(connectors),
-            None => {
-                connectors::list_accessible_connectors_from_mcp_tools(turn_context.config.as_ref())
-                    .await
-                    .ok()
-            }
+            None => connectors::list_accessible_connectors_from_mcp_tools(
+                turn_context.config.as_ref(),
+                auth.as_ref(),
+            )
+            .await
+            .ok(),
         };
         connectors.and_then(|connectors| {
             let connector_id = tool_info.connector_id.as_deref()?;

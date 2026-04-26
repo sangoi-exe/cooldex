@@ -3405,6 +3405,14 @@ impl ChatWidget {
     // guards only cover refreshed rate-limit notifications, not live token-count payloads.
     pub(crate) fn on_active_account_changed(&mut self) {
         self.plan_type = None;
+        self.invalidate_rate_limit_state_after_account_change();
+    }
+
+    pub(crate) fn on_projected_account_generation_changed(&mut self) {
+        self.invalidate_rate_limit_state_after_account_change();
+    }
+
+    fn invalidate_rate_limit_state_after_account_change(&mut self) {
         self.rate_limit_warnings = RateLimitWarningState::default();
         self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
         self.rate_limit_account_generation = self.rate_limit_account_generation.wrapping_add(1);
@@ -8640,11 +8648,18 @@ impl ChatWidget {
         }
 
         let config = self.config.clone();
+        let auth_manager = self.auth_manager.clone();
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
+            let auth_snapshot =
+                connectors::load_connector_auth_snapshot(auth_manager.as_ref()).await;
+            let auth = auth_snapshot
+                .as_ref()
+                .map(connectors::ChatGptConnectorAuthSnapshot::codex_auth);
             let accessible_result =
                 match connectors::list_accessible_connectors_from_mcp_tools_with_options_and_status(
                     &config,
+                    auth,
                     force_refetch,
                 )
                 .await
@@ -8670,8 +8685,12 @@ impl ChatWidget {
             });
 
             let result: Result<ConnectorsSnapshot, String> = async {
-                let all_connectors =
-                    connectors::list_all_connectors_with_options(&config, force_refetch).await?;
+                let all_connectors = connectors::list_all_connectors_with_options(
+                    &config,
+                    auth_snapshot.as_ref(),
+                    force_refetch,
+                )
+                .await?;
                 let connectors = connectors::merge_connectors_with_accessible(
                     all_connectors,
                     accessible_connectors,

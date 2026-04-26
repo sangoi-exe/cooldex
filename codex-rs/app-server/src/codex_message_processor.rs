@@ -712,11 +712,27 @@ impl CodexMessageProcessor {
         let outgoing = Arc::clone(&self.outgoing);
         let last_sent_account_updated_notification =
             Arc::clone(&self.last_sent_account_updated_notification);
+        let cloud_requirements = Arc::clone(&self.cloud_requirements);
+        let chatgpt_base_url = self.config.chatgpt_base_url.clone();
+        let codex_home = self.config.codex_home.to_path_buf();
+        let cli_overrides = Arc::clone(&self.cli_overrides);
         self.background_tasks.spawn(async move {
             loop {
                 if auth_state_rx.changed().await.is_err() {
                     return;
                 }
+                let current_cli_overrides = cli_overrides
+                    .read()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                refresh_cloud_requirements_for_account(
+                    cloud_requirements.as_ref(),
+                    Arc::clone(&auth_manager),
+                    chatgpt_base_url.clone(),
+                    codex_home.clone(),
+                    &current_cli_overrides,
+                )
+                .await;
                 Self::send_account_updated_notification_if_changed(
                     outgoing.as_ref(),
                     last_sent_account_updated_notification.as_ref(),
@@ -874,6 +890,18 @@ impl CodexMessageProcessor {
             .read()
             .map(|guard| guard.clone())
             .unwrap_or_default()
+    }
+
+    async fn refresh_cloud_requirements_for_current_account(&self) {
+        let cli_overrides = self.current_cli_overrides();
+        refresh_cloud_requirements_for_account(
+            self.cloud_requirements.as_ref(),
+            self.auth_manager.clone(),
+            self.config.chatgpt_base_url.clone(),
+            self.config.codex_home.to_path_buf(),
+            &cli_overrides,
+        )
+        .await;
     }
 
     fn current_cli_overrides(&self) -> Vec<(String, TomlValue)> {
@@ -1414,6 +1442,7 @@ impl CodexMessageProcessor {
     async fn login_api_key_v2(&self, request_id: ConnectionRequestId, params: LoginApiKeyParams) {
         match self.login_api_key_common(&params).await {
             Ok(()) => {
+                self.refresh_cloud_requirements_for_current_account().await;
                 let response = codex_app_server_protocol::LoginAccountResponse::ApiKey {};
                 self.outgoing.send_response(request_id, response).await;
 
@@ -1553,6 +1582,17 @@ impl CodexMessageProcessor {
                             }
                         };
 
+                        if success {
+                            refresh_cloud_requirements_for_account(
+                                cloud_requirements.as_ref(),
+                                auth_manager.clone(),
+                                chatgpt_base_url,
+                                codex_home,
+                                &cli_overrides,
+                            )
+                            .await;
+                        }
+
                         let payload_v2 = AccountLoginCompletedNotification {
                             login_id: Some(login_id.to_string()),
                             success,
@@ -1565,18 +1605,6 @@ impl CodexMessageProcessor {
                             .await;
 
                         if success {
-                            replace_cloud_requirements_loader(
-                                cloud_requirements.as_ref(),
-                                auth_manager.clone(),
-                                chatgpt_base_url,
-                                codex_home,
-                            );
-                            sync_default_client_residency_requirement(
-                                &cli_overrides,
-                                cloud_requirements.as_ref(),
-                            )
-                            .await;
-
                             // Notify clients with the actual current auth mode.
                             let payload_v2 = Self::account_updated_notification_from_auth_manager(
                                 auth_manager.as_ref(),
@@ -1680,6 +1708,17 @@ impl CodexMessageProcessor {
                             }
                         };
 
+                        if success {
+                            refresh_cloud_requirements_for_account(
+                                cloud_requirements.as_ref(),
+                                auth_manager.clone(),
+                                chatgpt_base_url,
+                                codex_home,
+                                &cli_overrides,
+                            )
+                            .await;
+                        }
+
                         let payload_v2 = AccountLoginCompletedNotification {
                             login_id: Some(login_id.to_string()),
                             success,
@@ -1692,18 +1731,6 @@ impl CodexMessageProcessor {
                             .await;
 
                         if success {
-                            replace_cloud_requirements_loader(
-                                cloud_requirements.as_ref(),
-                                auth_manager.clone(),
-                                chatgpt_base_url,
-                                codex_home,
-                            );
-                            sync_default_client_residency_requirement(
-                                &cli_overrides,
-                                cloud_requirements.as_ref(),
-                            )
-                            .await;
-
                             let payload_v2 = Self::account_updated_notification_from_auth_manager(
                                 auth_manager.as_ref(),
                             );
@@ -1850,15 +1877,15 @@ impl CodexMessageProcessor {
             }
         }
         self.auth_manager.reload();
-        replace_cloud_requirements_loader(
+        let cli_overrides = self.current_cli_overrides();
+        refresh_cloud_requirements_for_account(
             self.cloud_requirements.as_ref(),
             self.auth_manager.clone(),
             self.config.chatgpt_base_url.clone(),
             self.config.codex_home.to_path_buf(),
-        );
-        let cli_overrides = self.current_cli_overrides();
-        sync_default_client_residency_requirement(&cli_overrides, self.cloud_requirements.as_ref())
-            .await;
+            &cli_overrides,
+        )
+        .await;
 
         self.outgoing
             .send_response(request_id, LoginAccountResponse::ChatgptAuthTokens {})
@@ -1910,6 +1937,7 @@ impl CodexMessageProcessor {
     async fn logout_v2(&self, request_id: ConnectionRequestId) {
         match self.logout_common().await {
             Ok(_current_auth_method) => {
+                self.refresh_cloud_requirements_for_current_account().await;
                 self.outgoing
                     .send_response(request_id, LogoutAccountResponse {})
                     .await;
@@ -2115,6 +2143,7 @@ impl CodexMessageProcessor {
     ) {
         match self.auth_manager.set_active_account(&params.account_id) {
             Ok(()) => {
+                self.refresh_cloud_requirements_for_current_account().await;
                 self.outgoing
                     .send_response(request_id, SetActiveAccountResponse {})
                     .await;
@@ -2204,11 +2233,10 @@ impl CodexMessageProcessor {
         &self,
         params: SendAddCreditsNudgeEmailParams,
     ) -> Result<AddCreditsNudgeEmailStatus, JSONRPCErrorError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some(auth) = self.auth_manager.chatgpt_auth().await else {
             return Err(JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
-                message: "codex account authentication required to notify workspace owner"
-                    .to_string(),
+                message: "chatgpt authentication required to notify workspace owner".to_string(),
                 data: None,
             });
         };
@@ -2260,10 +2288,10 @@ impl CodexMessageProcessor {
         ),
         JSONRPCErrorError,
     > {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some(auth) = self.auth_manager.chatgpt_auth().await else {
             return Err(JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
-                message: "codex account authentication required to read rate limits".to_string(),
+                message: "chatgpt authentication required to read rate limits".to_string(),
                 data: None,
             });
         };
@@ -2772,21 +2800,27 @@ impl CodexMessageProcessor {
         request_trace: Option<W3cTraceContext>,
     ) {
         let requested_cwd = typesafe_overrides.cwd.clone();
+        // Merge-safety anchor: app-server start must reserve the thread id
+        // before target-config auth/cloud derivation so AccountManager leases are
+        // linked to the same Codex session id that the spawned thread reports.
+        let reserved_thread_id = ThreadId::new();
+        let linked_codex_session_id = reserved_thread_id.to_string();
         let config_inputs = ConfigDerivationInputs {
             cli_overrides: &cli_overrides,
             cloud_requirements: &cloud_requirements,
             codex_home: &listener_task_context.codex_home,
             runtime_feature_enablement: &runtime_feature_enablement,
         };
-        let mut config = match derive_config_from_params(
+        let mut runtime_config = match derive_runtime_config_from_params(
             config_inputs,
             config_overrides.clone(),
             typesafe_overrides.clone(),
             config_path.clone(),
+            Some(linked_codex_session_id.clone()),
         )
         .await
         {
-            Ok(config) => config,
+            Ok(runtime_config) => runtime_config,
             Err(err) => {
                 let error = config_load_error(&err);
                 listener_task_context
@@ -2796,6 +2830,8 @@ impl CodexMessageProcessor {
                 return;
             }
         };
+        let mut config = runtime_config.config;
+        let mut auth_manager = runtime_config.auth_manager;
 
         // The user may have requested WorkspaceWrite or DangerFullAccess via
         // the command line, though in the process of deriving the Config, it
@@ -2862,15 +2898,16 @@ impl CodexMessageProcessor {
                 ..config_inputs
             };
 
-            config = match derive_config_from_params(
+            runtime_config = match derive_runtime_config_from_params(
                 config_inputs_for_reload,
                 config_overrides,
                 typesafe_overrides,
                 config_path,
+                Some(linked_codex_session_id),
             )
             .await
             {
-                Ok(config) => config,
+                Ok(runtime_config) => runtime_config,
                 Err(err) => {
                     let error = config_load_error(&err);
                     listener_task_context
@@ -2880,6 +2917,8 @@ impl CodexMessageProcessor {
                     return;
                 }
             };
+            config = runtime_config.config;
+            auth_manager = runtime_config.auth_manager;
         }
 
         let instruction_sources = Self::instruction_sources_from_config(&config).await;
@@ -2913,7 +2952,7 @@ impl CodexMessageProcessor {
 
         match listener_task_context
             .thread_manager
-            .start_thread_with_tools_and_service_name(
+            .start_thread_with_tools_service_name_and_auth_manager(
                 config,
                 match session_start_source
                     .unwrap_or(codex_app_server_protocol::ThreadStartSource::Startup)
@@ -2921,6 +2960,8 @@ impl CodexMessageProcessor {
                     codex_app_server_protocol::ThreadStartSource::Startup => InitialHistory::New,
                     codex_app_server_protocol::ThreadStartSource::Clear => InitialHistory::Cleared,
                 },
+                Some(reserved_thread_id),
+                auth_manager,
                 core_dynamic_tools,
                 persist_extended_history,
                 service_name,
@@ -4644,22 +4685,25 @@ impl CodexMessageProcessor {
         };
         let request_overrides_for_instruction_reuse = request_overrides.clone();
         let typesafe_overrides_for_instruction_reuse = typesafe_overrides.clone();
-        let mut config = match derive_config_for_cwd(
+        let runtime_config = match derive_runtime_config_for_cwd(
             config_inputs,
             request_overrides,
             typesafe_overrides,
             history_cwd,
             requested_config_path.or(history_config_path),
+            Some(thread_id.clone()),
         )
         .await
         {
-            Ok(config) => config,
+            Ok(runtime_config) => runtime_config,
             Err(err) => {
                 let error = config_load_error(&err);
                 self.outgoing.send_error(request_id, error).await;
                 return;
             }
         };
+        let mut config = runtime_config.config;
+        let auth_manager = runtime_config.auth_manager;
         apply_persisted_instruction_overrides_from_history(
             &thread_history,
             request_overrides_for_instruction_reuse.as_ref(),
@@ -4676,7 +4720,7 @@ impl CodexMessageProcessor {
             .resume_thread_with_history(
                 config,
                 thread_history,
-                self.auth_manager.clone(),
+                auth_manager,
                 persist_extended_history,
                 self.request_trace_context(&request_id).await,
             )
@@ -5254,16 +5298,22 @@ impl CodexMessageProcessor {
         };
         let request_overrides_for_instruction_reuse = request_overrides.clone();
         let typesafe_overrides_for_instruction_reuse = typesafe_overrides.clone();
-        let mut config = match derive_config_for_cwd(
+        // Merge-safety anchor: fork target-config auth/cloud derivation must use
+        // the id reserved for the forked thread, not the source thread or a
+        // startup-scoped placeholder.
+        let reserved_thread_id = ThreadId::new();
+        let linked_codex_session_id = reserved_thread_id.to_string();
+        let runtime_config = match derive_runtime_config_for_cwd(
             config_inputs,
             request_overrides,
             typesafe_overrides,
             history_session_location.cwd,
             requested_config_path.or(history_session_location.config_path),
+            Some(linked_codex_session_id),
         )
         .await
         {
-            Ok(config) => config,
+            Ok(runtime_config) => runtime_config,
             Err(err) => {
                 self.outgoing
                     .send_error(request_id, config_load_error(&err))
@@ -5271,6 +5321,8 @@ impl CodexMessageProcessor {
                 return;
             }
         };
+        let mut config = runtime_config.config;
+        let auth_manager = runtime_config.auth_manager;
 
         if let Some(fork_history) = fork_history.as_ref() {
             apply_persisted_instruction_overrides_from_history(
@@ -5290,10 +5342,12 @@ impl CodexMessageProcessor {
             session_configured,
         } = match self
             .thread_manager
-            .fork_thread(
+            .fork_thread_with_auth_manager(
                 ForkSnapshot::Interrupted,
                 config,
                 rollout_path.clone(),
+                Some(reserved_thread_id),
+                auth_manager,
                 persist_extended_history,
                 self.request_trace_context(&request_id).await,
             )
@@ -6052,7 +6106,7 @@ impl CodexMessageProcessor {
         let mcp_config = config
             .to_mcp_config(self.thread_manager.plugins_manager().as_ref())
             .await;
-        let auth = self.auth_manager.auth().await;
+        let auth = self.auth_manager.chatgpt_auth().await;
         let runtime_environment = match self.thread_manager.environment_manager().current().await {
             Ok(Some(environment)) => {
                 McpRuntimeEnvironment::new(environment, config.cwd.to_path_buf())
@@ -6510,10 +6564,11 @@ impl CodexMessageProcessor {
                 .set_enabled(Feature::Apps, thread.enabled(Feature::Apps));
         }
 
-        let auth = self.auth_manager.auth().await;
+        let auth_snapshot =
+            connectors::load_connector_auth_snapshot(self.auth_manager.as_ref()).await;
         if !config
             .features
-            .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::is_chatgpt_auth))
+            .apps_enabled_for_auth(auth_snapshot.is_some())
         {
             self.outgoing
                 .send_response(
@@ -6530,7 +6585,7 @@ impl CodexMessageProcessor {
         let request = request_id.clone();
         let outgoing = Arc::clone(&self.outgoing);
         tokio::spawn(async move {
-            Self::apps_list_task(outgoing, request, params, config).await;
+            Self::apps_list_task(outgoing, request, params, config, auth_snapshot).await;
         });
     }
 
@@ -6539,6 +6594,7 @@ impl CodexMessageProcessor {
         request_id: ConnectionRequestId,
         params: AppsListParams,
         config: Config,
+        auth_snapshot: Option<connectors::ChatGptConnectorAuthSnapshot>,
     ) {
         let AppsListParams {
             cursor,
@@ -6562,19 +6618,27 @@ impl CodexMessageProcessor {
             None => 0,
         };
 
+        let auth = auth_snapshot
+            .as_ref()
+            .map(connectors::ChatGptConnectorAuthSnapshot::codex_auth);
         let (mut accessible_connectors, mut all_connectors) = tokio::join!(
-            connectors::list_cached_accessible_connectors_from_mcp_tools(&config),
-            connectors::list_cached_all_connectors(&config)
+            connectors::list_cached_accessible_connectors_from_mcp_tools(&config, auth),
+            connectors::list_cached_all_connectors(&config, auth_snapshot.as_ref())
         );
         let cached_all_connectors = all_connectors.clone();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         let accessible_config = config.clone();
+        let accessible_auth_snapshot = auth_snapshot.clone();
         let accessible_tx = tx.clone();
         tokio::spawn(async move {
+            let accessible_auth = accessible_auth_snapshot
+                .as_ref()
+                .map(connectors::ChatGptConnectorAuthSnapshot::codex_auth);
             let result = connectors::list_accessible_connectors_from_mcp_tools_with_options(
                 &accessible_config,
+                accessible_auth,
                 force_refetch,
             )
             .await
@@ -6583,10 +6647,15 @@ impl CodexMessageProcessor {
         });
 
         let all_config = config.clone();
+        let all_auth_snapshot = auth_snapshot.clone();
         tokio::spawn(async move {
-            let result = connectors::list_all_connectors_with_options(&all_config, force_refetch)
-                .await
-                .map_err(|err| format!("failed to list apps: {err}"));
+            let result = connectors::list_all_connectors_with_options(
+                &all_config,
+                all_auth_snapshot.as_ref(),
+                force_refetch,
+            )
+            .await
+            .map_err(|err| format!("failed to list apps: {err}"));
             let _ = tx.send(AppListLoadResult::Directory(result));
         });
 
@@ -7108,8 +7177,12 @@ impl CodexMessageProcessor {
                 return;
             }
         };
-        let app_summaries =
-            plugin_app_helpers::load_plugin_app_summaries(&config, &outcome.plugin.apps).await;
+        let app_summaries = plugin_app_helpers::load_plugin_app_summaries(
+            &config,
+            self.auth_manager.as_ref(),
+            &outcome.plugin.apps,
+        )
+        .await;
         let visible_skills = outcome
             .plugin
             .skills
@@ -7291,17 +7364,28 @@ impl CodexMessageProcessor {
                 }
 
                 let plugin_apps = load_plugin_apps(result.installed_path.as_path()).await;
-                let auth = self.auth_manager.auth().await;
+                let auth_snapshot =
+                    connectors::load_connector_auth_snapshot(self.auth_manager.as_ref()).await;
                 let apps_needing_auth = if plugin_apps.is_empty()
-                    || !config.features.apps_enabled_for_auth(
-                        auth.as_ref().is_some_and(CodexAuth::is_chatgpt_auth),
-                    ) {
+                    || !config
+                        .features
+                        .apps_enabled_for_auth(auth_snapshot.is_some())
+                {
                     Vec::new()
                 } else {
+                    let auth = auth_snapshot
+                        .as_ref()
+                        .map(connectors::ChatGptConnectorAuthSnapshot::codex_auth);
                     let (all_connectors_result, accessible_connectors_result) = tokio::join!(
-                        connectors::list_all_connectors_with_options(&config, /*force_refetch*/ true),
+                        connectors::list_all_connectors_with_options(
+                            &config,
+                            auth_snapshot.as_ref(),
+                            /*force_refetch*/ true
+                        ),
                         connectors::list_accessible_connectors_from_mcp_tools_with_options_and_status(
-                            &config, /*force_refetch*/ true
+                            &config,
+                            auth,
+                            /*force_refetch*/ true
                         ),
                     );
 
@@ -7312,7 +7396,7 @@ impl CodexMessageProcessor {
                                 plugin = result.plugin_id.as_key(),
                                 "failed to load app metadata after plugin install: {err:#}"
                             );
-                            connectors::list_cached_all_connectors(&config)
+                            connectors::list_cached_all_connectors(&config, auth_snapshot.as_ref())
                                 .await
                                 .unwrap_or_default()
                         }
@@ -7329,7 +7413,7 @@ impl CodexMessageProcessor {
                                 );
                                 (
                                     connectors::list_cached_accessible_connectors_from_mcp_tools(
-                                        &config,
+                                        &config, auth,
                                     )
                                     .await
                                     .unwrap_or_default(),
@@ -9811,7 +9895,27 @@ fn replace_cloud_requirements_loader(
     }
 }
 
+async fn refresh_cloud_requirements_for_account(
+    cloud_requirements: &RwLock<CloudRequirementsLoader>,
+    auth_manager: Arc<AuthManager>,
+    chatgpt_base_url: String,
+    codex_home: PathBuf,
+    cli_overrides: &[(String, TomlValue)],
+) {
+    // Merge-safety anchor: account/auth mutations must refresh the
+    // app-server cloud-requirements loader and default residency before
+    // account-update followers observe the new auth owner.
+    replace_cloud_requirements_loader(
+        cloud_requirements,
+        auth_manager,
+        chatgpt_base_url,
+        codex_home.clone(),
+    );
+    sync_default_client_residency_requirement(codex_home, cli_overrides, cloud_requirements).await;
+}
+
 async fn sync_default_client_residency_requirement(
+    codex_home: PathBuf,
     cli_overrides: &[(String, TomlValue)],
     cloud_requirements: &RwLock<CloudRequirementsLoader>,
 ) {
@@ -9820,6 +9924,7 @@ async fn sync_default_client_residency_requirement(
         .map(|guard| guard.clone())
         .unwrap_or_default();
     match codex_core::config::ConfigBuilder::default()
+        .codex_home(codex_home)
         .cli_overrides(cli_overrides.to_vec())
         .cloud_requirements(loader)
         .build()
@@ -9851,12 +9956,18 @@ struct ConfigDerivationInputs<'a> {
     runtime_feature_enablement: &'a BTreeMap<String, bool>,
 }
 
-async fn derive_config_from_params(
+struct RuntimeConfigDerivation {
+    config: Config,
+    auth_manager: Arc<AuthManager>,
+}
+
+async fn derive_runtime_config_from_params(
     inputs: ConfigDerivationInputs<'_>,
     request_overrides: Option<HashMap<String, serde_json::Value>>,
     typesafe_overrides: ConfigOverrides,
     config_path: Option<PathBuf>,
-) -> std::io::Result<Config> {
+    linked_codex_session_id: Option<String>,
+) -> std::io::Result<RuntimeConfigDerivation> {
     let merged_cli_overrides = inputs
         .cli_overrides
         .iter()
@@ -9869,16 +9980,92 @@ async fn derive_config_from_params(
         )
         .collect::<Vec<_>>();
 
+    derive_runtime_config(
+        inputs,
+        merged_cli_overrides,
+        typesafe_overrides,
+        /*fallback_cwd*/ None,
+        config_path,
+        linked_codex_session_id,
+    )
+    .await
+}
+
+async fn derive_runtime_config_for_cwd(
+    inputs: ConfigDerivationInputs<'_>,
+    request_overrides: Option<HashMap<String, serde_json::Value>>,
+    typesafe_overrides: ConfigOverrides,
+    cwd: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+    linked_codex_session_id: Option<String>,
+) -> std::io::Result<RuntimeConfigDerivation> {
+    let merged_cli_overrides = inputs
+        .cli_overrides
+        .iter()
+        .cloned()
+        .chain(
+            request_overrides
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(k, v)| (k, json_to_toml(v))),
+        )
+        .collect::<Vec<_>>();
+
+    derive_runtime_config(
+        inputs,
+        merged_cli_overrides,
+        typesafe_overrides,
+        cwd,
+        config_path,
+        linked_codex_session_id,
+    )
+    .await
+}
+
+async fn derive_runtime_config(
+    inputs: ConfigDerivationInputs<'_>,
+    cli_overrides: Vec<(String, TomlValue)>,
+    typesafe_overrides: ConfigOverrides,
+    fallback_cwd: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+    linked_codex_session_id: Option<String>,
+) -> std::io::Result<RuntimeConfigDerivation> {
+    let bootstrap_config = codex_core::config::ConfigBuilder::default()
+        .codex_home(inputs.codex_home.to_path_buf())
+        .cli_overrides(cli_overrides.clone())
+        .harness_overrides(typesafe_overrides.clone())
+        .fallback_cwd(fallback_cwd.clone())
+        .user_config_path(config_path.clone())
+        .cloud_requirements(CloudRequirementsLoader::default())
+        .build()
+        .await?;
+    let auth_manager = AuthManager::shared_with_sqlite_home_workspace_and_linked_session(
+        bootstrap_config.codex_home.to_path_buf(),
+        bootstrap_config.sqlite_home.clone(),
+        bootstrap_config.forced_chatgpt_workspace_id.clone(),
+        linked_codex_session_id,
+        /*enable_codex_api_key_env*/ false,
+        bootstrap_config.cli_auth_credentials_store_mode,
+    );
+    let cloud_requirements = cloud_requirements_loader(
+        auth_manager.clone(),
+        bootstrap_config.chatgpt_base_url.clone(),
+        bootstrap_config.codex_home.to_path_buf(),
+    );
     let mut config = codex_core::config::ConfigBuilder::default()
         .codex_home(inputs.codex_home.to_path_buf())
-        .cli_overrides(merged_cli_overrides)
+        .cli_overrides(cli_overrides)
         .harness_overrides(typesafe_overrides)
+        .fallback_cwd(fallback_cwd)
         .user_config_path(config_path)
-        .cloud_requirements(inputs.cloud_requirements.clone())
+        .cloud_requirements(cloud_requirements)
         .build()
         .await?;
     apply_runtime_feature_enablement(&mut config, inputs.runtime_feature_enablement);
-    Ok(config)
+    Ok(RuntimeConfigDerivation {
+        config,
+        auth_manager,
+    })
 }
 
 async fn derive_config_for_cwd(
@@ -10786,6 +10973,85 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    fn test_config_derivation_inputs<'a>(
+        codex_home: &'a Path,
+        cli_overrides: &'a [(String, TomlValue)],
+        cloud_requirements: &'a CloudRequirementsLoader,
+        runtime_feature_enablement: &'a BTreeMap<String, bool>,
+    ) -> ConfigDerivationInputs<'a> {
+        ConfigDerivationInputs {
+            cli_overrides,
+            cloud_requirements,
+            codex_home,
+            runtime_feature_enablement,
+        }
+    }
+
+    // Merge-safety anchor: thread/start must pass the reserved target ThreadId
+    // into target-config auth derivation before cloud requirements are loaded.
+    #[tokio::test]
+    async fn thread_start_runtime_config_derivation_preserves_linked_session_id() -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let cli_overrides = Vec::new();
+        let cloud_requirements = CloudRequirementsLoader::default();
+        let runtime_feature_enablement = BTreeMap::new();
+        let linked_codex_session_id = ThreadId::new().to_string();
+
+        let runtime_config = derive_runtime_config_from_params(
+            test_config_derivation_inputs(
+                codex_home.path(),
+                &cli_overrides,
+                &cloud_requirements,
+                &runtime_feature_enablement,
+            ),
+            /*request_overrides*/ None,
+            ConfigOverrides::default(),
+            /*config_path*/ None,
+            Some(linked_codex_session_id.clone()),
+        )
+        .await?;
+
+        assert_eq!(
+            runtime_config.auth_manager.linked_codex_session_id(),
+            Some(linked_codex_session_id)
+        );
+        Ok(())
+    }
+
+    // Merge-safety anchor: thread/fork must derive target auth/cloud state with
+    // the reserved fork ThreadId rather than leaving AccountManager leases
+    // linked to a startup placeholder.
+    #[tokio::test]
+    async fn thread_fork_runtime_config_derivation_preserves_linked_session_id() -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let workspace = TempDir::new()?;
+        let cli_overrides = Vec::new();
+        let cloud_requirements = CloudRequirementsLoader::default();
+        let runtime_feature_enablement = BTreeMap::new();
+        let linked_codex_session_id = ThreadId::new().to_string();
+
+        let runtime_config = derive_runtime_config_for_cwd(
+            test_config_derivation_inputs(
+                codex_home.path(),
+                &cli_overrides,
+                &cloud_requirements,
+                &runtime_feature_enablement,
+            ),
+            /*request_overrides*/ None,
+            ConfigOverrides::default(),
+            Some(workspace.path().to_path_buf()),
+            /*config_path*/ None,
+            Some(linked_codex_session_id.clone()),
+        )
+        .await?;
+
+        assert_eq!(
+            runtime_config.auth_manager.linked_codex_session_id(),
+            Some(linked_codex_session_id)
+        );
+        Ok(())
+    }
 
     #[test]
     fn validate_dynamic_tools_rejects_unsupported_input_schema() {

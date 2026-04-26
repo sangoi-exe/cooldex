@@ -57,6 +57,7 @@ use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_as_toml_with_cli_overrides;
+use codex_core::config::resolve_chatgpt_base_url_for_config_toml;
 use codex_core::config::resolve_cli_auth_credentials_store_mode_for_config_toml;
 use codex_core::config::resolve_forced_chatgpt_workspace_id_for_config_toml;
 use codex_core::config::resolve_oss_provider;
@@ -327,10 +328,8 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         }
     };
 
-    let chatgpt_base_url = config_toml
-        .chatgpt_base_url
-        .clone()
-        .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
+    let chatgpt_base_url =
+        resolve_chatgpt_base_url_for_config_toml(&config_toml, config_profile.clone())?;
     let sqlite_home = resolve_sqlite_home_for_config_toml(
         codex_home.as_path(),
         config_cwd.as_path(),
@@ -495,7 +494,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
-    auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
     let in_process_start_args = InProcessClientStartArgs {
         arg0_paths,
         config: std::sync::Arc::new(config.clone()),

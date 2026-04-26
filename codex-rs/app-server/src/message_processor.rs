@@ -99,6 +99,9 @@ use tracing::Instrument;
 
 const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 
+// Merge-safety anchor: remote app-server auth refresh must stay wired through
+// the visible AuthManager owner so ChatGPT account projections and cloud
+// requirements do not drift behind client-provided tokens.
 #[derive(Clone)]
 struct ExternalAuthRefreshBridge {
     outgoing: Arc<OutgoingMessageSender>,
@@ -1050,20 +1053,28 @@ impl MessageProcessor {
                 return;
             }
         };
-        let auth = self.auth_manager.auth().await;
-        if !config.features.apps_enabled_for_auth(
-            auth.as_ref()
-                .is_some_and(codex_login::CodexAuth::is_chatgpt_auth),
-        ) {
+        let auth_snapshot =
+            connectors::load_connector_auth_snapshot(self.auth_manager.as_ref()).await;
+        if !config
+            .features
+            .apps_enabled_for_auth(auth_snapshot.is_some())
+        {
             return;
         }
 
         let outgoing = Arc::clone(&self.outgoing);
         tokio::spawn(async move {
+            let auth = auth_snapshot
+                .as_ref()
+                .map(connectors::ChatGptConnectorAuthSnapshot::codex_auth);
             let (all_connectors_result, accessible_connectors_result) = tokio::join!(
-                connectors::list_all_connectors_with_options(&config, /*force_refetch*/ true),
+                connectors::list_all_connectors_with_options(
+                    &config,
+                    auth_snapshot.as_ref(),
+                    /*force_refetch*/ true
+                ),
                 connectors::list_accessible_connectors_from_mcp_tools_with_options(
-                    &config, /*force_refetch*/ true,
+                    &config, auth, /*force_refetch*/ true,
                 ),
             );
             let all_connectors = match all_connectors_result {

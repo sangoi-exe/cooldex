@@ -185,6 +185,20 @@ pub fn resolve_forced_chatgpt_workspace_id_for_config_toml(cfg: &ConfigToml) -> 
     })
 }
 
+// Merge-safety anchor: pre-Config cloud-requirements bootstrap must resolve
+// profile-scoped ChatGPT base URLs with the same precedence as full Config
+// loading, or startup can fetch requirements from the wrong backend.
+pub fn resolve_chatgpt_base_url_for_config_toml(
+    cfg: &ConfigToml,
+    config_profile: Option<String>,
+) -> Result<String, std::io::Error> {
+    let profile = cfg.get_config_profile(config_profile)?;
+    Ok(profile
+        .chatgpt_base_url
+        .or_else(|| cfg.chatgpt_base_url.clone())
+        .unwrap_or("https://chatgpt.com/backend-api/".to_string()))
+}
+
 fn resolve_cli_auth_credentials_store_mode(
     configured: AuthCredentialsStoreMode,
     package_version: &str,

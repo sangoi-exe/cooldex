@@ -112,6 +112,8 @@ pub(crate) enum ChatGptAddAccountControl {
         login_id: String,
         app_event_tx: AppEventSender,
     },
+    #[cfg(test)]
+    Test,
 }
 
 impl ChatGptAddAccountView {
@@ -216,7 +218,7 @@ impl BottomPaneView for ChatGptAddAccountView {
                     let login_id = login_id.clone();
                     let app_event_tx = app_event_tx.clone();
                     tokio::spawn(async move {
-                        let _ = request_handle
+                        let result = request_handle
                             .request_typed::<CancelLoginAccountResponse>(
                                 ClientRequest::CancelLoginAccount {
                                     request_id: codex_app_server_protocol::RequestId::String(
@@ -227,10 +229,17 @@ impl BottomPaneView for ChatGptAddAccountView {
                                     },
                                 },
                             )
-                            .await;
-                        app_event_tx.send(AppEvent::RemoteChatGptAddAccountCancelled { login_id });
+                            .await
+                            .map(|response| response.status)
+                            .map_err(|err| err.to_string());
+                        app_event_tx.send(AppEvent::RemoteChatGptAddAccountCancelFinished {
+                            login_id,
+                            result,
+                        });
                     });
                 }
+                #[cfg(test)]
+                ChatGptAddAccountControl::Test => {}
             }
         }
 
@@ -275,5 +284,48 @@ impl crate::render::renderable::Renderable for ChatGptAddAccountView {
             };
             self.hint_line().dim().render(hint_area, buf);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render::renderable::Renderable;
+    use insta::assert_snapshot;
+
+    fn render_status_snapshot(status: ChatGptAddAccountStatus) -> String {
+        let shared_state = Arc::new(ChatGptAddAccountSharedState::new());
+        shared_state.set_status(status);
+        let view = ChatGptAddAccountView::new(
+            "https://chatgpt.example/add-account/device-code/abcdef".to_string(),
+            shared_state,
+            ChatGptAddAccountControl::Test,
+        );
+        let area = Rect::new(0, 0, 72, view.desired_height(/*width*/ 72));
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+        format!("{buf:?}")
+    }
+
+    // Merge-safety anchor: remote add-account cancellation has distinct visible
+    // states for confirmed cancellation versus failed cancellation requests.
+    #[test]
+    fn add_account_cancelled_snapshot() {
+        assert_snapshot!(
+            "chatgpt_add_account_cancelled",
+            render_status_snapshot(ChatGptAddAccountStatus::Cancelled)
+        );
+    }
+
+    // Merge-safety anchor: failed remote add-account cancellation must render as
+    // failure, not as a successful user cancellation.
+    #[test]
+    fn add_account_failed_snapshot() {
+        assert_snapshot!(
+            "chatgpt_add_account_failed",
+            render_status_snapshot(ChatGptAddAccountStatus::Failed {
+                message: "remote login request was not found".to_string(),
+            })
+        );
     }
 }

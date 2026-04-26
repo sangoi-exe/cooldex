@@ -1,25 +1,20 @@
 #[cfg(test)]
 use codex_login::AuthCredentialsStoreMode;
 use codex_login::AuthManager;
+#[cfg(test)]
 use codex_login::AuthManagerConfig;
-use codex_login::token_data::TokenData;
+use codex_login::ChatGptRequestAuth;
 #[cfg(test)]
 use std::path::PathBuf;
 
-/// Load a ChatGPT request token snapshot from auth storage.
-pub async fn load_chatgpt_token_data_from_auth(
-    config: &impl AuthManagerConfig,
-) -> std::io::Result<Option<TokenData>> {
-    // Merge-safety anchor: ChatGPT token snapshots receive resolved config and
-    // must preserve sqlite_home plus forced workspace before account-runtime
-    // state hydrates; never reintroduce a process-global token owner here.
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false);
-    auth_manager
-        .auth()
-        .await
-        .map(|auth| auth.get_token_data())
-        .transpose()
+/// Load a ChatGPT request-auth snapshot from the caller's runtime owner.
+pub async fn load_chatgpt_request_auth(
+    auth_manager: &AuthManager,
+) -> std::io::Result<Option<ChatGptRequestAuth>> {
+    // Merge-safety anchor: ChatGPT request snapshots must be derived from the
+    // caller's lease-bearing AuthManager; never construct a hidden AccountManager
+    // or reintroduce a process-global token owner here.
+    Ok(auth_manager.chatgpt_request_auth().await)
 }
 
 #[cfg(test)]
@@ -61,9 +56,11 @@ mod tests {
         std::fs::create_dir_all(&config.codex_home)?;
         std::fs::create_dir_all(&config.sqlite_home)?;
 
-        let token_data = load_chatgpt_token_data_from_auth(&config).await?;
+        let auth_manager =
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+        let request_auth = load_chatgpt_request_auth(auth_manager.as_ref()).await?;
 
-        assert_eq!(token_data, None);
+        assert_eq!(request_auth, None);
         Ok(())
     }
 }

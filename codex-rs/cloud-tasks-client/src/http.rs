@@ -47,6 +47,13 @@ impl HttpClient {
         self
     }
 
+    // Merge-safety anchor: cloud task HTTP calls share the ChatGPT account-id
+    // and FedRAMP routing contract used by Codex CLI backend requests.
+    pub fn with_fedramp_routing_header(mut self) -> Self {
+        self.backend = self.backend.clone().with_fedramp_routing_header();
+        self
+    }
+
     fn tasks_api(&self) -> api::Tasks<'_> {
         api::Tasks::new(self)
     }

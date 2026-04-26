@@ -6,6 +6,7 @@ mod util;
 // Merge-safety anchor: account-runtime ownership lives in the dedicated
 // AccountManager module; do not fold this owner back into AuthManager.
 mod account_manager;
+mod account_runtime_context;
 mod external_bearer;
 mod manager;
 mod revoke;

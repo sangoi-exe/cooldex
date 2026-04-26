@@ -1,4 +1,3 @@
-use base64::Engine as _;
 use chrono::DateTime;
 use chrono::Local;
 use chrono::Utc;
@@ -7,6 +6,7 @@ use std::sync::Arc;
 
 use codex_core::config::Config;
 use codex_login::AuthManager;
+use codex_login::ChatGptRequestAuth;
 
 pub fn set_user_agent_suffix(suffix: &str) {
     if let Ok(mut guard) = codex_login::default_client::USER_AGENT_SUFFIX.lock() {
@@ -43,66 +43,41 @@ pub fn normalize_base_url(input: &str) -> String {
     base_url
 }
 
-/// Extract the ChatGPT account id from a JWT token, when present.
-pub fn extract_chatgpt_account_id(token: &str) -> Option<String> {
-    let mut parts = token.split('.');
-    let (_h, payload_b64, _s) = match (parts.next(), parts.next(), parts.next()) {
-        (Some(h), Some(p), Some(s)) if !h.is_empty() && !p.is_empty() && !s.is_empty() => (h, p, s),
-        _ => return None,
-    };
-    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
-    v.get("https://api.openai.com/auth")
-        .and_then(|auth| auth.get("chatgpt_account_id"))
-        .and_then(|id| id.as_str())
-        .map(str::to_string)
-}
-
-pub async fn load_auth_manager() -> Option<Arc<AuthManager>> {
-    // TODO: pass in cli overrides once cloud tasks properly support them.
-    let config = Config::load_with_cli_overrides(Vec::new()).await.ok()?;
+pub fn auth_manager_from_config(config: &Config) -> Arc<AuthManager> {
     // Merge-safety anchor: cloud-task ChatGPT headers are a config-aware
     // production auth path, so AuthManager must receive sqlite_home and forced
     // workspace together before cached auth or account-state leases hydrate.
-    Some(AuthManager::shared_from_config(
-        &config, /*enable_codex_api_key_env*/ false,
-    ))
+    AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
 }
 
-/// Build headers for ChatGPT-backed requests: `User-Agent`, optional `Authorization`,
-/// and optional `ChatGPT-Account-Id`.
-pub async fn build_chatgpt_headers() -> HeaderMap {
+/// Build headers for ChatGPT-backed requests from the command's request-auth snapshot.
+pub fn build_chatgpt_headers(auth: &ChatGptRequestAuth) -> HeaderMap {
     use reqwest::header::AUTHORIZATION;
     use reqwest::header::HeaderName;
     use reqwest::header::HeaderValue;
     use reqwest::header::USER_AGENT;
 
-    set_user_agent_suffix("codex_cloud_tasks_tui");
     let ua = codex_login::default_client::get_codex_user_agent();
     let mut headers = HeaderMap::new();
     headers.insert(
         USER_AGENT,
         HeaderValue::from_str(&ua).unwrap_or(HeaderValue::from_static("codex-cli")),
     );
-    if let Some(am) = load_auth_manager().await
-        && let Some(auth) = am.auth().await
-        && let Ok(tok) = auth.get_token()
-        && !tok.is_empty()
+    // Merge-safety anchor: cloud-task environment probes share the command
+    // AuthManager request-auth snapshot; never recover account id from JWTs
+    // or mint a fresh AuthManager per probe.
+    if let Ok(header_value) = HeaderValue::from_str(auth.authorization()) {
+        headers.insert(AUTHORIZATION, header_value);
+    }
+    if let Ok(name) = HeaderName::from_bytes(b"ChatGPT-Account-Id")
+        && let Ok(header_value) = HeaderValue::from_str(auth.account_id())
     {
-        let v = format!("Bearer {tok}");
-        if let Ok(hv) = HeaderValue::from_str(&v) {
-            headers.insert(AUTHORIZATION, hv);
-        }
-        if let Some(acc) = auth
-            .get_account_id()
-            .or_else(|| extract_chatgpt_account_id(&tok))
-            && let Ok(name) = HeaderName::from_bytes(b"ChatGPT-Account-Id")
-            && let Ok(hv) = HeaderValue::from_str(&acc)
-        {
-            headers.insert(name, hv);
-        }
+        headers.insert(name, header_value);
+    }
+    if auth.is_fedramp_account()
+        && let Ok(name) = HeaderName::from_bytes(b"X-OpenAI-Fedramp")
+    {
+        headers.insert(name, HeaderValue::from_static("true"));
     }
     headers
 }

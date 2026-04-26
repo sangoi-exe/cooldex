@@ -1,9 +1,9 @@
 use codex_core::config::Config;
+use codex_login::AuthManager;
+use codex_login::ChatGptRequestAuth;
 use codex_login::default_client::create_client;
-use codex_login::token_data::TokenData;
 
-use crate::chatgpt_token::load_chatgpt_token_data_from_auth;
-
+use crate::chatgpt_token::load_chatgpt_request_auth;
 use anyhow::Context;
 use serde::de::DeserializeOwned;
 use std::time::Duration;
@@ -11,45 +11,45 @@ use std::time::Duration;
 /// Make a GET request to the ChatGPT backend API.
 pub(crate) async fn chatgpt_get_request<T: DeserializeOwned>(
     config: &Config,
+    auth_manager: &AuthManager,
     path: String,
 ) -> anyhow::Result<T> {
-    chatgpt_get_request_with_timeout(config, path, /*timeout*/ None).await
+    chatgpt_get_request_with_timeout(config, auth_manager, path, /*timeout*/ None).await
 }
 
 pub(crate) async fn chatgpt_get_request_with_timeout<T: DeserializeOwned>(
     config: &Config,
+    auth_manager: &AuthManager,
     path: String,
     timeout: Option<Duration>,
 ) -> anyhow::Result<T> {
     // Merge-safety anchor: direct ChatGPT backend calls must use the
-    // config-aware token snapshot so forced workspace and WS12 sqlite_home
-    // selection cannot drift from the request account or stale global state.
-    let token = load_chatgpt_token_data_from_auth(config)
+    // caller-owned request-auth snapshot so WS12 leases, forced workspace,
+    // FedRAMP routing, and request account cannot drift through a hidden owner.
+    let auth = load_chatgpt_request_auth(auth_manager)
         .await?
         .ok_or_else(|| anyhow::anyhow!("ChatGPT token not available"))?;
-    chatgpt_get_request_with_token(config, path, timeout, token).await
+    chatgpt_get_request_with_auth(config, path, timeout, auth).await
 }
 
-pub(crate) async fn chatgpt_get_request_with_token<T: DeserializeOwned>(
+pub(crate) async fn chatgpt_get_request_with_auth<T: DeserializeOwned>(
     config: &Config,
     path: String,
     timeout: Option<Duration>,
-    token: TokenData,
+    auth: ChatGptRequestAuth,
 ) -> anyhow::Result<T> {
     let chatgpt_base_url = &config.chatgpt_base_url;
-    // Make direct HTTP request to ChatGPT backend API with the token
     let client = create_client();
     let url = format!("{chatgpt_base_url}{path}");
 
-    let account_id = token.account_id.ok_or_else(|| {
-        anyhow::anyhow!("ChatGPT account ID not available, please re-run `codex login`")
-    });
-
     let mut request = client
         .get(&url)
-        .bearer_auth(&token.access_token)
-        .header("chatgpt-account-id", account_id?)
+        .header("Authorization", auth.authorization())
+        .header("chatgpt-account-id", auth.account_id())
         .header("Content-Type", "application/json");
+    if auth.is_fedramp_account() {
+        request = request.header("X-OpenAI-Fedramp", "true");
+    }
 
     if let Some(timeout) = timeout {
         request = request.timeout(timeout);

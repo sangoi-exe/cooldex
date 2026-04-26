@@ -21,6 +21,8 @@ use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::ConfigRequirementsToml;
 use codex_core::util::backoff;
 use codex_login::AuthManager;
+use codex_login::ChatgptAccountAuthResolution;
+use codex_login::ChatgptAccountRefreshMode;
 use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
 use codex_protocol::account::PlanType;
@@ -52,6 +54,7 @@ const CLOUD_REQUIREMENTS_LOAD_METRIC: &str = "codex.cloud_requirements.load";
 const CLOUD_REQUIREMENTS_LOAD_FAILED_MESSAGE: &str = "failed to load your workspace-managed config";
 const CLOUD_REQUIREMENTS_PARSE_FAILED_MESSAGE: &str = "Your workspace-managed config is invalid and could not be parsed. Please contact your workspace admin.";
 const CLOUD_REQUIREMENTS_AUTH_RECOVERY_FAILED_MESSAGE: &str = "Your authentication session could not be refreshed automatically. Please log out and sign in again.";
+const CLOUD_REQUIREMENTS_AUTH_ACCOUNT_MISMATCH_MESSAGE: &str = "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.";
 const CLOUD_REQUIREMENTS_CACHE_WRITE_HMAC_KEY: &[u8] =
     b"codex-cloud-requirements-cache-v3-064f8542-75b4-494c-a294-97d3ce597271";
 const CLOUD_REQUIREMENTS_CACHE_READ_HMAC_KEYS: &[&[u8]] =
@@ -324,7 +327,10 @@ impl CloudRequirementsService {
     }
 
     async fn fetch(&self) -> Result<Option<ConfigRequirementsToml>, CloudRequirementsLoadError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        // Merge-safety anchor: cloud requirements are a ChatGPT-workspace
+        // contract and must ignore CODEX_API_KEY while still using the caller's
+        // lease-bearing AuthManager owner.
+        let Some(auth) = self.auth_manager.chatgpt_auth().await else {
             return Ok(None);
         };
         let Some(plan_type) = auth.account_plan_type() else {
@@ -363,7 +369,13 @@ impl CloudRequirementsService {
     ) -> Result<Option<ConfigRequirementsToml>, CloudRequirementsLoadError> {
         let mut attempt = 1;
         let mut last_status_code: Option<u16> = None;
-        let mut auth_recovery = self.auth_manager.unauthorized_recovery();
+        let expected_store_account_id = auth
+            .active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id);
+        let expected_account_id = auth_identity(&auth).1;
+        let mut attempted_store_reload = false;
+        let mut attempted_token_refresh = false;
+        let mut external_auth_recovery = self.auth_manager.unauthorized_recovery();
 
         while attempt <= CLOUD_REQUIREMENTS_MAX_ATTEMPTS {
             let contents = match self.fetcher.fetch_requirements(&auth).await {
@@ -395,17 +407,18 @@ impl CloudRequirementsService {
                 }) => {
                     last_status_code = status_code;
                     emit_fetch_attempt_metric(trigger, attempt, "unauthorized", status_code);
-                    if auth_recovery.has_next() {
+                    if auth.is_external_chatgpt_tokens() && external_auth_recovery.has_next() {
                         tracing::warn!(
                             attempt,
                             max_attempts = CLOUD_REQUIREMENTS_MAX_ATTEMPTS,
                             "Cloud requirements request was unauthorized; attempting auth recovery"
                         );
-                        match auth_recovery.next().await {
+                        match external_auth_recovery.next().await {
                             Ok(_) => {
-                                let Some(refreshed_auth) = self.auth_manager.auth().await else {
+                                let Some(refreshed_auth) = self.auth_manager.chatgpt_auth().await
+                                else {
                                     tracing::error!(
-                                        "Auth recovery succeeded but no auth is available for cloud requirements"
+                                        "Auth recovery succeeded but no ChatGPT auth is available for cloud requirements"
                                     );
                                     emit_fetch_final_metric(
                                         trigger,
@@ -453,6 +466,157 @@ impl CloudRequirementsService {
                                 }
                                 attempt += 1;
                                 continue;
+                            }
+                        }
+                    }
+                    if !auth.is_external_chatgpt_tokens()
+                        && let Some(store_account_id) = expected_store_account_id.as_deref()
+                    {
+                        if !attempted_store_reload {
+                            attempted_store_reload = true;
+                            tracing::warn!(
+                                attempt,
+                                max_attempts = CLOUD_REQUIREMENTS_MAX_ATTEMPTS,
+                                "Cloud requirements request was unauthorized; reloading ChatGPT auth from store"
+                            );
+                            let Some(reloaded_auth) = self.auth_manager.chatgpt_auth().await else {
+                                tracing::error!(
+                                    "Auth store reload found no ChatGPT auth for cloud requirements"
+                                );
+                                emit_fetch_final_metric(
+                                    trigger,
+                                    "error",
+                                    "auth_recovery_missing_auth",
+                                    attempt,
+                                    status_code,
+                                );
+                                return Err(CloudRequirementsLoadError::new(
+                                    CloudRequirementsLoadErrorCode::Auth,
+                                    status_code,
+                                    CLOUD_REQUIREMENTS_AUTH_RECOVERY_FAILED_MESSAGE,
+                                ));
+                            };
+                            let reloaded_store_account_id = reloaded_auth
+                                .active_chatgpt_account_summary()
+                                .map(|summary| summary.store_account_id);
+                            let reloaded_account_id = auth_identity(&reloaded_auth).1;
+                            let matches_expected_account = expected_account_id
+                                .as_deref()
+                                .is_some_and(|expected_account_id| {
+                                    reloaded_account_id.as_deref() == Some(expected_account_id)
+                                });
+                            let matches_expected_store = expected_account_id.is_none()
+                                && reloaded_store_account_id.as_deref() == Some(store_account_id);
+                            if !(matches_expected_account || matches_expected_store) {
+                                tracing::warn!(
+                                    expected_store_account_id = store_account_id,
+                                    expected_account_id = ?expected_account_id.as_deref(),
+                                    found_store_account_id = ?reloaded_store_account_id.as_deref(),
+                                    found_account_id = ?reloaded_account_id.as_deref(),
+                                    "Cloud requirements auth recovery found a different active ChatGPT account"
+                                );
+                                emit_fetch_final_metric(
+                                    trigger,
+                                    "error",
+                                    "auth_recovery_account_mismatch",
+                                    attempt,
+                                    status_code,
+                                );
+                                return Err(CloudRequirementsLoadError::new(
+                                    CloudRequirementsLoadErrorCode::Auth,
+                                    status_code,
+                                    CLOUD_REQUIREMENTS_AUTH_ACCOUNT_MISMATCH_MESSAGE,
+                                ));
+                            }
+                            auth = reloaded_auth;
+                            continue;
+                        }
+
+                        if !attempted_token_refresh {
+                            attempted_token_refresh = true;
+                            tracing::warn!(
+                                attempt,
+                                max_attempts = CLOUD_REQUIREMENTS_MAX_ATTEMPTS,
+                                "Cloud requirements request was unauthorized; refreshing ChatGPT auth"
+                            );
+                            match self
+                                .auth_manager
+                                .resolve_chatgpt_auth_for_store_account_id(
+                                    store_account_id,
+                                    ChatgptAccountRefreshMode::Force,
+                                )
+                                .await
+                            {
+                                Ok(ChatgptAccountAuthResolution::Auth(refreshed_auth)) => {
+                                    auth = *refreshed_auth;
+                                    continue;
+                                }
+                                Ok(ChatgptAccountAuthResolution::Missing) => {
+                                    tracing::error!(
+                                        "Auth recovery refreshed no ChatGPT auth for cloud requirements"
+                                    );
+                                    emit_fetch_final_metric(
+                                        trigger,
+                                        "error",
+                                        "auth_recovery_missing_auth",
+                                        attempt,
+                                        status_code,
+                                    );
+                                    return Err(CloudRequirementsLoadError::new(
+                                        CloudRequirementsLoadErrorCode::Auth,
+                                        status_code,
+                                        CLOUD_REQUIREMENTS_AUTH_RECOVERY_FAILED_MESSAGE,
+                                    ));
+                                }
+                                Ok(ChatgptAccountAuthResolution::Removed { error, .. }) => {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "Failed to recover from unauthorized cloud requirements request"
+                                    );
+                                    emit_fetch_final_metric(
+                                        trigger,
+                                        "error",
+                                        "auth_recovery_unrecoverable",
+                                        attempt,
+                                        status_code,
+                                    );
+                                    return Err(CloudRequirementsLoadError::new(
+                                        CloudRequirementsLoadErrorCode::Auth,
+                                        status_code,
+                                        error.message,
+                                    ));
+                                }
+                                Err(RefreshTokenError::Permanent(failed)) => {
+                                    tracing::warn!(
+                                        error = %failed,
+                                        "Failed to recover from unauthorized cloud requirements request"
+                                    );
+                                    emit_fetch_final_metric(
+                                        trigger,
+                                        "error",
+                                        "auth_recovery_unrecoverable",
+                                        attempt,
+                                        status_code,
+                                    );
+                                    return Err(CloudRequirementsLoadError::new(
+                                        CloudRequirementsLoadErrorCode::Auth,
+                                        status_code,
+                                        failed.message,
+                                    ));
+                                }
+                                Err(RefreshTokenError::Transient(recovery_err)) => {
+                                    if attempt < CLOUD_REQUIREMENTS_MAX_ATTEMPTS {
+                                        tracing::warn!(
+                                            error = %recovery_err,
+                                            attempt,
+                                            max_attempts = CLOUD_REQUIREMENTS_MAX_ATTEMPTS,
+                                            "Failed to recover from unauthorized cloud requirements request; retrying"
+                                        );
+                                        sleep(backoff(attempt as u64)).await;
+                                    }
+                                    attempt += 1;
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -544,7 +708,7 @@ impl CloudRequirementsService {
     }
 
     async fn refresh_cache(&self) -> bool {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some(auth) = self.auth_manager.chatgpt_auth().await else {
             return false;
         };
         let Some(plan_type) = auth.account_plan_type() else {
@@ -824,6 +988,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::pending;
     use std::path::Path;
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use tempfile::TempDir;
@@ -954,6 +1119,38 @@ mod tests {
         manager: Arc<AuthManager>,
     }
 
+    static CODEX_API_KEY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: cloud-requirements tests that mutate process environment
+            // hold CODEX_API_KEY_ENV_LOCK for the full async test.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: cloud-requirements tests that mutate process environment
+            // hold CODEX_API_KEY_ENV_LOCK for the full async test.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     fn managed_auth_context(
         plan_type: &str,
         chatgpt_user_id: Option<&str>,
@@ -1048,30 +1245,35 @@ mod tests {
         }
     }
 
-    struct TokenFetcher {
+    struct ReloadingTokenFetcher {
+        auth_home: PathBuf,
+        refreshed_auth_json: serde_json::Value,
         expected_token: String,
         contents: String,
         request_count: AtomicUsize,
     }
 
     #[async_trait::async_trait]
-    impl RequirementsFetcher for TokenFetcher {
+    impl RequirementsFetcher for ReloadingTokenFetcher {
         async fn fetch_requirements(
             &self,
             auth: &CodexAuth,
         ) -> Result<Option<String>, FetchAttemptError> {
-            self.request_count.fetch_add(1, Ordering::SeqCst);
+            let request_index = self.request_count.fetch_add(1, Ordering::SeqCst);
             if matches!(
                 auth.get_token().as_deref(),
                 Ok(token) if token == self.expected_token.as_str()
             ) {
-                Ok(Some(self.contents.clone()))
-            } else {
-                Err(FetchAttemptError::Unauthorized {
-                    status_code: Some(401),
-                    message: "GET /config/requirements failed: 401".to_string(),
-                })
+                return Ok(Some(self.contents.clone()));
             }
+            if request_index == 0 {
+                write_auth_json(&self.auth_home, self.refreshed_auth_json.clone())
+                    .expect("write refreshed auth");
+            }
+            Err(FetchAttemptError::Unauthorized {
+                status_code: Some(401),
+                message: "GET /config/requirements failed: 401".to_string(),
+            })
         }
     }
 
@@ -1353,7 +1555,7 @@ enabled = false
                 permissions: None,
             }))
         );
-        assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1379,24 +1581,22 @@ enabled = false
             AuthCredentialsStoreMode::File,
         ));
 
-        write_auth_json(
-            auth_home.path(),
-            chatgpt_auth_json_with_last_refresh(
-                "business",
-                Some("user-12345"),
-                Some("account-12345"),
-                "fresh-access-token",
-                "test-refresh-token",
-                "3025-01-01T00:00:00Z",
-            ),
-        )
-        .expect("write refreshed auth");
+        let refreshed_auth_json = chatgpt_auth_json_with_last_refresh(
+            "business",
+            Some("user-12345"),
+            Some("account-12345"),
+            "fresh-access-token",
+            "test-refresh-token",
+            "3025-01-01T00:00:00Z",
+        );
         let auth = ManagedAuthContext {
             _home: auth_home,
             manager: auth_manager,
         };
 
-        let fetcher = Arc::new(TokenFetcher {
+        let fetcher = Arc::new(ReloadingTokenFetcher {
+            auth_home: auth._home.path().to_path_buf(),
+            refreshed_auth_json,
             expected_token: "fresh-access-token".to_string(),
             contents: "allowed_approval_policies = [\"never\"]".to_string(),
             request_count: AtomicUsize::new(0),
@@ -1426,7 +1626,7 @@ enabled = false
                 permissions: None,
             }))
         );
-        assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1450,24 +1650,22 @@ enabled = false
             AuthCredentialsStoreMode::File,
         ));
 
-        write_auth_json(
-            auth_home.path(),
-            chatgpt_auth_json_with_last_refresh(
-                "business",
-                Some("user-99999"),
-                Some("account-12345"),
-                "fresh-access-token",
-                "test-refresh-token",
-                "3025-01-01T00:00:00Z",
-            ),
-        )
-        .expect("write refreshed auth");
+        let refreshed_auth_json = chatgpt_auth_json_with_last_refresh(
+            "business",
+            Some("user-99999"),
+            Some("account-12345"),
+            "fresh-access-token",
+            "test-refresh-token",
+            "3025-01-01T00:00:00Z",
+        );
         let auth = ManagedAuthContext {
             _home: auth_home,
             manager: auth_manager,
         };
 
-        let fetcher = Arc::new(TokenFetcher {
+        let fetcher = Arc::new(ReloadingTokenFetcher {
+            auth_home: auth._home.path().to_path_buf(),
+            refreshed_auth_json,
             expected_token: "fresh-access-token".to_string(),
             contents: "allowed_approval_policies = [\"never\"]".to_string(),
             request_count: AtomicUsize::new(0),
@@ -1514,6 +1712,89 @@ enabled = false
     }
 
     #[tokio::test]
+    async fn fetch_cloud_requirements_recovers_after_unauthorized_reload_with_codex_api_key_env() {
+        let _env_lock = CODEX_API_KEY_ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::set(codex_login::CODEX_API_KEY_ENV_VAR, "sk-env");
+        let auth_home = tempdir().expect("tempdir");
+        write_auth_json(
+            auth_home.path(),
+            chatgpt_auth_json_with_last_refresh(
+                "business",
+                Some("user-12345"),
+                Some("account-12345"),
+                "stale-access-token",
+                "test-refresh-token",
+                "3025-01-01T00:00:00Z",
+            ),
+        )
+        .expect("write initial auth");
+        let auth_manager = Arc::new(AuthManager::new(
+            auth_home.path().to_path_buf(),
+            /*enable_codex_api_key_env*/ true,
+            AuthCredentialsStoreMode::File,
+        ));
+        assert!(
+            auth_manager
+                .auth_cached()
+                .as_ref()
+                .is_some_and(CodexAuth::is_api_key_auth),
+            "generic cache should be owned by CODEX_API_KEY"
+        );
+        let auth = ManagedAuthContext {
+            _home: auth_home,
+            manager: auth_manager,
+        };
+
+        let fetcher = Arc::new(ReloadingTokenFetcher {
+            auth_home: auth._home.path().to_path_buf(),
+            refreshed_auth_json: chatgpt_auth_json_with_last_refresh(
+                "business",
+                Some("user-12345"),
+                Some("account-12345"),
+                "fresh-access-token",
+                "test-refresh-token",
+                "3025-01-01T00:00:00Z",
+            ),
+            expected_token: "fresh-access-token".to_string(),
+            contents: "allowed_approval_policies = [\"never\"]".to_string(),
+            request_count: AtomicUsize::new(0),
+        });
+        let codex_home = tempdir().expect("tempdir");
+        let service = CloudRequirementsService::new(
+            Arc::clone(&auth.manager),
+            fetcher.clone(),
+            codex_home.path().to_path_buf(),
+            CLOUD_REQUIREMENTS_TIMEOUT,
+        );
+
+        assert_eq!(
+            service.fetch().await,
+            Ok(Some(ConfigRequirementsToml {
+                allowed_approval_policies: Some(vec![AskForApproval::Never]),
+                allowed_approvals_reviewers: None,
+                allowed_sandbox_modes: None,
+                allowed_web_search_modes: None,
+                guardian_policy_config: None,
+                feature_requirements: None,
+                mcp_servers: None,
+                apps: None,
+                rules: None,
+                enforce_residency: None,
+                network: None,
+                permissions: None,
+            }))
+        );
+        assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
+        assert!(
+            auth.manager
+                .auth_cached()
+                .as_ref()
+                .is_some_and(CodexAuth::is_api_key_auth),
+            "cloud requirements recovery must not steal generic CODEX_API_KEY cache ownership"
+        );
+    }
+
+    #[tokio::test]
     async fn fetch_cloud_requirements_surfaces_auth_recovery_message() {
         let auth = managed_auth_context(
             "enterprise",
@@ -1522,20 +1803,17 @@ enabled = false
             "stale-access-token",
             "test-refresh-token",
         );
-        write_auth_json(
-            auth._home.path(),
-            chatgpt_auth_json(
+        let fetcher = Arc::new(ReloadingTokenFetcher {
+            auth_home: auth._home.path().to_path_buf(),
+            refreshed_auth_json: chatgpt_auth_json(
                 "enterprise",
                 Some("user-12345"),
                 Some("account-99999"),
                 "fresh-access-token",
                 "test-refresh-token",
             ),
-        )
-        .expect("write mismatched auth");
-
-        let fetcher = Arc::new(UnauthorizedFetcher {
-            message: "GET /config/requirements failed: 401".to_string(),
+            expected_token: "unreachable-token".to_string(),
+            contents: "allowed_approval_policies = [\"never\"]".to_string(),
             request_count: AtomicUsize::new(0),
         });
         let codex_home = tempdir().expect("tempdir");
@@ -1558,7 +1836,7 @@ enabled = false
     }
 
     #[tokio::test]
-    async fn fetch_cloud_requirements_unauthorized_without_recovery_uses_generic_message() {
+    async fn fetch_cloud_requirements_unauthorized_refresh_failure_surfaces_refresh_message() {
         let auth_home = tempdir().expect("tempdir");
         write_auth_json(
             auth_home.path(),
@@ -1599,11 +1877,11 @@ enabled = false
             .expect_err("cloud requirements should fail closed");
         assert_eq!(
             err.to_string(),
-            CLOUD_REQUIREMENTS_AUTH_RECOVERY_FAILED_MESSAGE
+            "Your access token could not be refreshed. Please log out and sign in again."
         );
         assert_eq!(err.code(), CloudRequirementsLoadErrorCode::Auth);
         assert_eq!(err.status_code(), Some(401));
-        assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

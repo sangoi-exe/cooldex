@@ -5,32 +5,45 @@ use codex_app_server_protocol::AppSummary;
 use codex_chatgpt::connectors;
 use codex_core::config::Config;
 use codex_core::plugins::AppConnectorId;
+use codex_login::AuthManager;
 use tracing::warn;
 
 pub(super) async fn load_plugin_app_summaries(
     config: &Config,
+    auth_manager: &AuthManager,
     plugin_apps: &[AppConnectorId],
 ) -> Vec<AppSummary> {
     if plugin_apps.is_empty() {
         return Vec::new();
     }
 
-    let connectors =
-        match connectors::list_all_connectors_with_options(config, /*force_refetch*/ false).await {
-            Ok(connectors) => connectors,
-            Err(err) => {
-                warn!("failed to load app metadata for plugin/read: {err:#}");
-                connectors::list_cached_all_connectors(config)
-                    .await
-                    .unwrap_or_default()
-            }
-        };
+    let auth_snapshot = connectors::load_connector_auth_snapshot(auth_manager).await;
+    let connectors = match connectors::list_all_connectors_with_options(
+        config,
+        auth_snapshot.as_ref(),
+        /*force_refetch*/ false,
+    )
+    .await
+    {
+        Ok(connectors) => connectors,
+        Err(err) => {
+            warn!("failed to load app metadata for plugin/read: {err:#}");
+            connectors::list_cached_all_connectors(config, auth_snapshot.as_ref())
+                .await
+                .unwrap_or_default()
+        }
+    };
 
     let plugin_connectors = connectors::connectors_for_plugin_apps(connectors, plugin_apps);
 
+    // Merge-safety anchor: app metadata access checks must use the app-server
+    // AccountManager owner passed into this request, not a hidden AuthManager.
+    let auth = auth_snapshot
+        .as_ref()
+        .map(connectors::ChatGptConnectorAuthSnapshot::codex_auth);
     let accessible_connectors =
         match connectors::list_accessible_connectors_from_mcp_tools_with_options_and_status(
-            config, /*force_refetch*/ false,
+            config, auth, /*force_refetch*/ false,
         )
         .await
         {

@@ -9,10 +9,12 @@
 //! quits without reaching into the app loop or coupling to shutdown/exit sequencing.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use codex_app_server_protocol::AccountListEntry;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
 use codex_app_server_protocol::AppInfo;
+use codex_app_server_protocol::CancelLoginAccountStatus;
 use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::PluginInstallResponse;
 use codex_app_server_protocol::PluginListResponse;
@@ -33,6 +35,7 @@ use codex_utils_approval_presets::ApprovalPreset;
 
 use crate::app_server_session::AppServerAccountProjection;
 use crate::bottom_pane::ApprovalRequest;
+use crate::bottom_pane::ChatGptAddAccountSharedState;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::history_cell::HistoryCell;
@@ -93,6 +96,7 @@ pub(crate) enum ChatGptAddAccountOutcome {
     Success {
         active_account_display: Option<String>,
         active_store_account_id: Option<String>,
+        completion_state: Option<Arc<ChatGptAddAccountSharedState>>,
     },
     Cancelled,
     Failed {
@@ -473,10 +477,10 @@ pub(crate) enum AppEvent {
     /// Completion notification for a remote ChatGPT add-account flow.
     RemoteChatGptAddAccountLoginCompleted(AccountLoginCompletedNotification),
 
-    /// Local acknowledgement that the active remote add-account flow was
-    /// cancelled by the user.
-    RemoteChatGptAddAccountCancelled {
+    /// Result of requesting cancellation for the active remote add-account flow.
+    RemoteChatGptAddAccountCancelFinished {
         login_id: String,
+        result: Result<CancelLoginAccountStatus, String>,
     },
 
     /// Result of running the ChatGPT add-account login flow.

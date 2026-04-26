@@ -27,26 +27,54 @@ pub(crate) fn create_env_for_mcp_server(
 pub(crate) fn create_env_overlay_for_remote_mcp_server(
     extra_env: Option<HashMap<OsString, OsString>>,
     env_vars: &[McpServerEnvVar],
-) -> HashMap<OsString, OsString> {
+) -> Result<HashMap<OsString, OsString>> {
     // Merge-safety anchor: remote-aware stdio MCP env routing treats `source = "remote"`
     // as executor-owned input and must not copy that variable from the local orchestrator.
     // Remote stdio should inherit PATH/HOME/etc. from the executor side, not
     // from the orchestrator process. Only forward variables explicitly named
     // by the MCP config plus literal env overrides from that config.
-    env_vars
+    reject_remote_stdio_env_collisions(extra_env.as_ref(), env_vars)?;
+    Ok(env_vars
         .iter()
         .filter(|var| !var.is_remote_source())
         .filter_map(|var| env::var_os(var.name()).map(|value| (OsString::from(var.name()), value)))
         .chain(extra_env.unwrap_or_default())
-        .collect()
+        .collect())
 }
 
-pub(crate) fn remote_mcp_env_var_names(env_vars: &[McpServerEnvVar]) -> Vec<String> {
-    env_vars
+pub(crate) fn remote_mcp_env_var_names(env_vars: &[McpServerEnvVar]) -> Result<Vec<String>> {
+    reject_remote_stdio_env_collisions(/*extra_env*/ None, env_vars)?;
+    Ok(env_vars
         .iter()
         .filter(|var| var.is_remote_source())
         .map(|var| var.name().to_string())
-        .collect()
+        .collect())
+}
+
+fn reject_remote_stdio_env_collisions(
+    extra_env: Option<&HashMap<OsString, OsString>>,
+    env_vars: &[McpServerEnvVar],
+) -> Result<()> {
+    let mut seen_remote_source_by_name = HashMap::<&str, bool>::new();
+    for var in env_vars {
+        let name = var.name();
+        let is_remote = var.is_remote_source();
+        if let Some(previous_was_remote) = seen_remote_source_by_name.insert(name, is_remote)
+            && (previous_was_remote || is_remote)
+        {
+            return Err(anyhow!(
+                "env_vars entry `{name}` is declared more than once across remote stdio sources"
+            ));
+        }
+        if is_remote
+            && extra_env.is_some_and(|extra_env| extra_env.contains_key(&OsString::from(name)))
+        {
+            return Err(anyhow!(
+                "env var `{name}` is source `remote` and cannot also be provided by local env overrides"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn local_stdio_env_var_names(env_vars: &[McpServerEnvVar]) -> Result<impl Iterator<Item = &str>> {
@@ -249,7 +277,8 @@ mod tests {
         let _custom_guard = EnvVarGuard::set(custom_var, &custom_value);
 
         let env =
-            create_env_overlay_for_remote_mcp_server(/*extra_env*/ None, &[custom_var.into()]);
+            create_env_overlay_for_remote_mcp_server(/*extra_env*/ None, &[custom_var.into()])
+                .expect("remote MCP env overlay should build");
 
         assert_eq!(
             env,
@@ -278,7 +307,8 @@ mod tests {
                     source: Some(McpServerEnvVarSource::Local),
                 },
             ],
-        );
+        )
+        .expect("remote MCP env overlay should build");
 
         assert_eq!(
             env,
@@ -298,9 +328,50 @@ mod tests {
                 name: "REMOTE".to_string(),
                 source: Some(McpServerEnvVarSource::Remote),
             },
-        ]);
+        ])
+        .expect("remote source names should build");
 
         assert_eq!(names, vec!["REMOTE".to_string()]);
+    }
+
+    #[test]
+    fn remote_mcp_env_rejects_local_override_for_remote_source_name() {
+        let err = create_env_overlay_for_remote_mcp_server(
+            Some(HashMap::from([(
+                OsString::from("REMOTE"),
+                OsString::from("local-value"),
+            )])),
+            &[McpServerEnvVar::Config {
+                name: "REMOTE".to_string(),
+                source: Some(McpServerEnvVarSource::Remote),
+            }],
+        )
+        .expect_err("remote source must not collide with local env overrides");
+
+        assert!(
+            err.to_string().contains("cannot also be provided"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn remote_mcp_env_rejects_duplicate_remote_and_local_source_names() {
+        let err = remote_mcp_env_var_names(&[
+            McpServerEnvVar::Config {
+                name: "DUPLICATE".to_string(),
+                source: Some(McpServerEnvVarSource::Local),
+            },
+            McpServerEnvVar::Config {
+                name: "DUPLICATE".to_string(),
+                source: Some(McpServerEnvVarSource::Remote),
+            },
+        ])
+        .expect_err("remote and local env_vars must not share a name");
+
+        assert!(
+            err.to_string().contains("declared more than once"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

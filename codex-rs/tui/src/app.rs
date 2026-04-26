@@ -1,3 +1,9 @@
+use crate::account_projection::AccountProjectionRefreshExpectation;
+use crate::account_projection::AccountProjectionRefreshTrigger;
+use crate::account_projection::LiveAccountStateOwner;
+use crate::account_projection::PendingLocalChatGptAddAccountCompletion;
+use crate::account_projection::PendingRemoteChatGptAddAccount;
+use crate::account_projection::VisibleAccountProjectionFollowers;
 use crate::app_backtrack::BacktrackState;
 use crate::app_command::AppCommand;
 use crate::app_command::AppCommandView;
@@ -94,6 +100,7 @@ use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::AccountListEntry;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
 use codex_app_server_protocol::AuthMode;
+use codex_app_server_protocol::CancelLoginAccountStatus;
 use codex_app_server_protocol::ChatgptAuthTokensRefreshResponse;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
@@ -266,41 +273,17 @@ fn popup_accounts_from_remote_entries(accounts: Vec<AccountListEntry>) -> Vec<Ac
 }
 
 fn build_chatgpt_add_account_success_outcome(
-    auth_manager: &AuthManager,
-    shared_state: &crate::bottom_pane::ChatGptAddAccountSharedState,
+    shared_state: Arc<crate::bottom_pane::ChatGptAddAccountSharedState>,
     login_success: &codex_login::LoginSuccess,
 ) -> ChatGptAddAccountOutcome {
-    // Merge-safety anchor: add-account completion must reload freshly persisted
-    // auth through AuthManager, then activate the account through the
-    // AccountManager-owned set-active path.
-    let activation_result = auth_manager
-        .reload_strict()
-        .and_then(|_| auth_manager.set_active_account(&login_success.store_account_id));
-    match activation_result {
-        Ok(()) => {
-            let active_account_display = auth_manager
-                .list_accounts()
-                .iter()
-                .find(|account| account.id == login_success.store_account_id)
-                .map(|account| {
-                    format_account_display(
-                        account.label.as_deref(),
-                        account.email.as_deref(),
-                        &login_success.store_account_id,
-                    )
-                });
-            shared_state.set_success(active_account_display.clone());
-            ChatGptAddAccountOutcome::Success {
-                active_account_display,
-                active_store_account_id: Some(login_success.store_account_id.clone()),
-            }
-        }
-        Err(err) => {
-            let message =
-                format!("failed to select newly added ChatGPT account after login: {err}");
-            shared_state.set_failed(message.clone());
-            ChatGptAddAccountOutcome::Failed { message }
-        }
+    // Merge-safety anchor: local add-account completion must not mutate the
+    // AuthManager directly; the embedded app-server set-active owner performs
+    // the only active-account mutation and the popup only reports success after
+    // the app-server projection converges.
+    ChatGptAddAccountOutcome::Success {
+        active_account_display: None,
+        active_store_account_id: Some(login_success.store_account_id.clone()),
+        completion_state: Some(shared_state),
     }
 }
 
@@ -330,6 +313,7 @@ fn build_remote_chatgpt_add_account_success_outcome(
         ChatGptAddAccountOutcome::Success {
             active_account_display: Some(active_account_display),
             active_store_account_id: Some(active_store_account_id),
+            completion_state: None,
         }
     } else {
         let message =
@@ -1525,67 +1509,13 @@ pub(crate) struct App {
     next_account_projection_refresh_request_id: u64,
     pending_account_projection_refresh_request_id: Option<u64>,
     pending_remote_chatgpt_add_account: Option<PendingRemoteChatGptAddAccount>,
+    pending_local_chatgpt_add_account_completion: Option<PendingLocalChatGptAddAccountCompletion>,
     suppress_ambiguous_rate_limit_notifications_generation: Option<u64>,
     pending_app_server_requests: PendingAppServerRequests,
     // Serialize plugin enablement writes per plugin so stale completions cannot
     // overwrite a newer toggle, even if the plugin is toggled from different
     // cwd contexts.
     pending_plugin_enabled_writes: HashMap<String, Option<bool>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LiveAccountStateOwner {
-    AppServerProjection,
-    AuthManager,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AccountProjectionRefreshTrigger {
-    AccountUpdate,
-    AuthTokenRefresh,
-    ManualSetActiveAccount,
-    ManualAddAccount,
-    #[cfg(test)]
-    ManualRemoveActiveAccount,
-    #[cfg(test)]
-    ManualRemoveLastAccount,
-}
-
-impl AccountProjectionRefreshTrigger {
-    fn description(self) -> &'static str {
-        match self {
-            Self::AccountUpdate => "account update",
-            Self::AuthTokenRefresh => "auth token refresh",
-            Self::ManualSetActiveAccount => "manual account selection",
-            Self::ManualAddAccount => "adding ChatGPT account",
-            #[cfg(test)]
-            Self::ManualRemoveActiveAccount => "removing the active account",
-            #[cfg(test)]
-            Self::ManualRemoveLastAccount => "removing the last account",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct VisibleAccountProjectionFollowers {
-    active_store_account_id: Option<String>,
-    status_account_display: Option<StatusAccountDisplay>,
-    plan_type: Option<PlanType>,
-    has_chatgpt_account: bool,
-    feedback_audience: FeedbackAudience,
-    default_model: String,
-    available_models: Vec<ModelPreset>,
-}
-
-struct PendingRemoteChatGptAddAccount {
-    login_id: String,
-    shared_state: Arc<crate::bottom_pane::ChatGptAddAccountSharedState>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AccountProjectionRefreshExpectation {
-    AcceptBaselineAfterRetries,
-    RequireChangeFromBaseline,
 }
 
 #[derive(Default)]
@@ -2576,6 +2506,7 @@ impl App {
     // Merge-safety anchor: account-switch handling must keep chat-widget account identity and
     // rate-limit generation state in sync so stale refresh results never repopulate the next
     // account's `/status` cache or suppress its warnings.
+    #[cfg(test)]
     fn handle_active_account_changed(&mut self) {
         self.live_account_state_owner = LiveAccountStateOwner::AuthManager;
         self.refresh_observed_active_store_account_id();
@@ -2616,6 +2547,7 @@ impl App {
         self.recompute_accounts_status_cache_expiry(Utc::now());
     }
 
+    #[cfg(test)]
     fn begin_manual_account_projection_refresh(&mut self) -> VisibleAccountProjectionFollowers {
         let stale_projection_baseline = self.visible_account_projection_followers();
         self.handle_active_account_changed();
@@ -2705,7 +2637,15 @@ impl App {
         previous_account_id: Option<&str>,
     ) -> std::result::Result<ChatgptAuthTokensRefreshResponse, ThreadlessChatgptAuthRefreshError>
     {
-        let previous_active_store_account_id = self.active_store_account_id_from_auth_manager();
+        // Keep this cache-only so `refresh_token()` can still compare the
+        // session's current auth snapshot against storage before deciding
+        // whether another local instance already refreshed the token.
+        let previous_active_store_account_id = self
+            .auth_manager
+            .auth_cached()
+            .as_ref()
+            .and_then(CodexAuth::active_chatgpt_account_summary)
+            .map(|summary| summary.store_account_id);
         self.select_local_chatgpt_account_for_threadless_refresh(previous_account_id)
             .map_err(ThreadlessChatgptAuthRefreshError::Other)?;
         let refresh_result = self.auth_manager.refresh_token().await;
@@ -2850,26 +2790,12 @@ impl App {
         );
     }
 
-    fn refresh_app_server_account_projection_after_manual_auth_change(
-        &mut self,
-        app_server_client: &AppServerSession,
-        trigger: AccountProjectionRefreshTrigger,
-    ) {
-        let stale_projection_baseline = self.begin_manual_account_projection_refresh();
-        self.refresh_app_server_account_projection_after_local_auth_change_from_baseline(
-            app_server_client,
-            trigger,
-            stale_projection_baseline,
-            AccountProjectionRefreshExpectation::RequireChangeFromBaseline,
-        );
-    }
-
     fn refresh_app_server_account_projection_after_remote_account_change(
         &mut self,
         app_server_client: &AppServerSession,
         trigger: AccountProjectionRefreshTrigger,
         active_store_account_id: Option<String>,
-    ) {
+    ) -> u64 {
         // Merge-safety anchor: remote account mutations must keep visible
         // followers under the app-server projection owner; do not bounce through
         // local AuthManager state after an app-server account mutation request.
@@ -2893,7 +2819,7 @@ impl App {
             stale_projection_baseline,
             expected_projection_followers,
             expectation,
-        );
+        )
     }
 
     fn refresh_app_server_account_projection_after_local_auth_change_from_baseline(
@@ -2920,7 +2846,7 @@ impl App {
         stale_projection_baseline: VisibleAccountProjectionFollowers,
         expected_projection_followers: VisibleAccountProjectionFollowers,
         expectation: AccountProjectionRefreshExpectation,
-    ) {
+    ) -> u64 {
         let request_id = self.next_account_projection_refresh_request_id;
         self.next_account_projection_refresh_request_id += 1;
         self.pending_account_projection_refresh_request_id = Some(request_id);
@@ -3006,6 +2932,7 @@ impl App {
                 result,
             });
         });
+        request_id
     }
 
     #[cfg(test)]
@@ -3219,29 +3146,23 @@ impl App {
         plan_type: Option<PlanType>,
         has_chatgpt_account: bool,
     ) {
-        let next_status_account_display = status_account_display.clone();
-        let next_plan_type = plan_type;
-        self.chat_widget.update_account_state(
-            next_status_account_display,
-            next_plan_type,
-            has_chatgpt_account,
-        );
-        self.invalidate_rate_limit_state_for_account_change();
         self.chat_widget.update_account_state(
             status_account_display,
             plan_type,
             has_chatgpt_account,
         );
+        self.invalidate_rate_limit_state_for_account_change();
     }
 
     fn invalidate_rate_limit_state_for_account_change(&mut self) {
-        self.chat_widget.on_active_account_changed();
-        self.suppress_ambiguous_rate_limit_notifications_generation =
-            if self.live_account_state_owner == LiveAccountStateOwner::AppServerProjection {
-                Some(self.chat_widget.rate_limit_account_generation())
-            } else {
-                None
-            };
+        if self.live_account_state_owner == LiveAccountStateOwner::AppServerProjection {
+            self.chat_widget.on_projected_account_generation_changed();
+            self.suppress_ambiguous_rate_limit_notifications_generation =
+                Some(self.chat_widget.rate_limit_account_generation());
+        } else {
+            self.chat_widget.on_active_account_changed();
+            self.suppress_ambiguous_rate_limit_notifications_generation = None;
+        }
     }
 
     fn handle_account_rate_limits_updated_notification(
@@ -6180,6 +6101,7 @@ impl App {
             next_account_projection_refresh_request_id: 0,
             pending_account_projection_refresh_request_id: None,
             pending_remote_chatgpt_add_account: None,
+            pending_local_chatgpt_add_account_completion: None,
             suppress_ambiguous_rate_limit_notifications_generation: None,
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_plugin_enabled_writes: HashMap::new(),
@@ -6189,12 +6111,20 @@ impl App {
                 .await?;
         }
 
-        app.recompute_accounts_status_cache_expiry(Utc::now());
-        app.maybe_start_accounts_status_refresh(
-            /*force*/ true, /*open_popup_when_ready*/ false,
-            /*show_loading_popup*/ false,
-        );
-        Self::spawn_accounts_cache_poller(app.app_event_tx.clone());
+        if app.remote_app_server_url.is_some() {
+            app.refresh_app_server_account_projection_after_remote_account_change(
+                &app_server,
+                AccountProjectionRefreshTrigger::AccountUpdate,
+                /*active_store_account_id*/ None,
+            );
+        } else {
+            app.recompute_accounts_status_cache_expiry(Utc::now());
+            app.maybe_start_accounts_status_refresh(
+                /*force*/ true, /*open_popup_when_ready*/ false,
+                /*show_loading_popup*/ false,
+            );
+            Self::spawn_accounts_cache_poller(app.app_event_tx.clone());
+        }
 
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
         #[cfg(target_os = "windows")]
@@ -7103,6 +7033,12 @@ impl App {
                 .await;
             }
             AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate => {
+                if self.pending_local_chatgpt_add_account_completion.is_some() {
+                    tracing::debug!(
+                        "suppressed notification-driven account projection refresh while local add-account completion owns convergence"
+                    );
+                    return Ok(AppRunControl::Continue);
+                }
                 self.refresh_app_server_account_projection_after_local_auth_change(
                     app_server,
                     AccountProjectionRefreshTrigger::AccountUpdate,
@@ -7117,12 +7053,44 @@ impl App {
                     return Ok(AppRunControl::Continue);
                 }
                 self.pending_account_projection_refresh_request_id = None;
+                let pending_chatgpt_add_account_completion = if self
+                    .pending_local_chatgpt_add_account_completion
+                    .as_ref()
+                    .is_some_and(|pending| pending.projection_request_id == request_id)
+                {
+                    self.pending_local_chatgpt_add_account_completion.take()
+                } else {
+                    None
+                };
                 match result {
-                    Ok(projection) => self.finish_app_server_account_projection_refresh(projection),
-                    Err(error_message) => self.report_app_server_account_projection_refresh_error(
-                        trigger_description,
-                        error_message,
-                    ),
+                    Ok(projection) => {
+                        self.finish_app_server_account_projection_refresh(projection);
+                        if let Some(pending) = pending_chatgpt_add_account_completion {
+                            pending
+                                .shared_state
+                                .set_success(pending.active_account_display.clone());
+                            if let Some(display) = pending.active_account_display {
+                                self.chat_widget.add_info_message(
+                                    format!("Active account: {display}"),
+                                    /*hint*/ None,
+                                );
+                            } else {
+                                self.chat_widget.add_info_message(
+                                    "Added ChatGPT account.".to_string(),
+                                    /*hint*/ None,
+                                );
+                            }
+                        }
+                    }
+                    Err(error_message) => {
+                        if let Some(pending) = pending_chatgpt_add_account_completion {
+                            pending.shared_state.set_failed(error_message.clone());
+                        }
+                        self.report_app_server_account_projection_refresh_error(
+                            trigger_description,
+                            error_message,
+                        );
+                    }
                 }
             }
             AppEvent::SetActiveAccount { account_id } => {
@@ -7164,23 +7132,33 @@ impl App {
                     }
                     return Ok(AppRunControl::Continue);
                 }
-                match self.auth_manager.set_active_account(&account_id) {
+                // Merge-safety anchor: embedded TUI account mutations must use
+                // the app-server mutation owner too, because that owner refreshes
+                // cloud requirements/default residency before projection followers
+                // observe the new active ChatGPT account.
+                match app_server.set_active_account(account_id.clone()).await {
                     Ok(()) => {
-                        let accounts = self.auth_manager.list_accounts();
-                        let display = accounts
-                            .iter()
-                            .find(|account| account.id == account_id)
-                            .map(|account| {
-                                format_account_display(
-                                    account.label.as_deref(),
-                                    account.email.as_deref(),
-                                    &account_id,
-                                )
+                        let display = app_server
+                            .list_accounts()
+                            .await
+                            .ok()
+                            .and_then(|accounts| {
+                                accounts
+                                    .into_iter()
+                                    .find(|account| account.id == account_id)
+                                    .map(|account| {
+                                        format_account_display(
+                                            account.label.as_deref(),
+                                            account.email.as_deref(),
+                                            &account_id,
+                                        )
+                                    })
                             })
                             .unwrap_or_else(|| account_id.clone());
-                        self.refresh_app_server_account_projection_after_manual_auth_change(
+                        self.refresh_app_server_account_projection_after_remote_account_change(
                             app_server,
                             AccountProjectionRefreshTrigger::ManualSetActiveAccount,
+                            Some(account_id),
                         );
                         self.chat_widget.add_info_message(
                             format!("Active account: {display}"),
@@ -7348,13 +7326,11 @@ impl App {
 
                 let frame_requester = tui.frame_requester();
                 let app_event_tx = self.app_event_tx.clone();
-                let auth_manager = self.auth_manager.clone();
                 tokio::spawn(async move {
                     let result = child.block_until_done().await;
                     let outcome = match result {
                         Ok(login_success) => build_chatgpt_add_account_success_outcome(
-                            &auth_manager,
-                            &shared_state,
+                            Arc::clone(&shared_state),
                             &login_success,
                         ),
                         Err(err) => {
@@ -7430,7 +7406,7 @@ impl App {
                 self.app_event_tx
                     .send(AppEvent::ChatGptAddAccountFinished(outcome));
             }
-            AppEvent::RemoteChatGptAddAccountCancelled { login_id } => {
+            AppEvent::RemoteChatGptAddAccountCancelFinished { login_id, result } => {
                 if self
                     .pending_remote_chatgpt_add_account
                     .as_ref()
@@ -7449,15 +7425,31 @@ impl App {
                     );
                     return Ok(AppRunControl::Continue);
                 };
-                pending.shared_state.set_cancelled();
-                self.app_event_tx.send(AppEvent::ChatGptAddAccountFinished(
-                    ChatGptAddAccountOutcome::Cancelled,
-                ));
+                let outcome = match result {
+                    Ok(CancelLoginAccountStatus::Canceled) => {
+                        pending.shared_state.set_cancelled();
+                        ChatGptAddAccountOutcome::Cancelled
+                    }
+                    Ok(CancelLoginAccountStatus::NotFound) => {
+                        let message =
+                            "remote ChatGPT login was not found during cancellation".to_string();
+                        pending.shared_state.set_failed(message.clone());
+                        ChatGptAddAccountOutcome::Failed { message }
+                    }
+                    Err(error) => {
+                        let message = format!("failed to cancel remote ChatGPT login: {error}");
+                        pending.shared_state.set_failed(message.clone());
+                        ChatGptAddAccountOutcome::Failed { message }
+                    }
+                };
+                self.app_event_tx
+                    .send(AppEvent::ChatGptAddAccountFinished(outcome));
             }
             AppEvent::ChatGptAddAccountFinished(outcome) => match outcome {
                 ChatGptAddAccountOutcome::Success {
-                    active_account_display,
+                    mut active_account_display,
                     active_store_account_id,
+                    completion_state,
                 } => {
                     if self.remote_app_server_url.is_some() {
                         // Merge-safety anchor: remote add-account completion must refresh
@@ -7469,14 +7461,72 @@ impl App {
                             active_store_account_id,
                         );
                     } else {
-                        self.refresh_app_server_account_projection_after_manual_auth_change(
-                            app_server,
-                            AccountProjectionRefreshTrigger::ManualAddAccount,
-                        );
+                        let Some(completion_state) = completion_state else {
+                            self.chat_widget.add_error_message(
+                                "ChatGPT login succeeded but local popup state was lost."
+                                    .to_string(),
+                            );
+                            return Ok(AppRunControl::Continue);
+                        };
+                        let Some(active_store_account_id) = active_store_account_id else {
+                            completion_state.set_failed(
+                                "ChatGPT login succeeded but did not report an active account."
+                                    .to_string(),
+                            );
+                            self.chat_widget.add_error_message(
+                                "ChatGPT login succeeded but did not report an active account."
+                                    .to_string(),
+                            );
+                            return Ok(AppRunControl::Continue);
+                        };
+                        // Merge-safety anchor: local add-account completion must
+                        // pass through the embedded app-server account mutation
+                        // owner so cloud requirements/default residency refresh
+                        // before visible projection followers converge.
+                        if let Err(error) = app_server
+                            .set_active_account(active_store_account_id.clone())
+                            .await
+                        {
+                            completion_state.set_failed(format!(
+                                "failed to sync added ChatGPT account with app server: {error}"
+                            ));
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to sync added ChatGPT account with app server: {error}"
+                            ));
+                            return Ok(AppRunControl::Continue);
+                        }
+                        if active_account_display.is_none() {
+                            active_account_display =
+                                app_server.list_accounts().await.ok().and_then(|accounts| {
+                                    accounts
+                                        .into_iter()
+                                        .find(|account| account.id == active_store_account_id)
+                                        .map(|account| {
+                                            format_account_display(
+                                                account.label.as_deref(),
+                                                account.email.as_deref(),
+                                                &active_store_account_id,
+                                            )
+                                        })
+                                });
+                        }
+                        let projection_request_id = self
+                            .refresh_app_server_account_projection_after_remote_account_change(
+                                app_server,
+                                AccountProjectionRefreshTrigger::ManualAddAccount,
+                                Some(active_store_account_id),
+                            );
+                        self.pending_local_chatgpt_add_account_completion =
+                            Some(PendingLocalChatGptAddAccountCompletion {
+                                projection_request_id,
+                                shared_state: completion_state,
+                                active_account_display,
+                            });
                         self.maybe_start_accounts_status_refresh(
                             /*force*/ true, /*open_popup_when_ready*/ false,
                             /*show_loading_popup*/ false,
                         );
+                        return Ok(AppRunControl::Continue);
                     }
                     if let Some(display) = active_account_display {
                         self.chat_widget.add_info_message(
@@ -10031,6 +10081,69 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn local_set_active_account_uses_app_server_mutation_owner() -> Result<()> {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let (_primary_store_account_id, secondary_store_account_id) =
+            seed_canonical_chatgpt_accounts(&mut app, "account-a");
+        let mut app_server = crate::start_app_server_for_picker_with_auth_manager(
+            app.chat_widget.config_ref(),
+            &crate::AppServerTarget::Embedded,
+            app.auth_manager.clone(),
+            app.environment_manager.clone(),
+        )
+        .await
+        .expect("embedded app server sharing app auth manager");
+        let mut tui = make_test_tui();
+        while app_event_rx.try_recv().is_ok() {}
+
+        // Merge-safety anchor: local TUI account switching must use the same
+        // app-server mutation owner as remote switching so cloud requirements
+        // refresh before projection followers converge.
+        let control = app
+            .handle_event(
+                &mut tui,
+                &mut app_server,
+                AppEvent::SetActiveAccount {
+                    account_id: secondary_store_account_id.clone(),
+                },
+            )
+            .await?;
+        assert!(matches!(control, AppRunControl::Continue));
+
+        let deadline = time::Instant::now() + std::time::Duration::from_secs(5);
+        let projection_refreshed_event = loop {
+            let event = time::timeout_at(deadline, app_event_rx.recv())
+                .await
+                .expect("timed out waiting for local projection refresh")
+                .expect("app event channel closed");
+            if matches!(event, AppEvent::AppServerAccountProjectionRefreshed { .. }) {
+                break event;
+            }
+        };
+        assert_matches!(
+            &projection_refreshed_event,
+            AppEvent::AppServerAccountProjectionRefreshed { result: Ok(_), .. }
+        );
+        let control = app
+            .handle_event(&mut tui, &mut app_server, projection_refreshed_event)
+            .await?;
+        assert!(matches!(control, AppRunControl::Continue));
+
+        let accounts = app_server.list_accounts().await?;
+        assert!(
+            accounts
+                .iter()
+                .any(|account| account.id == secondary_store_account_id && account.is_active),
+            "embedded app-server account owner should observe the switched account"
+        );
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(secondary_store_account_id)
+        );
+        Ok(())
+    }
+
     #[test]
     fn observed_active_store_account_id_for_projection_owner_prefers_projection_for_remote() {
         assert_eq!(
@@ -10430,6 +10543,7 @@ mod tests {
                     AppEvent::ChatGptAddAccountFinished(ChatGptAddAccountOutcome::Success {
                         active_account_display: Some(display),
                         active_store_account_id: Some(active_store_account_id),
+                        ..
                     }) if display == "New — new@example.com"
                         && active_store_account_id == &new_store_account_id
                 )
@@ -12017,8 +12131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_chatgpt_add_account_success_outcome_reloads_strictly_and_manual_add_converges_followers()
-     {
+    async fn build_chatgpt_add_account_success_outcome_defers_active_mutation_to_app_server() {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
         seed_chatgpt_accounts(&mut app, "account-a");
         let initial_models = vec![all_model_presets()[0].clone()];
@@ -12052,33 +12165,40 @@ mod tests {
         let login_success = codex_login::LoginSuccess {
             store_account_id: canonical_chatgpt_store_account_id("account-c"),
         };
-        let outcome = build_chatgpt_add_account_success_outcome(
-            &app.auth_manager,
-            &shared_state,
-            &login_success,
-        );
-        let active_account_display = match outcome {
+        let outcome =
+            build_chatgpt_add_account_success_outcome(Arc::clone(&shared_state), &login_success);
+        let (active_account_display, completion_state) = match outcome {
             ChatGptAddAccountOutcome::Success {
                 active_account_display,
                 active_store_account_id,
+                completion_state,
             } => {
                 assert_eq!(
                     active_store_account_id,
-                    Some(login_success.store_account_id)
+                    Some(login_success.store_account_id.clone())
                 );
-                active_account_display
+                (active_account_display, completion_state)
             }
             other => panic!("expected add-account success outcome, saw {other:?}"),
         };
-        assert_eq!(
-            active_account_display.as_deref(),
-            Some("New — new@example.com")
+        assert_eq!(active_account_display, None);
+        assert!(
+            completion_state.is_some(),
+            "local add-account success must carry popup state for post-convergence completion"
+        );
+        assert_eq!(format!("{:?}", shared_state.status()), "Pending");
+        assert_ne!(
+            app.auth_manager
+                .active_chatgpt_account_summary()
+                .map(|summary| summary.store_account_id),
+            Some(login_success.store_account_id.clone()),
+            "add-account outcome must not mutate active account before app-server owner runs"
         );
         let active_store_account_id = app
             .auth_manager
-            .active_chatgpt_account_summary()
-            .map(|summary| summary.store_account_id)
-            .expect("active store account id after add-account reload");
+            .set_active_account(&login_success.store_account_id)
+            .map(|_| login_success.store_account_id.clone())
+            .expect("simulate embedded app-server active-account mutation");
 
         let refreshed_models = vec![all_model_presets()[1].clone()];
         let refreshed_default_model = refreshed_models[0].model.clone();
@@ -12136,7 +12256,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_chatgpt_add_account_success_outcome_fails_when_reload_strict_fails_and_preserves_state()
+    async fn local_chatgpt_add_account_marks_popup_success_after_projection_refresh() -> Result<()>
+    {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        seed_chatgpt_accounts(&mut app, "account-a");
+        let mut app_server = crate::start_app_server_for_picker_with_auth_manager(
+            app.chat_widget.config_ref(),
+            &crate::AppServerTarget::Embedded,
+            app.auth_manager.clone(),
+            app.environment_manager.clone(),
+        )
+        .await
+        .expect("embedded app server sharing app auth manager");
+        let mut tui = make_test_tui();
+        while app_event_rx.try_recv().is_ok() {}
+
+        let updated_store = AuthStore {
+            active_account_id: Some("account-c".to_string()),
+            accounts: vec![
+                chatgpt_account("account-a", "primary@example.com", Some("Primary")),
+                chatgpt_account("account-c", "new@example.com", Some("New")),
+            ],
+            ..AuthStore::default()
+        };
+        save_auth(
+            &app.config.codex_home,
+            &updated_store,
+            app.config.cli_auth_credentials_store_mode,
+        )?;
+
+        let shared_state = Arc::new(crate::bottom_pane::ChatGptAddAccountSharedState::new());
+        let login_success = codex_login::LoginSuccess {
+            store_account_id: canonical_chatgpt_store_account_id("account-c"),
+        };
+        let outcome =
+            build_chatgpt_add_account_success_outcome(Arc::clone(&shared_state), &login_success);
+        let control = app
+            .handle_event(
+                &mut tui,
+                &mut app_server,
+                AppEvent::ChatGptAddAccountFinished(outcome),
+            )
+            .await?;
+        assert!(matches!(control, AppRunControl::Continue));
+        assert_eq!(format!("{:?}", shared_state.status()), "Pending");
+        let manual_projection_request_id = app
+            .pending_account_projection_refresh_request_id
+            .expect("manual add-account projection refresh should be pending");
+
+        let app_server_event =
+            time::timeout(std::time::Duration::from_secs(5), app_server.next_event())
+                .await
+                .expect("timed out waiting for add-account account-updated notification")
+                .expect("app-server event stream closed");
+        assert_matches!(
+            &app_server_event,
+            codex_app_server_client::AppServerEvent::ServerNotification(
+                ServerNotification::AccountUpdated(_)
+            )
+        );
+        app.handle_app_server_event(&mut app_server, app_server_event)
+            .await;
+        assert_eq!(
+            app.pending_account_projection_refresh_request_id,
+            Some(manual_projection_request_id),
+            "app-server account-updated notification must not supersede local add-account completion"
+        );
+
+        let control = app
+            .handle_event(
+                &mut tui,
+                &mut app_server,
+                AppEvent::RefreshAppServerAccountProjectionAfterAccountUpdate,
+            )
+            .await?;
+        assert!(matches!(control, AppRunControl::Continue));
+        assert_eq!(
+            app.pending_account_projection_refresh_request_id,
+            Some(manual_projection_request_id),
+            "notification-driven account refresh must not supersede local add-account completion"
+        );
+        assert_eq!(format!("{:?}", shared_state.status()), "Pending");
+
+        let deadline = time::Instant::now() + std::time::Duration::from_secs(5);
+        let projection_refreshed_event = loop {
+            let event = time::timeout_at(deadline, app_event_rx.recv())
+                .await
+                .expect("timed out waiting for add-account projection refresh")
+                .expect("app event channel closed");
+            if matches!(event, AppEvent::AppServerAccountProjectionRefreshed { .. }) {
+                break event;
+            }
+        };
+        assert_matches!(
+            &projection_refreshed_event,
+            AppEvent::AppServerAccountProjectionRefreshed { result: Ok(_), .. }
+        );
+        let control = app
+            .handle_event(&mut tui, &mut app_server, projection_refreshed_event)
+            .await?;
+        assert!(matches!(control, AppRunControl::Continue));
+        assert!(format!("{:?}", shared_state.status()).contains("Success"));
+        assert_eq!(
+            app.observed_active_store_account_id,
+            Some(login_success.store_account_id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_chatgpt_add_account_success_outcome_does_not_touch_auth_store_on_success()
     -> Result<()> {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
         let available_models = all_model_presets();
@@ -12155,28 +12384,23 @@ mod tests {
         ));
         while app_event_rx.try_recv().is_ok() {}
 
-        let broken_home = tempdir()?;
-        let broken_path = broken_home.path().join("not-a-directory");
-        std::fs::write(&broken_path, "broken codex home")?;
-        let mut broken_config = app.config.clone();
-        broken_config.codex_home = broken_path.abs();
-        let broken_auth_manager = auth_manager_from_config(&broken_config);
         let shared_state = Arc::new(crate::bottom_pane::ChatGptAddAccountSharedState::new());
         let login_success = codex_login::LoginSuccess {
             store_account_id: canonical_chatgpt_store_account_id("account-c"),
         };
 
-        let outcome = build_chatgpt_add_account_success_outcome(
-            &broken_auth_manager,
-            shared_state.as_ref(),
-            &login_success,
-        );
+        let outcome =
+            build_chatgpt_add_account_success_outcome(Arc::clone(&shared_state), &login_success);
 
         assert!(matches!(
             outcome,
-            ChatGptAddAccountOutcome::Failed { ref message }
-                if message.contains("failed to select newly added ChatGPT account after login")
+            ChatGptAddAccountOutcome::Success {
+                active_account_display: None,
+                active_store_account_id: Some(_),
+                completion_state: Some(_),
+            }
         ));
+        assert_eq!(format!("{:?}", shared_state.status()), "Pending");
         assert!(matches!(
             app.chat_widget.status_account_display(),
             Some(StatusAccountDisplay::ChatGpt {
@@ -14829,68 +15053,115 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn attach_live_thread_for_selection_rejects_empty_non_ephemeral_fallback_threads()
-    -> Result<()> {
-        let mut app = make_test_app().await;
-        let mut app_server =
-            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
-                .await
-                .expect("embedded app server");
-        let started = app_server
-            .start_thread(app.chat_widget.config_ref())
-            .await?;
-        let thread_id = started.session.thread_id;
-        app.agent_navigation.upsert(
-            thread_id,
-            Some("Scout".to_string()),
-            Some("worker".to_string()),
-            /*is_closed*/ false,
-        );
+    fn run_async_test_with_large_stack<F, Fut>(name: &'static str, test: F) -> Result<()>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<()>> + 'static,
+    {
+        const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
 
-        let err = app
-            .attach_live_thread_for_selection(&mut app_server, thread_id)
-            .await
-            .expect_err("empty fallback should not attach as a blank replay-only thread");
+        let handle = std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(TEST_STACK_SIZE_BYTES)
+            // Merge-safety anchor: these app-server attach tests construct
+            // large async state machines. Keep the test harness stack
+            // explicit so failure assertions do not depend on host defaults.
+            .spawn(|| -> Result<()> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(test())
+            })?;
 
-        assert_eq!(
-            err.to_string(),
-            format!("Agent thread {thread_id} is not yet available for replay or live attach.")
-        );
-        assert!(!app.thread_event_channels.contains_key(&thread_id));
-        Ok(())
+        match handle.join() {
+            Ok(result) => result,
+            Err(_) => Err(color_eyre::eyre::eyre!("{name} thread panicked")),
+        }
     }
 
-    #[tokio::test]
-    async fn attach_live_thread_for_selection_rejects_unmaterialized_fallback_threads() -> Result<()>
+    #[test]
+    fn attach_live_thread_for_selection_rejects_empty_non_ephemeral_fallback_threads() -> Result<()>
     {
-        let mut app = make_test_app().await;
-        let mut app_server =
-            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
-                .await
-                .expect("embedded app server");
-        let mut ephemeral_config = app.chat_widget.config_ref().clone();
-        ephemeral_config.ephemeral = true;
-        let started = app_server.start_thread(&ephemeral_config).await?;
-        let thread_id = started.session.thread_id;
-        app.agent_navigation.upsert(
-            thread_id,
-            Some("Scout".to_string()),
-            Some("worker".to_string()),
-            /*is_closed*/ false,
-        );
+        run_async_test_with_large_stack(
+            "attach_live_thread_for_selection_rejects_empty_non_ephemeral_fallback_threads",
+            || async {
+                let mut app = make_test_app().await;
+                let mut app_server =
+                    crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+                        .await
+                        .expect("embedded app server");
+                let started = app_server
+                    .start_thread(app.chat_widget.config_ref())
+                    .await?;
+                let thread_id = started.session.thread_id;
+                app.agent_navigation.upsert(
+                    thread_id,
+                    Some("Scout".to_string()),
+                    Some("worker".to_string()),
+                    /*is_closed*/ false,
+                );
 
-        let err = app
-            .attach_live_thread_for_selection(&mut app_server, thread_id)
-            .await
-            .expect_err("ephemeral fallback should not attach as a blank live thread");
+                let err = match app
+                    .attach_live_thread_for_selection(&mut app_server, thread_id)
+                    .await
+                {
+                    Ok(_) => {
+                        panic!("empty fallback should not attach as a blank replay-only thread")
+                    }
+                    Err(err) => err,
+                };
 
-        assert_eq!(
-            err.to_string(),
-            format!("Agent thread {thread_id} is not yet available for replay or live attach.")
-        );
-        assert!(!app.thread_event_channels.contains_key(&thread_id));
-        Ok(())
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "Agent thread {thread_id} is not yet available for replay or live attach."
+                    )
+                );
+                assert!(!app.thread_event_channels.contains_key(&thread_id));
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn attach_live_thread_for_selection_rejects_unmaterialized_fallback_threads() -> Result<()> {
+        run_async_test_with_large_stack(
+            "attach_live_thread_for_selection_rejects_unmaterialized_fallback_threads",
+            || async {
+                let mut app = make_test_app().await;
+                let mut app_server =
+                    crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+                        .await
+                        .expect("embedded app server");
+                let mut ephemeral_config = app.chat_widget.config_ref().clone();
+                ephemeral_config.ephemeral = true;
+                let started = app_server.start_thread(&ephemeral_config).await?;
+                let thread_id = started.session.thread_id;
+                app.agent_navigation.upsert(
+                    thread_id,
+                    Some("Scout".to_string()),
+                    Some("worker".to_string()),
+                    /*is_closed*/ false,
+                );
+
+                let err = match app
+                    .attach_live_thread_for_selection(&mut app_server, thread_id)
+                    .await
+                {
+                    Ok(_) => panic!("ephemeral fallback should not attach as a blank live thread"),
+                    Err(err) => err,
+                };
+
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "Agent thread {thread_id} is not yet available for replay or live attach."
+                    )
+                );
+                assert!(!app.thread_event_channels.contains_key(&thread_id));
+                Ok(())
+            },
+        )
     }
 
     #[tokio::test]
@@ -16625,6 +16896,7 @@ guardian_approval = true
             next_account_projection_refresh_request_id: 0,
             pending_account_projection_refresh_request_id: None,
             pending_remote_chatgpt_add_account: None,
+            pending_local_chatgpt_add_account_completion: None,
             suppress_ambiguous_rate_limit_notifications_generation: None,
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_plugin_enabled_writes: HashMap::new(),
@@ -16696,6 +16968,7 @@ guardian_approval = true
                 next_account_projection_refresh_request_id: 0,
                 pending_account_projection_refresh_request_id: None,
                 pending_remote_chatgpt_add_account: None,
+                pending_local_chatgpt_add_account_completion: None,
                 suppress_ambiguous_rate_limit_notifications_generation: None,
                 pending_app_server_requests: PendingAppServerRequests::default(),
                 pending_plugin_enabled_writes: HashMap::new(),
@@ -16703,6 +16976,19 @@ guardian_approval = true
             rx,
             op_rx,
         )
+    }
+
+    fn install_test_user_config(app: &mut App, config_toml: &str) -> Result<tempfile::TempDir> {
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        let config_path = codex_home.path().join("config.toml").abs();
+        std::fs::write(config_path.as_path(), config_toml)?;
+        let user_config = toml::from_str::<TomlValue>(config_toml)?;
+        app.config.config_layer_stack = app
+            .config
+            .config_layer_stack
+            .with_user_config(&config_path, user_config);
+        Ok(codex_home)
     }
 
     fn make_test_tui() -> crate::tui::Tui {
@@ -17314,6 +17600,7 @@ guardian_approval = true
     async fn refresh_in_memory_config_from_disk_reapplies_forced_workspace_to_auth_manager()
     -> Result<()> {
         let mut app = make_test_app().await;
+        let _codex_home = install_test_user_config(&mut app, "")?;
         let config_path = app.config.active_user_config_path()?;
         app.auth_manager
             .set_forced_chatgpt_workspace_id(Some("stale-workspace".to_string()));
@@ -17334,8 +17621,8 @@ guardian_approval = true
     #[tokio::test]
     async fn manual_set_active_account_rejects_wrong_workspace_and_preserves_state() -> Result<()> {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-        let config_path = app.config.active_user_config_path()?;
-        std::fs::write(config_path, "forced_chatgpt_workspace_id = \"account-a\"\n")?;
+        let _codex_home =
+            install_test_user_config(&mut app, "forced_chatgpt_workspace_id = \"account-a\"\n")?;
         app.refresh_in_memory_config_from_disk().await?;
         seed_chatgpt_accounts(&mut app, "account-a");
         let active_store_account_id_before_switch = app

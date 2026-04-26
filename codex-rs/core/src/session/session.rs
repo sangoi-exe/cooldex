@@ -233,6 +233,7 @@ impl Session {
         prompt_gc_active: watch::Sender<bool>,
         prompt_gc_activity_edges: tokio::sync::broadcast::Sender<PromptGcActivityEdge>,
         initial_history: InitialHistory,
+        reserved_thread_id: Option<ThreadId>,
         session_source: SessionSource,
         skills_manager: Arc<SkillsManager>,
         plugins_manager: Arc<PluginsManager>,
@@ -251,7 +252,11 @@ impl Session {
 
         let (conversation_id, rollout_params) = match &initial_history {
             InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
-                let conversation_id = ThreadId::default();
+                // Merge-safety anchor: app-server start/fork derives auth and
+                // cloud requirements before spawning the core session, so it
+                // must be able to reserve the exact ThreadId that AccountManager
+                // uses as the linked Codex session lease owner.
+                let conversation_id = reserved_thread_id.unwrap_or_default();
                 (
                     conversation_id,
                     RolloutRecorderParams::new(

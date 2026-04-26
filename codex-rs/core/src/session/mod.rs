@@ -410,6 +410,7 @@ pub struct CodexSpawnOk {
 pub(crate) struct CodexSpawnArgs {
     pub(crate) config: Config,
     pub(crate) auth_manager: Arc<AuthManager>,
+    pub(crate) reserved_thread_id: Option<ThreadId>,
     pub(crate) models_manager: Arc<ModelsManager>,
     pub(crate) environment_manager: Arc<EnvironmentManager>,
     pub(crate) skills_manager: Arc<SkillsManager>,
@@ -464,6 +465,7 @@ impl Codex {
         let CodexSpawnArgs {
             mut config,
             auth_manager,
+            reserved_thread_id,
             models_manager,
             environment_manager,
             skills_manager,
@@ -676,6 +678,7 @@ impl Codex {
             prompt_gc_active_tx,
             prompt_gc_activity_edges.clone(),
             conversation_history,
+            reserved_thread_id,
             session_source_clone,
             skills_manager,
             plugins_manager,
