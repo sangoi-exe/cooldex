@@ -49,8 +49,9 @@ For commentless customization-adjacent seams such as JSON schema artifacts, the 
 - `post-compact prompt-top context restoration`: after local or remote compaction, whether manual `/compact` or pre-turn auto-compact, the next regular turn must rebuild canonical prompt-top context like a fresh session so `developer_instructions` and the root/path `AGENTS.md`-derived contextual user block stay ahead of compacted history; mid-turn compaction instead reinjects that same canonical initial context immediately before the last real user message or summary so the summary/compaction item stays last. Representative files: `codex-rs/core/src/compact.rs`, `codex-rs/core/src/compact_remote.rs`, `codex-rs/core/src/session/mod.rs`, `codex-rs/core/src/agents_md.rs`, `codex-rs/core/tests/suite/compact.rs`, `codex-rs/core/tests/suite/compact_remote.rs`.
 - `resume transcript rendering`: stored-session resume now prefers rollout-backed reconstructed turn replay over the lossy `SessionConfigured.initial_messages` projection, with `[tui].resume_history` truncating at the last surviving visible `Context compacted` marker by default. In the unified TUI, once reconstructed turns are available they define the resume boundary even if the surviving suffix is currently non-renderable; fall back to legacy `initial_messages` only when reconstructed turns could not be loaded at all. Keep visible replay parity for completed unified-exec/review-finish/collab-wait/file-change surfaces, keep hook-prompt-only reconstructed history non-renderable until hook prompts get a real visible replay surface, and keep begin-only web/image tool history non-renderable so resume never fabricates completed-looking rows from incomplete evidence. Preserve rollback-aware truncation in shared turn reconstruction and keep the TUI replay/session adapters aligned with that contract. Representative files: `codex-rs/app-server-protocol/src/protocol/thread_history.rs`, `codex-rs/core/src/config/mod.rs`, `codex-rs/core/config.schema.json`, `codex-rs/tui/src/app.rs`, `codex-rs/tui/src/app_server_session.rs`, `codex-rs/tui/src/app/app_server_adapter.rs`, `codex-rs/tui/src/chatwidget.rs`, `codex-rs/tui/src/chatwidget/tests.rs`, `codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__resumed_turn_history_replays_original_rollout.snap`, `docs/config.md`.
 - `final turn handoff raw debug dump`: `[tui].final_turn_handoff_debug` is a workspace-local operator debug surface that must stay owned by the core turn-finish path, not a TUI-only render side path. Keep the raw `last_agent_message` byte-preserving dump contract aligned across config/schema/docs/tests/runtime: when enabled and non-empty, write `${codex_home}/debug/<session_uuid>/turn-<turn_id>-final-handoff-raw.txt` from `Session::on_task_finished(...)`; on create/write failure, emit a warning for that turn and still complete it. Representative files: `codex-rs/config/src/types.rs`, `codex-rs/core/src/config/mod.rs`, `codex-rs/core/config.schema.json`, `codex-rs/core/src/tasks/mod.rs`, `codex-rs/core/src/session/tests.rs`, `docs/config.md`.
-- `/accounts`: multi-account ChatGPT management is a cross-file divergence cluster, not a single TUI command. Treat AccountManager-owned saved-account roster/runtime-active/lease/autoswitch state, auth storage, TUI popup/cache flow, slash-command gating, remote app-server roster/set-active/lease-management surfaces, autoswitch refresh, and auth docs as one subsystem. Representative files: `codex-rs/login/src/auth/account_manager.rs`, `codex-rs/login/src/auth/manager.rs`, `codex-rs/login/src/auth/storage.rs`, `codex-rs/core/src/session/turn.rs`, `codex-rs/app-server-protocol/src/protocol/common.rs`, `codex-rs/app-server-protocol/src/protocol/v2.rs`, `codex-rs/app-server/src/codex_message_processor.rs`, `codex-rs/tui/src/app_server_session.rs`, `codex-rs/tui/src/app.rs`, `codex-rs/tui/src/app_event.rs`, `codex-rs/tui/src/chatwidget.rs`, `codex-rs/tui/src/slash_command.rs`, `codex-rs/app-server/README.md`, `docs/authentication.md`, `docs/slash_commands.md`.
+- `/accounts`: multi-account ChatGPT management is a cross-file divergence cluster, not a single TUI command. Treat AccountManager-owned saved-account roster/runtime-active/lease/autoswitch state, auth storage, TUI popup/cache/projection flow, slash-command gating, remote app-server roster/set-active/lease-management surfaces, autoswitch refresh, and auth docs as one subsystem. Representative files: `codex-rs/login/src/auth/account_manager.rs`, `codex-rs/login/src/auth/account_runtime_context.rs`, `codex-rs/login/src/auth/manager.rs`, `codex-rs/login/src/auth/storage.rs`, `codex-rs/core/src/session/turn.rs`, `codex-rs/app-server-protocol/src/protocol/common.rs`, `codex-rs/app-server-protocol/src/protocol/v2.rs`, `codex-rs/app-server/src/codex_message_processor.rs`, `codex-rs/tui/src/account_projection.rs`, `codex-rs/tui/src/app_server_session.rs`, `codex-rs/tui/src/app.rs`, `codex-rs/tui/src/app/app_server_adapter.rs`, `codex-rs/tui/src/app_event.rs`, `codex-rs/tui/src/chatwidget.rs`, `codex-rs/tui/src/slash_command.rs`, `codex-rs/app-server/README.md`, `docs/authentication.md`, `docs/slash_commands.md`.
 - `WS12 account-state coordination`: saved-account usage truth is moving under `AccountManager` plus a dedicated SQLite owner so autoswitch, `/accounts`, and rate-limit reconciliation stop treating the legacy auth-store cache as live runtime truth. Keep the SQLite owner, AccountManager hydration/strip/runtime-active flow, AuthManager auth-derivation facade, and config-based `sqlite_home` wiring aligned during the staged cutover. Representative files: `codex-rs/account-state/src/lib.rs`, `codex-rs/login/src/auth/account_manager.rs`, `codex-rs/login/src/auth/manager.rs`, `codex-rs/login/src/auth/storage.rs`, `codex-rs/core/src/config/mod.rs`, `codex-rs/Cargo.toml`.
+- `ChatGPT request-auth and cloud requirements ownership`: ChatGPT backend, connectors, cloud requirements, cloud tasks, app-server target threads, `codex exec`, and TUI resume/fork must consume owner-derived request-auth snapshots instead of process-global tokens or hidden bootstrap `AuthManager`/`AccountManager` owners. Keep `forced_chatgpt_workspace_id`, profile-scoped `chatgpt_base_url`, `codex_home`, `sqlite_home`, default client residency, model-catalog owner, and linked session id aligned before cloud requirements or account mutation success surfaces run. Representative files: `codex-rs/login/src/auth/manager.rs`, `codex-rs/chatgpt/src/chatgpt_token.rs`, `codex-rs/chatgpt/src/chatgpt_client.rs`, `codex-rs/chatgpt/src/connectors.rs`, `codex-rs/chatgpt/src/get_task.rs`, `codex-rs/cloud-requirements/src/lib.rs`, `codex-rs/cloud-tasks/src/lib.rs`, `codex-rs/cloud-tasks/src/util.rs`, `codex-rs/app-server/src/codex_message_processor.rs`, `codex-rs/exec/src/lib.rs`, `codex-rs/tui/src/lib.rs`, `codex-rs/tui/src/app.rs`.
 - sub-agent/runtime orchestration: custom spawn/profile plumbing, background-agent handling, parallel tool execution, collaboration/thread APIs, and child-agent prompt layering live outside upstream. Preserve `subagent_instructions_file` as the child base-instructions source, keep child spawn/resume config inheriting workspace AGENTS/project-doc context plus `Feature::ChildAgentsMd`, preserve AGENTS-derived `user_instructions` in forked child history, and allow child `developer_instructions` from lead/role config to stay active. Keep the active legacy collab surface contract separate from `MultiAgentV2`: do not rename shipped legacy tools or backport V2-only task-name/path semantics into legacy unless a deliberate V2 rollout is in scope. Keep the active built-in collab prompts aligned with that same legacy surface so embedded guidance does not keep telling the lead to call stale tool names. Representative files: `codex-rs/core/src/tools/handlers/multi_agents.rs`, `codex-rs/core/src/tools/handlers/multi_agents_v2.rs`, `codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs`, `codex-rs/core/src/tools/parallel.rs`, `codex-rs/core/src/config/mod.rs`, `codex-rs/core/src/config/profile.rs`, `codex-rs/core/config.schema.json`, `codex-rs/core/src/agents_md.rs`, `codex-rs/core/src/state/session.rs`, `codex-rs/core/src/agent/control.rs`, `codex-rs/core/src/agent/builtins/awaiter.toml`, `codex-rs/core/templates/collab/experimental_prompt.md`, `codex-rs/core/src/rid.rs`, `codex-rs/app-server-protocol/src/protocol/v2.rs`, `codex-rs/app-server-protocol/schema/**`, `codex-rs/app-server/src/codex_message_processor.rs`, `codex-rs/state/src/runtime/threads.rs`, `AGENTS.md`.
 - TUI debugging/custom operator surfaces: `/debug`, raw-response inspection, and context-window/operator-facing debugging affordances are local customizations and must stay aligned with runtime event/cache semantics. Representative files: `codex-rs/tui/src/chatwidget.rs`, `codex-rs/tui/src/slash_command.rs`, `codex-rs/core/src/prompt_debug.rs`, `codex-rs/tui/src/app.rs`.
 - remote-aware MCP stdio env-source routing: `env_vars[].source` is a typed local/remote contract so local stdio rejects remote-sourced variables, remote stdio forwards only local-sourced env overlays from the orchestrator while requesting remote-sourced names from the executor, and generated schema/TOML followers do not drift back to arbitrary strings. Representative files: `codex-rs/config/src/mcp_types.rs`, `codex-rs/config/src/mcp_edit.rs`, `codex-rs/core/src/config/edit.rs`, `codex-rs/core/config.schema.json`, `codex-rs/core/src/session/mcp.rs`, `codex-rs/core/src/session/session.rs`, `codex-rs/codex-mcp/src/lib.rs`, `codex-rs/codex-mcp/src/mcp/mod.rs`, `codex-rs/codex-mcp/src/mcp_connection_manager.rs`, `codex-rs/config/src/lib.rs`, `codex-rs/rmcp-client/src/lib.rs`, `codex-rs/rmcp-client/src/rmcp_client.rs`, `codex-rs/rmcp-client/src/utils.rs`, `codex-rs/rmcp-client/src/stdio_server_launcher.rs`, `codex-rs/rmcp-client/src/executor_process_transport.rs`, `codex-rs/core/tests/suite/rmcp_client.rs`.
@@ -322,6 +323,17 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
 - If the current `HEAD` / `upstream/main` no longer matches the review commit above, re-check the high-churn hotspot files listed below before trusting fine-grained owner details.
 - When you land in a folder that already has its own `AGENTS.md`, read that local sub-atlas immediately before editing inside that folder.
 - Treat this atlas as a first-pass routing map, not a license to guess gated names, stale symbols, or follower behavior without checking the live owner file.
+
+### Current `master` local delta notes
+
+Spot-reviewed on `2026-04-26` against local `main`/`upstream/main` for the Phase-0 auth/account/cloud/TUI surfaces only; this does not refresh the whole `upstream/main` atlas baseline.
+
+- Current `master` adds a local `AccountManager` runtime owner beneath `codex-login`; upstream/main does not provide the same saved-account roster/runtime-active/lease/autoswitch owner split.
+- `AuthManager` on `master` is an auth/request-auth facade over owner-loaded account snapshots. Do not add saved-account runtime behavior back to `AuthManager` just because upstream/main still concentrates more auth-store logic there.
+- ChatGPT request paths on `master` use owner-derived request-auth snapshots. Do not reintroduce a process-global ChatGPT token cache or helper APIs that construct hidden `AuthManager`/`AccountManager` owners from a raw `Config`.
+- Cloud requirements and model/default-residency decisions are target-config-sensitive on `master`: TUI resume/fork, app-server `thread/start`/`thread/fork`, `codex exec`, and `codex cloud` must use the target config path, forced workspace, profile base URL, `codex_home`, `sqlite_home`, and linked session id together.
+- TUI account state on `master` has an explicit app-server projection follower. Local add-account and manual set-active flows must route through the embedded app-server mutation owner and wait for projection convergence before claiming visible success.
+- MCP remote stdio env-source handling on `master` rejects same-name local/remote sourced collisions; upstream/main does not define that workspace-local fail-loud contract.
 
 ### Existing local sub-atlases
 
@@ -777,8 +789,10 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
   - File-search utility surface.
 - `codex-rs/cloud-requirements`
   - Cloud-hosted config requirements loader used during config bootstrap.
+  - On current `master`, this is part of the auth/account bootstrap surface: it must consume the caller/target `AuthManager` request-auth owner instead of constructing a hidden account runtime.
 - `codex-rs/cloud-tasks`, `codex-rs/cloud-tasks-client`
   - `codex cloud` command family and its backend client. Relevant only when the task explicitly touches cloud-task browsing/apply behavior.
+  - On current `master`, header construction must stay aligned with the same ChatGPT request-auth snapshot owner used by direct backend/connectors/cloud-requirements paths.
 - `codex-rs/codex-backend-openapi-models`
   - Generated backend model follower crate. Open only after a backend-client/API owner already points there.
 - `codex-rs/response-debug-context`
@@ -1246,6 +1260,9 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
     - Active-thread submission path for app-server-backed sessions.
   - `backfill_loaded_subagent_threads(...)`
     - Rehydrates already-running child threads into the UI model.
+- `codex-rs/tui/src/account_projection.rs`
+  - Shared TUI account projection state and pending add-account completion structs for app-server-owned account truth.
+  - Open this before adding new account popup/projection state to `app.rs`.
 - `codex-rs/tui/src/chatwidget.rs`
   - `handle_key_event(...)`
     - High-traffic operator input handler.
@@ -1256,6 +1273,7 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
 - `codex-rs/tui/src/app/app_server_adapter.rs`
   - `handle_app_server_event(...)`
     - Hybrid bridge from app-server notifications/requests into older TUI-local state/event paths.
+  - On current `master`, AccountUpdated refresh suppression while a local add-account completion owns convergence lives at this boundary.
 - `codex-rs/tui/src/app_server_session.rs`
   - Typed wrappers for `thread/start`, `thread/resume`, `thread/list`, `thread/read`, `thread/fork`, and `turn/start`.
   - This is the client-side owner for request shape before the server sees it.
@@ -1289,6 +1307,7 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
     - Routes `thread/start`, `thread/resume`, `thread/list`, `thread/read`, `turn/start`, and adjacent RPCs.
   - `thread_start(...)`
     - Creates a new thread and sends `SessionConfigured`-derived data back to the caller.
+    - On current `master`, derive target config/auth/cloud requirements/model catalog after reserving the target thread id so account runtime leases can link to the actual session id.
   - `thread_list(...)`
     - Builds picker rows from thread-store data plus runtime overlays.
   - `thread_read(...)`
@@ -1297,6 +1316,7 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
     - Reattaches to an existing session/history using precedence `history > path > thread_id`.
   - `turn_start(...)`
     - Translates app-server turn params into core `Op::UserInput`/turn execution.
+  - Account mutation handlers on current `master` must refresh cloud requirements/default residency before success responses or visible follower notifications.
 - `codex-rs/app-server/src/dynamic_tools.rs`
   - `on_call_response(...)`
     - Converts app-server dynamic-tool results back into `Op::DynamicToolResponse`.
@@ -1322,9 +1342,16 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
 - `codex-rs/login/src/auth/account_manager.rs`
   - `AccountManager`
     - Canonical saved-account runtime-state owner: roster, active-account leases, autoswitch, usage/limit followers, live auth-store loading, and account-runtime mutations.
+- `codex-rs/login/src/auth/account_runtime_context.rs`
+  - Lightweight linked-session/runtime context carried into account-runtime owners.
+  - Preserve this as metadata for the real Codex session/thread id; do not replace it with a startup-scoped placeholder when target thread ids are available.
 - `codex-rs/login/src/auth/manager.rs`
   - `AuthManager`
     - Auth facade that derives and caches runtime auth from AccountManager-loaded snapshots; it is not the owner for saved-account runtime state.
+  - `ChatGptRequestAuth`
+    - Current local request-auth snapshot for ChatGPT backend/cloud callers.
+  - `chatgpt_auth(...)` / `chatgpt_request_auth(...)`
+    - Non-mutating ChatGPT auth snapshot seams; use these instead of generic `auth()` for ChatGPT backend/cloud requirements recovery.
   - `shared_from_config(...)`
     - Builds the shared auth manager from effective config.
   - `get_token(...)`
@@ -1358,6 +1385,15 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
 - `codex-rs/login/src/token_data.rs`
   - `parse_chatgpt_jwt_claims(...)` / `parse_jwt_expiration(...)`
     - JWT-derived account/workspace/plan/expiration parsing used by runtime auth decisions.
+- `codex-rs/chatgpt/src/chatgpt_token.rs`
+  - ChatGPT request-auth snapshot bootstrap helpers.
+  - On current `master`, this file must not own a process-global mutable token cache.
+- `codex-rs/chatgpt/src/chatgpt_client.rs`, `connectors.rs`, `get_task.rs`
+  - Direct ChatGPT backend, connector, and task callers that consume request-auth snapshots from the runtime owner.
+- `codex-rs/cloud-requirements/src/lib.rs`
+  - Cloud requirements fetch/cache owner; ChatGPT 401 recovery must consult ChatGPT-specific auth recovery, not generic API-key runtime auth.
+- `codex-rs/cloud-tasks/src/lib.rs`, `codex-rs/cloud-tasks/src/util.rs`, `codex-rs/cloud-tasks-client/src/http.rs`
+  - `codex cloud` task API and header owner; preserve caller-selected user-agent suffixes while deriving account/FedRAMP auth from the canonical request-auth snapshot.
 - `codex-rs/cli/src/login.rs`
   - Operator-facing login/status/logout UX wrapper.
 - `codex-rs/models-manager/src/manager.rs`
@@ -1474,6 +1510,7 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
 - Auth/account bug
   - `codex-rs/login/src/auth/account_manager.rs`
   - `codex-rs/login/src/auth/manager.rs`
+  - `codex-rs/login/src/auth/account_runtime_context.rs` when the symptom involves session-linked leases or target thread ids
   - `codex-rs/login/src/auth/storage.rs`
   - `codex-rs/cli/src/login.rs`
   - `codex-rs/login/src/server.rs` for browser callback / token exchange bugs
@@ -1481,6 +1518,11 @@ Last reviewed against `upstream/main` commit `43a69c50eb` on `2026-04-20`.
   - `codex-rs/login/src/auth/external_bearer.rs` for provider command-backed auth bugs
   - `codex-rs/login/src/token_data.rs` when account/workspace/plan claims look wrong
   - `codex-rs/login/src/auth/revoke.rs` for logout-with-revoke behavior
+  - `codex-rs/chatgpt/src/chatgpt_token.rs`, `chatgpt_client.rs`, and `connectors.rs` when the symptom is stale ChatGPT backend/connector request auth
+  - `codex-rs/cloud-requirements/src/lib.rs` when the symptom is forced-workspace, default residency, or cloud-requirements recovery drift
+  - `codex-rs/cloud-tasks/src/lib.rs` and `codex-rs/cloud-tasks/src/util.rs` when `codex cloud` account/FedRAMP headers drift
+  - `codex-rs/app-server/src/codex_message_processor.rs` when login/logout/set-active/thread-start success surfaces race cloud requirements, model catalog, or account projection convergence
+  - `codex-rs/tui/src/account_projection.rs` and `codex-rs/tui/src/app/app_server_adapter.rs` for `/accounts` projection/interleaving bugs after the auth owner is locked
   - `codex-rs/model-provider/src/auth.rs` if the behavior differs by provider
   - TUI `/accounts` surface only after the auth owner is locked
 - Compact/history reconstruction bug
