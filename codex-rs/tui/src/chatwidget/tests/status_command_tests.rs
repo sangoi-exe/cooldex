@@ -71,7 +71,7 @@ async fn status_command_refresh_updates_cached_limits_for_future_status_outputs(
         other => panic!("expected refreshed status output, got {other:?}"),
     };
     assert!(
-        refreshed.contains("45% left"),
+        refreshed.contains("55% left"),
         "expected a future /status output to use refreshed cached limits, got: {refreshed}"
     );
 }
@@ -202,7 +202,7 @@ async fn status_command_stale_cell_refreshes_in_place_when_refresh_completes() {
         "expected stale /status output to declare background refresh while it stays live-updating, got: {stale_rendered}"
     );
     assert!(
-        stale_rendered.contains("8% left"),
+        stale_rendered.contains("92% left"),
         "expected stale /status output to render the cached rate-limit rows, got: {stale_rendered}"
     );
 
@@ -219,7 +219,7 @@ async fn status_command_stale_cell_refreshes_in_place_when_refresh_completes() {
 
     let refreshed_rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
     assert!(
-        refreshed_rendered.contains("45% left"),
+        refreshed_rendered.contains("55% left"),
         "expected the already-rendered /status cell to refresh in place when the new data arrives, got: {refreshed_rendered}"
     );
     assert!(
@@ -288,7 +288,7 @@ async fn status_command_empty_successful_refresh_replaces_existing_cache_with_un
     };
     let initial_rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
     assert!(
-        initial_rendered.contains("45% left"),
+        initial_rendered.contains("55% left"),
         "expected the pre-refresh /status cell to use the existing cache, got: {initial_rendered}"
     );
 
@@ -309,7 +309,7 @@ async fn status_command_empty_successful_refresh_replaces_existing_cache_with_un
         "expected a successful empty refresh to replace stale cached limits with unavailable, got: {refreshed_rendered}"
     );
     assert!(
-        !refreshed_rendered.contains("45% left"),
+        !refreshed_rendered.contains("55% left"),
         "expected cached rows to clear after the empty refresh completed, got: {refreshed_rendered}"
     );
 }
@@ -377,7 +377,7 @@ async fn active_account_change_clears_cached_limits_and_prefetches() {
         "expected account switch to clear the previous account cache before /status renders, got: {rendered}"
     );
     assert!(
-        !rendered.contains("45% left"),
+        !rendered.contains("55% left"),
         "expected account switch to prevent stale cached limits from rendering, got: {rendered}"
     );
 }
@@ -425,7 +425,7 @@ async fn stale_status_refresh_does_not_repaint_card_from_new_account_cache() {
 
     let rendered_before = lines_to_single_string(&cell.display_lines(/*width*/ 80));
     assert!(
-        rendered_before.contains("45% left"),
+        rendered_before.contains("55% left"),
         "expected original /status card to render the old account cache, got: {rendered_before}"
     );
 
@@ -443,11 +443,11 @@ async fn stale_status_refresh_does_not_repaint_card_from_new_account_cache() {
 
     let rendered_after = lines_to_single_string(&cell.display_lines(/*width*/ 80));
     assert!(
-        rendered_after.contains("45% left"),
+        rendered_after.contains("55% left"),
         "expected stale refresh completion to preserve the original card data, got: {rendered_after}"
     );
     assert!(
-        !rendered_after.contains("12% left"),
+        !rendered_after.contains("88% left"),
         "expected stale refresh completion to avoid repainting from the next account cache, got: {rendered_after}"
     );
 }

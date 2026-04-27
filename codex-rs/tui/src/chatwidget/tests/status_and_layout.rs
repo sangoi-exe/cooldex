@@ -196,12 +196,30 @@ async fn rate_limit_warnings_emit_thresholds() {
     let mut state = RateLimitWarningState::default();
     let mut warnings: Vec<String> = Vec::new();
 
-    warnings.extend(state.take_warnings(Some(10.0), Some(10079), Some(55.0), Some(299)));
-    warnings.extend(state.take_warnings(Some(55.0), Some(10081), Some(10.0), Some(299)));
-    warnings.extend(state.take_warnings(Some(10.0), Some(10081), Some(80.0), Some(299)));
-    warnings.extend(state.take_warnings(Some(80.0), Some(10081), Some(10.0), Some(299)));
-    warnings.extend(state.take_warnings(Some(10.0), Some(10081), Some(95.0), Some(299)));
-    warnings.extend(state.take_warnings(Some(95.0), Some(10079), Some(10.0), Some(299)));
+    warnings.extend(state.take_warnings(
+        /*secondary_remaining_percent*/ None,
+        /*secondary_window_minutes*/ None,
+        /*primary_remaining_percent*/ Some(25.0),
+        /*primary_window_minutes*/ Some(299),
+    ));
+    warnings.extend(state.take_warnings(
+        /*secondary_remaining_percent*/ Some(25.0),
+        /*secondary_window_minutes*/ Some(10081),
+        /*primary_remaining_percent*/ Some(10.0),
+        /*primary_window_minutes*/ Some(299),
+    ));
+    warnings.extend(state.take_warnings(
+        /*secondary_remaining_percent*/ Some(10.0),
+        /*secondary_window_minutes*/ Some(10081),
+        /*primary_remaining_percent*/ Some(5.0),
+        /*primary_window_minutes*/ Some(299),
+    ));
+    warnings.extend(state.take_warnings(
+        /*secondary_remaining_percent*/ Some(5.0),
+        /*secondary_window_minutes*/ Some(10081),
+        /*primary_remaining_percent*/ None,
+        /*primary_window_minutes*/ None,
+    ));
 
     assert_eq!(
         warnings,
@@ -213,6 +231,12 @@ async fn rate_limit_warnings_emit_thresholds() {
                 "Heads up, you have less than 25% of your weekly limit left. Run /status for a breakdown.",
             ),
             String::from(
+                "Heads up, you have less than 10% of your 5h limit left. Run /status for a breakdown."
+            ),
+            String::from(
+                "Heads up, you have less than 10% of your weekly limit left. Run /status for a breakdown.",
+            ),
+            String::from(
                 "Heads up, you have less than 5% of your 5h limit left. Run /status for a breakdown."
             ),
             String::from(
@@ -220,6 +244,25 @@ async fn rate_limit_warnings_emit_thresholds() {
             ),
         ],
         "expected one warning per limit for the highest crossed threshold"
+    );
+
+    let mut direct_drop_state = RateLimitWarningState::default();
+    assert_eq!(
+        direct_drop_state.take_warnings(
+            /*secondary_remaining_percent*/ Some(5.0),
+            /*secondary_window_minutes*/ Some(10081),
+            /*primary_remaining_percent*/ Some(5.0),
+            /*primary_window_minutes*/ Some(299),
+        ),
+        vec![
+            String::from(
+                "Heads up, you have less than 5% of your weekly limit left. Run /status for a breakdown.",
+            ),
+            String::from(
+                "Heads up, you have less than 5% of your 5h limit left. Run /status for a breakdown."
+            ),
+        ],
+        "expected a direct drop below multiple thresholds to emit only the highest crossed threshold per limit"
     );
 }
 
@@ -229,8 +272,8 @@ async fn test_rate_limit_warnings_monthly() {
     let mut warnings: Vec<String> = Vec::new();
 
     warnings.extend(state.take_warnings(
-        Some(75.0),
-        Some(43199),
+        /*secondary_remaining_percent*/ Some(25.0),
+        /*secondary_window_minutes*/ Some(43199),
         /*primary_remaining_percent*/ None,
         /*primary_window_minutes*/ None,
     ));
@@ -431,7 +474,7 @@ async fn rate_limit_switch_prompt_skips_when_on_lower_cost_model() {
     let (mut chat, _, _) = make_chatwidget_manual(Some(NUDGE_MODEL_SLUG)).await;
     chat.has_chatgpt_account = true;
 
-    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 95.0)));
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 8.0)));
 
     assert!(matches!(
         chat.rate_limit_switch_prompt,
@@ -448,7 +491,7 @@ async fn rate_limit_switch_prompt_skips_non_codex_limit() {
         limit_id: Some("codex_other".to_string()),
         limit_name: Some("codex_other".to_string()),
         primary: Some(RateLimitWindow {
-            remaining_percent: 95.0,
+            remaining_percent: 8.0,
             window_minutes: Some(60),
             resets_at: None,
         }),
@@ -469,7 +512,7 @@ async fn rate_limit_switch_prompt_shows_once_per_session() {
     let (mut chat, _, _) = make_chatwidget_manual(Some("gpt-5")).await;
     chat.has_chatgpt_account = true;
 
-    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 90.0)));
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 8.0)));
     assert!(
         chat.rate_limit_warnings.primary_index >= 1,
         "warnings not emitted"
@@ -480,7 +523,7 @@ async fn rate_limit_switch_prompt_shows_once_per_session() {
         RateLimitSwitchPromptState::Shown
     ));
 
-    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 95.0)));
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 5.0)));
     assert!(matches!(
         chat.rate_limit_switch_prompt,
         RateLimitSwitchPromptState::Shown
@@ -493,7 +536,7 @@ async fn rate_limit_switch_prompt_respects_hidden_notice() {
     chat.has_chatgpt_account = true;
     chat.config.notices.hide_rate_limit_model_nudge = Some(true);
 
-    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 95.0)));
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 8.0)));
 
     assert!(matches!(
         chat.rate_limit_switch_prompt,
@@ -507,7 +550,7 @@ async fn rate_limit_switch_prompt_defers_until_task_complete() {
     chat.has_chatgpt_account = true;
 
     chat.bottom_pane.set_task_running(/*running*/ true);
-    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 90.0)));
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 8.0)));
     assert!(matches!(
         chat.rate_limit_switch_prompt,
         RateLimitSwitchPromptState::Pending
@@ -526,7 +569,7 @@ async fn rate_limit_switch_prompt_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
     chat.has_chatgpt_account = true;
 
-    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 92.0)));
+    chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 8.0)));
     chat.maybe_show_pending_rate_limit_prompt();
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
