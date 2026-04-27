@@ -18869,12 +18869,15 @@ guardian_approval = true
     #[tokio::test]
     async fn reload_live_user_config_and_followers_refreshes_enabled_skills() -> Result<()> {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        // Merge-safety anchor: app/skill config-write tests must install a real
+        // active user config layer before embedded app-server writes; writing a
+        // loose codex_home/config.toml bypasses the current config-layer owner.
+        let _codex_home = install_test_user_config(&mut app, "")?;
         let skill_path = write_test_skill(&app.config.codex_home, "demo-skill")?;
-        std::fs::write(app.config.codex_home.join("config.toml"), "")?;
-        let mut app_server =
-            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
-                .await
-                .expect("embedded app server");
+        let config_path = app.config.active_user_config_path()?;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&app.config)
+            .await
+            .expect("embedded app server");
 
         app.reload_live_user_config_and_followers(&mut app_server)
             .await?;
@@ -18882,7 +18885,7 @@ guardian_approval = true
         assert!(enabled_skills.contains(&"demo-skill".to_string()));
 
         std::fs::write(
-            app.config.codex_home.join("config.toml"),
+            &config_path,
             format!(
                 "[[skills.config]]\npath = \"{}\"\nenabled = false\n",
                 skill_path.display()
@@ -18900,12 +18903,12 @@ guardian_approval = true
     async fn set_skill_enabled_via_app_server_disables_skill_and_refreshes_live_state() -> Result<()>
     {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let _codex_home = install_test_user_config(&mut app, "")?;
         let skill_path = write_test_skill(&app.config.codex_home, "demo-skill")?;
-        std::fs::write(app.config.codex_home.join("config.toml"), "")?;
-        let mut app_server =
-            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
-                .await
-                .expect("embedded app server");
+        let config_path = app.config.active_user_config_path()?;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&app.config)
+            .await
+            .expect("embedded app server");
 
         app.reload_live_user_config_and_followers(&mut app_server)
             .await?;
@@ -18917,7 +18920,7 @@ guardian_approval = true
         let enabled_skills = app.chat_widget.enabled_skill_names_for_test();
         assert!(!enabled_skills.contains(&"demo-skill".to_string()));
 
-        let config = std::fs::read_to_string(app.config.codex_home.join("config.toml"))?;
+        let config = std::fs::read_to_string(config_path)?;
         assert!(config.contains("[[skills.config]]"));
         assert!(config.contains("enabled = false"));
         assert!(config.contains(&skill_path.display().to_string()));
@@ -18928,16 +18931,15 @@ guardian_approval = true
     async fn set_app_enabled_via_app_server_disables_app_and_refreshes_live_state() -> Result<()> {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
         let app_id = "demo_app".to_string();
+        let _codex_home = install_test_user_config(&mut app, "")?;
         let config_path = app.config.active_user_config_path()?;
-        std::fs::write(&config_path, "")?;
         app.chat_widget.on_connectors_loaded(
             Ok(test_connectors_snapshot(&app_id, /*enabled*/ true)),
             true,
         );
-        let mut app_server =
-            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
-                .await
-                .expect("embedded app server");
+        let mut app_server = crate::start_embedded_app_server_for_picker(&app.config)
+            .await
+            .expect("embedded app server");
 
         assert_eq!(app_enabled_in_effective_config(&app.config, &app_id), None);
         assert_eq!(
@@ -18967,16 +18969,15 @@ guardian_approval = true
     async fn set_app_enabled_via_app_server_supports_dotted_app_ids() -> Result<()> {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
         let app_id = "demo.app".to_string();
+        let _codex_home = install_test_user_config(&mut app, "")?;
         let config_path = app.config.active_user_config_path()?;
-        std::fs::write(&config_path, "")?;
         app.chat_widget.on_connectors_loaded(
             Ok(test_connectors_snapshot(&app_id, /*enabled*/ true)),
             true,
         );
-        let mut app_server =
-            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
-                .await
-                .expect("embedded app server");
+        let mut app_server = crate::start_embedded_app_server_for_picker(&app.config)
+            .await
+            .expect("embedded app server");
 
         app.set_app_enabled_via_app_server(&mut app_server, app_id.clone(), false)
             .await?;
@@ -19001,20 +19002,19 @@ guardian_approval = true
     async fn set_app_enabled_via_app_server_enables_app_and_refreshes_live_state() -> Result<()> {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
         let app_id = "demo_app".to_string();
-        let config_path = app.config.active_user_config_path()?;
-        std::fs::write(
-            &config_path,
+        let _codex_home = install_test_user_config(
+            &mut app,
             "[apps.demo_app]\nenabled = false\ndisabled_reason = \"user\"\n",
         )?;
+        let config_path = app.config.active_user_config_path()?;
         app.refresh_in_memory_config_from_disk().await?;
         app.chat_widget.on_connectors_loaded(
             Ok(test_connectors_snapshot(&app_id, /*enabled*/ false)),
             true,
         );
-        let mut app_server =
-            crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
-                .await
-                .expect("embedded app server");
+        let mut app_server = crate::start_embedded_app_server_for_picker(&app.config)
+            .await
+            .expect("embedded app server");
 
         assert_eq!(
             app_enabled_in_effective_config(&app.config, &app_id),
@@ -19086,6 +19086,7 @@ guardian_approval = true
     async fn set_app_enabled_keeps_previous_visible_state_when_local_refresh_fails() -> Result<()> {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
         let app_id = "demo_app";
+        let _codex_home = install_test_user_config(&mut app, "")?;
         let config_path = app.config.active_user_config_path()?;
         while app_event_rx.try_recv().is_ok() {}
         app.chat_widget
