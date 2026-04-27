@@ -46,9 +46,11 @@ Runtime modes:
 - `dev`: current local test path; the service expects `codex` on `PATH`, typically from the operator's Rust-built local Codex checkout. This mode is local-operator-only and is not a silent fallback for non-local/containerized/shared launches.
 - `prod`: placeholder only for now; the intended future path is a production-owned Codex runtime plus CLI-native auth retrieval from backend/JWT-backed state. The current service fails loud at startup if `prod` is selected.
 
+<!-- Merge-safety anchor: this service consumes the Codex CLI account/auth runtime through `codex exec`; it must not become a second account or provider-token owner. -->
+
 `SANGOI_CODEX_RUNTIME_MODE` must always be set explicitly. Copying `.env.example` into a local `.env` is the supported local convenience path. Launches that do not set runtime mode must fail closed instead of silently inheriting local `dev`.
 
-`CODEX_API_KEY` and other Codex auth/config are inherited from the host environment in `dev`. Do not treat that as the final production auth model.
+`CODEX_API_KEY`, `CODEX_HOME`, and other Codex auth/config are inherited from the host environment in `dev`; account roster, active-account selection, leases, usage, autoswitch, and request-auth derivation stay owned by the local Codex CLI runtime. This service does not read `auth.json`, carry provider tokens, or select active ChatGPT accounts itself. Do not treat inherited dev auth/config as the final production auth model.
 
 Even in future `prod`, `CODEX_HOME` remains writable and owns sessions, logs, skills, caches, and rollout state. It is not the final source of truth for provider auth, and file-backed `auth.json` is not the intended production truth.
 

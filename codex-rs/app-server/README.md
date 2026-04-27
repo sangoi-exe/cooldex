@@ -1439,6 +1439,8 @@ $demo-app Pull the latest updates from the team.
 
 The JSON-RPC auth/account surface exposes request/response methods plus server-initiated notifications (no `id`). Use these to determine auth state, start or cancel logins, logout, list/switch saved ChatGPT accounts, recover account leases, and inspect ChatGPT rate limits.
 
+The account roster, active saved-account selection, lease state, usage/rate-limit followers, and autoswitch-visible projection fields come from the CLI `AccountManager` owner. `account/read` reports the current auth state derived by `AuthManager` from that owner snapshot; it is not a second account-runtime source.
+
 ### Authentication modes
 
 The stable auth/account surface supports two normal authentication modes. `account/read` and `account/updated` both surface the current exact `authMode`, and ChatGPT display payloads continue to use the `chatgpt` account shape for label/email/plan presentation.
@@ -1489,7 +1491,7 @@ Field notes:
 
 - `refreshToken` (bool): set `true` to force a token refresh.
 - `requiresOpenaiAuth` reflects the active provider; when `false`, Codex can run without OpenAI credentials.
-- `authMode` (`apikey` | `chatgpt` | `chatgptAuthTokens` | `null`): the exact current auth owner. The experimental/internal `chatgptAuthTokens` value appears only when that auth path is active.
+- `authMode` (`apikey` | `chatgpt` | `chatgptAuthTokens` | `null`): the exact current auth mode. The experimental/internal `chatgptAuthTokens` value appears only when that auth path is active.
 - `activeChatgptStoreAccountId` (`string | null`): carries the stable store/workspace identity for the currently selected ChatGPT auth context. It can be non-null for saved-account ChatGPT auth and external `chatgptAuthTokens` auth, and is `null` when the current auth does not expose a ChatGPT store/workspace identity.
 
 ### 2) Manage saved ChatGPT accounts

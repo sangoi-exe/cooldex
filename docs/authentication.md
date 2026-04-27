@@ -28,6 +28,8 @@ When `keyring` or `auto` is used, the credentials are stored as a single seriali
 <!-- Merge-safety anchor: ChatGPT auth admission policy must stay aligned across `/accounts`, external token login, and hidden auth consumers. -->
 When using ChatGPT authentication, `auth.json` (or the keyring entry) stores a **versioned** auth store that can contain multiple ChatGPT accounts.
 
+`auth.json` is credential storage, not the live account-runtime owner. `AccountManager` owns the saved-account roster, runtime-active selection, leases, usage/rate-limit followers, autoswitch decisions, and `/accounts` projection fields. `AuthManager` owns auth derivation, token refresh/logout/revoke, API-key auth, external bearer flows, and request-auth materialization from AccountManager-loaded snapshots.
+
 - Each ChatGPT login **upserts** the account and makes it **active**.
 - Supported ChatGPT plans for saved-account auth are **Plus**, **Pro**, **Team**, **Business**, **Enterprise**, and **Edu**; unsupported plans fail the login, and stale unsupported accounts are purged on load or refresh if they are already present.
 - External ChatGPT token login (`chatgptAuthTokens`) follows the same supported-plan policy; missing or unsupported plans fail before ephemeral auth can become active.

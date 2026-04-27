@@ -26,6 +26,10 @@ The first shipped capability is bounded parsing of Santa Maria `informacoes urba
 
 - Keep this service dedicated to Sangoi. If a new capability is needed, add a new bounded route and prompt/schema pair instead of turning this package into a generic Codex session bridge.
 - `codex exec` is the runtime seam here. Do not import or mirror logic from `mcp-standalone`.
+
+<!-- Merge-safety anchor: mcp-sangoi-ia must consume the CLI account/auth runtime through `codex exec`, not grow its own account or provider-token owner. -->
+
+- Do not parse `auth.json`, carry provider tokens, or implement active-account selection in this service; `AccountManager` and `AuthManager` in the invoked Codex CLI own that runtime.
 - Current runtime split is explicit: `dev` uses the operator's local Codex CLI, while `prod` remains placeholder-only until the CLI grows its backend/JWT-backed auth retrieval path.
 - `SANGOI_CODEX_RUNTIME_MODE` must be explicit. Missing mode must fail closed instead of silently inheriting local `dev`.
 - In that future `prod` path, runtime JWT authenticates this service/CLI to the auth backend; provider tokens remain backend-owned and are not carried in the JWT.
@@ -35,4 +39,4 @@ The first shipped capability is bounded parsing of Santa Maria `informacoes urba
 
 ## Review metadata
 
-- Last reviewed: 2026-04-12
+- Last reviewed: 2026-04-26
