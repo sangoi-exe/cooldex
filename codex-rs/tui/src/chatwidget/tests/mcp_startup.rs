@@ -1,6 +1,11 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+// Merge-safety anchor: MCP startup warning assertions and the directly coupled
+// rendered snapshot must follow `new_warning_event(...)` prefix bytes so raw
+// span checks and terminal output stay tied to the same warning owner.
+const MCP_STARTUP_ALPHA_FAILED_WARNING: &str = "⚠  MCP startup incomplete (failed: alpha)\n";
+
 #[tokio::test]
 async fn mcp_startup_header_booting_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -117,7 +122,7 @@ async fn app_server_mcp_startup_failure_renders_warning_history() {
         .iter()
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
-    assert_eq!(summary_text, "⚠ MCP startup incomplete (failed: alpha)\n");
+    assert_eq!(summary_text, MCP_STARTUP_ALPHA_FAILED_WARNING);
     assert!(!chat.bottom_pane.is_task_running());
 
     let width: u16 = 120;
@@ -252,7 +257,7 @@ async fn app_server_mcp_startup_after_lag_can_settle_without_starting_updates() 
         .iter()
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
-    assert_eq!(summary_text, "⚠ MCP startup incomplete (failed: alpha)\n");
+    assert_eq!(summary_text, MCP_STARTUP_ALPHA_FAILED_WARNING);
     assert!(!chat.bottom_pane.is_task_running());
 }
 
@@ -468,7 +473,7 @@ async fn app_server_mcp_startup_next_round_keeps_terminal_statuses_after_startin
         .iter()
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
-    assert_eq!(summary_text, "⚠ MCP startup incomplete (failed: alpha)\n");
+    assert_eq!(summary_text, MCP_STARTUP_ALPHA_FAILED_WARNING);
     assert!(!chat.bottom_pane.is_task_running());
 }
 
