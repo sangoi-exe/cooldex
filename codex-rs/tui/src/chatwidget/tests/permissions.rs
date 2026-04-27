@@ -1,5 +1,12 @@
 use super::*;
+use codex_utils_approval_presets::guardian_approval_preset;
 use pretty_assertions::assert_eq;
+
+// Merge-safety anchor: `/permissions` row-label assertions must follow the
+// shared Guardian preset owner instead of preserving stale Auto-review aliases.
+fn guardian_approvals_label() -> &'static str {
+    guardian_approval_preset().label
+}
 
 #[tokio::test]
 async fn approvals_selection_popup_snapshot() {
@@ -339,7 +346,7 @@ async fn permissions_selection_history_snapshot_full_access_to_default() {
     chat.open_permissions_popup();
     let popup = render_bottom_popup(&chat, /*width*/ 120);
     chat.handle_key_event(KeyEvent::from(KeyCode::Up));
-    if popup.contains("Auto-review") {
+    if popup.contains(guardian_approvals_label()) {
         chat.handle_key_event(KeyEvent::from(KeyCode::Up));
     }
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
@@ -410,13 +417,13 @@ async fn permissions_selection_hides_guardian_approvals_when_feature_disabled() 
     let popup = render_bottom_popup(&chat, /*width*/ 120);
 
     assert!(
-        !popup.contains("Auto-review"),
-        "expected Auto-review to stay hidden until the experimental feature is enabled: {popup}"
+        !popup.contains(guardian_approvals_label()),
+        "expected Guardian Approvals to stay hidden until the experimental feature is enabled: {popup}"
     );
 }
 
 #[tokio::test]
-async fn permissions_selection_hides_guardian_approvals_when_feature_disabled_even_if_auto_review_is_active()
+async fn permissions_selection_shows_guardian_approvals_when_feature_disabled_if_guardian_review_is_active()
  {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     #[cfg(target_os = "windows")]
@@ -440,10 +447,11 @@ async fn permissions_selection_hides_guardian_approvals_when_feature_disabled_ev
 
     chat.open_permissions_popup();
     let popup = render_bottom_popup(&chat, /*width*/ 120);
+    let current_guardian_approvals_label = format!("{} (current)", guardian_approvals_label());
 
     assert!(
-        !popup.contains("Auto-review"),
-        "expected Auto-review to stay hidden when the experimental feature is disabled: {popup}"
+        popup.contains(&current_guardian_approvals_label),
+        "expected current Guardian Approvals routing to stay visible when the experimental feature is disabled: {popup}"
     );
 }
 
@@ -485,10 +493,11 @@ async fn permissions_selection_marks_guardian_approvals_current_after_session_co
 
     chat.open_permissions_popup();
     let popup = render_bottom_popup(&chat, /*width*/ 120);
+    let current_guardian_approvals_label = format!("{} (current)", guardian_approvals_label());
 
     assert!(
-        popup.contains("Auto-review (current)"),
-        "expected Auto-review to be current after SessionConfigured sync: {popup}"
+        popup.contains(&current_guardian_approvals_label),
+        "expected Guardian Approvals to be current after SessionConfigured sync: {popup}"
     );
 }
 
@@ -539,10 +548,11 @@ async fn permissions_selection_marks_guardian_approvals_current_with_custom_work
 
     chat.open_permissions_popup();
     let popup = render_bottom_popup(&chat, /*width*/ 120);
+    let current_guardian_approvals_label = format!("{} (current)", guardian_approvals_label());
 
     assert!(
-        popup.contains("Auto-review (current)"),
-        "expected Auto-review to be current even with custom workspace-write details: {popup}"
+        popup.contains(&current_guardian_approvals_label),
+        "expected Guardian Approvals to be current even with custom workspace-write details: {popup}"
     );
 }
 
@@ -577,7 +587,7 @@ async fn permissions_selection_can_disable_guardian_approvals() {
             event,
             AppEvent::UpdateApprovalsReviewer(ApprovalsReviewer::User)
         )),
-        "expected selecting Default from Auto-review to switch back to manual approval review: {events:?}"
+        "expected selecting Default from Guardian Approvals to switch back to manual approval review: {events:?}"
     );
     assert!(
         !events
@@ -623,8 +633,8 @@ async fn permissions_selection_sends_approvals_reviewer_in_override_turn_context
     assert!(
         popup
             .lines()
-            .any(|line| line.contains("Auto-review") && line.contains('›')),
-        "expected one Down from Default to select Auto-review: {popup}"
+            .any(|line| line.contains(guardian_approvals_label()) && line.contains('›')),
+        "expected one Down from Default to select Guardian Approvals: {popup}"
     );
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 

@@ -1895,29 +1895,6 @@ impl App {
         let mut approvals_reviewer_override = None;
         let mut sandbox_policy_override = None;
         let mut feature_updates_to_apply = Vec::with_capacity(updates.len());
-        // Auto-Review owns `approvals_reviewer`, but disabling the feature
-        // from inside a profile should not silently clear a value configured at
-        // the root scope.
-        let (
-            root_approvals_reviewer_blocks_profile_disable,
-            _profile_approvals_reviewer_configured,
-        ) = {
-            let effective_config = next_config.config_layer_stack.effective_config();
-            let root_blocks_disable = effective_config
-                .as_table()
-                .and_then(|table| table.get("approvals_reviewer"))
-                .is_some_and(|value| value != &TomlValue::String("user".to_string()));
-            let profile_configured = active_profile.as_deref().is_some_and(|profile| {
-                effective_config
-                    .as_table()
-                    .and_then(|table| table.get("profiles"))
-                    .and_then(TomlValue::as_table)
-                    .and_then(|profiles| profiles.get(profile))
-                    .and_then(TomlValue::as_table)
-                    .is_some_and(|profile_config| profile_config.contains_key("approvals_reviewer"))
-            });
-            (root_blocks_disable, profile_configured)
-        };
         let mut permissions_history_label: Option<&'static str> = None;
         let mut builder = ConfigEditsBuilder::new(&self.config.codex_home)
             .with_profile(self.active_profile.as_deref());
@@ -1925,16 +1902,6 @@ impl App {
         for (feature, enabled) in updates {
             let feature_key = feature.key();
             let mut feature_edits = Vec::new();
-            if feature == Feature::GuardianApproval
-                && !enabled
-                && self.active_profile.is_some()
-                && root_approvals_reviewer_blocks_profile_disable
-            {
-                self.chat_widget.add_error_message(
-                        "Cannot disable Auto-review in this profile because `approvals_reviewer` is configured outside the active profile.".to_string(),
-                    );
-                continue;
-            }
             let mut feature_config = next_config.clone();
             if let Err(err) = feature_config.features.set_enabled(feature, enabled) {
                 tracing::error!(

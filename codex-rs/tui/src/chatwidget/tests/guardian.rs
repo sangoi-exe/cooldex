@@ -1,6 +1,9 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+// Merge-safety anchor: Guardian denial/timeout rendered snapshots follow shared
+// warning-event prefix bytes and current terminal wrapping, not stale one-line output.
+
 #[tokio::test]
 async fn guardian_denied_exec_renders_warning_and_denied_request() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
