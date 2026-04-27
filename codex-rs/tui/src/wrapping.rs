@@ -12,11 +12,10 @@
 //!   `textwrap` with the caller's options unchanged. Used when the
 //!   content is known to be plain prose.
 //! - **Adaptive** (`adaptive_wrap_line`, `adaptive_wrap_lines`):
-//!   inspects the line for protected tokens; if any are found, the
-//!   wrapping switches to `AsciiSpace` word separation and a custom
-//!   `WordSplitter` that refuses to split URL-like tokens while still
-//!   allowing controlled intra-token wrapping for local paths and
-//!   ordinary words.
+//!   inspects each line for protected tokens. URL-bearing lines keep
+//!   URL-like tokens intact while still allowing long non-URL tokens to
+//!   wrap. Local-path-only lines keep ordinary prose on word boundaries
+//!   and split path tokens only when the path itself cannot fit.
 //!
 //! Callers that *might* encounter URLs or local path-like tokens should
 //! use the `adaptive_*` functions. Callers that definitely will not
@@ -576,14 +575,20 @@ fn preserve_url_and_path_wrap_options<'a>(opts: RtOptions<'a>) -> RtOptions<'a> 
         .break_words(/*break_words*/ false)
 }
 
+fn preserve_local_path_prose_wrap_options<'a>(opts: RtOptions<'a>) -> RtOptions<'a> {
+    opts.word_separator(textwrap::WordSeparator::AsciiSpace)
+        .word_splitter(textwrap::WordSplitter::NoHyphenation)
+        .break_words(/*break_words*/ false)
+}
+
 /// Reconfigures wrapping options so that URL-like tokens are never split while
 /// still allowing controlled wrapping for local paths.
 ///
 /// Sets `AsciiSpace` word separation (so `/` and `-` inside URLs and
 /// local paths are not treated as default break points), disables
 /// `break_words`, and installs a custom `WordSplitter` that returns no
-/// split points for URL-like tokens while still allowing local
-/// file-path tokens to wrap at explicit character boundaries under our
+/// split points for URL-like tokens or ordinary prose while still allowing
+/// local file-path tokens to wrap at explicit path boundaries under our
 /// control instead of relying on terminal autowrap.
 pub(crate) fn protected_token_wrap_options<'a>(opts: RtOptions<'a>) -> RtOptions<'a> {
     opts.word_separator(textwrap::WordSeparator::AsciiSpace)
@@ -602,35 +607,46 @@ fn split_non_url_or_path_word(word: &str) -> Vec<usize> {
 /// Custom `textwrap::WordSplitter` callback.
 ///
 /// URL-like tokens return no split points so they stay intact for
-/// clickability. Local file-path-like tokens return character
+/// clickability. Local file-path-like tokens return path-aware
 /// boundaries so transcript wrapping stays deterministic and does not
-/// depend on terminal autowrap behavior. Everything else also returns
-/// character boundaries.
+/// depend on terminal autowrap behavior. Ordinary prose returns no
+/// split points so local-path lines wrap at word boundaries.
 fn split_non_protected_word(word: &str) -> Vec<usize> {
     if is_url_like_token(word) {
         return Vec::new();
     }
 
-    if let Some(suffix_start) = local_path_location_suffix_start(word) {
-        return word
-            .char_indices()
-            .skip(1)
-            .map(|(idx, _)| idx)
-            .filter(|idx| *idx <= suffix_start)
-            .collect();
+    if !is_local_path_like_token(word) {
+        return Vec::new();
     }
 
-    word.char_indices().skip(1).map(|(idx, _)| idx).collect()
+    let suffix_start = local_path_location_suffix_start(word);
+    let path_boundaries: Vec<usize> = word
+        .char_indices()
+        .map(|(idx, character)| (idx + character.len_utf8(), character))
+        .filter(|(idx, _)| *idx < word.len())
+        .filter(|(idx, _)| suffix_start.is_none_or(|suffix_start| *idx <= suffix_start))
+        .filter_map(|(idx, character)| matches!(character, '/' | '\\' | '-').then_some(idx))
+        .collect();
+
+    if !path_boundaries.is_empty() {
+        return path_boundaries;
+    }
+
+    word.char_indices()
+        .skip(1)
+        .map(|(idx, _)| idx)
+        .filter(|idx| suffix_start.is_none_or(|suffix_start| *idx <= suffix_start))
+        .collect()
 }
 
 /// Wraps a single ratatui `Line`, automatically switching to
 /// protected-token-preserving options when the line contains a URL-like
 /// or local path-like token.
 ///
-/// When no URL is detected, wrapping behavior is identical to
-/// [`word_wrap_line`]. When a protected token is detected, the line is
-/// wrapped with [`protected_token_wrap_options`] — protected tokens stay
-/// intact while other words on the same line still break normally.
+/// Lines with URLs keep URL tokens intact while allowing long non-URL tokens
+/// to wrap. Lines with only local paths keep ordinary prose on word
+/// boundaries and split local path tokens only when the path itself cannot fit.
 #[must_use]
 pub(crate) fn adaptive_wrap_line<'a>(line: &'a Line<'a>, base: RtOptions<'a>) -> Vec<Line<'a>> {
     if let Some(split_before_path) = split_before_local_path_token_if_better(line, &base) {
@@ -645,7 +661,7 @@ fn select_adaptive_wrap_options<'a>(line: &Line<'a>, base: RtOptions<'a>) -> RtO
         preserve_url_and_path_wrap_options(base)
     } else if line_contains_local_path_like(line) {
         if local_path_tokens_fit_in_available_width(line, &base) {
-            preserve_url_and_path_wrap_options(base)
+            preserve_local_path_prose_wrap_options(base)
         } else {
             protected_token_wrap_options(base)
         }
@@ -663,13 +679,16 @@ fn split_before_local_path_token_if_better<'a>(
     // Merge-safety anchor: dense list/file-ref turns only split before a local path when moving
     // the path to the continuation line materially improves fit; if the list marker or short
     // prefix still fits with the path on the first line, keep them together to avoid marker-only
-    // rows and live-vs-resume transcript drift.
+    // rows and live-vs-resume transcript drift. Local-path lines must also wrap ordinary words at
+    // spaces, while URL-plus-long-token lines keep their mixed-token wrapping behavior.
     if !line_contains_local_path_like(line) {
         return None;
     }
 
-    let mut pending_line = line_to_static(line);
-    let mut pending_opts = rt_options_to_static(base);
+    let original_line = line_to_static(line);
+    let original_opts = rt_options_to_static(base);
+    let mut pending_line = original_line.clone();
+    let mut pending_opts = original_opts.clone();
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut split_any = false;
 
@@ -694,7 +713,15 @@ fn split_before_local_path_token_if_better<'a>(
         &pending_line,
         select_adaptive_wrap_options(&pending_line, pending_opts),
     ));
-    Some(retag_owned_lines(out))
+    let baseline = word_wrap_line_owned(
+        &original_line,
+        select_adaptive_wrap_options(&original_line, original_opts),
+    );
+    if out.len() < baseline.len() {
+        Some(retag_owned_lines(out))
+    } else {
+        None
+    }
 }
 
 fn split_before_local_path_token_once(
@@ -1678,6 +1705,53 @@ them."#
                 "- .sangoi/planning/2026-04-10-codex-cli-rust-full-remediation-master-plan.md:294"
                     .to_string(),
                 "  stays aligned".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn adaptive_wrap_line_keeps_ordinary_words_on_local_path_lines() {
+        let line = Line::from(concat!(
+            "- codex-rs/README.md:93: core is the agent/business logic, tui is the ",
+            "terminal UI, exec is the headless automation surface, and cli is the ",
+            "top-level multitool binary."
+        ));
+
+        let out = adaptive_wrap_line(
+            &line,
+            RtOptions::new(/*width*/ 70).subsequent_indent("  ".into()),
+        );
+        let rendered: Vec<String> = out.iter().map(concat_line).collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "- codex-rs/README.md:93: core is the agent/business logic, tui is the".to_string(),
+                "  terminal UI, exec is the headless automation surface, and cli is the"
+                    .to_string(),
+                "  top-level multitool binary.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn adaptive_wrap_line_keeps_short_command_prefix_with_first_local_path_when_no_split_is_better()
+    {
+        let line =
+            Line::from("git add tui/src/render/mod.rs tui/src/render/renderable.rs this time");
+
+        let out = adaptive_wrap_line(
+            &line,
+            RtOptions::new(/*width*/ 26).subsequent_indent("  ".into()),
+        );
+        let rendered: Vec<String> = out.iter().map(concat_line).collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "git add tui/src/render/".to_string(),
+                "  mod.rs tui/src/render/".to_string(),
+                "  renderable.rs this time".to_string(),
             ]
         );
     }

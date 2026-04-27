@@ -321,9 +321,14 @@ mod tests {
             .iter()
             .position(|cmd| *cmd == "diff")
             .expect("expected /diff in default popup order");
+        let copy_idx = cmds
+            .iter()
+            .position(|cmd| *cmd == "copy")
+            .expect("expected /copy in default popup order");
 
         assert_eq!(subagents_idx, sanitize_idx + 1);
-        assert_eq!(diff_idx, subagents_idx + 1);
+        assert_eq!(copy_idx, subagents_idx + 1);
+        assert_eq!(diff_idx, copy_idx + 1);
     }
 
     #[test]

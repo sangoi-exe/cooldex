@@ -1,6 +1,9 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+// Merge-safety anchor: app-server warning and collab-wait history followers must stay aligned with
+// `history_cell::new_warning_event(...)` and explicit wait-state rendering owners.
+
 #[tokio::test]
 async fn collab_spawn_end_shows_requested_model_and_effort() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
@@ -389,7 +392,12 @@ async fn live_app_server_collab_wait_items_render_history() {
                 model: None,
                 reasoning_effort: None,
                 agents_states: HashMap::new(),
-                wait_state: None,
+                wait_state: Some(codex_app_server_protocol::CollabWaitState {
+                    return_when: codex_app_server_protocol::CollabWaitReturnWhen::AnyFinal,
+                    disable_timeout: false,
+                    condition_enabled: false,
+                    timed_out: None,
+                }),
             },
         }),
         /*replay_kind*/ None,
@@ -437,7 +445,12 @@ async fn live_app_server_collab_wait_items_render_history() {
                         },
                     ),
                 ]),
-                wait_state: None,
+                wait_state: Some(codex_app_server_protocol::CollabWaitState {
+                    return_when: codex_app_server_protocol::CollabWaitReturnWhen::AnyFinal,
+                    disable_timeout: false,
+                    condition_enabled: false,
+                    timed_out: None,
+                }),
             },
         }),
         /*replay_kind*/ None,
@@ -680,7 +693,7 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
 
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1);
-    assert_eq!(lines_to_single_string(&cells[0]), "⚠ server overloaded\n");
+    assert_eq!(lines_to_single_string(&cells[0]), "⚠  server overloaded\n");
     assert!(!chat.bottom_pane.is_task_running());
 }
 
