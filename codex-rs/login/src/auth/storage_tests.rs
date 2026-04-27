@@ -1,7 +1,11 @@
 use super::*;
+use crate::auth::PreflightAuthState;
+use crate::auth::load_auth_preflight_state;
 use crate::token_data::IdTokenInfo;
 use anyhow::Context;
 use base64::Engine;
+use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::RateLimitWindow;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::tempdir;
@@ -35,6 +39,72 @@ async fn file_storage_load_returns_auth_dot_json() -> anyhow::Result<()> {
 
     let loaded = storage.load().context("failed to load auth file")?;
     assert_eq!(Some(auth_store_from_legacy(auth_dot_json)), loaded);
+    Ok(())
+}
+
+#[test]
+fn auth_store_loads_old_usage_cache_without_losing_accounts() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let (expected, value) = auth_store_with_old_usage_cache()?;
+    std::fs::write(
+        get_auth_file(codex_home.path()),
+        serde_json::to_string(&value)?,
+    )?;
+
+    let loaded = storage.load()?.context("auth store should load")?;
+
+    assert_eq!(loaded, expected);
+    Ok(())
+}
+
+#[test]
+fn preflight_accepts_old_usage_cache_without_relogin() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let (_, value) = auth_store_with_old_usage_cache()?;
+    std::fs::write(
+        get_auth_file(codex_home.path()),
+        serde_json::to_string(&value)?,
+    )?;
+
+    let preflight = load_auth_preflight_state(
+        codex_home.path(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        Some("workspace-legacy-cache"),
+    )?;
+
+    assert_eq!(
+        preflight,
+        PreflightAuthState::Chatgpt {
+            has_matching_workspace: true
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn versioned_auth_store_parse_errors_do_not_fallback_to_legacy() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    std::fs::write(
+        get_auth_file(codex_home.path()),
+        r#"{"version":1,"active_account_id":"missing","accounts":[]}"#,
+    )?;
+
+    let err = storage
+        .load()
+        .expect_err("invalid versioned store should fail");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string()
+            .contains("failed to parse versioned auth.json")
+    );
+    assert!(
+        err.to_string()
+            .contains("active_account_id 'missing' does not exist")
+    );
     Ok(())
 }
 
@@ -219,6 +289,109 @@ fn auth_with_prefix(prefix: &str) -> AuthStore {
         last_refresh: None,
         agent_identity: None,
     })
+}
+
+fn supported_chatgpt_id_token_with_prefix(prefix: &str, workspace_id: &str) -> IdTokenInfo {
+    #[derive(Serialize)]
+    struct Header {
+        alg: &'static str,
+        typ: &'static str,
+    }
+
+    let header = Header {
+        alg: "none",
+        typ: "JWT",
+    };
+    let payload = json!({
+        "email": format!("{prefix}@example.com"),
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "team",
+            "chatgpt_user_id": format!("user-{prefix}"),
+            "chatgpt_account_id": workspace_id,
+        },
+    });
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header_b64 = encode(&serde_json::to_vec(&header).expect("serialize header"));
+    let payload_b64 = encode(&serde_json::to_vec(&payload).expect("serialize payload"));
+    let signature_b64 = encode(b"sig");
+    let fake_jwt = format!("{header_b64}.{payload_b64}.{signature_b64}");
+
+    crate::token_data::parse_chatgpt_jwt_claims(&fake_jwt).expect("fake JWT should parse")
+}
+
+fn fixed_usage_time() -> chrono::DateTime<Utc> {
+    chrono::DateTime::parse_from_rfc3339("2026-04-27T04:51:00Z")
+        .expect("fixed time should parse")
+        .with_timezone(&Utc)
+}
+
+fn auth_store_with_old_usage_cache() -> anyhow::Result<(AuthStore, serde_json::Value)> {
+    let workspace_id = "workspace-legacy-cache";
+    let store_account_id = format!("chatgpt-user:user-legacy-cache:workspace:{workspace_id}");
+    let expected = AuthStore {
+        active_account_id: Some(store_account_id.clone()),
+        accounts: vec![StoredAccount {
+            id: store_account_id,
+            label: Some("Legacy usage cache".to_string()),
+            tokens: TokenData {
+                id_token: supported_chatgpt_id_token_with_prefix("legacy-cache", workspace_id),
+                access_token: "legacy-cache-access".to_string(),
+                refresh_token: "legacy-cache-refresh".to_string(),
+                account_id: Some(workspace_id.to_string()),
+            },
+            last_refresh: Some(fixed_usage_time()),
+            usage: Some(AccountUsageCache {
+                last_rate_limits: Some(RateLimitSnapshot {
+                    limit_id: Some("codex".to_string()),
+                    limit_name: None,
+                    primary: Some(RateLimitWindow {
+                        remaining_percent: 53.0,
+                        window_minutes: Some(300),
+                        resets_at: Some(1_777_283_454),
+                    }),
+                    secondary: Some(RateLimitWindow {
+                        remaining_percent: 20.0,
+                        window_minutes: Some(10_080),
+                        resets_at: Some(1_777_596_056),
+                    }),
+                    credits: None,
+                    plan_type: None,
+                    rate_limit_reached_type: None,
+                }),
+                exhausted_until: None,
+                last_seen_at: Some(fixed_usage_time()),
+            }),
+        }],
+        ..AuthStore::default()
+    };
+    let mut value = serde_json::to_value(&expected)?;
+    replace_remaining_percent_with_used_percent(
+        &mut value,
+        "/accounts/0/usage/last_rate_limits/primary",
+        47.0,
+    )?;
+    replace_remaining_percent_with_used_percent(
+        &mut value,
+        "/accounts/0/usage/last_rate_limits/secondary",
+        80.0,
+    )?;
+    Ok((expected, value))
+}
+
+fn replace_remaining_percent_with_used_percent(
+    value: &mut serde_json::Value,
+    pointer: &str,
+    used_percent: f64,
+) -> anyhow::Result<()> {
+    let window = value
+        .pointer_mut(pointer)
+        .and_then(serde_json::Value::as_object_mut)
+        .context("rate-limit window should exist")?;
+    window
+        .remove("remaining_percent")
+        .context("remaining_percent should exist before legacy rewrite")?;
+    window.insert("used_percent".to_string(), json!(used_percent));
+    Ok(())
 }
 
 #[test]

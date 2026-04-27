@@ -125,7 +125,11 @@ pub struct StoredAccount {
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Default)]
 pub struct AccountUsageCache {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_cached_rate_limits"
+    )]
     pub last_rate_limits: Option<RateLimitSnapshot>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,6 +137,53 @@ pub struct AccountUsageCache {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<DateTime<Utc>>,
+}
+
+fn deserialize_cached_rate_limits<'de, D>(
+    deserializer: D,
+) -> Result<Option<RateLimitSnapshot>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(mut value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    migrate_legacy_cached_rate_limit_windows(&mut value).map_err(serde::de::Error::custom)?;
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+// Account usage in auth.json is cache data; normalize old cache windows here so
+// stale usage cannot invalidate the saved-account roster.
+fn migrate_legacy_cached_rate_limit_windows(value: &mut serde_json::Value) -> Result<(), String> {
+    for window_key in ["primary", "secondary"] {
+        let Some(window) = value
+            .get_mut(window_key)
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if window.contains_key("remaining_percent") {
+            continue;
+        }
+        let Some(used_percent) = window
+            .get("used_percent")
+            .and_then(serde_json::Value::as_f64)
+        else {
+            continue;
+        };
+        let remaining_percent = 100.0 - used_percent;
+        let remaining_percent =
+            serde_json::Number::from_f64(remaining_percent).ok_or_else(|| {
+                format!("invalid legacy used_percent in cached {window_key} rate-limit window")
+            })?;
+        window.insert(
+            "remaining_percent".to_string(),
+            serde_json::Value::Number(remaining_percent),
+        );
+    }
+    Ok(())
 }
 
 impl AuthStore {
@@ -526,19 +577,36 @@ pub(super) fn create_auth_storage(
 }
 
 fn parse_auth_store(contents: &str) -> std::io::Result<AuthStore> {
-    match serde_json::from_str::<AuthStore>(contents) {
-        Ok(mut store) => {
-            store.normalize_account_ids();
-            store.validate()?;
-            Ok(store)
-        }
-        Err(_) => {
-            let legacy: AuthDotJson = serde_json::from_str(contents).map_err(|err| {
-                std::io::Error::other(format!("failed to parse auth.json: {err}"))
-            })?;
-            Ok(AuthStore::from_legacy(legacy))
-        }
+    let value = serde_json::from_str::<serde_json::Value>(contents)
+        .map_err(|err| invalid_auth_store(format!("failed to parse auth.json: {err}")))?;
+
+    if is_versioned_auth_store(&value) {
+        return parse_versioned_auth_store(value);
     }
+
+    let legacy: AuthDotJson = serde_json::from_value(value)
+        .map_err(|err| invalid_auth_store(format!("failed to parse auth.json: {err}")))?;
+    Ok(AuthStore::from_legacy(legacy))
+}
+
+fn is_versioned_auth_store(value: &serde_json::Value) -> bool {
+    value.get("version").is_some()
+        || value.get("accounts").is_some()
+        || value.get("active_account_id").is_some()
+}
+
+fn parse_versioned_auth_store(value: serde_json::Value) -> std::io::Result<AuthStore> {
+    let mut store: AuthStore = serde_json::from_value(value)
+        .map_err(|err| invalid_auth_store(format!("failed to parse versioned auth.json: {err}")))?;
+    store.normalize_account_ids();
+    store
+        .validate()
+        .map_err(|err| invalid_auth_store(format!("failed to parse versioned auth.json: {err}")))?;
+    Ok(store)
+}
+
+fn invalid_auth_store(message: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
 fn create_auth_storage_with_keyring_store(
