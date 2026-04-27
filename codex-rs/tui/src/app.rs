@@ -13753,13 +13753,16 @@ mod tests {
         app.complete_thread_prompt_gc_cycle(thread_id).await;
         app.set_thread_prompt_gc_context_usage(thread_id, Some(token_usage_info))
             .await;
-        assert_eq!(app.chat_widget.status_line_text(), Some("60% left".into()));
+        assert_eq!(
+            app.chat_widget.status_line_text(),
+            Some("Context 60% left".into())
+        );
 
         app.set_thread_prompt_gc_activity(thread_id, true).await;
 
         let status_line = app.chat_widget.status_line_text().unwrap_or_default();
         assert!(
-            !status_line.contains("60% left"),
+            !status_line.contains("Context 60% left"),
             "expected second cycle start to clear stale prompt-GC status line, got {status_line}"
         );
     }
@@ -13834,6 +13837,8 @@ mod tests {
             last_token_usage: last_token_usage.clone(),
             model_context_window: Some(13_000),
         };
+        app.chat_widget
+            .setup_status_line(vec![crate::bottom_pane::StatusLineItem::ContextRemaining]);
         app.ensure_thread_channel(thread_id);
         app.active_thread_id = Some(thread_id);
         app.handle_codex_event_now(Event {
@@ -13864,9 +13869,9 @@ mod tests {
             .chat_widget
             .status_line_text()
             .expect("status line should be present");
-        assert!(
-            status_line.contains("60% left"),
-            "expected prompt-GC status line to include context-left, got: {status_line}"
+        assert_eq!(
+            status_line, "Context 60% left",
+            "expected prompt-GC status line to include context-left"
         );
         assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(60));
         assert_eq!(
@@ -14164,13 +14169,16 @@ mod tests {
         app.complete_primary_prompt_gc_cycle().await;
         app.set_primary_prompt_gc_context_usage(Some(token_usage_info))
             .await;
-        assert_eq!(app.chat_widget.status_line_text(), Some("60% left".into()));
+        assert_eq!(
+            app.chat_widget.status_line_text(),
+            Some("Context 60% left".into())
+        );
 
         app.set_primary_prompt_gc_activity(true).await;
 
         let status_line = app.chat_widget.status_line_text().unwrap_or_default();
         assert!(
-            !status_line.contains("60% left"),
+            !status_line.contains("Context 60% left"),
             "expected second cycle start to clear stale primary prompt-GC status line, got {status_line}"
         );
     }
@@ -14348,7 +14356,10 @@ mod tests {
 
         app.replay_thread_snapshot(snapshot, false);
 
-        assert_eq!(app.chat_widget.status_line_text(), Some("60% left".into()));
+        assert_eq!(
+            app.chat_widget.status_line_text(),
+            Some("Context 60% left".into())
+        );
         assert_eq!(app.chat_widget.context_window_percent_for_test(), Some(60));
         assert_eq!(
             app.chat_widget.token_usage(),
@@ -14450,7 +14461,7 @@ mod tests {
         app.chat_widget
             .apply_external_edit("queued follow-up".to_string());
         app.chat_widget
-            .handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let input_state = app
             .chat_widget
             .capture_thread_input_state()
@@ -14508,7 +14519,7 @@ mod tests {
         app.chat_widget
             .apply_external_edit("queued follow-up".to_string());
         app.chat_widget
-            .handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let input_state = app
             .chat_widget
             .capture_thread_input_state()
@@ -14567,7 +14578,7 @@ mod tests {
         let input_state = app
             .chat_widget
             .capture_thread_input_state()
-            .expect("expected pending-steer state");
+            .expect("expected queued follow-up state");
 
         let (chat_widget, _app_event_tx, _rx, mut new_op_rx) =
             make_chatwidget_manual_with_sender().await;
@@ -14623,7 +14634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_thread_snapshot_does_not_submit_queue_before_replay_catches_up() {
+    async fn replay_thread_snapshot_does_not_submit_pending_steer_before_replay_catches_up() {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
         let thread_id = ThreadId::new();
         let session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
@@ -14639,11 +14650,11 @@ mod tests {
         app.chat_widget
             .apply_external_edit("queued follow-up".to_string());
         app.chat_widget
-            .handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let input_state = app
             .chat_widget
             .capture_thread_input_state()
-            .expect("expected queued follow-up state");
+            .expect("expected pending-steer state");
 
         let (chat_widget, _app_event_tx, _rx, mut new_op_rx) =
             make_chatwidget_manual_with_sender().await;
