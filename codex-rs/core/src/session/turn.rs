@@ -952,7 +952,7 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit(
         return Ok(false);
     }
 
-    let refresh_state = refresh_accounts_rate_limits_before_auto_switch(sess, turn_context).await;
+    let refresh_state = refresh_accounts_rate_limits_before_auto_switch(sess, turn_context).await?;
     maybe_auto_switch_account_on_usage_limit_with_refreshed_account_state(
         sess,
         turn_context,
@@ -1196,20 +1196,24 @@ pub(crate) async fn maybe_emit_transport_fallback_warning_for_execution_mode(
 // account; ambiguous `Unknown` accounts must never enter this set.
 pub(crate) fn auto_switch_refresh_account_ids_from_roster(
     roster: AccountRateLimitRefreshRoster,
-) -> Option<Vec<String>> {
+) -> CodexResult<Vec<String>> {
     match roster.status {
         AccountRateLimitRefreshRosterStatus::LeaseManaged
-        | AccountRateLimitRefreshRosterStatus::NoLeaseOwner => Some(roster.store_account_ids),
-        AccountRateLimitRefreshRosterStatus::LeaseReadFailed => None,
+        | AccountRateLimitRefreshRosterStatus::NoLeaseOwner => Ok(roster.store_account_ids),
+        AccountRateLimitRefreshRosterStatus::LeaseReadFailed => {
+            Err(CodexErr::Io(std::io::Error::other(
+                "failed to read account lease state before usage-limit auto-switch",
+            )))
+        }
     }
 }
 
 pub(crate) async fn refresh_accounts_rate_limits_before_auto_switch(
     sess: &Session,
     turn_context: &TurnContext,
-) -> AutoSwitchRefreshState {
+) -> CodexResult<AutoSwitchRefreshState> {
     if cfg!(test) && !turn_context.usage_limit_auto_switch_pre_refresh_enabled_in_tests() {
-        return AutoSwitchRefreshState::default();
+        return Ok(AutoSwitchRefreshState::default());
     }
 
     let refresh_roster = match sess
@@ -1220,19 +1224,15 @@ pub(crate) async fn refresh_accounts_rate_limits_before_auto_switch(
     {
         Ok(roster) => roster,
         Err(error) => {
-            warn!(
-                error = %error,
-                "failed to load account refresh roster before usage-limit auto-switch"
-            );
-            return AutoSwitchRefreshState::default();
+            return Err(CodexErr::Io(error.into_io_error()));
         }
     };
-    let Some(account_ids) = auto_switch_refresh_account_ids_from_roster(refresh_roster) else {
-        warn!("failed to load lease-aware refresh roster before usage-limit auto-switch");
-        return AutoSwitchRefreshState::default();
-    };
+    // Merge-safety anchor: usage-limit autoswitch may only restrict fallback
+    // selection with a known fresh roster; owner/lease read failures must surface
+    // instead of becoming an empty fresh-candidate set.
+    let account_ids = auto_switch_refresh_account_ids_from_roster(refresh_roster)?;
     if account_ids.is_empty() {
-        return AutoSwitchRefreshState::default();
+        return Ok(AutoSwitchRefreshState::default());
     }
     let mut outcomes = Vec::new();
     let mut refresh_state = AutoSwitchRefreshState::default();
@@ -1373,7 +1373,7 @@ pub(crate) async fn refresh_accounts_rate_limits_before_auto_switch(
     }
 
     if outcomes.is_empty() {
-        return refresh_state;
+        return Ok(refresh_state);
     }
 
     match sess
@@ -1396,7 +1396,7 @@ pub(crate) async fn refresh_accounts_rate_limits_before_auto_switch(
         }
     }
 
-    refresh_state
+    Ok(refresh_state)
 }
 
 fn auto_switch_refresh_snapshot_is_selectable(

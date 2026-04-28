@@ -2438,22 +2438,25 @@ fn auto_switch_refresh_account_ids_from_roster_retains_only_refreshable_candidat
         auto_switch_refresh_account_ids_from_roster(codex_login::AccountRateLimitRefreshRoster {
             store_account_ids: vec!["account-a".to_string(), "account-b".to_string()],
             status: codex_login::AccountRateLimitRefreshRosterStatus::LeaseManaged,
-        }),
-        Some(vec!["account-a".to_string(), "account-b".to_string()]),
+        })
+        .expect("lease-managed roster should be refreshable"),
+        vec!["account-a".to_string(), "account-b".to_string()],
     );
     assert_eq!(
         auto_switch_refresh_account_ids_from_roster(codex_login::AccountRateLimitRefreshRoster {
             store_account_ids: vec!["account-a".to_string()],
             status: codex_login::AccountRateLimitRefreshRosterStatus::NoLeaseOwner,
-        }),
-        Some(vec!["account-a".to_string()]),
+        })
+        .expect("roster without lease owner should be refreshable"),
+        vec!["account-a".to_string()],
     );
-    assert_eq!(
+    assert!(
         auto_switch_refresh_account_ids_from_roster(codex_login::AccountRateLimitRefreshRoster {
             store_account_ids: vec!["account-a".to_string()],
             status: codex_login::AccountRateLimitRefreshRosterStatus::LeaseReadFailed,
-        }),
-        None,
+        })
+        .is_err(),
+        "lease-read failure must not become a successful empty refresh roster"
     );
 }
 
@@ -2507,8 +2510,9 @@ async fn usage_limit_auto_switch_pre_refresh_stays_default_off_without_test_opt_
         .mount(&server)
         .await;
 
-    let refresh_state =
-        refresh_accounts_rate_limits_before_auto_switch(&session, &turn_context).await;
+    let refresh_state = refresh_accounts_rate_limits_before_auto_switch(&session, &turn_context)
+        .await
+        .expect("test-disabled pre-refresh should be an empty successful state");
 
     assert_eq!(
         refresh_state.freshly_selectable_store_account_ids,

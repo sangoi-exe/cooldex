@@ -259,8 +259,18 @@ ON CONFLICT(account_id) DO UPDATE SET
         lease_ttl_seconds: i64,
     ) -> Result<SessionActiveAccountRefresh> {
         let mut connection = self.lock_connection()?;
-        let transaction = write_transaction(&mut connection)?;
         let now_epoch = now.timestamp();
+        if let Some(account_id) = load_refreshable_session_active_account_without_write(
+            &connection,
+            session_id,
+            codex_session_id,
+            now_epoch,
+            lease_ttl_seconds,
+        )? {
+            return Ok(SessionActiveAccountRefresh::Active(account_id));
+        }
+
+        let transaction = write_transaction(&mut connection)?;
         let account_id = match load_session_active_account_id(&transaction, session_id)? {
             Some(account_id) => Some(account_id),
             None => match codex_session_id {
@@ -541,6 +551,95 @@ fn load_session_active_account_id(
         )
         .optional()
         .map_err(Into::into)
+}
+
+fn load_refreshable_session_active_account_without_write(
+    connection: &Connection,
+    session_id: &str,
+    codex_session_id: Option<&str>,
+    now_epoch: i64,
+    lease_ttl_seconds: i64,
+) -> Result<Option<String>> {
+    let Some((account_id, row_codex_session_id)) = connection
+        .query_row(
+            r#"
+SELECT account_id, codex_session_id
+FROM session_active_account
+WHERE session_id = ?
+            "#,
+            [session_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    if row_codex_session_id.as_deref() != codex_session_id {
+        return Ok(None);
+    }
+
+    let Some((lease_session_id, lease_codex_session_id, lease_until)) = connection
+        .query_row(
+            r#"
+SELECT session_id, codex_session_id, lease_until
+FROM account_leases
+WHERE account_id = ?
+            "#,
+            [account_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    if lease_session_id != session_id || lease_codex_session_id.as_deref() != codex_session_id {
+        return Ok(None);
+    }
+
+    let renewal_headroom_seconds = std::cmp::max(1, lease_ttl_seconds / 2);
+    if lease_until <= now_epoch + renewal_headroom_seconds {
+        return Ok(None);
+    }
+
+    let Some(codex_session_id) = codex_session_id else {
+        return Ok(Some(account_id));
+    };
+    let sibling_session_rows = connection.query_row(
+        r#"
+SELECT COUNT(*)
+FROM session_active_account
+WHERE codex_session_id = ? AND session_id != ?
+        "#,
+        params![codex_session_id, session_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if sibling_session_rows != 0 {
+        return Ok(None);
+    }
+
+    let mismatched_lease_rows = connection.query_row(
+        r#"
+SELECT COUNT(*)
+FROM account_leases
+WHERE codex_session_id = ? AND account_id != ?
+        "#,
+        params![codex_session_id, account_id.as_str()],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if mismatched_lease_rows != 0 {
+        return Ok(None);
+    }
+
+    // Merge-safety anchor: same-session runtime hydrate is a read-mostly path; when
+    // the active lease has ample headroom and no logical-session cleanup is due, do
+    // not renew SQLite rows on every auth/list/request-auth read.
+    Ok(Some(account_id))
 }
 
 fn load_force_released_account_owners(
@@ -918,7 +1017,7 @@ ORDER BY account_id
                 .refresh_session_active_account(
                     "session-a",
                     None,
-                    now + chrono::Duration::seconds(30),
+                    now + chrono::Duration::seconds(151),
                     300,
                 )
                 .expect("refresh owned lease"),
@@ -964,7 +1063,7 @@ ORDER BY account_id
             let result = contending_store.refresh_session_active_account(
                 "session-a",
                 None,
-                now + chrono::Duration::seconds(30),
+                now + chrono::Duration::seconds(151),
                 300,
             );
             result_tx.send(result).expect("send contender result");
@@ -992,6 +1091,157 @@ ORDER BY account_id
         assert_eq!(
             refresh,
             SessionActiveAccountRefresh::Active("account-a".to_string())
+        );
+        contender.join().expect("join contender thread");
+    }
+
+    #[test]
+    fn runtime_lease_refresh_uses_read_only_fast_path_with_headroom() {
+        let sqlite_home = TempDir::new().expect("tempdir");
+        let lock_holder =
+            AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open lock holder");
+        let contending_store =
+            AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open contender");
+        let now = fixed_now();
+
+        assert_eq!(
+            lock_holder
+                .set_session_active_account("session-a", None, "account-a", now, 300)
+                .expect("assign initial lease"),
+            SessionActiveAccountSetOutcome::Assigned
+        );
+
+        let mut held_connection = lock_holder
+            .lock_connection()
+            .expect("lock writer connection");
+        let held_transaction =
+            write_transaction(&mut held_connection).expect("hold writer transaction");
+        let (result_tx, result_rx) = mpsc::channel();
+        let contender = thread::spawn(move || {
+            let result = contending_store.refresh_session_active_account(
+                "session-a",
+                None,
+                now + chrono::Duration::seconds(30),
+                300,
+            );
+            result_tx.send(result).expect("send contender result");
+        });
+
+        let refresh = match result_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(result) => result.expect("read-only refresh should succeed while writer is held"),
+            Err(error) => {
+                held_transaction
+                    .commit()
+                    .expect("release held writer after timeout");
+                drop(held_connection);
+                contender.join().expect("join contender after timeout");
+                panic!("read-only lease refresh waited for the held writer: {error}");
+            }
+        };
+        assert_eq!(
+            refresh,
+            SessionActiveAccountRefresh::Active("account-a".to_string())
+        );
+        held_transaction.commit().expect("release held writer");
+        drop(held_connection);
+        contender.join().expect("join contender thread");
+    }
+
+    #[test]
+    fn runtime_lease_refresh_waits_when_logical_session_collapse_needed() {
+        let sqlite_home = TempDir::new().expect("tempdir");
+        let lock_holder =
+            AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open lock holder");
+        let contending_store =
+            AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open contender");
+        let now = fixed_now();
+        {
+            let connection = lock_holder.lock_connection().expect("lock seed connection");
+            upsert_session_active_account(
+                &connection,
+                "runtime-a",
+                "account-a",
+                Some("codex-session-1"),
+                now.timestamp(),
+            )
+            .expect("seed active runtime row");
+            upsert_account_lease(
+                &connection,
+                "account-a",
+                "runtime-a",
+                Some("codex-session-1"),
+                (now + chrono::Duration::seconds(300)).timestamp(),
+                now.timestamp(),
+            )
+            .expect("seed active lease");
+            upsert_session_active_account(
+                &connection,
+                "runtime-b",
+                "account-a",
+                Some("codex-session-1"),
+                (now + chrono::Duration::seconds(1)).timestamp(),
+            )
+            .expect("seed sibling runtime row needing collapse");
+        }
+
+        ACCOUNT_STATE_BUSY_HANDLER_OBSERVED.store(false, Ordering::SeqCst);
+        {
+            let connection = contending_store
+                .lock_connection()
+                .expect("lock contender connection");
+            connection
+                .busy_handler(Some(observe_account_state_busy_handler))
+                .expect("install busy observer");
+        }
+
+        let mut held_connection = lock_holder
+            .lock_connection()
+            .expect("lock writer connection");
+        let held_transaction =
+            write_transaction(&mut held_connection).expect("hold writer transaction");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let contender = thread::spawn(move || {
+            started_tx.send(()).expect("notify contender started");
+            let result = contending_store.refresh_session_active_account(
+                "runtime-a",
+                Some("codex-session-1"),
+                now + chrono::Duration::seconds(30),
+                300,
+            );
+            result_tx.send(result).expect("send contender result");
+        });
+
+        started_rx.recv().expect("wait for contender start");
+        let contention_wait_started = Instant::now();
+        while !ACCOUNT_STATE_BUSY_HANDLER_OBSERVED.load(Ordering::SeqCst) {
+            if let Ok(result) = result_rx.try_recv() {
+                panic!("logical-session refresh completed before waiting on writer: {result:?}");
+            }
+            assert!(
+                contention_wait_started.elapsed() < Duration::from_secs(1),
+                "logical-session refresh did not reach SQLite busy handling"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        held_transaction.commit().expect("release held writer");
+        drop(held_connection);
+        let refresh = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wait for contending refresh")
+            .expect("logical-session refresh should succeed after writer release");
+        assert_eq!(
+            refresh,
+            SessionActiveAccountRefresh::Active("account-a".to_string())
+        );
+        assert_eq!(
+            load_session_active_rows(&lock_holder),
+            vec![SessionActiveAccountRow {
+                session_id: "runtime-a".to_string(),
+                account_id: "account-a".to_string(),
+                codex_session_id: Some("codex-session-1".to_string()),
+            }]
         );
         contender.join().expect("join contender thread");
     }
