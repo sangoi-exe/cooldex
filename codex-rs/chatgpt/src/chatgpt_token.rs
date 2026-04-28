@@ -14,7 +14,10 @@ pub async fn load_chatgpt_request_auth(
     // Merge-safety anchor: ChatGPT request snapshots must be derived from the
     // caller's lease-bearing AuthManager; never construct a hidden AccountManager
     // or reintroduce a process-global token owner here.
-    Ok(auth_manager.chatgpt_request_auth().await)
+    auth_manager
+        .chatgpt_request_auth()
+        .await
+        .map_err(codex_login::AccountRuntimeLoadError::into_io_error)
 }
 
 #[cfg(test)]
@@ -57,7 +60,7 @@ mod tests {
         std::fs::create_dir_all(&config.sqlite_home)?;
 
         let auth_manager =
-            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)?;
         let request_auth = load_chatgpt_request_auth(auth_manager.as_ref()).await?;
 
         assert_eq!(request_auth, None);

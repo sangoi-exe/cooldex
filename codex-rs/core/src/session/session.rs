@@ -352,16 +352,17 @@ impl Session {
         let config_for_mcp = Arc::clone(&config);
         let mcp_manager_for_mcp = Arc::clone(&mcp_manager);
         let auth_and_mcp_fut = async move {
-            let auth = auth_manager_clone.auth().await;
+            let auth = auth_manager_clone.auth().await?;
+            let request_auth = auth_manager_clone.chatgpt_request_auth().await?;
             let mcp_servers = mcp_manager_for_mcp
-                .effective_servers(&config_for_mcp, auth.as_ref())
+                .effective_servers(&config_for_mcp, request_auth.as_ref())
                 .await;
             let auth_statuses = compute_auth_statuses(
                 mcp_servers.iter(),
                 config_for_mcp.mcp_oauth_credentials_store_mode,
             )
             .await;
-            (auth, mcp_servers, auth_statuses)
+            Ok::<_, anyhow::Error>((auth, request_auth, mcp_servers, auth_statuses))
         }
         .instrument(info_span!(
             "session_init.auth_mcp",
@@ -372,8 +373,9 @@ impl Session {
         let (
             rollout_recorder_and_state_db,
             (history_log_id, history_entry_count),
-            (auth, mcp_servers, auth_statuses),
+            auth_and_mcp,
         ) = tokio::join!(rollout_fut, history_meta_fut, auth_and_mcp_fut);
+        let (auth, request_auth, mcp_servers, auth_statuses) = auth_and_mcp?;
 
         let (rollout_recorder, state_db_ctx) = rollout_recorder_and_state_db.map_err(|e| {
             error!("failed to initialize rollout recorder: {e:#}");
@@ -802,7 +804,7 @@ impl Session {
                 session_configuration.cwd.to_path_buf(),
             ),
             config.codex_home.to_path_buf(),
-            codex_apps_tools_cache_key(auth),
+            codex_apps_tools_cache_key(request_auth.as_ref()),
             tool_plugin_provenance,
         )
         .instrument(info_span!(

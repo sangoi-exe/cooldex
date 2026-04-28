@@ -417,7 +417,7 @@ pub(crate) async fn start_app_server_for_picker(
     start_app_server_for_picker_with_auth_manager(
         config,
         target,
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false),
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)?,
         environment_manager,
     )
     .await
@@ -857,7 +857,8 @@ pub async fn run_main(
         startup_forced_chatgpt_workspace_id,
         /*enable_codex_api_key_env*/ false,
         resolve_cli_auth_credentials_store_mode_for_config_toml(&config_toml),
-    );
+    )
+    .map_err(codex_login::AccountRuntimeLoadError::into_io_error)?;
     let cloud_requirements = cloud_requirements_loader(
         startup_auth_manager.clone(),
         chatgpt_base_url.clone(),
@@ -1851,7 +1852,11 @@ async fn load_resume_or_fork_config_with_fresh_cloud_requirements(
         linked_codex_session_id,
         /*enable_codex_api_key_env*/ false,
         bootstrap_config.cli_auth_credentials_store_mode,
-    );
+    )
+    .unwrap_or_else(|err| {
+        eprintln!("Error loading auth manager: {err}");
+        std::process::exit(1);
+    });
     let cloud_requirements = cloud_requirements_loader(
         auth_manager.clone(),
         bootstrap_config.chatgpt_base_url.clone(),
@@ -1994,7 +1999,7 @@ mod tests {
         config: Config,
     ) -> color_eyre::Result<InProcessAppServerClient> {
         let auth_manager =
-            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)?;
         start_embedded_app_server(EmbeddedAppServerStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
             config,
@@ -2428,7 +2433,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let config = build_config(&temp_dir).await?;
         let auth_manager =
-            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)?;
         let result = start_embedded_app_server_with(
             EmbeddedAppServerStartArgs {
                 arg0_paths: Arg0DispatchPaths::default(),

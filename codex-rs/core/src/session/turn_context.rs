@@ -5,8 +5,18 @@ use codex_model_provider::create_model_provider;
 // Merge-safety anchor: image-generation tool exposure must follow the same ChatGPT-capable auth
 // surface as the local external-token runtime, not only the persistent ChatGPT account mode.
 pub(super) fn image_generation_tool_auth_allowed(auth_manager: Option<&AuthManager>) -> bool {
+    let auth_mode = auth_manager.and_then(|auth_manager| match auth_manager.auth_mode() {
+        Ok(auth_mode) => auth_mode,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "disabling image generation tool because auth owner could not be loaded"
+            );
+            None
+        }
+    });
     matches!(
-        auth_manager.and_then(AuthManager::auth_mode),
+        auth_mode,
         Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)
     )
 }
@@ -90,13 +100,26 @@ impl TurnContext {
         let is_chatgpt_auth = self
             .auth_manager
             .as_deref()
-            .and_then(AuthManager::auth_cached)
+            .and_then(|auth_manager| match auth_manager.auth_cached() {
+                Ok(auth) => auth,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "treating apps as disabled because auth owner could not be loaded"
+                    );
+                    None
+                }
+            })
             .as_ref()
             .is_some_and(CodexAuth::is_chatgpt_auth);
         self.features.apps_enabled_for_auth(is_chatgpt_auth)
     }
 
-    pub(crate) async fn with_model(&self, model: String, models_manager: &ModelsManager) -> Self {
+    pub(crate) async fn with_model(
+        &self,
+        model: String,
+        models_manager: &ModelsManager,
+    ) -> CodexResult<Self> {
         let mut config = (*self.config).clone();
         config.model = Some(model.clone());
         let model_info = models_manager
@@ -131,11 +154,12 @@ impl TurnContext {
             /*developer_instructions*/ None,
         );
         let features = self.features.clone();
+        let available_models = models_manager
+            .list_models(RefreshStrategy::OnlineIfUncached)
+            .await?;
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
-            available_models: &models_manager
-                .list_models(RefreshStrategy::OnlineIfUncached)
-                .await,
+            available_models: &available_models,
             features: &features,
             image_generation_tool_auth_allowed: image_generation_tool_auth_allowed(
                 self.auth_manager.as_deref(),
@@ -156,7 +180,7 @@ impl TurnContext {
             &config.agent_roles,
         ));
 
-        Self {
+        Ok(Self {
             sub_id: self.sub_id.clone(),
             trace_id: self.trace_id.clone(),
             realtime_active: self.realtime_active,
@@ -204,7 +228,7 @@ impl TurnContext {
             #[cfg(test)]
             allow_usage_limit_auto_switch_pre_refresh_in_tests: self
                 .allow_usage_limit_auto_switch_pre_refresh_in_tests,
-        }
+        })
     }
 
     #[cfg(test)]

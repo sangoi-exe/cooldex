@@ -170,7 +170,7 @@ async fn mcp_resource_read_returns_error_for_unknown_thread() -> Result<()> {
         .await?;
     let config = Arc::new(config);
     let auth_manager =
-        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false);
+        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false)?;
     // This negative-path test does not need the stdio subprocess; keeping it
     // in-process avoids child-process teardown timing in nextest leak detection.
     let client = in_process::start(InProcessStartArgs {

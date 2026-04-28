@@ -994,7 +994,8 @@ mod tests {
             auth_manager: SharedAuthManager::shared_from_config(
                 config.as_ref(),
                 /*enable_codex_api_key_env*/ false,
-            ),
+            )
+            .expect("create test auth manager"),
             config,
             cli_overrides: Vec::new(),
             loader_overrides: LoaderOverrides::default(),
@@ -2012,7 +2013,8 @@ mod tests {
         let auth_manager = SharedAuthManager::shared_from_config(
             config.as_ref(),
             /*enable_codex_api_key_env*/ false,
-        );
+        )
+        .expect("create test auth manager");
         let environment_manager = Arc::new(EnvironmentManager::new(Some(
             "ws://127.0.0.1:8765".to_string(),
         )));
@@ -2048,7 +2050,8 @@ mod tests {
         let auth_manager = SharedAuthManager::shared_from_config(
             config.as_ref(),
             /*enable_codex_api_key_env*/ false,
-        );
+        )
+        .expect("create test auth manager");
         let environment_manager = Arc::new(EnvironmentManager::new(Some(
             "ws://127.0.0.1:8765".to_string(),
         )));

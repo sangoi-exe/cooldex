@@ -1054,7 +1054,16 @@ impl MessageProcessor {
             }
         };
         let auth_snapshot =
-            connectors::load_connector_auth_snapshot(self.auth_manager.as_ref()).await;
+            match connectors::load_connector_auth_snapshot(self.auth_manager.as_ref()).await {
+                Ok(auth_snapshot) => auth_snapshot,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to load connector auth for apps list refresh after experimental feature enablement"
+                    );
+                    return;
+                }
+            };
         if !config
             .features
             .apps_enabled_for_auth(auth_snapshot.is_some())
@@ -1064,9 +1073,7 @@ impl MessageProcessor {
 
         let outgoing = Arc::clone(&self.outgoing);
         tokio::spawn(async move {
-            let auth = auth_snapshot
-                .as_ref()
-                .map(connectors::ChatGptConnectorAuthSnapshot::codex_auth);
+            let auth = auth_snapshot.as_ref().map(|snapshot| snapshot.request_auth());
             let (all_connectors_result, accessible_connectors_result) = tokio::join!(
                 connectors::list_all_connectors_with_options(
                     &config,

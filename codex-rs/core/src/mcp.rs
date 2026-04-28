@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::plugins::PluginsManager;
 use codex_config::McpServerConfig;
-use codex_login::CodexAuth;
+use codex_login::ChatGptRequestAuth;
 use codex_mcp::ToolPluginProvenance;
 use codex_mcp::configured_mcp_servers;
 use codex_mcp::effective_mcp_servers;
@@ -28,7 +28,7 @@ impl McpManager {
     pub async fn effective_servers(
         &self,
         config: &Config,
-        auth: Option<&CodexAuth>,
+        auth: Option<&ChatGptRequestAuth>,
     ) -> HashMap<String, McpServerConfig> {
         let mcp_config = config.to_mcp_config(self.plugins_manager.as_ref()).await;
         effective_mcp_servers(&mcp_config, auth)

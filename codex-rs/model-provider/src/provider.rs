@@ -29,18 +29,18 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
     fn auth_manager(&self) -> Option<Arc<AuthManager>>;
 
     /// Returns the current provider-scoped auth value, if one is configured.
-    async fn auth(&self) -> Option<CodexAuth>;
+    async fn auth(&self) -> codex_protocol::error::Result<Option<CodexAuth>>;
 
     /// Returns provider configuration adapted for the API client.
     async fn api_provider(&self) -> codex_protocol::error::Result<Provider> {
-        let auth = self.auth().await;
+        let auth = self.auth().await?;
         self.info()
             .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))
     }
 
     /// Returns the auth provider used to attach request credentials.
     async fn api_auth(&self) -> codex_protocol::error::Result<SharedAuthProvider> {
-        let auth = self.auth().await;
+        let auth = self.auth().await?;
         resolve_provider_auth(auth.as_ref(), self.info())
     }
 }
@@ -77,10 +77,13 @@ impl ModelProvider for ConfiguredModelProvider {
         self.auth_manager.clone()
     }
 
-    async fn auth(&self) -> Option<CodexAuth> {
+    async fn auth(&self) -> codex_protocol::error::Result<Option<CodexAuth>> {
         match self.auth_manager.as_ref() {
-            Some(auth_manager) => auth_manager.auth().await,
-            None => None,
+            Some(auth_manager) => auth_manager
+                .auth()
+                .await
+                .map_err(|error| codex_protocol::error::CodexErr::Io(error.into_io_error())),
+            None => Ok(None),
         }
     }
 }

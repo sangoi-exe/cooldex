@@ -43,11 +43,12 @@ pub fn normalize_base_url(input: &str) -> String {
     base_url
 }
 
-pub fn auth_manager_from_config(config: &Config) -> Arc<AuthManager> {
+pub fn auth_manager_from_config(config: &Config) -> anyhow::Result<Arc<AuthManager>> {
     // Merge-safety anchor: cloud-task ChatGPT headers are a config-aware
     // production auth path, so AuthManager must receive sqlite_home and forced
     // workspace together before cached auth or account-state leases hydrate.
     AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
+        .map_err(anyhow::Error::from)
 }
 
 /// Build headers for ChatGPT-backed requests from the command's request-auth snapshot.

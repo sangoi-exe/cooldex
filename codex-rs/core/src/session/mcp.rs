@@ -182,7 +182,16 @@ impl Session {
         mcp_servers: HashMap<String, McpServerConfig>,
         store_mode: OAuthCredentialsStoreMode,
     ) {
-        let auth = self.services.auth_manager.auth().await;
+        let auth = match self.services.auth_manager.chatgpt_request_auth().await {
+            Ok(auth) => auth,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to load ChatGPT request auth for Codex Apps MCP refresh"
+                );
+                None
+            }
+        };
         let config = self.get_config().await;
         let mcp_config = config
             .to_mcp_config(self.services.plugins_manager.as_ref())

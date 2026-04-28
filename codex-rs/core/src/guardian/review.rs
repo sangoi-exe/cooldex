@@ -369,6 +369,14 @@ pub(super) async fn run_guardian_review_session(
         .models_manager
         .list_models(codex_models_manager::manager::RefreshStrategy::Offline)
         .await;
+    let available_models = match available_models {
+        Ok(models) => models,
+        Err(err) => {
+            return GuardianReviewOutcome::Completed(Err(anyhow::anyhow!(
+                "failed to load guardian review models: {err}"
+            )));
+        }
+    };
     let preferred_reasoning_effort = |supports_low: bool, fallback| {
         if supports_low {
             Some(codex_protocol::openai_models::ReasoningEffort::Low)

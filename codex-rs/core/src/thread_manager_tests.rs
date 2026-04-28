@@ -498,7 +498,7 @@ async fn new_uses_configured_openai_provider_for_model_refresh() {
         /*analytics_events_client*/ None,
     );
 
-    let _ = manager.list_models(RefreshStrategy::Online).await;
+    let _ = manager.list_models(RefreshStrategy::Online).await.expect("list models");
     assert_eq!(models_mock.requests().len(), 1);
 }
 

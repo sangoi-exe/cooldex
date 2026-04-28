@@ -93,7 +93,7 @@ use url::Url;
 
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
-use codex_login::CodexAuth;
+use codex_login::ChatGptRequestAuth;
 use codex_utils_plugins::mcp_connector::is_connector_id_allowed;
 use codex_utils_plugins::mcp_connector::sanitize_name;
 
@@ -119,22 +119,15 @@ fn sha1_hex(s: &str) -> String {
     format!("{sha1:x}")
 }
 
-pub fn codex_apps_tools_cache_key(auth: Option<&CodexAuth>) -> CodexAppsToolsCacheKey {
-    let token_data = auth.and_then(|auth| auth.get_token_data().ok());
-    let account_id = token_data
-        .as_ref()
-        .and_then(|token_data| token_data.account_id.clone());
-    let chatgpt_user_id = token_data
-        .as_ref()
-        .and_then(|token_data| token_data.id_token.chatgpt_user_id.clone());
-    let is_workspace_account = token_data
-        .as_ref()
-        .is_some_and(|token_data| token_data.id_token.is_workspace_account());
-
+pub fn codex_apps_tools_cache_key(
+    auth: Option<&ChatGptRequestAuth>,
+) -> CodexAppsToolsCacheKey {
     CodexAppsToolsCacheKey {
-        account_id,
-        chatgpt_user_id,
-        is_workspace_account,
+        account_id: auth.map(|auth| auth.account_id().to_string()),
+        chatgpt_user_id: auth
+            .and_then(ChatGptRequestAuth::chatgpt_user_id)
+            .map(str::to_string),
+        is_workspace_account: auth.is_some_and(ChatGptRequestAuth::is_workspace_account),
     }
 }
 
@@ -697,7 +690,7 @@ impl McpConnectionManager {
     pub fn effective_servers(
         &self,
         config: &McpConfig,
-        auth: Option<&CodexAuth>,
+        auth: Option<&ChatGptRequestAuth>,
     ) -> HashMap<String, McpServerConfig> {
         effective_mcp_servers(config, auth)
     }

@@ -186,7 +186,8 @@ pub(super) async fn make_chatwidget_manual(
     let current_collaboration_mode = base_mode;
     let active_collaboration_mask = collaboration_modes::default_mask(model_catalog.as_ref());
     let auth_manager =
-        codex_login::AuthManager::shared_from_config(&cfg, /*enable_codex_api_key_env*/ false);
+        codex_login::AuthManager::shared_from_config(&cfg, /*enable_codex_api_key_env*/ false)
+            .expect("create test auth manager");
     let mut widget = ChatWidget {
         app_event_tx,
         codex_op_target: super::CodexOpTarget::Direct(op_tx),

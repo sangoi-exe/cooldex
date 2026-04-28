@@ -356,6 +356,7 @@ fn status_account_displays_match(
 #[cfg(test)]
 fn auth_manager_from_config(config: &Config) -> Arc<AuthManager> {
     AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
+        .expect("create test auth manager")
 }
 
 async fn best_effort_resume_history_turns(
@@ -529,6 +530,22 @@ fn removed_active_account_needs_projection_refresh(
     active_store_account_id_before_refresh == Some(removed_store_account_id)
 }
 
+fn active_store_account_id_from_account_manager(auth_manager: &AuthManager) -> Option<String> {
+    match auth_manager.account_manager().list_accounts() {
+        Ok(accounts) => accounts
+            .into_iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to load active store account id from account manager"
+            );
+            None
+        }
+    }
+}
+
 fn spawn_next_accounts_rate_limit_fetch(
     join_set: &mut tokio::task::JoinSet<AccountsRateLimitFetchOutcome>,
     pending: &mut impl Iterator<Item = String>,
@@ -540,9 +557,8 @@ fn spawn_next_accounts_rate_limit_fetch(
         let base_url = base_url.to_string();
         join_set.spawn(async move {
             let account_id_for_log = store_account_id.clone();
-            let active_store_account_id_before_refresh = auth_manager
-                .active_chatgpt_account_summary()
-                .map(|summary| summary.store_account_id);
+            let active_store_account_id_before_refresh =
+                active_store_account_id_from_account_manager(auth_manager.as_ref());
             match auth_manager
                 .resolve_chatgpt_auth_for_store_account_id(
                     &store_account_id,
@@ -553,7 +569,10 @@ fn spawn_next_accounts_rate_limit_fetch(
                 Ok(ChatgptAccountAuthResolution::Auth(auth)) => {
                     let snapshots = match tokio::time::timeout(
                         ACCOUNTS_RATE_LIMIT_FETCH_TIMEOUT,
-                        crate::chatwidget::fetch_rate_limits(base_url, *auth),
+                        crate::chatwidget::fetch_rate_limits(
+                            base_url,
+                            auth.request_auth().clone(),
+                        ),
                     )
                     .await
                     {
@@ -625,9 +644,25 @@ async fn fetch_accounts_rate_limit_updates(
     auth_manager: Arc<AuthManager>,
 ) -> AccountsRateLimitRefreshResult {
     const MAX_IN_FLIGHT: usize = 4;
-    let refresh_roster = auth_manager
+    let refresh_roster = match auth_manager
         .account_manager()
-        .account_rate_limit_refresh_roster();
+        .account_rate_limit_refresh_roster()
+    {
+        Ok(roster) => roster,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to load account rate-limit refresh roster"
+            );
+            return AccountsRateLimitRefreshResult {
+                outcomes: Vec::new(),
+                attempted_fetches: 0,
+                successful_fetches: 0,
+                projection_refresh_needed: false,
+                roster_status: AccountRateLimitRefreshRosterStatus::LeaseReadFailed,
+            };
+        }
+    };
     let Some(pending_store_account_ids) =
         accounts_rate_limit_refresh_pending_store_account_ids(refresh_roster.clone())
     else {
@@ -2201,10 +2236,20 @@ impl App {
     }
 
     fn recompute_accounts_status_cache_expiry(&mut self, now: DateTime<Utc>) {
-        self.accounts_status_cache_expires_at = self
+        self.accounts_status_cache_expires_at = match self
             .auth_manager
             .account_manager()
-            .accounts_rate_limits_cache_expires_at(now);
+            .accounts_rate_limits_cache_expires_at(now)
+        {
+            Ok(expires_at) => expires_at,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to load accounts status cache expiry"
+                );
+                None
+            }
+        };
     }
 
     fn accounts_status_cache_is_active(&self, now: DateTime<Utc>) -> bool {
@@ -2224,10 +2269,17 @@ impl App {
 
         // Merge-safety anchor: `/accounts` UX depends on this refresh gate to avoid stale account
         // usage data before `chat_widget.open_accounts_popup()`.
-        if !matches!(
-            self.auth_manager.get_auth_mode(),
-            Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)
-        ) {
+        let auth_mode = match self.auth_manager.get_api_auth_mode() {
+            Ok(auth_mode) => auth_mode,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to load auth mode before accounts status refresh"
+                );
+                None
+            }
+        };
+        if !matches!(auth_mode, Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)) {
             self.pending_forced_accounts_status_refresh = false;
             self.accounts_status_cache_expires_at = None;
             if self.open_accounts_popup_when_cache_ready {
@@ -2399,41 +2451,54 @@ impl App {
     }
 
     fn sync_chat_widget_account_state_from_auth_manager(&mut self) {
-        match self.auth_manager.get_auth_mode() {
-            Some(AuthMode::ApiKey) => {
+        match self.auth_manager.get_api_auth_mode() {
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to sync chat widget account state from auth manager"
+                );
+                self.apply_chat_widget_account_state(None, None, false);
+            }
+            Ok(None) => {
+                self.apply_chat_widget_account_state(None, None, false);
+            }
+            Ok(Some(AuthMode::ApiKey)) => {
                 self.apply_chat_widget_account_state(
                     Some(StatusAccountDisplay::ApiKey),
                     None,
                     false,
                 );
             }
-            Some(AuthMode::Chatgpt) | Some(AuthMode::ChatgptAuthTokens) => {
-                let accounts = self.auth_manager.account_manager().list_accounts();
-                let status_account_display =
-                    accounts
-                        .iter()
-                        .find(|account| account.is_active)
-                        .map(|account| StatusAccountDisplay::ChatGpt {
-                            label: account.label.clone(),
-                            email: account.email.clone(),
-                            plan: None,
-                        });
+            Ok(Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)) => {
+                let accounts = match self.auth_manager.account_manager().list_accounts() {
+                    Ok(accounts) => accounts,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to list accounts while syncing chat widget account state"
+                        );
+                        self.apply_chat_widget_account_state(None, None, false);
+                        return;
+                    }
+                };
+                let status_account_display = accounts.iter().find(|account| account.is_active).map(
+                    |account| StatusAccountDisplay::ChatGpt {
+                        label: account.label.clone(),
+                        email: account.email.clone(),
+                        plan: None,
+                    },
+                );
                 self.apply_chat_widget_account_state(
                     status_account_display,
                     None,
                     !accounts.is_empty(),
                 );
             }
-            None => {
-                self.apply_chat_widget_account_state(None, None, false);
-            }
         }
     }
 
     fn active_store_account_id_from_auth_manager(&self) -> Option<String> {
-        self.auth_manager
-            .active_chatgpt_account_summary()
-            .map(|summary| summary.store_account_id)
+        active_store_account_id_from_account_manager(self.auth_manager.as_ref())
     }
 
     fn observed_active_store_account_id_for_projection_owner(
@@ -2576,6 +2641,7 @@ impl App {
         let current_account_id = self
             .auth_manager
             .auth_cached()
+            .map_err(|err| format!("failed to load cached auth: {err}"))?
             .as_ref()
             .and_then(CodexAuth::get_account_id);
         if current_account_id.as_deref() == Some(previous_account_id) {
@@ -2619,6 +2685,7 @@ impl App {
         let previous_active_store_account_id = self
             .auth_manager
             .auth_cached()
+            .map_err(|err| ThreadlessChatgptAuthRefreshError::Other(err.to_string()))?
             .as_ref()
             .and_then(CodexAuth::active_chatgpt_account_summary)
             .map(|summary| summary.store_account_id);
@@ -2698,6 +2765,7 @@ impl App {
         let current_account_id = self
             .auth_manager
             .auth_cached()
+            .map_err(|err| ThreadlessChatgptAuthRefreshError::Other(err.to_string()))?
             .as_ref()
             .and_then(CodexAuth::get_account_id);
         let local_auth = match current_account_id.as_deref() {
@@ -2708,10 +2776,7 @@ impl App {
                 self.config.forced_chatgpt_workspace_id.as_deref(),
             ),
             None => {
-                let Some(active_store_account_id) = self
-                    .auth_manager
-                    .active_chatgpt_account_summary()
-                    .map(|summary| summary.store_account_id)
+                let Some(active_store_account_id) = self.active_store_account_id_from_auth_manager()
                 else {
                     return Err(ThreadlessChatgptAuthRefreshError::Other(
                         "failed to load refreshed local ChatGPT auth: no session-active local ChatGPT account is available"
@@ -6024,9 +6089,7 @@ impl App {
         let observed_active_store_account_id =
             Self::observed_active_store_account_id_for_projection_owner(
                 remote_app_server_url.as_deref(),
-                auth_manager
-                    .active_chatgpt_account_summary()
-                    .map(|summary| summary.store_account_id),
+                active_store_account_id_from_account_manager(auth_manager.as_ref()),
                 bootstrap.active_store_account_id.clone(),
             );
 
@@ -6966,7 +7029,7 @@ impl App {
                     });
                     return Ok(AppRunControl::Continue);
                 }
-                if let Err(err) = self.auth_manager.reload_strict() {
+                if let Err(err) = self.auth_manager.reload() {
                     self.chat_widget
                         .add_error_message(format!("Failed to reload auth store: {err}"));
                     return Ok(AppRunControl::Continue);
@@ -7201,20 +7264,30 @@ impl App {
                     }
                     return Ok(AppRunControl::Continue);
                 }
-                let display = self
+                let display = match self
                     .auth_manager
                     .account_manager()
                     .list_accounts()
-                    .into_iter()
-                    .find(|account| account.id == account_id)
-                    .map(|account| {
-                        format_account_display(
-                            account.label.as_deref(),
-                            account.email.as_deref(),
-                            &account_id,
-                        )
-                    })
-                    .unwrap_or(display);
+                {
+                    Ok(accounts) => accounts
+                        .into_iter()
+                        .find(|account| account.id == account_id)
+                        .map(|account| {
+                            format_account_display(
+                                account.label.as_deref(),
+                                account.email.as_deref(),
+                                &account_id,
+                            )
+                        })
+                        .unwrap_or(display),
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to load accounts for account selection display"
+                        );
+                        display
+                    }
+                };
                 match self
                     .auth_manager
                     .account_manager()
@@ -7275,11 +7348,20 @@ impl App {
                     return Ok(AppRunControl::Continue);
                 }
 
-                if !self
+                let has_saved_chatgpt_accounts = match self
                     .auth_manager
                     .account_manager()
                     .has_saved_chatgpt_accounts()
-                    && !self.config.model_provider.requires_openai_auth
+                {
+                    Ok(has_saved_accounts) => has_saved_accounts,
+                    Err(error) => {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to load saved ChatGPT accounts: {error}"
+                        ));
+                        return Ok(AppRunControl::Continue);
+                    }
+                };
+                if !has_saved_chatgpt_accounts && !self.config.model_provider.requires_openai_auth
                 {
                     self.chat_widget.add_error_message(
                         "'/accounts' add needs saved ChatGPT accounts or an OpenAI-auth provider."
@@ -10204,9 +10286,7 @@ mod tests {
         });
 
         assert_eq!(
-            app.auth_manager
-                .active_chatgpt_account_summary()
-                .map(|summary| summary.store_account_id),
+            active_store_account_id_from_account_manager(app.auth_manager.as_ref()),
             Some(primary_store_account_id)
         );
         assert_eq!(
@@ -10226,9 +10306,7 @@ mod tests {
         ));
 
         assert_eq!(
-            app.auth_manager
-                .active_chatgpt_account_summary()
-                .map(|summary| summary.store_account_id),
+            active_store_account_id_from_account_manager(app.auth_manager.as_ref()),
             Some(secondary_store_account_id)
         );
         assert_eq!(
@@ -12257,9 +12335,7 @@ mod tests {
         );
         assert_eq!(format!("{:?}", shared_state.status()), "Pending");
         assert_ne!(
-            app.auth_manager
-                .active_chatgpt_account_summary()
-                .map(|summary| summary.store_account_id),
+            active_store_account_id_from_account_manager(app.auth_manager.as_ref()),
             Some(login_success.store_account_id.clone()),
             "add-account outcome must not mutate active account before app-server owner runs"
         );
@@ -12626,9 +12702,7 @@ mod tests {
         );
         assert_eq!(
             app.observed_active_store_account_id,
-            app.auth_manager
-                .active_chatgpt_account_summary()
-                .map(|summary| summary.store_account_id)
+            active_store_account_id_from_account_manager(app.auth_manager.as_ref())
         );
     }
 
@@ -12676,10 +12750,8 @@ mod tests {
 
         assert_eq!(response.chatgpt_account_id, "account-a");
         assert_eq!(
-            app.auth_manager
-                .active_chatgpt_account_summary()
-                .expect("session-active account should remain available")
-                .store_account_id,
+            active_store_account_id_from_account_manager(app.auth_manager.as_ref())
+                .expect("session-active account should remain available"),
             primary_store_account_id
         );
         assert_eq!(
@@ -12700,6 +12772,7 @@ mod tests {
         assert_eq!(
             app.auth_manager
                 .auth_cached()
+                .expect("load cached auth")
                 .as_ref()
                 .and_then(CodexAuth::get_account_id),
             Some("account-a".to_string())
@@ -12727,14 +12800,13 @@ mod tests {
         assert_eq!(
             app.auth_manager
                 .auth_cached()
+                .expect("load cached auth")
                 .as_ref()
                 .and_then(CodexAuth::get_account_id),
             Some("account-b".to_string())
         );
         assert_eq!(
-            app.auth_manager
-                .active_chatgpt_account_summary()
-                .map(|summary| summary.store_account_id),
+            app.active_store_account_id_from_auth_manager(),
             Some(secondary_store_account_id)
         );
     }
@@ -12749,9 +12821,7 @@ mod tests {
         app.select_local_chatgpt_account_for_threadless_refresh(Some("account-a"))
             .expect("requested workspace should select the matching saved account");
         assert_eq!(
-            app.auth_manager
-                .active_chatgpt_account_summary()
-                .map(|summary| summary.store_account_id),
+            active_store_account_id_from_account_manager(app.auth_manager.as_ref()),
             Some(canonical_chatgpt_store_account_id("account-a"))
         );
 
@@ -12769,9 +12839,7 @@ mod tests {
             "failed to refresh local ChatGPT auth: refresh transport failure"
         );
         assert_eq!(
-            app.auth_manager
-                .active_chatgpt_account_summary()
-                .map(|summary| summary.store_account_id),
+            active_store_account_id_from_account_manager(app.auth_manager.as_ref()),
             Some(secondary_store_account_id.clone())
         );
         assert_eq!(
@@ -16888,11 +16956,11 @@ guardian_approval = true
             .reload_strict()
             .expect("reload single-account auth store");
         let expected_store_account_id = canonical_chatgpt_store_account_id("account-a");
-        let releasing_active = app
-            .auth_manager
-            .active_chatgpt_account_summary()
+        let releasing_active_store_account_id = active_store_account_id_from_account_manager(
+            app.auth_manager.as_ref(),
+        )
             .expect("app auth manager should acquire the single saved account");
-        assert_eq!(releasing_active.store_account_id, expected_store_account_id);
+        assert_eq!(releasing_active_store_account_id, expected_store_account_id);
 
         let competing_manager = auth_manager_from_config(&app.config);
         competing_manager
@@ -16918,14 +16986,16 @@ guardian_approval = true
             competing_manager
                 .account_manager()
                 .list_accounts()
+                .expect("list competing accounts")
                 .into_iter()
                 .any(|account| account.is_active),
             "expected a competing manager to acquire the released runtime lease immediately"
         );
-        let competing_active = competing_manager
-            .active_chatgpt_account_summary()
+        let competing_active_store_account_id = active_store_account_id_from_account_manager(
+            competing_manager.as_ref(),
+        )
             .expect("competing manager should acquire the released account");
-        assert_eq!(competing_active.store_account_id, expected_store_account_id);
+        assert_eq!(competing_active_store_account_id, expected_store_account_id);
     }
 
     async fn make_test_app() -> App {
@@ -17715,11 +17785,9 @@ guardian_approval = true
             install_test_user_config(&mut app, "forced_chatgpt_workspace_id = \"account-a\"\n")?;
         app.refresh_in_memory_config_from_disk().await?;
         seed_chatgpt_accounts(&mut app, "account-a");
-        let active_store_account_id_before_switch = app
-            .auth_manager
-            .active_chatgpt_account_summary()
-            .expect("active account should be seeded")
-            .store_account_id;
+        let active_store_account_id_before_switch =
+            active_store_account_id_from_account_manager(app.auth_manager.as_ref())
+                .expect("active account should be seeded");
         let blocked_account_id = app
             .auth_manager
             .account_manager()
@@ -17741,12 +17809,9 @@ guardian_approval = true
                 .contains("does not match required workspace \"account-a\""),
             "unexpected error: {err}"
         );
-        let active_summary = app
-            .auth_manager
-            .active_chatgpt_account_summary()
-            .expect("active account should remain available");
         assert_eq!(
-            active_summary.store_account_id,
+            active_store_account_id_from_account_manager(app.auth_manager.as_ref())
+                .expect("active account should remain available"),
             active_store_account_id_before_switch
         );
         assert_matches!(

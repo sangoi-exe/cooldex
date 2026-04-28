@@ -76,9 +76,9 @@ use codex_hooks::HookResult;
 use codex_login::AccountRateLimitRefreshOutcome;
 use codex_login::AccountRateLimitRefreshRoster;
 use codex_login::AccountRateLimitRefreshRosterStatus;
+use codex_login::ChatGptRequestAuth;
 use codex_login::ChatgptAccountAuthResolution;
 use codex_login::ChatgptAccountRefreshMode;
-use codex_login::CodexAuth;
 use codex_login::UsageLimitAutoSwitchFallbackSelectionMode;
 use codex_login::UsageLimitAutoSwitchRequest;
 use codex_login::UsageLimitAutoSwitchSelectionScope;
@@ -812,7 +812,7 @@ async fn maybe_run_previous_model_inline_compact(
     let previous_model_turn_context = Arc::new(
         turn_context
             .with_model(previous_turn_settings.model, &sess.services.models_manager)
-            .await,
+            .await?,
     );
 
     let Some(old_context_window) = previous_model_turn_context.model_context_window() else {
@@ -924,8 +924,13 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit(
     request_store_account_id: Option<&str>,
     usage_limit_handling_policy: UsageLimitHandlingPolicy,
 ) -> CodexResult<bool> {
+    let auth_mode = sess
+        .services
+        .auth_manager
+        .auth_mode()
+        .map_err(|error| CodexErr::Io(error.into_io_error()))?;
     if !matches!(
-        sess.services.auth_manager.auth_mode(),
+        auth_mode,
         Some(crate::auth::AuthMode::Chatgpt | crate::auth::AuthMode::ChatgptAuthTokens)
     ) {
         return Ok(false);
@@ -951,7 +956,12 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit_with_refreshed_acco
     refresh_state: &AutoSwitchRefreshState,
     usage_limit_handling_policy: UsageLimitHandlingPolicy,
 ) -> CodexResult<bool> {
-    let accounts_before = sess.services.auth_manager.account_manager().list_accounts();
+    let accounts_before = sess
+        .services
+        .auth_manager
+        .account_manager()
+        .list_accounts()
+        .map_err(|error| CodexErr::Io(error.into_io_error()))?;
     let account_display_name = |account: &crate::auth::AccountSummary| {
         account
             .label
@@ -1018,6 +1028,7 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit_with_refreshed_acco
             .auth_manager
             .account_manager()
             .list_accounts()
+            .map_err(|error| CodexErr::Io(error.into_io_error()))?
             .into_iter()
             .find(|account| account.is_active)
             .map(|account| account.id);
@@ -1043,7 +1054,12 @@ pub(crate) async fn maybe_auto_switch_account_on_usage_limit_with_refreshed_acco
         return Ok(false);
     }
 
-    let accounts_after = sess.services.auth_manager.account_manager().list_accounts();
+    let accounts_after = sess
+        .services
+        .auth_manager
+        .account_manager()
+        .list_accounts()
+        .map_err(|error| CodexErr::Io(error.into_io_error()))?;
     let from_account_name = failing_store_account_id
         .as_ref()
         .and_then(|account_id| {
@@ -1180,11 +1196,21 @@ pub(crate) async fn refresh_accounts_rate_limits_before_auto_switch(
         return AutoSwitchRefreshState::default();
     }
 
-    let refresh_roster = sess
+    let refresh_roster = match sess
         .services
         .auth_manager
         .account_manager()
-        .account_rate_limit_refresh_roster();
+        .account_rate_limit_refresh_roster()
+    {
+        Ok(roster) => roster,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "failed to load account refresh roster before usage-limit auto-switch"
+            );
+            return AutoSwitchRefreshState::default();
+        }
+    };
     let Some(account_ids) = auto_switch_refresh_account_ids_from_roster(refresh_roster) else {
         warn!("failed to load lease-aware refresh roster before usage-limit auto-switch");
         return AutoSwitchRefreshState::default();
@@ -1230,7 +1256,7 @@ pub(crate) async fn refresh_accounts_rate_limits_before_auto_switch(
         };
         let snapshot = match fetch_account_rate_limits_snapshot(
             &turn_context.config.chatgpt_base_url,
-            &auth,
+            auth.request_auth(),
         )
         .await
         {
@@ -1275,7 +1301,7 @@ pub(crate) async fn refresh_accounts_rate_limits_before_auto_switch(
                 };
                 match fetch_account_rate_limits_snapshot(
                     &turn_context.config.chatgpt_base_url,
-                    &recovered_auth,
+                    recovered_auth.request_auth(),
                 )
                 .await
                 {
@@ -1394,12 +1420,13 @@ impl std::error::Error for FetchAccountRateLimitsError {}
 
 async fn fetch_account_rate_limits_snapshot(
     chatgpt_base_url: &str,
-    auth: &CodexAuth,
+    auth: &ChatGptRequestAuth,
 ) -> Result<Option<RateLimitSnapshot>, FetchAccountRateLimitsError> {
-    let client = codex_backend_client::Client::from_auth(chatgpt_base_url.to_string(), auth)
-        .map_err(|err| {
-            FetchAccountRateLimitsError::Other(format!("usage client init failed: {err}"))
-        })?;
+    let client =
+        codex_backend_client::Client::from_chatgpt_request_auth(chatgpt_base_url.to_string(), auth)
+            .map_err(|err| {
+                FetchAccountRateLimitsError::Other(format!("usage client init failed: {err}"))
+            })?;
     match client.get_rate_limits_detailed().await {
         Ok(snapshot) => Ok(Some(snapshot)),
         Err(err) => Err(if err.is_unauthorized() {
@@ -2109,8 +2136,12 @@ async fn run_sampling_request_with_router_and_prompt(
         let request_store_account_id = sess
             .services
             .auth_manager
-            .active_chatgpt_account_summary()
-            .map(|summary| summary.store_account_id);
+            .account_manager()
+            .list_accounts()
+            .map_err(|error| CodexErr::Io(error.into_io_error()))?
+            .into_iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id);
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
@@ -2406,7 +2437,12 @@ pub(crate) async fn built_tools(
     } else {
         None
     };
-    let auth = sess.services.auth_manager.auth().await;
+    let auth = sess
+        .services
+        .auth_manager
+        .chatgpt_request_auth()
+        .await
+        .map_err(|error| CodexErr::Io(error.into_io_error()))?;
     let discoverable_tools = if apps_enabled && turn_context.tools_config.tool_suggest {
         if let Some(accessible_connectors) = accessible_connectors_with_enabled_state.as_ref() {
             match connectors::list_tool_suggest_discoverable_tools_with_auth(
@@ -3072,12 +3108,17 @@ async fn try_run_sampling_request(
     cancellation_token: CancellationToken,
     execution_mode: SamplingExecutionMode,
 ) -> CodexResult<SamplingRequestResult> {
+    let auth_mode = sess
+        .services
+        .auth_manager
+        .auth_mode()
+        .map_err(|error| CodexErr::Io(error.into_io_error()))?;
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy.value(),
         sandbox_policy = turn_context.sandbox_policy.get(),
         effort = turn_context.reasoning_effort,
-        auth_mode = sess.services.auth_manager.auth_mode(),
+        auth_mode = auth_mode,
         features = sess.features.enabled_features(),
     );
     let mut stream = client_session

@@ -54,12 +54,13 @@ impl MessageProcessor {
         arg0_paths: Arg0DispatchPaths,
         config: Arc<Config>,
         environment_manager: Arc<EnvironmentManager>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let outgoing = Arc::new(outgoing);
         let auth_manager = AuthManager::shared_from_config(
             config.as_ref(),
             /*enable_codex_api_key_env*/ false,
-        );
+        )
+        .map_err(codex_login::AccountRuntimeLoadError::into_io_error)?;
         let thread_manager = Arc::new(ThreadManager::new(
             config.as_ref(),
             auth_manager,
@@ -72,13 +73,13 @@ impl MessageProcessor {
             environment_manager,
             /*analytics_events_client*/ None,
         ));
-        Self {
+        Ok(Self {
             outgoing,
             initialized: false,
             arg0_paths,
             thread_manager,
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
-        }
+        })
     }
 
     pub(crate) async fn process_request(&mut self, request: JsonRpcRequest<ClientRequest>) {

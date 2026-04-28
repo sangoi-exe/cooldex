@@ -743,7 +743,7 @@ impl ModelClient {
         &self,
         agent_task: Option<&RegisteredAgentTask>,
     ) -> Result<CurrentClientSetup> {
-        let auth = self.state.provider.auth().await;
+        let auth = self.state.provider.auth().await?;
         let api_provider = self.state.provider.api_provider().await?;
         let api_auth = match (
             agent_task,
@@ -751,9 +751,13 @@ impl ModelClient {
             auth.as_ref(),
         ) {
             (Some(agent_task), Some(auth_manager), Some(auth)) if auth.is_chatgpt_auth() => {
-                if let Some(record) = auth_manager.auth_cached().and_then(|cached_auth| {
-                    cached_auth.get_agent_identity(&agent_task.chatgpt_account_id)
-                }) {
+                if let Some(record) = auth_manager
+                    .auth_cached()
+                    .map_err(|error| CodexErr::Io(error.into_io_error()))?
+                    .and_then(|cached_auth| {
+                        cached_auth.get_agent_identity(&agent_task.chatgpt_account_id)
+                    })
+                {
                     let authorization_header_value =
                         agent_task.authorization_header(&record).map_err(|err| {
                             CodexErr::Stream(
@@ -805,7 +809,10 @@ impl ModelClient {
             ));
         };
 
-        let accounts = auth_manager.account_manager().list_accounts();
+        let accounts = auth_manager
+            .account_manager()
+            .list_accounts()
+            .map_err(|error| CodexErr::Io(error.into_io_error()))?;
         if accounts.is_empty() {
             return Err(CodexErr::InvalidRequest(
                 "OpenAI auth is required, but no saved ChatGPT account or API key is available for this session."
@@ -815,7 +822,8 @@ impl ModelClient {
 
         let roster = auth_manager
             .account_manager()
-            .account_rate_limit_refresh_roster();
+            .account_rate_limit_refresh_roster()
+            .map_err(|error| CodexErr::Io(error.into_io_error()))?;
         if accounts.iter().all(|account| !account.is_active)
             && roster.status == AccountRateLimitRefreshRosterStatus::LeaseManaged
             && roster.store_account_ids.is_empty()

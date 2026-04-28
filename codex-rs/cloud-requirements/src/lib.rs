@@ -21,10 +21,14 @@ use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::ConfigRequirementsToml;
 use codex_core::util::backoff;
 use codex_login::AuthManager;
+use codex_login::AccountRuntimeLoadError;
+use codex_login::ChatGptAuthContext;
+use codex_login::ChatGptRequestAuth;
 use codex_login::ChatgptAccountAuthResolution;
 use codex_login::ChatgptAccountRefreshMode;
-use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
+#[cfg(test)]
+use codex_login::CodexAuth;
 use codex_protocol::account::PlanType;
 use hmac::Hmac;
 use hmac::Mac;
@@ -170,14 +174,20 @@ fn verify_cache_signature(payload_bytes: &[u8], signature: &str) -> bool {
         .any(|key| verify_cache_signature_with_key(payload_bytes, &signature_bytes, key))
 }
 
-fn auth_identity(auth: &CodexAuth) -> (Option<String>, Option<String>) {
-    let token_data = auth.get_token_data().ok();
-    let chatgpt_user_id = token_data
-        .as_ref()
-        .and_then(|token_data| token_data.id_token.chatgpt_user_id.as_deref())
-        .map(str::to_owned);
-    let account_id = auth.get_account_id();
-    (chatgpt_user_id, account_id)
+fn auth_identity(auth: &ChatGptAuthContext) -> (Option<String>, Option<String>) {
+    let request_auth = auth.request_auth();
+    (
+        request_auth.chatgpt_user_id().map(str::to_owned),
+        Some(request_auth.account_id().to_string()),
+    )
+}
+
+fn auth_owner_load_error(error: AccountRuntimeLoadError) -> CloudRequirementsLoadError {
+    CloudRequirementsLoadError::new(
+        CloudRequirementsLoadErrorCode::Auth,
+        /*status_code*/ None,
+        format!("failed to load ChatGPT auth for cloud requirements: {error}"),
+    )
 }
 
 fn cache_payload_bytes(payload: &CloudRequirementsCacheSignedPayload) -> Option<Vec<u8>> {
@@ -191,7 +201,7 @@ trait RequirementsFetcher: Send + Sync {
     /// Returning `Err` indicates cloud requirements could not be fetched.
     async fn fetch_requirements(
         &self,
-        auth: &CodexAuth,
+        auth: &ChatGptRequestAuth,
     ) -> Result<Option<String>, FetchAttemptError>;
 }
 
@@ -209,9 +219,9 @@ impl BackendRequirementsFetcher {
 impl RequirementsFetcher for BackendRequirementsFetcher {
     async fn fetch_requirements(
         &self,
-        auth: &CodexAuth,
+        auth: &ChatGptRequestAuth,
     ) -> Result<Option<String>, FetchAttemptError> {
-        let client = BackendClient::from_auth(self.base_url.clone(), auth)
+        let client = BackendClient::from_chatgpt_request_auth(self.base_url.clone(), auth)
             .inspect_err(|err| {
                 tracing::warn!(
                     error = %err,
@@ -330,15 +340,18 @@ impl CloudRequirementsService {
         // Merge-safety anchor: cloud requirements are a ChatGPT-workspace
         // contract and must ignore CODEX_API_KEY while still using the caller's
         // lease-bearing AuthManager owner.
-        let Some(auth) = self.auth_manager.chatgpt_auth().await else {
+        let Some(auth) = self
+            .auth_manager
+            .chatgpt_auth()
+            .await
+            .map_err(auth_owner_load_error)?
+        else {
             return Ok(None);
         };
-        let Some(plan_type) = auth.account_plan_type() else {
+        let Some(plan_type) = auth.codex_auth().account_plan_type() else {
             return Ok(None);
         };
-        if !auth.is_chatgpt_auth()
-            || !(plan_type.is_business_like() || matches!(plan_type, PlanType::Enterprise))
-        {
+        if !(plan_type.is_business_like() || matches!(plan_type, PlanType::Enterprise)) {
             return Ok(None);
         }
         let (chatgpt_user_id, account_id) = auth_identity(&auth);
@@ -364,12 +377,13 @@ impl CloudRequirementsService {
 
     async fn fetch_with_retries(
         &self,
-        mut auth: CodexAuth,
+        mut auth: ChatGptAuthContext,
         trigger: &'static str,
     ) -> Result<Option<ConfigRequirementsToml>, CloudRequirementsLoadError> {
         let mut attempt = 1;
         let mut last_status_code: Option<u16> = None;
         let expected_store_account_id = auth
+            .codex_auth()
             .active_chatgpt_account_summary()
             .map(|summary| summary.store_account_id);
         let expected_account_id = auth_identity(&auth).1;
@@ -378,7 +392,7 @@ impl CloudRequirementsService {
         let mut external_auth_recovery = self.auth_manager.unauthorized_recovery();
 
         while attempt <= CLOUD_REQUIREMENTS_MAX_ATTEMPTS {
-            let contents = match self.fetcher.fetch_requirements(&auth).await {
+            let contents = match self.fetcher.fetch_requirements(auth.request_auth()).await {
                 Ok(contents) => {
                     emit_fetch_attempt_metric(
                         trigger, attempt, "success", /*status_code*/ None,
@@ -407,7 +421,9 @@ impl CloudRequirementsService {
                 }) => {
                     last_status_code = status_code;
                     emit_fetch_attempt_metric(trigger, attempt, "unauthorized", status_code);
-                    if auth.is_external_chatgpt_tokens() && external_auth_recovery.has_next() {
+                    if auth.codex_auth().is_external_chatgpt_tokens()
+                        && external_auth_recovery.has_next()
+                    {
                         tracing::warn!(
                             attempt,
                             max_attempts = CLOUD_REQUIREMENTS_MAX_ATTEMPTS,
@@ -415,7 +431,11 @@ impl CloudRequirementsService {
                         );
                         match external_auth_recovery.next().await {
                             Ok(_) => {
-                                let Some(refreshed_auth) = self.auth_manager.chatgpt_auth().await
+                                let Some(refreshed_auth) = self
+                                    .auth_manager
+                                    .chatgpt_auth()
+                                    .await
+                                    .map_err(auth_owner_load_error)?
                                 else {
                                     tracing::error!(
                                         "Auth recovery succeeded but no ChatGPT auth is available for cloud requirements"
@@ -469,7 +489,7 @@ impl CloudRequirementsService {
                             }
                         }
                     }
-                    if !auth.is_external_chatgpt_tokens()
+                    if !auth.codex_auth().is_external_chatgpt_tokens()
                         && let Some(store_account_id) = expected_store_account_id.as_deref()
                     {
                         if !attempted_store_reload {
@@ -479,7 +499,12 @@ impl CloudRequirementsService {
                                 max_attempts = CLOUD_REQUIREMENTS_MAX_ATTEMPTS,
                                 "Cloud requirements request was unauthorized; reloading ChatGPT auth from store"
                             );
-                            let Some(reloaded_auth) = self.auth_manager.chatgpt_auth().await else {
+                            let Some(reloaded_auth) = self
+                                .auth_manager
+                                .chatgpt_auth()
+                                .await
+                                .map_err(auth_owner_load_error)?
+                            else {
                                 tracing::error!(
                                     "Auth store reload found no ChatGPT auth for cloud requirements"
                                 );
@@ -497,6 +522,7 @@ impl CloudRequirementsService {
                                 ));
                             };
                             let reloaded_store_account_id = reloaded_auth
+                                .codex_auth()
                                 .active_chatgpt_account_summary()
                                 .map(|summary| summary.store_account_id);
                             let reloaded_account_id = auth_identity(&reloaded_auth).1;
@@ -708,15 +734,22 @@ impl CloudRequirementsService {
     }
 
     async fn refresh_cache(&self) -> bool {
-        let Some(auth) = self.auth_manager.chatgpt_auth().await else {
+        let auth = match self.auth_manager.chatgpt_auth().await {
+            Ok(Some(auth)) => auth,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "failed to load ChatGPT auth for cloud requirements cache refresh"
+                );
+                emit_load_metric("refresh", "error");
+                return false;
+            }
+        };
+        let Some(plan_type) = auth.codex_auth().account_plan_type() else {
             return false;
         };
-        let Some(plan_type) = auth.account_plan_type() else {
-            return false;
-        };
-        if !auth.is_chatgpt_auth()
-            || !(plan_type.is_business_like() || matches!(plan_type, PlanType::Enterprise))
-        {
+        if !(plan_type.is_business_like() || matches!(plan_type, PlanType::Enterprise)) {
             return false;
         }
 
@@ -1200,7 +1233,7 @@ mod tests {
     impl RequirementsFetcher for StaticFetcher {
         async fn fetch_requirements(
             &self,
-            _auth: &CodexAuth,
+            _auth: &ChatGptRequestAuth,
         ) -> Result<Option<String>, FetchAttemptError> {
             Ok(self.contents.clone())
         }
@@ -1212,7 +1245,7 @@ mod tests {
     impl RequirementsFetcher for PendingFetcher {
         async fn fetch_requirements(
             &self,
-            _auth: &CodexAuth,
+            _auth: &ChatGptRequestAuth,
         ) -> Result<Option<String>, FetchAttemptError> {
             pending::<()>().await;
             Ok(None)
@@ -1237,7 +1270,7 @@ mod tests {
     impl RequirementsFetcher for SequenceFetcher {
         async fn fetch_requirements(
             &self,
-            _auth: &CodexAuth,
+            _auth: &ChatGptRequestAuth,
         ) -> Result<Option<String>, FetchAttemptError> {
             self.request_count.fetch_add(1, Ordering::SeqCst);
             let mut responses = self.responses.lock().await;
@@ -1257,13 +1290,10 @@ mod tests {
     impl RequirementsFetcher for ReloadingTokenFetcher {
         async fn fetch_requirements(
             &self,
-            auth: &CodexAuth,
+            auth: &ChatGptRequestAuth,
         ) -> Result<Option<String>, FetchAttemptError> {
             let request_index = self.request_count.fetch_add(1, Ordering::SeqCst);
-            if matches!(
-                auth.get_token().as_deref(),
-                Ok(token) if token == self.expected_token.as_str()
-            ) {
+            if auth.authorization() == format!("Bearer {}", self.expected_token) {
                 return Ok(Some(self.contents.clone()));
             }
             if request_index == 0 {
@@ -1286,7 +1316,7 @@ mod tests {
     impl RequirementsFetcher for UnauthorizedFetcher {
         async fn fetch_requirements(
             &self,
-            _auth: &CodexAuth,
+            _auth: &ChatGptRequestAuth,
         ) -> Result<Option<String>, FetchAttemptError> {
             self.request_count.fetch_add(1, Ordering::SeqCst);
             Err(FetchAttemptError::Unauthorized {
@@ -1736,6 +1766,7 @@ enabled = false
         assert!(
             auth_manager
                 .auth_cached()
+                .expect("load cached auth")
                 .as_ref()
                 .is_some_and(CodexAuth::is_api_key_auth),
             "generic cache should be owned by CODEX_API_KEY"
@@ -1788,6 +1819,7 @@ enabled = false
         assert!(
             auth.manager
                 .auth_cached()
+                .expect("load cached auth")
                 .as_ref()
                 .is_some_and(CodexAuth::is_api_key_auth),
             "cloud requirements recovery must not steal generic CODEX_API_KEY cache ownership"

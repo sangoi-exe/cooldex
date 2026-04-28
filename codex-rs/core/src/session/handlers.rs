@@ -471,7 +471,16 @@ pub async fn reload_user_config(sess: &Arc<Session>) {
 
 pub async fn list_mcp_tools(sess: &Session, config: &Arc<Config>, sub_id: String) {
     let mcp_connection_manager = sess.services.mcp_connection_manager.read().await;
-    let auth = sess.services.auth_manager.auth().await;
+    let auth = match sess.services.auth_manager.chatgpt_request_auth().await {
+        Ok(auth) => auth,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to load ChatGPT request auth for MCP tool listing"
+            );
+            None
+        }
+    };
     let mcp_servers = sess
         .services
         .mcp_manager

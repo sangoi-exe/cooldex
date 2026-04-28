@@ -347,7 +347,8 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         forced_chatgpt_workspace_id,
         /*enable_codex_api_key_env*/ true,
         resolve_cli_auth_credentials_store_mode_for_config_toml(&config_toml),
-    );
+    )
+    .map_err(|err| anyhow::anyhow!("failed to load auth manager: {err}"))?;
     let cloud_requirements = cloud_requirements_loader(
         auth_manager.clone(),
         chatgpt_base_url,

@@ -17,7 +17,13 @@ pub(super) async fn load_plugin_app_summaries(
         return Vec::new();
     }
 
-    let auth_snapshot = connectors::load_connector_auth_snapshot(auth_manager).await;
+    let auth_snapshot = match connectors::load_connector_auth_snapshot(auth_manager).await {
+        Ok(auth_snapshot) => auth_snapshot,
+        Err(err) => {
+            warn!("failed to load app auth for plugin/read: {err:#}");
+            None
+        }
+    };
     let connectors = match connectors::list_all_connectors_with_options(
         config,
         auth_snapshot.as_ref(),
@@ -38,9 +44,7 @@ pub(super) async fn load_plugin_app_summaries(
 
     // Merge-safety anchor: app metadata access checks must use the app-server
     // AccountManager owner passed into this request, not a hidden AuthManager.
-    let auth = auth_snapshot
-        .as_ref()
-        .map(connectors::ChatGptConnectorAuthSnapshot::codex_auth);
+    let auth = auth_snapshot.as_ref().map(|snapshot| snapshot.request_auth());
     let accessible_connectors =
         match connectors::list_accessible_connectors_from_mcp_tools_with_options_and_status(
             config, auth, /*force_refetch*/ false,

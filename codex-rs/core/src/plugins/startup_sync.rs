@@ -253,9 +253,22 @@ pub(super) fn start_startup_remote_plugin_sync_once(
             return;
         }
 
-        let auth = auth_manager.auth().await;
+        let auth = match auth_manager.chatgpt_request_auth().await {
+            Ok(Some(auth)) => auth,
+            Ok(None) => {
+                warn!("skipping startup remote plugin sync because ChatGPT auth is unavailable");
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "skipping startup remote plugin sync because ChatGPT auth could not be loaded"
+                );
+                return;
+            }
+        };
         match manager
-            .sync_plugins_from_remote(&config, auth.as_ref(), /*additive_only*/ true)
+            .sync_plugins_from_remote(&config, &auth, /*additive_only*/ true)
             .await
         {
             Ok(sync_result) => {

@@ -407,7 +407,8 @@ pub async fn run_main_with_transport(
             // processor must reuse one lease-bearing `AuthManager` so one process does not mint
             // competing WS12 runtime owners against its own saved-account SQLite state.
             let auth_manager =
-                AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+                AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+                    .map_err(codex_login::AccountRuntimeLoadError::into_io_error)?;
             startup_auth_manager = Some(auth_manager.clone());
             cloud_requirements_loader(
                 auth_manager,
@@ -571,9 +572,11 @@ pub async fn run_main_with_transport(
         AppServerTransport::Off => {}
     }
 
-    let auth_manager = startup_auth_manager.unwrap_or_else(|| {
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
-    });
+    let auth_manager = match startup_auth_manager {
+        Some(auth_manager) => auth_manager,
+        None => AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+            .map_err(codex_login::AccountRuntimeLoadError::into_io_error)?,
+    };
 
     let remote_control_enabled = config.features.enabled(Feature::RemoteControl);
     if transport_accept_handles.is_empty() && !remote_control_enabled {

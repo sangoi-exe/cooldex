@@ -245,12 +245,11 @@ impl ModelsManager {
         skip(self),
         fields(refresh_strategy = %refresh_strategy)
     )]
-    pub async fn list_models(&self, refresh_strategy: RefreshStrategy) -> Vec<ModelPreset> {
-        if let Err(err) = self.refresh_available_models(refresh_strategy).await {
-            error!("failed to refresh available models: {err}");
-        }
+    pub async fn list_models(&self, refresh_strategy: RefreshStrategy) -> CoreResult<Vec<ModelPreset>> {
+        self.refresh_available_models(refresh_strategy).await?;
         let remote_models = self.get_remote_models().await;
-        self.build_available_models(remote_models)
+        let auth_mode = self.auth_mode()?;
+        Ok(self.build_available_models(remote_models, auth_mode))
     }
 
     /// List collaboration mode presets.
@@ -270,9 +269,12 @@ impl ModelsManager {
     /// Attempt to list models without blocking, using the current cached state.
     ///
     /// Returns an error if the internal lock cannot be acquired.
-    pub fn try_list_models(&self) -> Result<Vec<ModelPreset>, TryLockError> {
-        let remote_models = self.try_get_remote_models()?;
-        Ok(self.build_available_models(remote_models))
+    pub fn try_list_models(&self) -> CoreResult<Vec<ModelPreset>> {
+        let remote_models = self
+            .try_get_remote_models()
+            .map_err(|err| CodexErr::Fatal(format!("failed to acquire models cache: {err}")))?;
+        let auth_mode = self.auth_mode()?;
+        Ok(self.build_available_models(remote_models, auth_mode))
     }
 
     // todo(aibrahim): should be visible to core only and sent on session_configured event
@@ -292,21 +294,20 @@ impl ModelsManager {
         &self,
         model: &Option<String>,
         refresh_strategy: RefreshStrategy,
-    ) -> String {
+    ) -> CoreResult<String> {
         if let Some(model) = model.as_ref() {
-            return model.to_string();
+            return Ok(model.to_string());
         }
-        if let Err(err) = self.refresh_available_models(refresh_strategy).await {
-            error!("failed to refresh available models: {err}");
-        }
+        self.refresh_available_models(refresh_strategy).await?;
         let remote_models = self.get_remote_models().await;
-        let available = self.build_available_models(remote_models);
-        available
+        let auth_mode = self.auth_mode()?;
+        let available = self.build_available_models(remote_models, auth_mode);
+        Ok(available
             .iter()
             .find(|model| model.is_default)
             .or_else(|| available.first())
             .map(|model| model.model.clone())
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     // todo(aibrahim): look if we can tighten it to pub(crate)
@@ -399,10 +400,7 @@ impl ModelsManager {
             return Ok(());
         }
 
-        let auth_mode = self
-            .provider
-            .auth_manager()
-            .and_then(|auth_manager| auth_manager.auth_mode());
+        let auth_mode = self.auth_mode()?;
         if !matches!(
             auth_mode,
             Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)
@@ -446,7 +444,7 @@ impl ModelsManager {
         let codex_api_key_env_enabled = auth_manager
             .as_ref()
             .is_some_and(|auth_manager| auth_manager.codex_api_key_env_enabled());
-        let auth = self.provider.auth().await;
+        let auth = self.provider.auth().await?;
         let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
         let api_provider = self.provider.api_provider().await?;
         let api_auth = self.provider.api_auth().await?;
@@ -528,14 +526,23 @@ impl ModelsManager {
     }
 
     /// Build picker-ready presets from the active catalog snapshot.
-    fn build_available_models(&self, mut remote_models: Vec<ModelInfo>) -> Vec<ModelPreset> {
+    fn auth_mode(&self) -> CoreResult<Option<AuthMode>> {
+        match self.provider.auth_manager() {
+            Some(auth_manager) => auth_manager
+                .auth_mode()
+                .map_err(|error| CodexErr::Io(error.into_io_error())),
+            None => Ok(None),
+        }
+    }
+
+    fn build_available_models(
+        &self,
+        mut remote_models: Vec<ModelInfo>,
+        auth_mode: Option<AuthMode>,
+    ) -> Vec<ModelPreset> {
         remote_models.sort_by(|a, b| a.priority.cmp(&b.priority));
 
         let mut presets: Vec<ModelPreset> = remote_models.into_iter().map(Into::into).collect();
-        let auth_mode = self
-            .provider
-            .auth_manager()
-            .and_then(|auth_manager| auth_manager.auth_mode());
         // Merge-safety anchor: picker visibility must not diverge between persistent ChatGPT auth
         // and the local external-token ChatGPT surface.
         let chatgpt_mode = matches!(

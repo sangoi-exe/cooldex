@@ -7,7 +7,6 @@ use codex_account_state::ForceReleaseAccountOutcome;
 use codex_account_state::SessionActiveAccountRefresh;
 use codex_account_state::SessionActiveAccountSetOutcome;
 use codex_app_server_protocol::AuthMode;
-use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::auth::PlanType as InternalPlanType;
@@ -19,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use thiserror::Error;
 
 use super::account_runtime_context::AccountRuntimeContext;
 use crate::auth::storage::AccountUsageCache;
@@ -41,6 +41,58 @@ pub struct ActiveChatgptAccountSummary {
     pub label: Option<String>,
     pub email: Option<String>,
     pub auth_mode: AuthMode,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum AccountRuntimeLoadError {
+    #[error("failed to load auth store: {0}")]
+    AuthStoreLoad(String),
+    #[error("failed to load external auth store: {0}")]
+    ExternalAuthStoreLoad(String),
+    #[error("failed to synchronize saved-account usage truth: {0}")]
+    UsageSync(String),
+    #[error("failed to hydrate runtime active-account state: {0}")]
+    RuntimeActiveAccount(String),
+    #[error("failed to persist runtime-prepared auth store: {0}")]
+    PersistPreparedStore(String),
+    #[error("failed to read account lease state: {0}")]
+    LeaseStateRead(String),
+    #[error("failed to materialize ChatGPT request auth: {0}")]
+    RequestAuthMaterialization(String),
+}
+
+impl AccountRuntimeLoadError {
+    fn auth_store_load(error: std::io::Error) -> Self {
+        Self::AuthStoreLoad(error.to_string())
+    }
+
+    fn external_auth_store_load(error: std::io::Error) -> Self {
+        Self::ExternalAuthStoreLoad(error.to_string())
+    }
+
+    fn usage_sync(error: std::io::Error) -> Self {
+        Self::UsageSync(error.to_string())
+    }
+
+    fn runtime_active_account(error: std::io::Error) -> Self {
+        Self::RuntimeActiveAccount(error.to_string())
+    }
+
+    fn persist_prepared_store(error: std::io::Error) -> Self {
+        Self::PersistPreparedStore(error.to_string())
+    }
+
+    fn lease_state_read(error: std::io::Error) -> Self {
+        Self::LeaseStateRead(error.to_string())
+    }
+
+    pub(crate) fn request_auth_materialization(message: impl Into<String>) -> Self {
+        Self::RequestAuthMaterialization(message.into())
+    }
+
+    pub fn into_io_error(self) -> std::io::Error {
+        std::io::Error::other(self)
+    }
 }
 
 // Merge-safety anchor: loaded-store origin is the AccountManager loader
@@ -1049,22 +1101,16 @@ impl AccountManager {
         store_origin: LoadedStoreOrigin,
         admission_policy: ChatgptAuthAdmissionPolicy,
         runtime_context: &AccountRuntimeContext,
-    ) -> LoadedStoreCandidate {
+    ) -> Result<LoadedStoreCandidate, AccountRuntimeLoadError> {
         let loaded_had_active_account = store.active_account_id.is_some();
         let removed_account_ids = enforce_chatgpt_auth_accounts(&mut store, admission_policy);
         let mut sync_outcome = UsageStateSyncOutcome::default();
         if let Some(account_state_store) = self.account_state_store.as_ref() {
-            match synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store) {
-                Ok(outcome) => {
-                    sync_outcome = outcome;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "failed to synchronize saved-account usage truth while loading auth store"
-                    );
-                }
-            }
+            sync_outcome = synchronize_store_usage_from_legacy_and_sqlite(
+                account_state_store,
+                &mut store,
+            )
+            .map_err(AccountRuntimeLoadError::usage_sync)?;
         }
         if !removed_account_ids.is_empty() {
             tracing::info!(
@@ -1072,19 +1118,14 @@ impl AccountManager {
                 "removed accounts with unsupported ChatGPT plans while loading auth store"
             );
         }
-        if let Err(error) = Self::hydrate_runtime_active_account_for_runtime(
+        Self::hydrate_runtime_active_account_for_runtime(
             self.account_state_store.as_ref(),
             self.runtime_session_id(),
             runtime_context.linked_codex_session_id.as_deref(),
             runtime_context.forced_chatgpt_workspace_id.as_deref(),
             &mut store,
-        ) {
-            tracing::warn!(
-                error = %error,
-                "failed to hydrate runtime active-account state while loading auth store"
-            );
-            store.active_account_id = None;
-        }
+        )
+        .map_err(AccountRuntimeLoadError::runtime_active_account)?;
         if (sync_outcome.strip_persisted_auth_store
             || !removed_account_ids.is_empty()
             || (self.account_state_store.is_some() && loaded_had_active_account))
@@ -1094,16 +1135,13 @@ impl AccountManager {
                 sync_outcome.strip_persisted_auth_store,
             )
         {
-            tracing::warn!(
-                error = %error,
-                "failed to persist auth store while loading store"
-            );
+            return Err(AccountRuntimeLoadError::persist_prepared_store(error));
         }
 
-        LoadedStoreCandidate {
+        Ok(LoadedStoreCandidate {
             store,
             store_origin,
-        }
+        })
     }
 
     pub(super) fn chatgpt_auth_admission_policy_for_store_origin(
@@ -1156,7 +1194,7 @@ impl AccountManager {
         }
     }
 
-    pub(super) fn load_store_from_storage(&self) -> LoadedAuthStore {
+    pub(super) fn load_store_from_storage(&self) -> Result<LoadedAuthStore, AccountRuntimeLoadError> {
         // Merge-safety anchor: live store loading keeps AccountManager as the
         // owner of auth-store selection, admission filtering, sqlite-backed
         // usage/runtime hydration, and persisted-active stripping; AuthManager
@@ -1169,10 +1207,7 @@ impl AccountManager {
         let persistent_store = match self.storage.load() {
             Ok(Some(store)) => store,
             Ok(None) => AuthStore::default(),
-            Err(err) => {
-                tracing::warn!("Failed to load auth store: {err}");
-                AuthStore::default()
-            }
+            Err(err) => return Err(AccountRuntimeLoadError::auth_store_load(err)),
         };
         let persistent_origin = self.configured_store_origin();
         let mut selected_store = persistent_store;
@@ -1193,9 +1228,7 @@ impl AccountManager {
                     }
                 }
                 Ok(Some(_)) | Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!("Failed to load external auth store: {err}");
-                }
+                Err(err) => return Err(AccountRuntimeLoadError::external_auth_store_load(err)),
             }
         }
         let selected = self.prepare_loaded_store_candidate(
@@ -1204,142 +1237,51 @@ impl AccountManager {
             selected_origin,
             Self::chatgpt_auth_admission_policy_for_store_origin(selected_origin),
             &runtime_context,
-        );
+        )?;
 
-        LoadedAuthStore {
+        Ok(LoadedAuthStore {
             store: selected.store,
             store_origin: selected.store_origin,
-        }
+        })
     }
 
-    pub fn has_saved_chatgpt_accounts(&self) -> bool {
+    pub fn has_saved_chatgpt_accounts(&self) -> Result<bool, AccountRuntimeLoadError> {
         // Merge-safety anchor: saved-account presence checks must read the same
         // runtime-prepared store snapshot owner as `/accounts` and autoswitch,
         // not a stale auth/cache follower.
-        !self.load_store_from_storage().store.accounts.is_empty()
+        Ok(!self.load_store_from_storage()?.store.accounts.is_empty())
     }
 
-    pub(super) fn active_chatgpt_account_summary(
+    pub(super) fn load_store_for_guarded_reload(
         &self,
-        store: &AuthStore,
-        store_origin: LoadedStoreOrigin,
-    ) -> Option<ActiveChatgptAccountSummary> {
-        // Merge-safety anchor: active ChatGPT account summaries must come from
-        // the same runtime-prepared store snapshot owner as saved-account
-        // presence and autoswitch, not a stale auth-cache follower.
-        let active_account = store.active_account()?;
-        let auth_mode = match store_origin {
-            LoadedStoreOrigin::Persistent => ApiAuthMode::Chatgpt,
-            LoadedStoreOrigin::ExternalEphemeral => ApiAuthMode::ChatgptAuthTokens,
-        };
-        Some(ActiveChatgptAccountSummary {
-            store_account_id: active_account.id.clone(),
-            label: active_account.label.clone(),
-            email: active_account.tokens.id_token.email.clone(),
-            auth_mode,
-        })
-    }
-
-    pub(super) fn load_store_for_strict_reload(&self) -> std::io::Result<LoadedAuthStore> {
-        // Merge-safety anchor: strict reload lock/load/account-runtime
-        // prep/persist belongs to AccountManager; AuthManager may only derive
-        // and cache auth from the returned snapshot.
-        let _lock = lock_auth_store(&self.codex_home)?;
-        let store = self.storage.load()?.unwrap_or_default();
-        let store = self.prepare_strict_loaded_store(
-            store,
-            &*self.storage,
-            ChatgptAuthAdmissionPolicy::Persisted,
-        )?;
-        Ok(LoadedAuthStore {
-            store,
-            store_origin: self.configured_store_origin(),
-        })
-    }
-
-    fn prepare_strict_loaded_store(
-        &self,
-        mut store: AuthStore,
-        persist_storage: &dyn AuthStorageBackend,
-        admission_policy: ChatgptAuthAdmissionPolicy,
-    ) -> std::io::Result<AuthStore> {
-        // Merge-safety anchor: strict reload persisted-account prep,
-        // current-runtime hydration, and fail-loud persistence stay owned by
-        // AccountManager instead of the AuthManager cache facade.
-        let loaded_had_persisted_active_account = store.active_account_id.is_some();
-        let removed_account_ids = enforce_chatgpt_auth_accounts(&mut store, admission_policy);
-        let mut sync_outcome = UsageStateSyncOutcome::default();
-        if let Some(account_state_store) = self.account_state_store.as_ref() {
-            sync_outcome =
-                synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store)?;
-        }
-        self.hydrate_runtime_active_account(&mut store)?;
-        if sync_outcome.strip_persisted_auth_store
-            || !removed_account_ids.is_empty()
-            || (self.has_account_state_store() && loaded_had_persisted_active_account)
-        {
-            persist_auth_store(
-                persist_storage,
-                &store,
-                sync_outcome.strip_persisted_auth_store,
-            )?;
-        }
-        Ok(store)
-    }
-
-    pub(super) fn load_store_for_guarded_reload(&self) -> Option<GuardedReloadLoadedStore> {
+    ) -> Result<Option<GuardedReloadLoadedStore>, AccountRuntimeLoadError> {
         // Merge-safety anchor: guarded reload lock/load/account-runtime
         // prep/persist belongs to AccountManager; AuthManager may only compare,
         // derive, and cache auth from the returned snapshot.
-        let _lock = match lock_auth_store(&self.codex_home) {
-            Ok(lock) => lock,
-            Err(error) => {
-                tracing::warn!(
-                    "Skipping auth reload because auth store lock could not be acquired: {error}"
-                );
-                return None;
-            }
-        };
+        let _lock = lock_auth_store(&self.codex_home)
+            .map_err(AccountRuntimeLoadError::auth_store_load)?;
         let mut store = match self.storage.load() {
             Ok(Some(store)) => store,
             Ok(None) => {
                 tracing::info!("Skipping auth reload because auth store is missing.");
-                return None;
+                return Ok(None);
             }
-            Err(error) => {
-                tracing::warn!(
-                    "Skipping auth reload because auth store could not be loaded: {error}"
-                );
-                return None;
-            }
+            Err(error) => return Err(AccountRuntimeLoadError::auth_store_load(error)),
         };
-        let prepared = match self.prepare_guarded_reload_store(&mut store) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "skipping guarded auth reload because runtime active-account state could not be hydrated"
-                );
-                return None;
-            }
-        };
+        let prepared = self.prepare_guarded_reload_store(&mut store)?;
         if (prepared.loaded_had_persisted_active_account
             || !prepared.removed_account_ids.is_empty())
             && let Err(error) = self.persist_guarded_reload_store(&store)
         {
-            tracing::warn!(
-                error = %error,
-                "failed to persist auth store during guarded auth reload"
-            );
-            return None;
+            return Err(AccountRuntimeLoadError::persist_prepared_store(error));
         }
-        Some(GuardedReloadLoadedStore {
+        Ok(Some(GuardedReloadLoadedStore {
             loaded: LoadedAuthStore {
                 store,
                 store_origin: self.configured_store_origin(),
             },
             removed_account_ids: prepared.removed_account_ids,
-        })
+        }))
     }
 
     fn persist_guarded_reload_store(&self, store: &AuthStore) -> std::io::Result<()> {
@@ -1356,7 +1298,7 @@ impl AccountManager {
     fn prepare_guarded_reload_store(
         &self,
         store: &mut AuthStore,
-    ) -> std::io::Result<GuardedReloadStorePreparation> {
+    ) -> Result<GuardedReloadStorePreparation, AccountRuntimeLoadError> {
         // Merge-safety anchor: guarded reload persisted-account filtering and
         // current-runtime active-account hydration stay owned by AccountManager
         // instead of the AuthManager cache facade.
@@ -1369,7 +1311,8 @@ impl AccountManager {
                 "removed accounts with unsupported ChatGPT plans during guarded auth reload"
             );
         }
-        self.hydrate_runtime_active_account(store)?;
+        self.hydrate_runtime_active_account(store)
+            .map_err(AccountRuntimeLoadError::runtime_active_account)?;
         Ok(GuardedReloadStorePreparation {
             loaded_had_persisted_active_account,
             removed_account_ids,
@@ -1629,45 +1572,38 @@ impl AccountManager {
         }))
     }
 
-    pub fn account_rate_limit_refresh_roster(&self) -> AccountRateLimitRefreshRoster {
+    pub fn account_rate_limit_refresh_roster(
+        &self,
+    ) -> Result<AccountRateLimitRefreshRoster, AccountRuntimeLoadError> {
         // Merge-safety anchor: rate-limit refresh rosters must use the current
         // AccountManager-loaded runtime snapshot, not the AuthManager cache, so
         // pre-refresh candidates track live saved accounts and leases.
-        let store = self.load_store_from_storage().store;
+        let store = self.load_store_from_storage()?.store;
         let required_workspace_id = self.forced_chatgpt_workspace_id();
         let workspace_filtered_store_account_ids =
             workspace_filtered_store_account_ids(&store, required_workspace_id.as_deref());
 
         match self.account_ids_leased_by_other(&workspace_filtered_store_account_ids, Utc::now()) {
-            Ok(Some(leased_by_other_store_account_ids)) => {
+            Ok(Some(leased_by_other_store_account_ids)) => Ok(
                 account_rate_limit_refresh_roster_from_workspace_filtered_ids(
                     workspace_filtered_store_account_ids,
                     AccountRateLimitRefreshLeaseState::LeaseManaged(
                         &leased_by_other_store_account_ids,
                     ),
-                )
-            }
-            Ok(None) => account_rate_limit_refresh_roster_from_workspace_filtered_ids(
+                ),
+            ),
+            Ok(None) => Ok(account_rate_limit_refresh_roster_from_workspace_filtered_ids(
                 workspace_filtered_store_account_ids,
                 AccountRateLimitRefreshLeaseState::NoLeaseOwner,
-            ),
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "failed to load lease-aware rate-limit refresh roster"
-                );
-                account_rate_limit_refresh_roster_from_workspace_filtered_ids(
-                    workspace_filtered_store_account_ids,
-                    AccountRateLimitRefreshLeaseState::LeaseReadFailed,
-                )
-            }
+            )),
+            Err(error) => Err(AccountRuntimeLoadError::lease_state_read(error)),
         }
     }
 
     pub(super) fn account_lease_states(
         &self,
         store: &AuthStore,
-    ) -> HashMap<String, AccountLeaseState> {
+    ) -> Result<HashMap<String, AccountLeaseState>, AccountRuntimeLoadError> {
         let account_ids = store
             .accounts
             .iter()
@@ -1675,26 +1611,25 @@ impl AccountManager {
             .collect::<Vec<_>>();
         let mut lease_states = HashMap::with_capacity(account_ids.len());
         let active_account_id = store.active_account_id.as_deref();
-        let foreign_leases = self.account_ids_leased_by_other(&account_ids, Utc::now());
+        let foreign_leases = self
+            .account_ids_leased_by_other(&account_ids, Utc::now())
+            .map_err(AccountRuntimeLoadError::lease_state_read)?;
 
         for account_id in account_ids {
             let lease_state = match foreign_leases.as_ref() {
-                Ok(Some(foreign_leases)) if foreign_leases.contains(account_id.as_str()) => {
+                Some(foreign_leases) if foreign_leases.contains(account_id.as_str()) => {
                     AccountLeaseState::LeasedByOtherSession
                 }
-                Ok(Some(_)) if active_account_id == Some(account_id.as_str()) => {
+                Some(_) if active_account_id == Some(account_id.as_str()) => {
                     AccountLeaseState::LeasedByCurrentSession
                 }
-                Ok(Some(_)) => AccountLeaseState::NotLeased,
-                Err(_) if active_account_id == Some(account_id.as_str()) => {
-                    AccountLeaseState::LeasedByCurrentSession
-                }
-                Err(_) | Ok(None) => AccountLeaseState::Unavailable,
+                Some(_) => AccountLeaseState::NotLeased,
+                None => AccountLeaseState::Unavailable,
             };
             lease_states.insert(account_id, lease_state);
         }
 
-        lease_states
+        Ok(lease_states)
     }
 
     pub(super) fn select_account_for_auto_switch_with_leases(
@@ -1742,15 +1677,15 @@ impl AccountManager {
         &self,
         required_workspace_id: Option<&str>,
         exclude_store_account_id: Option<&str>,
-    ) -> Option<String> {
-        let store = self.load_store_from_storage().store;
-        self.select_account_for_auto_switch_with_leases(
+    ) -> Result<Option<String>, AccountRuntimeLoadError> {
+        let store = self.load_store_from_storage()?.store;
+        Ok(self.select_account_for_auto_switch_with_leases(
             &store,
             required_workspace_id,
             exclude_store_account_id,
             Utc::now(),
             UsageLimitAutoSwitchSelectionScope::PersistedTruth,
-        )
+        ))
     }
 
     fn update_saved_account_store<T>(
@@ -1762,7 +1697,7 @@ impl AccountManager {
         // keep this no-saved-accounts early return outside the persistence path
         // so API-key or empty stores are not loaded, persisted, or treated as
         // account-runtime state just because usage data arrived.
-        if !self.has_saved_chatgpt_accounts() {
+        if !self.has_saved_chatgpt_accounts().map_err(AccountRuntimeLoadError::into_io_error)? {
             return Ok(default);
         }
         let (out, _loaded) = self.mutate_store(mutator)?;
@@ -1779,7 +1714,7 @@ impl AccountManager {
         // the no-saved-accounts early return before consuming the caller's
         // iterator; API-key or empty stores must not be loaded, persisted, or
         // drained by account-runtime follower updates.
-        if !self.has_saved_chatgpt_accounts() {
+        if !self.has_saved_chatgpt_accounts().map_err(AccountRuntimeLoadError::into_io_error)? {
             return Ok(default);
         }
 
@@ -1869,7 +1804,7 @@ impl AccountManager {
         &self,
         request: UsageLimitAutoSwitchRequest<'_>,
     ) -> std::io::Result<AccountRuntimeMutation<Option<String>>> {
-        if !self.has_saved_chatgpt_accounts() {
+        if !self.has_saved_chatgpt_accounts().map_err(AccountRuntimeLoadError::into_io_error)? {
             // Merge-safety anchor: no saved-account autoswitch must remain a
             // no-op that does not materialize auth.json just to satisfy the
             // active-mutation refresh-token contract.
@@ -1973,11 +1908,11 @@ impl AccountManager {
         Ok(true)
     }
 
-    pub fn list_accounts(&self) -> Vec<AccountSummary> {
-        let store = self.load_store_from_storage().store;
+    pub fn list_accounts(&self) -> Result<Vec<AccountSummary>, AccountRuntimeLoadError> {
+        let store = self.load_store_from_storage()?.store;
         let active_account_id = store.active_account_id.as_deref();
-        let lease_states = self.account_lease_states(&store);
-        store
+        let lease_states = self.account_lease_states(&store)?;
+        Ok(store
             .accounts
             .iter()
             .map(|account| {
@@ -1987,7 +1922,7 @@ impl AccountManager {
                     .unwrap_or(AccountLeaseState::Unavailable);
                 AccountSummary::from_stored(account, active_account_id, lease_state)
             })
-            .collect()
+            .collect())
     }
 
     fn reconcile_account_rate_limit_refresh_outcomes_in_store(
@@ -2106,8 +2041,8 @@ impl AccountManager {
     pub fn accounts_rate_limits_cache_expires_at(
         &self,
         now: DateTime<Utc>,
-    ) -> Option<DateTime<Utc>> {
-        let store = self.load_store_from_storage().store;
+    ) -> Result<Option<DateTime<Utc>>, AccountRuntimeLoadError> {
+        let store = self.load_store_from_storage()?.store;
         let next_release_at = store
             .accounts
             .iter()
@@ -2120,10 +2055,10 @@ impl AccountManager {
             .filter(|until| *until > now)
             .min();
         if next_release_at.is_some() {
-            return next_release_at;
+            return Ok(next_release_at);
         }
 
-        store
+        Ok(store
             .accounts
             .iter()
             .filter_map(|account| {
@@ -2133,7 +2068,7 @@ impl AccountManager {
                     .and_then(|usage| usage.last_rate_limits.as_ref())
             })
             .filter_map(|snapshot| snapshot_next_reset_at(snapshot, now))
-            .min()
+            .min())
     }
 
     pub(super) fn switch_account_on_usage_limit_with_cooldown(
@@ -2424,7 +2359,6 @@ impl AccountSummary {
 enum AccountRateLimitRefreshLeaseState<'a> {
     LeaseManaged(&'a HashSet<String>),
     NoLeaseOwner,
-    LeaseReadFailed,
 }
 
 fn workspace_filtered_store_account_ids(
@@ -2450,9 +2384,6 @@ fn account_rate_limit_refresh_roster_from_workspace_filtered_ids(
         AccountRateLimitRefreshLeaseState::NoLeaseOwner => {
             AccountRateLimitRefreshRosterStatus::NoLeaseOwner
         }
-        AccountRateLimitRefreshLeaseState::LeaseReadFailed => {
-            AccountRateLimitRefreshRosterStatus::LeaseReadFailed
-        }
     };
     let store_account_ids = match lease_state {
         AccountRateLimitRefreshLeaseState::LeaseManaged(leased_by_other_store_account_ids) => {
@@ -2462,7 +2393,6 @@ fn account_rate_limit_refresh_roster_from_workspace_filtered_ids(
                 .collect()
         }
         AccountRateLimitRefreshLeaseState::NoLeaseOwner => workspace_filtered_store_account_ids,
-        AccountRateLimitRefreshLeaseState::LeaseReadFailed => Vec::new(),
     };
     AccountRateLimitRefreshRoster {
         store_account_ids,

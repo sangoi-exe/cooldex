@@ -27,7 +27,8 @@ pub async fn build_prompt_input(
     config.ephemeral = true;
 
     let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+            .map_err(|error| codex_protocol::error::CodexErr::Io(error.into_io_error()))?;
 
     let thread_manager = ThreadManager::new(
         &config,

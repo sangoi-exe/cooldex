@@ -183,9 +183,19 @@ impl AgentIdentityManager {
     }
 
     async fn current_auth_binding(&self) -> Option<(CodexAuth, AgentIdentityBinding)> {
-        let Some(auth) = self.auth_manager.auth().await else {
-            debug!("skipping agent identity flow because no auth is available");
-            return None;
+        let auth = match self.auth_manager.auth().await {
+            Ok(Some(auth)) => auth,
+            Ok(None) => {
+                debug!("skipping agent identity flow because no auth is available");
+                return None;
+            }
+            Err(err) => {
+                debug!(
+                    error = %err,
+                    "skipping agent identity flow because auth owner could not be loaded"
+                );
+                return None;
+            }
         };
 
         let binding =

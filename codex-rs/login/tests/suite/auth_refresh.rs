@@ -90,6 +90,7 @@ async fn refresh_token_succeeds_updates_storage() -> Result<()> {
         .auth_manager
         .auth()
         .await
+        .context("load auth")?
         .context("auth should be cached")?;
     let cached = cached_auth
         .get_token_data()
@@ -154,6 +155,7 @@ async fn refresh_token_refreshes_when_auth_is_unchanged() -> Result<()> {
         .auth_manager
         .auth()
         .await
+        .context("load auth")?
         .context("auth should be cached")?;
     let cached = cached_auth
         .get_token_data()
@@ -204,6 +206,7 @@ async fn refresh_token_skips_refresh_when_auth_changed() -> Result<()> {
     let cached_auth = ctx
         .auth_manager
         .auth_cached()
+        .context("load cached auth")?
         .context("auth should be cached")?;
     let cached_tokens = cached_auth
         .get_token_data()
@@ -256,8 +259,10 @@ async fn chatgpt_request_auth_serializes_stale_refresh() -> Result<()> {
     );
 
     for snapshot in [
-        first.context("first request auth snapshot should resolve")?,
-        second.context("second request auth snapshot should resolve")?,
+        (first.context("first request auth snapshot should resolve")?
+            .context("first request auth snapshot should exist")?),
+        (second.context("second request auth snapshot should resolve")?
+            .context("second request auth snapshot should exist")?),
     ] {
         assert_eq!(snapshot.authorization(), "Bearer new-access-token");
         assert_eq!(snapshot.account_id(), "account-id");
@@ -331,6 +336,7 @@ async fn refresh_token_errors_on_account_mismatch() -> Result<()> {
     let cached_after = ctx
         .auth_manager
         .auth_cached()
+        .context("load cached auth after refresh")?
         .context("auth should be cached after refresh")?;
     let cached_after_tokens = cached_after
         .get_token_data()
@@ -373,6 +379,7 @@ async fn returns_fresh_tokens_as_is() -> Result<()> {
         .auth_manager
         .auth()
         .await
+        .context("load auth")?
         .context("auth should be cached")?;
     let cached = cached_auth
         .get_token_data()
@@ -421,6 +428,7 @@ async fn refreshes_token_when_access_token_is_expired() -> Result<()> {
         .auth_manager
         .auth()
         .await
+        .context("load auth")?
         .context("auth should be cached")?;
     let refreshed_tokens = TokenData {
         access_token: "new-access-token".to_string(),
@@ -482,6 +490,7 @@ async fn auth_reloads_disk_auth_when_cached_auth_is_stale() -> Result<()> {
         .auth_manager
         .auth()
         .await
+        .context("load auth")?
         .context("auth should reload from disk")?;
     let cached = cached_auth
         .get_token_data()
@@ -541,6 +550,7 @@ async fn auth_reloads_disk_auth_without_calling_expired_refresh_token() -> Resul
         .auth_manager
         .auth()
         .await
+        .context("load auth")?
         .context("auth should reload from disk")?;
     let cached = cached_auth
         .get_token_data()
@@ -593,7 +603,7 @@ async fn refresh_token_terminal_expiration_removes_saved_account() -> Result<()>
 
     let stored = ctx.load_auth()?;
     assert_persisted_store_has_no_saved_accounts(&stored);
-    assert_eq!(ctx.auth_manager.auth_cached(), None);
+    assert_eq!(ctx.auth_manager.auth_cached()?, None);
 
     server.verify().await;
     Ok(())
@@ -652,7 +662,7 @@ async fn refresh_token_does_not_retry_after_permanent_failure() -> Result<()> {
 
     let stored = ctx.load_auth()?;
     assert_persisted_store_has_no_saved_accounts(&stored);
-    assert_eq!(ctx.auth_manager.auth_cached(), None);
+    assert_eq!(ctx.auth_manager.auth_cached()?, None);
 
     server.verify().await;
     Ok(())
@@ -713,6 +723,7 @@ async fn auth_reloads_changed_auth_after_terminal_permanent_failure() -> Result<
         .auth_manager
         .auth()
         .await
+        .context("load auth")?
         .context("auth should reload changed auth without retrying")?;
     let cached = cached_auth
         .get_token_data()
@@ -775,6 +786,7 @@ async fn refresh_token_returns_transient_error_on_server_failure() -> Result<()>
         .auth_manager
         .auth()
         .await
+        .context("load auth")?
         .context("auth should remain cached")?;
     let cached = cached_auth
         .get_token_data()
@@ -826,6 +838,7 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
     let cached_before = ctx
         .auth_manager
         .auth_cached()
+        .expect("load cached auth")
         .expect("auth should be cached");
     let cached_before_tokens = cached_before
         .get_token_data()
@@ -840,6 +853,7 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
     let cached_after = ctx
         .auth_manager
         .auth_cached()
+        .expect("load cached auth after reload")
         .expect("auth should be cached after reload");
     let cached_after_tokens = cached_after
         .get_token_data()
@@ -864,7 +878,8 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
         .auth_manager
         .auth()
         .await
-        .expect("auth should be cached");
+        .context("load auth")?
+        .context("auth should be cached")?;
     let cached_tokens = cached_auth
         .get_token_data()
         .context("token data should be cached")?;
@@ -917,6 +932,7 @@ async fn unauthorized_recovery_errors_on_account_mismatch() -> Result<()> {
     let cached_before = ctx
         .auth_manager
         .auth_cached()
+        .expect("load cached auth")
         .expect("auth should be cached");
     let cached_before_tokens = cached_before
         .get_token_data()
@@ -942,6 +958,7 @@ async fn unauthorized_recovery_errors_on_account_mismatch() -> Result<()> {
     let cached_after = ctx
         .auth_manager
         .auth_cached()
+        .context("load cached auth after refresh")?
         .context("auth should remain cached after refresh")?;
     let cached_after_tokens = cached_after
         .get_token_data()
@@ -1033,7 +1050,7 @@ impl RefreshTokenTestContext {
             codex_home.path().to_path_buf(),
             /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
-        );
+        )?;
 
         Ok(Self {
             codex_home,
@@ -1050,7 +1067,7 @@ impl RefreshTokenTestContext {
 
     fn write_auth(&self, auth_dot_json: &AuthDotJson) -> Result<()> {
         save_legacy_auth(self.codex_home.path(), auth_dot_json)?;
-        self.auth_manager.reload();
+        self.auth_manager.reload().context("reload auth")?;
         Ok(())
     }
 }

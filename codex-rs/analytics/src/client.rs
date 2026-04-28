@@ -304,23 +304,16 @@ async fn send_track_events(
     if events.is_empty() {
         return;
     }
-    let Some(auth) = auth_manager.auth().await else {
-        return;
-    };
-    if !auth.is_chatgpt_auth() {
-        return;
-    }
     // Merge-safety anchor: analytics uploads must resolve the current ChatGPT
-    // Authorization header through the auth owner instead of re-synthesizing a
-    // bare bearer string at the callsite.
-    let Some(authorization_header_value) = auth_manager
-        .chatgpt_authorization_header_for_auth(&auth)
-        .await
-    else {
-        return;
-    };
-    let Some(account_id) = auth.get_account_id() else {
-        return;
+    // request-auth snapshot through the auth owner instead of re-synthesizing a
+    // bare bearer/account header at the callsite.
+    let request_auth = match auth_manager.chatgpt_request_auth().await {
+        Ok(Some(request_auth)) => request_auth,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load ChatGPT auth for analytics upload");
+            return;
+        }
     };
 
     let base_url = base_url.trim_end_matches('/');
@@ -330,10 +323,10 @@ async fn send_track_events(
     let mut request = create_client()
         .post(&url)
         .timeout(ANALYTICS_EVENTS_TIMEOUT)
-        .header("authorization", authorization_header_value)
-        .header("chatgpt-account-id", &account_id)
+        .header("authorization", request_auth.authorization())
+        .header("chatgpt-account-id", request_auth.account_id())
         .header("Content-Type", "application/json");
-    if auth.is_fedramp_account() {
+    if request_auth.is_fedramp_account() {
         request = request.header("X-OpenAI-Fedramp", "true");
     }
     let response = request.json(&payload).send().await;

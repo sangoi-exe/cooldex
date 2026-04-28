@@ -205,7 +205,16 @@ pub(crate) async fn maybe_install_mcp_dependencies(
 
     // Refresh from the effective merged MCP map (global + repo + managed) and
     // overlay the updated global servers so we don't drop repo-scoped servers.
-    let auth = sess.services.auth_manager.auth().await;
+    let auth = match sess.services.auth_manager.chatgpt_request_auth().await {
+        Ok(auth) => auth,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "failed to load ChatGPT request auth for MCP dependency refresh"
+            );
+            None
+        }
+    };
     let mut refresh_servers = sess
         .services
         .mcp_manager

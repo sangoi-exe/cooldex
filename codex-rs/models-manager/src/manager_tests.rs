@@ -417,7 +417,7 @@ async fn refresh_available_models_sorts_by_priority() {
     let cached_remote = manager.get_remote_models().await;
     assert_models_contain(&cached_remote, &remote_models);
 
-    let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await;
+    let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await.expect("list models");
     let high_idx = available
         .iter()
         .position(|model| model.model == "priority-high")

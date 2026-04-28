@@ -5,20 +5,21 @@ use codex_app_server_protocol::ModelUpgradeInfo;
 use codex_app_server_protocol::ReasoningEffortOption;
 use codex_core::ThreadManager;
 use codex_models_manager::manager::RefreshStrategy;
+use codex_protocol::error::CodexErr;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 
 pub async fn supported_models(
     thread_manager: Arc<ThreadManager>,
     include_hidden: bool,
-) -> Vec<Model> {
-    thread_manager
+) -> Result<Vec<Model>, CodexErr> {
+    Ok(thread_manager
         .list_models(RefreshStrategy::OnlineIfUncached)
-        .await
+        .await?
         .into_iter()
         .filter(|preset| include_hidden || preset.show_in_picker)
         .map(model_from_preset)
-        .collect()
+        .collect())
 }
 
 fn model_from_preset(preset: ModelPreset) -> Model {

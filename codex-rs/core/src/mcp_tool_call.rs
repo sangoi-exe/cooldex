@@ -1087,7 +1087,16 @@ pub(crate) async fn lookup_mcp_tool_metadata(
         // Merge-safety anchor: Codex Apps MCP metadata may consult ChatGPT
         // connector auth, but only through the turn's AccountManager owner.
         let auth = match turn_context.auth_manager.as_deref() {
-            Some(auth_manager) => auth_manager.chatgpt_auth().await,
+            Some(auth_manager) => match auth_manager.chatgpt_request_auth().await {
+                Ok(auth) => auth,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to load ChatGPT request auth for MCP approval metadata"
+                    );
+                    None
+                }
+            },
             None => None,
         };
         let connectors = match connectors::list_cached_accessible_connectors_from_mcp_tools(

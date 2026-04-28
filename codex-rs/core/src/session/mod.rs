@@ -576,7 +576,7 @@ impl Codex {
         }
         let model = models_manager
             .get_default_model(&config.model, refresh_strategy)
-            .await;
+            .await?;
 
         // Resolve base instructions for the session. Priority order:
         // 1. config.base_instructions override

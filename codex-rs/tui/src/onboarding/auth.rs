@@ -979,7 +979,8 @@ mod tests {
             .await
             .unwrap();
         let auth_manager =
-            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+                .expect("create test auth manager");
         let client = InProcessAppServerClient::start(InProcessClientStartArgs {
             arg0_paths: Arg0DispatchPaths::default(),
             auth_manager: auth_manager.clone(),

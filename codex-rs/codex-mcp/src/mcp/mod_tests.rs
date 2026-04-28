@@ -1,5 +1,7 @@
 use super::*;
 use codex_config::Constrained;
+use codex_login::AuthManager;
+use codex_login::ChatGptRequestAuth;
 use codex_login::CodexAuth;
 use codex_plugin::AppConnectorId;
 use codex_plugin::PluginCapabilitySummary;
@@ -36,6 +38,19 @@ fn make_tool(name: &str) -> Tool {
         icons: None,
         meta: None,
     }
+}
+
+async fn dummy_chatgpt_request_auth() -> ChatGptRequestAuth {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let auth_manager = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        codex_home.path().to_path_buf(),
+    );
+    auth_manager
+        .chatgpt_request_auth()
+        .await
+        .expect("load ChatGPT request auth")
+        .expect("dummy ChatGPT auth should produce request auth")
 }
 
 #[test]
@@ -155,10 +170,10 @@ fn codex_apps_mcp_url_uses_legacy_codex_apps_path() {
     );
 }
 
-#[test]
-fn codex_apps_server_config_uses_legacy_codex_apps_path() {
+#[tokio::test]
+async fn codex_apps_server_config_uses_legacy_codex_apps_path() {
     let mut config = test_mcp_config(PathBuf::from("/tmp"));
-    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    let auth = dummy_chatgpt_request_auth().await;
 
     let mut servers = with_codex_apps_mcp(HashMap::new(), /*auth*/ None, &config);
     assert!(!servers.contains_key(CODEX_APPS_MCP_SERVER_NAME));
@@ -182,7 +197,7 @@ async fn effective_mcp_servers_preserve_user_servers_and_add_codex_apps() {
     let codex_home = tempfile::tempdir().expect("tempdir");
     let mut config = test_mcp_config(codex_home.path().to_path_buf());
     config.apps_enabled = true;
-    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    let auth = dummy_chatgpt_request_auth().await;
 
     config.configured_mcp_servers.insert(
         "sample".to_string(),

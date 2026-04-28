@@ -531,7 +531,7 @@ use chrono::Local;
 use chrono::Utc;
 use codex_file_search::FileMatch;
 use codex_login::AuthManager;
-use codex_login::CodexAuth;
+use codex_login::ChatGptRequestAuth;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -8652,10 +8652,17 @@ impl ChatWidget {
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
             let auth_snapshot =
-                connectors::load_connector_auth_snapshot(auth_manager.as_ref()).await;
-            let auth = auth_snapshot
-                .as_ref()
-                .map(connectors::ChatGptConnectorAuthSnapshot::codex_auth);
+                match connectors::load_connector_auth_snapshot(auth_manager.as_ref()).await {
+                    Ok(auth_snapshot) => auth_snapshot,
+                    Err(err) => {
+                        app_event_tx.send(AppEvent::ConnectorsLoaded {
+                            result: Err(format!("Failed to load apps: {err}")),
+                            is_final: true,
+                        });
+                        return;
+                    }
+                };
+            let auth = auth_snapshot.as_ref().map(|snapshot| snapshot.request_auth());
             let accessible_result =
                 match connectors::list_accessible_connectors_from_mcp_tools_with_options_and_status(
                     &config,
@@ -9820,10 +9827,22 @@ impl ChatWidget {
     }
 
     fn can_manage_chatgpt_accounts(&self) -> bool {
-        self.auth_manager
+        match self
+            .auth_manager
             .account_manager()
             .has_saved_chatgpt_accounts()
-            || self.config.model_provider.requires_openai_auth
+        {
+            Ok(has_saved_accounts) => {
+                has_saved_accounts || self.config.model_provider.requires_openai_auth
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to load saved ChatGPT account state"
+                );
+                self.config.model_provider.requires_openai_auth
+            }
+        }
     }
 
     pub(crate) fn open_accounts_loading_popup(&mut self) {
@@ -10169,13 +10188,17 @@ impl ChatWidget {
         // Merge-safety anchor: `/accounts` descriptions depend on the popup entry view model
         // preserving the popup-relevant `AccountManager::list_accounts()` semantics (active flag,
         // exhausted_until, last_rate_limits, lease state) across local and remote owners.
-        let accounts = self
+        let accounts = match self
             .auth_manager
             .account_manager()
             .list_accounts()
-            .into_iter()
-            .map(AccountsPopupEntry::from)
-            .collect();
+        {
+            Ok(accounts) => accounts.into_iter().map(AccountsPopupEntry::from).collect(),
+            Err(error) => {
+                self.add_error_message(format!("Failed to load saved ChatGPT accounts: {error}"));
+                return;
+            }
+        };
         self.open_accounts_popup_with_entries_at(
             now_local, accounts, /*allow_add_account*/ true,
         );
@@ -12803,8 +12826,11 @@ pub(crate) fn preferred_rate_limit_snapshot(
     preferred.or_else(|| snapshots.into_iter().next())
 }
 
-pub(crate) async fn fetch_rate_limits(base_url: String, auth: CodexAuth) -> Vec<RateLimitSnapshot> {
-    match BackendClient::from_auth(base_url, &auth) {
+pub(crate) async fn fetch_rate_limits(
+    base_url: String,
+    auth: ChatGptRequestAuth,
+) -> Vec<RateLimitSnapshot> {
+    match BackendClient::from_chatgpt_request_auth(base_url, &auth) {
         Ok(client) => match client.get_rate_limits_many().await {
             Ok(snapshots) => snapshots,
             Err(err) => {

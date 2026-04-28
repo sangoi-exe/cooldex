@@ -462,7 +462,8 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
             .services
             .models_manager
             .list_models(RefreshStrategy::Offline)
-            .await;
+            .await
+            .map_err(collab_spawn_error)?;
         let selected_model_name = find_spawn_agent_model_name(&available_models, requested_model)?;
         let selected_model_info = session
             .services

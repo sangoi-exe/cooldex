@@ -732,7 +732,8 @@ mod tests {
             auth_manager: AuthManager::shared_from_config(
                 config.as_ref(),
                 /*enable_codex_api_key_env*/ false,
-            ),
+            )
+            .expect("create test auth manager"),
             config,
             cli_overrides: Vec::new(),
             loader_overrides: LoaderOverrides::default(),

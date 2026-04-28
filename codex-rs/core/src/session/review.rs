@@ -23,13 +23,28 @@ pub(super) async fn spawn_review_thread(
     let _ = review_features.disable(Feature::WebSearchRequest);
     let _ = review_features.disable(Feature::WebSearchCached);
     let review_web_search_mode = WebSearchMode::Disabled;
+    let available_models = match sess
+        .services
+        .models_manager
+        .list_models(RefreshStrategy::OnlineIfUncached)
+        .await
+    {
+        Ok(models) => models,
+        Err(err) => {
+            sess.send_event(
+                parent_turn_context.as_ref(),
+                EventMsg::Error(ErrorEvent {
+                    message: format!("Failed to load models for review thread: {err}"),
+                    codex_error_info: Some(CodexErrorInfo::Other),
+                }),
+            )
+            .await;
+            return;
+        }
+    };
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &review_model_info,
-        available_models: &sess
-            .services
-            .models_manager
-            .list_models(RefreshStrategy::OnlineIfUncached)
-            .await,
+        available_models: &available_models,
         features: &review_features,
         image_generation_tool_auth_allowed: image_generation_tool_auth_allowed(Some(
             sess.services.auth_manager.as_ref(),

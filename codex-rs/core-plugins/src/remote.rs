@@ -1,4 +1,4 @@
-use codex_login::CodexAuth;
+use codex_login::ChatGptRequestAuth;
 use codex_login::default_client::build_reqwest_client;
 use codex_protocol::protocol::Product;
 use serde::Deserialize;
@@ -122,28 +122,16 @@ pub enum RemotePluginFetchError {
 
 pub async fn fetch_remote_plugin_status(
     config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
+    auth: &ChatGptRequestAuth,
 ) -> Result<Vec<RemotePluginStatusSummary>, RemotePluginFetchError> {
-    let Some(auth) = auth else {
-        return Err(RemotePluginFetchError::AuthRequired);
-    };
-    if !auth.is_chatgpt_auth() {
-        return Err(RemotePluginFetchError::UnsupportedAuthMode);
-    }
-
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
     let url = format!("{base_url}/plugins/list");
     let client = build_reqwest_client();
-    let token = auth
-        .get_token()
-        .map_err(RemotePluginFetchError::AuthToken)?;
-    let mut request = client
+    let request = client
         .get(&url)
         .timeout(REMOTE_PLUGIN_FETCH_TIMEOUT)
-        .bearer_auth(token);
-    if let Some(account_id) = auth.get_account_id() {
-        request = request.header("chatgpt-account-id", account_id);
-    }
+        .header("authorization", auth.authorization())
+        .header("chatgpt-account-id", auth.account_id());
 
     let response = request
         .send()
@@ -166,7 +154,7 @@ pub async fn fetch_remote_plugin_status(
 
 pub async fn fetch_remote_featured_plugin_ids(
     config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
+    auth: Option<&ChatGptRequestAuth>,
     product: Option<Product>,
 ) -> Result<Vec<String>, RemotePluginFetchError> {
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
@@ -180,14 +168,10 @@ pub async fn fetch_remote_featured_plugin_ids(
         )])
         .timeout(REMOTE_FEATURED_PLUGIN_FETCH_TIMEOUT);
 
-    if let Some(auth) = auth.filter(|auth| auth.is_chatgpt_auth()) {
-        let token = auth
-            .get_token()
-            .map_err(RemotePluginFetchError::AuthToken)?;
-        request = request.bearer_auth(token);
-        if let Some(account_id) = auth.get_account_id() {
-            request = request.header("chatgpt-account-id", account_id);
-        }
+    if let Some(auth) = auth {
+        request = request
+            .header("authorization", auth.authorization())
+            .header("chatgpt-account-id", auth.account_id());
     }
 
     let response = request
@@ -211,7 +195,7 @@ pub async fn fetch_remote_featured_plugin_ids(
 
 pub async fn enable_remote_plugin(
     config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
+    auth: &ChatGptRequestAuth,
     plugin_id: &str,
 ) -> Result<(), RemotePluginMutationError> {
     post_remote_plugin_mutation(config, auth, plugin_id, "enable").await?;
@@ -220,21 +204,11 @@ pub async fn enable_remote_plugin(
 
 pub async fn uninstall_remote_plugin(
     config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
+    auth: &ChatGptRequestAuth,
     plugin_id: &str,
 ) -> Result<(), RemotePluginMutationError> {
     post_remote_plugin_mutation(config, auth, plugin_id, "uninstall").await?;
     Ok(())
-}
-
-fn ensure_chatgpt_auth(auth: Option<&CodexAuth>) -> Result<&CodexAuth, RemotePluginMutationError> {
-    let Some(auth) = auth else {
-        return Err(RemotePluginMutationError::AuthRequired);
-    };
-    if !auth.is_chatgpt_auth() {
-        return Err(RemotePluginMutationError::UnsupportedAuthMode);
-    }
-    Ok(auth)
 }
 
 fn default_remote_marketplace_name() -> String {
@@ -243,23 +217,17 @@ fn default_remote_marketplace_name() -> String {
 
 async fn post_remote_plugin_mutation(
     config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
+    auth: &ChatGptRequestAuth,
     plugin_id: &str,
     action: &str,
 ) -> Result<RemotePluginMutationResponse, RemotePluginMutationError> {
-    let auth = ensure_chatgpt_auth(auth)?;
     let url = remote_plugin_mutation_url(config, plugin_id, action)?;
     let client = build_reqwest_client();
-    let token = auth
-        .get_token()
-        .map_err(RemotePluginMutationError::AuthToken)?;
-    let mut request = client
+    let request = client
         .post(url.clone())
         .timeout(REMOTE_PLUGIN_MUTATION_TIMEOUT)
-        .bearer_auth(token);
-    if let Some(account_id) = auth.get_account_id() {
-        request = request.header("chatgpt-account-id", account_id);
-    }
+        .header("authorization", auth.authorization())
+        .header("chatgpt-account-id", auth.account_id());
 
     let response = request
         .send()

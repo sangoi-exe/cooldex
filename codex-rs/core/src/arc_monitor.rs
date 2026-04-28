@@ -9,7 +9,6 @@ use crate::compact::content_items_to_text;
 use crate::event_mapping::is_contextual_user_message_content;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use codex_login::CodexAuth;
 use codex_login::default_client::build_reqwest_client;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
@@ -103,9 +102,15 @@ pub(crate) async fn monitor_action(
     protection_client_callsite: &'static str,
 ) -> ArcMonitorOutcome {
     let auth = match turn_context.auth_manager.as_ref() {
-        Some(auth_manager) => match auth_manager.auth().await {
-            Some(auth) if auth.is_chatgpt_auth() => Some(auth),
-            _ => None,
+        Some(auth_manager) => match auth_manager.chatgpt_request_auth().await {
+            Ok(auth) => auth,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "skipping safety monitor auth because auth owner could not be loaded"
+                );
+                None
+            }
         },
         None => None,
     };
@@ -114,7 +119,7 @@ pub(crate) async fn monitor_action(
     {
         (
             format!("Bearer {token}"),
-            auth.as_ref().and_then(CodexAuth::get_account_id),
+            auth.as_ref().map(|auth| auth.account_id().to_string()),
         )
     } else if let Some(authorization_header_value) =
         match sess.authorization_header_for_current_agent_task().await {
@@ -133,17 +138,10 @@ pub(crate) async fn monitor_action(
         let Some(auth) = auth.as_ref() else {
             return ArcMonitorOutcome::Ok;
         };
-        let token = match auth.get_token() {
-            Ok(token) => token,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    "skipping safety monitor because auth token is unavailable"
-                );
-                return ArcMonitorOutcome::Ok;
-            }
-        };
-        (format!("Bearer {token}"), auth.get_account_id())
+        (
+            auth.authorization().to_string(),
+            Some(auth.account_id().to_string()),
+        )
     };
 
     let url = read_non_empty_env_var(CODEX_ARC_MONITOR_ENDPOINT_OVERRIDE).unwrap_or_else(|| {

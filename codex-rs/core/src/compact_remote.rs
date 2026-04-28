@@ -171,6 +171,7 @@ async fn run_remote_compact_task_inner_impl(
             .services
             .auth_manager
             .auth_cached()
+            .map_err(|error| CodexErr::Io(error.into_io_error()))?
             .as_ref()
             .and_then(super::auth::CodexAuth::active_chatgpt_account_summary)
             .map(|summary| summary.store_account_id);
@@ -612,13 +613,14 @@ mod tests {
             AuthCredentialsStoreMode::File,
         );
         assert_eq!(
-            auth_manager.auth_mode(),
+            auth_manager.auth_mode().expect("load auth mode"),
             Some(crate::auth::AuthMode::Chatgpt),
             "fixture auth manager should load as ChatGPT auth"
         );
         assert_eq!(
             auth_manager
                 .auth_cached()
+                .expect("load cached auth")
                 .as_ref()
                 .and_then(CodexAuth::get_account_id)
                 .as_deref(),

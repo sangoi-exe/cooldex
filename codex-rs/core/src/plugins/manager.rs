@@ -53,7 +53,7 @@ use codex_core_plugins::store::PluginStore;
 use codex_core_plugins::store::PluginStoreError;
 use codex_features::Feature;
 use codex_login::AuthManager;
-use codex_login::CodexAuth;
+use codex_login::ChatGptRequestAuth;
 use codex_plugin::AppConnectorId;
 use codex_plugin::PluginCapabilitySummary;
 use codex_plugin::PluginId;
@@ -129,23 +129,13 @@ fn remote_plugin_service_config(config: &Config) -> RemotePluginServiceConfig {
 
 fn featured_plugin_ids_cache_key(
     config: &Config,
-    auth: Option<&CodexAuth>,
+    auth: Option<&ChatGptRequestAuth>,
 ) -> FeaturedPluginIdsCacheKey {
-    let token_data = auth.and_then(|auth| auth.get_token_data().ok());
-    let account_id = token_data
-        .as_ref()
-        .and_then(|token_data| token_data.account_id.clone());
-    let chatgpt_user_id = token_data
-        .as_ref()
-        .and_then(|token_data| token_data.id_token.chatgpt_user_id.clone());
-    let is_workspace_account = token_data
-        .as_ref()
-        .is_some_and(|token_data| token_data.id_token.is_workspace_account());
     FeaturedPluginIdsCacheKey {
         chatgpt_base_url: config.chatgpt_base_url.clone(),
-        account_id,
-        chatgpt_user_id,
-        is_workspace_account,
+        account_id: auth.map(|auth| auth.account_id().to_string()),
+        chatgpt_user_id: auth.and_then(|auth| auth.chatgpt_user_id().map(str::to_string)),
+        is_workspace_account: auth.is_some_and(ChatGptRequestAuth::is_workspace_account),
     }
 }
 
@@ -521,7 +511,7 @@ impl PluginsManager {
     pub async fn featured_plugin_ids_for_config(
         &self,
         config: &Config,
-        auth: Option<&CodexAuth>,
+        auth: Option<&ChatGptRequestAuth>,
     ) -> Result<Vec<String>, RemotePluginFetchError> {
         if !config.features.enabled(Feature::Plugins) {
             return Ok(Vec::new());
@@ -556,7 +546,7 @@ impl PluginsManager {
     pub async fn install_plugin_with_remote_sync(
         &self,
         config: &Config,
-        auth: Option<&CodexAuth>,
+        auth: &ChatGptRequestAuth,
         request: PluginInstallRequest,
     ) -> Result<PluginInstallOutcome, PluginInstallError> {
         let resolved = find_installable_marketplace_plugin(
@@ -650,7 +640,7 @@ impl PluginsManager {
     pub async fn uninstall_plugin_with_remote_sync(
         &self,
         config: &Config,
-        auth: Option<&CodexAuth>,
+        auth: &ChatGptRequestAuth,
         plugin_id: String,
     ) -> Result<(), PluginUninstallError> {
         // TODO: Remove this legacy remote-sync path once remote plugins have
@@ -703,7 +693,7 @@ impl PluginsManager {
     pub async fn sync_plugins_from_remote(
         &self,
         config: &Config,
-        auth: Option<&CodexAuth>,
+        auth: &ChatGptRequestAuth,
         additive_only: bool,
     ) -> Result<RemotePluginSyncResult, PluginRemoteSyncError> {
         let _remote_sync_guard = self.remote_sync_lock.lock().await;
@@ -1219,7 +1209,16 @@ impl PluginsManager {
             let config = config.clone();
             let manager = Arc::clone(self);
             tokio::spawn(async move {
-                let auth = auth_manager.auth().await;
+                let auth = match auth_manager.chatgpt_request_auth().await {
+                    Ok(auth) => auth,
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "failed to load ChatGPT auth while warming featured plugin ids cache"
+                        );
+                        return;
+                    }
+                };
                 if let Err(err) = manager
                     .featured_plugin_ids_for_config(&config, auth.as_ref())
                     .await

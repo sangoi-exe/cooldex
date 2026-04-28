@@ -169,10 +169,11 @@ async fn shared_from_config_applies_forced_workspace_before_cached_auth() -> Res
     let config = TestAuthManagerConfig::new(codex_home.path(), sqlite_home.path())
         .with_forced_chatgpt_workspace_id(workspace_b);
 
-    let manager = AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+    let manager = AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)?;
     let auth = manager
         .auth()
         .await
+        .expect("load auth")
         .expect("forced workspace should select matching saved account");
 
     assert_eq!(auth.get_account_id().as_deref(), Some(workspace_b));
@@ -212,7 +213,7 @@ async fn auth_manager_logout_with_revoke_uses_cached_auth() -> Result<()> {
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    );
+    ).expect("create auth manager");
     save_legacy_auth(
         codex_home.path(),
         &chatgpt_auth_with_refresh_token("newer-disk-refresh-token"),
@@ -221,7 +222,7 @@ async fn auth_manager_logout_with_revoke_uses_cached_auth() -> Result<()> {
     let removed = manager.logout_with_revoke().await?;
 
     assert!(removed);
-    assert!(manager.auth_cached().is_none());
+    assert!(manager.auth_cached()?.is_none());
     assert!(!codex_home.path().join("auth.json").exists());
 
     let requests = server

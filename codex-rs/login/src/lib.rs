@@ -34,6 +34,8 @@ pub use auth::AuthManagerConfig;
 pub use auth::AuthStore;
 pub use auth::CLIENT_ID;
 pub use auth::CODEX_API_KEY_ENV_VAR;
+pub use auth::AccountRuntimeLoadError;
+pub use auth::ChatGptAuthContext;
 pub use auth::ChatGptRequestAuth;
 pub use auth::ChatgptAccountAuthResolution;
 pub use auth::ChatgptAccountRefreshMode;

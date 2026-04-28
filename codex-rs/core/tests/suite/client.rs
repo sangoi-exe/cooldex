@@ -2166,7 +2166,10 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         model_info.slug.as_str(),
         /*account_id*/ None,
         Some("test@test.com".to_string()),
-        auth_manager.auth_mode().map(TelemetryAuthMode::from),
+        auth_manager
+            .auth_mode()
+            .expect("load auth mode")
+            .map(TelemetryAuthMode::from),
         "test_originator".to_string(),
         /*log_user_prompts*/ false,
         "test".to_string(),

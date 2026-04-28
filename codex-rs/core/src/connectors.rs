@@ -13,7 +13,6 @@ pub use codex_app_server_protocol::AppInfo;
 pub use codex_app_server_protocol::AppMetadata;
 use codex_connectors::AllConnectorsCacheKey;
 use codex_connectors::DirectoryListResponse;
-use codex_login::token_data::TokenData;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_tools::DiscoverableTool;
 use rmcp::model::ToolAnnotations;
@@ -32,7 +31,6 @@ use codex_config::types::AppsConfigToml;
 use codex_config::types::ToolSuggestDiscoverableType;
 use codex_features::Feature;
 use codex_login::ChatGptRequestAuth;
-use codex_login::CodexAuth;
 use codex_login::default_client::create_client;
 use codex_login::default_client::originator;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
@@ -91,7 +89,7 @@ pub struct AccessibleConnectorsStatus {
 
 pub async fn list_accessible_connectors_from_mcp_tools(
     config: &Config,
-    auth: Option<&CodexAuth>,
+    auth: Option<&ChatGptRequestAuth>,
 ) -> anyhow::Result<Vec<AppInfo>> {
     Ok(
         list_accessible_connectors_from_mcp_tools_with_options_and_status(
@@ -117,7 +115,7 @@ pub(crate) async fn list_accessible_and_enabled_connectors_from_manager(
 
 pub(crate) async fn list_tool_suggest_discoverable_tools_with_auth(
     config: &Config,
-    auth: Option<&CodexAuth>,
+    auth: Option<&ChatGptRequestAuth>,
     accessible_connectors: &[AppInfo],
 ) -> anyhow::Result<Vec<DiscoverableTool>> {
     let directory_connectors =
@@ -143,12 +141,9 @@ pub(crate) async fn list_tool_suggest_discoverable_tools_with_auth(
 
 pub async fn list_cached_accessible_connectors_from_mcp_tools(
     config: &Config,
-    auth: Option<&CodexAuth>,
+    auth: Option<&ChatGptRequestAuth>,
 ) -> Option<Vec<AppInfo>> {
-    if !config
-        .features
-        .apps_enabled_for_auth(auth.is_some_and(CodexAuth::is_chatgpt_auth))
-    {
+    if !config.features.apps_enabled_for_auth(auth.is_some()) {
         return Some(Vec::new());
     }
     let cache_key = accessible_connectors_cache_key(config, auth);
@@ -162,7 +157,7 @@ pub async fn list_cached_accessible_connectors_from_mcp_tools(
 
 pub(crate) fn refresh_accessible_connectors_cache_from_mcp_tools(
     config: &Config,
-    auth: Option<&CodexAuth>,
+    auth: Option<&ChatGptRequestAuth>,
     mcp_tools: &HashMap<String, ToolInfo>,
 ) {
     if !config.features.enabled(Feature::Apps) {
@@ -179,7 +174,7 @@ pub(crate) fn refresh_accessible_connectors_cache_from_mcp_tools(
 
 pub async fn list_accessible_connectors_from_mcp_tools_with_options(
     config: &Config,
-    auth: Option<&CodexAuth>,
+    auth: Option<&ChatGptRequestAuth>,
     force_refetch: bool,
 ) -> anyhow::Result<Vec<AppInfo>> {
     Ok(
@@ -195,13 +190,10 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_options(
 
 pub async fn list_accessible_connectors_from_mcp_tools_with_options_and_status(
     config: &Config,
-    auth: Option<&CodexAuth>,
+    auth: Option<&ChatGptRequestAuth>,
     force_refetch: bool,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
-    if !config
-        .features
-        .apps_enabled_for_auth(auth.is_some_and(CodexAuth::is_chatgpt_auth))
-    {
+    if !config.features.apps_enabled_for_auth(auth.is_some()) {
         return Ok(AccessibleConnectorsStatus {
             connectors: Vec::new(),
             codex_apps_ready: true,
@@ -328,23 +320,15 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_options_and_status(
 
 fn accessible_connectors_cache_key(
     config: &Config,
-    auth: Option<&CodexAuth>,
+    auth: Option<&ChatGptRequestAuth>,
 ) -> AccessibleConnectorsCacheKey {
-    let token_data: Option<TokenData> = auth.and_then(|auth| auth.get_token_data().ok());
-    let account_id = token_data
-        .as_ref()
-        .and_then(|token_data| token_data.account_id.clone());
-    let chatgpt_user_id = token_data
-        .as_ref()
-        .and_then(|token_data| token_data.id_token.chatgpt_user_id.clone());
-    let is_workspace_account = token_data
-        .as_ref()
-        .is_some_and(|token_data| token_data.id_token.is_workspace_account());
     AccessibleConnectorsCacheKey {
         chatgpt_base_url: config.chatgpt_base_url.clone(),
-        account_id,
-        chatgpt_user_id,
-        is_workspace_account,
+        account_id: auth.map(|auth| auth.account_id().to_string()),
+        chatgpt_user_id: auth
+            .and_then(ChatGptRequestAuth::chatgpt_user_id)
+            .map(str::to_string),
+        is_workspace_account: auth.is_some_and(ChatGptRequestAuth::is_workspace_account),
     }
 }
 
@@ -404,13 +388,13 @@ async fn tool_suggest_connector_ids(config: &Config) -> HashSet<String> {
 
 async fn list_directory_connectors_for_tool_suggest_with_auth(
     config: &Config,
-    auth: Option<&CodexAuth>,
+    auth: Option<&ChatGptRequestAuth>,
 ) -> anyhow::Result<Vec<AppInfo>> {
     if !config.features.enabled(Feature::Apps) {
         return Ok(Vec::new());
     }
 
-    let Some(request_auth) = auth.and_then(ChatGptRequestAuth::from_auth) else {
+    let Some(request_auth) = auth else {
         return Ok(Vec::new());
     };
 

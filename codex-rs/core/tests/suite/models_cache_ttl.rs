@@ -70,7 +70,7 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
     let models_manager = test.thread_manager.get_models_manager();
     let _ = models_manager
         .list_models(RefreshStrategy::OnlineIfUncached)
-        .await;
+        .await.expect("list models");
 
     let cache_path = config.codex_home.join(CACHE_FILE);
     let stale_time = Utc.timestamp_opt(0, 0).single().expect("valid epoch");
@@ -125,7 +125,7 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
     let offline_models = test
         .thread_manager
         .list_models(RefreshStrategy::Offline)
-        .await;
+        .await.expect("list models");
     assert!(
         offline_models
             .iter()
@@ -168,7 +168,7 @@ async fn uses_cache_when_version_matches() -> Result<()> {
     let models_manager = test.thread_manager.get_models_manager();
     let models = models_manager
         .list_models(RefreshStrategy::OnlineIfUncached)
-        .await;
+        .await.expect("list models");
 
     assert!(
         models.iter().any(|preset| preset.model == VERSIONED_MODEL),
@@ -215,7 +215,7 @@ async fn refreshes_when_cache_version_missing() -> Result<()> {
     let models_manager = test.thread_manager.get_models_manager();
     let models = models_manager
         .list_models(RefreshStrategy::OnlineIfUncached)
-        .await;
+        .await.expect("list models");
 
     assert!(
         models.iter().any(|preset| preset.model == "remote-missing"),
@@ -263,7 +263,7 @@ async fn refreshes_when_cache_version_differs() -> Result<()> {
     let models_manager = test.thread_manager.get_models_manager();
     let models = models_manager
         .list_models(RefreshStrategy::OnlineIfUncached)
-        .await;
+        .await.expect("list models");
 
     assert!(
         models

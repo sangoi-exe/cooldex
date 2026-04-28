@@ -17,42 +17,21 @@ pub use codex_core::connectors::list_cached_accessible_connectors_from_mcp_tools
 pub use codex_core::connectors::with_app_enabled_state;
 use codex_core::plugins::AppConnectorId;
 use codex_core::plugins::PluginsManager;
+use codex_login::AccountRuntimeLoadError;
 use codex_login::AuthManager;
+use codex_login::ChatGptAuthContext;
 use codex_login::ChatGptRequestAuth;
-use codex_login::CodexAuth;
 use codex_login::default_client::originator;
 
 const DIRECTORY_CONNECTORS_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[derive(Clone)]
-pub struct ChatGptConnectorAuthSnapshot {
-    auth: CodexAuth,
-    request_auth: ChatGptRequestAuth,
-}
-
-impl ChatGptConnectorAuthSnapshot {
-    fn from_auth(auth: CodexAuth) -> Option<Self> {
-        let request_auth = ChatGptRequestAuth::from_auth(&auth)?;
-        Some(Self { auth, request_auth })
-    }
-
-    pub fn codex_auth(&self) -> &CodexAuth {
-        &self.auth
-    }
-
-    fn request_auth(&self) -> &ChatGptRequestAuth {
-        &self.request_auth
-    }
-}
-
 pub async fn load_connector_auth_snapshot(
     auth_manager: &AuthManager,
-) -> Option<ChatGptConnectorAuthSnapshot> {
-    let auth = auth_manager.chatgpt_auth().await?;
-    ChatGptConnectorAuthSnapshot::from_auth(auth)
+) -> Result<Option<ChatGptAuthContext>, AccountRuntimeLoadError> {
+    auth_manager.chatgpt_auth().await
 }
 
-fn apps_enabled(config: &Config, auth_snapshot: Option<&ChatGptConnectorAuthSnapshot>) -> bool {
+fn apps_enabled(config: &Config, auth_snapshot: Option<&ChatGptAuthContext>) -> bool {
     config
         .features
         .apps_enabled_for_auth(auth_snapshot.is_some())
@@ -62,16 +41,16 @@ pub async fn list_connectors(
     config: &Config,
     auth_manager: &AuthManager,
 ) -> anyhow::Result<Vec<AppInfo>> {
-    let auth_snapshot = load_connector_auth_snapshot(auth_manager).await;
-    let auth = auth_snapshot
+    let auth_snapshot = load_connector_auth_snapshot(auth_manager).await?;
+    let request_auth = auth_snapshot
         .as_ref()
-        .map(ChatGptConnectorAuthSnapshot::codex_auth);
+        .map(ChatGptAuthContext::request_auth);
     if !apps_enabled(config, auth_snapshot.as_ref()) {
         return Ok(Vec::new());
     }
     let (connectors_result, accessible_result) = tokio::join!(
         list_all_connectors(config, auth_snapshot.as_ref()),
-        list_accessible_connectors_from_mcp_tools(config, auth),
+        list_accessible_connectors_from_mcp_tools(config, request_auth),
     );
     let connectors = connectors_result?;
     let accessible = accessible_result?;
@@ -85,14 +64,14 @@ pub async fn list_connectors(
 
 pub async fn list_all_connectors(
     config: &Config,
-    auth_snapshot: Option<&ChatGptConnectorAuthSnapshot>,
+    auth_snapshot: Option<&ChatGptAuthContext>,
 ) -> anyhow::Result<Vec<AppInfo>> {
     list_all_connectors_with_options(config, auth_snapshot, /*force_refetch*/ false).await
 }
 
 pub async fn list_cached_all_connectors(
     config: &Config,
-    auth_snapshot: Option<&ChatGptConnectorAuthSnapshot>,
+    auth_snapshot: Option<&ChatGptAuthContext>,
 ) -> Option<Vec<AppInfo>> {
     if !apps_enabled(config, auth_snapshot) {
         return Some(Vec::new());
@@ -119,7 +98,7 @@ pub async fn list_cached_all_connectors(
 
 pub async fn list_all_connectors_with_options(
     config: &Config,
-    auth_snapshot: Option<&ChatGptConnectorAuthSnapshot>,
+    auth_snapshot: Option<&ChatGptAuthContext>,
     force_refetch: bool,
 ) -> anyhow::Result<Vec<AppInfo>> {
     if !apps_enabled(config, auth_snapshot) {

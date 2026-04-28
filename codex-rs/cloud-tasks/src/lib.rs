@@ -60,7 +60,7 @@ async fn init_backend(user_agent_suffix: &str, config: &Config) -> anyhow::Resul
 
     #[cfg(debug_assertions)]
     if use_mock {
-        let auth_manager = util::auth_manager_from_config(config);
+        let auth_manager = util::auth_manager_from_config(config)?;
         return Ok(BackendContext {
             backend: Arc::new(codex_cloud_tasks_mock_client::MockClient),
             base_url,
@@ -78,14 +78,17 @@ async fn init_backend(user_agent_suffix: &str, config: &Config) -> anyhow::Resul
     };
     append_error_log(format!("startup: base_url={base_url} path_style={style}"));
 
-    let auth_manager = util::auth_manager_from_config(config);
+    let auth_manager = util::auth_manager_from_config(config)?;
     let request_auth = match auth_manager.chatgpt_request_auth().await {
-        Some(auth) => auth,
-        None => {
+        Ok(Some(auth)) => auth,
+        Ok(None) => {
             eprintln!(
                 "Not signed in. Please run 'codex login' to sign in with ChatGPT, then re-run 'codex cloud'."
             );
             std::process::exit(1);
+        }
+        Err(error) => {
+            anyhow::bail!("failed to load ChatGPT auth for cloud tasks: {error}");
         }
     };
 

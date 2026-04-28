@@ -138,7 +138,7 @@ impl Session {
         let Some(record) = self
             .services
             .auth_manager
-            .auth_cached()
+            .auth_cached()?
             .and_then(|cached_auth| cached_auth.get_agent_identity(&agent_task.chatgpt_account_id))
         else {
             return Ok(None);

@@ -36,7 +36,7 @@ pub async fn run_apply_command(
     // AuthManager and passes its request-auth snapshot down; do not reintroduce
     // hidden leaf managers or a process-global token bootstrap here.
     let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false);
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)?;
     let task_response = get_task(&config, auth_manager.as_ref(), apply_cli.task_id).await?;
     apply_diff_from_task(task_response, cwd).await
 }

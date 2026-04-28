@@ -690,55 +690,30 @@ pub(crate) async fn load_remote_control_auth(
     auth_manager: &Arc<AuthManager>,
 ) -> io::Result<RemoteControlConnectionAuth> {
     let mut reloaded = false;
-    let auth = loop {
-        let Some(auth) = auth_manager.auth().await else {
-            if reloaded {
-                return Err(io::Error::new(
-                    ErrorKind::PermissionDenied,
-                    "remote control requires ChatGPT authentication",
-                ));
+    let request_auth = loop {
+        match auth_manager.chatgpt_request_auth().await {
+            Ok(Some(auth)) => break auth,
+            Ok(None) => {
+                if reloaded {
+                    return Err(io::Error::new(
+                        ErrorKind::PermissionDenied,
+                        "remote control requires ChatGPT authentication",
+                    ));
+                }
+                auth_manager
+                    .reload()
+                    .map_err(codex_login::AccountRuntimeLoadError::into_io_error)?;
+                reloaded = true;
+                continue;
             }
-            auth_manager.reload();
-            reloaded = true;
-            continue;
-        };
-        if !auth.is_chatgpt_auth() {
-            break auth;
+            Err(error) => return Err(error.into_io_error()),
         }
-        if auth.get_account_id().is_none() && !reloaded {
-            auth_manager.reload();
-            reloaded = true;
-            continue;
-        }
-        break auth;
     };
 
-    if !auth.is_chatgpt_auth() {
-        return Err(io::Error::new(
-            ErrorKind::PermissionDenied,
-            "remote control requires ChatGPT authentication; API key auth is not supported",
-        ));
-    }
-
-    let authorization_header_value = auth_manager
-        .chatgpt_authorization_header_for_auth(&auth)
-        .await
-        .ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::WouldBlock,
-                "remote control enrollment is waiting for a ChatGPT authorization header",
-            )
-        })?;
-
     Ok(RemoteControlConnectionAuth {
-        authorization_header_value,
-        account_id: auth.get_account_id().ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::WouldBlock,
-                "remote control enrollment is waiting for a ChatGPT account id",
-            )
-        })?,
-        is_fedramp_account: auth.is_fedramp_account(),
+        authorization_header_value: request_auth.authorization().to_string(),
+        account_id: request_auth.account_id().to_string(),
+        is_fedramp_account: request_auth.is_fedramp_account(),
     })
 }
 

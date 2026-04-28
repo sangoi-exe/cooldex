@@ -13,6 +13,7 @@ use codex_tools::all_suggested_connectors_picked_up;
 use codex_tools::build_tool_suggestion_elicitation_request;
 use codex_tools::filter_tool_suggest_discoverable_tools_for_client;
 use codex_tools::verified_connector_suggestion_completed;
+use codex_login::ChatGptRequestAuth;
 use rmcp::model::RequestId;
 use tracing::warn;
 
@@ -72,7 +73,16 @@ impl ToolHandler for ToolSuggestHandler {
             ));
         }
 
-        let auth = session.services.auth_manager.auth().await;
+        let auth = session
+            .services
+            .auth_manager
+            .chatgpt_request_auth()
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "tool suggestions are unavailable right now: {error}"
+                ))
+            })?;
         let manager = session.services.mcp_connection_manager.read().await;
         let mcp_tools = manager.list_all_tools().await;
         drop(manager);
@@ -158,7 +168,7 @@ async fn verify_tool_suggestion_completed(
     session: &crate::session::session::Session,
     turn: &crate::session::turn_context::TurnContext,
     tool: &DiscoverableTool,
-    auth: Option<&codex_login::CodexAuth>,
+    auth: Option<&ChatGptRequestAuth>,
 ) -> bool {
     match tool {
         DiscoverableTool::Connector(connector) => refresh_missing_suggested_connectors(
@@ -196,7 +206,7 @@ async fn verify_tool_suggestion_completed(
 async fn refresh_missing_suggested_connectors(
     session: &crate::session::session::Session,
     turn: &crate::session::turn_context::TurnContext,
-    auth: Option<&codex_login::CodexAuth>,
+    auth: Option<&ChatGptRequestAuth>,
     expected_connector_ids: &[String],
     tool_id: &str,
 ) -> Option<Vec<AppInfo>> {

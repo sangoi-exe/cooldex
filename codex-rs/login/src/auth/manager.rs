@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::DateTime;
 use chrono::Utc;
+use reqwest::header::HeaderValue;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::Serialize;
@@ -26,6 +27,7 @@ use super::account_manager::ACTIVE_ACCOUNT_LEASE_TTL_SECONDS;
 #[cfg(test)]
 use super::account_manager::AccountLeaseState;
 use super::account_manager::AccountManager;
+use super::account_manager::AccountRuntimeLoadError;
 use super::account_manager::AccountRuntimeMutation;
 use super::account_manager::ActiveChatgptAccountSummary;
 use super::account_manager::ChatgptAuthAdmissionPolicy;
@@ -100,23 +102,48 @@ pub struct ChatGptRequestAuth {
 }
 
 impl ChatGptRequestAuth {
-    pub fn from_auth(auth: &CodexAuth) -> Option<Self> {
+    pub(crate) fn from_auth(
+        auth: &CodexAuth,
+    ) -> Result<Option<Self>, AccountRuntimeLoadError> {
         if !auth.is_chatgpt_auth() {
-            return None;
+            return Ok(None);
         }
-        let token_data = auth.get_token_data().ok()?;
+        let token_data = auth.get_token_data().map_err(|error| {
+            AccountRuntimeLoadError::request_auth_materialization(error.to_string())
+        })?;
         let access_token = token_data.access_token.trim();
         if access_token.is_empty() {
-            return None;
+            return Err(AccountRuntimeLoadError::request_auth_materialization(
+                "ChatGPT access token is empty",
+            ));
         }
-        let account_id = token_data.account_id.clone().filter(|id| !id.is_empty())?;
-        Some(Self {
-            authorization: format!("Bearer {access_token}"),
+        let account_id = token_data
+            .account_id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                AccountRuntimeLoadError::request_auth_materialization(
+                    "ChatGPT account id is missing",
+                )
+            })?;
+        let authorization = format!("Bearer {access_token}");
+        HeaderValue::from_str(&authorization).map_err(|error| {
+            AccountRuntimeLoadError::request_auth_materialization(format!(
+                "ChatGPT authorization header is invalid: {error}"
+            ))
+        })?;
+        HeaderValue::from_str(&account_id).map_err(|error| {
+            AccountRuntimeLoadError::request_auth_materialization(format!(
+                "ChatGPT account id header is invalid: {error}"
+            ))
+        })?;
+        Ok(Some(Self {
+            authorization,
             account_id,
             chatgpt_user_id: token_data.id_token.chatgpt_user_id.clone(),
             is_workspace_account: token_data.id_token.is_workspace_account(),
             is_fedramp_account: token_data.id_token.is_fedramp_account(),
-        })
+        }))
     }
 
     pub fn authorization(&self) -> &str {
@@ -137,6 +164,36 @@ impl ChatGptRequestAuth {
 
     pub fn is_fedramp_account(&self) -> bool {
         self.is_fedramp_account
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatGptAuthContext {
+    codex_auth: CodexAuth,
+    request_auth: ChatGptRequestAuth,
+}
+
+impl ChatGptAuthContext {
+    fn from_auth(codex_auth: CodexAuth) -> Result<Option<Self>, AccountRuntimeLoadError> {
+        let Some(request_auth) = ChatGptRequestAuth::from_auth(&codex_auth)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            codex_auth,
+            request_auth,
+        }))
+    }
+
+    pub fn codex_auth(&self) -> &CodexAuth {
+        &self.codex_auth
+    }
+
+    pub fn request_auth(&self) -> &ChatGptRequestAuth {
+        &self.request_auth
+    }
+
+    pub fn into_parts(self) -> (CodexAuth, ChatGptRequestAuth) {
+        (self.codex_auth, self.request_auth)
     }
 }
 
@@ -272,7 +329,7 @@ pub enum ChatgptAccountRefreshMode {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ChatgptAccountAuthResolution {
     /// The stored account is still usable and resolved to a current auth snapshot.
-    Auth(Box<CodexAuth>),
+    Auth(Box<ChatGptAuthContext>),
     /// The stored account was removed because refresh-token failure is terminal.
     Removed {
         error: RefreshTokenFailedError,
@@ -701,6 +758,7 @@ pub async fn logout_with_revoke(config: &impl AuthManagerConfig) -> std::io::Res
     // path and must construct AuthManager with resolved sqlite_home, not an
     // implicit codex_home fallback that leaves WS12 leases in a foreign DB.
     AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
+        .map_err(AccountRuntimeLoadError::into_io_error)?
         .logout_with_revoke()
         .await
 }
@@ -1404,6 +1462,7 @@ pub struct UnauthorizedRecovery {
     step: UnauthorizedRecoveryStep,
     expected_store_account_id: Option<String>,
     mode: UnauthorizedRecoveryMode,
+    load_error: Option<AccountRuntimeLoadError>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1419,7 +1478,10 @@ impl UnauthorizedRecoveryStepResult {
 
 impl UnauthorizedRecovery {
     fn new(manager: Arc<AuthManager>) -> Self {
-        let cached_auth = manager.auth_cached();
+        let (cached_auth, load_error) = match manager.auth_cached() {
+            Ok(cached_auth) => (cached_auth, None),
+            Err(error) => (None, Some(error)),
+        };
         let expected_store_account_id = cached_auth
             .as_ref()
             .and_then(CodexAuth::active_chatgpt_account_summary)
@@ -1442,20 +1504,22 @@ impl UnauthorizedRecovery {
             step,
             expected_store_account_id,
             mode,
+            load_error,
         }
     }
 
     pub fn has_next(&self) -> bool {
+        if self.load_error.is_some() {
+            return !matches!(self.step, UnauthorizedRecoveryStep::Done);
+        }
         if self.manager.has_external_api_key_auth() {
             return !matches!(self.step, UnauthorizedRecoveryStep::Done);
         }
 
-        if !self
-            .manager
-            .auth_cached()
-            .as_ref()
-            .is_some_and(CodexAuth::is_chatgpt_auth)
-        {
+        let Ok(cached_auth) = self.manager.auth_cached() else {
+            return true;
+        };
+        if !cached_auth.as_ref().is_some_and(CodexAuth::is_chatgpt_auth) {
             return false;
         }
 
@@ -1475,12 +1539,10 @@ impl UnauthorizedRecovery {
             };
         }
 
-        if !self
-            .manager
-            .auth_cached()
-            .as_ref()
-            .is_some_and(CodexAuth::is_chatgpt_auth)
-        {
+        let Ok(cached_auth) = self.manager.auth_cached() else {
+            return "runtime_owner_load_failed";
+        };
+        if !cached_auth.as_ref().is_some_and(CodexAuth::is_chatgpt_auth) {
             return "not_chatgpt_auth";
         }
 
@@ -1512,6 +1574,10 @@ impl UnauthorizedRecovery {
     }
 
     pub async fn next(&mut self) -> Result<UnauthorizedRecoveryStepResult, RefreshTokenError> {
+        if let Some(error) = self.load_error.take() {
+            self.step = UnauthorizedRecoveryStep::Done;
+            return Err(RefreshTokenError::Transient(error.into_io_error()));
+        }
         if !self.has_next() {
             return Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                 RefreshTokenFailedReason::Other,
@@ -1524,6 +1590,7 @@ impl UnauthorizedRecovery {
                 match self
                     .manager
                     .reload_if_store_account_id_matches(self.expected_store_account_id.as_deref())
+                    .map_err(|error| RefreshTokenError::Transient(error.into_io_error()))?
                 {
                     ReloadOutcome::ReloadedChanged => {
                         self.step = UnauthorizedRecoveryStep::RefreshToken;
@@ -1628,14 +1695,13 @@ impl Debug for AuthManager {
 
 impl AuthManager {
     /// Create a new manager loading the initial auth using the provided
-    /// preferred auth method. Errors loading auth are treated as an
-    /// unauthenticated state; opening the account-state store is required
-    /// because AccountManager owns saved-account runtime truth.
+    /// preferred auth method. AccountManager-owned load failures are returned
+    /// instead of being converted into an unauthenticated cache.
     pub fn new(
         codex_home: PathBuf,
         enable_codex_api_key_env: bool,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
-    ) -> Self {
+    ) -> Result<Self, AccountRuntimeLoadError> {
         Self::new_with_sqlite_home(
             codex_home.clone(),
             codex_home,
@@ -1649,7 +1715,7 @@ impl AuthManager {
         sqlite_home: PathBuf,
         enable_codex_api_key_env: bool,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
-    ) -> Self {
+    ) -> Result<Self, AccountRuntimeLoadError> {
         Self::new_with_sqlite_home_and_forced_workspace(
             codex_home,
             sqlite_home,
@@ -1665,7 +1731,7 @@ impl AuthManager {
         forced_chatgpt_workspace_id: Option<String>,
         enable_codex_api_key_env: bool,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
-    ) -> Self {
+    ) -> Result<Self, AccountRuntimeLoadError> {
         Self::new_with_sqlite_home_workspace_and_linked_session(
             codex_home,
             sqlite_home,
@@ -1683,7 +1749,7 @@ impl AuthManager {
         linked_codex_session_id: Option<String>,
         enable_codex_api_key_env: bool,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
-    ) -> Self {
+    ) -> Result<Self, AccountRuntimeLoadError> {
         let (auth_state_tx, _) = watch::channel(());
         let storage = create_auth_storage(codex_home.clone(), auth_credentials_store_mode);
         let account_state_store = Some(open_account_state_store(sqlite_home.as_path()));
@@ -1701,7 +1767,7 @@ impl AuthManager {
             linked_codex_session_id,
             forced_chatgpt_workspace_id,
         );
-        let loaded = account_manager.load_store_from_storage();
+        let loaded = account_manager.load_store_from_storage()?;
         let store = loaded.store;
         let store_origin = loaded.store_origin;
         let auth = Self::derive_auth_from_store(
@@ -1711,7 +1777,7 @@ impl AuthManager {
             enable_codex_api_key_env,
             store_origin,
         );
-        Self {
+        Ok(Self {
             codex_home,
             storage,
             account_manager,
@@ -1727,7 +1793,7 @@ impl AuthManager {
             refresh_lock: AsyncMutex::new(()),
             external_auth: RwLock::new(None),
             auth_state_tx,
-        }
+        })
     }
 
     /// Create an AuthManager with a specific CodexAuth, for testing only.
@@ -1841,21 +1907,19 @@ impl AuthManager {
     }
 
     /// Current cached auth (clone) without attempting a refresh.
-    pub fn auth_cached(&self) -> Option<CodexAuth> {
+    pub fn auth_cached(&self) -> Result<Option<CodexAuth>, AccountRuntimeLoadError> {
         let (mut store, store_origin) = {
-            let guard = self.inner.read().ok()?;
+            let guard = self.inner.read().map_err(|_| {
+                AccountRuntimeLoadError::RuntimeActiveAccount(
+                    "auth cache lock poisoned".to_string(),
+                )
+            })?;
             (guard.store.clone(), guard.store_origin)
         };
-        if let Err(error) = self
+        self
             .account_manager
             .hydrate_runtime_active_account(&mut store)
-        {
-            tracing::warn!(
-                error = %error,
-                "failed to hydrate runtime active-account state while reading cached auth"
-            );
-            store.active_account_id = None;
-        }
+            .map_err(|error| AccountRuntimeLoadError::RuntimeActiveAccount(error.to_string()))?;
         let auth = Self::derive_auth_from_store(
             &store,
             &self.codex_home,
@@ -1865,7 +1929,7 @@ impl AuthManager {
         );
         if auth.is_some() || store.accounts.is_empty() {
             self.set_cached_with_auth(store, auth.clone(), store_origin);
-            return auth;
+            return Ok(auth);
         }
 
         // Merge-safety anchor: WS12 bearerless recovery must refresh from persisted store truth
@@ -1877,7 +1941,7 @@ impl AuthManager {
             linked_codex_session_id = ?self.account_manager.linked_codex_session_id().as_deref(),
             "cached auth store had saved accounts but no active account after runtime hydration; reloading auth store from disk"
         );
-        let loaded = self.load_store_from_storage();
+        let loaded = self.load_store_from_storage()?;
         let reloaded_auth = Self::derive_auth_from_store(
             &loaded.store,
             &self.codex_home,
@@ -1886,62 +1950,24 @@ impl AuthManager {
             loaded.store_origin,
         );
         self.set_cached_with_auth(loaded.store, reloaded_auth.clone(), loaded.store_origin);
-        reloaded_auth
+        Ok(reloaded_auth)
     }
 
-    pub fn active_chatgpt_account_summary(&self) -> Option<ActiveChatgptAccountSummary> {
-        let (loaded, auth) = self.load_auth_from_storage_for_live_reader();
-        let summary = if matches!(
-            auth.as_ref().map(CodexAuth::api_auth_mode),
-            Some(ApiAuthMode::ApiKey)
-        ) {
-            None
-        } else {
-            self.account_manager
-                .active_chatgpt_account_summary(&loaded.store, loaded.store_origin)
+    pub async fn chatgpt_auth(
+        &self,
+    ) -> Result<Option<ChatGptAuthContext>, AccountRuntimeLoadError> {
+        let Some(auth) = self.current_chatgpt_auth_from_storage()? else {
+            return Ok(None);
         };
-        self.set_cached_with_auth_silent(loaded.store, auth, loaded.store_origin);
-        summary
-    }
-
-    // Merge-safety anchor: first-party ChatGPT backend callers must resolve one
-    // canonical Authorization header owner here so analytics and remote-control
-    // stay aligned on auth-header and FedRAMP behavior.
-    pub async fn chatgpt_authorization_header(&self) -> Option<String> {
-        let auth = self.auth().await?;
-        self.chatgpt_authorization_header_for_auth(&auth).await
-    }
-
-    pub async fn chatgpt_authorization_header_for_auth(&self, auth: &CodexAuth) -> Option<String> {
-        if !auth.is_chatgpt_auth() {
-            return None;
-        }
-
-        Self::chatgpt_bearer_authorization_header_for_auth(auth)
-    }
-
-    pub fn chatgpt_bearer_token_for_auth(auth: &CodexAuth) -> Option<String> {
-        if !auth.is_chatgpt_auth() {
-            return None;
-        }
-        auth.get_token().ok().filter(|token| !token.is_empty())
-    }
-
-    pub fn chatgpt_bearer_authorization_header_for_auth(auth: &CodexAuth) -> Option<String> {
-        Self::chatgpt_bearer_token_for_auth(auth).map(|token| format!("Bearer {token}"))
-    }
-
-    pub async fn chatgpt_auth(&self) -> Option<CodexAuth> {
-        let auth = self.current_chatgpt_auth_from_storage()?;
         if !Self::is_stale_for_proactive_refresh(&auth) {
-            return Some(auth);
+            return ChatGptAuthContext::from_auth(auth);
         }
 
         let Some(store_account_id) = auth
             .active_chatgpt_account_summary()
             .map(|summary| summary.store_account_id)
         else {
-            return Some(auth);
+            return ChatGptAuthContext::from_auth(auth);
         };
 
         match self
@@ -1951,54 +1977,64 @@ impl AuthManager {
             )
             .await
         {
-            Ok(ChatgptAccountAuthResolution::Auth(auth)) => Some(*auth),
+            Ok(ChatgptAccountAuthResolution::Auth(auth)) => Ok(Some(*auth)),
             Ok(ChatgptAccountAuthResolution::Removed { error, .. }) => {
                 tracing::error!("Failed to refresh ChatGPT request token: {}", error);
-                self.current_chatgpt_auth_from_storage()
+                match self.current_chatgpt_auth_from_storage()? {
+                    Some(auth) => ChatGptAuthContext::from_auth(auth),
+                    None => Ok(None),
+                }
             }
-            Ok(ChatgptAccountAuthResolution::Missing) => None,
+            Ok(ChatgptAccountAuthResolution::Missing) => Ok(None),
             Err(err) => {
                 tracing::error!("Failed to refresh ChatGPT request token: {}", err);
-                self.current_chatgpt_auth_from_storage()
+                match self.current_chatgpt_auth_from_storage()? {
+                    Some(auth) => ChatGptAuthContext::from_auth(auth),
+                    None => Ok(None),
+                }
             }
         }
     }
 
-    pub async fn chatgpt_request_auth(&self) -> Option<ChatGptRequestAuth> {
-        self.chatgpt_auth()
-            .await
-            .as_ref()
-            .and_then(ChatGptRequestAuth::from_auth)
+    pub async fn chatgpt_request_auth(
+        &self,
+    ) -> Result<Option<ChatGptRequestAuth>, AccountRuntimeLoadError> {
+        Ok(self
+            .chatgpt_auth()
+            .await?
+            .map(|context| context.request_auth().clone()))
     }
 
-    fn current_chatgpt_auth_from_storage(&self) -> Option<CodexAuth> {
-        let loaded = self.load_store_from_storage();
+    fn current_chatgpt_auth_from_storage(
+        &self,
+    ) -> Result<Option<CodexAuth>, AccountRuntimeLoadError> {
+        let loaded = self.load_store_from_storage()?;
         // Merge-safety anchor: ChatGPT-only request snapshots are allowed to
         // load AccountManager-owned store truth, but they must not overwrite the
         // generic AuthManager cache used by API-key-capable callers that share
         // this runtime owner, such as `codex exec` plus cloud requirements.
-        Self::derive_auth_from_store(
+        Ok(Self::derive_auth_from_store(
             &loaded.store,
             &self.codex_home,
             Arc::clone(&self.storage),
             /*enable_codex_api_key_env*/ false,
             loaded.store_origin,
         )
-        .filter(CodexAuth::is_chatgpt_auth)
+        .filter(CodexAuth::is_chatgpt_auth))
     }
 
     fn chatgpt_auth_for_store_account_id(
         &self,
         store_account_id: &str,
-    ) -> Option<(CodexAuth, LoadedStoreOrigin)> {
-        let loaded = self.load_store_from_storage();
+    ) -> Result<Option<(CodexAuth, LoadedStoreOrigin)>, AccountRuntimeLoadError> {
+        let loaded = self.load_store_from_storage()?;
         let auth = Self::derive_chatgpt_auth_from_store_account(
             &loaded.store,
             store_account_id,
             Self::storage_for_store_origin(&self.codex_home, &self.storage, loaded.store_origin),
             loaded.store_origin,
-        )?;
-        Some((auth, loaded.store_origin))
+        );
+        Ok(auth.map(|auth| (auth, loaded.store_origin)))
     }
 
     // Merge-safety anchor: `/accounts`, usage-limit auto-switch, and active auth recovery must use
@@ -2031,16 +2067,19 @@ impl AuthManager {
         store_account_id: &str,
         refresh_mode: ChatgptAccountRefreshMode,
     ) -> Result<ChatgptAccountAuthResolution, RefreshTokenError> {
-        let Some((auth, store_origin)) = self.chatgpt_auth_for_store_account_id(store_account_id)
+        let Some((auth, store_origin)) = self
+            .chatgpt_auth_for_store_account_id(store_account_id)
+            .map_err(|error| RefreshTokenError::Transient(error.into_io_error()))?
         else {
             return Ok(ChatgptAccountAuthResolution::Missing);
         };
         let CodexAuth::Chatgpt(chatgpt_auth) = &auth else {
-            return Ok(ChatgptAccountAuthResolution::Auth(Box::new(auth)));
+            return Self::chatgpt_account_auth_resolution(auth);
         };
 
         let cached_refresh_failure =
             self.auth_cached()
+                .map_err(|error| RefreshTokenError::Transient(error.into_io_error()))?
                 .as_ref()
                 .and_then(|cached_auth| match cached_auth {
                     CodexAuth::Chatgpt(cached_chatgpt_auth)
@@ -2075,7 +2114,7 @@ impl AuthManager {
             ChatgptAccountRefreshMode::Force => true,
         };
         if !should_refresh {
-            return Ok(ChatgptAccountAuthResolution::Auth(Box::new(auth)));
+            return Self::chatgpt_account_auth_resolution(auth);
         }
 
         let token_data = chatgpt_auth
@@ -2087,13 +2126,16 @@ impl AuthManager {
             .await
         {
             Ok(_) => {
-                self.reload();
-                Ok(self
+                self.reload()
+                    .map_err(|error| RefreshTokenError::Transient(error.into_io_error()))?;
+                match self
                     .chatgpt_auth_for_store_account_id(store_account_id)
+                    .map_err(|error| RefreshTokenError::Transient(error.into_io_error()))?
                     .map(|(auth, _store_origin)| auth)
-                    .map(Box::new)
-                    .map(ChatgptAccountAuthResolution::Auth)
-                    .unwrap_or(ChatgptAccountAuthResolution::Missing))
+                {
+                    Some(auth) => Self::chatgpt_account_auth_resolution(auth),
+                    None => Ok(ChatgptAccountAuthResolution::Missing),
+                }
             }
             Err(RefreshTokenError::Permanent(error)) => {
                 if let TerminalRefreshFailureAccountRemoval::Removed {
@@ -2113,6 +2155,17 @@ impl AuthManager {
             }
             Err(err) => Err(err),
         }
+    }
+
+    fn chatgpt_account_auth_resolution(
+        auth: CodexAuth,
+    ) -> Result<ChatgptAccountAuthResolution, RefreshTokenError> {
+        let Some(context) = ChatGptAuthContext::from_auth(auth)
+            .map_err(|error| RefreshTokenError::Transient(error.into_io_error()))?
+        else {
+            return Ok(ChatgptAccountAuthResolution::Missing);
+        };
+        Ok(ChatgptAccountAuthResolution::Auth(Box::new(context)))
     }
 
     pub fn refresh_auth_after_account_runtime_mutation<T>(
@@ -2141,12 +2194,12 @@ impl AuthManager {
     /// Current request auth. Uses cached auth on the hot path, reloads through
     /// AccountManager when the cache is empty, and refreshes stale managed
     /// ChatGPT auth only if the on-disk auth is unchanged.
-    pub async fn auth(&self) -> Option<CodexAuth> {
+    pub async fn auth(&self) -> Result<Option<CodexAuth>, AccountRuntimeLoadError> {
         if let Some(auth) = self.resolve_external_api_key_auth().await {
-            return Some(auth);
+            return Ok(Some(auth));
         }
 
-        let auth = match self.auth_cached() {
+        let auth = match self.auth_cached()? {
             Some(auth) => auth,
             None => {
                 // Merge-safety anchor: after terminal saved-account eviction,
@@ -2160,15 +2213,15 @@ impl AuthManager {
             && let Err(err) = self.refresh_token().await
         {
             tracing::error!("Failed to refresh token: {}", err);
-            let fallback_auth = self.auth_cached();
+            let fallback_auth = self.auth_cached()?;
             if fallback_auth.is_none() {
                 let attempted_store_account_id = auth
                     .active_chatgpt_account_summary()
                     .map(|summary| summary.store_account_id);
-                let accounts = self.account_manager.list_accounts();
+                let accounts = self.account_manager.list_accounts()?;
                 let active_saved_account_count =
                     accounts.iter().filter(|account| account.is_active).count();
-                let roster = self.account_manager.account_rate_limit_refresh_roster();
+                let roster = self.account_manager.account_rate_limit_refresh_roster()?;
                 tracing::warn!(
                     runtime_session_id = self.account_manager.runtime_session_id(),
                     linked_codex_session_id = ?self.account_manager.linked_codex_session_id().as_deref(),
@@ -2181,16 +2234,16 @@ impl AuthManager {
                     "proactive refresh failure left auth() without any bearer"
                 );
             }
-            return fallback_auth;
+            return Ok(fallback_auth);
         }
         self.auth_cached()
     }
 
     /// Force a reload of the auth information from auth.json. Returns
     /// whether the auth value changed.
-    pub fn reload(&self) -> bool {
+    pub fn reload(&self) -> Result<bool, AccountRuntimeLoadError> {
         tracing::info!("Reloading auth");
-        let loaded = self.load_store_from_storage();
+        let loaded = self.load_store_from_storage()?;
         let auth = Self::derive_auth_from_store(
             &loaded.store,
             &self.codex_home,
@@ -2198,30 +2251,23 @@ impl AuthManager {
             self.enable_codex_api_key_env,
             loaded.store_origin,
         );
-        self.set_cached_with_auth(loaded.store, auth, loaded.store_origin)
-    }
-
-    /// Like `reload()`, but fails loudly if the auth store cannot be loaded.
-    pub fn reload_strict(&self) -> std::io::Result<bool> {
-        tracing::info!("Reloading auth (strict)");
-        let loaded = self.account_manager.load_store_for_strict_reload()?;
-        Ok(self.set_cached(loaded.store, loaded.store_origin))
+        Ok(self.set_cached_with_auth(loaded.store, auth, loaded.store_origin))
     }
 
     fn reload_if_store_account_id_matches(
         &self,
         expected_store_account_id: Option<&str>,
-    ) -> ReloadOutcome {
+    ) -> Result<ReloadOutcome, AccountRuntimeLoadError> {
         let expected_store_account_id = match expected_store_account_id {
             Some(store_account_id) => store_account_id,
             None => {
                 tracing::info!("Skipping auth reload because no saved account id is available.");
-                return ReloadOutcome::Skipped;
+                return Ok(ReloadOutcome::Skipped);
             }
         };
 
-        let Some(guarded_store) = self.account_manager.load_store_for_guarded_reload() else {
-            return ReloadOutcome::Skipped;
+        let Some(guarded_store) = self.account_manager.load_store_for_guarded_reload()? else {
+            return Ok(ReloadOutcome::Skipped);
         };
         let GuardedReloadLoadedStore {
             loaded,
@@ -2254,24 +2300,24 @@ impl AuthManager {
                     "Reloading auth after expected saved account was removed by supported-plan policy"
                 );
                 self.set_cached(store, store_origin);
-                return ReloadOutcome::ReloadedChanged;
+                return Ok(ReloadOutcome::ReloadedChanged);
             }
             let found_store_account_id = new_store_account_id.as_deref().unwrap_or("unknown");
             tracing::info!(
                 "Skipping auth reload due to saved account id mismatch (expected: {expected_store_account_id}, found: {found_store_account_id})"
             );
-            return ReloadOutcome::Skipped;
+            return Ok(ReloadOutcome::Skipped);
         }
 
         tracing::info!("Reloading auth for saved account {expected_store_account_id}");
-        let cached_before_reload = self.auth_cached();
+        let cached_before_reload = self.auth_cached()?;
         let auth_changed =
             !Self::auths_equal_for_refresh(cached_before_reload.as_ref(), new_auth.as_ref());
         self.set_cached(store, store_origin);
         if auth_changed {
-            ReloadOutcome::ReloadedChanged
+            Ok(ReloadOutcome::ReloadedChanged)
         } else {
-            ReloadOutcome::ReloadedNoChange
+            Ok(ReloadOutcome::ReloadedNoChange)
         }
     }
 
@@ -2430,7 +2476,7 @@ impl AuthManager {
         }
     }
 
-    fn load_store_from_storage(&self) -> LoadedAuthStore {
+    fn load_store_from_storage(&self) -> Result<LoadedAuthStore, AccountRuntimeLoadError> {
         // Merge-safety anchor: live auth readers must delegate store snapshot
         // loading to AccountManager so runtime-active/usage truth comes from one
         // owner while AuthManager stays on auth derivation and cache refresh.
@@ -2533,20 +2579,15 @@ impl AuthManager {
             return Ok(false);
         }
         if self.account_manager.has_account_state_store() {
-            let _ = self.reload_strict()?;
+            let _ = self
+                .reload()
+                .map_err(AccountRuntimeLoadError::into_io_error)?;
         }
         Ok(true)
     }
 
     pub fn linked_codex_session_id(&self) -> Option<String> {
         self.account_manager.linked_codex_session_id()
-    }
-
-    pub fn persisted_active_store_account_id(&self) -> std::io::Result<Option<String>> {
-        Ok(self
-            .storage
-            .load()?
-            .and_then(|store| store.active_account_id))
     }
 
     pub fn forced_chatgpt_workspace_id(&self) -> Option<String> {
@@ -2561,10 +2602,11 @@ impl AuthManager {
         self.external_auth().is_some()
     }
 
-    pub fn is_external_chatgpt_auth_active(&self) -> bool {
-        self.auth_cached()
+    pub fn is_external_chatgpt_auth_active(&self) -> Result<bool, AccountRuntimeLoadError> {
+        Ok(self
+            .auth_cached()?
             .as_ref()
-            .is_some_and(CodexAuth::is_external_chatgpt_tokens)
+            .is_some_and(CodexAuth::is_external_chatgpt_tokens))
     }
 
     pub fn codex_api_key_env_enabled(&self) -> bool {
@@ -2576,7 +2618,7 @@ impl AuthManager {
         codex_home: PathBuf,
         enable_codex_api_key_env: bool,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, AccountRuntimeLoadError> {
         Self::shared_with_sqlite_home(
             codex_home.clone(),
             codex_home,
@@ -2590,13 +2632,13 @@ impl AuthManager {
         sqlite_home: PathBuf,
         enable_codex_api_key_env: bool,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
-    ) -> Arc<Self> {
-        Arc::new(Self::new_with_sqlite_home(
+    ) -> Result<Arc<Self>, AccountRuntimeLoadError> {
+        Ok(Arc::new(Self::new_with_sqlite_home(
             codex_home,
             sqlite_home,
             enable_codex_api_key_env,
             auth_credentials_store_mode,
-        ))
+        )?))
     }
 
     /// Convenience constructor returning an `Arc` wrapper from explicit
@@ -2607,14 +2649,14 @@ impl AuthManager {
         forced_chatgpt_workspace_id: Option<String>,
         enable_codex_api_key_env: bool,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
-    ) -> Arc<Self> {
-        Arc::new(Self::new_with_sqlite_home_and_forced_workspace(
+    ) -> Result<Arc<Self>, AccountRuntimeLoadError> {
+        Ok(Arc::new(Self::new_with_sqlite_home_and_forced_workspace(
             codex_home,
             sqlite_home,
             forced_chatgpt_workspace_id,
             enable_codex_api_key_env,
             auth_credentials_store_mode,
-        ))
+        )?))
     }
 
     pub fn shared_with_sqlite_home_workspace_and_linked_session(
@@ -2624,22 +2666,22 @@ impl AuthManager {
         linked_codex_session_id: Option<String>,
         enable_codex_api_key_env: bool,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
-    ) -> Arc<Self> {
-        Arc::new(Self::new_with_sqlite_home_workspace_and_linked_session(
+    ) -> Result<Arc<Self>, AccountRuntimeLoadError> {
+        Ok(Arc::new(Self::new_with_sqlite_home_workspace_and_linked_session(
             codex_home,
             sqlite_home,
             forced_chatgpt_workspace_id,
             linked_codex_session_id,
             enable_codex_api_key_env,
             auth_credentials_store_mode,
-        ))
+        )?))
     }
 
     /// Convenience constructor returning an `Arc` wrapper from resolved config.
     pub fn shared_from_config(
         config: &impl AuthManagerConfig,
         enable_codex_api_key_env: bool,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, AccountRuntimeLoadError> {
         Self::shared_with_sqlite_home_and_forced_workspace(
             config.codex_home(),
             config.sqlite_home(),
@@ -2694,7 +2736,9 @@ impl AuthManager {
     /// token is the same as the cached, then ask the token authority to refresh.
     pub async fn refresh_token(&self) -> Result<(), RefreshTokenError> {
         let _refresh_guard = self.refresh_lock.lock().await;
-        let auth_before_reload = self.auth_cached();
+        let auth_before_reload = self
+            .auth_cached()
+            .map_err(|error| RefreshTokenError::Transient(error.into_io_error()))?;
         if auth_before_reload
             .as_ref()
             .is_some_and(CodexAuth::is_api_key_auth)
@@ -2706,7 +2750,10 @@ impl AuthManager {
             .and_then(CodexAuth::active_chatgpt_account_summary)
             .map(|summary| summary.store_account_id);
 
-        match self.reload_if_store_account_id_matches(expected_store_account_id.as_deref()) {
+        match self
+            .reload_if_store_account_id_matches(expected_store_account_id.as_deref())
+            .map_err(|error| RefreshTokenError::Transient(error.into_io_error()))?
+        {
             ReloadOutcome::ReloadedChanged => {
                 tracing::info!("Skipping token refresh because auth changed after guarded reload.");
                 Ok(())
@@ -2733,7 +2780,10 @@ impl AuthManager {
     async fn refresh_token_from_authority_impl(&self) -> Result<(), RefreshTokenError> {
         tracing::info!("Refreshing token");
 
-        let auth = match self.auth_cached() {
+        let auth = match self
+            .auth_cached()
+            .map_err(|error| RefreshTokenError::Transient(error.into_io_error()))?
+        {
             Some(auth) => auth,
             None => return Ok(()),
         };
@@ -2757,7 +2807,9 @@ impl AuthManager {
                         error,
                         switched_to_store_account_id,
                     } => {
-                        let auth_after_removal = self.auth_cached();
+                        let auth_after_removal = self
+                            .auth_cached()
+                            .map_err(|error| RefreshTokenError::Transient(error.into_io_error()))?;
                         let active_store_account_id_after_removal = auth_after_removal
                             .as_ref()
                             .and_then(CodexAuth::active_chatgpt_account_summary)
@@ -2859,6 +2911,7 @@ impl AuthManager {
     pub async fn logout_with_revoke(&self) -> std::io::Result<bool> {
         let auth_dot_json = self
             .auth_cached()
+            .map_err(AccountRuntimeLoadError::into_io_error)?
             .and_then(|auth| auth.get_current_auth_json());
         if let Err(err) = revoke_auth_tokens(auth_dot_json.as_ref()).await {
             tracing::warn!("failed to revoke auth tokens during logout: {err}");
@@ -2867,27 +2920,26 @@ impl AuthManager {
         self.finish_logout(result)
     }
 
-    pub fn get_api_auth_mode(&self) -> Option<ApiAuthMode> {
+    pub fn get_api_auth_mode(&self) -> Result<Option<ApiAuthMode>, AccountRuntimeLoadError> {
         if self.has_external_api_key_auth() {
-            return Some(ApiAuthMode::ApiKey);
+            return Ok(Some(ApiAuthMode::ApiKey));
         }
-        self.current_auth_from_storage()
+        Ok(self
+            .current_auth_from_storage()?
             .as_ref()
-            .map(CodexAuth::api_auth_mode)
+            .map(CodexAuth::api_auth_mode))
     }
 
-    pub fn get_auth_mode(&self) -> Option<ApiAuthMode> {
-        self.get_api_auth_mode()
-    }
-
-    pub fn current_auth_from_storage(&self) -> Option<CodexAuth> {
-        let (loaded, auth) = self.load_auth_from_storage_for_live_reader();
+    pub fn current_auth_from_storage(&self) -> Result<Option<CodexAuth>, AccountRuntimeLoadError> {
+        let (loaded, auth) = self.load_auth_from_storage_for_live_reader()?;
         self.set_cached_with_auth_silent(loaded.store, auth.clone(), loaded.store_origin);
-        auth
+        Ok(auth)
     }
 
-    fn load_auth_from_storage_for_live_reader(&self) -> (LoadedAuthStore, Option<CodexAuth>) {
-        let loaded = self.load_store_from_storage();
+    fn load_auth_from_storage_for_live_reader(
+        &self,
+    ) -> Result<(LoadedAuthStore, Option<CodexAuth>), AccountRuntimeLoadError> {
+        let loaded = self.load_store_from_storage()?;
         let auth = Self::derive_auth_from_store(
             &loaded.store,
             &self.codex_home,
@@ -2895,7 +2947,7 @@ impl AuthManager {
             self.enable_codex_api_key_env,
             loaded.store_origin,
         );
-        (loaded, auth)
+        Ok((loaded, auth))
     }
 
     pub fn runtime_session_id(&self) -> &str {
@@ -2908,22 +2960,23 @@ impl AuthManager {
         // blocks the next session from claiming the saved account.
         let release_result = self.account_manager.release_runtime_active_account();
         // Always reload to clear any cached auth (even if file absent).
-        self.reload();
+        self.reload().map_err(AccountRuntimeLoadError::into_io_error)?;
         release_result?;
         Ok(removed)
     }
 
-    pub fn auth_mode(&self) -> Option<AuthMode> {
+    pub fn auth_mode(&self) -> Result<Option<AuthMode>, AccountRuntimeLoadError> {
         if self.has_external_api_key_auth() {
-            return Some(AuthMode::ApiKey);
+            return Ok(Some(AuthMode::ApiKey));
         }
         self.get_internal_auth_mode()
     }
 
-    pub fn get_internal_auth_mode(&self) -> Option<AuthMode> {
-        self.auth_cached()
+    fn get_internal_auth_mode(&self) -> Result<Option<AuthMode>, AccountRuntimeLoadError> {
+        Ok(self
+            .auth_cached()?
             .as_ref()
-            .map(CodexAuth::internal_auth_mode)
+            .map(CodexAuth::internal_auth_mode))
     }
 
     fn is_stale_for_proactive_refresh(auth: &CodexAuth) -> bool {
@@ -3024,6 +3077,7 @@ impl AuthManager {
             })?;
         if let Some(previous_auth) = self
             .auth_cached()
+            .map_err(|error| RefreshTokenError::Transient(error.into_io_error()))?
             .and_then(|auth| auth.get_current_auth_json())
         {
             auth_dot_json.agent_identity = previous_auth.agent_identity;
@@ -3047,7 +3101,8 @@ impl AuthManager {
             AuthCredentialsStoreMode::Ephemeral,
         )
         .map_err(RefreshTokenError::Transient)?;
-        self.reload();
+        self.reload()
+            .map_err(|error| RefreshTokenError::Transient(error.into_io_error()))?;
         if refreshed_store_account_id
             .as_ref()
             .is_some_and(|store_account_id| {
@@ -3086,6 +3141,7 @@ impl AuthManager {
             } => {
                 let active_store_account_id_after_removal = self
                     .auth_cached()
+                    .map_err(|error| RefreshTokenError::Transient(error.into_io_error()))?
                     .as_ref()
                     .and_then(CodexAuth::active_chatgpt_account_summary)
                     .map(|summary| summary.store_account_id);
@@ -3137,7 +3193,8 @@ impl AuthManager {
             .iter()
             .any(|account| account.id == auth.store_account_id())
         {
-            self.reload();
+            self.reload()
+                .map_err(|error| RefreshTokenError::Transient(error.into_io_error()))?;
             return Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                 RefreshTokenFailedReason::Other,
                 UNSUPPORTED_CHATGPT_PLAN_REMOVED_MESSAGE.to_string(),
