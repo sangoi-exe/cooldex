@@ -10,6 +10,7 @@ use crate::auth::storage::get_auth_file;
 use crate::token_data::IdTokenInfo;
 use chrono::Utc;
 use codex_account_state::AccountUsageState;
+use codex_account_state::accounts_db_path;
 use codex_app_server_protocol::AuthMode;
 use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::auth::KnownPlan as InternalKnownPlan;
@@ -598,6 +599,83 @@ fn public_auto_switch_selector_reads_live_storage_and_sqlite_usage_truth() {
             .select_account_for_auto_switch(None, None)
             .expect("select auto-switch account"),
         Some(fallback_store_account_id.to_string())
+    );
+}
+
+// Merge-safety anchor: lease read failures during auto-switch selection are
+// account-runtime owner errors, not false no-candidate outcomes.
+#[test]
+fn auto_switch_selector_surfaces_lease_read_failures() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let workspace_id = "workspace-a";
+    let store_account_id = "store-account-a";
+    let raw_jwt = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("plus".to_string()),
+        chatgpt_account_id: Some(workspace_id.to_string()),
+    })
+    .expect("create test jwt");
+    let account = StoredAccount {
+        id: store_account_id.to_string(),
+        label: Some("Primary".to_string()),
+        tokens: TokenData {
+            id_token: IdTokenInfo {
+                email: Some("store-account-a@example.com".to_string()),
+                chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                chatgpt_user_id: Some("user-store-account-a".to_string()),
+                chatgpt_account_id: Some(workspace_id.to_string()),
+                chatgpt_account_is_fedramp: false,
+                raw_jwt,
+            },
+            access_token: "store-account-a-access-token".to_string(),
+            refresh_token: "store-account-a-refresh-token".to_string(),
+            account_id: Some(workspace_id.to_string()),
+        },
+        last_refresh: None,
+        usage: None,
+    };
+    let manager = AuthManager::new_with_sqlite_home(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("create auth manager");
+    let store = AuthStore {
+        active_account_id: Some(store_account_id.to_string()),
+        accounts: vec![account],
+        ..AuthStore::default()
+    };
+
+    let account_state_store = manager
+        .account_manager
+        .account_state_store
+        .as_ref()
+        .expect("account-state store should open");
+    let accounts_db = accounts_db_path(account_state_store.sqlite_home());
+    let connection = rusqlite::Connection::open(accounts_db).expect("open account-state db");
+    connection
+        .execute_batch("DROP TABLE account_leases;")
+        .expect("drop account_leases");
+    drop(connection);
+
+    let error = manager
+        .account_manager
+        .select_account_for_auto_switch_with_leases(
+            &store,
+            /*required_workspace_id*/ None,
+            /*exclude_store_account_id*/ None,
+            Utc::now(),
+            UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+        )
+        .expect_err("lease read failure should surface");
+    let AccountRuntimeLoadError::LeaseStateRead(message) = error else {
+        panic!("expected LeaseStateRead, got {error:?}");
+    };
+    assert!(
+        message.contains("account_leases"),
+        "unexpected lease error: {message}"
     );
 }
 

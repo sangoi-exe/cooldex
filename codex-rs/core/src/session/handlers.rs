@@ -290,7 +290,12 @@ pub async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command
         return;
     }
 
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+    let Some(turn_context) = sess
+        .new_default_turn_with_sub_id_or_emit_error(sub_id)
+        .await
+    else {
+        return;
+    };
     sess.spawn_task(
         Arc::clone(&turn_context),
         Vec::new(),
@@ -592,13 +597,23 @@ pub async fn list_skills(sess: &Session, sub_id: String, cwds: Vec<PathBuf>, for
 }
 
 pub async fn undo(sess: &Arc<Session>, sub_id: String) {
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+    let Some(turn_context) = sess
+        .new_default_turn_with_sub_id_or_emit_error(sub_id)
+        .await
+    else {
+        return;
+    };
     sess.spawn_task(turn_context, Vec::new(), UndoTask::new())
         .await;
 }
 
 pub async fn compact(sess: &Arc<Session>, sub_id: String) {
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+    let Some(turn_context) = sess
+        .new_default_turn_with_sub_id_or_emit_error(sub_id)
+        .await
+    else {
+        return;
+    };
 
     sess.spawn_task(
         Arc::clone(&turn_context),
@@ -613,7 +628,12 @@ pub async fn compact(sess: &Arc<Session>, sub_id: String) {
 }
 
 pub async fn sanitize(sess: &Arc<Session>, sub_id: String) {
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+    let Some(turn_context) = sess
+        .new_default_turn_with_sub_id_or_emit_error(sub_id)
+        .await
+    else {
+        return;
+    };
     sess.spawn_task(turn_context, Vec::new(), SanitizeTask::new())
         .await;
 }
@@ -704,7 +724,12 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         return;
     }
 
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+    let Some(turn_context) = sess
+        .new_default_turn_with_sub_id_or_emit_error(sub_id)
+        .await
+    else {
+        return;
+    };
     let rollout_path = {
         let recorder = {
             let guard = sess.services.rollout.lock().await;
@@ -978,7 +1003,12 @@ pub async fn review(
     sub_id: String,
     review_request: ReviewRequest,
 ) {
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
+    let Some(turn_context) = sess
+        .new_default_turn_with_sub_id_or_emit_error(sub_id.clone())
+        .await
+    else {
+        return;
+    };
     sess.maybe_emit_unknown_model_warning_for_turn(turn_context.as_ref())
         .await;
     sess.refresh_mcp_servers_if_requested(&turn_context).await;

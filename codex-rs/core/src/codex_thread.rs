@@ -205,7 +205,16 @@ impl CodexThread {
             .await
             .is_err()
         {
-            let turn_context = self.codex.session.new_default_turn().await;
+            let turn_context = match self.codex.session.new_default_turn().await {
+                Ok(turn_context) => turn_context,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to create turn context for session-prefix message append"
+                    );
+                    return;
+                }
+            };
             self.codex
                 .session
                 .record_conversation_items(turn_context.as_ref(), &[message])
@@ -246,12 +255,12 @@ impl CodexThread {
             ));
         }
 
-        let turn_context = self.codex.session.new_default_turn().await;
+        let turn_context = self.codex.session.new_default_turn().await?;
         if self.codex.session.reference_context_item().await.is_none() {
             self.codex
                 .session
                 .record_context_updates_and_set_reference_context_item(turn_context.as_ref())
-                .await;
+                .await?;
         }
         self.codex
             .session

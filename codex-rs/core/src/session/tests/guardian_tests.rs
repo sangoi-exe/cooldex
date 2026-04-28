@@ -273,7 +273,8 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
         ],
         InitialContextInjection::BeforeLastUserMessage,
     )
-    .await;
+    .await
+    .expect("process compacted history");
 
     let developer_messages = refreshed
         .iter()

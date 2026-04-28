@@ -4,21 +4,19 @@ use codex_model_provider::create_model_provider;
 
 // Merge-safety anchor: image-generation tool exposure must follow the same ChatGPT-capable auth
 // surface as the local external-token runtime, not only the persistent ChatGPT account mode.
-pub(super) fn image_generation_tool_auth_allowed(auth_manager: Option<&AuthManager>) -> bool {
-    let auth_mode = auth_manager.and_then(|auth_manager| match auth_manager.auth_mode() {
-        Ok(auth_mode) => auth_mode,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "disabling image generation tool because auth owner could not be loaded"
-            );
-            None
-        }
-    });
-    matches!(
+pub(super) fn image_generation_tool_auth_allowed(
+    auth_manager: Option<&AuthManager>,
+) -> CodexResult<bool> {
+    let auth_mode = match auth_manager {
+        Some(auth_manager) => auth_manager
+            .auth_mode()
+            .map_err(|error| CodexErr::Io(error.into_io_error()))?,
+        None => None,
+    };
+    Ok(matches!(
         auth_mode,
         Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)
-    )
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -96,23 +94,15 @@ impl TurnContext {
             })
     }
 
-    pub(crate) fn apps_enabled(&self) -> bool {
-        let is_chatgpt_auth = self
-            .auth_manager
-            .as_deref()
-            .and_then(|auth_manager| match auth_manager.auth_cached() {
-                Ok(auth) => auth,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "treating apps as disabled because auth owner could not be loaded"
-                    );
-                    None
-                }
-            })
-            .as_ref()
-            .is_some_and(CodexAuth::is_chatgpt_auth);
-        self.features.apps_enabled_for_auth(is_chatgpt_auth)
+    pub(crate) fn apps_enabled(&self) -> CodexResult<bool> {
+        let auth = match self.auth_manager.as_deref() {
+            Some(auth_manager) => auth_manager
+                .auth_cached()
+                .map_err(|error| CodexErr::Io(error.into_io_error()))?,
+            None => None,
+        };
+        let is_chatgpt_auth = auth.as_ref().is_some_and(CodexAuth::is_chatgpt_auth);
+        Ok(self.features.apps_enabled_for_auth(is_chatgpt_auth))
     }
 
     pub(crate) async fn with_model(
@@ -163,7 +153,7 @@ impl TurnContext {
             features: &features,
             image_generation_tool_auth_allowed: image_generation_tool_auth_allowed(
                 self.auth_manager.as_deref(),
-            ),
+            )?,
             web_search_mode: self.tools_config.web_search_mode,
             session_source: self.session_source.clone(),
             sandbox_policy: self.sandbox_policy.get(),
@@ -390,7 +380,7 @@ impl Session {
         sub_id: String,
         js_repl: Arc<JsReplHandle>,
         skills_outcome: Arc<SkillLoadOutcome>,
-    ) -> TurnContext {
+    ) -> CodexResult<TurnContext> {
         let reasoning_effort = session_configuration.collaboration_mode.reasoning_effort();
         let reasoning_summary = session_configuration
             .model_reasoning_summary
@@ -401,13 +391,14 @@ impl Session {
         );
         let session_source = session_configuration.session_source.clone();
         let image_generation_tool_auth_allowed =
-            image_generation_tool_auth_allowed(auth_manager.as_deref());
+            image_generation_tool_auth_allowed(auth_manager.as_deref())?;
+        let available_models = models_manager.try_list_models()?;
         let auth_manager_for_context = auth_manager.clone();
         let provider_for_context = create_model_provider(provider, auth_manager);
         let session_telemetry_for_context = session_telemetry;
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
-            available_models: &models_manager.try_list_models().unwrap_or_default(),
+            available_models: &available_models,
             features: &per_turn_config.features,
             image_generation_tool_auth_allowed,
             web_search_mode: Some(per_turn_config.web_search_mode.value()),
@@ -442,7 +433,7 @@ impl Session {
             session_configuration.windows_sandbox_level,
         ));
         let (current_date, timezone) = local_time_context();
-        TurnContext {
+        Ok(TurnContext {
             sub_id,
             trace_id: current_span_trace_id(),
             realtime_active: false,
@@ -486,14 +477,14 @@ impl Session {
             turn_timing_state: Arc::new(TurnTimingState::default()),
             #[cfg(test)]
             allow_usage_limit_auto_switch_pre_refresh_in_tests: false,
-        }
+        })
     }
 
     pub(crate) async fn new_turn_with_sub_id(
         &self,
         sub_id: String,
         updates: SessionSettingsUpdate,
-    ) -> ConstraintResult<Arc<TurnContext>> {
+    ) -> CodexResult<Arc<TurnContext>> {
         let update_result = {
             let mut state = self.state.lock().await;
             match state.session_configuration.clone().apply(&updates) {
@@ -533,7 +524,7 @@ impl Session {
                     }),
                 })
                 .await;
-                return Err(err);
+                return Err(CodexErr::InvalidRequest(err.to_string()));
             }
         };
 
@@ -549,13 +540,12 @@ impl Session {
                 .await;
         }
 
-        Ok(self
-            .new_turn_from_configuration(
-                sub_id,
-                session_configuration,
-                updates.final_output_json_schema,
-            )
-            .await)
+        self.new_turn_from_configuration(
+            sub_id,
+            session_configuration,
+            updates.final_output_json_schema,
+        )
+        .await
     }
 
     async fn new_turn_from_configuration(
@@ -563,7 +553,7 @@ impl Session {
         sub_id: String,
         session_configuration: SessionConfiguration,
         final_output_json_schema: Option<Option<Value>>,
-    ) -> Arc<TurnContext> {
+    ) -> CodexResult<Arc<TurnContext>> {
         let per_turn_config = Self::build_per_turn_config(&session_configuration);
         {
             let mcp_connection_manager = self.services.mcp_connection_manager.read().await;
@@ -623,7 +613,7 @@ impl Session {
             sub_id,
             Arc::clone(&self.js_repl),
             skills_outcome,
-        );
+        )?;
         turn_context.realtime_active = self.conversation.running_state().await.is_some();
 
         if let Some(final_schema) = final_output_json_schema {
@@ -631,7 +621,24 @@ impl Session {
         }
         let turn_context = Arc::new(turn_context);
         turn_context.turn_metadata_state.spawn_git_enrichment_task();
-        turn_context
+        Ok(turn_context)
+    }
+
+    pub(crate) async fn new_default_turn_with_sub_id_or_emit_error(
+        &self,
+        sub_id: String,
+    ) -> Option<Arc<TurnContext>> {
+        match self.new_default_turn_with_sub_id(sub_id.clone()).await {
+            Ok(turn_context) => Some(turn_context),
+            Err(error) => {
+                self.send_event_raw(Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
+                })
+                .await;
+                None
+            }
+        }
     }
 
     pub(crate) async fn maybe_emit_unknown_model_warning_for_turn(&self, tc: &TurnContext) {
@@ -649,12 +656,15 @@ impl Session {
         }
     }
 
-    pub(crate) async fn new_default_turn(&self) -> Arc<TurnContext> {
+    pub(crate) async fn new_default_turn(&self) -> CodexResult<Arc<TurnContext>> {
         self.new_default_turn_with_sub_id(self.next_internal_sub_id())
             .await
     }
 
-    pub(crate) async fn new_default_turn_with_sub_id(&self, sub_id: String) -> Arc<TurnContext> {
+    pub(crate) async fn new_default_turn_with_sub_id(
+        &self,
+        sub_id: String,
+    ) -> CodexResult<Arc<TurnContext>> {
         let session_configuration = {
             let state = self.state.lock().await;
             state.session_configuration.clone()

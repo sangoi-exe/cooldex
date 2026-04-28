@@ -42,13 +42,26 @@ pub(super) async fn spawn_review_thread(
             return;
         }
     };
+    let image_generation_tool_auth_allowed =
+        match image_generation_tool_auth_allowed(Some(sess.services.auth_manager.as_ref())) {
+            Ok(image_generation_tool_auth_allowed) => image_generation_tool_auth_allowed,
+            Err(err) => {
+                sess.send_event(
+                    parent_turn_context.as_ref(),
+                    EventMsg::Error(ErrorEvent {
+                        message: format!("Failed to load auth mode for review thread tools: {err}"),
+                        codex_error_info: Some(CodexErrorInfo::Other),
+                    }),
+                )
+                .await;
+                return;
+            }
+        };
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &review_model_info,
         available_models: &available_models,
         features: &review_features,
-        image_generation_tool_auth_allowed: image_generation_tool_auth_allowed(Some(
-            sess.services.auth_manager.as_ref(),
-        )),
+        image_generation_tool_auth_allowed,
         web_search_mode: Some(review_web_search_mode),
         session_source: parent_turn_context.session_source.clone(),
         sandbox_policy: parent_turn_context.sandbox_policy.get(),

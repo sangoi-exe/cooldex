@@ -628,7 +628,13 @@ async fn run_review_on_session(
 }
 
 async fn append_guardian_followup_reminder(review_session: &GuardianReviewSession) {
-    let turn_context = review_session.codex.session.new_default_turn().await;
+    let turn_context = match review_session.codex.session.new_default_turn().await {
+        Ok(turn_context) => turn_context,
+        Err(error) => {
+            warn!(error = %error, "failed to create guardian follow-up reminder turn context");
+            return;
+        }
+    };
     let reminder: ResponseItem =
         DeveloperInstructions::new(GUARDIAN_FOLLOWUP_REVIEW_REMINDER).into();
     review_session

@@ -7386,6 +7386,17 @@ impl CodexMessageProcessor {
             &outcome.plugin.apps,
         )
         .await;
+        let app_summaries = match app_summaries {
+            Ok(app_summaries) => app_summaries,
+            Err(error) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to load plugin app summaries: {error:#}"),
+                )
+                .await;
+                return;
+            }
+        };
         let visible_skills = outcome
             .plugin
             .skills
@@ -7577,9 +7588,14 @@ impl CodexMessageProcessor {
                         warn!(
                             plugin = result.plugin_id.as_key(),
                             error = %error,
-                            "failed to load connector auth after plugin install"
+                            "connector auth load failed after plugin install"
                         );
-                        None
+                        self.send_internal_error(
+                            request_id,
+                            format!("connector auth load failed after plugin install: {error}"),
+                        )
+                        .await;
+                        return;
                     }
                 };
                 let apps_needing_auth = if plugin_apps.is_empty()
@@ -7625,21 +7641,27 @@ impl CodexMessageProcessor {
                                     plugin = result.plugin_id.as_key(),
                                     "failed to load accessible apps after plugin install: {err:#}"
                                 );
-                                (
-                                    connectors::list_cached_accessible_connectors_from_mcp_tools(
-                                        &config, auth,
-                                    )
-                                    .await
-                                    .unwrap_or_default(),
-                                    false,
+                                self.send_internal_error(
+                                    request_id,
+                                    format!(
+                                        "failed to load accessible apps after plugin install: {err:#}"
+                                    ),
                                 )
+                                .await;
+                                return;
                             }
                         };
                     if !codex_apps_ready {
                         warn!(
                             plugin = result.plugin_id.as_key(),
-                            "codex_apps MCP not ready after plugin install; skipping appsNeedingAuth check"
+                            "codex_apps MCP not ready after plugin install"
                         );
+                        self.send_internal_error(
+                            request_id,
+                            "codex_apps MCP is not ready after plugin install".to_string(),
+                        )
+                        .await;
+                        return;
                     }
 
                     plugin_app_helpers::plugin_apps_needing_auth(

@@ -1209,8 +1209,11 @@ impl Session {
         state.clear_connector_selection();
     }
 
-    async fn record_initial_history(&self, conversation_history: InitialHistory) {
-        let turn_context = self.new_default_turn().await;
+    async fn try_record_initial_history(
+        &self,
+        conversation_history: InitialHistory,
+    ) -> CodexResult<()> {
+        let turn_context = self.new_default_turn().await?;
         let is_subagent = {
             let state = self.state.lock().await;
             matches!(
@@ -1295,6 +1298,14 @@ impl Session {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn record_initial_history(&self, conversation_history: InitialHistory) {
+        self.try_record_initial_history(conversation_history)
+            .await
+            .expect("record initial history");
     }
 
     async fn apply_rollout_reconstruction(
@@ -2408,7 +2419,7 @@ impl Session {
     pub(crate) async fn build_initial_context(
         &self,
         turn_context: &TurnContext,
-    ) -> Vec<ResponseItem> {
+    ) -> CodexResult<Vec<ResponseItem>> {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
         let shell = self.user_shell();
@@ -2504,7 +2515,7 @@ impl Session {
                 );
             }
         }
-        if turn_context.config.include_apps_instructions && turn_context.apps_enabled() {
+        if turn_context.config.include_apps_instructions && turn_context.apps_enabled()? {
             let mcp_connection_manager = self.services.mcp_connection_manager.read().await;
             let accessible_and_enabled_connectors =
                 connectors::list_accessible_and_enabled_connectors_from_manager(
@@ -2600,7 +2611,7 @@ impl Session {
         {
             items.push(guardian_developer_message);
         }
-        items
+        Ok(items)
     }
 
     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
@@ -2641,14 +2652,14 @@ impl Session {
     pub(crate) async fn record_context_updates_and_set_reference_context_item(
         &self,
         turn_context: &TurnContext,
-    ) {
+    ) -> CodexResult<()> {
         let reference_context_item = {
             let state = self.state.lock().await;
             state.reference_context_item()
         };
         let should_inject_full_context = reference_context_item.is_none();
         let context_items = if should_inject_full_context {
-            self.build_initial_context(turn_context).await
+            self.build_initial_context(turn_context).await?
         } else {
             // Steady-state path: append only context diffs to minimize token overhead.
             self.build_settings_update_items(reference_context_item.as_ref(), turn_context)
@@ -2668,6 +2679,7 @@ impl Session {
         // context items. This keeps later runtime diffing aligned with the current turn state.
         let mut state = self.state.lock().await;
         state.set_reference_context_item(Some(turn_context_item));
+        Ok(())
     }
 
     pub(crate) async fn update_token_usage_info(

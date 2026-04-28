@@ -1143,7 +1143,12 @@ async fn multi_agent_v2_list_agents_returns_completed_status_and_last_task_messa
         .get_thread(agent_id)
         .await
         .expect("child thread should exist");
-    let child_turn = child_thread.codex.session.new_default_turn().await;
+    let child_turn = child_thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .expect("create child turn context");
     child_thread
         .codex
         .session
@@ -1516,7 +1521,12 @@ async fn multi_agent_v2_followup_task_interrupts_busy_child_without_losing_messa
         .await
         .expect("worker thread should exist");
 
-    let active_turn = thread.codex.session.new_default_turn().await;
+    let active_turn = thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .expect("create active turn context");
     let interrupted_turn_id = active_turn.sub_id.clone();
     thread
         .codex
@@ -1621,7 +1631,12 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         .expect("worker thread should exist");
     let worker_path = AgentPath::try_from("/root/worker").expect("worker path");
 
-    let first_turn = thread.codex.session.new_default_turn().await;
+    let first_turn = thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .expect("create first turn context");
     thread
         .codex
         .session
@@ -1649,7 +1664,12 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         .await
         .expect("followup_task should succeed");
 
-    let second_turn = thread.codex.session.new_default_turn().await;
+    let second_turn = thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .expect("create second turn context");
     thread
         .codex
         .session
@@ -1806,7 +1826,12 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
         .await
         .expect("worker thread should exist");
 
-    let aborted_turn = thread.codex.session.new_default_turn().await;
+    let aborted_turn = thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .expect("create aborted turn context");
     thread
         .codex
         .session
@@ -2003,7 +2028,12 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         .get_thread(agent_id)
         .await
         .expect("spawned agent thread should exist");
-    let child_turn = child_thread.codex.session.new_default_turn().await;
+    let child_turn = child_thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .expect("create child turn context");
     assert_eq!(
         child_turn.file_system_sandbox_policy,
         expected_file_system_sandbox_policy
@@ -3475,7 +3505,10 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let child_spawn_output = SpawnAgentHandler
         .handle(invocation(
             parent_session.clone(),
-            parent_session.new_default_turn().await,
+            parent_session
+                .new_default_turn()
+                .await
+                .expect("create parent turn context"),
             "spawn_agent",
             function_payload(json!({"message": "hello child"})),
         ))
@@ -3500,7 +3533,10 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let grandchild_spawn_output = SpawnAgentHandler
         .handle(invocation(
             child_session.clone(),
-            child_session.new_default_turn().await,
+            child_session
+                .new_default_turn()
+                .await
+                .expect("create child turn context"),
             "spawn_agent",
             function_payload(json!({"message": "hello grandchild"})),
         ))
@@ -3520,7 +3556,10 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let close_output = CloseAgentHandler
         .handle(invocation(
             parent_session.clone(),
-            parent_session.new_default_turn().await,
+            parent_session
+                .new_default_turn()
+                .await
+                .expect("create close turn context"),
             "close_agent",
             function_payload(json!({"target": child_thread_id.to_string()})),
         ))
@@ -3546,7 +3585,10 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let child_resume_output = ResumeAgentHandler
         .handle(invocation(
             parent_session.clone(),
-            parent_session.new_default_turn().await,
+            parent_session
+                .new_default_turn()
+                .await
+                .expect("create resume turn context"),
             "resume_agent",
             function_payload(json!({"id": child_thread_id.to_string()})),
         ))
@@ -3572,7 +3614,10 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let close_again_output = CloseAgentHandler
         .handle(invocation(
             parent_session.clone(),
-            parent_session.new_default_turn().await,
+            parent_session
+                .new_default_turn()
+                .await
+                .expect("create repeat close turn context"),
             "close_agent",
             function_payload(json!({"target": child_thread_id.to_string()})),
         ))
@@ -3614,7 +3659,13 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
     let parent_resume_output = ResumeAgentHandler
         .handle(invocation(
             operator_session,
-            operator.thread.codex.session.new_default_turn().await,
+            operator
+                .thread
+                .codex
+                .session
+                .new_default_turn()
+                .await
+                .expect("create parent resume turn context"),
             "resume_agent",
             function_payload(json!({"id": parent_thread_id.to_string()})),
         ))

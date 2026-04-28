@@ -1,29 +1,23 @@
 use std::collections::HashSet;
 
+use anyhow::Result;
 use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::AppSummary;
 use codex_chatgpt::connectors;
 use codex_core::config::Config;
 use codex_core::plugins::AppConnectorId;
 use codex_login::AuthManager;
-use tracing::warn;
 
 pub(super) async fn load_plugin_app_summaries(
     config: &Config,
     auth_manager: &AuthManager,
     plugin_apps: &[AppConnectorId],
-) -> Vec<AppSummary> {
+) -> Result<Vec<AppSummary>> {
     if plugin_apps.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    let auth_snapshot = match connectors::load_connector_auth_snapshot(auth_manager).await {
-        Ok(auth_snapshot) => auth_snapshot,
-        Err(err) => {
-            warn!("failed to load app auth for plugin/read: {err:#}");
-            None
-        }
-    };
+    let auth_snapshot = connectors::load_connector_auth_snapshot(auth_manager).await?;
     let connectors = match connectors::list_all_connectors_with_options(
         config,
         auth_snapshot.as_ref(),
@@ -33,7 +27,7 @@ pub(super) async fn load_plugin_app_summaries(
     {
         Ok(connectors) => connectors,
         Err(err) => {
-            warn!("failed to load app metadata for plugin/read: {err:#}");
+            tracing::warn!("failed to load app metadata for plugin/read: {err:#}");
             connectors::list_cached_all_connectors(config, auth_snapshot.as_ref())
                 .await
                 .unwrap_or_default()
@@ -55,17 +49,10 @@ pub(super) async fn load_plugin_app_summaries(
         {
             Ok(status) if status.codex_apps_ready => status.connectors,
             Ok(_) => {
-                return plugin_connectors
-                    .into_iter()
-                    .map(AppSummary::from)
-                    .collect();
+                anyhow::bail!("codex_apps MCP is not ready for plugin/read app auth state");
             }
             Err(err) => {
-                warn!("failed to load app auth state for plugin/read: {err:#}");
-                return plugin_connectors
-                    .into_iter()
-                    .map(AppSummary::from)
-                    .collect();
+                return Err(err.context("failed to load app auth state for plugin/read"));
             }
         };
 
@@ -74,7 +61,7 @@ pub(super) async fn load_plugin_app_summaries(
         .map(|connector| connector.id.as_str())
         .collect::<HashSet<_>>();
 
-    plugin_connectors
+    Ok(plugin_connectors
         .into_iter()
         .map(|connector| {
             let needs_auth = !accessible_ids.contains(connector.id.as_str());
@@ -86,7 +73,7 @@ pub(super) async fn load_plugin_app_summaries(
                 needs_auth,
             }
         })
-        .collect()
+        .collect())
 }
 
 pub(super) fn plugin_apps_needing_auth(

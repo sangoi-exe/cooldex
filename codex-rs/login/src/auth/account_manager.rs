@@ -82,7 +82,7 @@ impl AccountRuntimeLoadError {
         Self::PersistPreparedStore(error.to_string())
     }
 
-    fn lease_state_read(error: std::io::Error) -> Self {
+    fn lease_state_read(error: impl std::fmt::Display) -> Self {
         Self::LeaseStateRead(error.to_string())
     }
 
@@ -1454,13 +1454,15 @@ impl AccountManager {
         let required_workspace_id = self.forced_chatgpt_workspace_id();
         let switched_to_store_account_id = if was_active {
             let selection_now = Utc::now();
-            let next_store_account_id = self.select_account_for_auto_switch_with_leases(
-                store,
-                required_workspace_id.as_deref(),
-                /*exclude_store_account_id*/ None,
-                selection_now,
-                UsageLimitAutoSwitchSelectionScope::PersistedTruth,
-            );
+            let next_store_account_id = self
+                .select_account_for_auto_switch_with_leases(
+                    store,
+                    required_workspace_id.as_deref(),
+                    /*exclude_store_account_id*/ None,
+                    selection_now,
+                    UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+                )
+                .map_err(AccountRuntimeLoadError::into_io_error)?;
             if next_store_account_id.is_none() {
                 let fallback_workspace_candidate_count = store
                     .accounts
@@ -1641,12 +1643,15 @@ impl AccountManager {
         exclude_store_account_id: Option<&str>,
         now: DateTime<Utc>,
         selection_scope: UsageLimitAutoSwitchSelectionScope,
-    ) -> Option<String> {
-        let account_state_store = self.account_state_store.as_ref()?;
+    ) -> Result<Option<String>, AccountRuntimeLoadError> {
+        let Some(account_state_store) = self.account_state_store.as_ref() else {
+            return Ok(None);
+        };
         let mut filtered_store = store.clone();
-        filtered_store.accounts.retain(|account| {
+        let mut retained_accounts = Vec::with_capacity(filtered_store.accounts.len());
+        for account in filtered_store.accounts {
             if Some(account.id.as_str()) == exclude_store_account_id {
-                return false;
+                continue;
             }
             match account_state_store.account_is_leased_by_other(
                 self.runtime_session_id(),
@@ -1654,25 +1659,19 @@ impl AccountManager {
                 account.id.as_str(),
                 now,
             ) {
-                Ok(false) => true,
-                Ok(true) => false,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        account_id = account.id,
-                        "failed to evaluate active-account lease conflict while selecting an auto-switch candidate"
-                    );
-                    false
-                }
+                Ok(false) => retained_accounts.push(account),
+                Ok(true) => {}
+                Err(error) => return Err(AccountRuntimeLoadError::lease_state_read(error)),
             }
-        });
-        select_account_for_auto_switch_from_store(
+        }
+        filtered_store.accounts = retained_accounts;
+        Ok(select_account_for_auto_switch_from_store(
             &filtered_store,
             required_workspace_id,
             exclude_store_account_id,
             now,
             selection_scope,
-        )
+        ))
     }
 
     pub fn select_account_for_auto_switch(
@@ -1681,13 +1680,13 @@ impl AccountManager {
         exclude_store_account_id: Option<&str>,
     ) -> Result<Option<String>, AccountRuntimeLoadError> {
         let store = self.load_store_from_storage()?.store;
-        Ok(self.select_account_for_auto_switch_with_leases(
+        self.select_account_for_auto_switch_with_leases(
             &store,
             required_workspace_id,
             exclude_store_account_id,
             Utc::now(),
             UsageLimitAutoSwitchSelectionScope::PersistedTruth,
-        ))
+        )
     }
 
     fn update_saved_account_store<T>(
@@ -1908,13 +1907,15 @@ impl AccountManager {
             return Ok(false);
         }
         if store.active_account_id.as_deref() == Some(id) {
-            store.active_account_id = self.select_account_for_auto_switch_with_leases(
-                store,
-                required_workspace_id.as_deref(),
-                /*exclude_store_account_id*/ None,
-                Utc::now(),
-                UsageLimitAutoSwitchSelectionScope::PersistedTruth,
-            );
+            store.active_account_id = self
+                .select_account_for_auto_switch_with_leases(
+                    store,
+                    required_workspace_id.as_deref(),
+                    /*exclude_store_account_id*/ None,
+                    Utc::now(),
+                    UsageLimitAutoSwitchSelectionScope::PersistedTruth,
+                )
+                .map_err(AccountRuntimeLoadError::into_io_error)?;
         }
         Ok(true)
     }
@@ -2287,13 +2288,16 @@ impl AccountManager {
             return Ok(None);
         }
 
-        let Some(next_account_id) = self.select_account_for_auto_switch_with_leases(
-            store,
-            *required_workspace_id,
-            Some(failing_store_account_id.as_str()),
-            mutation_now,
-            *selection_scope,
-        ) else {
+        let Some(next_account_id) = self
+            .select_account_for_auto_switch_with_leases(
+                store,
+                *required_workspace_id,
+                Some(failing_store_account_id.as_str()),
+                mutation_now,
+                *selection_scope,
+            )
+            .map_err(AccountRuntimeLoadError::into_io_error)?
+        else {
             return Ok(None);
         };
 

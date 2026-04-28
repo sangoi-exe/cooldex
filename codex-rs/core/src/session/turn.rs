@@ -183,8 +183,15 @@ pub(crate) async fn run_turn(
 
     let skills_outcome = Some(turn_context.turn_skills.outcome.as_ref());
 
-    sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
-        .await;
+    if let Err(error) = sess
+        .record_context_updates_and_set_reference_context_item(turn_context.as_ref())
+        .await
+    {
+        info!("Turn context error: {error:#}");
+        let event = EventMsg::Error(error.to_error_event(/*message_prefix*/ None));
+        sess.send_event(&turn_context, event).await;
+        return None;
+    }
 
     let loaded_plugins = sess
         .services
@@ -195,7 +202,16 @@ pub(crate) async fn run_turn(
     // enabled plugins, then converted into turn-scoped guidance below.
     let mentioned_plugins =
         collect_explicit_plugin_mentions(&input, loaded_plugins.capability_summaries());
-    let mcp_tools = if turn_context.apps_enabled() || !mentioned_plugins.is_empty() {
+    let apps_enabled = match turn_context.apps_enabled() {
+        Ok(apps_enabled) => apps_enabled,
+        Err(error) => {
+            info!("Turn app-auth error: {error:#}");
+            let event = EventMsg::Error(error.to_error_event(/*message_prefix*/ None));
+            sess.send_event(&turn_context, event).await;
+            return None;
+        }
+    };
+    let mcp_tools = if apps_enabled || !mentioned_plugins.is_empty() {
         // Plugin mentions need raw MCP/app inventory even when app tools
         // are normally hidden so we can describe the plugin's currently
         // usable capabilities for this turn.
@@ -209,13 +225,13 @@ pub(crate) async fn run_turn(
             .await
         {
             Ok(mcp_tools) => mcp_tools,
-            Err(_) if turn_context.apps_enabled() => return None,
+            Err(_) if apps_enabled => return None,
             Err(_) => HashMap::new(),
         }
     } else {
         HashMap::new()
     };
-    let available_connectors = if turn_context.apps_enabled() {
+    let available_connectors = if apps_enabled {
         let connectors = codex_connectors::merge::merge_plugin_connectors_with_accessible(
             loaded_plugins
                 .effective_apps()
@@ -2415,7 +2431,7 @@ pub(crate) async fn built_tools(
     let mut effective_explicitly_enabled_connectors = explicitly_enabled_connectors.clone();
     effective_explicitly_enabled_connectors.extend(sess.get_connector_selection().await);
 
-    let apps_enabled = turn_context.apps_enabled();
+    let apps_enabled = turn_context.apps_enabled()?;
     let accessible_connectors =
         apps_enabled.then(|| connectors::accessible_connectors_from_mcp_tools(&all_mcp_tools));
     let accessible_connectors_with_enabled_state =

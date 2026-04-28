@@ -402,7 +402,14 @@ impl Session {
             *active_turn = Some(ActiveTurn::default());
         }
 
-        let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
+        let Some(turn_context) = self
+            .new_default_turn_with_sub_id_or_emit_error(sub_id)
+            .await
+        else {
+            let mut active_turn = self.active_turn.lock().await;
+            *active_turn = None;
+            return;
+        };
         self.maybe_emit_unknown_model_warning_for_turn(turn_context.as_ref())
             .await;
         self.start_task(turn_context, Vec::new(), RegularTask::new())

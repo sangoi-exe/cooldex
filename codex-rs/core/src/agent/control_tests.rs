@@ -613,7 +613,12 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     parent_thread
         .inject_user_message_without_turn("parent seed context".to_string())
         .await;
-    let turn_context = parent_thread.codex.session.new_default_turn().await;
+    let turn_context = parent_thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .expect("create turn context");
     let parent_spawn_call_id = "spawn-call-history".to_string();
     let trigger_message = InterAgentCommunication::new(
         AgentPath::root(),
@@ -738,6 +743,7 @@ async fn export_forked_subagent_turn_context_preserves_inherited_instructions() 
         .session
         .new_default_turn()
         .await
+        .expect("create turn context")
         .to_turn_context_item();
     turn_context.user_instructions = Some("user-only".to_string());
     turn_context.developer_instructions = Some("role-dev".to_string());
@@ -830,7 +836,12 @@ fn export_forked_subagent_history_filters_parent_spawn_tool_items_from_compactio
 async fn spawn_agent_fork_does_not_leak_parent_spawn_tool_items_into_child_history() {
     let harness = AgentControlHarness::new().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
-    let turn_context = parent_thread.codex.session.new_default_turn().await;
+    let turn_context = parent_thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .expect("create turn context");
     let parent_spawn_call_id = "spawn-call-1".to_string();
     let parent_spawn_call = ResponseItem::FunctionCall {
         id: None,
@@ -919,7 +930,12 @@ async fn spawn_agent_fork_does_not_leak_parent_spawn_tool_items_into_child_histo
 async fn spawn_agent_fork_flushes_parent_rollout_before_loading_history() {
     let harness = AgentControlHarness::new().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
-    let turn_context = parent_thread.codex.session.new_default_turn().await;
+    let turn_context = parent_thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .expect("create turn context");
     let parent_spawn_call_id = "spawn-call-unflushed".to_string();
     parent_thread
         .codex
@@ -991,7 +1007,12 @@ async fn spawn_agent_fork_last_n_turns_keeps_only_recent_turns() {
         "queued message".to_string(),
         /*trigger_turn*/ false,
     );
-    let queued_turn_context = parent_thread.codex.session.new_default_turn().await;
+    let queued_turn_context = parent_thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .expect("create queued turn context");
     parent_thread
         .codex
         .session
@@ -1008,7 +1029,12 @@ async fn spawn_agent_fork_last_n_turns_keeps_only_recent_turns() {
         "triggered context".to_string(),
         /*trigger_turn*/ true,
     );
-    let triggered_turn_context = parent_thread.codex.session.new_default_turn().await;
+    let triggered_turn_context = parent_thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .expect("create triggered turn context");
     parent_thread
         .codex
         .session
@@ -1020,7 +1046,12 @@ async fn spawn_agent_fork_last_n_turns_keeps_only_recent_turns() {
     parent_thread
         .inject_user_message_without_turn("current parent task".to_string())
         .await;
-    let spawn_turn_context = parent_thread.codex.session.new_default_turn().await;
+    let spawn_turn_context = parent_thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .expect("create spawn turn context");
     let parent_spawn_call_id = "spawn-call-last-n".to_string();
     parent_thread
         .codex
@@ -1418,7 +1449,12 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
         .get_thread(tester_thread_id)
         .await
         .expect("tester thread should exist");
-    let tester_turn = tester_thread.codex.session.new_default_turn().await;
+    let tester_turn = tester_thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .expect("create tester turn context");
     tester_thread
         .codex
         .session
@@ -1504,7 +1540,12 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         tester_path.to_string(),
         Some(tester_path.clone()),
     );
-    let tester_turn = tester_thread.codex.session.new_default_turn().await;
+    let tester_turn = tester_thread
+        .codex
+        .session
+        .new_default_turn()
+        .await
+        .expect("create tester turn context");
     tester_thread
         .codex
         .session
@@ -2091,6 +2132,7 @@ async fn resume_agent_from_rollout_uses_latest_child_turn_context_when_state_db_
         .session
         .new_default_turn()
         .await
+        .expect("create child turn context")
         .to_turn_context_item();
     latest_turn_context.sandbox_policy = SandboxPolicy::ReadOnly {
         access: ReadOnlyAccess::FullAccess,

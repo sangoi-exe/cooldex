@@ -703,7 +703,12 @@ mod phase2 {
             }
             other => panic!("unexpected sandbox policy: {other:?}"),
         }
-        let turn_context = subagent.codex.session.new_default_turn().await;
+        let turn_context = subagent
+            .codex
+            .session
+            .new_default_turn()
+            .await
+            .expect("create subagent turn context");
         pretty_assertions::assert_eq!(
             turn_context.file_system_sandbox_policy,
             FileSystemSandboxPolicy::from_legacy_sandbox_policy(

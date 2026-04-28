@@ -104,7 +104,14 @@ pub(in crate::memories) async fn run(session: &Arc<Session>, config: &Config) {
     }
 
     // 2. Build request.
-    let stage_one_context = build_request_context(session, config).await;
+    let Some(stage_one_context) = build_request_context(session, config).await else {
+        session.services.session_telemetry.counter(
+            metrics::MEMORY_PHASE_ONE_JOBS,
+            /*inc*/ 1,
+            &[("status", "failed_request_context")],
+        );
+        return;
+    };
 
     // 3. Run the parallel sampling.
     let outcomes = run_jobs(session, claimed_candidates, stage_one_context).await;
@@ -219,7 +226,7 @@ async fn claim_startup_jobs(
     }
 }
 
-async fn build_request_context(session: &Arc<Session>, config: &Config) -> RequestContext {
+async fn build_request_context(session: &Arc<Session>, config: &Config) -> Option<RequestContext> {
     let model_name = config
         .memories
         .extract_model
@@ -230,12 +237,18 @@ async fn build_request_context(session: &Arc<Session>, config: &Config) -> Reque
         .models_manager
         .get_model_info(&model_name, &config.to_models_manager_config())
         .await;
-    let turn_context = session.new_default_turn().await;
-    RequestContext::from_turn_context(
+    let turn_context = match session.new_default_turn().await {
+        Ok(turn_context) => turn_context,
+        Err(error) => {
+            warn!(error = %error, "failed to create memory extraction turn context");
+            return None;
+        }
+    };
+    Some(RequestContext::from_turn_context(
         turn_context.as_ref(),
         turn_context.turn_metadata_state.current_header_value(),
         model,
-    )
+    ))
 }
 
 async fn run_jobs(

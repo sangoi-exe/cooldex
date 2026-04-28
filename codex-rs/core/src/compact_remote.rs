@@ -235,7 +235,7 @@ async fn run_remote_compact_task_inner_impl(
         new_history,
         initial_context_injection,
     )
-    .await;
+    .await?;
 
     #[cfg(test)]
     {
@@ -304,17 +304,20 @@ pub(crate) async fn process_compacted_history(
     turn_context: &TurnContext,
     mut compacted_history: Vec<ResponseItem>,
     initial_context_injection: InitialContextInjection,
-) -> Vec<ResponseItem> {
+) -> CodexResult<Vec<ResponseItem>> {
     let initial_context = if matches!(
         initial_context_injection,
         InitialContextInjection::BeforeLastUserMessage
     ) {
-        sess.build_initial_context(turn_context).await
+        sess.build_initial_context(turn_context).await?
     } else {
         Vec::new()
     };
     compacted_history.retain(should_keep_compacted_history_item);
-    insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context)
+    Ok(insert_initial_context_before_last_real_user_or_summary(
+        compacted_history,
+        initial_context,
+    ))
 }
 
 /// Returns whether an item from remote compaction output should be preserved.

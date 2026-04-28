@@ -205,7 +205,7 @@ async fn schedule_startup_prewarm_inner(
 ) -> CodexResult<ModelClientSession> {
     let startup_turn_context = session
         .new_default_turn_with_sub_id(INITIAL_SUBMIT_ID.to_owned())
-        .await;
+        .await?;
     let startup_cancellation_token = CancellationToken::new();
     let startup_router = built_tools(
         session.as_ref(),

@@ -12,14 +12,18 @@ async fn process_compacted_history_with_test_session(
     session
         .set_previous_turn_settings(previous_turn_settings.cloned())
         .await;
-    let initial_context = session.build_initial_context(&turn_context).await;
+    let initial_context = session
+        .build_initial_context(&turn_context)
+        .await
+        .expect("build initial context");
     let refreshed = crate::compact_remote::process_compacted_history(
         &session,
         &turn_context,
         compacted_history,
         InitialContextInjection::BeforeLastUserMessage,
     )
-    .await;
+    .await
+    .expect("process compacted history");
     (refreshed, initial_context)
 }
 

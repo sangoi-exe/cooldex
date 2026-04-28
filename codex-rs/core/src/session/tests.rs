@@ -4181,7 +4181,10 @@ async fn danger_full_access_turns_do_not_expose_managed_network_proxy() -> anyho
     })
     .await?;
 
-    let turn_context = session.new_default_turn().await;
+    let turn_context = session
+        .new_default_turn()
+        .await
+        .expect("create turn context");
     assert!(turn_context.network.is_none());
     Ok(())
 }
@@ -4269,7 +4272,10 @@ async fn danger_full_access_tool_attempts_do_not_enforce_managed_network() -> an
     })
     .await?;
 
-    let turn = session.new_default_turn().await;
+    let turn = session
+        .new_default_turn()
+        .await
+        .expect("create turn context");
     assert!(turn.network.is_none());
 
     let mut orchestrator = crate::tools::orchestrator::ToolOrchestrator::new();
@@ -4315,7 +4321,10 @@ async fn workspace_write_turns_continue_to_expose_managed_network_proxy() -> any
     })
     .await?;
 
-    let turn_context = session.new_default_turn().await;
+    let turn_context = session
+        .new_default_turn()
+        .await
+        .expect("create turn context");
     assert!(turn_context.network.is_some());
     Ok(())
 }
@@ -4338,7 +4347,10 @@ async fn user_shell_commands_do_not_inherit_managed_network_proxy() -> anyhow::R
     })
     .await?;
 
-    let turn_context = session.new_default_turn().await;
+    let turn_context = session
+        .new_default_turn()
+        .await
+        .expect("create turn context");
     assert!(turn_context.network.is_some());
 
     #[cfg(windows)]
@@ -4572,7 +4584,10 @@ async fn reconstruct_history_matches_live_compactions() {
     let (session, turn_context) = make_session_and_context().await;
     let (rollout_items, expected) = sample_rollout(&session, &turn_context).await;
 
-    let reconstruction_turn = session.new_default_turn().await;
+    let reconstruction_turn = session
+        .new_default_turn()
+        .await
+        .expect("create reconstruction turn");
     let reconstructed = session
         .reconstruct_history_from_rollout(reconstruction_turn.as_ref(), &rollout_items)
         .await;
@@ -4664,14 +4679,21 @@ async fn resumed_history_injects_initial_context_on_first_context_update_only() 
 
     session
         .record_context_updates_and_set_reference_context_item(&turn_context)
-        .await;
-    expected.extend(session.build_initial_context(&turn_context).await);
+        .await
+        .expect("record context updates");
+    expected.extend(
+        session
+            .build_initial_context(&turn_context)
+            .await
+            .expect("build initial context"),
+    );
     let history_after_seed = session.clone_history().await;
     assert_eq!(expected, history_after_seed.raw_items());
 
     session
         .record_context_updates_and_set_reference_context_item(&turn_context)
-        .await;
+        .await
+        .expect("record context updates");
     let history_after_second_seed = session.clone_history().await;
     assert_eq!(
         history_after_seed.raw_items(),
@@ -5045,7 +5067,10 @@ async fn thread_rollback_drops_last_turn_from_history() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
     let rollout_path = attach_rollout_recorder(&sess).await;
 
-    let initial_context = sess.build_initial_context(tc.as_ref()).await;
+    let initial_context = sess
+        .build_initial_context(tc.as_ref())
+        .await
+        .expect("build initial context");
     let turn_1 = vec![
         user_message("turn 1 user"),
         assistant_message("turn 1 assistant"),
@@ -5109,7 +5134,10 @@ async fn thread_rollback_clears_history_when_num_turns_exceeds_existing_turns() 
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
     attach_rollout_recorder(&sess).await;
 
-    let initial_context = sess.build_initial_context(tc.as_ref()).await;
+    let initial_context = sess
+        .build_initial_context(tc.as_ref())
+        .await
+        .expect("build initial context");
     let turn_1 = vec![user_message("turn 1 user")];
     let mut full_history = Vec::new();
     full_history.extend(initial_context.clone());
@@ -5135,7 +5163,10 @@ async fn thread_rollback_clears_history_when_num_turns_exceeds_existing_turns() 
 async fn thread_rollback_fails_without_persisted_rollout_path() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
 
-    let initial_context = sess.build_initial_context(tc.as_ref()).await;
+    let initial_context = sess
+        .build_initial_context(tc.as_ref())
+        .await
+        .expect("build initial context");
     sess.record_into_history(&initial_context, tc.as_ref())
         .await;
 
@@ -5477,7 +5508,10 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
 async fn thread_rollback_fails_when_turn_in_progress() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
 
-    let initial_context = sess.build_initial_context(tc.as_ref()).await;
+    let initial_context = sess
+        .build_initial_context(tc.as_ref())
+        .await
+        .expect("build initial context");
     sess.record_into_history(&initial_context, tc.as_ref())
         .await;
 
@@ -5498,7 +5532,10 @@ async fn thread_rollback_fails_when_turn_in_progress() {
 async fn thread_rollback_fails_when_num_turns_is_zero() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
 
-    let initial_context = sess.build_initial_context(tc.as_ref()).await;
+    let initial_context = sess
+        .build_initial_context(tc.as_ref())
+        .await
+        .expect("build initial context");
     sess.record_into_history(&initial_context, tc.as_ref())
         .await;
 
@@ -6251,7 +6288,8 @@ async fn synthesized_user_turn_update_preserves_inherited_reasoning_effort_in_tu
         "turn_id".to_string(),
         js_repl,
         skills_outcome,
-    );
+    )
+    .expect("make turn context");
 
     assert_eq!(updated.collaboration_mode.reasoning_effort(), None);
     assert_eq!(
@@ -6450,7 +6488,8 @@ enabled = false
 
     let child_turn = session
         .new_default_turn_with_sub_id("role-skill-turn".to_string())
-        .await;
+        .await
+        .expect("create role skill turn context");
     let child_skill = child_turn
         .turn_skills
         .outcome
@@ -6527,7 +6566,7 @@ async fn session_update_settings_keeps_runtime_cwds_absolute() {
         state.session_configuration.cwd.clone()
     };
     let config = session.get_config().await;
-    let next_turn = session.new_default_turn().await;
+    let next_turn = session.new_default_turn().await.expect("create next turn");
 
     assert_eq!(session_cwd, updated_cwd);
     assert_eq!(config.cwd, turn_context.cwd);
@@ -6837,7 +6876,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         "turn_id".to_string(),
         Arc::clone(&js_repl),
         skills_outcome,
-    );
+    )
+    .expect("make turn context");
     let (prompt_gc_active_tx, _prompt_gc_active_rx) = watch::channel(false);
     let (prompt_gc_activity_edges, _) = tokio::sync::broadcast::channel(16);
 
@@ -7203,7 +7243,10 @@ async fn new_default_turn_captures_current_span_trace_id() {
             .span_context()
             .trace_id()
             .to_string();
-        let turn_context = session.new_default_turn().await;
+        let turn_context = session
+            .new_default_turn()
+            .await
+            .expect("create turn context");
         let turn_context_item = turn_context.to_turn_context_item();
         assert_eq!(turn_context_item.trace_id, Some(expected_trace_id));
         turn_context_item
@@ -7847,24 +7890,27 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
             .skills_for_config(&skills_input, Some(Arc::clone(&skill_fs)))
             .await,
     );
-    let turn_context = Arc::new(Session::make_turn_context(
-        conversation_id,
-        Some(Arc::clone(&auth_manager)),
-        &session_telemetry,
-        session_configuration.provider.clone(),
-        &session_configuration,
-        services.user_shell.as_ref(),
-        services.shell_zsh_path.as_ref(),
-        services.main_execve_wrapper_exe.as_ref(),
-        per_turn_config,
-        model_info,
-        &models_manager,
-        /*network*/ None,
-        Some(environment),
-        "turn_id".to_string(),
-        Arc::clone(&js_repl),
-        skills_outcome,
-    ));
+    let turn_context = Arc::new(
+        Session::make_turn_context(
+            conversation_id,
+            Some(Arc::clone(&auth_manager)),
+            &session_telemetry,
+            session_configuration.provider.clone(),
+            &session_configuration,
+            services.user_shell.as_ref(),
+            services.shell_zsh_path.as_ref(),
+            services.main_execve_wrapper_exe.as_ref(),
+            per_turn_config,
+            model_info,
+            &models_manager,
+            /*network*/ None,
+            Some(environment),
+            "turn_id".to_string(),
+            Arc::clone(&js_repl),
+            skills_outcome,
+        )
+        .expect("make turn context"),
+    );
     let (prompt_gc_active_tx, _prompt_gc_active_rx) = watch::channel(false);
     let (prompt_gc_activity_edges, _) = tokio::sync::broadcast::channel(16);
 
@@ -8245,7 +8291,10 @@ async fn build_initial_context_uses_previous_realtime_state() {
     let (session, mut turn_context) = make_session_and_context().await;
     turn_context.realtime_active = true;
 
-    let initial_context = session.build_initial_context(&turn_context).await;
+    let initial_context = session
+        .build_initial_context(&turn_context)
+        .await
+        .expect("build initial context");
     let developer_texts = developer_input_texts(&initial_context);
     assert!(
         developer_texts
@@ -8259,7 +8308,10 @@ async fn build_initial_context_uses_previous_realtime_state() {
         let mut state = session.state.lock().await;
         state.set_reference_context_item(Some(previous_context_item));
     }
-    let resumed_context = session.build_initial_context(&turn_context).await;
+    let resumed_context = session
+        .build_initial_context(&turn_context)
+        .await
+        .expect("build initial context");
     let resumed_developer_texts = developer_input_texts(&resumed_context);
     assert!(
         !resumed_developer_texts
@@ -8284,7 +8336,10 @@ async fn build_initial_context_omits_default_image_save_location_with_image_hist
         )
         .await;
 
-    let initial_context = session.build_initial_context(&turn_context).await;
+    let initial_context = session
+        .build_initial_context(&turn_context)
+        .await
+        .expect("build initial context");
     let developer_texts = developer_input_texts(&initial_context);
     assert!(
         !developer_texts
@@ -8298,7 +8353,10 @@ async fn build_initial_context_omits_default_image_save_location_with_image_hist
 async fn build_initial_context_omits_default_image_save_location_without_image_history() {
     let (session, turn_context) = make_session_and_context().await;
 
-    let initial_context = session.build_initial_context(&turn_context).await;
+    let initial_context = session
+        .build_initial_context(&turn_context)
+        .await
+        .expect("build initial context");
     let developer_texts = developer_input_texts(&initial_context);
 
     assert!(
@@ -8338,7 +8396,10 @@ async fn build_initial_context_trims_skill_metadata_from_context_window_budget()
     turn_context.model_info.context_window = Some(100);
     turn_context.turn_skills = TurnSkillsContext::new(Arc::new(outcome));
 
-    let initial_context = session.build_initial_context(&turn_context).await;
+    let initial_context = session
+        .build_initial_context(&turn_context)
+        .await
+        .expect("build initial context");
     let developer_texts = developer_input_texts(&initial_context);
 
     assert!(
@@ -8418,7 +8479,10 @@ async fn build_initial_context_emits_thread_start_skill_warning_on_repeated_buil
     turn_context.model_info.context_window = Some(100);
     turn_context.turn_skills = TurnSkillsContext::new(Arc::new(outcome));
 
-    let _ = session.build_initial_context(&turn_context).await;
+    let _ = session
+        .build_initial_context(&turn_context)
+        .await
+        .expect("build initial context");
     let warning_event = timeout(Duration::from_secs(1), rx.recv())
         .await
         .expect("warning event should arrive")
@@ -8429,7 +8493,10 @@ async fn build_initial_context_emits_thread_start_skill_warning_on_repeated_buil
             if message == THREAD_START_SKILLS_TRIMMED_WARNING_MESSAGE
     ));
 
-    let _ = session.build_initial_context(&turn_context).await;
+    let _ = session
+        .build_initial_context(&turn_context)
+        .await
+        .expect("build initial context");
     let warning_event = timeout(Duration::from_secs(1), rx.recv())
         .await
         .expect("warning event should arrive on repeated build")
@@ -8540,7 +8607,10 @@ async fn build_initial_context_uses_previous_turn_settings_for_realtime_end() {
     session
         .set_previous_turn_settings(Some(previous_turn_settings))
         .await;
-    let initial_context = session.build_initial_context(&turn_context).await;
+    let initial_context = session
+        .build_initial_context(&turn_context)
+        .await
+        .expect("build initial context");
     let developer_texts = developer_input_texts(&initial_context);
     assert!(
         developer_texts
@@ -8562,7 +8632,10 @@ async fn build_initial_context_restates_realtime_start_when_reference_context_is
     session
         .set_previous_turn_settings(Some(previous_turn_settings))
         .await;
-    let initial_context = session.build_initial_context(&turn_context).await;
+    let initial_context = session
+        .build_initial_context(&turn_context)
+        .await
+        .expect("build initial context");
     let developer_texts = developer_input_texts(&initial_context);
     assert!(
         developer_texts
@@ -8619,9 +8692,13 @@ async fn record_context_updates_and_set_reference_context_item_injects_full_cont
     let (session, turn_context) = make_session_and_context().await;
     session
         .record_context_updates_and_set_reference_context_item(&turn_context)
-        .await;
+        .await
+        .expect("record context updates");
     let history = session.clone_history().await;
-    let initial_context = session.build_initial_context(&turn_context).await;
+    let initial_context = session
+        .build_initial_context(&turn_context)
+        .await
+        .expect("build initial context");
     assert_eq!(history.raw_items().to_vec(), initial_context);
 
     let current_context = session.reference_context_item().await;
@@ -8650,7 +8727,8 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
         .await;
     session
         .record_context_updates_and_set_reference_context_item(&turn_context)
-        .await;
+        .await
+        .expect("record context updates");
     {
         let mut state = session.state.lock().await;
         state.set_reference_context_item(/*item*/ None);
@@ -8664,11 +8742,17 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
 
     session
         .record_context_updates_and_set_reference_context_item(&turn_context)
-        .await;
+        .await
+        .expect("record context updates");
 
     let history = session.clone_history().await;
     let mut expected_history = vec![compacted_summary];
-    expected_history.extend(session.build_initial_context(&turn_context).await);
+    expected_history.extend(
+        session
+            .build_initial_context(&turn_context)
+            .await
+            .expect("build initial context"),
+    );
     assert_eq!(history.raw_items().to_vec(), expected_history);
 }
 
@@ -8719,7 +8803,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
 
     session
         .record_context_updates_and_set_reference_context_item(&turn_context)
-        .await;
+        .await
+        .expect("record context updates");
 
     assert_eq!(
         session.clone_history().await.raw_items().to_vec(),
@@ -8782,7 +8867,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_split_fi
 
     session
         .record_context_updates_and_set_reference_context_item(&turn_context)
-        .await;
+        .await
+        .expect("record context updates");
     session.ensure_rollout_materialized().await;
     session.flush_rollout().await.expect("rollout should flush");
 
@@ -8813,7 +8899,10 @@ async fn build_initial_context_prepends_model_switch_message() {
     session
         .set_previous_turn_settings(Some(previous_turn_settings))
         .await;
-    let initial_context = session.build_initial_context(&turn_context).await;
+    let initial_context = session
+        .build_initial_context(&turn_context)
+        .await
+        .expect("build initial context");
 
     let ResponseItem::Message { role, content, .. } = &initial_context[0] else {
         panic!("expected developer message");
@@ -8883,7 +8972,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
         .await;
     session
         .record_context_updates_and_set_reference_context_item(&turn_context)
-        .await;
+        .await
+        .expect("record context updates");
     session.ensure_rollout_materialized().await;
     session.flush_rollout().await.expect("rollout should flush");
 
@@ -9586,7 +9676,10 @@ async fn steer_input_rejects_non_regular_turns() {
             text: "hello".to_string(),
             text_elements: Vec::new(),
         }];
-        let turn_context = sess.new_default_turn_with_sub_id("turn".to_string()).await;
+        let turn_context = sess
+            .new_default_turn_with_sub_id("turn".to_string())
+            .await
+            .expect("create turn context");
         sess.spawn_task(
             turn_context,
             input,
@@ -10084,10 +10177,14 @@ async fn sample_rollout(
 
     // Use the same turn_context source as record_initial_history so model_info (and thus
     // personality_spec) matches reconstruction.
-    let reconstruction_turn = session.new_default_turn().await;
+    let reconstruction_turn = session
+        .new_default_turn()
+        .await
+        .expect("create reconstruction turn");
     let mut initial_context = session
         .build_initial_context(reconstruction_turn.as_ref())
-        .await;
+        .await
+        .expect("build initial context");
     // Ensure personality_spec is present when Personality is enabled, so expected matches
     // what reconstruction produces (build_initial_context may omit it when baked into model).
     if !initial_context.iter().any(|m| {
