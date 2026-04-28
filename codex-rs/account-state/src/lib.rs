@@ -10,6 +10,9 @@ use chrono::Utc;
 use codex_protocol::protocol::RateLimitSnapshot;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
+use rusqlite::Result as SqliteResult;
+use rusqlite::Transaction;
+use rusqlite::TransactionBehavior;
 use rusqlite::params;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -183,7 +186,7 @@ CREATE TABLE IF NOT EXISTS account_leases (
         usage_by_account: &HashMap<String, AccountUsageState>,
     ) -> Result<()> {
         let mut connection = self.lock_connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         transaction.execute("DELETE FROM account_usage_state", [])?;
         let mut statement = transaction.prepare(
             r#"
@@ -216,7 +219,7 @@ INSERT INTO account_usage_state (
         usage_by_account: &HashMap<String, AccountUsageState>,
     ) -> Result<()> {
         let mut connection = self.lock_connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         let mut statement = transaction.prepare(
             r#"
 INSERT INTO account_usage_state (
@@ -256,7 +259,7 @@ ON CONFLICT(account_id) DO UPDATE SET
         lease_ttl_seconds: i64,
     ) -> Result<SessionActiveAccountRefresh> {
         let mut connection = self.lock_connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         let now_epoch = now.timestamp();
         let account_id = match load_session_active_account_id(&transaction, session_id)? {
             Some(account_id) => Some(account_id),
@@ -359,7 +362,7 @@ LIMIT 1
         lease_ttl_seconds: i64,
     ) -> Result<SessionActiveAccountSetOutcome> {
         let mut connection = self.lock_connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         let now_epoch = now.timestamp();
         if let Some(conflict) =
             load_unexpired_lease_conflict(&transaction, account_id, session_id, now_epoch)?
@@ -403,7 +406,7 @@ LIMIT 1
 
     pub fn clear_session_active_account(&self, session_id: &str) -> Result<Option<String>> {
         let mut connection = self.lock_connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         let account_id = load_session_active_account_id(&transaction, session_id)?;
         if let Some(account_id) = account_id.as_deref() {
             transaction.execute(
@@ -421,7 +424,7 @@ LIMIT 1
 
     pub fn force_release_account(&self, account_id: &str) -> Result<ForceReleaseAccountOutcome> {
         let mut connection = self.lock_connection()?;
-        let transaction = connection.transaction()?;
+        let transaction = write_transaction(&mut connection)?;
         let released_owners = load_force_released_account_owners(&transaction, account_id)?;
         if released_owners.session_ids.is_empty() && released_owners.codex_session_ids.is_empty() {
             transaction.commit()?;
@@ -494,6 +497,14 @@ pub fn accounts_db_filename() -> String {
 
 pub fn accounts_db_path(sqlite_home: &Path) -> PathBuf {
     sqlite_home.join(accounts_db_filename())
+}
+
+fn write_transaction(connection: &mut Connection) -> SqliteResult<Transaction<'_>> {
+    // Merge-safety anchor: runtime account-state writes read lease/session rows
+    // before updating them; acquire SQLite writer intent up front so concurrent
+    // Codex sessions wait through the busy handler instead of failing during
+    // deferred read-to-write promotion.
+    connection.transaction_with_behavior(TransactionBehavior::Immediate)
 }
 
 fn serialize_snapshot(snapshot: Option<&RateLimitSnapshot>) -> Result<Option<String>> {
@@ -719,7 +730,20 @@ mod tests {
     use super::*;
     use codex_protocol::protocol::RateLimitWindow;
     use pretty_assertions::assert_eq;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
     use tempfile::TempDir;
+
+    static ACCOUNT_STATE_BUSY_HANDLER_OBSERVED: AtomicBool = AtomicBool::new(false);
+
+    fn observe_account_state_busy_handler(_: i32) -> bool {
+        ACCOUNT_STATE_BUSY_HANDLER_OBSERVED.store(true, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(5));
+        true
+    }
 
     fn fixed_now() -> DateTime<Utc> {
         DateTime::from_timestamp(1_763_233_549, 0).expect("fixed timestamp")
@@ -900,6 +924,76 @@ ORDER BY account_id
                 .expect("refresh owned lease"),
             SessionActiveAccountRefresh::Active("account-a".to_string())
         );
+    }
+
+    #[test]
+    fn runtime_lease_refresh_waits_for_contending_writer() {
+        let sqlite_home = TempDir::new().expect("tempdir");
+        let lock_holder =
+            AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open lock holder");
+        let contending_store =
+            AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open contender");
+        let now = fixed_now();
+
+        assert_eq!(
+            lock_holder
+                .set_session_active_account("session-a", None, "account-a", now, 300)
+                .expect("assign initial lease"),
+            SessionActiveAccountSetOutcome::Assigned
+        );
+
+        ACCOUNT_STATE_BUSY_HANDLER_OBSERVED.store(false, Ordering::SeqCst);
+        {
+            let connection = contending_store
+                .lock_connection()
+                .expect("lock contender connection");
+            connection
+                .busy_handler(Some(observe_account_state_busy_handler))
+                .expect("install busy observer");
+        }
+
+        let mut held_connection = lock_holder
+            .lock_connection()
+            .expect("lock writer connection");
+        let held_transaction =
+            write_transaction(&mut held_connection).expect("hold writer transaction");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let contender = thread::spawn(move || {
+            started_tx.send(()).expect("notify contender started");
+            let result = contending_store.refresh_session_active_account(
+                "session-a",
+                None,
+                now + chrono::Duration::seconds(30),
+                300,
+            );
+            result_tx.send(result).expect("send contender result");
+        });
+
+        started_rx.recv().expect("wait for contender start");
+        let contention_wait_started = Instant::now();
+        while !ACCOUNT_STATE_BUSY_HANDLER_OBSERVED.load(Ordering::SeqCst) {
+            if let Ok(result) = result_rx.try_recv() {
+                panic!("contending lease refresh completed before waiting on writer: {result:?}");
+            }
+            assert!(
+                contention_wait_started.elapsed() < Duration::from_secs(1),
+                "contending lease refresh did not reach SQLite busy handling"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        held_transaction.commit().expect("release held writer");
+        drop(held_connection);
+        let refresh = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wait for contending refresh")
+            .expect("contending refresh should succeed after writer release");
+        assert_eq!(
+            refresh,
+            SessionActiveAccountRefresh::Active("account-a".to_string())
+        );
+        contender.join().expect("join contender thread");
     }
 
     #[test]

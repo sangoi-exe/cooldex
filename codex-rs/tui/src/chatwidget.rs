@@ -4256,10 +4256,13 @@ impl ChatWidget {
     fn on_exec_command_begin(&mut self, ev: ExecCommandBeginEvent) {
         self.flush_answer_stream_with_separator();
         if is_unified_exec_source(ev.source) {
-            self.track_unified_exec_process_begin(&ev);
+            // Merge-safety anchor: resume/thread replay can contain historical
+            // begin-only unified-exec records; only an active task may claim
+            // live background-terminal ownership for the footer and /ps registry.
             if !self.bottom_pane.is_task_running() {
                 return;
             }
+            self.track_unified_exec_process_begin(&ev);
             // Unified exec may be parsed as Unknown; keep the working indicator visible regardless.
             self.bottom_pane.ensure_status_indicator();
             if !is_standard_tool_call(&ev.parsed_cmd) {

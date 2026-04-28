@@ -800,6 +800,56 @@ async fn replayed_in_progress_turn_marks_task_running() {
 }
 
 #[tokio::test]
+async fn completed_turn_replay_does_not_register_stale_unified_exec_processes() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.replay_thread_turns(
+        vec![AppServerTurn {
+            id: "turn-1".to_string(),
+            items: vec![AppServerThreadItem::CommandExecution {
+                id: "cmd-1".to_string(),
+                command: "sleep 5".to_string(),
+                cwd: test_path_buf("/tmp").abs(),
+                process_id: Some("process-1".to_string()),
+                source: AppServerCommandExecutionSource::UnifiedExecStartup,
+                status: AppServerCommandExecutionStatus::InProgress,
+                command_actions: vec![AppServerCommandAction::Unknown {
+                    command: "sleep 5".to_string(),
+                }],
+                aggregated_output: None,
+                exit_code: None,
+                duration_ms: None,
+            }],
+            status: AppServerTurnStatus::Completed,
+            error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+        }],
+        ReplayKind::ResumeInitialMessages,
+    );
+
+    assert!(drain_insert_history(&mut rx).is_empty());
+    assert!(chat.unified_exec_processes.is_empty());
+
+    chat.add_ps_output();
+    let cells = drain_insert_history(&mut rx);
+    let combined = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        combined.contains("No background terminals running."),
+        "expected /ps to ignore replayed completed-turn process; got {combined:?}"
+    );
+    assert!(
+        !combined.contains("sleep 5"),
+        "expected /ps to omit stale replayed command; got {combined:?}"
+    );
+}
+
+#[tokio::test]
 async fn replayed_stream_error_does_not_set_retry_status_or_status_indicator() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.set_status_header("Idle".to_string());

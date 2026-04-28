@@ -1261,6 +1261,7 @@ async fn approval_modal_patch_snapshot() -> anyhow::Result<()> {
 #[tokio::test]
 async fn interrupt_preserves_unified_exec_processes() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
 
     begin_unified_exec_startup(&mut chat, "call-1", "process-1", "sleep 5");
     begin_unified_exec_startup(&mut chat, "call-2", "process-2", "sleep 6");
@@ -1338,6 +1339,7 @@ async fn interrupt_preserves_unified_exec_wait_streak_snapshot() {
 #[tokio::test]
 async fn turn_complete_keeps_unified_exec_processes() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
 
     begin_unified_exec_startup(&mut chat, "call-1", "process-1", "sleep 5");
     begin_unified_exec_startup(&mut chat, "call-2", "process-2", "sleep 6");

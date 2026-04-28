@@ -1332,6 +1332,7 @@ async fn review_branch_picker_escape_navigates_back_then_dismisses() {
 #[tokio::test]
 async fn review_ended_keeps_unified_exec_processes() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
 
     begin_unified_exec_startup(&mut chat, "call-1", "process-1", "sleep 5");
     begin_unified_exec_startup(&mut chat, "call-2", "process-2", "sleep 6");
