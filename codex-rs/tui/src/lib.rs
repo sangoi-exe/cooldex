@@ -1854,7 +1854,10 @@ async fn load_resume_or_fork_config_with_fresh_cloud_requirements(
         bootstrap_config.cli_auth_credentials_store_mode,
     )
     .unwrap_or_else(|err| {
-        eprintln!("Error loading auth manager: {err}");
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!("Error loading auth manager: {err}");
+        }
         std::process::exit(1);
     });
     let cloud_requirements = cloud_requirements_loader(

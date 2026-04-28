@@ -33,6 +33,10 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 const INTERNAL_ERROR_CODE: i64 = -32603;
 
+// Merge-safety anchor: rate-limit and add-credits app-server routes are
+// ChatGPT backend routes; tests must require AuthManager-derived ChatGPT
+// request auth and preserve the authorization/account-id header checks.
+
 #[tokio::test]
 async fn get_account_rate_limits_requires_auth() -> Result<()> {
     let codex_home = TempDir::new()?;
@@ -52,7 +56,7 @@ async fn get_account_rate_limits_requires_auth() -> Result<()> {
     assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
     assert_eq!(
         error.error.message,
-        "codex account authentication required to read rate limits"
+        "chatgpt authentication required to read rate limits"
     );
 
     Ok(())
@@ -257,7 +261,7 @@ async fn send_add_credits_nudge_email_requires_auth() -> Result<()> {
     assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
     assert_eq!(
         error.error.message,
-        "codex account authentication required to notify workspace owner"
+        "chatgpt authentication required to notify workspace owner"
     );
 
     Ok(())

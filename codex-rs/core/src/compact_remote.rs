@@ -170,10 +170,9 @@ async fn run_remote_compact_task_inner_impl(
         let request_store_account_id = sess
             .services
             .auth_manager
-            .auth_cached()
+            .account_manager()
+            .active_chatgpt_account_summary()
             .map_err(|error| CodexErr::Io(error.into_io_error()))?
-            .as_ref()
-            .and_then(super::auth::CodexAuth::active_chatgpt_account_summary)
             .map(|summary| summary.store_account_id);
         match sess
             .services
@@ -611,7 +610,8 @@ mod tests {
             auth_home.path().to_path_buf(),
             false,
             AuthCredentialsStoreMode::File,
-        );
+        )
+        .expect("create auth manager");
         assert_eq!(
             auth_manager.auth_mode().expect("load auth mode"),
             Some(crate::auth::AuthMode::Chatgpt),
@@ -628,7 +628,11 @@ mod tests {
             "fixture auth manager should expose acc-1 as the active cached auth"
         );
         assert_eq!(
-            auth_manager.account_manager().list_accounts().len(),
+            auth_manager
+                .account_manager()
+                .list_accounts()
+                .expect("list fixture accounts")
+                .len(),
             2,
             "fixture auth manager should expose both stored accounts"
         );
@@ -636,6 +640,7 @@ mod tests {
             auth_manager
                 .account_manager()
                 .select_account_for_auto_switch(None, Some("acc-1"))
+                .expect("select auto-switch target")
                 .as_deref(),
             Some("acc-2"),
             "fixture auth manager should select acc-2 as the auto-switch target"
@@ -698,7 +703,10 @@ mod tests {
             ]
         );
 
-        let accounts = auth_manager.account_manager().list_accounts();
+        let accounts = auth_manager
+            .account_manager()
+            .list_accounts()
+            .expect("list final accounts");
         assert_eq!(
             accounts
                 .iter()

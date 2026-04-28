@@ -245,7 +245,10 @@ impl ModelsManager {
         skip(self),
         fields(refresh_strategy = %refresh_strategy)
     )]
-    pub async fn list_models(&self, refresh_strategy: RefreshStrategy) -> CoreResult<Vec<ModelPreset>> {
+    pub async fn list_models(
+        &self,
+        refresh_strategy: RefreshStrategy,
+    ) -> CoreResult<Vec<ModelPreset>> {
         self.refresh_available_models(refresh_strategy).await?;
         let remote_models = self.get_remote_models().await;
         let auth_mode = self.auth_mode()?;

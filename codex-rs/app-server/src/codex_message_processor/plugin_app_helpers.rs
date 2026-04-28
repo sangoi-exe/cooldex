@@ -44,7 +44,9 @@ pub(super) async fn load_plugin_app_summaries(
 
     // Merge-safety anchor: app metadata access checks must use the app-server
     // AccountManager owner passed into this request, not a hidden AuthManager.
-    let auth = auth_snapshot.as_ref().map(|snapshot| snapshot.request_auth());
+    let auth = auth_snapshot
+        .as_ref()
+        .map(codex_login::ChatGptAuthContext::request_auth);
     let accessible_connectors =
         match connectors::list_accessible_connectors_from_mcp_tools_with_options_and_status(
             config, auth, /*force_refetch*/ false,

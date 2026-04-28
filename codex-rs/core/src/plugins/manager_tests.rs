@@ -18,7 +18,7 @@ use codex_config::types::McpServerTransportConfig;
 use codex_core_plugins::loader::refresh_non_curated_plugin_cache;
 use codex_core_plugins::loader::refresh_non_curated_plugin_cache_force_reinstall;
 use codex_core_plugins::marketplace::MarketplacePluginInstallPolicy;
-use codex_login::CodexAuth;
+use codex_login::ChatGptRequestAuth;
 use codex_protocol::protocol::Product;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use pretty_assertions::assert_eq;
@@ -35,6 +35,13 @@ use wiremock::matchers::path;
 use wiremock::matchers::query_param;
 
 const MAX_CAPABILITY_SUMMARY_DESCRIPTION_LEN: usize = 1024;
+
+fn dummy_chatgpt_request_auth() -> ChatGptRequestAuth {
+    // Merge-safety anchor: remote plugin catalog sync tests must consume the
+    // AuthManager-derived ChatGPT request-auth snapshot, not raw CodexAuth or
+    // locally reconstructed account headers.
+    ChatGptRequestAuth::create_dummy_for_testing()
+}
 
 fn write_plugin_with_version(
     root: &Path,
@@ -1755,8 +1762,9 @@ plugins = false
     );
 
     let config = load_config(tmp.path(), tmp.path()).await;
+    let auth = dummy_chatgpt_request_auth();
     let outcome = PluginsManager::new(tmp.path().to_path_buf())
-        .sync_plugins_from_remote(&config, /*auth*/ None, /*additive_only*/ false)
+        .sync_plugins_from_remote(&config, &auth, /*additive_only*/ false)
         .await
         .unwrap();
 
@@ -2299,13 +2307,10 @@ enabled = true
 
     let mut config = load_config(tmp.path(), tmp.path()).await;
     config.chatgpt_base_url = format!("{}/backend-api/", server.uri());
+    let auth = dummy_chatgpt_request_auth();
     let manager = PluginsManager::new(tmp.path().to_path_buf());
     let result = manager
-        .sync_plugins_from_remote(
-            &config,
-            Some(&CodexAuth::create_dummy_chatgpt_auth_for_testing()),
-            /*additive_only*/ false,
-        )
+        .sync_plugins_from_remote(&config, &auth, /*additive_only*/ false)
         .await
         .unwrap();
 
@@ -2419,13 +2424,10 @@ enabled = true
 
     let mut config = load_config(tmp.path(), tmp.path()).await;
     config.chatgpt_base_url = format!("{}/backend-api/", server.uri());
+    let auth = dummy_chatgpt_request_auth();
     let manager = PluginsManager::new(tmp.path().to_path_buf());
     let result = manager
-        .sync_plugins_from_remote(
-            &config,
-            Some(&CodexAuth::create_dummy_chatgpt_auth_for_testing()),
-            /*additive_only*/ true,
-        )
+        .sync_plugins_from_remote(&config, &auth, /*additive_only*/ true)
         .await
         .unwrap();
 
@@ -2491,13 +2493,10 @@ enabled = false
 
     let mut config = load_config(tmp.path(), tmp.path()).await;
     config.chatgpt_base_url = format!("{}/backend-api/", server.uri());
+    let auth = dummy_chatgpt_request_auth();
     let manager = PluginsManager::new(tmp.path().to_path_buf());
     let result = manager
-        .sync_plugins_from_remote(
-            &config,
-            Some(&CodexAuth::create_dummy_chatgpt_auth_for_testing()),
-            /*additive_only*/ false,
-        )
+        .sync_plugins_from_remote(&config, &auth, /*additive_only*/ false)
         .await
         .unwrap();
 
@@ -2554,13 +2553,10 @@ enabled = false
 
     let mut config = load_config(tmp.path(), tmp.path()).await;
     config.chatgpt_base_url = format!("{}/backend-api/", server.uri());
+    let auth = dummy_chatgpt_request_auth();
     let manager = PluginsManager::new(tmp.path().to_path_buf());
     let err = manager
-        .sync_plugins_from_remote(
-            &config,
-            Some(&CodexAuth::create_dummy_chatgpt_auth_for_testing()),
-            /*additive_only*/ false,
-        )
+        .sync_plugins_from_remote(&config, &auth, /*additive_only*/ false)
         .await
         .unwrap_err();
 
@@ -2643,13 +2639,10 @@ plugins = true
 
     let mut config = load_config(tmp.path(), tmp.path()).await;
     config.chatgpt_base_url = format!("{}/backend-api/", server.uri());
+    let auth = dummy_chatgpt_request_auth();
     let manager = PluginsManager::new(tmp.path().to_path_buf());
     let result = manager
-        .sync_plugins_from_remote(
-            &config,
-            Some(&CodexAuth::create_dummy_chatgpt_auth_for_testing()),
-            /*additive_only*/ false,
-        )
+        .sync_plugins_from_remote(&config, &auth, /*additive_only*/ false)
         .await
         .unwrap();
 
@@ -2697,12 +2690,10 @@ plugins = true
         tmp.path().to_path_buf(),
         Some(Product::Chatgpt),
     );
+    let auth = dummy_chatgpt_request_auth();
 
     let featured_plugin_ids = manager
-        .featured_plugin_ids_for_config(
-            &config,
-            Some(&CodexAuth::create_dummy_chatgpt_auth_for_testing()),
-        )
+        .featured_plugin_ids_for_config(&config, Some(&auth))
         .await
         .unwrap();
 

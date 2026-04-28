@@ -42,9 +42,7 @@ pub async fn list_connectors(
     auth_manager: &AuthManager,
 ) -> anyhow::Result<Vec<AppInfo>> {
     let auth_snapshot = load_connector_auth_snapshot(auth_manager).await?;
-    let request_auth = auth_snapshot
-        .as_ref()
-        .map(ChatGptAuthContext::request_auth);
+    let request_auth = auth_snapshot.as_ref().map(ChatGptAuthContext::request_auth);
     if !apps_enabled(config, auth_snapshot.as_ref()) {
         return Ok(Vec::new());
     }

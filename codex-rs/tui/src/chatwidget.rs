@@ -8662,7 +8662,9 @@ impl ChatWidget {
                         return;
                     }
                 };
-            let auth = auth_snapshot.as_ref().map(|snapshot| snapshot.request_auth());
+            let auth = auth_snapshot
+                .as_ref()
+                .map(codex_login::ChatGptAuthContext::request_auth);
             let accessible_result =
                 match connectors::list_accessible_connectors_from_mcp_tools_with_options_and_status(
                     &config,
@@ -10188,11 +10190,7 @@ impl ChatWidget {
         // Merge-safety anchor: `/accounts` descriptions depend on the popup entry view model
         // preserving the popup-relevant `AccountManager::list_accounts()` semantics (active flag,
         // exhausted_until, last_rate_limits, lease state) across local and remote owners.
-        let accounts = match self
-            .auth_manager
-            .account_manager()
-            .list_accounts()
-        {
+        let accounts = match self.auth_manager.account_manager().list_accounts() {
             Ok(accounts) => accounts.into_iter().map(AccountsPopupEntry::from).collect(),
             Err(error) => {
                 self.add_error_message(format!("Failed to load saved ChatGPT accounts: {error}"));

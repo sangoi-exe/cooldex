@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use codex_app_server_protocol::AppInfo;
+use codex_login::ChatGptRequestAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_rmcp_client::ElicitationAction;
 use codex_tools::DiscoverableTool;
@@ -13,7 +14,6 @@ use codex_tools::all_suggested_connectors_picked_up;
 use codex_tools::build_tool_suggestion_elicitation_request;
 use codex_tools::filter_tool_suggest_discoverable_tools_for_client;
 use codex_tools::verified_connector_suggestion_completed;
-use codex_login::ChatGptRequestAuth;
 use rmcp::model::RequestId;
 use tracing::warn;
 
@@ -25,6 +25,9 @@ use crate::tools::context::ToolPayload;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
+
+// Merge-safety anchor: tool suggestions must consume ChatGPT request-auth
+// snapshots when checking connector access; do not rebuild auth headers here.
 
 pub struct ToolSuggestHandler;
 

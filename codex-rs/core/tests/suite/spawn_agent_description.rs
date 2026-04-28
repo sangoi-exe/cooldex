@@ -28,6 +28,9 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::time::sleep;
 
+// Merge-safety anchor: spawn-agent prompt-surface tests depend on the current
+// ModelsManager refresh path before asserting the shipped legacy tool text.
+
 const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
 
 fn spawn_agent_description(body: &Value) -> Option<String> {
@@ -92,7 +95,10 @@ fn test_model_info(
 async fn wait_for_model_available(manager: &Arc<ModelsManager>, slug: &str) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        let available_models = manager.list_models(RefreshStrategy::Online).await.expect("list models");
+        let available_models = manager
+            .list_models(RefreshStrategy::Online)
+            .await
+            .expect("list models");
         if available_models.iter().any(|model| model.model == slug) {
             return;
         }

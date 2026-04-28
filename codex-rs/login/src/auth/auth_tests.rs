@@ -298,7 +298,7 @@ fn external_chatgpt_auth_store_with_plan(
                 refresh_token: "external-refresh-token".to_string(),
                 account_id: Some(workspace_id.to_string()),
             },
-            last_refresh: None,
+            last_refresh: Some(Utc::now()),
             usage: None,
         }],
         ..AuthStore::default()
@@ -318,7 +318,8 @@ fn auth_manager_new_fails_loud_when_account_state_store_cannot_open() {
         sqlite_home,
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
 }
 
 #[test]
@@ -341,7 +342,8 @@ fn auth_manager_logout_releases_runtime_active_account_lease() {
         dir.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
 
     assert!(
         manager
@@ -381,7 +383,8 @@ async fn auth_manager_logout_with_revoke_releases_runtime_active_account_lease()
         dir.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
 
     assert!(
         manager
@@ -458,7 +461,8 @@ async fn resolve_chatgpt_auth_for_store_account_id_reads_latest_persisted_tokens
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     let cached_auth = manager
         .auth_cached()
         .expect("load cached auth")
@@ -536,7 +540,8 @@ fn public_auto_switch_selector_reads_live_storage_and_sqlite_usage_truth() {
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
 
     assert_eq!(
         manager
@@ -634,7 +639,8 @@ fn rate_limit_refresh_roster_reads_live_storage_and_excludes_foreign_leases() {
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     assert_eq!(
         manager
             .account_manager()
@@ -739,7 +745,8 @@ fn set_active_account_respects_forced_workspace_and_updates_last_seen() {
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     manager.set_forced_chatgpt_workspace_id(Some(workspace_a.to_string()));
 
     let err = manager
@@ -762,10 +769,7 @@ fn set_active_account_respects_forced_workspace_and_updates_last_seen() {
         current_active_chatgpt_store_account_id(&manager),
         Some("store-account-b".to_string())
     );
-    assert_eq!(
-        persisted_active_store_account_id(codex_home.path()),
-        None
-    );
+    assert_eq!(persisted_active_store_account_id(codex_home.path()), None);
 
     let cached_store = manager
         .inner
@@ -821,7 +825,8 @@ fn upsert_account_inserts_updates_and_preserves_existing_label_without_new_label
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     let expected_account_id = "chatgpt-user:user-12345:workspace:workspace-a";
 
     assert_eq!(
@@ -924,7 +929,8 @@ fn remove_account_reselects_unleased_fallback_account() {
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     manager
         .account_manager
         .account_state_store
@@ -960,10 +966,7 @@ fn remove_account_reselects_unleased_fallback_account() {
         current_active_chatgpt_store_account_id(&manager),
         Some("store-account-b".to_string())
     );
-    assert_eq!(
-        persisted_active_store_account_id(codex_home.path()),
-        None
-    );
+    assert_eq!(persisted_active_store_account_id(codex_home.path()), None);
 
     let accounts = manager
         .account_manager()
@@ -1039,7 +1042,8 @@ fn terminal_refresh_failure_removes_active_account_and_switches_to_unleased_fall
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     manager
         .account_manager
         .account_state_store
@@ -1091,10 +1095,7 @@ fn terminal_refresh_failure_removes_active_account_and_switches_to_unleased_fall
         current_active_chatgpt_store_account_id(&manager),
         Some("store-account-c".to_string())
     );
-    assert_eq!(
-        persisted_active_store_account_id(codex_home.path()),
-        None
-    );
+    assert_eq!(persisted_active_store_account_id(codex_home.path()), None);
 }
 
 // Merge-safety anchor: terminal ChatGPT refresh-token eviction must not let
@@ -1121,7 +1122,8 @@ fn terminal_refresh_failure_with_fallback_preserves_env_api_key_cache() {
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ true,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     let auth = manager
         .auth_cached()
         .expect("load cached auth")
@@ -1180,7 +1182,8 @@ fn terminal_refresh_failure_without_fallback_preserves_env_api_key_cache() {
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ true,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     let auth = manager
         .auth_cached()
         .expect("load cached auth")
@@ -1265,7 +1268,8 @@ fn reconcile_account_rate_limit_refresh_outcomes_updates_live_usage_truth() {
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
 
     let reset_at = Utc::now() + chrono::Duration::minutes(12);
     let snapshot = RateLimitSnapshot {
@@ -1301,7 +1305,10 @@ fn reconcile_account_rate_limit_refresh_outcomes_updates_live_usage_truth() {
         2
     );
 
-    let accounts = manager.account_manager().list_accounts().expect("list accounts");
+    let accounts = manager
+        .account_manager()
+        .list_accounts()
+        .expect("list accounts");
     let primary_account = accounts
         .iter()
         .find(|account| account.id == "store-account-a")
@@ -1366,7 +1373,8 @@ fn mark_usage_limit_reached_updates_active_usage_and_cache_expiry_uses_sqlite_tr
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
 
     let now = Utc::now();
     let reset_at = now + chrono::Duration::minutes(7);
@@ -1391,7 +1399,10 @@ fn mark_usage_limit_reached_updates_active_usage_and_cache_expiry_uses_sqlite_tr
         .mark_usage_limit_reached(Some(reset_at), Some(snapshot.clone()))
         .expect("usage-limit mark should succeed");
 
-    let accounts = manager.account_manager().list_accounts().expect("list accounts");
+    let accounts = manager
+        .account_manager()
+        .list_accounts()
+        .expect("list accounts");
     let active_account = accounts
         .iter()
         .find(|account| account.id == "store-account-a")
@@ -1420,7 +1431,8 @@ fn saved_account_runtime_updates_skip_empty_store_without_persisting_auth() {
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     let snapshot = RateLimitSnapshot {
         limit_id: Some("codex".to_string()),
         limit_name: None,
@@ -1555,7 +1567,8 @@ fn update_usage_for_active_updates_live_active_usage() {
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
 
     let reset_at = Utc::now() + chrono::Duration::minutes(11);
     let expected_reset_at =
@@ -1579,7 +1592,10 @@ fn update_usage_for_active_updates_live_active_usage() {
         .update_usage_for_active(snapshot.clone())
         .expect("active usage update should succeed");
 
-    let accounts = manager.account_manager().list_accounts().expect("list accounts");
+    let accounts = manager
+        .account_manager()
+        .list_accounts()
+        .expect("list accounts");
     let active_account = accounts
         .iter()
         .find(|account| account.id == "store-account-a")
@@ -1645,7 +1661,8 @@ fn update_rate_limits_for_account_and_accounts_update_targeted_usage() {
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
 
     let single_reset_at = Utc::now() + chrono::Duration::minutes(13);
     let single_snapshot = RateLimitSnapshot {
@@ -1705,7 +1722,10 @@ fn update_rate_limits_for_account_and_accounts_update_targeted_usage() {
         2
     );
 
-    let accounts = manager.account_manager().list_accounts().expect("list accounts");
+    let accounts = manager
+        .account_manager()
+        .list_accounts()
+        .expect("list accounts");
 
     let account_a = accounts
         .iter()
@@ -1775,7 +1795,8 @@ fn switch_account_on_usage_limit_respects_cooldown_but_still_marks_failing_accou
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     *manager
         .account_manager
         .usage_limit_auto_switch_cooldown_until
@@ -1893,7 +1914,8 @@ fn switch_account_on_usage_limit_starts_cooldown_after_switching_to_fallback() {
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
 
     let reset_at = Utc::now() + chrono::Duration::minutes(9);
     let snapshot = RateLimitSnapshot {
@@ -1981,7 +2003,8 @@ fn has_saved_chatgpt_accounts_reads_latest_persisted_store_after_manager_constru
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     assert!(
         !manager
             .account_manager()
@@ -2045,11 +2068,9 @@ fn auth_mode_and_active_summary_read_latest_persisted_store_after_manager_constr
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
-    assert_eq!(
-        manager.get_api_auth_mode().expect("load auth mode"),
-        None
-    );
+    )
+    .expect("create auth manager");
+    assert_eq!(manager.get_api_auth_mode().expect("load auth mode"), None);
     assert_eq!(current_active_chatgpt_store_account_id(&manager), None);
 
     save_auth(
@@ -2101,11 +2122,9 @@ fn auth_mode_and_active_summary_read_latest_external_store_after_manager_constru
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
-    assert_eq!(
-        manager.get_api_auth_mode().expect("load auth mode"),
-        None
-    );
+    )
+    .expect("create auth manager");
+    assert_eq!(manager.get_api_auth_mode().expect("load auth mode"), None);
     assert_eq!(current_active_chatgpt_store_account_id(&manager), None);
 
     save_auth(
@@ -2143,7 +2162,8 @@ fn live_auth_readers_do_not_emit_auth_state_notifications() {
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     let mut auth_state_rx = manager.subscribe_auth_state();
     let _ = auth_state_rx.borrow_and_update();
 
@@ -2244,7 +2264,8 @@ fn active_summary_returns_none_when_env_api_key_override_is_enabled() {
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ true,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
 
     assert_eq!(
         manager.get_api_auth_mode().expect("load auth mode"),
@@ -2264,7 +2285,8 @@ async fn chatgpt_snapshot_reads_do_not_mutate_api_key_cache() {
         empty_sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ true,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     assert_eq!(
         empty_manager
             .auth_cached()
@@ -2331,7 +2353,8 @@ async fn chatgpt_snapshot_reads_do_not_mutate_api_key_cache() {
         sqlite_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ true,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     assert_eq!(
         manager
             .auth_cached()
@@ -2365,7 +2388,8 @@ fn idempotent_reload_does_not_emit_auth_state_notifications() {
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
 
     write_auth_file(
         AuthFileParams {
@@ -2505,7 +2529,8 @@ async fn external_chatgpt_token_auth_manager_reload_and_resolution_stay_construc
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     let cached_auth = manager
         .auth_cached()
         .expect("load cached auth")
@@ -2555,7 +2580,8 @@ fn auth_manager_prefers_external_chatgpt_tokens_over_persisted_auth() {
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     let auth = manager
         .auth_cached()
         .expect("load cached auth")
@@ -2618,7 +2644,8 @@ fn terminal_refresh_failure_removes_external_account_from_external_store() {
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     assert_eq!(
         manager
             .auth_cached()
@@ -2708,7 +2735,8 @@ fn auth_manager_falls_back_to_persisted_auth_when_external_store_is_not_admitted
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     assert!(manager.account_manager.account_state_store.is_some());
     let cached_store = manager
         .inner
@@ -2803,7 +2831,8 @@ fn unauthorized_recovery_reports_mode_and_step_names() {
         dir.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     let managed = UnauthorizedRecovery {
         manager: Arc::clone(&manager),
         step: UnauthorizedRecoveryStep::Reload,
@@ -3117,7 +3146,8 @@ async fn auth_manager_notifies_when_auth_state_changes() {
         dir.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     let mut auth_state_rx = manager.subscribe_auth_state();
 
     save_auth(

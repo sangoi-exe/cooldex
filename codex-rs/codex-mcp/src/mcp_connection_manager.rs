@@ -119,9 +119,7 @@ fn sha1_hex(s: &str) -> String {
     format!("{sha1:x}")
 }
 
-pub fn codex_apps_tools_cache_key(
-    auth: Option<&ChatGptRequestAuth>,
-) -> CodexAppsToolsCacheKey {
+pub fn codex_apps_tools_cache_key(auth: Option<&ChatGptRequestAuth>) -> CodexAppsToolsCacheKey {
     CodexAppsToolsCacheKey {
         account_id: auth.map(|auth| auth.account_id().to_string()),
         chatgpt_user_id: auth

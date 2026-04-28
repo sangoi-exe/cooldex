@@ -53,6 +53,9 @@ use tokio_tungstenite::tungstenite;
 use tokio_util::sync::CancellationToken;
 
 fn remote_control_auth_manager() -> Arc<AuthManager> {
+    // Merge-safety anchor: remote-control tests must keep request headers tied
+    // to AuthManager-derived ChatGPT auth, matching the shipped app-server
+    // remote-control account header contract.
     auth_manager_from_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
 }
 
@@ -492,7 +495,8 @@ async fn remote_control_start_allows_missing_auth_when_enabled() {
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    );
+    )
+    .expect("auth manager should load");
     let (transport_event_tx, _transport_event_rx) =
         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let shutdown_token = CancellationToken::new();
@@ -1081,7 +1085,8 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
         codex_home.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
-    );
+    )
+    .expect("auth manager should load");
     let expected_server_name = gethostname().to_string_lossy().trim().to_string();
     let expected_enrollment = RemoteControlEnrollment {
         account_id: "account_id".to_string(),

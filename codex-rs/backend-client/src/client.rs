@@ -156,6 +156,10 @@ impl Client {
         base_url: impl Into<String>,
         auth: &ChatGptRequestAuth,
     ) -> Result<Self> {
+        // Merge-safety anchor: first-party ChatGPT backend callers must use the
+        // request-auth snapshot so authorization, account id, and FedRAMP
+        // routing stay owned by AuthManager/AccountManager instead of ad hoc
+        // header reconstruction.
         let authorization_header = HeaderValue::from_str(auth.authorization())?;
         let account_id = HeaderValue::from_str(auth.account_id())?;
         let mut client = Self::new(base_url)?
@@ -222,15 +226,14 @@ impl Client {
                 h.insert(AUTHORIZATION, hv);
             }
         }
-        if let Some(acc) = &self.chatgpt_account_id
-            && let Ok(name) = HeaderName::from_bytes(b"ChatGPT-Account-Id")
-        {
-            h.insert(name, acc.clone());
+        if let Some(acc) = &self.chatgpt_account_id {
+            h.insert(HeaderName::from_static("chatgpt-account-id"), acc.clone());
         }
-        if self.chatgpt_account_is_fedramp
-            && let Ok(name) = HeaderName::from_bytes(b"X-OpenAI-Fedramp")
-        {
-            h.insert(name, HeaderValue::from_static("true"));
+        if self.chatgpt_account_is_fedramp {
+            h.insert(
+                HeaderName::from_static("x-openai-fedramp"),
+                HeaderValue::from_static("true"),
+            );
         }
         h
     }

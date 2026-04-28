@@ -60,7 +60,8 @@ mod tests {
         std::fs::create_dir_all(&config.sqlite_home)?;
 
         let auth_manager =
-            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)?;
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
+                .map_err(codex_login::AccountRuntimeLoadError::into_io_error)?;
         let request_auth = load_chatgpt_request_auth(auth_manager.as_ref()).await?;
 
         assert_eq!(request_auth, None);

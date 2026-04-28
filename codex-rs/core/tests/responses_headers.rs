@@ -315,9 +315,13 @@ async fn responses_respects_model_info_overrides_from_config() {
     let config = Arc::new(config);
 
     let conversation_id = ThreadId::new();
+    // Merge-safety anchor: response-header fixtures must preserve the
+    // AuthManager-owned auth-mode lookup so request metadata does not drift
+    // back to stale cached-auth assumptions.
     let auth_mode =
         codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("Test API Key"))
             .auth_mode()
+            .expect("load auth mode")
             .map(TelemetryAuthMode::from);
     let session_source =
         SessionSource::SubAgent(SubAgentSource::Other("override-check".to_string()));

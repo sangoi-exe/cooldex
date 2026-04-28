@@ -20,15 +20,15 @@ use codex_core::config_loader::CloudRequirementsLoadErrorCode;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::ConfigRequirementsToml;
 use codex_core::util::backoff;
-use codex_login::AuthManager;
 use codex_login::AccountRuntimeLoadError;
+use codex_login::AuthManager;
 use codex_login::ChatGptAuthContext;
 use codex_login::ChatGptRequestAuth;
 use codex_login::ChatgptAccountAuthResolution;
 use codex_login::ChatgptAccountRefreshMode;
-use codex_login::RefreshTokenError;
 #[cfg(test)]
 use codex_login::CodexAuth;
+use codex_login::RefreshTokenError;
 use codex_protocol::account::PlanType;
 use hmac::Hmac;
 use hmac::Mac;
@@ -382,9 +382,11 @@ impl CloudRequirementsService {
     ) -> Result<Option<ConfigRequirementsToml>, CloudRequirementsLoadError> {
         let mut attempt = 1;
         let mut last_status_code: Option<u16> = None;
-        let expected_store_account_id = auth
-            .codex_auth()
+        let expected_store_account_id = self
+            .auth_manager
+            .account_manager()
             .active_chatgpt_account_summary()
+            .map_err(auth_owner_load_error)?
             .map(|summary| summary.store_account_id);
         let expected_account_id = auth_identity(&auth).1;
         let mut attempted_store_reload = false;
@@ -521,9 +523,11 @@ impl CloudRequirementsService {
                                     CLOUD_REQUIREMENTS_AUTH_RECOVERY_FAILED_MESSAGE,
                                 ));
                             };
-                            let reloaded_store_account_id = reloaded_auth
-                                .codex_auth()
+                            let reloaded_store_account_id = self
+                                .auth_manager
+                                .account_manager()
                                 .active_chatgpt_account_summary()
+                                .map_err(auth_owner_load_error)?
                                 .map(|summary| summary.store_account_id);
                             let reloaded_account_id = auth_identity(&reloaded_auth).1;
                             let matches_expected_account = expected_account_id
@@ -1040,11 +1044,14 @@ mod tests {
             "last_refresh": null,
         });
         write_auth_json(tmp.path(), auth_json).expect("write auth");
-        Arc::new(AuthManager::new(
-            tmp.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
-            AuthCredentialsStoreMode::File,
-        ))
+        Arc::new(
+            AuthManager::new(
+                tmp.path().to_path_buf(),
+                /*enable_codex_api_key_env*/ false,
+                AuthCredentialsStoreMode::File,
+            )
+            .expect("create auth manager"),
+        )
     }
 
     fn auth_manager_with_plan_and_identity(
@@ -1064,11 +1071,14 @@ mod tests {
             ),
         )
         .expect("write auth");
-        Arc::new(AuthManager::new(
-            tmp.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
-            AuthCredentialsStoreMode::File,
-        ))
+        Arc::new(
+            AuthManager::new(
+                tmp.path().to_path_buf(),
+                /*enable_codex_api_key_env*/ false,
+                AuthCredentialsStoreMode::File,
+            )
+            .expect("create auth manager"),
+        )
     }
 
     fn chatgpt_auth_json(
@@ -1204,11 +1214,14 @@ mod tests {
         )
         .expect("write auth");
         ManagedAuthContext {
-            manager: Arc::new(AuthManager::new(
-                home.path().to_path_buf(),
-                /*enable_codex_api_key_env*/ false,
-                AuthCredentialsStoreMode::File,
-            )),
+            manager: Arc::new(
+                AuthManager::new(
+                    home.path().to_path_buf(),
+                    /*enable_codex_api_key_env*/ false,
+                    AuthCredentialsStoreMode::File,
+                )
+                .expect("create auth manager"),
+            ),
             _home: home,
         }
     }
@@ -1605,11 +1618,14 @@ enabled = false
             ),
         )
         .expect("write initial auth");
-        let auth_manager = Arc::new(AuthManager::new(
-            auth_home.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
-            AuthCredentialsStoreMode::File,
-        ));
+        let auth_manager = Arc::new(
+            AuthManager::new(
+                auth_home.path().to_path_buf(),
+                /*enable_codex_api_key_env*/ false,
+                AuthCredentialsStoreMode::File,
+            )
+            .expect("create auth manager"),
+        );
 
         let refreshed_auth_json = chatgpt_auth_json_with_last_refresh(
             "business",
@@ -1674,11 +1690,14 @@ enabled = false
             ),
         )
         .expect("write initial auth");
-        let auth_manager = Arc::new(AuthManager::new(
-            auth_home.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
-            AuthCredentialsStoreMode::File,
-        ));
+        let auth_manager = Arc::new(
+            AuthManager::new(
+                auth_home.path().to_path_buf(),
+                /*enable_codex_api_key_env*/ false,
+                AuthCredentialsStoreMode::File,
+            )
+            .expect("create auth manager"),
+        );
 
         let refreshed_auth_json = chatgpt_auth_json_with_last_refresh(
             "business",
@@ -1758,11 +1777,14 @@ enabled = false
             ),
         )
         .expect("write initial auth");
-        let auth_manager = Arc::new(AuthManager::new(
-            auth_home.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ true,
-            AuthCredentialsStoreMode::File,
-        ));
+        let auth_manager = Arc::new(
+            AuthManager::new(
+                auth_home.path().to_path_buf(),
+                /*enable_codex_api_key_env*/ true,
+                AuthCredentialsStoreMode::File,
+            )
+            .expect("create auth manager"),
+        );
         assert!(
             auth_manager
                 .auth_cached()
@@ -1883,11 +1905,14 @@ enabled = false
             ),
         )
         .expect("write auth");
-        let auth_manager = Arc::new(AuthManager::new(
-            auth_home.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
-            AuthCredentialsStoreMode::File,
-        ));
+        let auth_manager = Arc::new(
+            AuthManager::new(
+                auth_home.path().to_path_buf(),
+                /*enable_codex_api_key_env*/ false,
+                AuthCredentialsStoreMode::File,
+            )
+            .expect("create auth manager"),
+        );
 
         let fetcher = Arc::new(UnauthorizedFetcher {
             message:

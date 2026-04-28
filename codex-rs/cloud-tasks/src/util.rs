@@ -67,18 +67,23 @@ pub fn build_chatgpt_headers(auth: &ChatGptRequestAuth) -> HeaderMap {
     // Merge-safety anchor: cloud-task environment probes share the command
     // AuthManager request-auth snapshot; never recover account id from JWTs
     // or mint a fresh AuthManager per probe.
-    if let Ok(header_value) = HeaderValue::from_str(auth.authorization()) {
-        headers.insert(AUTHORIZATION, header_value);
-    }
-    if let Ok(name) = HeaderName::from_bytes(b"ChatGPT-Account-Id")
-        && let Ok(header_value) = HeaderValue::from_str(auth.account_id())
-    {
-        headers.insert(name, header_value);
-    }
-    if auth.is_fedramp_account()
-        && let Ok(name) = HeaderName::from_bytes(b"X-OpenAI-Fedramp")
-    {
-        headers.insert(name, HeaderValue::from_static("true"));
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(auth.authorization()).unwrap_or_else(|error| {
+            panic!("validated ChatGPT authorization header should materialize: {error}")
+        }),
+    );
+    headers.insert(
+        HeaderName::from_static("chatgpt-account-id"),
+        HeaderValue::from_str(auth.account_id()).unwrap_or_else(|error| {
+            panic!("validated ChatGPT account id header should materialize: {error}")
+        }),
+    );
+    if auth.is_fedramp_account() {
+        headers.insert(
+            HeaderName::from_static("x-openai-fedramp"),
+            HeaderValue::from_static("true"),
+        );
     }
     headers
 }

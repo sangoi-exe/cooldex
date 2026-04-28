@@ -148,6 +148,8 @@ use codex_features::Feature;
 use codex_login::AccountRateLimitRefreshOutcome;
 use codex_login::AccountRateLimitRefreshRoster;
 use codex_login::AccountRateLimitRefreshRosterStatus;
+#[cfg(test)]
+use codex_login::AccountSummary;
 use codex_login::AuthManager;
 use codex_login::CLIENT_ID;
 use codex_login::ChatgptAccountAuthResolution;
@@ -546,6 +548,14 @@ fn active_store_account_id_from_account_manager(auth_manager: &AuthManager) -> O
     }
 }
 
+#[cfg(test)]
+fn test_list_accounts(auth_manager: &AuthManager) -> Vec<AccountSummary> {
+    auth_manager
+        .account_manager()
+        .list_accounts()
+        .expect("list test accounts")
+}
+
 fn spawn_next_accounts_rate_limit_fetch(
     join_set: &mut tokio::task::JoinSet<AccountsRateLimitFetchOutcome>,
     pending: &mut impl Iterator<Item = String>,
@@ -569,10 +579,7 @@ fn spawn_next_accounts_rate_limit_fetch(
                 Ok(ChatgptAccountAuthResolution::Auth(auth)) => {
                     let snapshots = match tokio::time::timeout(
                         ACCOUNTS_RATE_LIMIT_FETCH_TIMEOUT,
-                        crate::chatwidget::fetch_rate_limits(
-                            base_url,
-                            auth.request_auth().clone(),
-                        ),
+                        crate::chatwidget::fetch_rate_limits(base_url, auth.request_auth().clone()),
                     )
                     .await
                     {
@@ -2279,7 +2286,10 @@ impl App {
                 None
             }
         };
-        if !matches!(auth_mode, Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)) {
+        if !matches!(
+            auth_mode,
+            Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)
+        ) {
             self.pending_forced_accounts_status_refresh = false;
             self.accounts_status_cache_expires_at = None;
             if self.open_accounts_popup_when_cache_ready {
@@ -2481,13 +2491,15 @@ impl App {
                         return;
                     }
                 };
-                let status_account_display = accounts.iter().find(|account| account.is_active).map(
-                    |account| StatusAccountDisplay::ChatGpt {
-                        label: account.label.clone(),
-                        email: account.email.clone(),
-                        plan: None,
-                    },
-                );
+                let status_account_display =
+                    accounts
+                        .iter()
+                        .find(|account| account.is_active)
+                        .map(|account| StatusAccountDisplay::ChatGpt {
+                            label: account.label.clone(),
+                            email: account.email.clone(),
+                            plan: None,
+                        });
                 self.apply_chat_widget_account_state(
                     status_account_display,
                     None,
@@ -2679,15 +2691,11 @@ impl App {
         previous_account_id: Option<&str>,
     ) -> std::result::Result<ChatgptAuthTokensRefreshResponse, ThreadlessChatgptAuthRefreshError>
     {
-        // Keep this cache-only so `refresh_token()` can still compare the
-        // session's current auth snapshot against storage before deciding
-        // whether another local instance already refreshed the token.
         let previous_active_store_account_id = self
             .auth_manager
-            .auth_cached()
+            .account_manager()
+            .active_chatgpt_account_summary()
             .map_err(|err| ThreadlessChatgptAuthRefreshError::Other(err.to_string()))?
-            .as_ref()
-            .and_then(CodexAuth::active_chatgpt_account_summary)
             .map(|summary| summary.store_account_id);
         self.select_local_chatgpt_account_for_threadless_refresh(previous_account_id)
             .map_err(ThreadlessChatgptAuthRefreshError::Other)?;
@@ -7264,11 +7272,7 @@ impl App {
                     }
                     return Ok(AppRunControl::Continue);
                 }
-                let display = match self
-                    .auth_manager
-                    .account_manager()
-                    .list_accounts()
-                {
+                let display = match self.auth_manager.account_manager().list_accounts() {
                     Ok(accounts) => accounts
                         .into_iter()
                         .find(|account| account.id == account_id)
@@ -7361,8 +7365,7 @@ impl App {
                         return Ok(AppRunControl::Continue);
                     }
                 };
-                if !has_saved_chatgpt_accounts && !self.config.model_provider.requires_openai_auth
-                {
+                if !has_saved_chatgpt_accounts && !self.config.model_provider.requires_openai_auth {
                     self.chat_widget.add_error_message(
                         "'/accounts' add needs saved ChatGPT accounts or an OpenAI-auth provider."
                             .to_string(),
@@ -9979,10 +9982,7 @@ mod tests {
         let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
         seed_chatgpt_account_cache(&mut app);
         let reset_at = Utc::now() + chrono::Duration::minutes(45);
-        let store_account_id = app
-            .auth_manager
-            .account_manager()
-            .list_accounts()
+        let store_account_id = test_list_accounts(app.auth_manager.as_ref())
             .into_iter()
             .map(|account| account.id)
             .next()
@@ -10021,10 +10021,7 @@ mod tests {
         app.recompute_accounts_status_cache_expiry(Utc::now());
         assert_eq!(app.accounts_status_cache_expires_at, None);
 
-        let store_account_id = app
-            .auth_manager
-            .account_manager()
-            .list_accounts()
+        let store_account_id = test_list_accounts(app.auth_manager.as_ref())
             .into_iter()
             .map(|account| account.id)
             .next()
@@ -10584,7 +10581,7 @@ mod tests {
         // active-account mutation.
         harness
             .remote_auth_manager
-            .reload_strict()
+            .reload()
             .expect("reload newly added remote account");
         let mutation = harness
             .remote_auth_manager
@@ -11026,10 +11023,7 @@ mod tests {
             }));
         assert_eq!(app.chat_widget.rate_limit_snapshot_count(), 1);
 
-        let switched_account_id = app
-            .auth_manager
-            .account_manager()
-            .list_accounts()
+        let switched_account_id = test_list_accounts(app.auth_manager.as_ref())
             .into_iter()
             .find(|account| account.label.as_deref() == Some("Secondary"))
             .map(|account| account.id)
@@ -11094,10 +11088,7 @@ mod tests {
             })
         );
 
-        let switched_account_id = app
-            .auth_manager
-            .account_manager()
-            .list_accounts()
+        let switched_account_id = test_list_accounts(app.auth_manager.as_ref())
             .into_iter()
             .find(|account| account.label.as_deref() == Some("Secondary"))
             .map(|account| account.id)
@@ -11170,10 +11161,7 @@ mod tests {
             })
         );
 
-        let switched_account_id = app
-            .auth_manager
-            .account_manager()
-            .list_accounts()
+        let switched_account_id = test_list_accounts(app.auth_manager.as_ref())
             .into_iter()
             .find(|account| account.label.as_deref() == Some("Secondary"))
             .map(|account| account.id)
@@ -11244,10 +11232,7 @@ mod tests {
             })
         );
 
-        let switched_account_id = app
-            .auth_manager
-            .account_manager()
-            .list_accounts()
+        let switched_account_id = test_list_accounts(app.auth_manager.as_ref())
             .into_iter()
             .find(|account| account.label.as_deref() == Some("Secondary"))
             .map(|account| account.id)
@@ -11444,10 +11429,7 @@ mod tests {
         app.finish_app_server_account_projection_refresh(stale_projection.clone());
         while app_event_rx.try_recv().is_ok() {}
 
-        let secondary_store_account_id = app
-            .auth_manager
-            .account_manager()
-            .list_accounts()
+        let secondary_store_account_id = test_list_accounts(app.auth_manager.as_ref())
             .into_iter()
             .find(|account| account.label.as_deref() == Some("Secondary"))
             .map(|account| account.id)
@@ -11530,10 +11512,7 @@ mod tests {
             .observed_active_store_account_id
             .clone()
             .expect("primary account should be observed");
-        let secondary_store_account_id = app
-            .auth_manager
-            .account_manager()
-            .list_accounts()
+        let secondary_store_account_id = test_list_accounts(app.auth_manager.as_ref())
             .into_iter()
             .find(|account| account.label.as_deref() == Some("Secondary"))
             .map(|account| account.id)
@@ -11679,7 +11658,7 @@ mod tests {
         ));
         while app_event_rx.try_recv().is_ok() {}
 
-        let accounts = app.auth_manager.account_manager().list_accounts();
+        let accounts = test_list_accounts(app.auth_manager.as_ref());
         let active_store_account_id = accounts
             .iter()
             .find(|account| account.is_active)
@@ -11776,10 +11755,8 @@ mod tests {
         )
         .expect("save auth store");
         app.auth_manager = auth_manager_from_config(&app.config);
-        app.auth_manager
-            .reload_strict()
-            .expect("reload seeded auth store");
-        let accounts = app.auth_manager.account_manager().list_accounts();
+        app.auth_manager.reload().expect("reload seeded auth store");
+        let accounts = test_list_accounts(app.auth_manager.as_ref());
         let active_store_account_id = accounts
             .iter()
             .find(|account| account.is_active)
@@ -11869,7 +11846,7 @@ mod tests {
         ));
         while app_event_rx.try_recv().is_ok() {}
 
-        let accounts = app.auth_manager.account_manager().list_accounts();
+        let accounts = test_list_accounts(app.auth_manager.as_ref());
         let active_store_account_id = accounts
             .iter()
             .find(|account| account.is_active)
@@ -11959,13 +11936,8 @@ mod tests {
         )
         .expect("save auth store");
         app.auth_manager = auth_manager_from_config(&app.config);
-        app.auth_manager
-            .reload_strict()
-            .expect("reload seeded auth store");
-        let active_store_account_id = app
-            .auth_manager
-            .account_manager()
-            .list_accounts()
+        app.auth_manager.reload().expect("reload seeded auth store");
+        let active_store_account_id = test_list_accounts(app.auth_manager.as_ref())
             .into_iter()
             .find(|account| account.is_active)
             .map(|account| account.id)
@@ -12049,7 +12021,7 @@ mod tests {
         ));
         while app_event_rx.try_recv().is_ok() {}
 
-        let accounts = app.auth_manager.account_manager().list_accounts();
+        let accounts = test_list_accounts(app.auth_manager.as_ref());
         let active_store_account_id = accounts
             .iter()
             .find(|account| account.is_active)
@@ -12126,7 +12098,7 @@ mod tests {
         ));
         while app_event_rx.try_recv().is_ok() {}
 
-        let accounts = app.auth_manager.account_manager().list_accounts();
+        let accounts = test_list_accounts(app.auth_manager.as_ref());
         let active_store_account_id = accounts
             .iter()
             .find(|account| account.is_active)
@@ -12231,10 +12203,7 @@ mod tests {
         ));
         while app_event_rx.try_recv().is_ok() {}
 
-        let active_store_account_id = app
-            .auth_manager
-            .account_manager()
-            .list_accounts()
+        let active_store_account_id = test_list_accounts(app.auth_manager.as_ref())
             .into_iter()
             .find(|account| account.is_active)
             .map(|account| account.id)
@@ -12579,10 +12548,7 @@ mod tests {
         ));
         while app_event_rx.try_recv().is_ok() {}
 
-        let secondary_store_account_id = app
-            .auth_manager
-            .account_manager()
-            .list_accounts()
+        let secondary_store_account_id = test_list_accounts(app.auth_manager.as_ref())
             .into_iter()
             .find(|account| account.label.as_deref() == Some("Secondary"))
             .map(|account| account.id)
@@ -16953,24 +16919,21 @@ guardian_approval = true
         .expect("save single-account auth store");
         app.auth_manager = auth_manager_from_config(&app.config);
         app.auth_manager
-            .reload_strict()
+            .reload()
             .expect("reload single-account auth store");
         let expected_store_account_id = canonical_chatgpt_store_account_id("account-a");
-        let releasing_active_store_account_id = active_store_account_id_from_account_manager(
-            app.auth_manager.as_ref(),
-        )
-            .expect("app auth manager should acquire the single saved account");
+        let releasing_active_store_account_id =
+            active_store_account_id_from_account_manager(app.auth_manager.as_ref())
+                .expect("app auth manager should acquire the single saved account");
         assert_eq!(releasing_active_store_account_id, expected_store_account_id);
 
         let competing_manager = auth_manager_from_config(&app.config);
         competing_manager
-            .reload_strict()
+            .reload()
             .expect("reload competing auth manager");
 
         assert!(
-            competing_manager
-                .account_manager()
-                .list_accounts()
+            test_list_accounts(competing_manager.as_ref())
                 .into_iter()
                 .all(|account| !account.is_active),
             "expected the live app manager to hold the only saved-account lease before exit"
@@ -16979,22 +16942,18 @@ guardian_approval = true
         app.release_runtime_auth_lease_for_exit();
 
         competing_manager
-            .reload_strict()
+            .reload()
             .expect("reload competing auth manager after exit");
 
         assert!(
-            competing_manager
-                .account_manager()
-                .list_accounts()
-                .expect("list competing accounts")
+            test_list_accounts(competing_manager.as_ref())
                 .into_iter()
                 .any(|account| account.is_active),
             "expected a competing manager to acquire the released runtime lease immediately"
         );
-        let competing_active_store_account_id = active_store_account_id_from_account_manager(
-            competing_manager.as_ref(),
-        )
-            .expect("competing manager should acquire the released account");
+        let competing_active_store_account_id =
+            active_store_account_id_from_account_manager(competing_manager.as_ref())
+                .expect("competing manager should acquire the released account");
         assert_eq!(competing_active_store_account_id, expected_store_account_id);
     }
 
@@ -17170,9 +17129,7 @@ guardian_approval = true
         )
         .expect("save canonical auth store");
         let auth_manager = auth_manager_from_config(config);
-        auth_manager
-            .reload_strict()
-            .expect("reload canonical auth store");
+        auth_manager.reload().expect("reload canonical auth store");
         (
             auth_manager,
             primary_store_account_id,
@@ -17291,7 +17248,7 @@ guardian_approval = true
             .expect("save same-visible canonical auth store");
             let remote_auth_manager = auth_manager_from_config(&remote_config);
             remote_auth_manager
-                .reload_strict()
+                .reload()
                 .expect("reload same-visible canonical auth store");
 
             let mut app_server = crate::start_app_server_for_picker_with_auth_manager(
@@ -17337,7 +17294,7 @@ guardian_approval = true
             .expect("save same-email canonical auth store");
             let remote_auth_manager = auth_manager_from_config(&remote_config);
             remote_auth_manager
-                .reload_strict()
+                .reload()
                 .expect("reload same-email canonical auth store");
 
             let mut app_server = crate::start_app_server_for_picker_with_auth_manager(
@@ -17600,9 +17557,7 @@ guardian_approval = true
         )
         .expect("save auth store");
         app.auth_manager = auth_manager_from_config(&app.config);
-        app.auth_manager
-            .reload_strict()
-            .expect("reload seeded auth store");
+        app.auth_manager.reload().expect("reload seeded auth store");
     }
 
     fn fake_chatgpt_jwt(email: &str, account_id: &str, plan_type: &str) -> String {
@@ -17744,9 +17699,7 @@ guardian_approval = true
         )
         .expect("save auth store");
         app.auth_manager = auth_manager_from_config(&app.config);
-        app.auth_manager
-            .reload_strict()
-            .expect("reload seeded auth store");
+        app.auth_manager.reload().expect("reload seeded auth store");
     }
 
     fn seed_canonical_chatgpt_accounts(app: &mut App, active_account_id: &str) -> (String, String) {
@@ -17788,10 +17741,7 @@ guardian_approval = true
         let active_store_account_id_before_switch =
             active_store_account_id_from_account_manager(app.auth_manager.as_ref())
                 .expect("active account should be seeded");
-        let blocked_account_id = app
-            .auth_manager
-            .account_manager()
-            .list_accounts()
+        let blocked_account_id = test_list_accounts(app.auth_manager.as_ref())
             .into_iter()
             .find(|account| !account.is_active)
             .map(|account| account.id)

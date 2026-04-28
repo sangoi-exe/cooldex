@@ -36,6 +36,10 @@ use tokio::time::sleep;
 use wiremock::BodyPrintLimit;
 use wiremock::MockServer;
 
+// Merge-safety anchor: personality remote-template tests must keep the
+// ModelsManager refresh path aligned with the active AuthManager-backed model
+// catalog owner.
+
 const LOCAL_FRIENDLY_TEMPLATE: &str =
     "You optimize for team morale and being a supportive teammate as much as code quality.";
 const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
@@ -906,7 +910,10 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
 async fn wait_for_model_available(manager: &Arc<ModelsManager>, slug: &str) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        let models = manager.list_models(RefreshStrategy::OnlineIfUncached).await.expect("list models");
+        let models = match manager.list_models(RefreshStrategy::OnlineIfUncached).await {
+            Ok(models) => models,
+            Err(error) => panic!("list models: {error}"),
+        };
         if models.iter().any(|model| model.model == slug) {
             return;
         }

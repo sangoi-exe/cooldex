@@ -215,7 +215,10 @@ fn codex_apps_mcp_http_headers(
         "Authorization".to_string(),
         auth.authorization().to_string(),
     );
-    headers.insert("ChatGPT-Account-ID".to_string(), auth.account_id().to_string());
+    headers.insert(
+        "ChatGPT-Account-ID".to_string(),
+        auth.account_id().to_string(),
+    );
     if auth.is_fedramp_account() {
         headers.insert("X-OpenAI-Fedramp".to_string(), "true".to_string());
     }

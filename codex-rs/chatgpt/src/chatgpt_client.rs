@@ -116,7 +116,7 @@ mod tests {
             codex_home.to_path_buf(),
             /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
-        )
+        )?
         .chatgpt_request_auth()
         .await?
         .ok_or_else(|| anyhow::anyhow!("saved ChatGPT auth should produce request auth"))

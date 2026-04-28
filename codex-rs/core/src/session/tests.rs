@@ -2045,8 +2045,12 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
         auth_home.path().to_path_buf(),
         false,
         crate::auth::AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
-    let accounts = auth_manager.account_manager().list_accounts().expect("list accounts");
+    )
+    .expect("create auth manager");
+    let accounts = auth_manager
+        .account_manager()
+        .list_accounts()
+        .expect("list accounts");
     assert_eq!(
         accounts.len(),
         3,
@@ -2112,7 +2116,10 @@ async fn visible_usage_limit_retry_preserves_changed_active_account_until_its_ow
         should_retry,
         "changed active account should stay retryable until its own usage-limit path runs"
     );
-    let accounts = auth_manager.account_manager().list_accounts().expect("list accounts");
+    let accounts = auth_manager
+        .account_manager()
+        .list_accounts()
+        .expect("list accounts");
     assert_eq!(
         accounts
             .iter()
@@ -2181,7 +2188,8 @@ async fn visible_usage_limit_retry_marks_failing_account_exhausted_even_when_sta
         auth_home.path().to_path_buf(),
         false,
         crate::auth::AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
     session_mut.services.auth_manager = Arc::clone(&auth_manager);
     let turn_context_mut =
@@ -2223,7 +2231,10 @@ async fn visible_usage_limit_retry_marks_failing_account_exhausted_even_when_sta
     .expect("stale request should still retry under the later active account");
 
     assert!(should_retry);
-    let accounts = auth_manager.account_manager().list_accounts().expect("list accounts");
+    let accounts = auth_manager
+        .account_manager()
+        .list_accounts()
+        .expect("list accounts");
     let failing_account = accounts
         .iter()
         .find(|account| account.id == acc_0_store_account_id)
@@ -2334,7 +2345,8 @@ async fn visible_usage_limit_retry_prefers_managed_auth_when_saved_fallbacks_and
         auth_home.path().to_path_buf(),
         false,
         crate::auth::AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     assert_eq!(
         auth_manager.auth_mode().expect("load auth mode"),
         Some(crate::auth::AuthMode::Chatgpt)
@@ -2384,7 +2396,10 @@ async fn visible_usage_limit_retry_prefers_managed_auth_when_saved_fallbacks_and
     .expect("usage-limit retry should switch when the mixed roster stays on managed auth");
 
     assert!(should_retry);
-    let accounts = auth_manager.account_manager().list_accounts().expect("list accounts");
+    let accounts = auth_manager
+        .account_manager()
+        .list_accounts()
+        .expect("list accounts");
     assert_eq!(
         accounts
             .iter()
@@ -2574,23 +2589,29 @@ async fn visible_usage_limit_core_pre_refresh_respects_foreign_leases_until_rele
         auth_home.path().to_path_buf(),
         false,
         crate::auth::AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     let manager_b = AuthManager::shared(
         auth_home.path().to_path_buf(),
         false,
         crate::auth::AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
 
     assert_eq!(
         manager_a
+            .account_manager()
             .active_chatgpt_account_summary()
+            .expect("load primary session active account")
             .expect("primary session active account")
             .store_account_id,
         acc_0_store_account_id
     );
     assert_eq!(
         manager_b
+            .account_manager()
             .active_chatgpt_account_summary()
+            .expect("load secondary session active account")
             .expect("secondary session active account")
             .store_account_id,
         acc_1_store_account_id
@@ -2650,7 +2671,9 @@ async fn visible_usage_limit_core_pre_refresh_respects_foreign_leases_until_rele
     assert!(phase_1_retry);
     assert_eq!(
         manager_a
+            .account_manager()
             .active_chatgpt_account_summary()
+            .expect("load primary session active account")
             .expect("primary session should move to the unleased fallback")
             .store_account_id,
         acc_2_store_account_id
@@ -2687,7 +2710,9 @@ async fn visible_usage_limit_core_pre_refresh_respects_foreign_leases_until_rele
     manager_b.refresh_auth_after_account_runtime_mutation(mutation);
     assert_eq!(
         manager_b
+            .account_manager()
             .active_chatgpt_account_summary()
+            .expect("load secondary session active account")
             .expect("secondary session should now hold Account A")
             .store_account_id,
         acc_0_store_account_id
@@ -2729,7 +2754,9 @@ async fn visible_usage_limit_core_pre_refresh_respects_foreign_leases_until_rele
     assert!(phase_2_retry);
     assert_eq!(
         manager_a
+            .account_manager()
             .active_chatgpt_account_summary()
+            .expect("load primary session active account")
             .expect("primary session should now move onto the released account")
             .store_account_id,
         acc_1_store_account_id
@@ -3139,7 +3166,8 @@ async fn prompt_gc_hidden_usage_limit_auto_switches_and_retries() {
         auth_home.path().to_path_buf(),
         false,
         crate::auth::AuthCredentialsStoreMode::File,
-    ).expect("create auth manager");
+    )
+    .expect("create auth manager");
     let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
     session_mut.services.auth_manager = Arc::clone(&auth_manager);
     let turn_context_mut =
@@ -3192,7 +3220,8 @@ async fn prompt_gc_hidden_usage_limit_auto_switches_and_retries() {
     assert_eq!(
         auth_manager
             .account_manager()
-            .list_accounts().expect("list accounts")
+            .list_accounts()
+            .expect("list accounts")
             .into_iter()
             .find(|account| account.is_active)
             .map(|account| account.id),
@@ -5750,7 +5779,8 @@ async fn turn_context_with_model_updates_model_fields() {
     turn_context.reasoning_effort = Some(ReasoningEffortConfig::Minimal);
     let updated = turn_context
         .with_model("gpt-5.1".to_string(), &session.services.models_manager)
-        .await.expect("switch model");
+        .await
+        .expect("switch model");
     let expected_model_info = session
         .services
         .models_manager
@@ -8007,7 +8037,8 @@ async fn build_settings_update_items_emits_environment_item_for_network_changes(
             previous_context.model_info.slug.clone(),
             &session.services.models_manager,
         )
-        .await.expect("switch model");
+        .await
+        .expect("switch model");
 
     let mut config = (*current_context.config).clone();
     let mut requirements = config.config_layer_stack.requirements().clone();
@@ -8069,7 +8100,8 @@ async fn build_settings_update_items_emits_environment_item_for_time_changes() {
             previous_context.model_info.slug.clone(),
             &session.services.models_manager,
         )
-        .await.expect("switch model");
+        .await
+        .expect("switch model");
     current_context.current_date = Some("2026-02-27".to_string());
     current_context.timezone = Some("Europe/Berlin".to_string());
 
@@ -8095,7 +8127,8 @@ async fn build_settings_update_items_omits_environment_item_when_disabled() {
             previous_context.model_info.slug.clone(),
             &session.services.models_manager,
         )
-        .await.expect("switch model");
+        .await
+        .expect("switch model");
     let mut config = (*current_context.config).clone();
     config.include_environment_context = false;
     current_context.config = Arc::new(config);
@@ -8124,7 +8157,8 @@ async fn build_settings_update_items_emits_realtime_start_when_session_becomes_l
             previous_context.model_info.slug.clone(),
             &session.services.models_manager,
         )
-        .await.expect("switch model");
+        .await
+        .expect("switch model");
     current_context.realtime_active = true;
 
     let update_items = session
@@ -8152,7 +8186,8 @@ async fn build_settings_update_items_emits_realtime_end_when_session_stops_being
             previous_context.model_info.slug.clone(),
             &session.services.models_manager,
         )
-        .await.expect("switch model");
+        .await
+        .expect("switch model");
     current_context.realtime_active = false;
 
     let update_items = session
@@ -8185,7 +8220,8 @@ async fn build_settings_update_items_uses_previous_turn_settings_for_realtime_en
             previous_context.model_info.slug.clone(),
             &session.services.models_manager,
         )
-        .await.expect("switch model");
+        .await
+        .expect("switch model");
     current_context.realtime_active = false;
 
     session
@@ -8647,7 +8683,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
     };
     let turn_context = previous_context
         .with_model(next_model.to_string(), &session.services.models_manager)
-        .await.expect("switch model");
+        .await
+        .expect("switch model");
     let previous_context_item = previous_context.to_turn_context_item();
     {
         let mut state = session.state.lock().await;
@@ -8799,7 +8836,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
     };
     let turn_context = previous_context
         .with_model(next_model.to_string(), &session.services.models_manager)
-        .await.expect("switch model");
+        .await
+        .expect("switch model");
     let config = session.get_config().await;
     let recorder = RolloutRecorder::new(
         config.as_ref(),

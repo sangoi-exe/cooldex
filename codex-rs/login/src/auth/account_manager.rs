@@ -1106,11 +1106,9 @@ impl AccountManager {
         let removed_account_ids = enforce_chatgpt_auth_accounts(&mut store, admission_policy);
         let mut sync_outcome = UsageStateSyncOutcome::default();
         if let Some(account_state_store) = self.account_state_store.as_ref() {
-            sync_outcome = synchronize_store_usage_from_legacy_and_sqlite(
-                account_state_store,
-                &mut store,
-            )
-            .map_err(AccountRuntimeLoadError::usage_sync)?;
+            sync_outcome =
+                synchronize_store_usage_from_legacy_and_sqlite(account_state_store, &mut store)
+                    .map_err(AccountRuntimeLoadError::usage_sync)?;
         }
         if !removed_account_ids.is_empty() {
             tracing::info!(
@@ -1194,7 +1192,9 @@ impl AccountManager {
         }
     }
 
-    pub(super) fn load_store_from_storage(&self) -> Result<LoadedAuthStore, AccountRuntimeLoadError> {
+    pub(super) fn load_store_from_storage(
+        &self,
+    ) -> Result<LoadedAuthStore, AccountRuntimeLoadError> {
         // Merge-safety anchor: live store loading keeps AccountManager as the
         // owner of auth-store selection, admission filtering, sqlite-backed
         // usage/runtime hydration, and persisted-active stripping; AuthManager
@@ -1258,8 +1258,8 @@ impl AccountManager {
         // Merge-safety anchor: guarded reload lock/load/account-runtime
         // prep/persist belongs to AccountManager; AuthManager may only compare,
         // derive, and cache auth from the returned snapshot.
-        let _lock = lock_auth_store(&self.codex_home)
-            .map_err(AccountRuntimeLoadError::auth_store_load)?;
+        let _lock =
+            lock_auth_store(&self.codex_home).map_err(AccountRuntimeLoadError::auth_store_load)?;
         let mut store = match self.storage.load() {
             Ok(Some(store)) => store,
             Ok(None) => {
@@ -1592,10 +1592,12 @@ impl AccountManager {
                     ),
                 ),
             ),
-            Ok(None) => Ok(account_rate_limit_refresh_roster_from_workspace_filtered_ids(
-                workspace_filtered_store_account_ids,
-                AccountRateLimitRefreshLeaseState::NoLeaseOwner,
-            )),
+            Ok(None) => Ok(
+                account_rate_limit_refresh_roster_from_workspace_filtered_ids(
+                    workspace_filtered_store_account_ids,
+                    AccountRateLimitRefreshLeaseState::NoLeaseOwner,
+                ),
+            ),
             Err(error) => Err(AccountRuntimeLoadError::lease_state_read(error)),
         }
     }
@@ -1697,7 +1699,10 @@ impl AccountManager {
         // keep this no-saved-accounts early return outside the persistence path
         // so API-key or empty stores are not loaded, persisted, or treated as
         // account-runtime state just because usage data arrived.
-        if !self.has_saved_chatgpt_accounts().map_err(AccountRuntimeLoadError::into_io_error)? {
+        if !self
+            .has_saved_chatgpt_accounts()
+            .map_err(AccountRuntimeLoadError::into_io_error)?
+        {
             return Ok(default);
         }
         let (out, _loaded) = self.mutate_store(mutator)?;
@@ -1714,7 +1719,10 @@ impl AccountManager {
         // the no-saved-accounts early return before consuming the caller's
         // iterator; API-key or empty stores must not be loaded, persisted, or
         // drained by account-runtime follower updates.
-        if !self.has_saved_chatgpt_accounts().map_err(AccountRuntimeLoadError::into_io_error)? {
+        if !self
+            .has_saved_chatgpt_accounts()
+            .map_err(AccountRuntimeLoadError::into_io_error)?
+        {
             return Ok(default);
         }
 
@@ -1804,7 +1812,10 @@ impl AccountManager {
         &self,
         request: UsageLimitAutoSwitchRequest<'_>,
     ) -> std::io::Result<AccountRuntimeMutation<Option<String>>> {
-        if !self.has_saved_chatgpt_accounts().map_err(AccountRuntimeLoadError::into_io_error)? {
+        if !self
+            .has_saved_chatgpt_accounts()
+            .map_err(AccountRuntimeLoadError::into_io_error)?
+        {
             // Merge-safety anchor: no saved-account autoswitch must remain a
             // no-op that does not materialize auth.json just to satisfy the
             // active-mutation refresh-token contract.
@@ -1923,6 +1934,33 @@ impl AccountManager {
                 AccountSummary::from_stored(account, active_account_id, lease_state)
             })
             .collect())
+    }
+
+    pub fn active_chatgpt_account_summary(
+        &self,
+    ) -> Result<Option<ActiveChatgptAccountSummary>, AccountRuntimeLoadError> {
+        let loaded = self.load_store_from_storage()?;
+        Ok(Self::active_chatgpt_account_summary_from_store(
+            &loaded.store,
+            loaded.store_origin,
+        ))
+    }
+
+    fn active_chatgpt_account_summary_from_store(
+        store: &AuthStore,
+        store_origin: LoadedStoreOrigin,
+    ) -> Option<ActiveChatgptAccountSummary> {
+        let active_account = store.active_account()?;
+        let auth_mode = match store_origin {
+            LoadedStoreOrigin::Persistent => AuthMode::Chatgpt,
+            LoadedStoreOrigin::ExternalEphemeral => AuthMode::ChatgptAuthTokens,
+        };
+        Some(ActiveChatgptAccountSummary {
+            store_account_id: active_account.id.clone(),
+            label: active_account.label.clone(),
+            email: active_account.tokens.id_token.email.clone(),
+            auth_mode,
+        })
     }
 
     fn reconcile_account_rate_limit_refresh_outcomes_in_store(

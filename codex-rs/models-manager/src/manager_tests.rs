@@ -417,7 +417,10 @@ async fn refresh_available_models_sorts_by_priority() {
     let cached_remote = manager.get_remote_models().await;
     assert_models_contain(&cached_remote, &remote_models);
 
-    let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await.expect("list models");
+    let available = manager
+        .list_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("list models");
     let high_idx = available
         .iter()
         .position(|model| model.model == "priority-high")
@@ -735,11 +738,14 @@ async fn refresh_available_models_skips_network_without_chatgpt_auth() {
     .await;
 
     let codex_home = tempdir().expect("temp dir");
-    let auth_manager = Arc::new(AuthManager::new(
-        codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-    ));
+    let auth_manager = Arc::new(
+        AuthManager::new(
+            codex_home.path().to_path_buf(),
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("create auth manager"),
+    );
     let provider = provider_for(server.uri());
     let manager = ModelsManager::with_provider_for_tests(
         codex_home.path().to_path_buf(),
@@ -788,11 +794,14 @@ async fn refresh_available_models_uses_network_with_external_chatgpt_tokens() {
         AuthCredentialsStoreMode::Ephemeral,
     )
     .expect("save external ChatGPT token auth store");
-    let auth_manager = Arc::new(AuthManager::new(
-        codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-    ));
+    let auth_manager = Arc::new(
+        AuthManager::new(
+            codex_home.path().to_path_buf(),
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("create auth manager"),
+    );
     let provider = provider_for(server.uri());
     let manager = ModelsManager::with_provider_for_tests(
         codex_home.path().to_path_buf(),
@@ -936,7 +945,8 @@ fn build_available_models_picks_default_after_hiding_hidden_models() {
     let mut expected_visible = ModelPreset::from(visible_model.clone());
     expected_visible.is_default = true;
 
-    let available = manager.build_available_models(vec![hidden_model, visible_model]);
+    let available =
+        manager.build_available_models(vec![hidden_model, visible_model], Some(AuthMode::ApiKey));
 
     assert_eq!(available, vec![expected_hidden, expected_visible]);
 }
@@ -950,11 +960,14 @@ fn build_available_models_keeps_chatgpt_only_models_for_external_chatgpt_tokens(
         AuthCredentialsStoreMode::Ephemeral,
     )
     .expect("save external ChatGPT token auth store");
-    let auth_manager = Arc::new(AuthManager::new(
-        codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-    ));
+    let auth_manager = Arc::new(
+        AuthManager::new(
+            codex_home.path().to_path_buf(),
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+        )
+        .expect("create auth manager"),
+    );
     let provider = provider_for("http://example.test".to_string());
     let manager = ModelsManager::with_provider_for_tests(
         codex_home.path().to_path_buf(),
@@ -968,7 +981,10 @@ fn build_available_models_keeps_chatgpt_only_models_for_external_chatgpt_tokens(
     };
     let api_model = remote_model("api-model", "API Model", /*priority*/ 2);
 
-    let available = manager.build_available_models(vec![chatgpt_only_model.clone(), api_model]);
+    let available = manager.build_available_models(
+        vec![chatgpt_only_model.clone(), api_model],
+        Some(AuthMode::ChatgptAuthTokens),
+    );
 
     assert!(
         available

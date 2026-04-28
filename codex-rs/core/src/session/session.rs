@@ -370,11 +370,8 @@ impl Session {
         ));
 
         // Join all independent futures.
-        let (
-            rollout_recorder_and_state_db,
-            (history_log_id, history_entry_count),
-            auth_and_mcp,
-        ) = tokio::join!(rollout_fut, history_meta_fut, auth_and_mcp_fut);
+        let (rollout_recorder_and_state_db, (history_log_id, history_entry_count), auth_and_mcp) =
+            tokio::join!(rollout_fut, history_meta_fut, auth_and_mcp_fut);
         let (auth, request_auth, mcp_servers, auth_statuses) = auth_and_mcp?;
 
         let (rollout_recorder, state_db_ctx) = rollout_recorder_and_state_db.map_err(|e| {

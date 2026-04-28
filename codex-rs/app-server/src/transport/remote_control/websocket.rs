@@ -1070,7 +1070,8 @@ mod tests {
             codex_home.path().to_path_buf(),
             /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
-        );
+        )
+        .expect("auth manager should load");
         let mut auth_recovery = auth_manager.unauthorized_recovery();
         let mut enrollment = Some(RemoteControlEnrollment {
             account_id: "account_id".to_string(),
@@ -1116,6 +1117,7 @@ mod tests {
                 .auth()
                 .await
                 .expect("auth should remain available")
+                .expect("ChatGPT auth should remain available")
                 .get_token()
                 .expect("token should be readable"),
             "fresh-token"
@@ -1151,7 +1153,8 @@ mod tests {
             codex_home.path().to_path_buf(),
             /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
-        );
+        )
+        .expect("auth manager should load");
         let mut auth_recovery = auth_manager.unauthorized_recovery();
         let mut enrollment = None;
         save_auth(
@@ -1185,6 +1188,7 @@ mod tests {
                 .auth()
                 .await
                 .expect("auth should remain available")
+                .expect("ChatGPT auth should remain available")
                 .get_token()
                 .expect("token should be readable"),
             "fresh-token"

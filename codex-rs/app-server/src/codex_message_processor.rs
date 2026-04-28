@@ -680,15 +680,18 @@ impl CodexMessageProcessor {
         self.thread_manager.skills_manager().clear_cache();
     }
 
-    fn current_account_updated_notification(&self) -> AccountUpdatedNotificationState {
+    fn current_account_updated_notification(&self) -> Option<AccountUpdatedNotificationState> {
         Self::account_updated_notification_from_auth_manager(self.auth_manager.as_ref())
     }
 
     async fn send_account_updated_notification_if_changed(
         outgoing: &OutgoingMessageSender,
         last_sent_account_updated_notification: &Mutex<Option<AccountUpdatedNotificationState>>,
-        payload: AccountUpdatedNotificationState,
+        payload: Option<AccountUpdatedNotificationState>,
     ) {
+        let Some(payload) = payload else {
+            return;
+        };
         let mut last_sent = last_sent_account_updated_notification.lock().await;
         if last_sent.as_ref() == Some(&payload) {
             return;
@@ -747,7 +750,7 @@ impl CodexMessageProcessor {
 
     fn account_updated_notification_from_auth_manager(
         auth_manager: &AuthManager,
-    ) -> AccountUpdatedNotificationState {
+    ) -> Option<AccountUpdatedNotificationState> {
         let auth = match auth_manager.current_auth_from_storage() {
             Ok(auth) => auth,
             Err(error) => {
@@ -755,13 +758,23 @@ impl CodexMessageProcessor {
                     error = %error,
                     "failed to load account notification auth state"
                 );
-                None
+                return None;
             }
         };
-        let active_chatgpt_account_summary = auth
-            .as_ref()
-            .and_then(CodexAuth::active_chatgpt_account_summary);
-        AccountUpdatedNotificationState {
+        let active_chatgpt_account_summary = match auth_manager
+            .account_manager()
+            .active_chatgpt_account_summary()
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to load account notification active account state"
+                );
+                return None;
+            }
+        };
+        Some(AccountUpdatedNotificationState {
             notification: AccountUpdatedNotification {
                 auth_mode: auth.as_ref().map(CodexAuth::api_auth_mode),
                 label: active_chatgpt_account_summary
@@ -775,7 +788,7 @@ impl CodexMessageProcessor {
             account_email: active_chatgpt_account_summary
                 .as_ref()
                 .and_then(|summary| summary.email.clone()),
-        }
+        })
     }
 
     fn finalize_chatgpt_login_success(
@@ -854,9 +867,9 @@ impl CodexMessageProcessor {
             auth_manager,
             thread_manager,
             outgoing: outgoing.clone(),
-            last_sent_account_updated_notification: Arc::new(Mutex::new(Some(
+            last_sent_account_updated_notification: Arc::new(Mutex::new(
                 initial_account_updated_notification,
-            ))),
+            )),
             analytics_events_client,
             arg0_paths,
             thread_store: LocalThreadStore::new(codex_rollout::RolloutConfig::from_view(&config)),
@@ -1455,11 +1468,13 @@ impl CodexMessageProcessor {
             self.config.cli_auth_credentials_store_mode,
         ) {
             Ok(()) => {
-                self.auth_manager.reload().map_err(|err| JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!("failed to reload auth after API key login: {err}"),
-                    data: None,
-                })?;
+                self.auth_manager
+                    .reload()
+                    .map_err(|err| JSONRPCErrorError {
+                        code: INTERNAL_ERROR_CODE,
+                        message: format!("failed to reload auth after API key login: {err}"),
+                        data: None,
+                    })?;
                 Ok(())
             }
             Err(err) => Err(JSONRPCErrorError {
@@ -2090,7 +2105,9 @@ impl CodexMessageProcessor {
                     if let Err(err) = self.auth_manager.refresh_token_from_authority().await {
                         let error = JSONRPCErrorError {
                             code: INTERNAL_ERROR_CODE,
-                            message: format!("failed to refresh token while getting account: {err}"),
+                            message: format!(
+                                "failed to refresh token while getting account: {err}"
+                            ),
                             data: None,
                         };
                         self.outgoing.send_error(request_id, error).await;
@@ -2134,9 +2151,26 @@ impl CodexMessageProcessor {
                 return;
             }
         };
-        let active_chatgpt_summary = auth
-            .as_ref()
-            .and_then(CodexAuth::active_chatgpt_account_summary);
+        let active_chatgpt_summary = match self
+            .auth_manager
+            .account_manager()
+            .active_chatgpt_account_summary()
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                self.outgoing
+                    .send_error(
+                        request_id,
+                        JSONRPCErrorError {
+                            code: INTERNAL_ERROR_CODE,
+                            message: format!("failed to load active account summary: {error}"),
+                            data: None,
+                        },
+                    )
+                    .await;
+                return;
+            }
+        };
         let active_chatgpt_store_account_id = active_chatgpt_summary
             .as_ref()
             .map(|summary| summary.store_account_id.clone());
@@ -2227,7 +2261,10 @@ impl CodexMessageProcessor {
             }
         };
         let response = AccountListResponse {
-            accounts: accounts.into_iter().map(account_list_entry_from_summary).collect(),
+            accounts: accounts
+                .into_iter()
+                .map(account_list_entry_from_summary)
+                .collect(),
         };
         self.outgoing.send_response(request_id, response).await;
     }
@@ -2356,16 +2393,15 @@ impl CodexMessageProcessor {
             });
         };
 
-        let client =
-            BackendClient::from_chatgpt_request_auth(
-                self.config.chatgpt_base_url.clone(),
-                auth.request_auth(),
-            )
-            .map_err(|err| JSONRPCErrorError {
-                code: INTERNAL_ERROR_CODE,
-                message: format!("failed to construct backend client: {err}"),
-                data: None,
-            })?;
+        let client = BackendClient::from_chatgpt_request_auth(
+            self.config.chatgpt_base_url.clone(),
+            auth.request_auth(),
+        )
+        .map_err(|err| JSONRPCErrorError {
+            code: INTERNAL_ERROR_CODE,
+            message: format!("failed to construct backend client: {err}"),
+            data: None,
+        })?;
 
         match client
             .send_add_credits_nudge_email(Self::backend_credit_type(params.credit_type))
@@ -2416,16 +2452,15 @@ impl CodexMessageProcessor {
             });
         };
 
-        let client =
-            BackendClient::from_chatgpt_request_auth(
-                self.config.chatgpt_base_url.clone(),
-                auth.request_auth(),
-            )
-            .map_err(|err| JSONRPCErrorError {
-                code: INTERNAL_ERROR_CODE,
-                message: format!("failed to construct backend client: {err}"),
-                data: None,
-            })?;
+        let client = BackendClient::from_chatgpt_request_auth(
+            self.config.chatgpt_base_url.clone(),
+            auth.request_auth(),
+        )
+        .map_err(|err| JSONRPCErrorError {
+            code: INTERNAL_ERROR_CODE,
+            message: format!("failed to construct backend client: {err}"),
+            data: None,
+        })?;
 
         let snapshots = client
             .get_rate_limits_many()
@@ -6717,7 +6752,9 @@ impl CodexMessageProcessor {
                             request_id,
                             JSONRPCErrorError {
                                 code: INTERNAL_ERROR_CODE,
-                                message: format!("failed to load ChatGPT auth for apps list: {error}"),
+                                message: format!(
+                                    "failed to load ChatGPT auth for apps list: {error}"
+                                ),
                                 data: None,
                             },
                         )
@@ -7530,19 +7567,21 @@ impl CodexMessageProcessor {
                 }
 
                 let plugin_apps = load_plugin_apps(result.installed_path.as_path()).await;
-                let auth_snapshot =
-                    match connectors::load_connector_auth_snapshot(self.auth_manager.as_ref()).await
-                    {
-                        Ok(auth_snapshot) => auth_snapshot,
-                        Err(error) => {
-                            warn!(
-                                plugin = result.plugin_id.as_key(),
-                                error = %error,
-                                "failed to load connector auth after plugin install"
-                            );
-                            None
-                        }
-                    };
+                let auth_snapshot = match connectors::load_connector_auth_snapshot(
+                    self.auth_manager.as_ref(),
+                )
+                .await
+                {
+                    Ok(auth_snapshot) => auth_snapshot,
+                    Err(error) => {
+                        warn!(
+                            plugin = result.plugin_id.as_key(),
+                            error = %error,
+                            "failed to load connector auth after plugin install"
+                        );
+                        None
+                    }
+                };
                 let apps_needing_auth = if plugin_apps.is_empty()
                     || !config
                         .features
@@ -11236,7 +11275,7 @@ mod tests {
             codex_home.path().to_path_buf(),
             /*enable_codex_api_key_env*/ false,
             codex_config::types::AuthCredentialsStoreMode::File,
-        ));
+        )?);
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/backend-api/wham/config/requirements"))

@@ -259,9 +259,11 @@ async fn chatgpt_request_auth_serializes_stale_refresh() -> Result<()> {
     );
 
     for snapshot in [
-        (first.context("first request auth snapshot should resolve")?
+        (first
+            .context("first request auth snapshot should resolve")?
             .context("first request auth snapshot should exist")?),
-        (second.context("second request auth snapshot should resolve")?
+        (second
+            .context("second request auth snapshot should resolve")?
             .context("second request auth snapshot should exist")?),
     ] {
         assert_eq!(snapshot.authorization(), "Bearer new-access-token");

@@ -52,6 +52,10 @@ use tokio::time::timeout;
 use wiremock::BodyPrintLimit;
 use wiremock::MockServer;
 
+// Merge-safety anchor: remote model tests must keep model catalog refreshes
+// behind ModelsManager so auth-aware cache and picker visibility contracts stay
+// aligned.
+
 const REMOTE_MODEL_SLUG: &str = "codex-test";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -104,7 +108,10 @@ async fn remote_models_get_model_info_uses_longest_matching_prefix() -> Result<(
         provider,
     );
 
-    manager.list_models(RefreshStrategy::OnlineIfUncached).await.expect("list models");
+    manager
+        .list_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("list models");
 
     let model_info = manager
         .get_model_info("gpt-5.3-codex-test", &config.to_models_manager_config())
@@ -905,7 +912,10 @@ async fn remote_models_do_not_append_removed_builtin_presets() -> Result<()> {
         provider,
     );
 
-    let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await.expect("list models");
+    let available = manager
+        .list_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("list models");
     let remote = available
         .iter()
         .find(|model| model.model == "remote-alpha")
@@ -966,7 +976,10 @@ async fn remote_models_merge_adds_new_high_priority_first() -> Result<()> {
         provider,
     );
 
-    let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await.expect("list models");
+    let available = manager
+        .list_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("list models");
     assert_eq!(
         available.first().map(|model| model.model.as_str()),
         Some("remote-top")
@@ -1013,7 +1026,10 @@ async fn remote_models_merge_replaces_overlapping_model() -> Result<()> {
         provider,
     );
 
-    let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await.expect("list models");
+    let available = manager
+        .list_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("list models");
     let overridden = available
         .iter()
         .find(|model| model.model == slug)
@@ -1057,7 +1073,10 @@ async fn remote_models_merge_preserves_bundled_models_on_empty_response() -> Res
         provider,
     );
 
-    let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await.expect("list models");
+    let available = manager
+        .list_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("list models");
     let bundled_slug = bundled_model_slug();
     assert!(
         available.iter().any(|model| model.model == bundled_slug),
@@ -1104,7 +1123,8 @@ async fn remote_models_request_times_out_after_5s() -> Result<()> {
         Duration::from_secs(7),
         manager.get_default_model(&None, RefreshStrategy::OnlineIfUncached),
     )
-    .await.expect("get default model");
+    .await
+    .expect("get default model");
     let elapsed = start.elapsed();
     // get_model should return a default model even when refresh times out
     let default_model = model.expect("get_model should finish and return default model");
@@ -1171,10 +1191,14 @@ async fn remote_models_hide_picker_only_models() -> Result<()> {
 
     let selected = manager
         .get_default_model(&None, RefreshStrategy::OnlineIfUncached)
-        .await.expect("get default model");
+        .await
+        .expect("get default model");
     assert_eq!(selected, bundled_default_model_slug());
 
-    let available = manager.list_models(RefreshStrategy::OnlineIfUncached).await.expect("list models");
+    let available = manager
+        .list_models(RefreshStrategy::OnlineIfUncached)
+        .await
+        .expect("list models");
     let hidden = available
         .iter()
         .find(|model| model.model == "codex-auto-balanced")
@@ -1195,7 +1219,10 @@ async fn wait_for_model_available(manager: &Arc<ModelsManager>, slug: &str) -> M
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         if let Some(model) = {
-            let guard = manager.list_models(RefreshStrategy::OnlineIfUncached).await.expect("list models");
+            let guard = manager
+                .list_models(RefreshStrategy::OnlineIfUncached)
+                .await
+                .expect("list models");
             guard.iter().find(|model| model.model == slug).cloned()
         } {
             return model;
