@@ -384,6 +384,16 @@ impl RefreshTokenError {
             Self::Transient(_) => None,
         }
     }
+
+    pub fn is_account_runtime_load_error(&self) -> bool {
+        match self {
+            Self::Permanent(_) => false,
+            Self::Transient(error) => error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<AccountRuntimeLoadError>())
+                .is_some(),
+        }
+    }
 }
 
 fn open_account_state_store(sqlite_home: &Path) -> AccountStateStore {

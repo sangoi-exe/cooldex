@@ -1228,8 +1228,8 @@ pub(crate) async fn refresh_accounts_rate_limits_before_auto_switch(
         }
     };
     // Merge-safety anchor: usage-limit autoswitch may only restrict fallback
-    // selection with a known fresh roster; owner/lease read failures must surface
-    // instead of becoming an empty fresh-candidate set.
+    // selection with known fresh roster/auth owner state; owner/lease/runtime
+    // failures must surface instead of becoming empty or no-usable snapshot truth.
     let account_ids = auto_switch_refresh_account_ids_from_roster(refresh_roster)?;
     if account_ids.is_empty() {
         return Ok(AutoSwitchRefreshState::default());
@@ -1257,6 +1257,9 @@ pub(crate) async fn refresh_accounts_rate_limits_before_auto_switch(
                 continue;
             }
             Ok(ChatgptAccountAuthResolution::Missing) => continue,
+            Err(err) if err.is_account_runtime_load_error() => {
+                return Err(CodexErr::Io(err.into()));
+            }
             Err(err) => {
                 debug!(
                     store_account_id = %store_account_id,
@@ -1302,6 +1305,9 @@ pub(crate) async fn refresh_accounts_rate_limits_before_auto_switch(
                         continue;
                     }
                     Ok(ChatgptAccountAuthResolution::Missing) => continue,
+                    Err(err) if err.is_account_runtime_load_error() => {
+                        return Err(CodexErr::Io(err.into()));
+                    }
                     Err(err) => {
                         debug!(
                             store_account_id = %store_account_id,

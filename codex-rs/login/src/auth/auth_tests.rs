@@ -36,6 +36,23 @@ use tokio::time::timeout;
 // Merge-safety anchor: auth tests must exercise the AuthStore-backed persistence surface
 // and current constructor paths rather than removed legacy-only helpers.
 
+#[test]
+fn refresh_token_error_identifies_account_runtime_load_errors() {
+    let runtime_error = RefreshTokenError::Transient(
+        AccountRuntimeLoadError::LeaseStateRead("database is locked".to_string()).into_io_error(),
+    );
+    assert!(runtime_error.is_account_runtime_load_error());
+
+    let ordinary_transient = RefreshTokenError::Transient(std::io::Error::other("network failure"));
+    assert!(!ordinary_transient.is_account_runtime_load_error());
+
+    let permanent_error = RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+        RefreshTokenFailedReason::Exhausted,
+        "refresh token exhausted",
+    ));
+    assert!(!permanent_error.is_account_runtime_load_error());
+}
+
 fn current_active_chatgpt_store_account_id(manager: &AuthManager) -> Option<String> {
     manager
         .current_auth_from_storage()
