@@ -602,6 +602,112 @@ fn public_auto_switch_selector_reads_live_storage_and_sqlite_usage_truth() {
     );
 }
 
+// Merge-safety anchor: manual `/accounts` mutations and target-thread request
+// auth may use different AuthManager runtime ids for the same Codex session;
+// they must converge through AccountManager/account-state, not auth.json order.
+#[tokio::test]
+async fn linked_auth_managers_adopt_manual_set_active_before_request_auth() {
+    let codex_home = tempdir().expect("create auth tempdir");
+    let sqlite_home = tempdir().expect("create sqlite tempdir");
+    let linked_codex_session_id = "thread-session-1".to_string();
+    let primary_store_account_id = "store-account-a";
+    let secondary_store_account_id = "store-account-b";
+    let primary_workspace_id = "workspace-a";
+    let secondary_workspace_id = "workspace-b";
+    let make_account = |store_account_id: &str, workspace_id: &str, label: &str| StoredAccount {
+        id: store_account_id.to_string(),
+        label: Some(label.to_string()),
+        tokens: TokenData {
+            id_token: IdTokenInfo {
+                email: Some(format!("{store_account_id}@example.com")),
+                chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Plus)),
+                chatgpt_user_id: Some(format!("user-{store_account_id}")),
+                chatgpt_account_id: Some(workspace_id.to_string()),
+                chatgpt_account_is_fedramp: false,
+                raw_jwt: fake_jwt_for_auth_file_params(&AuthFileParams {
+                    openai_api_key: None,
+                    chatgpt_plan_type: Some("plus".to_string()),
+                    chatgpt_account_id: Some(workspace_id.to_string()),
+                })
+                .expect("create test jwt"),
+            },
+            access_token: format!("{store_account_id}-access-token"),
+            refresh_token: format!("{store_account_id}-refresh-token"),
+            account_id: Some(workspace_id.to_string()),
+        },
+        last_refresh: Some(Utc::now()),
+        usage: None,
+    };
+    save_auth(
+        codex_home.path(),
+        &AuthStore {
+            active_account_id: Some(primary_store_account_id.to_string()),
+            accounts: vec![
+                make_account(primary_store_account_id, primary_workspace_id, "Primary"),
+                make_account(
+                    secondary_store_account_id,
+                    secondary_workspace_id,
+                    "Secondary",
+                ),
+            ],
+            ..AuthStore::default()
+        },
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("save linked auth store");
+
+    let target_manager = AuthManager::shared_with_sqlite_home_workspace_and_linked_session(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*forced_chatgpt_workspace_id*/ None,
+        Some(linked_codex_session_id.clone()),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("create target thread auth manager");
+    assert_eq!(
+        current_active_chatgpt_store_account_id(target_manager.as_ref()),
+        Some(primary_store_account_id.to_string())
+    );
+
+    let app_manager = AuthManager::shared_with_sqlite_home_workspace_and_linked_session(
+        codex_home.path().to_path_buf(),
+        sqlite_home.path().to_path_buf(),
+        /*forced_chatgpt_workspace_id*/ None,
+        Some(linked_codex_session_id),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("create app-server auth manager");
+    let mutation = app_manager
+        .account_manager()
+        .set_active_account(secondary_store_account_id)
+        .expect("manual set-active should succeed");
+    app_manager.refresh_auth_after_account_runtime_mutation(mutation);
+    assert_eq!(
+        current_active_chatgpt_store_account_id(app_manager.as_ref()),
+        Some(secondary_store_account_id.to_string())
+    );
+
+    let resolved_auth = target_manager
+        .auth()
+        .await
+        .expect("target auth should load")
+        .expect("target auth should exist");
+    assert_eq!(
+        resolved_auth
+            .active_chatgpt_account_summary()
+            .map(|summary| summary.store_account_id),
+        Some(secondary_store_account_id.to_string())
+    );
+    let request_auth = target_manager
+        .chatgpt_request_auth()
+        .await
+        .expect("target request auth should materialize")
+        .expect("target request auth should exist");
+    assert_eq!(request_auth.account_id(), secondary_workspace_id);
+}
+
 // Merge-safety anchor: lease read failures during auto-switch selection are
 // account-runtime owner errors, not false no-candidate outcomes.
 #[test]

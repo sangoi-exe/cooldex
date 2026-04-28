@@ -258,7 +258,30 @@ ON CONFLICT(account_id) DO UPDATE SET
         let mut connection = self.lock_connection()?;
         let transaction = connection.transaction()?;
         let now_epoch = now.timestamp();
-        let Some(account_id) = load_session_active_account_id(&transaction, session_id)? else {
+        let account_id = match load_session_active_account_id(&transaction, session_id)? {
+            Some(account_id) => Some(account_id),
+            None => match codex_session_id {
+                // Merge-safety anchor: linked AccountManagers for one Codex
+                // thread may rotate process-local runtime ids, so refresh must
+                // deterministically adopt the latest logical-session row before
+                // AccountManager bootstraps a saved account from auth-store order.
+                Some(codex_session_id) => transaction
+                    .query_row(
+                        r#"
+SELECT account_id
+FROM session_active_account
+WHERE codex_session_id = ?
+ORDER BY updated_at DESC, session_id DESC
+LIMIT 1
+                        "#,
+                        [codex_session_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?,
+                None => None,
+            },
+        };
+        let Some(account_id) = account_id else {
             transaction.commit()?;
             return Ok(SessionActiveAccountRefresh::None);
         };
@@ -714,6 +737,7 @@ mod tests {
             secondary: None,
             credits: None,
             plan_type: None,
+            rate_limit_reached_type: None,
         }
     }
 
@@ -1082,8 +1106,24 @@ ORDER BY account_id
                     now + chrono::Duration::seconds(2),
                     300,
                 )
-                .expect("collapsed runtime row should stay gone"),
-            SessionActiveAccountRefresh::None
+                .expect("collapsed runtime row should adopt logical session account"),
+            SessionActiveAccountRefresh::Active("account-a".to_string())
+        );
+        assert_eq!(
+            load_session_active_rows(&store),
+            vec![SessionActiveAccountRow {
+                session_id: "runtime-a".to_string(),
+                account_id: "account-a".to_string(),
+                codex_session_id: Some("codex-session-1".to_string()),
+            }]
+        );
+        assert_eq!(
+            load_account_lease_rows(&store),
+            vec![AccountLeaseRow {
+                account_id: "account-a".to_string(),
+                session_id: "runtime-a".to_string(),
+                codex_session_id: Some("codex-session-1".to_string()),
+            }]
         );
         assert!(
             !store
@@ -1094,6 +1134,102 @@ ORDER BY account_id
                     now + chrono::Duration::seconds(3),
                 )
                 .expect("reclaimed lease should stay local"),
+        );
+    }
+
+    #[test]
+    fn newest_logical_session_active_row_is_adopted_deterministically() {
+        let sqlite_home = TempDir::new().expect("tempdir");
+        let store = AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open store");
+        let now = fixed_now();
+        {
+            let connection = store.lock_connection().expect("lock connection");
+            upsert_session_active_account(
+                &connection,
+                "runtime-a",
+                "account-a",
+                Some("codex-session-1"),
+                now.timestamp(),
+            )
+            .expect("seed older logical session row");
+            upsert_session_active_account(
+                &connection,
+                "runtime-b",
+                "account-b",
+                Some("codex-session-1"),
+                (now + chrono::Duration::seconds(1)).timestamp(),
+            )
+            .expect("seed newest logical session row");
+        }
+
+        assert_eq!(
+            store
+                .refresh_session_active_account(
+                    "runtime-c",
+                    Some("codex-session-1"),
+                    now + chrono::Duration::seconds(2),
+                    300,
+                )
+                .expect("refresh should adopt newest logical row"),
+            SessionActiveAccountRefresh::Active("account-b".to_string())
+        );
+        assert_eq!(
+            load_session_active_rows(&store),
+            vec![SessionActiveAccountRow {
+                session_id: "runtime-c".to_string(),
+                account_id: "account-b".to_string(),
+                codex_session_id: Some("codex-session-1".to_string()),
+            }]
+        );
+        assert_eq!(
+            load_account_lease_rows(&store),
+            vec![AccountLeaseRow {
+                account_id: "account-b".to_string(),
+                session_id: "runtime-c".to_string(),
+                codex_session_id: Some("codex-session-1".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn refresh_does_not_adopt_unrelated_or_threadless_runtime_rows() {
+        let sqlite_home = TempDir::new().expect("tempdir");
+        let store = AccountStateStore::open(sqlite_home.path().to_path_buf()).expect("open store");
+        let now = fixed_now();
+
+        store
+            .set_session_active_account("runtime-a", Some("codex-session-1"), "account-a", now, 300)
+            .expect("assign linked runtime");
+
+        assert_eq!(
+            store
+                .refresh_session_active_account(
+                    "runtime-b",
+                    Some("codex-session-2"),
+                    now + chrono::Duration::seconds(1),
+                    300,
+                )
+                .expect("unrelated linked runtime should not adopt"),
+            SessionActiveAccountRefresh::None
+        );
+        assert_eq!(
+            store
+                .refresh_session_active_account(
+                    "runtime-c",
+                    None,
+                    now + chrono::Duration::seconds(2),
+                    300,
+                )
+                .expect("threadless runtime should not adopt"),
+            SessionActiveAccountRefresh::None
+        );
+        assert_eq!(
+            load_session_active_rows(&store),
+            vec![SessionActiveAccountRow {
+                session_id: "runtime-a".to_string(),
+                account_id: "account-a".to_string(),
+                codex_session_id: Some("codex-session-1".to_string()),
+            }]
         );
     }
 
