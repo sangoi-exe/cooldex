@@ -7,7 +7,8 @@ use serde_json::json;
 use std::collections::BTreeMap;
 
 // Merge-safety anchor: legacy spawn_agent v1 exported metadata must stay aligned with the
-// active profile-based runtime contract; do not reintroduce dead model/reasoning overrides.
+// active profile-based runtime contract; do not reintroduce dead model/reasoning overrides,
+// hardcoded spawn-authorization gates, or default worker write-owner policy.
 
 #[derive(Debug, Clone)]
 pub struct SpawnAgentToolOptions<'a> {
@@ -16,6 +17,12 @@ pub struct SpawnAgentToolOptions<'a> {
     pub hide_agent_type_model_reasoning: bool,
     pub include_usage_hint: bool,
     pub usage_hint_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnAgentModelSelection {
+    ProfileOnly,
+    DirectOverrides,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,8 +35,12 @@ pub struct WaitAgentTimeoutOptions {
 pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions<'_>) -> ToolSpec {
     let return_value_description =
         "Returns the spawned agent id plus the user-facing nickname when available.";
-    let available_models_description = (!options.hide_agent_type_model_reasoning)
-        .then(|| spawn_agent_models_description(options.available_models));
+    let available_models_description = (!options.hide_agent_type_model_reasoning).then(|| {
+        spawn_agent_models_description(
+            options.available_models,
+            SpawnAgentModelSelection::ProfileOnly,
+        )
+    });
     let mut properties = spawn_agent_common_properties_v1(&options.agent_type_description);
     if options.hide_agent_type_model_reasoning {
         hide_spawn_agent_metadata_options_v1(&mut properties);
@@ -51,8 +62,12 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions<'_>) -> ToolSpe
 }
 
 pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions<'_>) -> ToolSpec {
-    let available_models_description = (!options.hide_agent_type_model_reasoning)
-        .then(|| spawn_agent_models_description(options.available_models));
+    let available_models_description = (!options.hide_agent_type_model_reasoning).then(|| {
+        spawn_agent_models_description(
+            options.available_models,
+            SpawnAgentModelSelection::DirectOverrides,
+        )
+    });
     let mut properties = spawn_agent_common_properties_v2(&options.agent_type_description);
     if options.hide_agent_type_model_reasoning {
         hide_spawn_agent_metadata_options_v2(&mut properties);
@@ -635,49 +650,7 @@ fn spawn_agent_tool_description(
 {usage_hint_text}"#
         );
     }
-    let agent_role_usage_hint = available_models_description
-        .map(|_| {
-            "Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself."
-        })
-        .unwrap_or_default();
-    format!(
-        r#"
-        {tool_description}
-This spawn_agent tool provides you access to smaller but more efficient sub-agents. A mini model can solve many tasks faster than the main model. You should follow the rules and guidelines below to use this tool.
-
-Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work.
-Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.
-{agent_role_usage_hint}
-
-### When to delegate vs. do the subtask yourself
-- First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers on the critical path, and which tasks are sidecar tasks that are needed but can run in parallel without blocking the next local step. As part of that plan, explicitly decide what immediate task you should do locally right now. Do this planning step before delegating to agents so you do not hand off the immediate blocking task to a submodel and then waste time waiting on it.
-- Use the smaller subagent when a subtask is easy enough for it to handle and can run in parallel with your local work. Prefer delegating concrete, bounded sidecar tasks that materially advance the main task without blocking your immediate next local step.
-- Do not delegate urgent blocking work when your immediate next step depends on that result. If the very next action is blocked on that task, the main rollout should usually do it locally to keep the critical path moving.
-- Keep work local when the subtask is too difficult to delegate well and when it is tightly coupled, urgent, or likely to block your immediate next step.
-
-### Designing delegated subtasks
-- Subtasks must be concrete, well-defined, and self-contained.
-- Delegated subtasks must materially advance the main task.
-- Do not duplicate work between the main rollout and delegated subtasks.
-- Avoid issuing multiple delegate calls on the same unresolved thread unless the new delegated task is genuinely different and necessary.
-- Narrow the delegated ask to the concrete output you need next.
-- For coding tasks, prefer delegating concrete code-change worker subtasks over read-only explorer analysis when the subagent can make a bounded patch in a clear write scope.
-- When delegating coding work, instruct the submodel to edit files directly in its forked workspace and list the file paths it changed in the final answer.
-- For code-edit subtasks, decompose work so each delegated task has a disjoint write set.
-
-### After you delegate
-- Call wait_agent very sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns.
-- Do not redo delegated subagent tasks yourself; focus on integrating results or tackling non-overlapping work.
-- While the subagent is running in the background, do meaningful non-overlapping work immediately.
-- Do not repeatedly wait by reflex.
-- When a delegated coding task returns, quickly review the uploaded changes, then integrate or refine them.
-
-### Parallel delegation patterns
-- Run multiple independent information-seeking subtasks in parallel when you have distinct questions that can be answered independently.
-- Split implementation into disjoint codebase slices and spawn multiple agents for them in parallel when the write scopes do not overlap.
-- Delegate verification only when it can run in parallel with ongoing implementation and is likely to catch a concrete risk before final integration.
-- The key is to find opportunities to spawn multiple independent subtasks in parallel within the same round, while ensuring each subtask is well-defined, self-contained, and materially advances the main task."#
-    )
+    tool_description
 }
 
 fn spawn_agent_tool_description_v2(
@@ -710,14 +683,17 @@ The new agent's canonical task name will be provided to it along with the messag
     tool_description
 }
 
-fn spawn_agent_models_description(models: &[ModelPreset]) -> String {
+fn spawn_agent_models_description(
+    models: &[ModelPreset],
+    selection: SpawnAgentModelSelection,
+) -> String {
     let visible_models: Vec<&ModelPreset> =
         models.iter().filter(|model| model.show_in_picker).collect();
     if visible_models.is_empty() {
         return "No picker-visible models are currently loaded.".to_string();
     }
 
-    visible_models
+    let model_lines = visible_models
         .into_iter()
         .map(|model| {
             let efforts = model
@@ -736,7 +712,18 @@ fn spawn_agent_models_description(models: &[ModelPreset]) -> String {
             )
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+
+    let selection_text = match selection {
+        SpawnAgentModelSelection::ProfileOnly => {
+            "The model catalog below is informational only; legacy `spawn_agent` does not accept direct `model` or `reasoning_effort` arguments.\nUse `profile` when you need alternate child settings; otherwise the child inherits the lead's live model and reasoning."
+        }
+        SpawnAgentModelSelection::DirectOverrides => {
+            "The model catalog below is informational; use the `model` and `reasoning_effort` arguments when you need direct child overrides.\nOmit them to inherit the lead's live model and reasoning."
+        }
+    };
+
+    format!("### Informational model catalog\n{selection_text}\n{model_lines}")
 }
 
 fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema {

@@ -343,6 +343,7 @@ fn test_build_specs_multi_agent_v1_uses_ids_and_wait_conditions() {
         model_info: &model_info,
         available_models: &available_models,
         features: &features,
+        image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
         sandbox_policy: &SandboxPolicy::DangerFullAccess,

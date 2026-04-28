@@ -353,6 +353,9 @@ pub(crate) mod spawn_tool_spec {
 mod built_in {
     use super::*;
 
+    // Merge-safety anchor: built-in role metadata is generic fallback guidance; do not
+    // reintroduce authoritative explorer trust or default worker write-owner policy.
+
     /// Returns the cached built-in role declarations defined in this module.
     pub(super) fn configs() -> &'static BTreeMap<String, AgentRoleConfig> {
         static CONFIG: LazyLock<BTreeMap<String, AgentRoleConfig>> = LazyLock::new(|| {
@@ -368,13 +371,12 @@ mod built_in {
                 (
                     "explorer".to_string(),
                     AgentRoleConfig {
-                        description: Some(r#"Use `explorer` for specific codebase questions.
-Explorers are fast and authoritative.
-They must be used to ask specific, well-scoped questions on the codebase.
-Rules:
-- In order to avoid redundant work, you should avoid exploring the same problem that explorers have already covered. Typically, you should trust the explorer results without additional verification. You are still allowed to inspect the code yourself to gain the needed context!
-- You are encouraged to spawn up multiple explorers in parallel when you have multiple distinct questions to ask about the codebase that can be answered independently. This allows you to get more information faster without waiting for one question to finish before asking the next. While waiting for the explorer results, you can continue working on other local tasks that do not depend on those results. This parallelism is a key advantage of delegation, so use it whenever you have multiple questions to ask.
-- Reuse existing explorers for related questions."#.to_string()),
+                        description: Some(r#"Built-in generic fallback for specific, bounded codebase questions when no configured specialist role fits.
+Default posture:
+- Keep explorer tasks read-only and evidence-seeking.
+- Treat results as advisory claims; verify important conclusions against source artifacts before relying on them.
+- Use multiple explorers only for independent questions that can run in parallel without blocking your immediate next step.
+- Reuse an existing explorer for related follow-up questions."#.to_string()),
                         config_file: Some("explorer.toml".to_string().parse().unwrap_or_default()),
                         nickname_candidates: None,
                     }
@@ -382,14 +384,12 @@ Rules:
                 (
                     "worker".to_string(),
                     AgentRoleConfig {
-                        description: Some(r#"Use for execution and production work.
-Typical tasks:
-- Implement part of a feature
-- Fix tests or bugs
-- Split large refactors into independent chunks
-Rules:
-- Explicitly assign **ownership** of the task (files / responsibility). When the subtask involves code changes, you should clearly specify which files or modules the worker is responsible for. This helps avoid merge conflicts and ensures accountability. For example, you can say "Worker 1 is responsible for updating the authentication module, while Worker 2 will handle the database layer." By defining clear ownership, you can delegate more effectively and reduce coordination overhead.
-- Always tell workers they are **not alone in the codebase**, and they should not revert the edits made by others, and they should adjust their implementation to accommodate the changes made by others. This is important because there may be multiple workers making changes in parallel, and they need to be aware of each other's work to avoid conflicts and ensure a cohesive final product."#.to_string()),
+                        description: Some(r#"Built-in generic fallback for bounded advisory work when no configured specialist role fits.
+Default posture:
+- Keep tasks read-only by default; ask for diagnosis, decomposition, validation pointers, or implementation guidance rather than file edits.
+- Treat output as advisory claims for the lead to verify and integrate.
+- Scope the question and relevant files clearly so the answer is auditable.
+- Avoid assigning production ownership to this built-in role; prefer configured specialist roles for local gated workflows."#.to_string()),
                         config_file: None,
                         nickname_candidates: None,
                     }

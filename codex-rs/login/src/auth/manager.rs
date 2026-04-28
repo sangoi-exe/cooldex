@@ -688,11 +688,19 @@ impl CodexAuth {
 
     /// Consider this private to integration tests.
     pub fn create_dummy_chatgpt_auth_for_testing() -> Self {
+        // Merge-safety anchor: test ChatGPT auth must seed a parseable id_token so versioned
+        // auth-store reloads exercise real validation without depending on operator auth.json.
+        let id_token = parse_chatgpt_jwt_claims(
+            "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.\
+             eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20ifQ.\
+             c2ln",
+        )
+        .unwrap_or_else(|error| panic!("dummy ChatGPT id_token should parse: {error}"));
         let active_account = ActiveChatgptAccountSnapshot {
             store_account_id: "account_id".to_string(),
             label: None,
             tokens: TokenData {
-                id_token: Default::default(),
+                id_token,
                 access_token: "Access Token".to_string(),
                 refresh_token: "test".to_string(),
                 account_id: Some("account_id".to_string()),

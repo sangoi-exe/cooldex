@@ -65,13 +65,22 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         .expect("spawn_agent should use object params");
     assert!(description.contains("Spawns an agent to work on the specified task."));
     assert!(description.contains("The spawned agent will have the same tools as you"));
+    assert!(description.contains(
+        "The model catalog below is informational; use the `model` and `reasoning_effort` arguments when you need direct child overrides."
+    ));
     assert!(description.contains("visible display (`visible-model`)"));
     assert!(!description.contains("hidden display (`hidden-model`)"));
     assert!(properties.contains_key("task_name"));
     assert!(properties.contains_key("message"));
     assert!(properties.contains_key("fork_turns"));
+    assert!(properties.contains_key("model"));
+    assert!(properties.contains_key("reasoning_effort"));
     assert!(!properties.contains_key("items"));
     assert!(!properties.contains_key("fork_context"));
+    assert!(!description.contains(concat!(
+        "does not accept direct `model` ",
+        "or `reasoning_effort` arguments"
+    )));
     assert_eq!(
         properties.get("agent_type"),
         Some(&JsonSchema::string(Some("role help".to_string())))
@@ -113,6 +122,74 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
     assert!(!properties.contains_key("model"));
     assert!(!properties.contains_key("reasoning_effort"));
     assert!(!properties.contains_key("fork_turns"));
+}
+
+#[test]
+fn spawn_agent_tool_v1_default_description_has_no_delegation_policy() {
+    let tool = create_spawn_agent_tool_v1(SpawnAgentToolOptions {
+        available_models: &[],
+        agent_type_description: "role help".to_string(),
+        hide_agent_type_model_reasoning: false,
+        include_usage_hint: true,
+        usage_hint_text: None,
+    });
+
+    let ToolSpec::Function(ResponsesApiTool { description, .. }) = tool else {
+        panic!("spawn_agent should be a function tool");
+    };
+
+    assert!(description.contains("Spawn a sub-agent for a well-scoped task."));
+    for stale_text in [
+        concat!("Only use `spawn_agent` ", "if and only if"),
+        concat!("Requests for depth, ", "thoroughness"),
+        concat!("Agent-role guidance below ", "only helps choose"),
+        concat!("prefer delegating concrete ", "code-change worker"),
+        concat!("edit files directly ", "in its forked workspace"),
+        concat!("For code-edit subtasks, ", "decompose work"),
+        concat!("Split implementation into ", "disjoint codebase slices"),
+    ] {
+        assert!(
+            !description.contains(stale_text),
+            "spawn_agent V1 description should not contain stale policy {stale_text:?}: {description:?}"
+        );
+    }
+}
+
+#[test]
+fn spawn_agent_tools_append_custom_usage_hint_text() {
+    let usage_hint_text = Some("Custom delegation guidance.".to_string());
+    let v1_tool = create_spawn_agent_tool_v1(SpawnAgentToolOptions {
+        available_models: &[],
+        agent_type_description: "role help".to_string(),
+        hide_agent_type_model_reasoning: false,
+        include_usage_hint: true,
+        usage_hint_text: usage_hint_text.clone(),
+    });
+    let v2_tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
+        available_models: &[],
+        agent_type_description: "role help".to_string(),
+        hide_agent_type_model_reasoning: false,
+        include_usage_hint: true,
+        usage_hint_text,
+    });
+
+    let ToolSpec::Function(ResponsesApiTool {
+        description: v1_description,
+        ..
+    }) = v1_tool
+    else {
+        panic!("spawn_agent V1 should be a function tool");
+    };
+    let ToolSpec::Function(ResponsesApiTool {
+        description: v2_description,
+        ..
+    }) = v2_tool
+    else {
+        panic!("spawn_agent V2 should be a function tool");
+    };
+
+    assert!(v1_description.contains("Custom delegation guidance."));
+    assert!(v2_description.contains("Custom delegation guidance."));
 }
 
 #[test]

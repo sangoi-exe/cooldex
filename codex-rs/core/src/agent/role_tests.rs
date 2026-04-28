@@ -692,7 +692,39 @@ fn spawn_tool_spec_build_deduplicates_user_defined_built_in_roles() {
     assert!(spec.contains("researcher: no description"));
     assert!(spec.contains("explorer: {\nuser override\n}"));
     assert!(spec.contains("default: {\nDefault agent.\n}"));
-    assert!(!spec.contains("Explorers are fast and authoritative."));
+    assert!(!spec.contains(concat!("Explorers are fast ", "and authoritative.")));
+}
+
+// Merge-safety anchor: built-in role metadata must stay advisory by default and must not
+// reintroduce authoritative explorer trust or default worker write-owner language.
+#[test]
+fn spawn_tool_spec_builtin_roles_are_advisory_by_default() {
+    let user_defined_roles = BTreeMap::<String, AgentRoleConfig>::new();
+
+    let spec = spawn_tool_spec::build(&user_defined_roles);
+
+    assert!(spec.contains("Built-in generic fallback for specific, bounded codebase questions"));
+    assert!(spec.contains("Treat results as advisory claims"));
+    assert!(spec.contains("Built-in generic fallback for bounded advisory work"));
+    assert!(spec.contains("Keep tasks read-only by default"));
+    for stale_text in [
+        concat!("Explorers are fast ", "and authoritative."),
+        concat!(
+            "trust the explorer results ",
+            "without additional verification"
+        ),
+        concat!("Use for execution ", "and production work"),
+        concat!("Implement part ", "of a feature"),
+        concat!("Fix tests ", "or bugs"),
+        concat!("Split large refactors ", "into independent chunks"),
+        concat!("Explicitly assign ", "**ownership**"),
+        concat!("not alone ", "in the codebase"),
+    ] {
+        assert!(
+            !spec.contains(stale_text),
+            "built-in role metadata should not contain stale policy {stale_text:?}: {spec:?}"
+        );
+    }
 }
 
 #[test]

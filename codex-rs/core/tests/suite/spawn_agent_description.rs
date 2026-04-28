@@ -4,8 +4,6 @@
 use anyhow::Result;
 use codex_features::Feature;
 use codex_login::CodexAuth;
-use codex_models_manager::manager::ModelsManager;
-use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
@@ -17,19 +15,14 @@ use codex_protocol::openai_models::TruncationPolicyConfig;
 use codex_protocol::openai_models::default_input_modalities;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_models_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
 use serde_json::Value;
-use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
-use tokio::time::sleep;
 
-// Merge-safety anchor: spawn-agent prompt-surface tests depend on the current
-// ModelsManager refresh path before asserting the shipped legacy tool text.
+// Merge-safety anchor: spawn-agent prompt-surface tests seed the session-start model catalog so
+// assertions follow the actual tool-schema owner instead of post-start refresh side effects.
 
 const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
 
@@ -92,62 +85,41 @@ fn test_model_info(
     }
 }
 
-async fn wait_for_model_available(manager: &Arc<ModelsManager>, slug: &str) {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let available_models = manager
-            .list_models(RefreshStrategy::Online)
-            .await
-            .expect("list models");
-        if available_models.iter().any(|model| model.model == slug) {
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!("timed out waiting for remote model {slug} to appear");
-        }
-        sleep(Duration::from_millis(25)).await;
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_agent_description_lists_visible_models_as_informational_catalog() -> Result<()> {
     let server = start_mock_server().await;
-    mount_models_once(
-        &server,
-        ModelsResponse {
-            models: vec![
-                test_model_info(
-                    "visible-model",
-                    "Visible Model",
-                    "Fast and capable",
-                    ModelVisibility::List,
-                    ReasoningEffort::Medium,
-                    vec![
-                        ReasoningEffortPreset {
-                            effort: ReasoningEffort::Low,
-                            description: "Quick scan".to_string(),
-                        },
-                        ReasoningEffortPreset {
-                            effort: ReasoningEffort::High,
-                            description: "Deep dive".to_string(),
-                        },
-                    ],
-                ),
-                test_model_info(
-                    "hidden-model",
-                    "Hidden Model",
-                    "Should not be shown",
-                    ModelVisibility::Hide,
-                    ReasoningEffort::Low,
-                    vec![ReasoningEffortPreset {
+    let model_catalog = ModelsResponse {
+        models: vec![
+            test_model_info(
+                "visible-model",
+                "Visible Model",
+                "Fast and capable",
+                ModelVisibility::List,
+                ReasoningEffort::Medium,
+                vec![
+                    ReasoningEffortPreset {
                         effort: ReasoningEffort::Low,
-                        description: "Not visible".to_string(),
-                    }],
-                ),
-            ],
-        },
-    )
-    .await;
+                        description: "Quick scan".to_string(),
+                    },
+                    ReasoningEffortPreset {
+                        effort: ReasoningEffort::High,
+                        description: "Deep dive".to_string(),
+                    },
+                ],
+            ),
+            test_model_info(
+                "hidden-model",
+                "Hidden Model",
+                "Should not be shown",
+                ModelVisibility::Hide,
+                ReasoningEffort::Low,
+                vec![ReasoningEffortPreset {
+                    effort: ReasoningEffort::Low,
+                    description: "Not visible".to_string(),
+                }],
+            ),
+        ],
+    };
     let resp_mock = mount_sse_once(
         &server,
         sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
@@ -162,9 +134,9 @@ async fn spawn_agent_description_lists_visible_models_as_informational_catalog()
                 .features
                 .enable(Feature::Collab)
                 .expect("test config should allow feature update");
+            config.model_catalog = Some(model_catalog);
         });
     let test = builder.build(&server).await?;
-    wait_for_model_available(&test.thread_manager.get_models_manager(), "visible-model").await;
 
     test.submit_turn("hello").await?;
 
@@ -182,7 +154,7 @@ async fn spawn_agent_description_lists_visible_models_as_informational_catalog()
     );
     assert!(
         description.contains(
-            "The model catalog below is informational only; `spawn_agent` does not accept direct `model` or `reasoning_effort` arguments."
+            "The model catalog below is informational only; legacy `spawn_agent` does not accept direct `model` or `reasoning_effort` arguments."
         ),
         "expected non-selectable model catalog wording in spawn_agent description: {description:?}"
     );
@@ -204,24 +176,32 @@ async fn spawn_agent_description_lists_visible_models_as_informational_catalog()
         !description.contains("Hidden Model"),
         "hidden picker model should be omitted from spawn_agent description: {description:?}"
     );
-    assert!(
-        description.contains(
-            "Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work."
+    let body_text = body.to_string();
+    for stale_text in [
+        concat!("Only use `spawn_agent` ", "if and only if"),
+        concat!("Requests for depth, ", "thoroughness"),
+        concat!("Agent-role guidance below ", "only helps choose"),
+        concat!(
+            "trust the explorer results ",
+            "without additional verification"
         ),
-        "expected explicit authorization rule in spawn_agent description: {description:?}"
-    );
-    assert!(
-        description.contains(
-            "Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn."
-        ),
-        "expected non-authorization clarification in spawn_agent description: {description:?}"
-    );
-    assert!(
-        description.contains(
-            "Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself."
-        ),
-        "expected agent-role clarification in spawn_agent description: {description:?}"
-    );
+        concat!("prefer delegating concrete ", "code-change worker"),
+        concat!("edit files directly ", "in its forked workspace"),
+        concat!("For code-edit subtasks, ", "decompose work"),
+        concat!("Split implementation into ", "disjoint codebase slices"),
+        concat!("Explorers are fast ", "and authoritative"),
+        concat!("Use for execution ", "and production work"),
+        concat!("Implement part ", "of a feature"),
+        concat!("Fix tests ", "or bugs"),
+        concat!("Split large refactors ", "into independent chunks"),
+        concat!("Explicitly assign ", "**ownership**"),
+        concat!("not alone ", "in the codebase"),
+    ] {
+        assert!(
+            !body_text.contains(stale_text),
+            "spawn_agent schema should not contain stale policy {stale_text:?}: {body_text:?}"
+        );
+    }
     assert!(
         !description.contains("A mini model can solve many tasks faster than the main model."),
         "spawn_agent description should no longer imply direct model downshifts: {description:?}"
