@@ -2325,6 +2325,16 @@ pub(crate) async fn run_sampling_request(
                 ));
             }
         }
+        let request_store_account_id = sess
+            .services
+            .auth_manager
+            .account_manager()
+            .list_accounts()
+            .map_err(|error| CodexErr::Io(error.into_io_error()))?
+            .into_iter()
+            .find(|account| account.is_active)
+            .map(|account| account.id);
+
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
@@ -2346,12 +2356,20 @@ pub(crate) async fn run_sampling_request(
                 sess.set_total_tokens_full(&turn_context).await;
                 return Err(CodexErr::ContextWindowExceeded);
             }
-            Err(CodexErr::UsageLimitReached(e)) => {
-                let rate_limits = e.rate_limits.clone();
-                if let Some(rate_limits) = rate_limits {
-                    sess.update_rate_limits(&turn_context, *rate_limits).await;
+            Err(CodexErr::UsageLimitReached(error)) => {
+                if handle_usage_limit_for_execution_mode(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    &error,
+                    request_store_account_id.as_deref(),
+                    SamplingExecutionMode::Visible,
+                    UsageLimitHandlingPolicy::VisibleWarnAndAutoSwitch,
+                )
+                .await?
+                {
+                    continue;
                 }
-                return Err(CodexErr::UsageLimitReached(e));
+                return Err(CodexErr::UsageLimitReached(error));
             }
             Err(err) => err,
         };

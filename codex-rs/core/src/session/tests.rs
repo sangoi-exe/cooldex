@@ -14,6 +14,7 @@ use super::turn::parse_prompt_gc_summary_response_text;
 use super::turn::prompt_gc_plan_build_failure_details;
 use super::turn::refresh_accounts_rate_limits_before_auto_switch;
 use super::turn::run_prompt_gc_sidecar_if_needed;
+use super::turn::run_sampling_request;
 use super::turn::stale_request_should_retry_without_switch;
 use super::*;
 use crate::RolloutRecorderParams;
@@ -2636,6 +2637,7 @@ async fn visible_usage_limit_core_pre_refresh_respects_foreign_leases_until_rele
         .respond_with(UsageLimitRefreshSequenceResponder {
             calls: AtomicUsize::new(0),
             observed_account_ids: Arc::clone(&observed_refresh_account_ids),
+            expected_responses: vec![("acc-0", 100), ("acc-2", 0), ("acc-1", 0), ("acc-2", 100)],
         })
         .expect(4)
         .mount(&server)
@@ -2799,6 +2801,274 @@ async fn visible_usage_limit_core_pre_refresh_respects_foreign_leases_until_rele
         rx.try_recv().is_err(),
         "phase-2 core auto-switch should emit exactly one warning event"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn visible_usage_limit_auto_switches_and_retries_same_turn() {
+    let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let server = MockServer::start().await;
+    let observed_model_headers = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_refresh_account_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let auth_home = tempfile::tempdir().expect("create auth tempdir");
+
+    let mut acc_0_tokens = test_chatgpt_token_data("acc-0");
+    acc_0_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_0_tokens.id_token.raw_jwt)
+            .expect("parse acc-0 id token");
+    let acc_0_store_account_id = acc_0_tokens
+        .preferred_store_account_id()
+        .expect("acc-0 store account id");
+    let mut acc_2_tokens = test_chatgpt_token_data("acc-2");
+    acc_2_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_2_tokens.id_token.raw_jwt)
+            .expect("parse acc-2 id token");
+    let acc_2_store_account_id = acc_2_tokens
+        .preferred_store_account_id()
+        .expect("acc-2 store account id");
+    let auth_store = crate::auth::AuthStore {
+        active_account_id: Some(acc_0_store_account_id.clone()),
+        accounts: vec![
+            crate::auth::StoredAccount {
+                id: acc_0_store_account_id.clone(),
+                label: Some("Account A".to_string()),
+                tokens: acc_0_tokens,
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+            crate::auth::StoredAccount {
+                id: acc_2_store_account_id.clone(),
+                label: Some("Account C".to_string()),
+                tokens: acc_2_tokens,
+                last_refresh: Some(Utc::now()),
+                usage: None,
+            },
+        ],
+        ..crate::auth::AuthStore::default()
+    };
+    crate::auth::save_auth(
+        auth_home.path(),
+        &auth_store,
+        crate::auth::AuthCredentialsStoreMode::File,
+    )
+    .expect("persist auth store");
+    let auth_manager = AuthManager::shared(
+        auth_home.path().to_path_buf(),
+        false,
+        crate::auth::AuthCredentialsStoreMode::File,
+    )
+    .expect("create auth manager");
+    let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
+    session_mut.services.auth_manager = Arc::clone(&auth_manager);
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.auth_manager = Some(Arc::clone(&auth_manager));
+    let mut config = (*turn_context_mut.config).clone();
+    config.chatgpt_base_url = server.uri();
+    turn_context_mut.config = Arc::new(config);
+    turn_context_mut.allow_usage_limit_auto_switch_pre_refresh_in_tests = true;
+
+    let resets_at = (Utc::now() + chrono::Duration::minutes(15)).timestamp();
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(UsageLimitRetryResponder {
+            calls: AtomicUsize::new(0),
+            observed_headers: Arc::clone(&observed_model_headers),
+            resets_at,
+            response_body: sse(&[
+                response_created("resp-visible-retry"),
+                assistant_message_event("msg-visible-retry", "visible retry ok"),
+                response_completed_with_usage("resp-visible-retry", 17),
+            ]),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/codex/usage"))
+        .respond_with(UsageLimitRefreshSequenceResponder {
+            calls: AtomicUsize::new(0),
+            observed_account_ids: Arc::clone(&observed_refresh_account_ids),
+            expected_responses: vec![("acc-0", 100), ("acc-2", 0)],
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
+    let mut client_session = session.services.model_client.new_session();
+    let explicitly_enabled_connectors = HashSet::new();
+    let mut server_model_warning_emitted_for_turn = false;
+    let result = run_sampling_request(
+        Arc::clone(&session),
+        Arc::clone(&turn_context),
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &mut client_session,
+        None,
+        vec![user_message("trigger visible autoswitch")],
+        &explicitly_enabled_connectors,
+        None,
+        None,
+        &mut server_model_warning_emitted_for_turn,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("visible usage-limit autoswitch should retry the same turn");
+
+    assert_eq!(
+        result.last_agent_message.as_deref(),
+        Some("visible retry ok")
+    );
+    assert_eq!(
+        auth_manager
+            .account_manager()
+            .active_chatgpt_account_summary()
+            .expect("load active account after visible autoswitch")
+            .expect("visible autoswitch should leave an active account")
+            .store_account_id,
+        acc_2_store_account_id
+    );
+    assert_eq!(
+        observed_model_headers
+            .lock()
+            .expect("model headers should be readable")
+            .clone(),
+        vec![
+            ("acc-0".to_string(), "Bearer access-acc-0".to_string()),
+            ("acc-2".to_string(), "Bearer access-acc-2".to_string()),
+        ]
+    );
+    assert_eq!(
+        observed_refresh_account_ids
+            .lock()
+            .expect("refresh headers should be readable")
+            .clone(),
+        vec!["acc-0".to_string(), "acc-2".to_string()]
+    );
+    let mut warning_message = None;
+    for _ in 0..5 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for visible autoswitch warning")
+            .expect("visible autoswitch warning");
+        if let EventMsg::Warning(WarningEvent { message }) = event.msg {
+            warning_message = Some(message);
+            break;
+        }
+    }
+    let warning_message = warning_message.expect("visible autoswitch warning should be emitted");
+    assert_eq!(
+        warning_message,
+        "Usage limit reached for account 'Account A'. Auto-switched to account 'Account C' and retrying."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn visible_usage_limit_returns_original_error_when_auto_switch_noops() {
+    let (mut session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+    let server = MockServer::start().await;
+    let observed_model_headers = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let auth_home = tempfile::tempdir().expect("create auth tempdir");
+
+    let mut acc_0_tokens = test_chatgpt_token_data("acc-0");
+    acc_0_tokens.id_token =
+        codex_login::token_data::parse_chatgpt_jwt_claims(&acc_0_tokens.id_token.raw_jwt)
+            .expect("parse acc-0 id token");
+    let acc_0_store_account_id = acc_0_tokens
+        .preferred_store_account_id()
+        .expect("acc-0 store account id");
+    let auth_store = crate::auth::AuthStore {
+        active_account_id: Some(acc_0_store_account_id.clone()),
+        accounts: vec![crate::auth::StoredAccount {
+            id: acc_0_store_account_id.clone(),
+            label: Some("Account A".to_string()),
+            tokens: acc_0_tokens,
+            last_refresh: Some(Utc::now()),
+            usage: None,
+        }],
+        ..crate::auth::AuthStore::default()
+    };
+    crate::auth::save_auth(
+        auth_home.path(),
+        &auth_store,
+        crate::auth::AuthCredentialsStoreMode::File,
+    )
+    .expect("persist auth store");
+    let auth_manager = AuthManager::shared(
+        auth_home.path().to_path_buf(),
+        false,
+        crate::auth::AuthCredentialsStoreMode::File,
+    )
+    .expect("create auth manager");
+    let session_mut = Arc::get_mut(&mut session).expect("session arc should be unique");
+    session_mut.services.auth_manager = Arc::clone(&auth_manager);
+    let turn_context_mut =
+        Arc::get_mut(&mut turn_context).expect("turn_context arc should be unique");
+    turn_context_mut.auth_manager = Some(Arc::clone(&auth_manager));
+
+    let resets_at = Utc
+        .timestamp_opt(Utc::now().timestamp() + 900, 0)
+        .single()
+        .expect("valid reset timestamp");
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(UsageLimitRetryResponder {
+            calls: AtomicUsize::new(0),
+            observed_headers: Arc::clone(&observed_model_headers),
+            resets_at: resets_at.timestamp(),
+            response_body: String::new(),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    configure_session_model_client_for_server(&mut session, &turn_context, &server);
+
+    let mut client_session = session.services.model_client.new_session();
+    let explicitly_enabled_connectors = HashSet::new();
+    let mut server_model_warning_emitted_for_turn = false;
+    let error = run_sampling_request(
+        Arc::clone(&session),
+        Arc::clone(&turn_context),
+        Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        &mut client_session,
+        None,
+        vec![user_message("trigger visible usage limit")],
+        &explicitly_enabled_connectors,
+        None,
+        None,
+        &mut server_model_warning_emitted_for_turn,
+        CancellationToken::new(),
+    )
+    .await
+    .expect_err("visible usage limit without fallback should return the usage error");
+
+    match error {
+        CodexErr::UsageLimitReached(error) => {
+            assert_eq!(error.resets_at, Some(resets_at));
+            assert!(error.rate_limits.is_some());
+        }
+        other => panic!("expected original usage-limit error, got {other:?}"),
+    }
+    assert_eq!(
+        auth_manager
+            .account_manager()
+            .active_chatgpt_account_summary()
+            .expect("load active account after no-op autoswitch")
+            .expect("no-op autoswitch should keep active account")
+            .store_account_id,
+        acc_0_store_account_id
+    );
+    assert_eq!(
+        observed_model_headers
+            .lock()
+            .expect("model headers should be readable")
+            .clone(),
+        vec![("acc-0".to_string(), "Bearer access-acc-0".to_string())]
+    );
+    while let Ok(event) = rx.try_recv() {
+        if let EventMsg::Warning(WarningEvent { message }) = event.msg {
+            panic!("no-op visible autoswitch should not emit a switch warning: {message}");
+        }
+    }
 }
 
 // Merge-safety anchor: prompt_gc tests in this file must stay aligned with the
@@ -3180,7 +3450,7 @@ async fn prompt_gc_hidden_usage_limit_auto_switches_and_retries() {
 
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
-        .respond_with(PromptGcRetryResponder {
+        .respond_with(UsageLimitRetryResponder {
             calls: AtomicUsize::new(0),
             observed_headers: Arc::clone(&observed_headers),
             resets_at: Utc
@@ -3693,14 +3963,14 @@ impl Respond for StaticSseResponder {
     }
 }
 
-struct PromptGcRetryResponder {
+struct UsageLimitRetryResponder {
     calls: AtomicUsize,
     observed_headers: Arc<std::sync::Mutex<Vec<(String, String)>>>,
     resets_at: i64,
     response_body: String,
 }
 
-impl Respond for PromptGcRetryResponder {
+impl Respond for UsageLimitRetryResponder {
     fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
         let account_id = request
             .headers
@@ -3716,7 +3986,7 @@ impl Respond for PromptGcRetryResponder {
             .to_string();
         self.observed_headers
             .lock()
-            .expect("prompt_gc retry headers should be writable")
+            .expect("usage-limit retry headers should be writable")
             .push((account_id, authorization));
         match self.calls.fetch_add(1, Ordering::SeqCst) {
             0 => ResponseTemplate::new(429)
@@ -3733,7 +4003,7 @@ impl Respond for PromptGcRetryResponder {
             1 => ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
                 .set_body_string(self.response_body.clone()),
-            call_num => panic!("unexpected extra prompt_gc request {call_num}"),
+            call_num => panic!("unexpected extra usage-limit request {call_num}"),
         }
     }
 }
@@ -3741,6 +4011,7 @@ impl Respond for PromptGcRetryResponder {
 struct UsageLimitRefreshSequenceResponder {
     calls: AtomicUsize,
     observed_account_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    expected_responses: Vec<(&'static str, u8)>,
 }
 
 impl Respond for UsageLimitRefreshSequenceResponder {
@@ -3757,13 +4028,12 @@ impl Respond for UsageLimitRefreshSequenceResponder {
             .and_then(|value| value.to_str().ok())
             .expect("authorization header")
             .to_string();
-        let (expected_account_id, used_percent) = match self.calls.fetch_add(1, Ordering::SeqCst) {
-            0 => ("acc-0", 100),
-            1 => ("acc-2", 0),
-            2 => ("acc-1", 0),
-            3 => ("acc-2", 100),
-            call_num => panic!("unexpected extra usage refresh request {call_num}"),
-        };
+        let call_num = self.calls.fetch_add(1, Ordering::SeqCst);
+        let (expected_account_id, used_percent) = self
+            .expected_responses
+            .get(call_num)
+            .copied()
+            .unwrap_or_else(|| panic!("unexpected extra usage refresh request {call_num}"));
         assert_eq!(account_id, expected_account_id);
         assert_eq!(
             authorization,
