@@ -15,12 +15,14 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ConversationStartParams;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::PostCompactRecoveryCompactionAnchor;
 use codex_protocol::protocol::PostCompactRecoveryItem;
 use codex_protocol::protocol::PostCompactRecoveryStatus;
 use codex_protocol::protocol::RealtimeConversationRealtimeEvent;
@@ -46,6 +48,8 @@ use core_test_support::wait_for_event_match;
 use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use sha2::Digest as _;
+use sha2::Sha256;
 use tokio::time::Duration;
 use wiremock::ResponseTemplate;
 
@@ -702,6 +706,21 @@ async fn resume_injects_uncleared_post_compact_recovery_packet() -> Result<()> {
     let restored_packet_marker = "RESTORED_UNCLEARED_READY_RECOVERY_PACKET";
     let recovery_packet =
         format!("{POST_COMPACT_RECOVERY_TAG}\n{restored_packet_marker}\n</post_compact_recovery>");
+    let compacted_item = CompactedItem {
+        message: "synthetic compacted marker for recovery restore".to_string(),
+        replacement_history: None,
+        prompt_gc: None,
+    };
+    let compacted_rollout_index = fs::read_to_string(&rollout_path)?.lines().count();
+    let compacted_digest = Sha256::digest(serde_json::to_vec(&compacted_item)?);
+    let compaction_anchor = PostCompactRecoveryCompactionAnchor {
+        rollout_index: compacted_rollout_index,
+        digest: format!("sha256:{compacted_digest:x}"),
+    };
+    let compacted_line = serde_json::to_string(&RolloutLine {
+        timestamp: "2026-04-29T00:00:00.000Z".to_string(),
+        item: RolloutItem::Compacted(compacted_item),
+    })?;
     let recovery_line = serde_json::to_string(&RolloutLine {
         timestamp: "2026-04-29T00:00:00.000Z".to_string(),
         item: RolloutItem::PostCompactRecovery(PostCompactRecoveryItem {
@@ -711,7 +730,8 @@ async fn resume_injects_uncleared_post_compact_recovery_packet() -> Result<()> {
             phase: "mid_turn".to_string(),
             reason: "context_limit".to_string(),
             implementation: "test_fixture".to_string(),
-            latest_compacted_index: Some(1),
+            compaction_anchor: Some(compaction_anchor),
+            latest_compacted_index: Some(compacted_rollout_index),
             last_boundary_kind: Some("replacement_history_compacted".to_string()),
             created_at_unix_secs: Some(1),
             packet: Some(recovery_packet),
@@ -719,6 +739,7 @@ async fn resume_injects_uncleared_post_compact_recovery_packet() -> Result<()> {
         }),
     })?;
     let mut rollout_file = fs::OpenOptions::new().append(true).open(&rollout_path)?;
+    writeln!(rollout_file, "{compacted_line}")?;
     writeln!(rollout_file, "{recovery_line}")?;
 
     let mut resume_builder = chatgpt_remote_compact_test_codex();

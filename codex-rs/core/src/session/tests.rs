@@ -116,6 +116,7 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::NetworkApprovalProtocol;
 use codex_protocol::protocol::NonSteerableTurnKind;
+use codex_protocol::protocol::PostCompactRecoveryItem;
 use codex_protocol::protocol::PostCompactRecoveryStatus;
 use codex_protocol::protocol::PromptGcCompactionMetadata;
 use codex_protocol::protocol::PromptGcExecutionPhase;
@@ -806,6 +807,50 @@ async fn auto_compact_recovery_packet_failure_emits_error_and_failed_rollout_ite
             PostCompactRecoveryStatus::Started,
             PostCompactRecoveryStatus::Failed,
         ]
+    );
+}
+
+#[tokio::test]
+async fn no_rollout_auto_compact_injects_unavailable_recovery_packet() {
+    let (session, mut turn_context) = make_session_and_context().await;
+    let mut config = (*turn_context.config).clone();
+    config.ephemeral = true;
+    config.post_compact_recovery_warning =
+        Some("runtime recovery context was prepared".to_string());
+    turn_context.config = Arc::new(config);
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+
+    begin_auto_compact_recovery(
+        &session,
+        &turn_context,
+        CompactionReason::ContextLimit,
+        CompactionPhase::PreTurn,
+        "test_compact",
+    )
+    .await
+    .expect("no-rollout recovery should inject unavailable packet without failing compact");
+
+    let input = session
+        .inject_pending_post_compact_recovery(Vec::new())
+        .await;
+    let Some(ResponseItem::Message { content, .. }) = input.first() else {
+        panic!("expected injected developer recovery packet");
+    };
+    let packet_text = content
+        .iter()
+        .find_map(|item| match item {
+            ContentItem::InputText { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .expect("developer packet text");
+    assert!(
+        packet_text.contains("\"mode\":\"post_compact_runtime_recovery_unavailable\""),
+        "unexpected packet: {packet_text}"
+    );
+    assert!(
+        packet_text.contains("\"unavailable_reason\":\"rollout_recovery_unavailable\""),
+        "unexpected packet: {packet_text}"
     );
 }
 
@@ -4989,6 +5034,214 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
 
     let history = session.state.lock().await.clone_history();
     assert_eq!(expected, history.raw_items());
+}
+
+#[tokio::test]
+async fn rollout_reconstruction_drops_recovery_compaction_anchor_after_rollback() {
+    let (session, turn_context) = make_session_and_context().await;
+    let turn_id = "rolled-back-turn".to_string();
+    let rollout_items = vec![
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: turn_id.clone(),
+            started_at: None,
+            model_context_window: Some(128_000),
+            collaboration_mode_kind: ModeKind::Default,
+        })),
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "rolled back user turn".to_string(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+        })),
+        RolloutItem::Compacted(CompactedItem {
+            message: "rolled back compacted summary".to_string(),
+            replacement_history: None,
+            prompt_gc: None,
+        }),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        })),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed.surviving_compaction_indices,
+        Vec::<usize>::new()
+    );
+}
+
+#[tokio::test]
+async fn rollout_reconstruction_drops_recovery_lifecycle_after_rollback() {
+    let (session, turn_context) = make_session_and_context().await;
+    let compacted = CompactedItem {
+        message: "surviving compacted summary".to_string(),
+        replacement_history: None,
+        prompt_gc: None,
+    };
+    let compaction_anchor = super::post_compact_recovery_replay::compaction_anchor(
+        /*rollout_index*/ 0, &compacted,
+    )
+    .expect("compaction anchor");
+    let ready_item = PostCompactRecoveryItem {
+        recovery_id: "surviving-turn:mid_turn:recovery-0".to_string(),
+        turn_id: "surviving-turn".to_string(),
+        status: PostCompactRecoveryStatus::Ready,
+        phase: "mid_turn".to_string(),
+        reason: "context_limit".to_string(),
+        implementation: "test_fixture".to_string(),
+        compaction_anchor: Some(compaction_anchor.clone()),
+        latest_compacted_index: Some(0),
+        last_boundary_kind: Some("replacement_history_compacted".to_string()),
+        created_at_unix_secs: Some(1),
+        packet: Some("SURVIVING_PACKET".to_string()),
+        failure: None,
+    };
+    let cleared_item = PostCompactRecoveryItem {
+        recovery_id: "rolled-back-turn:mid_turn:recovery-1".to_string(),
+        turn_id: "rolled-back-turn".to_string(),
+        status: PostCompactRecoveryStatus::Cleared,
+        phase: "mid_turn".to_string(),
+        reason: "context_limit".to_string(),
+        implementation: "test_fixture".to_string(),
+        compaction_anchor: Some(compaction_anchor),
+        latest_compacted_index: Some(0),
+        last_boundary_kind: Some("replacement_history_compacted".to_string()),
+        created_at_unix_secs: Some(2),
+        packet: None,
+        failure: None,
+    };
+    let rollout_items = vec![
+        RolloutItem::Compacted(compacted),
+        RolloutItem::PostCompactRecovery(ready_item),
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "rolled-back-turn".to_string(),
+            started_at: None,
+            model_context_window: Some(128_000),
+            collaboration_mode_kind: ModeKind::Default,
+        })),
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "rolled back user turn".to_string(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+        })),
+        RolloutItem::PostCompactRecovery(cleared_item),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        })),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(reconstructed.surviving_compaction_indices, vec![0]);
+    assert_eq!(
+        reconstructed.surviving_post_compact_recovery_indices,
+        vec![1]
+    );
+}
+
+#[tokio::test]
+async fn rollout_reconstruction_keeps_post_rollback_recovery_lifecycle() {
+    let (session, turn_context) = make_session_and_context().await;
+    let compacted = CompactedItem {
+        message: "surviving compacted summary".to_string(),
+        replacement_history: None,
+        prompt_gc: None,
+    };
+    let compaction_anchor = super::post_compact_recovery_replay::compaction_anchor(
+        /*rollout_index*/ 0, &compacted,
+    )
+    .expect("compaction anchor");
+    let ready_item = PostCompactRecoveryItem {
+        recovery_id: "post-rollback:resume_repair:recovery-2".to_string(),
+        turn_id: "post-rollback".to_string(),
+        status: PostCompactRecoveryStatus::Ready,
+        phase: "resume_repair".to_string(),
+        reason: "missing_ready_for_surviving_compaction".to_string(),
+        implementation: "resume_repair".to_string(),
+        compaction_anchor: Some(compaction_anchor),
+        latest_compacted_index: Some(0),
+        last_boundary_kind: Some("replacement_history_compacted".to_string()),
+        created_at_unix_secs: Some(3),
+        packet: Some("POST_ROLLBACK_PACKET".to_string()),
+        failure: None,
+    };
+    let rollout_items = vec![
+        RolloutItem::Compacted(compacted),
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "rolled-back-turn".to_string(),
+            started_at: None,
+            model_context_window: Some(128_000),
+            collaboration_mode_kind: ModeKind::Default,
+        })),
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "rolled back user turn".to_string(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+        })),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        })),
+        RolloutItem::PostCompactRecovery(ready_item),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(reconstructed.surviving_compaction_indices, vec![0]);
+    assert_eq!(
+        reconstructed.surviving_post_compact_recovery_indices,
+        vec![4]
+    );
+}
+
+#[tokio::test]
+async fn forked_initial_history_strips_post_compact_recovery_items() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+    let recovery_item = PostCompactRecoveryItem {
+        recovery_id: "source-turn:mid_turn:recovery-0".to_string(),
+        turn_id: "source-turn".to_string(),
+        status: PostCompactRecoveryStatus::Ready,
+        phase: "mid_turn".to_string(),
+        reason: "context_limit".to_string(),
+        implementation: "test_fixture".to_string(),
+        compaction_anchor: None,
+        latest_compacted_index: Some(0),
+        last_boundary_kind: Some("replacement_history_compacted".to_string()),
+        created_at_unix_secs: Some(1),
+        packet: Some("SOURCE_PACKET".to_string()),
+        failure: None,
+    };
+
+    session
+        .record_initial_history(InitialHistory::Forked(vec![
+            RolloutItem::ResponseItem(user_message("forked request")),
+            RolloutItem::PostCompactRecovery(recovery_item),
+        ]))
+        .await;
+    session.flush_rollout().await.expect("flush rollout");
+
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    assert!(
+        !resumed
+            .history
+            .iter()
+            .any(|item| matches!(item, RolloutItem::PostCompactRecovery(_))),
+        "fork import must not persist source-thread runtime recovery state"
+    );
 }
 
 #[tokio::test]

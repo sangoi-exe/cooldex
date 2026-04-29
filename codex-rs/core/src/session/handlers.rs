@@ -792,7 +792,8 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         .into_iter()
         .chain(std::iter::once(RolloutItem::EventMsg(rollback_msg.clone())))
         .collect::<Vec<_>>();
-    sess.apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
+    let reconstruction = sess
+        .apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
         .await;
     sess.recompute_token_usage(turn_context.as_ref()).await;
 
@@ -809,6 +810,14 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         )
         .await;
     }
+
+    sess.restore_post_compact_recovery_from_replay(
+        turn_context.as_ref(),
+        replay_items.as_slice(),
+        &reconstruction.surviving_compaction_indices,
+        &reconstruction.surviving_post_compact_recovery_indices,
+    )
+    .await;
 
     sess.deliver_event_raw(Event {
         id: turn_context.sub_id.clone(),

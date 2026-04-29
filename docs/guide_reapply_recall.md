@@ -51,7 +51,7 @@ When changing recall behavior, update these in the same change:
 - `codex-rs/core/src/tools/spec.rs` when the tool description or output-surface wording changes
 - `codex-rs/core/src/prompt_gc_rollout.rs` when prompt-gc hydratability or rollback-discard boundary rules move
 - `codex-rs/core/src/session/rollout_reconstruction.rs` when legacy-standard compaction replay/recovery semantics move
-- `codex-rs/core/src/session/mod.rs`, `codex-rs/core/tests/suite/compact.rs`, and `codex-rs/core/tests/suite/compact_remote.rs` when runtime recovery warning text or packet injection changes
+- `codex-rs/core/src/session/post_compact_recovery.rs`, `codex-rs/core/src/session/post_compact_recovery_replay.rs`, `codex-rs/core/src/session/mod.rs`, `codex-rs/core/tests/suite/compact.rs`, and `codex-rs/core/tests/suite/compact_remote.rs` when runtime recovery warning text, lifecycle replay, or packet injection changes
 - `docs/recall.md`
 - `docs/guide_reapply_recall.md`
 - `AGENTS.md` when the recall inventory or source-of-truth seams change

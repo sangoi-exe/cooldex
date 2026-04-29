@@ -186,6 +186,28 @@ async fn returns_config_error_for_schema_error_in_user_config() {
 }
 
 #[tokio::test]
+async fn returns_config_error_for_removed_post_compact_key() {
+    let tmp = tempdir().expect("tempdir");
+    let contents = "pos_compact_instructions = \"call recall first\"";
+    let config_path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&config_path, contents).expect("write config");
+
+    let err = ConfigBuilder::default()
+        .codex_home(tmp.path().to_path_buf())
+        .fallback_cwd(Some(tmp.path().to_path_buf()))
+        .build()
+        .await
+        .expect_err("expected error");
+
+    let config_error = config_error_from_io(&err);
+    let _guard = codex_utils_absolute_path::AbsolutePathBufGuard::new(tmp.path());
+    let expected_config_error =
+        codex_config::config_error_from_typed_toml::<ConfigToml>(&config_path, contents)
+            .expect("unknown key error");
+    assert_eq!(config_error, &expected_config_error);
+}
+
+#[tokio::test]
 async fn merges_managed_config_layer_on_top() {
     let tmp = tempdir().expect("tempdir");
     let managed_path = tmp.path().join("managed_config.toml");

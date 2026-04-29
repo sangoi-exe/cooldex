@@ -5935,6 +5935,21 @@ fn config_toml_deserializes_mcp_oauth_callback_url() {
     );
 }
 
+#[test]
+fn config_toml_rejects_removed_pos_compact_instructions_key() {
+    let toml = r#"pos_compact_instructions = "call recall first""#;
+
+    let error = toml::from_str::<ConfigToml>(toml)
+        .expect_err("removed post-compact config key must fail loud");
+
+    assert!(
+        error
+            .to_string()
+            .contains("unknown field `pos_compact_instructions`"),
+        "unexpected error: {error}"
+    );
+}
+
 #[tokio::test]
 async fn config_loads_mcp_oauth_callback_port_from_toml() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;

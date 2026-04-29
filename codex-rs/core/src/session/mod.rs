@@ -169,6 +169,7 @@ mod agent_task_lifecycle;
 mod handlers;
 mod mcp;
 pub(crate) mod post_compact_recovery;
+pub(crate) mod post_compact_recovery_replay;
 mod review;
 mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
@@ -1237,11 +1238,17 @@ impl Session {
             InitialHistory::Resumed(resumed_history) => {
                 let rollout_items = resumed_history.history;
                 self.restore_persisted_agent_task(&rollout_items).await;
-                self.restore_post_compact_recovery_from_rollout(&rollout_items)
-                    .await;
-                let previous_turn_settings = self
+                let reconstruction = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
+                let previous_turn_settings = reconstruction.previous_turn_settings.clone();
+                self.restore_post_compact_recovery_from_replay(
+                    &turn_context,
+                    &rollout_items,
+                    &reconstruction.surviving_compaction_indices,
+                    &reconstruction.surviving_post_compact_recovery_indices,
+                )
+                .await;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info.slug.as_str();
@@ -1277,6 +1284,10 @@ impl Session {
                 }
             }
             InitialHistory::Forked(rollout_items) => {
+                // Merge-safety anchor: fork imports must strip source-thread
+                // post-compact runtime recovery state before persistence or
+                // replay, otherwise a fork can inherit stale recovery packets.
+                let rollout_items = Self::strip_runtime_only_rollout_items_for_fork(rollout_items);
                 self.apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
 
@@ -1315,19 +1326,28 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
-    ) -> Option<PreviousTurnSettings> {
+    ) -> rollout_reconstruction::RolloutReconstruction {
         let reconstructed_rollout = self
             .reconstruct_history_from_rollout(turn_context, rollout_items)
             .await;
         let previous_turn_settings = reconstructed_rollout.previous_turn_settings.clone();
         self.replace_history(
-            reconstructed_rollout.history,
-            reconstructed_rollout.reference_context_item,
+            reconstructed_rollout.history.clone(),
+            reconstructed_rollout.reference_context_item.clone(),
         )
         .await;
         self.set_previous_turn_settings(previous_turn_settings.clone())
             .await;
-        previous_turn_settings
+        reconstructed_rollout
+    }
+
+    fn strip_runtime_only_rollout_items_for_fork(
+        rollout_items: Vec<RolloutItem>,
+    ) -> Vec<RolloutItem> {
+        rollout_items
+            .into_iter()
+            .filter(|item| !matches!(item, RolloutItem::PostCompactRecovery(_)))
+            .collect()
     }
 
     fn last_token_info_from_rollout(rollout_items: &[RolloutItem]) -> Option<TokenUsageInfo> {

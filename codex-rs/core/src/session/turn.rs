@@ -936,6 +936,9 @@ fn resolved_post_compact_recovery_warning(turn_context: &TurnContext) -> String 
     let is_subagent = matches!(&turn_context.session_source, SessionSource::SubAgent(_));
     let default_warning =
         crate::session::default_post_compact_recovery_warning(config, is_subagent).to_string();
+    if !crate::session::rollout_recovery_enabled(config) {
+        return default_warning;
+    }
     let Some(raw) = config.post_compact_recovery_warning.as_deref() else {
         return default_warning;
     };

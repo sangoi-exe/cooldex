@@ -62,6 +62,11 @@ When Codex knows which client started the turn, the legacy notify JSON payload a
 after runtime-owned post-compact recovery context is prepared. This text is a
 UI notice only; Codex injects the structured recovery packet as transient
 developer context and does not persist the warning as conversation history.
+When rollout-backed recovery is unavailable, Codex ignores this override and
+emits the runtime-owned unavailable warning instead.
+
+The removed `pos_compact_instructions` key is not accepted as an alias. A
+config file that still uses it fails to load.
 
 ## JSON Schema
 

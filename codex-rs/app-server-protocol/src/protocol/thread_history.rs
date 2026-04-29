@@ -3749,6 +3749,7 @@ mod tests {
                 phase: "mid_turn".into(),
                 reason: "context_limit".into(),
                 implementation: "local_inline".into(),
+                compaction_anchor: None,
                 latest_compacted_index: Some(2),
                 last_boundary_kind: Some("replacement_history_compacted".into()),
                 created_at_unix_secs: Some(1),

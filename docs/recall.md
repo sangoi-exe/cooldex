@@ -89,3 +89,19 @@
   - `items[]` objects with `kind` (`"reasoning" | "assistant_message" | "tool_context_note" | "reasoning_context_note"`), `source` (`"rollout"` | `"replacement_history"`), `rollout_index` (nullable for items hydrated from sanitized `replacement_history`), `text`, optional `phase`, and optional truncation fields (`truncated`, `truncation.side`, `truncation.original_bytes`, `truncation.returned_bytes`)
 
 For hydrated prompt-gc context notes, `text` preserves the tagged note body, including the leading `chunk_id=...` line from the stored note.
+
+### Post-Compact Runtime Recovery
+
+Auto-compact recovery is runtime-owned state layered on top of `recall`, not a
+second user-message protocol. Local and remote auto-compact persist
+`PostCompactRecovery` rollout lifecycle items outside conversation history,
+bind ready packets to a compaction anchor (`rollout_index` plus a `sha256:`
+digest of the compacted item), and restore pending recovery only when the same
+compaction survives rollback-aware rollout replay.
+
+If the latest surviving compaction has no valid ready recovery entry, resume
+attempts a repair build from the surviving rollout. If preparation was
+interrupted, preparation failed, repair fails, or rollout-backed recovery is
+unavailable, Codex injects a transient
+`mode = "post_compact_runtime_recovery_unavailable"` developer packet instead
+of silently continuing without recovery context.

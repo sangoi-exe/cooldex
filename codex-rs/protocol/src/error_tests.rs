@@ -62,7 +62,7 @@ fn rate_limit_window_fractional_remaining_is_not_depleted_before_reset() {
     };
 
     assert_eq!(window.display_remaining_percent(), 0);
-    assert!(!window.is_depleted_at(0));
+    assert!(!window.is_depleted_at(/*now_unix_seconds*/ 0));
 }
 
 #[test]

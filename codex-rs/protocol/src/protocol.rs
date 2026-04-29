@@ -2877,7 +2877,17 @@ pub struct SessionStateUpdate {
     pub agent_task: Option<SessionAgentTask>,
 }
 
+/// Compaction identity bound to runtime-owned post-compaction recovery state.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct PostCompactRecoveryCompactionAnchor {
+    pub rollout_index: usize,
+    pub digest: String,
+}
+
 /// Runtime-owned post-compaction recovery state persisted outside conversation history.
+// Merge-safety anchor: post-compact recovery is bound to a surviving compaction
+// anchor so rollback/fork replay cannot restore recovery packets from another
+// timeline as active developer context.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
 pub struct PostCompactRecoveryItem {
     pub recovery_id: String,
@@ -2886,6 +2896,8 @@ pub struct PostCompactRecoveryItem {
     pub phase: String,
     pub reason: String,
     pub implementation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_anchor: Option<PostCompactRecoveryCompactionAnchor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_compacted_index: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
