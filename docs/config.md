@@ -56,6 +56,13 @@ Codex can run a notification hook when the agent finishes a turn. See the config
 
 When Codex knows which client started the turn, the legacy notify JSON payload also includes a top-level `client` field. The TUI reports `codex-tui`, and the app server reports the `clientInfo.name` value from `initialize`.
 
+## Post-Compact Recovery Warning
+
+`post_compact_recovery_warning` customizes the user-visible warning emitted
+after runtime-owned post-compact recovery context is prepared. This text is a
+UI notice only; Codex injects the structured recovery packet as transient
+developer context and does not persist the warning as conversation history.
+
 ## JSON Schema
 
 The generated JSON Schema for `config.toml` lives at `codex-rs/core/config.schema.json`.

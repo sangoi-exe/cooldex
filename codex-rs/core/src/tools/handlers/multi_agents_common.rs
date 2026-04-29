@@ -208,11 +208,13 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallE
 
 fn apply_child_prompt_overrides(config: &mut Config) {
     // Merge-safety anchor: child agents now inherit the same AGENTS/project-doc prompt layers as
-    // the lead workspace, but they still replace the lead-only post-compact ritual with the
-    // sub-agent recall warning. Re-run this after any role/profile reload that reconstructs
+    // the lead workspace, but they still replace lead-only post-compact UI wording with the
+    // sub-agent warning. Re-run this after any role/profile reload that reconstructs
     // `Config` from persisted layers.
-    config.pos_compact_instructions =
-        Some(crate::session::default_pos_compact_warning(config, /*is_subagent*/ true).to_string());
+    config.post_compact_recovery_warning = Some(
+        crate::session::default_post_compact_recovery_warning(config, /*is_subagent*/ true)
+            .to_string(),
+    );
 }
 
 pub(crate) async fn finalize_spawn_agent_prompt_config(

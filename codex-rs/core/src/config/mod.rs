@@ -380,8 +380,8 @@ pub struct Config {
     /// Compact prompt override.
     pub compact_prompt: Option<String>,
 
-    /// Optional instructions appended after successful remote auto-compaction.
-    pub pos_compact_instructions: Option<String>,
+    /// Optional user-visible warning after runtime-owned post-compact recovery is prepared.
+    pub post_compact_recovery_warning: Option<String>,
 
     /// Optional commit attribution text for commit message co-author trailers.
     ///
@@ -2149,14 +2149,17 @@ impl Config {
                 Some(trimmed.to_string())
             }
         });
-        let pos_compact_instructions = cfg.pos_compact_instructions.as_ref().and_then(|value| {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        });
+        let post_compact_recovery_warning =
+            cfg.post_compact_recovery_warning
+                .as_ref()
+                .and_then(|value| {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                });
 
         let commit_attribution = cfg.commit_attribution;
 
@@ -2406,7 +2409,7 @@ impl Config {
             personality,
             developer_instructions,
             compact_prompt,
-            pos_compact_instructions,
+            post_compact_recovery_warning,
             commit_attribution,
             include_permissions_instructions,
             include_apps_instructions,

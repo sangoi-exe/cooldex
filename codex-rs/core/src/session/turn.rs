@@ -112,6 +112,7 @@ use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -694,6 +695,19 @@ pub(crate) async fn run_turn(
                         .await;
                         return None;
                     }
+                    if let Err(err) = sess
+                        .clear_pending_post_compact_recovery_after_successful_turn()
+                        .await
+                    {
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Error(err.to_error_event(Some(
+                                "Error clearing post-compact recovery state".to_string(),
+                            ))),
+                        )
+                        .await;
+                        return None;
+                    }
                     break;
                 }
                 continue;
@@ -874,8 +888,14 @@ async fn run_auto_compact(
             phase,
         )
         .await?;
-        let warning = resolved_pos_compact_warning(turn_context.config.as_ref());
-        sess.record_model_warning(warning, turn_context).await;
+        begin_auto_compact_recovery(
+            sess,
+            turn_context,
+            reason,
+            phase,
+            "remote_responses_compact",
+        )
+        .await?;
     } else {
         run_inline_auto_compact_task(
             Arc::clone(sess),
@@ -885,14 +905,38 @@ async fn run_auto_compact(
             phase,
         )
         .await?;
+        begin_auto_compact_recovery(sess, turn_context, reason, phase, "local_inline").await?;
     }
     Ok(())
 }
 
-fn resolved_pos_compact_warning(config: &crate::config::Config) -> String {
+pub(crate) async fn begin_auto_compact_recovery(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    reason: CompactionReason,
+    phase: CompactionPhase,
+    implementation: &'static str,
+) -> CodexResult<()> {
+    let warning = resolved_post_compact_recovery_warning(turn_context);
+    if let Err(error) = sess
+        .begin_post_compact_recovery(turn_context, reason, phase, implementation, warning)
+        .await
+    {
+        let event = EventMsg::Error(
+            error.to_error_event(Some("Error preparing post-compact recovery".to_string())),
+        );
+        sess.send_event(turn_context, event).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn resolved_post_compact_recovery_warning(turn_context: &TurnContext) -> String {
+    let config = turn_context.config.as_ref();
+    let is_subagent = matches!(&turn_context.session_source, SessionSource::SubAgent(_));
     let default_warning =
-        crate::session::default_pos_compact_warning(config, /*is_subagent*/ false).to_string();
-    let Some(raw) = config.pos_compact_instructions.as_deref() else {
+        crate::session::default_post_compact_recovery_warning(config, is_subagent).to_string();
+    let Some(raw) = config.post_compact_recovery_warning.as_deref() else {
         return default_warning;
     };
 
@@ -2309,6 +2353,9 @@ pub(crate) async fn run_sampling_request(
                 .await
                 .for_prompt(&turn_context.model_info.input_modalities)
         };
+        let prompt_input = sess
+            .inject_pending_post_compact_recovery(prompt_input)
+            .await;
         let mut prompt = build_prompt(
             prompt_input,
             router.as_ref(),

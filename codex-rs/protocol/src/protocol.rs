@@ -2877,6 +2877,37 @@ pub struct SessionStateUpdate {
     pub agent_task: Option<SessionAgentTask>,
 }
 
+/// Runtime-owned post-compaction recovery state persisted outside conversation history.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct PostCompactRecoveryItem {
+    pub recovery_id: String,
+    pub turn_id: String,
+    pub status: PostCompactRecoveryStatus,
+    pub phase: String,
+    pub reason: String,
+    pub implementation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_compacted_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_boundary_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_unix_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum PostCompactRecoveryStatus {
+    Started,
+    Ready,
+    Failed,
+    Cleared,
+}
+
 /// SessionMeta contains session-level data that doesn't correspond to a specific turn.
 ///
 /// NOTE: There used to be an `instructions` field here, which stored user_instructions, but we
@@ -2956,6 +2987,7 @@ pub enum RolloutItem {
     SessionState(SessionStateUpdate),
     ResponseItem(ResponseItem),
     Compacted(CompactedItem),
+    PostCompactRecovery(PostCompactRecoveryItem),
     TurnContext(TurnContextItem),
     EventMsg(EventMsg),
 }

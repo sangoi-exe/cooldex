@@ -741,6 +741,9 @@ impl RolloutRecorder {
                     RolloutItem::Compacted(item) => {
                         items.push(RolloutItem::Compacted(item));
                     }
+                    RolloutItem::PostCompactRecovery(item) => {
+                        items.push(RolloutItem::PostCompactRecovery(item));
+                    }
                     RolloutItem::SessionState(item) => {
                         items.push(RolloutItem::SessionState(item));
                     }
@@ -1676,6 +1679,7 @@ async fn resume_candidate_matches_cwd(
             RolloutItem::SessionMeta(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::Compacted(_)
+            | RolloutItem::PostCompactRecovery(_)
             | RolloutItem::SessionState(_)
             | RolloutItem::EventMsg(_) => None,
         })

@@ -74,6 +74,7 @@ pub fn builder_from_items(
         RolloutItem::SessionMeta(meta_line) => Some(meta_line),
         RolloutItem::ResponseItem(_)
         | RolloutItem::Compacted(_)
+        | RolloutItem::PostCompactRecovery(_)
         | RolloutItem::SessionState(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::EventMsg(_) => None,
@@ -129,6 +130,7 @@ pub async fn extract_metadata_from_rollout(
             RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
             RolloutItem::ResponseItem(_)
             | RolloutItem::Compacted(_)
+            | RolloutItem::PostCompactRecovery(_)
             | RolloutItem::SessionState(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::EventMsg(_) => None,

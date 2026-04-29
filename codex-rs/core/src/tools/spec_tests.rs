@@ -220,6 +220,46 @@ fn find_namespace_function_tool<'a>(
         .unwrap_or_else(|| panic!("expected tool {expected_namespace}{expected_name} in namespace"))
 }
 
+#[tokio::test]
+async fn recall_tool_schema_is_strict_empty_object() {
+    let config = test_config().await;
+    let model_info = construct_model_info_offline("gpt-5-codex", &config);
+    let features = Features::with_defaults();
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        image_generation_tool_auth_allowed: true,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*deferred_mcp_tools*/ None,
+        &[],
+    )
+    .build();
+    let recall = find_tool(&tools, "recall");
+    let ToolSpec::Function(ResponsesApiTool {
+        strict, parameters, ..
+    }) = &recall.spec
+    else {
+        panic!("recall should be a function tool");
+    };
+
+    assert!(*strict);
+    assert_eq!(parameters.properties.as_ref().map(BTreeMap::len), Some(0));
+    assert_eq!(parameters.required, None);
+    assert_eq!(
+        parameters.additional_properties,
+        Some(AdditionalProperties::Boolean(false))
+    );
+}
+
 async fn multi_agent_v2_tools_config() -> ToolsConfig {
     let config = test_config().await;
     let model_info = construct_model_info_offline("gpt-5-codex", &config);

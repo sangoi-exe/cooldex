@@ -16,6 +16,7 @@ use crate::response_item_utils::is_unified_exec_output_frame;
 use crate::response_item_utils::is_unified_exec_token_qty_marker_line;
 use crate::rid::rid_to_string;
 use crate::session::PreviousTurnSettings;
+use crate::session::post_compact_recovery::PendingPostCompactRecovery;
 use crate::session::session::SessionConfiguration;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::state::ContextItemSummary;
@@ -59,6 +60,8 @@ pub(crate) struct SessionState {
     pub(crate) agent_task: Option<RegisteredAgentTask>,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_source: Option<codex_hooks::SessionStartSource>,
+    pending_post_compact_recovery: Option<PendingPostCompactRecovery>,
+    next_post_compact_recovery_sequence: u64,
     granted_permissions: Option<PermissionProfile>,
     next_turn_is_first: bool,
 }
@@ -91,6 +94,8 @@ impl SessionState {
             agent_task: None,
             active_connector_selection: HashSet::new(),
             pending_session_start_source: None,
+            pending_post_compact_recovery: None,
+            next_post_compact_recovery_sequence: 0,
             granted_permissions: None,
             next_turn_is_first: true,
         }
@@ -512,6 +517,41 @@ impl SessionState {
         &mut self,
     ) -> Option<codex_hooks::SessionStartSource> {
         self.pending_session_start_source.take()
+    }
+
+    pub(crate) fn set_pending_post_compact_recovery(
+        &mut self,
+        recovery: Option<PendingPostCompactRecovery>,
+    ) {
+        self.pending_post_compact_recovery = recovery;
+    }
+
+    pub(crate) fn pending_post_compact_recovery(&self) -> Option<&PendingPostCompactRecovery> {
+        self.pending_post_compact_recovery.as_ref()
+    }
+
+    pub(crate) fn pending_post_compact_recovery_mut(
+        &mut self,
+    ) -> Option<&mut PendingPostCompactRecovery> {
+        self.pending_post_compact_recovery.as_mut()
+    }
+
+    pub(crate) fn clear_pending_post_compact_recovery(
+        &mut self,
+    ) -> Option<PendingPostCompactRecovery> {
+        self.pending_post_compact_recovery.take()
+    }
+
+    pub(crate) fn allocate_post_compact_recovery_sequence(&mut self) -> u64 {
+        let sequence = self.next_post_compact_recovery_sequence;
+        self.next_post_compact_recovery_sequence =
+            self.next_post_compact_recovery_sequence.saturating_add(1);
+        sequence
+    }
+
+    pub(crate) fn ensure_next_post_compact_recovery_sequence_at_least(&mut self, next: u64) {
+        self.next_post_compact_recovery_sequence =
+            self.next_post_compact_recovery_sequence.max(next);
     }
 
     pub(crate) fn record_granted_permissions(&mut self, permissions: PermissionProfile) {

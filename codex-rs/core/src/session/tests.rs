@@ -2,6 +2,7 @@ use super::turn::AssistantMessageStreamParsers;
 use super::turn::AutoSwitchRefreshState;
 use super::turn::UsageLimitHandlingPolicy;
 use super::turn::auto_switch_refresh_account_ids_from_roster;
+use super::turn::begin_auto_compact_recovery;
 use super::turn::collect_explicit_app_ids_from_skill_items;
 use super::turn::filter_connectors_for_input;
 use super::turn::handle_usage_limit_for_execution_mode;
@@ -56,6 +57,8 @@ use crate::turn_diff_tracker::TurnDiffTracker;
 use base64::Engine;
 use chrono::TimeZone;
 use chrono::Utc;
+use codex_analytics::CompactionPhase;
+use codex_analytics::CompactionReason;
 use codex_app_server_protocol::AppInfo;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::ProjectConfig;
@@ -113,6 +116,7 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::NetworkApprovalProtocol;
 use codex_protocol::protocol::NonSteerableTurnKind;
+use codex_protocol::protocol::PostCompactRecoveryStatus;
 use codex_protocol::protocol::PromptGcCompactionMetadata;
 use codex_protocol::protocol::PromptGcExecutionPhase;
 use codex_protocol::protocol::PromptGcOutcomeKind;
@@ -713,31 +717,95 @@ async fn prompt_gc_sidecar_no_eligible_chunks_complete_without_visible_accountin
 }
 
 #[tokio::test]
-async fn default_pos_compact_warning_keeps_recall_when_rollout_recovery_is_available() {
+async fn default_post_compact_recovery_warning_reports_runtime_recovery_when_available() {
     let config = test_config().await;
 
     assert_eq!(
-        default_pos_compact_warning(&config, /*is_subagent*/ false),
-        AUTO_COMPACT_RECON_WARNING_BODY
+        default_post_compact_recovery_warning(&config, /*is_subagent*/ false),
+        AUTO_COMPACT_RECOVERY_WARNING_BODY
     );
     assert_eq!(
-        default_pos_compact_warning(&config, /*is_subagent*/ true),
-        SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY
+        default_post_compact_recovery_warning(&config, /*is_subagent*/ true),
+        SUBAGENT_AUTO_COMPACT_RECOVERY_WARNING_BODY
     );
 }
 
 #[tokio::test]
-async fn default_pos_compact_warning_drops_recall_for_ephemeral_sessions() {
+async fn default_post_compact_recovery_warning_reports_missing_rollout_recovery() {
     let mut config = test_config().await;
     config.ephemeral = true;
 
     assert_eq!(
-        default_pos_compact_warning(&config, /*is_subagent*/ false),
-        AUTO_COMPACT_RECON_NO_RECALL_WARNING_BODY
+        default_post_compact_recovery_warning(&config, /*is_subagent*/ false),
+        AUTO_COMPACT_RECOVERY_NO_ROLLOUT_WARNING_BODY
     );
     assert_eq!(
-        default_pos_compact_warning(&config, /*is_subagent*/ true),
-        SUBAGENT_AUTO_COMPACT_NO_RECALL_WARNING_BODY
+        default_post_compact_recovery_warning(&config, /*is_subagent*/ true),
+        SUBAGENT_AUTO_COMPACT_RECOVERY_NO_ROLLOUT_WARNING_BODY
+    );
+}
+
+#[tokio::test]
+async fn auto_compact_recovery_packet_failure_emits_error_and_failed_rollout_item() {
+    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let rollout_path = attach_rollout_recorder(&session).await;
+
+    let error = begin_auto_compact_recovery(
+        &session,
+        &turn_context,
+        CompactionReason::ContextLimit,
+        CompactionPhase::MidTurn,
+        "test_compact",
+    )
+    .await
+    .expect_err("missing compacted marker should fail recovery preparation");
+
+    assert!(
+        error
+            .to_string()
+            .contains("current session rollout has no compacted marker"),
+        "unexpected recovery error: {error}"
+    );
+
+    let error_event = timeout(Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.expect("event");
+            if let EventMsg::Error(payload) = event.msg {
+                break payload;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for post-compact recovery error");
+    assert!(
+        error_event
+            .message
+            .contains("Error preparing post-compact recovery"),
+        "unexpected error event: {}",
+        error_event.message
+    );
+
+    session.flush_rollout().await.expect("flush rollout");
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    let statuses: Vec<_> = resumed
+        .history
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::PostCompactRecovery(item) => Some(item.status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![
+            PostCompactRecoveryStatus::Started,
+            PostCompactRecoveryStatus::Failed,
+        ]
     );
 }
 

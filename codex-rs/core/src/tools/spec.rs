@@ -127,7 +127,7 @@ fn create_recall_tool() -> ToolSpec {
         description:
                 "Recall recent reasoning, assistant messages, and prompt-gc context notes from the current session rollout before the latest real non-observational compaction marker (tool outputs excluded)."
                     .to_string(),
-        strict: false,
+        strict: true,
         defer_loading: None,
         parameters: JsonSchema::object(properties, None, Some(false.into())),
         output_schema: None,

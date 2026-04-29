@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use std::fs;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -20,6 +21,8 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::PostCompactRecoveryItem;
+use codex_protocol::protocol::PostCompactRecoveryStatus;
 use codex_protocol::protocol::RealtimeConversationRealtimeEvent;
 use codex_protocol::protocol::RealtimeEvent;
 use codex_protocol::protocol::RealtimeOutputModality;
@@ -31,7 +34,6 @@ use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
 use core_test_support::responses;
-use core_test_support::responses::mount_models_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_websocket_server;
@@ -62,9 +64,39 @@ fn estimate_compact_payload_tokens(request: &responses::ResponsesRequest) -> i64
         .saturating_add(approx_token_count(&request.instructions_text()))
 }
 
-const AUTO_COMPACT_RECON_WARNING: &str = "STOP. Codex CLI has just performed an auto-compact. BEFORE any other action: call recall. Then recon unstaged changes and update_plan status. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
-// Merge-safety anchor: this fixture string must match compact.rs and runtime
-// auto-compact warning injection so recall-first assertions stay coherent.
+const POST_COMPACT_RECOVERY_TAG: &str = "<post_compact_recovery>";
+// Merge-safety anchor: this fixture string must match the runtime-owned
+// post-compact recovery packet injection boundary.
+fn chatgpt_remote_compact_test_codex() -> TestCodexBuilder {
+    test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            let model = config
+                .model
+                .clone()
+                .unwrap_or_else(|| "gpt-5.1-codex".to_string());
+            config.model_catalog = Some(ModelsResponse {
+                models: vec![model_info_with_context_window(&model, 273_000)],
+            });
+        })
+}
+
+fn rollout_post_compact_recovery_ids(rollout_path: &PathBuf) -> Result<Vec<String>> {
+    let rollout_text = fs::read_to_string(rollout_path)?;
+    let mut recovery_ids = Vec::new();
+    for line in rollout_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let entry = serde_json::from_str::<RolloutLine>(line)?;
+        if let RolloutItem::PostCompactRecovery(item) = entry.item {
+            recovery_ids.push(item.recovery_id);
+        }
+    }
+    Ok(recovery_ids)
+}
+
 fn model_info_with_context_window(slug: &str, context_window: i64) -> ModelInfo {
     let models_response: ModelsResponse =
         serde_json::from_str(include_str!("../../../models-manager/models.json"))
@@ -287,10 +319,7 @@ async fn wait_for_turn_complete(codex: &codex_core::CodexThread) {
 async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let harness = TestCodexHarness::with_builder(
-        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
-    )
-    .await?;
+    let harness = TestCodexHarness::with_builder(chatgpt_remote_compact_test_codex()).await?;
     let codex = harness.test().codex.clone();
     let session_id = harness.test().session_configured.session_id.to_string();
 
@@ -435,10 +464,7 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
 async fn remote_compact_runs_automatically() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let harness = TestCodexHarness::with_builder(
-        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
-    )
-    .await?;
+    let harness = TestCodexHarness::with_builder(chatgpt_remote_compact_test_codex()).await?;
     let codex = harness.test().codex.clone();
     let session_id = harness.test().session_configured.session_id.to_string();
 
@@ -496,22 +522,25 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     assert!(follow_up_body.contains("REMOTE_COMPACTED_SUMMARY"));
     assert!(follow_up_body.contains("ENCRYPTED_COMPACTION_SUMMARY"));
     assert!(
-        follow_up_body.contains(AUTO_COMPACT_RECON_WARNING),
-        "expected follow-up request to include hard auto-compact recon warning"
+        follow_up_body.contains(POST_COMPACT_RECOVERY_TAG),
+        "expected follow-up request to include runtime recovery packet"
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_auto_compact_warning_is_emitted_after_each_compaction() -> Result<()> {
+async fn remote_auto_compact_recovery_packet_is_injected_after_each_compaction() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let harness = TestCodexHarness::with_builder(
-        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
-    )
-    .await?;
+    let harness = TestCodexHarness::with_builder(chatgpt_remote_compact_test_codex()).await?;
     let codex = harness.test().codex.clone();
+    let rollout_path = harness
+        .test()
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
 
     let responses_mock = responses::mount_sse_sequence(
         harness.server(),
@@ -560,7 +589,7 @@ async fn remote_auto_compact_warning_is_emitted_after_each_compaction() -> Resul
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
-                text: "trigger one-shot auto-compact warning".into(),
+                text: "trigger one-shot auto-compact recovery".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
@@ -583,23 +612,154 @@ async fn remote_auto_compact_warning_is_emitted_after_each_compaction() -> Resul
     let third_request_body = requests[2].body_json().to_string();
 
     assert!(
-        !first_request_body.contains(AUTO_COMPACT_RECON_WARNING),
-        "request before auto-compact should not include recon warning"
+        !first_request_body.contains(POST_COMPACT_RECOVERY_TAG),
+        "request before auto-compact should not include recovery packet"
     );
     assert!(
-        second_request_body.contains(AUTO_COMPACT_RECON_WARNING),
-        "first request after auto-compact should include recon warning"
+        second_request_body.contains(POST_COMPACT_RECOVERY_TAG),
+        "first request after auto-compact should include recovery packet"
     );
     assert!(
-        third_request_body.contains(AUTO_COMPACT_RECON_WARNING),
-        "second request after second auto-compact should include recon warning"
+        third_request_body.contains(POST_COMPACT_RECOVERY_TAG),
+        "second request after second auto-compact should include recovery packet"
+    );
+
+    codex.submit(Op::Shutdown).await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    let recovery_ids = rollout_post_compact_recovery_ids(&rollout_path)?;
+    let unique_recovery_ids: std::collections::BTreeSet<_> = recovery_ids.iter().cloned().collect();
+    assert_eq!(
+        unique_recovery_ids.len(),
+        2,
+        "expected exactly two recovery IDs for two compact generations, got {recovery_ids:?}"
+    );
+    assert!(
+        unique_recovery_ids
+            .iter()
+            .any(|recovery_id| recovery_id.ends_with(":recovery-0")),
+        "expected first recovery sequence in {unique_recovery_ids:?}"
+    );
+    assert!(
+        unique_recovery_ids
+            .iter()
+            .any(|recovery_id| recovery_id.ends_with(":recovery-1")),
+        "expected second recovery sequence in {unique_recovery_ids:?}"
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_pre_sampling_auto_compact_emits_warning_after_model_switch() -> Result<()> {
+async fn resume_injects_uncleared_post_compact_recovery_packet() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = wiremock::MockServer::start().await;
+    let mut initial_builder = chatgpt_remote_compact_test_codex();
+    let initial = initial_builder.build(&server).await?;
+    let home = initial.home.clone();
+    let rollout_path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    let responses_mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_assistant_message("m1", "INITIAL_BEFORE_RECOVERY_RESUME"),
+                responses::ev_completed("resp-1"),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("m2", "AFTER_RECOVERY_RESUME"),
+                responses::ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    initial
+        .codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "initial turn before synthetic pending recovery".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await?;
+    wait_for_event(&initial.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    initial.codex.submit(Op::Shutdown).await?;
+    wait_for_event(&initial.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    let restored_packet_marker = "RESTORED_UNCLEARED_READY_RECOVERY_PACKET";
+    let recovery_packet =
+        format!("{POST_COMPACT_RECOVERY_TAG}\n{restored_packet_marker}\n</post_compact_recovery>");
+    let recovery_line = serde_json::to_string(&RolloutLine {
+        timestamp: "2026-04-29T00:00:00.000Z".to_string(),
+        item: RolloutItem::PostCompactRecovery(PostCompactRecoveryItem {
+            recovery_id: "turn_id:mid_turn:recovery-0".to_string(),
+            turn_id: "turn_id".to_string(),
+            status: PostCompactRecoveryStatus::Ready,
+            phase: "mid_turn".to_string(),
+            reason: "context_limit".to_string(),
+            implementation: "test_fixture".to_string(),
+            latest_compacted_index: Some(1),
+            last_boundary_kind: Some("replacement_history_compacted".to_string()),
+            created_at_unix_secs: Some(1),
+            packet: Some(recovery_packet),
+            failure: None,
+        }),
+    })?;
+    let mut rollout_file = fs::OpenOptions::new().append(true).open(&rollout_path)?;
+    writeln!(rollout_file, "{recovery_line}")?;
+
+    let mut resume_builder = chatgpt_remote_compact_test_codex();
+    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
+    resumed
+        .codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "turn after resume should receive pending recovery".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await?;
+    wait_for_event(&resumed.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = responses_mock.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected initial request plus one resumed request"
+    );
+    let resumed_body = requests[1].body_json().to_string();
+    assert!(
+        resumed_body.contains(POST_COMPACT_RECOVERY_TAG),
+        "resumed request should include pending recovery packet"
+    );
+    assert!(
+        resumed_body.contains(restored_packet_marker),
+        "resumed request should include the exact restored recovery packet"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_pre_sampling_auto_compact_injects_recovery_after_model_switch() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let previous_model = "gpt-5.2-codex";
@@ -615,21 +775,16 @@ async fn remote_pre_sampling_auto_compact_emits_warning_after_model_switch() -> 
                     .enable(Feature::RemoteModels)
                     .expect("remote models feature should be enabled for this test");
                 config.model_auto_compact_token_limit = Some(100_000);
+                config.model_catalog = Some(ModelsResponse {
+                    models: vec![
+                        model_info_with_context_window(previous_model, 273_000),
+                        model_info_with_context_window(next_model, 125_000),
+                    ],
+                });
             }),
     )
     .await?;
     let codex = harness.test().codex.clone();
-
-    let _models_mock = mount_models_once(
-        harness.server(),
-        ModelsResponse {
-            models: vec![
-                model_info_with_context_window(previous_model, 273_000),
-                model_info_with_context_window(next_model, 125_000),
-            ],
-        },
-    )
-    .await;
 
     let responses_mock = responses::mount_sse_sequence(
         harness.server(),
@@ -729,8 +884,8 @@ async fn remote_pre_sampling_auto_compact_emits_warning_after_model_switch() -> 
     let second_request_body = requests[1].body_json().to_string();
 
     assert!(
-        !first_request_body.contains(AUTO_COMPACT_RECON_WARNING),
-        "request before pre-sampling auto-compact should not include warning"
+        !first_request_body.contains(POST_COMPACT_RECOVERY_TAG),
+        "request before pre-sampling auto-compact should not include recovery packet"
     );
     assert!(
         second_request_body.contains("REMOTE_PRE_SAMPLING_COMPACTED_SUMMARY"),
@@ -741,8 +896,8 @@ async fn remote_pre_sampling_auto_compact_emits_warning_after_model_switch() -> 
         "request after pre-sampling auto-compact should include compaction item"
     );
     assert!(
-        second_request_body.contains(AUTO_COMPACT_RECON_WARNING),
-        "request after pre-sampling remote auto-compact should include warning"
+        second_request_body.contains(POST_COMPACT_RECOVERY_TAG),
+        "request after pre-sampling remote auto-compact should include recovery packet"
     );
 
     Ok(())
@@ -1082,8 +1237,8 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
     );
     let compact_request_body = first_compact_mock.single_request().body_json().to_string();
     assert!(
-        !compact_request_body.contains(AUTO_COMPACT_RECON_WARNING),
-        "failed compaction should not inject hard auto-compact recon warning"
+        !compact_request_body.contains(POST_COMPACT_RECOVERY_TAG),
+        "failed compaction should not inject runtime recovery packet"
     );
     assert_eq!(
         first_compact_mock.requests().len(),
@@ -1116,8 +1271,8 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
 
     let recovery_request_body = manual_compact_mock.single_request().body_json().to_string();
     assert!(
-        !recovery_request_body.contains(AUTO_COMPACT_RECON_WARNING),
-        "manual compact request after failed auto-compact should not inherit recon warning"
+        !recovery_request_body.contains(POST_COMPACT_RECOVERY_TAG),
+        "manual compact request after failed auto-compact should not inherit recovery packet"
     );
 
     insta::assert_snapshot!(

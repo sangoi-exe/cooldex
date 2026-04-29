@@ -168,6 +168,7 @@ use codex_protocol::exec_output::StreamOutput;
 mod agent_task_lifecycle;
 mod handlers;
 mod mcp;
+pub(crate) mod post_compact_recovery;
 mod review;
 mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
@@ -377,26 +378,26 @@ pub struct PromptGcActivityEdge {
 }
 
 pub(crate) const THREAD_START_SKILLS_TRIMMED_WARNING_MESSAGE: &str = "Some enabled skills were not included in the model-visible skills list for this session. Mention a skill by name or path if you need it.";
-pub(crate) const AUTO_COMPACT_RECON_WARNING_BODY: &str = "STOP. Codex CLI has just performed an auto-compact. BEFORE any other action: call recall. Then recon unstaged changes and update_plan status. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
-pub(crate) const AUTO_COMPACT_RECON_NO_RECALL_WARNING_BODY: &str = "STOP. Codex CLI has just performed an auto-compact. BEFORE any other action: recon unstaged changes and update_plan status. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
-// Merge-safety anchor: sub-agents must get a recall-only post-compact warning so child threads do
-// not inherit lead-only recon/manage_context rituals from workspace-local overlays.
-pub(crate) const SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY: &str = "STOP. Codex CLI has just performed an auto-compact. BEFORE any other action: call recall. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
-pub(crate) const SUBAGENT_AUTO_COMPACT_NO_RECALL_WARNING_BODY: &str = "STOP. Codex CLI has just performed an auto-compact. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
+pub(crate) const AUTO_COMPACT_RECOVERY_WARNING_BODY: &str = "Codex CLI performed an auto-compact. Runtime recovery context was prepared automatically; continue the interrupted task after checking live state if continuity is unclear.";
+pub(crate) const AUTO_COMPACT_RECOVERY_NO_ROLLOUT_WARNING_BODY: &str = "Codex CLI performed an auto-compact. Runtime recovery context is unavailable because this session has no rollout recovery; inspect live state before continuing.";
+// Merge-safety anchor: sub-agents keep child-specific post-compact wording so
+// child threads do not inherit lead-only recon rituals from workspace-local overlays.
+pub(crate) const SUBAGENT_AUTO_COMPACT_RECOVERY_WARNING_BODY: &str = "Codex CLI performed an auto-compact in this sub-agent. Runtime recovery context was prepared automatically; continue the interrupted task.";
+pub(crate) const SUBAGENT_AUTO_COMPACT_RECOVERY_NO_ROLLOUT_WARNING_BODY: &str = "Codex CLI performed an auto-compact in this sub-agent. Runtime recovery context is unavailable because this session has no rollout recovery; inspect live state before continuing.";
 
 pub(crate) fn rollout_recovery_enabled(config: &crate::config::Config) -> bool {
     !config.ephemeral
 }
 
-pub(crate) fn default_pos_compact_warning(
+pub(crate) fn default_post_compact_recovery_warning(
     config: &crate::config::Config,
     is_subagent: bool,
 ) -> &'static str {
     match (is_subagent, rollout_recovery_enabled(config)) {
-        (false, true) => AUTO_COMPACT_RECON_WARNING_BODY,
-        (false, false) => AUTO_COMPACT_RECON_NO_RECALL_WARNING_BODY,
-        (true, true) => SUBAGENT_AUTO_COMPACT_RECALL_WARNING_BODY,
-        (true, false) => SUBAGENT_AUTO_COMPACT_NO_RECALL_WARNING_BODY,
+        (false, true) => AUTO_COMPACT_RECOVERY_WARNING_BODY,
+        (false, false) => AUTO_COMPACT_RECOVERY_NO_ROLLOUT_WARNING_BODY,
+        (true, true) => SUBAGENT_AUTO_COMPACT_RECOVERY_WARNING_BODY,
+        (true, false) => SUBAGENT_AUTO_COMPACT_RECOVERY_NO_ROLLOUT_WARNING_BODY,
     }
 }
 
@@ -1236,6 +1237,8 @@ impl Session {
             InitialHistory::Resumed(resumed_history) => {
                 let rollout_items = resumed_history.history;
                 self.restore_persisted_agent_task(&rollout_items).await;
+                self.restore_post_compact_recovery_from_rollout(&rollout_items)
+                    .await;
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;

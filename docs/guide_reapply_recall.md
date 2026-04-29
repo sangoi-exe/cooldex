@@ -23,19 +23,25 @@ This document lists the required maintenance touchpoints and validation when `re
 - Otherwise, returned rollout scan starts immediately after the lower boundary marker; when no lower boundary exists, scan starts at index `0`.
 - Returned items include assistant messages, reasoning text, and prompt-gc tool/reasoning context notes hydrated from replacement-history boundaries.
 - Returned items exclude ordinary user messages, tool calls, and tool outputs.
+- Successful payloads report `integrity`, `boundary`, `counts`, and `user_anchors` in both compact and debug modes.
+- `user_anchors.policy` is `missing_latest_only`: report latest real user coverage and include at most one `missing_latest_user_anchor` only when the latest compacted `replacement_history` is present and missing that anchor.
+- Synthetic post-compact recovery warnings and prompt-gc context notes are never real user anchors.
 - Opaque encrypted-only reasoning is intentionally skipped because it has no semantic payload to reapply.
 - `recall_kbytes_limit` applies a KiB byte cap from the tail of matching items.
+- If the newest matching item alone exceeds `recall_kbytes_limit`, return a suffix-truncated item with explicit truncation metadata instead of returning empty solely because that newest item is too large.
 - `recall_debug` controls output shape:
   - unset/`false` (default): compact payload (`mode = "recall_pre_compact_compact"`)
     - includes `legend["[r]"] = "reasoning"`, `legend["[am]"] = "assistant message"`, `legend["[tc]"] = "tool context note"`, and `legend["[rc]"] = "reasoning context note"`
+    - returns numbered string entries; truncated entries include `[truncated_from_start][bytes=<returned>/<original>]`
   - `true`: debug payload (`mode = "recall_pre_compact"`)
 - In debug mode, `filters.include_context_notes = true`.
 - In debug mode, replacement-history-derived items must report `source = "replacement_history"` and may use `rollout_index = null`; raw rollout-derived items use `source = "rollout"` with a concrete rollout index.
 - In debug mode, hydrated prompt-gc notes use `kind = "tool_context_note"` or `kind = "reasoning_context_note"` and preserve the tagged note body, including the leading `chunk_id=...` line.
-- Malformed rollout JSONL lines are skipped before normal payload construction; in debug mode, successful responses must expose the skipped-line count via `integrity.rollout_parse_errors`.
-- In debug mode, `integrity.status` must be exactly `"ok"` when no malformed lines were skipped and `"degraded"` when at least one malformed line was skipped.
+- Malformed rollout JSONL lines are skipped before normal payload construction; successful responses must expose the skipped-line count via `integrity.rollout_parse_errors`.
+- `integrity.status` must be exactly `"ok"` when no malformed lines were skipped and `"degraded"` when at least one malformed line was skipped.
+- `integrity.truncated`, `counts.dropped_items`, and item-level truncation metadata must reflect byte-budget trimming.
 - If no compaction marker exists after malformed lines are skipped, recall fails loud with `stop_reason = "no_compaction_marker"`.
-- Merge-safety anchor: keep this recall-first recovery contract aligned with auto-compact warning coverage in `codex-rs/core/tests/suite/compact.rs` and `codex-rs/core/tests/suite/compact_remote.rs`.
+- Merge-safety anchor: keep this recall recovery contract aligned with runtime auto-compact recovery packet coverage in `codex-rs/core/tests/suite/compact.rs` and `codex-rs/core/tests/suite/compact_remote.rs`.
 
 ## Required Touchpoints for Contract Changes
 
@@ -45,7 +51,7 @@ When changing recall behavior, update these in the same change:
 - `codex-rs/core/src/tools/spec.rs` when the tool description or output-surface wording changes
 - `codex-rs/core/src/prompt_gc_rollout.rs` when prompt-gc hydratability or rollback-discard boundary rules move
 - `codex-rs/core/src/session/rollout_reconstruction.rs` when legacy-standard compaction replay/recovery semantics move
-- `codex-rs/core/src/session/mod.rs`, `codex-rs/core/tests/suite/compact.rs`, and `codex-rs/core/tests/suite/compact_remote.rs` when recall-first warning text or injection changes
+- `codex-rs/core/src/session/mod.rs`, `codex-rs/core/tests/suite/compact.rs`, and `codex-rs/core/tests/suite/compact_remote.rs` when runtime recovery warning text or packet injection changes
 - `docs/recall.md`
 - `docs/guide_reapply_recall.md`
 - `AGENTS.md` when the recall inventory or source-of-truth seams change

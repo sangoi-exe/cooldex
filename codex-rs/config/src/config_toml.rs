@@ -151,8 +151,8 @@ pub struct ConfigToml {
     /// Compact prompt used for history compaction.
     pub compact_prompt: Option<String>,
 
-    /// Optional instructions appended after successful remote auto-compaction.
-    pub pos_compact_instructions: Option<String>,
+    /// Optional user-visible warning after runtime-owned post-compact recovery is prepared.
+    pub post_compact_recovery_warning: Option<String>,
 
     /// Optional commit attribution text for commit message co-author trailers.
     ///

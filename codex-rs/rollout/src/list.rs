@@ -1082,6 +1082,11 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             RolloutItem::SessionState(_) => {
                 // Not included in `head`; skip.
             }
+            RolloutItem::PostCompactRecovery(_) => {
+                // Merge-safety anchor: typed post-compact recovery is runtime
+                // state, not visible or head-renderable transcript content.
+                // Not included in `head`; skip.
+            }
             RolloutItem::Compacted(_) => {
                 // Not included in `head`; skip.
             }
@@ -1137,6 +1142,7 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
                     }
                 }
                 RolloutItem::Compacted(_)
+                | RolloutItem::PostCompactRecovery(_)
                 | RolloutItem::SessionState(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::EventMsg(_) => {}

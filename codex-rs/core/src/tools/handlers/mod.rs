@@ -13,7 +13,7 @@ mod plan;
 // Merge-safety anchor: prompt_gc helper exposure must stay crate-visible for the
 // runtime-owned summary flow without re-registering the removed prompt_gc tool loop.
 pub(crate) mod prompt_gc;
-mod recall;
+pub(crate) mod recall;
 mod request_permissions;
 mod request_user_input;
 mod shell;

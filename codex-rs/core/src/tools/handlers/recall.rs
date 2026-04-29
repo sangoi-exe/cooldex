@@ -86,6 +86,136 @@ struct RecallItem {
     text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    truncation: Option<RecallItemTruncation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecallItemTruncation {
+    side: &'static str,
+    original_bytes: usize,
+    returned_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecallIntegrityMetadata {
+    status: &'static str,
+    rollout_parse_errors: usize,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecallBoundaryMetadata {
+    start_index: usize,
+    last_boundary_index: Option<usize>,
+    last_boundary_kind: Option<&'static str>,
+    latest_compacted_index: usize,
+    compacted_markers_seen: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecallFilters {
+    include_reasoning: bool,
+    include_assistant_messages: bool,
+    include_context_notes: bool,
+    exclude_tool_output: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecallCounts {
+    matching_pre_compact_items: usize,
+    returned_items: usize,
+    dropped_items: usize,
+    returned_bytes: usize,
+    bytes_limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecallUserAnchorCoverage {
+    policy: &'static str,
+    coverage_status: &'static str,
+    latest_real_user_seen_in_rollout: bool,
+    latest_real_user_rollout_index: Option<usize>,
+    latest_real_user_present_in_replacement_history: Option<bool>,
+    older_user_messages_may_be_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    missing_latest_user_anchor: Option<RecallUserAnchor>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecallUserAnchor {
+    rollout_index: usize,
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecallCompactPayload {
+    mode: &'static str,
+    source: &'static str,
+    legend: RecallLegend,
+    integrity: RecallIntegrityMetadata,
+    boundary: RecallBoundaryMetadata,
+    counts: RecallCounts,
+    user_anchors: RecallUserAnchorCoverage,
+    items: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecallDebugPayload {
+    mode: &'static str,
+    source: &'static str,
+    integrity: RecallIntegrityMetadata,
+    boundary: RecallBoundaryMetadata,
+    filters: RecallFilters,
+    counts: RecallCounts,
+    user_anchors: RecallUserAnchorCoverage,
+    items: Vec<RecallItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecallLegend {
+    #[serde(rename = "[r]")]
+    reasoning: &'static str,
+    #[serde(rename = "[am]")]
+    assistant_message: &'static str,
+    #[serde(rename = "[tc]")]
+    tool_context_note: &'static str,
+    #[serde(rename = "[rc]")]
+    reasoning_context_note: &'static str,
+}
+
+impl Default for RecallLegend {
+    fn default() -> Self {
+        Self {
+            reasoning: "reasoning",
+            assistant_message: "assistant message",
+            tool_context_note: "tool context note",
+            reasoning_context_note: "reasoning context note",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RecallTrimResult {
+    items: Vec<RecallItem>,
+    returned_bytes: usize,
+    dropped_items: usize,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct CompactRecallPayloadItems {
+    items: Vec<String>,
+    returned_bytes: usize,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct StringTrimResult {
+    items: Vec<String>,
+    truncated: bool,
 }
 
 impl ToolHandler for RecallHandler {
@@ -168,7 +298,7 @@ async fn current_rollout_recorder(session: &Session) -> Result<RolloutRecorder, 
     })
 }
 
-fn build_recall_payload(
+pub(crate) fn build_recall_payload(
     rollout_items: &[RolloutItem],
     recall_kbytes_limit: usize,
     parse_errors: usize,
@@ -196,7 +326,7 @@ fn build_recall_payload(
             })
     else {
         // Merge-safety anchor: "no_compaction_marker" drives the fail-loud
-        // recall-first recovery path after auto-compaction warnings.
+        // recall recovery path after runtime-owned auto-compaction recovery.
         return Err(contract_error(
             StopReason::NoCompactionMarker,
             "current session rollout has no compacted marker",
@@ -231,73 +361,100 @@ fn build_recall_payload(
     let matching_pre_compact_items = matching_items.len();
 
     let recall_bytes_limit = recall_kbytes_limit.saturating_mul(1024);
-    let (matching_items, returned_bytes) =
-        trim_items_to_bytes_limit(matching_items, recall_bytes_limit);
+    let user_anchors = build_user_anchor_coverage(
+        rollout_items,
+        latest_compacted_index,
+        &discarded_rollout_indices,
+    );
+    let trim_result = trim_items_to_bytes_limit(matching_items, recall_bytes_limit);
+    let boundary = RecallBoundaryMetadata {
+        start_index,
+        last_boundary_index: last_boundary.map(|boundary| boundary.index),
+        last_boundary_kind: last_boundary.map(|boundary| boundary.kind.as_str()),
+        latest_compacted_index,
+        compacted_markers_seen,
+    };
     if !recall_debug {
-        let compact = build_compact_recall_payload(matching_items, recall_bytes_limit);
-        return Ok(json!({
-            "mode": "recall_pre_compact_compact",
-            "source": "current_session_rollout",
-            "legend": {
-                "[r]": "reasoning",
-                "[am]": "assistant message",
-                "[tc]": "tool context note",
-                "[rc]": "reasoning context note",
+        let compact = build_compact_recall_payload(trim_result.items, recall_bytes_limit);
+        let payload = RecallCompactPayload {
+            mode: "recall_pre_compact_compact",
+            source: "current_session_rollout",
+            legend: RecallLegend::default(),
+            integrity: recall_integrity_metadata(
+                parse_errors,
+                trim_result.truncated || compact.truncated,
+            ),
+            boundary,
+            counts: RecallCounts {
+                matching_pre_compact_items,
+                returned_items: compact.items.len(),
+                dropped_items: matching_pre_compact_items.saturating_sub(compact.items.len()),
+                returned_bytes: compact.returned_bytes,
+                bytes_limit: recall_bytes_limit,
             },
-            "items": compact.items,
-        }));
+            user_anchors,
+            items: compact.items,
+        };
+        return serialize_recall_payload(payload);
     }
 
-    let returned_items = matching_items.len();
-
-    Ok(json!({
-        "mode": "recall_pre_compact",
-        "source": "current_session_rollout",
-        "integrity": {
-            "status": recall_integrity_status(parse_errors),
-            "rollout_parse_errors": parse_errors,
+    let returned_items = trim_result.items.len();
+    serialize_recall_payload(RecallDebugPayload {
+        mode: "recall_pre_compact",
+        source: "current_session_rollout",
+        integrity: recall_integrity_metadata(parse_errors, trim_result.truncated),
+        boundary,
+        filters: RecallFilters {
+            include_reasoning: true,
+            include_assistant_messages: true,
+            include_context_notes: true,
+            exclude_tool_output: true,
         },
-        "boundary": {
-            "start_index": start_index,
-            "last_boundary_index": last_boundary.map(|boundary| boundary.index),
-            "last_boundary_kind": last_boundary.map(|boundary| boundary.kind.as_str()),
-            "latest_compacted_index": latest_compacted_index,
-            "compacted_markers_seen": compacted_markers_seen,
+        counts: RecallCounts {
+            matching_pre_compact_items,
+            returned_items,
+            dropped_items: trim_result.dropped_items,
+            returned_bytes: trim_result.returned_bytes,
+            bytes_limit: recall_bytes_limit,
         },
-        "filters": {
-            "include_reasoning": true,
-            "include_assistant_messages": true,
-            "include_context_notes": true,
-            "exclude_tool_output": true,
-        },
-        "counts": {
-            "matching_pre_compact_items": matching_pre_compact_items,
-            "returned_items": returned_items,
-            "returned_bytes": returned_bytes,
-            "bytes_limit": recall_bytes_limit,
-        },
-        "items": matching_items,
-    }))
+        user_anchors,
+        items: trim_result.items,
+    })
 }
 
 fn recall_integrity_status(parse_errors: usize) -> &'static str {
     if parse_errors > 0 { "degraded" } else { "ok" }
 }
 
-#[derive(Debug)]
-struct CompactRecallPayload {
-    items: Vec<String>,
+fn recall_integrity_metadata(parse_errors: usize, truncated: bool) -> RecallIntegrityMetadata {
+    RecallIntegrityMetadata {
+        status: recall_integrity_status(parse_errors),
+        rollout_parse_errors: parse_errors,
+        truncated,
+    }
+}
+
+fn serialize_recall_payload(
+    payload: impl Serialize,
+) -> Result<serde_json::Value, FunctionCallError> {
+    serde_json::to_value(payload).map_err(|error| {
+        contract_error(
+            StopReason::InvalidContract,
+            format!("failed to serialize recall payload: {error}"),
+        )
+    })
 }
 
 fn build_compact_recall_payload(
     matching_items: Vec<RecallItem>,
     recall_bytes_limit: usize,
-) -> CompactRecallPayload {
+) -> CompactRecallPayloadItems {
     let compact_entries: Vec<String> = matching_items
         .into_iter()
-        .map(|item| format!("{} {}", compact_item_tag(item.kind.as_str()), item.text))
+        .map(|item| compact_item_entry(&item))
         .collect();
-    let (trimmed_entries, _) = trim_strings_to_bytes_limit(compact_entries, recall_bytes_limit);
+    let trim_result = trim_strings_to_bytes_limit(compact_entries, recall_bytes_limit);
+    let trimmed_entries = trim_result.items;
 
     let mut start_index = 0usize;
     loop {
@@ -309,7 +466,11 @@ fn build_compact_recall_payload(
             .collect::<Vec<String>>();
         let numbered_bytes = estimate_string_items_bytes(numbered.iter());
         if numbered_bytes <= recall_bytes_limit || numbered.is_empty() {
-            return CompactRecallPayload { items: numbered };
+            return CompactRecallPayloadItems {
+                items: numbered,
+                returned_bytes: numbered_bytes,
+                truncated: trim_result.truncated,
+            };
         }
         start_index = start_index.saturating_add(1);
     }
@@ -362,6 +523,158 @@ fn replacement_history_for_boundary(
         Some(RolloutItem::Compacted(compacted)) => compacted.replacement_history.as_deref(),
         _ => None,
     }
+}
+
+fn build_user_anchor_coverage(
+    rollout_items: &[RolloutItem],
+    latest_compacted_index: usize,
+    discarded_rollout_indices: &HashSet<usize>,
+) -> RecallUserAnchorCoverage {
+    let latest_user = latest_real_user_anchor_before(
+        rollout_items,
+        latest_compacted_index,
+        discarded_rollout_indices,
+    );
+    let replacement_history =
+        replacement_history_for_boundary(rollout_items, latest_compacted_index);
+    let latest_real_user_present_in_replacement_history = latest_user
+        .as_ref()
+        .map(|user_anchor| {
+            replacement_history
+                .map(|history| replacement_history_contains_user_anchor(history, user_anchor))
+        })
+        .unwrap_or(None);
+    let coverage_status = match (
+        latest_user.as_ref(),
+        latest_real_user_present_in_replacement_history,
+    ) {
+        (None, _) => "not_applicable",
+        (Some(_), Some(true)) => "covered",
+        (Some(_), Some(false)) => "missing",
+        (Some(_), None) => "unknown",
+    };
+    let missing_latest_user_anchor = if matches!(coverage_status, "missing") {
+        latest_user.clone()
+    } else {
+        None
+    };
+
+    RecallUserAnchorCoverage {
+        policy: "missing_latest_only",
+        coverage_status,
+        latest_real_user_seen_in_rollout: latest_user.is_some(),
+        latest_real_user_rollout_index: latest_user
+            .as_ref()
+            .map(|user_anchor| user_anchor.rollout_index),
+        latest_real_user_present_in_replacement_history,
+        older_user_messages_may_be_truncated: latest_user.is_some(),
+        missing_latest_user_anchor,
+    }
+}
+
+fn latest_real_user_anchor_before(
+    rollout_items: &[RolloutItem],
+    latest_compacted_index: usize,
+    discarded_rollout_indices: &HashSet<usize>,
+) -> Option<RecallUserAnchor> {
+    rollout_items
+        .iter()
+        .enumerate()
+        .take(latest_compacted_index)
+        .rev()
+        .find_map(|(index, item)| {
+            if discarded_rollout_indices.contains(&index) {
+                return None;
+            }
+            real_user_text_from_rollout_item(item).map(|text| RecallUserAnchor {
+                rollout_index: index,
+                text,
+            })
+        })
+}
+
+fn replacement_history_contains_user_anchor(
+    replacement_history: &[ResponseItem],
+    user_anchor: &RecallUserAnchor,
+) -> bool {
+    let expected = normalize_user_anchor_text(user_anchor.text.as_str());
+    replacement_history
+        .iter()
+        .filter_map(real_user_text_from_response_item)
+        .any(|text| normalize_user_anchor_text(text.as_str()) == expected)
+}
+
+fn real_user_text_from_rollout_item(item: &RolloutItem) -> Option<String> {
+    match item {
+        RolloutItem::ResponseItem(response_item) => {
+            real_user_text_from_response_item(response_item)
+        }
+        RolloutItem::EventMsg(EventMsg::UserMessage(user_message)) => {
+            real_user_text(user_message.message.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn real_user_text_from_response_item(response_item: &ResponseItem) -> Option<String> {
+    let ResponseItem::Message { role, content, .. } = response_item else {
+        return None;
+    };
+    if role != "user" {
+        return None;
+    }
+    let text = message_content_text(content)?;
+    real_user_text(text.as_str())
+}
+
+fn real_user_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty()
+        || crate::compact::is_summary_message(trimmed)
+        || is_context_note_message_text(trimmed)
+        || looks_like_post_compact_recovery_warning(trimmed)
+    {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn message_content_text(content_items: &[ContentItem]) -> Option<String> {
+    let text = content_items
+        .iter()
+        .filter_map(|content_item| match content_item {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                let trimmed = text.trim();
+                (!trimmed.is_empty()).then_some(trimmed.to_string())
+            }
+            ContentItem::InputImage { .. } => None,
+        })
+        .collect::<Vec<String>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn is_context_note_message_text(text: &str) -> bool {
+    extract_context_note_text(text, TOOL_CONTEXT_OPEN_TAG, TOOL_CONTEXT_CLOSE_TAG).is_some()
+        || extract_context_note_text(
+            text,
+            REASONING_CONTEXT_OPEN_TAG,
+            REASONING_CONTEXT_CLOSE_TAG,
+        )
+        .is_some()
+}
+
+fn looks_like_post_compact_recovery_warning(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("codex cli")
+        && lower.contains("auto-compact")
+        && (lower.contains("post-compact")
+            || lower.contains("runtime recovery context was prepared automatically"))
+}
+
+fn normalize_user_anchor_text(text: &str) -> String {
+    text.trim().replace("\r\n", "\n")
 }
 
 fn previous_recall_boundary_before(
@@ -429,6 +742,8 @@ fn recall_item_from_response_item(
                 rollout_index,
                 text: trimmed.to_string(),
                 phase: None,
+                truncated: None,
+                truncation: None,
             })
         }
         ResponseItem::Message {
@@ -450,6 +765,8 @@ fn recall_item_from_response_item(
                 phase: phase
                     .as_ref()
                     .map(|message_phase| phase_name(message_phase).to_string()),
+                truncated: None,
+                truncation: None,
             })
         }
         ResponseItem::Message { role, content, .. }
@@ -478,6 +795,8 @@ fn recall_item_from_context_note_message(
             rollout_index,
             text: note_text,
             phase: None,
+            truncated: None,
+            truncation: None,
         });
     }
     if let Some(note_text) = extract_context_note_text(
@@ -491,6 +810,8 @@ fn recall_item_from_context_note_message(
             rollout_index,
             text: note_text,
             phase: None,
+            truncated: None,
+            truncation: None,
         });
     }
     None
@@ -505,47 +826,163 @@ fn extract_context_note_text(text: &str, open_tag: &str, close_tag: &str) -> Opt
     (!note_body.is_empty()).then(|| note_body.to_string())
 }
 
-fn trim_items_to_bytes_limit(
-    items: Vec<RecallItem>,
-    bytes_limit: usize,
-) -> (Vec<RecallItem>, usize) {
+fn trim_items_to_bytes_limit(items: Vec<RecallItem>, bytes_limit: usize) -> RecallTrimResult {
+    let original_count = items.len();
     if items.is_empty() || bytes_limit == 0 {
-        return (Vec::new(), 0);
+        return RecallTrimResult {
+            items: Vec::new(),
+            returned_bytes: 0,
+            dropped_items: original_count,
+            truncated: false,
+        };
     }
     let mut used_bytes = 0usize;
     let mut selected_reversed: Vec<RecallItem> = Vec::new();
     for item in items.into_iter().rev() {
-        let item_bytes = serde_json::to_vec(&item)
-            .map(|bytes| bytes.len())
-            .unwrap_or_else(|_| item.text.len());
+        let item_bytes = estimate_recall_item_bytes(&item);
         if used_bytes.saturating_add(item_bytes) > bytes_limit {
+            if selected_reversed.is_empty() {
+                let truncated_item = truncate_recall_item_to_fit(item, bytes_limit);
+                used_bytes = estimate_recall_item_bytes(&truncated_item);
+                selected_reversed.push(truncated_item);
+            }
             break;
         }
         used_bytes = used_bytes.saturating_add(item_bytes);
         selected_reversed.push(item);
     }
     selected_reversed.reverse();
-    (selected_reversed, used_bytes)
+    let truncated = selected_reversed
+        .iter()
+        .any(|item| item.truncated == Some(true));
+    RecallTrimResult {
+        dropped_items: original_count.saturating_sub(selected_reversed.len()),
+        items: selected_reversed,
+        returned_bytes: used_bytes,
+        truncated,
+    }
 }
 
-fn trim_strings_to_bytes_limit(items: Vec<String>, bytes_limit: usize) -> (Vec<String>, usize) {
+fn estimate_recall_item_bytes(item: &RecallItem) -> usize {
+    serde_json::to_vec(item)
+        .map(|bytes| bytes.len())
+        .unwrap_or_else(|_| item.text.len())
+}
+
+fn truncate_recall_item_to_fit(mut item: RecallItem, bytes_limit: usize) -> RecallItem {
+    let original_bytes = item.text.len();
+    let original_text = item.text.clone();
+    let mut best = None;
+    let mut boundaries = original_text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<usize>>();
+    boundaries.push(original_text.len());
+
+    let mut low = 0usize;
+    let mut high = boundaries.len().saturating_sub(1);
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        item.text = original_text[boundaries[mid]..].to_string();
+        item.truncated = Some(true);
+        item.truncation = Some(RecallItemTruncation {
+            side: "start",
+            original_bytes,
+            returned_bytes: item.text.len(),
+        });
+        if estimate_recall_item_bytes(&item) <= bytes_limit {
+            best = Some(item.clone());
+            if mid == 0 {
+                break;
+            }
+            high = mid - 1;
+        } else {
+            low = mid + 1;
+        }
+    }
+
+    best.unwrap_or_else(|| {
+        item.text.clear();
+        item.truncated = Some(true);
+        item.truncation = Some(RecallItemTruncation {
+            side: "start",
+            original_bytes,
+            returned_bytes: 0,
+        });
+        item
+    })
+}
+
+fn trim_strings_to_bytes_limit(items: Vec<String>, bytes_limit: usize) -> StringTrimResult {
     if items.is_empty() || bytes_limit == 0 {
-        return (Vec::new(), 0);
+        return StringTrimResult {
+            items: Vec::new(),
+            truncated: false,
+        };
     }
     let mut used_bytes = 0usize;
     let mut selected_reversed: Vec<String> = Vec::new();
+    let mut truncated = false;
     for item in items.into_iter().rev() {
         let item_bytes = serde_json::to_vec(&item)
             .map(|bytes| bytes.len())
             .unwrap_or_else(|_| item.len());
         if used_bytes.saturating_add(item_bytes) > bytes_limit {
+            if selected_reversed.is_empty() {
+                let truncated_item = truncate_string_from_start_to_fit(item.as_str(), bytes_limit);
+                selected_reversed.push(truncated_item);
+                truncated = true;
+            }
             break;
         }
         used_bytes = used_bytes.saturating_add(item_bytes);
         selected_reversed.push(item);
     }
     selected_reversed.reverse();
-    (selected_reversed, used_bytes)
+    StringTrimResult {
+        items: selected_reversed,
+        truncated,
+    }
+}
+
+fn truncate_string_from_start_to_fit(text: &str, bytes_limit: usize) -> String {
+    let original_bytes = text.len();
+    let mut best = String::new();
+    let mut boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<usize>>();
+    boundaries.push(text.len());
+
+    let mut low = 0usize;
+    let mut high = boundaries.len().saturating_sub(1);
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let suffix = &text[boundaries[mid]..];
+        let candidate = format!(
+            "[truncated_from_start][bytes={}/{}] {suffix}",
+            suffix.len(),
+            original_bytes
+        );
+        let candidate_bytes = serde_json::to_vec(&candidate)
+            .map(|bytes| bytes.len())
+            .unwrap_or_else(|_| candidate.len());
+        if candidate_bytes <= bytes_limit {
+            best = candidate;
+            if mid == 0 {
+                break;
+            }
+            high = mid - 1;
+        } else {
+            low = mid + 1;
+        }
+    }
+
+    if best.is_empty() {
+        format!("[truncated_from_start][bytes=0/{original_bytes}]")
+    } else {
+        best
+    }
 }
 
 fn estimate_string_items_bytes<'a>(items: impl Iterator<Item = &'a String>) -> usize {
@@ -564,6 +1001,18 @@ fn compact_item_tag(kind: &str) -> &'static str {
         "tool_context_note" => "[tc]",
         "reasoning_context_note" => "[rc]",
         _ => "[other]",
+    }
+}
+
+fn compact_item_entry(item: &RecallItem) -> String {
+    let tag = compact_item_tag(item.kind.as_str());
+    if let Some(truncation) = &item.truncation {
+        format!(
+            "{tag}[truncated_from_start][bytes={}/{}] {}",
+            truncation.returned_bytes, truncation.original_bytes, item.text
+        )
+    } else {
+        format!("{tag} {}", item.text)
     }
 }
 
@@ -680,6 +1129,30 @@ mod tests {
             end_turn: None,
             phase: None,
         })
+    }
+
+    fn user_response_item(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }
+    }
+
+    fn assistant_response_item(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: text.to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }
     }
 
     fn reasoning(summary_text: &str) -> RolloutItem {
@@ -938,6 +1411,100 @@ mod tests {
             Some(&json!(2))
         );
         assert_eq!(payload.pointer("/counts/returned_items"), Some(&json!(2)));
+    }
+
+    #[test]
+    fn recall_reports_latest_user_anchor_covered_without_returning_user_text() {
+        let rollout_items = vec![
+            user_message("critical instruction"),
+            assistant_message("assistant before compact", None),
+            replacement_history_compacted_marker_with_history(vec![
+                user_response_item("critical instruction"),
+                assistant_response_item("summary assistant"),
+            ]),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, false)
+            .expect("build recall payload");
+
+        assert_eq!(
+            payload.pointer("/user_anchors/coverage_status"),
+            Some(&json!("covered"))
+        );
+        assert_eq!(
+            payload.pointer("/user_anchors/latest_real_user_seen_in_rollout"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            payload.pointer("/user_anchors/latest_real_user_present_in_replacement_history"),
+            Some(&json!(true))
+        );
+        assert!(
+            payload
+                .pointer("/user_anchors/missing_latest_user_anchor")
+                .is_none()
+        );
+        assert!(
+            compact_recall_items(&payload)
+                .iter()
+                .all(|item| !item.contains("critical instruction"))
+        );
+    }
+
+    #[test]
+    fn recall_includes_missing_latest_user_anchor_only_when_absent_from_replacement_history() {
+        let rollout_items = vec![
+            user_message("missing critical instruction"),
+            assistant_message("assistant before compact", None),
+            replacement_history_compacted_marker_with_history(vec![assistant_response_item(
+                "summary assistant",
+            )]),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, false)
+            .expect("build recall payload");
+
+        assert_eq!(
+            payload.pointer("/user_anchors/coverage_status"),
+            Some(&json!("missing"))
+        );
+        assert_eq!(
+            payload.pointer("/user_anchors/latest_real_user_present_in_replacement_history"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            payload.pointer("/user_anchors/missing_latest_user_anchor/text"),
+            Some(&json!("missing critical instruction"))
+        );
+        assert_eq!(
+            payload.pointer("/user_anchors/missing_latest_user_anchor/rollout_index"),
+            Some(&json!(0))
+        );
+    }
+
+    #[test]
+    fn recall_does_not_treat_post_compact_warning_as_user_anchor() {
+        let rollout_items = vec![
+            user_message(
+                "Codex CLI performed an auto-compact. Runtime recovery context was prepared automatically.",
+            ),
+            assistant_message("assistant before compact", None),
+            replacement_history_compacted_marker_with_history(vec![assistant_response_item(
+                "summary assistant",
+            )]),
+        ];
+
+        let payload = build_recall_payload(&rollout_items, TEST_RECALL_KBYTES_LIMIT, 0, false)
+            .expect("build recall payload");
+
+        assert_eq!(
+            payload.pointer("/user_anchors/coverage_status"),
+            Some(&json!("not_applicable"))
+        );
+        assert_eq!(
+            payload.pointer("/user_anchors/latest_real_user_seen_in_rollout"),
+            Some(&json!(false))
+        );
     }
 
     #[test]
@@ -1477,6 +2044,59 @@ mod tests {
     }
 
     #[test]
+    fn recall_truncates_oversized_newest_item_instead_of_returning_empty() {
+        let oversized = "x".repeat(4 * 1024);
+        let rollout_items = vec![
+            assistant_message(oversized.as_str(), None),
+            compacted_marker(),
+        ];
+
+        let payload =
+            build_recall_payload(&rollout_items, 1, 0, true).expect("build constrained payload");
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(payload.pointer("/integrity/truncated"), Some(&json!(true)));
+        assert_eq!(payload.pointer("/counts/dropped_items"), Some(&json!(0)));
+        assert_eq!(items[0].pointer("/truncated"), Some(&json!(true)));
+        assert_eq!(items[0].pointer("/truncation/side"), Some(&json!("start")));
+        assert_eq!(
+            items[0].pointer("/truncation/original_bytes"),
+            Some(&json!(4096))
+        );
+        assert!(
+            items[0]
+                .pointer("/truncation/returned_bytes")
+                .and_then(Value::as_u64)
+                .is_some_and(|returned_bytes| returned_bytes < 4096)
+        );
+    }
+
+    #[test]
+    fn recall_compact_mode_marks_truncated_newest_item() {
+        let oversized = "x".repeat(4 * 1024);
+        let rollout_items = vec![
+            assistant_message(oversized.as_str(), None),
+            compacted_marker(),
+        ];
+
+        let payload =
+            build_recall_payload(&rollout_items, 1, 0, false).expect("build constrained payload");
+        let items = compact_recall_items(&payload);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(payload.pointer("/integrity/truncated"), Some(&json!(true)));
+        assert!(
+            items[0].contains("[am][truncated_from_start][bytes="),
+            "compact item should expose truncation marker: {}",
+            items[0]
+        );
+    }
+
+    #[test]
     fn recall_reports_degraded_integrity_when_rollout_has_parse_errors() {
         let rollout_items = vec![
             assistant_message("assistant before compact", None),
@@ -1497,7 +2117,7 @@ mod tests {
     }
 
     #[test]
-    fn recall_compact_mode_returns_string_items_and_hides_debug_metadata() {
+    fn recall_compact_mode_returns_string_items_with_minimal_metadata() {
         let rollout_items = vec![
             assistant_message("assistant one", Some(MessagePhase::Commentary)),
             reasoning("reasoning one"),
@@ -1527,9 +2147,26 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].as_str(), Some("1: [am] assistant one"));
         assert_eq!(items[1].as_str(), Some("2: [r] reasoning one"));
-        assert!(payload.get("integrity").is_none());
-        assert!(payload.get("boundary").is_none());
-        assert!(payload.get("counts").is_none());
+        assert_eq!(payload.pointer("/integrity/status"), Some(&json!("ok")));
+        assert_eq!(
+            payload.pointer("/integrity/rollout_parse_errors"),
+            Some(&json!(0))
+        );
+        assert_eq!(payload.pointer("/integrity/truncated"), Some(&json!(false)));
+        assert_eq!(
+            payload.pointer("/boundary/latest_compacted_index"),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            payload.pointer("/counts/matching_pre_compact_items"),
+            Some(&json!(2))
+        );
+        assert_eq!(payload.pointer("/counts/returned_items"), Some(&json!(2)));
+        assert_eq!(payload.pointer("/counts/dropped_items"), Some(&json!(0)));
+        assert_eq!(
+            payload.pointer("/user_anchors/policy"),
+            Some(&json!("missing_latest_only"))
+        );
     }
 
     #[test]

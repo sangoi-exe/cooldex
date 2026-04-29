@@ -24,6 +24,7 @@ pub fn apply_rollout_item(
         RolloutItem::EventMsg(event) => apply_event_msg(metadata, event),
         RolloutItem::ResponseItem(item) => apply_response_item(metadata, item),
         RolloutItem::Compacted(_) => {}
+        RolloutItem::PostCompactRecovery(_) => {}
     }
     if metadata.model_provider.is_empty() {
         metadata.model_provider = default_provider.to_string();
@@ -38,9 +39,10 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         RolloutItem::EventMsg(
             EventMsg::TokenCount(_) | EventMsg::UserMessage(_) | EventMsg::ThreadNameUpdated(_),
         ) => true,
-        RolloutItem::EventMsg(_) | RolloutItem::ResponseItem(_) | RolloutItem::Compacted(_) => {
-            false
-        }
+        RolloutItem::EventMsg(_)
+        | RolloutItem::ResponseItem(_)
+        | RolloutItem::Compacted(_)
+        | RolloutItem::PostCompactRecovery(_) => false,
     }
 }
 

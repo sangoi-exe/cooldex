@@ -420,6 +420,7 @@ impl ThreadHistoryBuilder {
                     self.next_rollout_index - 1,
                 );
             }
+            RolloutItem::PostCompactRecovery(_) => {}
             RolloutItem::SessionState(_) => {}
         }
     }
@@ -1895,6 +1896,8 @@ mod tests {
     use codex_protocol::protocol::McpInvocation;
     use codex_protocol::protocol::McpToolCallEndEvent;
     use codex_protocol::protocol::PatchApplyBeginEvent;
+    use codex_protocol::protocol::PostCompactRecoveryItem;
+    use codex_protocol::protocol::PostCompactRecoveryStatus;
     use codex_protocol::protocol::PromptGcCompactionMetadata;
     use codex_protocol::protocol::PromptGcExecutionPhase;
     use codex_protocol::protocol::PromptGcOutcomeKind;
@@ -3720,6 +3723,77 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 items: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn post_compact_recovery_rollout_item_is_not_visible_history() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-recovery".into(),
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "continue".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::PostCompactRecovery(PostCompactRecoveryItem {
+                recovery_id: "recovery-1".into(),
+                turn_id: "turn-recovery".into(),
+                status: PostCompactRecoveryStatus::Ready,
+                phase: "mid_turn".into(),
+                reason: "context_limit".into(),
+                implementation: "local_inline".into(),
+                latest_compacted_index: Some(2),
+                last_boundary_kind: Some("replacement_history_compacted".into()),
+                created_at_unix_secs: Some(1),
+                packet: Some("runtime recovery packet".into()),
+                failure: None,
+            }),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: "done".into(),
+                phase: None,
+                memory_citation: None,
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "turn-recovery".into(),
+                last_agent_message: None,
+                completed_at: None,
+                duration_ms: None,
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+
+        assert_eq!(
+            turns,
+            vec![Turn {
+                id: "turn-recovery".into(),
+                status: TurnStatus::Completed,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                items: vec![
+                    ThreadItem::UserMessage {
+                        id: "item-1".into(),
+                        content: vec![UserInput::Text {
+                            text: "continue".into(),
+                            text_elements: Vec::new(),
+                        }],
+                    },
+                    ThreadItem::AgentMessage {
+                        id: "item-2".into(),
+                        text: "done".into(),
+                        phase: None,
+                        memory_citation: None,
+                    },
+                ],
             }]
         );
     }

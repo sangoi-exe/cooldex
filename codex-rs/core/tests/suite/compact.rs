@@ -70,9 +70,9 @@ const POST_AUTO_USER_MSG: &str = "post auto follow-up";
 const PRETURN_CONTEXT_DIFF_CWD: &str = "/tmp/PRETURN_CONTEXT_DIFF_CWD";
 
 pub(super) const COMPACT_WARNING_MESSAGE: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
-// Merge-safety anchor: keep this warning string aligned with runtime auto-compact
-// injection and compact_remote.rs assertions for the recall-first flow.
-const AUTO_COMPACT_RECON_WARNING: &str = "STOP. Codex CLI has just performed an auto-compact. BEFORE any other action: call recall. Then recon unstaged changes and update_plan status. After that you can proceed with what was in progress before auto-compact. This is an automatic post-compact message.";
+// Merge-safety anchor: keep this recovery packet boundary aligned with runtime
+// auto-compact injection and compact_remote.rs assertions.
+const POST_COMPACT_RECOVERY_TAG: &str = "<post_compact_recovery>";
 
 fn auto_summary(summary: &str) -> String {
     summary.to_string()
@@ -528,8 +528,8 @@ async fn manual_compact_uses_custom_prompt() {
     let body = requests[1].body_json();
     let body_text = body.to_string();
     assert!(
-        !body_contains_text(&body_text, AUTO_COMPACT_RECON_WARNING),
-        "manual /compact request should not include hard auto-compact recon warning"
+        !body_contains_text(&body_text, POST_COMPACT_RECOVERY_TAG),
+        "manual /compact request should not include runtime recovery packet"
     );
 
     let input = body
@@ -1555,7 +1555,7 @@ async fn auto_compact_emits_context_compaction_items() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn local_auto_compact_does_not_emit_remote_warning() {
+async fn local_auto_compact_injects_runtime_recovery_packet() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -1599,7 +1599,7 @@ async fn local_auto_compact_does_not_emit_remote_warning() {
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
-                text: "trigger local one-shot auto-compact warning".into(),
+                text: "trigger local one-shot auto-compact recovery".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
@@ -1622,20 +1622,20 @@ async fn local_auto_compact_does_not_emit_remote_warning() {
     let post_compact_request_2_body = requests[3].body_json().to_string();
 
     assert!(
-        !body_contains_text(&first_request_body, AUTO_COMPACT_RECON_WARNING),
-        "request before auto-compact should not include recon warning"
+        !body_contains_text(&first_request_body, POST_COMPACT_RECOVERY_TAG),
+        "request before auto-compact should not include recovery packet"
     );
     assert!(
-        !body_contains_text(&compact_request_body, AUTO_COMPACT_RECON_WARNING),
-        "auto-compact request itself should not include recon warning"
+        !body_contains_text(&compact_request_body, POST_COMPACT_RECOVERY_TAG),
+        "auto-compact request itself should not include recovery packet"
     );
     assert!(
-        !body_contains_text(&post_compact_request_1_body, AUTO_COMPACT_RECON_WARNING),
-        "local auto-compact should not include remote auto-compact warning"
+        body_contains_text(&post_compact_request_1_body, POST_COMPACT_RECOVERY_TAG),
+        "first local request after auto-compact should include recovery packet"
     );
     assert!(
-        !body_contains_text(&post_compact_request_2_body, AUTO_COMPACT_RECON_WARNING),
-        "local auto-compact should not include remote auto-compact warning"
+        body_contains_text(&post_compact_request_2_body, POST_COMPACT_RECOVERY_TAG),
+        "second local request after auto-compact should keep recovery packet until turn success"
     );
 }
 

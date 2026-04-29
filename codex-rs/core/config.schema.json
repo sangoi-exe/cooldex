@@ -2850,8 +2850,8 @@
       "description": "User-level plugin config entries keyed by plugin name.",
       "type": "object"
     },
-    "pos_compact_instructions": {
-      "description": "Optional instructions appended after successful remote auto-compaction.",
+    "post_compact_recovery_warning": {
+      "description": "Optional user-visible warning after runtime-owned post-compact recovery is prepared.",
       "type": "string"
     },
     "profile": {
