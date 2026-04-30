@@ -203,6 +203,15 @@ impl Session {
                         "failed to persist failed post-compact recovery item"
                     );
                 }
+                let packet = unavailable_recovery_packet(
+                    UnavailableReason::PreparationFailed,
+                    Some(&failed_item),
+                    failed_item.failure.clone(),
+                );
+                let mut state = self.state.lock().await;
+                state.set_pending_post_compact_recovery(Some(
+                    PendingPostCompactRecovery::unavailable(packet),
+                ));
                 return Err(error);
             }
         };

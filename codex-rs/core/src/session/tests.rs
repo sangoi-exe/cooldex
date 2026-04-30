@@ -746,6 +746,9 @@ async fn default_post_compact_recovery_warning_reports_missing_rollout_recovery(
     );
 }
 
+// Merge-safety anchor: live post-compact recovery preparation failures must
+// leave a same-process unavailable packet pending before returning the existing
+// fail-loud error; resume replay alone is not enough.
 #[tokio::test]
 async fn auto_compact_recovery_packet_failure_emits_error_and_failed_rollout_item() {
     let (session, turn_context, rx) = make_session_and_context_with_rx().await;
@@ -784,6 +787,28 @@ async fn auto_compact_recovery_packet_failure_emits_error_and_failed_rollout_ite
             .contains("Error preparing post-compact recovery"),
         "unexpected error event: {}",
         error_event.message
+    );
+
+    let input = session
+        .inject_pending_post_compact_recovery(Vec::new())
+        .await;
+    let Some(ResponseItem::Message { content, .. }) = input.first() else {
+        panic!("expected injected developer recovery packet");
+    };
+    let packet_text = content
+        .iter()
+        .find_map(|item| match item {
+            ContentItem::InputText { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .expect("developer packet text");
+    assert!(
+        packet_text.contains("\"mode\":\"post_compact_runtime_recovery_unavailable\""),
+        "unexpected packet: {packet_text}"
+    );
+    assert!(
+        packet_text.contains("\"unavailable_reason\":\"preparation_failed\""),
+        "unexpected packet: {packet_text}"
     );
 
     session.flush_rollout().await.expect("flush rollout");
