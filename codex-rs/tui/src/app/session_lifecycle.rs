@@ -733,3 +733,118 @@ impl App {
         Ok(AppRunControl::Continue)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::test_support::*;
+    use std::time::Duration;
+    use tokio::time;
+
+    #[tokio::test]
+    async fn reset_thread_event_state_aborts_listener_tasks() {
+        struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _notify_on_drop = NotifyOnDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        app.thread_event_listener_tasks.insert(thread_id, handle);
+        started_rx
+            .await
+            .expect("listener task should report it started");
+
+        app.reset_thread_event_state();
+
+        assert!(app.thread_event_listener_tasks.is_empty());
+        time::timeout(Duration::from_millis(50), dropped_rx)
+            .await
+            .expect("timed out waiting for listener task abort")
+            .expect("listener task drop notification should succeed");
+    }
+    #[tokio::test]
+    async fn reset_thread_event_state_clears_prompt_gc_primary_flags() {
+        let mut app = make_test_app().await;
+        app.primary_prompt_gc_completion_pending = true;
+        app.primary_prompt_gc_private_usage_closed = true;
+
+        app.reset_thread_event_state();
+
+        assert!(!app.primary_prompt_gc_completion_pending);
+        assert!(!app.primary_prompt_gc_private_usage_closed);
+    }
+    #[test]
+    fn terminal_thread_read_error_detection_matches_not_loaded_errors() {
+        let err = color_eyre::eyre::eyre!(
+            "thread/read failed during TUI session lookup: thread/read failed: thread not loaded: thr_123"
+        );
+
+        assert!(App::is_terminal_thread_read_error(&err));
+    }
+    #[test]
+    fn terminal_thread_read_error_detection_ignores_transient_failures() {
+        let err = color_eyre::eyre::eyre!(
+            "thread/read failed during TUI session lookup: thread/read transport error: broken pipe"
+        );
+
+        assert!(!App::is_terminal_thread_read_error(&err));
+    }
+    #[test]
+    fn closed_state_for_thread_read_error_preserves_live_state_without_cache_on_transient_error() {
+        let err = color_eyre::eyre::eyre!(
+            "thread/read failed during TUI session lookup: thread/read transport error: broken pipe"
+        );
+
+        assert!(!App::closed_state_for_thread_read_error(
+            &err, /*existing_is_closed*/ None
+        ));
+    }
+    #[test]
+    fn closed_state_for_thread_read_error_marks_terminal_uncached_threads_closed() {
+        let err = color_eyre::eyre::eyre!(
+            "thread/read failed during TUI session lookup: thread/read failed: thread not loaded: thr_123"
+        );
+
+        assert!(App::closed_state_for_thread_read_error(
+            &err, /*existing_is_closed*/ None
+        ));
+    }
+    #[test]
+    fn include_turns_fallback_detection_handles_unmaterialized_and_ephemeral_threads() {
+        let unmaterialized = color_eyre::eyre::eyre!(
+            "thread/read failed during TUI session lookup: thread/read failed: thread thr_123 is not materialized yet; includeTurns is unavailable before first user message"
+        );
+        let ephemeral = color_eyre::eyre::eyre!(
+            "thread/read failed during TUI session lookup: thread/read failed: ephemeral threads do not support includeTurns"
+        );
+
+        assert!(App::can_fallback_from_include_turns_error(&unmaterialized));
+        assert!(App::can_fallback_from_include_turns_error(&ephemeral));
+    }
+    #[tokio::test]
+    async fn fresh_session_config_uses_current_service_tier() {
+        let mut app = make_test_app().await;
+        app.chat_widget
+            .set_service_tier(Some(codex_protocol::config_types::ServiceTier::Fast));
+
+        let config = app.fresh_session_config();
+
+        assert_eq!(
+            config.service_tier,
+            Some(codex_protocol::config_types::ServiceTier::Fast)
+        );
+    }
+}

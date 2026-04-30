@@ -256,3 +256,194 @@ impl ThreadEventChannel {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::test_support::*;
+    use codex_app_server_protocol::RequestId as AppServerRequestId;
+
+    #[test]
+    fn thread_event_store_tracks_active_turn_lifecycle() {
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
+        assert_eq!(store.active_turn_id(), None);
+
+        let thread_id = ThreadId::new();
+        store.push_notification(turn_started_notification(thread_id, "turn-1"));
+        assert_eq!(store.active_turn_id(), Some("turn-1"));
+
+        store.push_notification(turn_completed_notification(
+            thread_id,
+            "turn-2",
+            TurnStatus::Completed,
+        ));
+        assert_eq!(store.active_turn_id(), Some("turn-1"));
+
+        store.push_notification(turn_completed_notification(
+            thread_id,
+            "turn-1",
+            TurnStatus::Interrupted,
+        ));
+        assert_eq!(store.active_turn_id(), None);
+    }
+    #[test]
+    fn thread_event_store_restores_active_turn_from_snapshot_turns() {
+        let thread_id = ThreadId::new();
+        let session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
+        let turns = vec![
+            test_turn("turn-1", TurnStatus::Completed, Vec::new()),
+            test_turn("turn-2", TurnStatus::InProgress, Vec::new()),
+        ];
+
+        let store =
+            ThreadEventStore::new_with_session(/*capacity*/ 8, session.clone(), turns.clone());
+        assert_eq!(store.active_turn_id(), Some("turn-2"));
+
+        let mut refreshed_store = ThreadEventStore::new(/*capacity*/ 8);
+        refreshed_store.set_session(session, turns);
+        assert_eq!(refreshed_store.active_turn_id(), Some("turn-2"));
+    }
+    #[test]
+    fn thread_event_store_clear_active_turn_id_resets_cached_turn() {
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
+        let thread_id = ThreadId::new();
+        store.push_notification(turn_started_notification(thread_id, "turn-1"));
+
+        store.clear_active_turn_id();
+
+        assert_eq!(store.active_turn_id(), None);
+    }
+    #[test]
+    fn thread_event_store_rebase_preserves_resolved_request_state() {
+        let thread_id = ThreadId::new();
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
+        store.push_request(exec_approval_request(
+            thread_id,
+            "turn-approval",
+            "call-approval",
+            /*approval_id*/ None,
+        ));
+        store.push_notification(ServerNotification::ServerRequestResolved(
+            codex_app_server_protocol::ServerRequestResolvedNotification {
+                request_id: AppServerRequestId::Integer(1),
+                thread_id: thread_id.to_string(),
+            },
+        ));
+
+        store.rebase_buffer_after_session_refresh();
+
+        let snapshot = store.snapshot();
+        assert!(snapshot.events.is_empty());
+        assert!(!store.has_pending_thread_approvals());
+    }
+    #[test]
+    fn thread_event_store_rebase_preserves_hook_notifications() {
+        let thread_id = ThreadId::new();
+        let mut store = ThreadEventStore::new(/*capacity*/ 8);
+        store.push_notification(hook_started_notification(thread_id, "turn-hook"));
+        store.push_notification(hook_completed_notification(thread_id, "turn-hook"));
+
+        store.rebase_buffer_after_session_refresh();
+
+        let snapshot = store.snapshot();
+        let hook_notifications = snapshot
+            .events
+            .into_iter()
+            .map(|event| match event {
+                ThreadBufferedEvent::Notification(notification) => {
+                    serde_json::to_value(notification).expect("hook notification should serialize")
+                }
+                other => panic!("expected buffered hook notification, saw: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hook_notifications,
+            vec![
+                serde_json::to_value(hook_started_notification(thread_id, "turn-hook"))
+                    .expect("hook notification should serialize"),
+                serde_json::to_value(hook_completed_notification(thread_id, "turn-hook"))
+                    .expect("hook notification should serialize"),
+            ]
+        );
+    }
+    #[test]
+    fn thread_event_store_snapshot_carries_prompt_gc_activity_outside_event_buffer() {
+        let mut store = ThreadEventStore::new(8);
+        store.prompt_gc_active = true;
+
+        let snapshot = store.snapshot();
+        assert!(snapshot.events.is_empty());
+        assert!(snapshot.prompt_gc_active);
+        assert_eq!(snapshot.prompt_gc_token_usage_info, None);
+    }
+    #[test]
+    fn thread_event_store_snapshot_carries_prompt_gc_token_usage_info_outside_event_buffer() {
+        let mut store = ThreadEventStore::new(8);
+        let token_usage_info = TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 40_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        };
+        store.prompt_gc_token_usage_info = Some(token_usage_info.clone());
+
+        let snapshot = store.snapshot();
+        assert!(snapshot.events.is_empty());
+        assert_eq!(snapshot.prompt_gc_token_usage_info, Some(token_usage_info));
+    }
+    #[test]
+    fn thread_event_store_clears_prompt_gc_token_usage_info_on_visible_token_count() {
+        let mut store = ThreadEventStore::new(8);
+        store.prompt_gc_completion_pending = true;
+        store.prompt_gc_token_usage_info = Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 50_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        });
+
+        store.push_notification(token_usage_notification(
+            ThreadId::new(),
+            "turn-1",
+            Some(13_000),
+        ));
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.prompt_gc_token_usage_info, None);
+        assert!(store.prompt_gc_private_usage_closed);
+    }
+    #[tokio::test]
+    async fn thread_event_store_clears_prompt_gc_token_usage_info_on_turn_started() {
+        let mut store = ThreadEventStore::new(8);
+        store.prompt_gc_completion_pending = true;
+        store.prompt_gc_private_usage_closed = true;
+        store.prompt_gc_token_usage_info = Some(TokenUsageInfo {
+            total_token_usage: TokenUsage {
+                total_tokens: 50_000,
+                ..TokenUsage::default()
+            },
+            last_token_usage: TokenUsage {
+                total_tokens: 12_400,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(13_000),
+        });
+
+        store.push_notification(turn_started_notification(ThreadId::new(), "turn-2"));
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.prompt_gc_token_usage_info, None);
+        assert!(!store.prompt_gc_completion_pending);
+        assert!(!store.prompt_gc_private_usage_closed);
+    }
+}

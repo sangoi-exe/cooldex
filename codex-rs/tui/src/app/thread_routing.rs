@@ -1356,3 +1356,171 @@ impl App {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::test_support::*;
+
+    #[test]
+    fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
+        assert!(
+            App::should_wait_for_initial_session(&SessionSelection::StartFresh)
+        );
+        assert!(
+            App::should_wait_for_initial_session(&SessionSelection::Exit)
+        );
+        assert!(
+            !App::should_wait_for_initial_session(&SessionSelection::Resume(
+                crate::resume_picker::SessionTarget {
+                    path: Some(PathBuf::from("/tmp/restore")),
+                    thread_id: ThreadId::new(),
+                }
+            ))
+        );
+        assert!(
+            !App::should_wait_for_initial_session(&SessionSelection::Fork(
+                crate::resume_picker::SessionTarget {
+                    path: Some(PathBuf::from("/tmp/fork")),
+                    thread_id: ThreadId::new(),
+                }
+            ))
+        );
+    }
+    #[test]
+    fn startup_waiting_gate_holds_active_thread_events_until_primary_thread_configured() {
+        let mut wait_for_initial_session =
+            App::should_wait_for_initial_session(&SessionSelection::StartFresh);
+        assert!(wait_for_initial_session);
+        assert!(
+            !App::should_handle_active_thread_events(
+                wait_for_initial_session,
+                /*has_active_thread_receiver*/ true
+            )
+        );
+
+        assert!(
+            !App::should_stop_waiting_for_initial_session(
+                wait_for_initial_session,
+                /*primary_thread_id*/ None
+            )
+        );
+        if App::should_stop_waiting_for_initial_session(
+            wait_for_initial_session,
+            Some(ThreadId::new()),
+        ) {
+            wait_for_initial_session = false;
+        }
+        assert!(!wait_for_initial_session);
+
+        assert!(
+            App::should_handle_active_thread_events(
+                wait_for_initial_session,
+                /*has_active_thread_receiver*/ true
+            )
+        );
+    }
+    #[test]
+    fn startup_waiting_gate_not_applied_for_resume_or_fork_session_selection() {
+        let wait_for_resume = App::should_wait_for_initial_session(&SessionSelection::Resume(
+            crate::resume_picker::SessionTarget {
+                path: Some(PathBuf::from("/tmp/restore")),
+                thread_id: ThreadId::new(),
+            },
+        ));
+        assert!(
+            App::should_handle_active_thread_events(
+                wait_for_resume,
+                /*has_active_thread_receiver*/ true
+            )
+        );
+        let wait_for_fork = App::should_wait_for_initial_session(&SessionSelection::Fork(
+            crate::resume_picker::SessionTarget {
+                path: Some(PathBuf::from("/tmp/fork")),
+                thread_id: ThreadId::new(),
+            },
+        ));
+        assert!(
+            App::should_handle_active_thread_events(
+                wait_for_fork,
+                /*has_active_thread_receiver*/ true
+            )
+        );
+    }
+    #[tokio::test]
+    async fn active_non_primary_shutdown_target_returns_none_for_non_shutdown_event() -> Result<()>
+    {
+        let mut app = make_test_app().await;
+        app.active_thread_id = Some(ThreadId::new());
+        app.primary_thread_id = Some(ThreadId::new());
+
+        assert_eq!(
+            app.active_non_primary_shutdown_target(&ServerNotification::SkillsChanged(
+                codex_app_server_protocol::SkillsChangedNotification {},
+            )),
+            None
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn active_non_primary_shutdown_target_returns_none_for_primary_thread_shutdown()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        app.active_thread_id = Some(thread_id);
+        app.primary_thread_id = Some(thread_id);
+
+        assert_eq!(
+            app.active_non_primary_shutdown_target(&thread_closed_notification(thread_id)),
+            None
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn active_non_primary_shutdown_target_returns_ids_for_non_primary_shutdown() -> Result<()>
+    {
+        let mut app = make_test_app().await;
+        let active_thread_id = ThreadId::new();
+        let primary_thread_id = ThreadId::new();
+        app.active_thread_id = Some(active_thread_id);
+        app.primary_thread_id = Some(primary_thread_id);
+
+        assert_eq!(
+            app.active_non_primary_shutdown_target(&thread_closed_notification(active_thread_id)),
+            Some((active_thread_id, primary_thread_id))
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn active_non_primary_shutdown_target_returns_none_when_shutdown_exit_is_pending()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let active_thread_id = ThreadId::new();
+        let primary_thread_id = ThreadId::new();
+        app.active_thread_id = Some(active_thread_id);
+        app.primary_thread_id = Some(primary_thread_id);
+        app.pending_shutdown_exit_thread_id = Some(active_thread_id);
+
+        assert_eq!(
+            app.active_non_primary_shutdown_target(&thread_closed_notification(active_thread_id)),
+            None
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn active_non_primary_shutdown_target_still_switches_for_other_pending_exit_thread()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let active_thread_id = ThreadId::new();
+        let primary_thread_id = ThreadId::new();
+        app.active_thread_id = Some(active_thread_id);
+        app.primary_thread_id = Some(primary_thread_id);
+        app.pending_shutdown_exit_thread_id = Some(ThreadId::new());
+
+        assert_eq!(
+            app.active_non_primary_shutdown_target(&thread_closed_notification(active_thread_id)),
+            Some((active_thread_id, primary_thread_id))
+        );
+        Ok(())
+    }
+}

@@ -655,3 +655,698 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::test_support::*;
+    use codex_protocol::protocol::SessionConfiguredEvent;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn update_reasoning_effort_updates_collaboration_mode() {
+        let mut app = make_test_app().await;
+        app.chat_widget
+            .set_reasoning_effort(Some(ReasoningEffortConfig::Medium));
+
+        app.on_update_reasoning_effort(Some(ReasoningEffortConfig::High));
+
+        assert_eq!(
+            app.chat_widget.current_reasoning_effort(),
+            Some(ReasoningEffortConfig::High)
+        );
+        assert_eq!(
+            app.config.model_reasoning_effort,
+            Some(ReasoningEffortConfig::High)
+        );
+    }
+    #[tokio::test]
+    async fn refresh_in_memory_config_from_disk_loads_latest_apps_state() -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        let app_id = "unit_test_refresh_in_memory_config_connector".to_string();
+
+        assert_eq!(app_enabled_in_effective_config(&app.config, &app_id), None);
+
+        ConfigEditsBuilder::new(&app.config.codex_home)
+            .with_edits([
+                ConfigEdit::SetPath {
+                    segments: vec!["apps".to_string(), app_id.clone(), "enabled".to_string()],
+                    value: false.into(),
+                },
+                ConfigEdit::SetPath {
+                    segments: vec![
+                        "apps".to_string(),
+                        app_id.clone(),
+                        "disabled_reason".to_string(),
+                    ],
+                    value: "user".into(),
+                },
+            ])
+            .apply()
+            .await
+            .expect("persist app toggle");
+
+        assert_eq!(app_enabled_in_effective_config(&app.config, &app_id), None);
+
+        app.refresh_in_memory_config_from_disk().await?;
+
+        assert_eq!(
+            app_enabled_in_effective_config(&app.config, &app_id),
+            Some(false)
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn refresh_in_memory_config_from_disk_best_effort_keeps_current_config_on_error()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        std::fs::write(codex_home.path().join("config.toml"), "[broken")?;
+        let original_config = app.config.clone();
+
+        app.refresh_in_memory_config_from_disk_best_effort("starting a new thread")
+            .await;
+
+        assert_eq!(app.config, original_config);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn refresh_in_memory_config_from_disk_uses_active_chat_widget_cwd() -> Result<()> {
+        let mut app = make_test_app().await;
+        let original_cwd = app.config.cwd.clone();
+        let next_cwd_tmp = tempdir()?;
+        let next_cwd = next_cwd_tmp.path().to_path_buf();
+
+        app.chat_widget.handle_codex_event(Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                session_id: ThreadId::new(),
+                forked_from_id: None,
+                thread_name: None,
+                model: "gpt-test".to_string(),
+                model_provider_id: "test-provider".to_string(),
+                service_tier: None,
+                approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                cwd: next_cwd.clone().abs(),
+                reasoning_effort: None,
+                history_log_id: 0,
+                history_entry_count: 0,
+                initial_messages: None,
+                network_proxy: None,
+                rollout_path: Some(PathBuf::new()),
+            }),
+        });
+
+        assert_eq!(app.chat_widget.config_ref().cwd.to_path_buf(), next_cwd);
+        assert_eq!(app.config.cwd, original_cwd);
+
+        app.refresh_in_memory_config_from_disk().await?;
+
+        assert_eq!(app.config.cwd, app.chat_widget.config_ref().cwd);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn update_feature_flags_enabling_guardian_selects_guardian_approvals() -> Result<()> {
+        let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        let guardian_approvals = guardian_approvals_mode();
+
+        app.update_feature_flags(vec![(Feature::GuardianApproval, true)])
+            .await;
+
+        assert!(app.config.features.enabled(Feature::GuardianApproval));
+        assert!(
+            app.chat_widget
+                .config_ref()
+                .features
+                .enabled(Feature::GuardianApproval)
+        );
+        assert_eq!(
+            app.config.approvals_reviewer,
+            guardian_approvals.approvals_reviewer
+        );
+        assert_eq!(
+            app.config.permissions.approval_policy.value(),
+            guardian_approvals.approval
+        );
+        assert_eq!(
+            app.chat_widget
+                .config_ref()
+                .permissions
+                .approval_policy
+                .value(),
+            guardian_approvals.approval
+        );
+        assert_eq!(
+            app.chat_widget
+                .config_ref()
+                .permissions
+                .sandbox_policy
+                .get(),
+            &guardian_approvals.sandbox
+        );
+        assert_eq!(
+            app.chat_widget.config_ref().approvals_reviewer,
+            guardian_approvals.approvals_reviewer
+        );
+        assert_eq!(app.runtime_approval_policy_override, None);
+        assert_eq!(app.runtime_sandbox_policy_override, None);
+        assert_eq!(
+            op_rx.try_recv(),
+            Ok(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: Some(guardian_approvals.approval),
+                approvals_reviewer: Some(guardian_approvals.approvals_reviewer),
+                sandbox_policy: Some(guardian_approvals.sandbox.clone()),
+                windows_sandbox_level: None,
+                model: None,
+                effort: None,
+                summary: None,
+                service_tier: None,
+                collaboration_mode: None,
+                personality: None,
+            })
+        );
+        let cell = match app_event_rx.try_recv() {
+            Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+            other => panic!("expected InsertHistoryCell event, got {other:?}"),
+        };
+        let rendered = cell
+            .display_lines(/*width*/ 120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Permissions updated to Auto-review"));
+
+        let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+        assert!(config.contains("guardian_approval = true"));
+        assert!(config.contains("approvals_reviewer = \"guardian_subagent\""));
+        assert!(config.contains("approval_policy = \"on-request\""));
+        assert!(config.contains("sandbox_mode = \"workspace-write\""));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn update_feature_flags_disabling_guardian_preserves_active_guardian_review_policy()
+    -> Result<()> {
+        let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        let config_toml_path = codex_home.path().join("config.toml").abs();
+        let config_toml = "approvals_reviewer = \"guardian_subagent\"\napproval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n\n[features]\nguardian_approval = true\n";
+        std::fs::write(config_toml_path.as_path(), config_toml)?;
+        let user_config = toml::from_str::<TomlValue>(config_toml)?;
+        app.config.config_layer_stack = app
+            .config
+            .config_layer_stack
+            .with_user_config(&config_toml_path, user_config);
+        app.config
+            .features
+            .set_enabled(Feature::GuardianApproval, /*enabled*/ true)?;
+        app.chat_widget
+            .set_feature_enabled(Feature::GuardianApproval, /*enabled*/ true);
+        app.config.approvals_reviewer = ApprovalsReviewer::GuardianSubagent;
+        app.chat_widget
+            .set_approvals_reviewer(ApprovalsReviewer::GuardianSubagent);
+        app.config
+            .permissions
+            .approval_policy
+            .set(AskForApproval::OnRequest)?;
+        app.config
+            .permissions
+            .sandbox_policy
+            .set(SandboxPolicy::new_workspace_write_policy())?;
+        app.chat_widget
+            .set_approval_policy(AskForApproval::OnRequest);
+        app.chat_widget
+            .set_sandbox_policy(SandboxPolicy::new_workspace_write_policy())?;
+
+        app.update_feature_flags(vec![(Feature::GuardianApproval, false)])
+            .await;
+
+        assert!(!app.config.features.enabled(Feature::GuardianApproval));
+        assert!(
+            !app.chat_widget
+                .config_ref()
+                .features
+                .enabled(Feature::GuardianApproval)
+        );
+        assert_eq!(
+            app.config.approvals_reviewer,
+            ApprovalsReviewer::GuardianSubagent
+        );
+        assert_eq!(
+            app.config.permissions.approval_policy.value(),
+            AskForApproval::OnRequest
+        );
+        assert_eq!(
+            app.chat_widget.config_ref().approvals_reviewer,
+            ApprovalsReviewer::GuardianSubagent
+        );
+        assert_eq!(app.runtime_approval_policy_override, None);
+        assert_eq!(app.runtime_sandbox_policy_override, None);
+        assert!(
+            op_rx.try_recv().is_err(),
+            "disabling Guardian Approval should not rewrite the live reviewer-owned mode"
+        );
+        assert!(
+            app_event_rx.try_recv().is_err(),
+            "disabling Guardian Approval should not emit a permissions history rewrite"
+        );
+
+        let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+        assert!(!config.contains("guardian_approval = true"));
+        assert!(config.contains("approvals_reviewer = \"guardian_subagent\""));
+        assert!(config.contains("approval_policy = \"on-request\""));
+        assert!(config.contains("sandbox_mode = \"workspace-write\""));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn update_feature_flags_enabling_guardian_overrides_explicit_manual_review_policy()
+    -> Result<()> {
+        let (mut app, _app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        let guardian_approvals = guardian_approvals_mode();
+        let config_toml_path = codex_home.path().join("config.toml").abs();
+        let config_toml = "approvals_reviewer = \"user\"\n";
+        std::fs::write(config_toml_path.as_path(), config_toml)?;
+        let user_config = toml::from_str::<TomlValue>(config_toml)?;
+        app.config.config_layer_stack = app
+            .config
+            .config_layer_stack
+            .with_user_config(&config_toml_path, user_config);
+        app.config.approvals_reviewer = ApprovalsReviewer::User;
+        app.chat_widget
+            .set_approvals_reviewer(ApprovalsReviewer::User);
+
+        app.update_feature_flags(vec![(Feature::GuardianApproval, true)])
+            .await;
+
+        assert!(app.config.features.enabled(Feature::GuardianApproval));
+        assert_eq!(
+            app.config.approvals_reviewer,
+            guardian_approvals.approvals_reviewer
+        );
+        assert_eq!(
+            app.chat_widget.config_ref().approvals_reviewer,
+            guardian_approvals.approvals_reviewer
+        );
+        assert_eq!(
+            app.config.permissions.approval_policy.value(),
+            guardian_approvals.approval
+        );
+        assert_eq!(
+            app.chat_widget
+                .config_ref()
+                .permissions
+                .sandbox_policy
+                .get(),
+            &guardian_approvals.sandbox
+        );
+        assert_eq!(
+            op_rx.try_recv(),
+            Ok(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: Some(guardian_approvals.approval),
+                approvals_reviewer: Some(guardian_approvals.approvals_reviewer),
+                sandbox_policy: Some(guardian_approvals.sandbox.clone()),
+                windows_sandbox_level: None,
+                model: None,
+                effort: None,
+                summary: None,
+                service_tier: None,
+                collaboration_mode: None,
+                personality: None,
+            })
+        );
+
+        let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+        assert!(config.contains("approvals_reviewer = \"guardian_subagent\""));
+        assert!(config.contains("guardian_approval = true"));
+        assert!(config.contains("approval_policy = \"on-request\""));
+        assert!(config.contains("sandbox_mode = \"workspace-write\""));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn update_feature_flags_disabling_guardian_leaves_manual_review_policy_unchanged()
+    -> Result<()> {
+        let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        let config_toml_path = codex_home.path().join("config.toml").abs();
+        let config_toml = "approvals_reviewer = \"user\"\napproval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n\n[features]\nguardian_approval = true\n";
+        std::fs::write(config_toml_path.as_path(), config_toml)?;
+        let user_config = toml::from_str::<TomlValue>(config_toml)?;
+        app.config.config_layer_stack = app
+            .config
+            .config_layer_stack
+            .with_user_config(&config_toml_path, user_config);
+        app.config
+            .features
+            .set_enabled(Feature::GuardianApproval, /*enabled*/ true)?;
+        app.chat_widget
+            .set_feature_enabled(Feature::GuardianApproval, /*enabled*/ true);
+        app.config.approvals_reviewer = ApprovalsReviewer::User;
+        app.chat_widget
+            .set_approvals_reviewer(ApprovalsReviewer::User);
+
+        app.update_feature_flags(vec![(Feature::GuardianApproval, false)])
+            .await;
+
+        assert!(!app.config.features.enabled(Feature::GuardianApproval));
+        assert_eq!(app.config.approvals_reviewer, ApprovalsReviewer::User);
+        assert_eq!(
+            app.chat_widget.config_ref().approvals_reviewer,
+            ApprovalsReviewer::User
+        );
+        assert!(
+            op_rx.try_recv().is_err(),
+            "manual review should stay untouched when disabling Guardian Approval"
+        );
+        assert!(
+            app_event_rx.try_recv().is_err(),
+            "manual review should not emit a permissions history update when the effective state stays default"
+        );
+
+        let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+        assert!(!config.contains("guardian_approval = true"));
+        assert!(config.contains("approvals_reviewer = \"user\""));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn update_feature_flags_enabling_guardian_in_profile_sets_profile_auto_review_policy()
+    -> Result<()> {
+        let (mut app, _app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        let guardian_approvals = guardian_approvals_mode();
+        app.active_profile = Some("guardian".to_string());
+        let config_toml_path = codex_home.path().join("config.toml").abs();
+        let config_toml = "profile = \"guardian\"\napprovals_reviewer = \"user\"\n";
+        std::fs::write(config_toml_path.as_path(), config_toml)?;
+        let user_config = toml::from_str::<TomlValue>(config_toml)?;
+        app.config.config_layer_stack = app
+            .config
+            .config_layer_stack
+            .with_user_config(&config_toml_path, user_config);
+        app.config.approvals_reviewer = ApprovalsReviewer::User;
+        app.chat_widget
+            .set_approvals_reviewer(ApprovalsReviewer::User);
+
+        app.update_feature_flags(vec![(Feature::GuardianApproval, true)])
+            .await;
+
+        assert!(app.config.features.enabled(Feature::GuardianApproval));
+        assert_eq!(
+            app.config.approvals_reviewer,
+            guardian_approvals.approvals_reviewer
+        );
+        assert_eq!(
+            app.chat_widget.config_ref().approvals_reviewer,
+            guardian_approvals.approvals_reviewer
+        );
+        assert_eq!(
+            op_rx.try_recv(),
+            Ok(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: Some(guardian_approvals.approval),
+                approvals_reviewer: Some(guardian_approvals.approvals_reviewer),
+                sandbox_policy: Some(guardian_approvals.sandbox.clone()),
+                windows_sandbox_level: None,
+                model: None,
+                effort: None,
+                summary: None,
+                service_tier: None,
+                collaboration_mode: None,
+                personality: None,
+            })
+        );
+
+        let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+        let config_value = toml::from_str::<TomlValue>(&config)?;
+        let profile_config = config_value
+            .as_table()
+            .and_then(|table| table.get("profiles"))
+            .and_then(TomlValue::as_table)
+            .and_then(|profiles| profiles.get("guardian"))
+            .and_then(TomlValue::as_table)
+            .expect("guardian profile should exist");
+        assert_eq!(
+            config_value
+                .as_table()
+                .and_then(|table| table.get("approvals_reviewer")),
+            Some(&TomlValue::String("user".to_string()))
+        );
+        assert_eq!(
+            profile_config.get("approvals_reviewer"),
+            Some(&TomlValue::String("guardian_subagent".to_string()))
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn update_feature_flags_disabling_guardian_in_profile_preserves_profile_owned_reviewer()
+    -> Result<()> {
+        let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        app.active_profile = Some("guardian".to_string());
+        let config_toml_path = codex_home.path().join("config.toml").abs();
+        let config_toml = r#"
+profile = "guardian"
+approvals_reviewer = "user"
+
+[profiles.guardian]
+approvals_reviewer = "guardian_subagent"
+
+[profiles.guardian.features]
+guardian_approval = true
+"#;
+        std::fs::write(config_toml_path.as_path(), config_toml)?;
+        let user_config = toml::from_str::<TomlValue>(config_toml)?;
+        app.config.config_layer_stack = app
+            .config
+            .config_layer_stack
+            .with_user_config(&config_toml_path, user_config);
+        app.config
+            .features
+            .set_enabled(Feature::GuardianApproval, /*enabled*/ true)?;
+        app.chat_widget
+            .set_feature_enabled(Feature::GuardianApproval, /*enabled*/ true);
+        app.config.approvals_reviewer = ApprovalsReviewer::GuardianSubagent;
+        app.chat_widget
+            .set_approvals_reviewer(ApprovalsReviewer::GuardianSubagent);
+
+        app.update_feature_flags(vec![(Feature::GuardianApproval, false)])
+            .await;
+
+        assert!(!app.config.features.enabled(Feature::GuardianApproval));
+        assert!(
+            !app.chat_widget
+                .config_ref()
+                .features
+                .enabled(Feature::GuardianApproval)
+        );
+        assert_eq!(
+            app.config.approvals_reviewer,
+            ApprovalsReviewer::GuardianSubagent
+        );
+        assert_eq!(
+            app.chat_widget.config_ref().approvals_reviewer,
+            ApprovalsReviewer::GuardianSubagent
+        );
+        assert!(
+            op_rx.try_recv().is_err(),
+            "disabling the feature should not rewrite a profile-owned guardian reviewer"
+        );
+        assert!(
+            app_event_rx.try_recv().is_err(),
+            "disabling the feature should not emit a permissions history rewrite for a profile-owned guardian reviewer"
+        );
+
+        let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+        assert!(!config.contains("guardian_approval = true"));
+        let config_value = toml::from_str::<TomlValue>(&config)?;
+        let profile_config = config_value
+            .as_table()
+            .and_then(|table| table.get("profiles"))
+            .and_then(TomlValue::as_table)
+            .and_then(|profiles| profiles.get("guardian"))
+            .and_then(TomlValue::as_table)
+            .expect("guardian profile should exist");
+        assert_eq!(
+            config_value
+                .as_table()
+                .and_then(|table| table.get("approvals_reviewer")),
+            Some(&TomlValue::String("user".to_string()))
+        );
+        assert_eq!(
+            profile_config.get("approvals_reviewer"),
+            Some(&TomlValue::String("guardian_subagent".to_string()))
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn update_feature_flags_disabling_guardian_in_profile_preserves_inherited_non_user_reviewer()
+    -> Result<()> {
+        let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        app.active_profile = Some("guardian".to_string());
+        let config_toml_path = codex_home.path().join("config.toml").abs();
+        let config_toml = "profile = \"guardian\"\napprovals_reviewer = \"guardian_subagent\"\n\n[features]\nguardian_approval = true\n";
+        std::fs::write(config_toml_path.as_path(), config_toml)?;
+        let user_config = toml::from_str::<TomlValue>(config_toml)?;
+        app.config.config_layer_stack = app
+            .config
+            .config_layer_stack
+            .with_user_config(&config_toml_path, user_config);
+        app.config
+            .features
+            .set_enabled(Feature::GuardianApproval, /*enabled*/ true)?;
+        app.chat_widget
+            .set_feature_enabled(Feature::GuardianApproval, /*enabled*/ true);
+        app.config.approvals_reviewer = ApprovalsReviewer::GuardianSubagent;
+        app.chat_widget
+            .set_approvals_reviewer(ApprovalsReviewer::GuardianSubagent);
+
+        app.update_feature_flags(vec![(Feature::GuardianApproval, false)])
+            .await;
+
+        assert!(!app.config.features.enabled(Feature::GuardianApproval));
+        assert!(
+            !app.chat_widget
+                .config_ref()
+                .features
+                .enabled(Feature::GuardianApproval)
+        );
+        assert_eq!(
+            app.config.approvals_reviewer,
+            ApprovalsReviewer::GuardianSubagent
+        );
+        assert_eq!(
+            app.chat_widget.config_ref().approvals_reviewer,
+            ApprovalsReviewer::GuardianSubagent
+        );
+        assert!(
+            op_rx.try_recv().is_err(),
+            "disabling an inherited non-user reviewer should not patch the active session"
+        );
+        let app_events = std::iter::from_fn(|| app_event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            !app_events.iter().any(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => cell
+                    .display_lines(/*width*/ 120)
+                    .iter()
+                    .any(|line| line.to_string().contains("Permissions updated to")),
+                _ => false,
+            }),
+            "blocking disable with inherited guardian review should not emit a permissions history update: {app_events:?}"
+        );
+
+        let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+        let config_value = toml::from_str::<TomlValue>(&config)?;
+        assert_eq!(
+            config_value
+                .as_table()
+                .and_then(|table| table.get("approvals_reviewer")),
+            Some(&TomlValue::String("guardian_subagent".to_string()))
+        );
+        let profile_config = config_value
+            .as_table()
+            .and_then(|table| table.get("profiles"))
+            .and_then(TomlValue::as_table)
+            .and_then(|profiles| profiles.get("guardian"))
+            .and_then(TomlValue::as_table)
+            .expect("guardian profile should exist");
+        let profile_features = profile_config
+            .get("features")
+            .and_then(TomlValue::as_table)
+            .expect("guardian profile features should exist");
+        assert_eq!(
+            profile_features.get("guardian_approval"),
+            Some(&TomlValue::Boolean(false))
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn rebuild_config_for_resume_or_fallback_uses_current_config_on_same_cwd_error()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        std::fs::write(codex_home.path().join("config.toml"), "[broken")?;
+        let current_config = app.config.clone();
+        let current_cwd = current_config.cwd.clone();
+
+        let resume_config = app
+            .rebuild_config_for_resume_or_fallback(
+                &current_cwd,
+                current_cwd.to_path_buf(),
+                /*config_path*/ None,
+            )
+            .await?;
+
+        assert_eq!(resume_config, current_config);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn rebuild_config_for_resume_or_fallback_errors_when_cwd_changes() -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        std::fs::write(codex_home.path().join("config.toml"), "[broken")?;
+        let current_cwd = app.config.cwd.clone();
+        let next_cwd_tmp = tempdir()?;
+        let next_cwd = next_cwd_tmp.path().to_path_buf();
+
+        let result = app
+            .rebuild_config_for_resume_or_fallback(
+                &current_cwd,
+                next_cwd,
+                /*config_path*/ None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn rebuild_config_for_resume_or_fallback_errors_for_same_cwd_when_target_config_path_is_explicit()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        let current_cwd = app.config.cwd.clone();
+        let missing_config_path = codex_home.path().join("missing-config.toml");
+
+        let result = app
+            .rebuild_config_for_resume_or_fallback(
+                &current_cwd,
+                current_cwd.to_path_buf(),
+                Some(missing_config_path),
+            )
+            .await;
+
+        assert!(result.is_err());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn sync_tui_theme_selection_updates_chat_widget_config_copy() {
+        let mut app = make_test_app().await;
+
+        app.sync_tui_theme_selection("dracula".to_string());
+
+        assert_eq!(app.config.tui_theme.as_deref(), Some("dracula"));
+        assert_eq!(
+            app.chat_widget.config_ref().tui_theme.as_deref(),
+            Some("dracula")
+        );
+    }
+}
