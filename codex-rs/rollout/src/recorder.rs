@@ -715,8 +715,8 @@ impl RolloutRecorder {
             if line.trim().is_empty() {
                 continue;
             }
-            let v: Value = match serde_json::from_str(line) {
-                Ok(v) => v,
+            let mut line_value: Value = match serde_json::from_str(line) {
+                Ok(value) => value,
                 Err(e) => {
                     warn!("failed to parse line as JSON: {line:?}, error: {e}");
                     parse_errors = parse_errors.saturating_add(1);
@@ -724,8 +724,43 @@ impl RolloutRecorder {
                 }
             };
 
+            // Merge-safety anchor: rollout loading is the only place where
+            // historical token-count windows may be normalized from persisted
+            // `used_percent` into the active `remaining_percent` contract.
+            if line_value.get("type").and_then(Value::as_str) == Some("event_msg")
+                && line_value.pointer("/payload/type").and_then(Value::as_str)
+                    == Some("token_count")
+                && let Some(rate_limits) = line_value
+                    .pointer_mut("/payload/rate_limits")
+                    .and_then(Value::as_object_mut)
+            {
+                for window_name in ["primary", "secondary"] {
+                    let Some(window) = rate_limits
+                        .get_mut(window_name)
+                        .and_then(Value::as_object_mut)
+                    else {
+                        continue;
+                    };
+                    if window.contains_key("remaining_percent") {
+                        continue;
+                    }
+                    let Some(used_percent) = window.get("used_percent").and_then(Value::as_f64)
+                    else {
+                        continue;
+                    };
+                    if let Some(remaining_percent) =
+                        serde_json::Number::from_f64((100.0 - used_percent).clamp(0.0, 100.0))
+                    {
+                        window.insert(
+                            "remaining_percent".to_string(),
+                            Value::Number(remaining_percent),
+                        );
+                    }
+                }
+            }
+
             // Parse the rollout line structure
-            match serde_json::from_value::<RolloutLine>(v.clone()) {
+            match serde_json::from_value::<RolloutLine>(line_value) {
                 Ok(rollout_line) => match rollout_line.item {
                     RolloutItem::SessionMeta(session_meta_line) => {
                         // Use the FIRST SessionMeta encountered in the file as the canonical
@@ -2294,6 +2329,107 @@ mod tests {
         );
 
         recorder.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rollout_loading_normalizes_historical_token_count_used_percent() -> std::io::Result<()>
+    {
+        let home = TempDir::new().expect("temp dir");
+        let session_uuid = Uuid::from_u128(9910);
+        let path = write_session_file(home.path(), "2025-01-03T13-00-00", session_uuid)?;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+        let historical_token_count = serde_json::json!({
+            "timestamp": "2025-01-03T13:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": null,
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "limit_name": "Codex",
+                    "primary": {
+                        "used_percent": 25.0,
+                        "window_minutes": 300,
+                        "resets_at": 123,
+                    },
+                    "secondary": {
+                        "used_percent": 150.0,
+                        "window_minutes": 10080,
+                        "resets_at": 456,
+                    },
+                },
+            },
+        });
+        writeln!(file, "{historical_token_count}")?;
+
+        let (items, _thread_id, parse_errors) =
+            RolloutRecorder::load_rollout_items_skipping_malformed_lines(path.as_path()).await?;
+        assert_eq!(parse_errors, 0);
+
+        let token_counts = items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::EventMsg(EventMsg::TokenCount(event)) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(token_counts.len(), 1);
+        let rate_limits = token_counts[0]
+            .rate_limits
+            .as_ref()
+            .expect("rate limits should parse");
+        assert_eq!(
+            rate_limits
+                .primary
+                .as_ref()
+                .map(|window| window.remaining_percent),
+            Some(75.0)
+        );
+        assert_eq!(
+            rate_limits
+                .secondary
+                .as_ref()
+                .map(|window| window.remaining_percent),
+            Some(0.0)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rollout_loading_keeps_invalid_token_count_window_malformed() -> std::io::Result<()> {
+        let home = TempDir::new().expect("temp dir");
+        let session_uuid = Uuid::from_u128(9912);
+        let path = write_session_file(home.path(), "2025-01-03T13-00-00", session_uuid)?;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+        let invalid_token_count = serde_json::json!({
+            "timestamp": "2025-01-03T13:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": null,
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {
+                        "used_percent": "25",
+                        "window_minutes": 300,
+                        "resets_at": 123,
+                    },
+                },
+            },
+        });
+        writeln!(file, "{invalid_token_count}")?;
+
+        let (items, _thread_id, parse_errors) =
+            RolloutRecorder::load_rollout_items_skipping_malformed_lines(path.as_path()).await?;
+        assert_eq!(parse_errors, 1);
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TokenCount(_))))
+        );
+
         Ok(())
     }
 
