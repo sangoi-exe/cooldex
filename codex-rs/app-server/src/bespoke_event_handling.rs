@@ -44,7 +44,6 @@ use codex_app_server_protocol::FileChangeOutputDeltaNotification;
 use codex_app_server_protocol::FileChangeRequestApprovalParams;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
 use codex_app_server_protocol::FileUpdateChange;
-use codex_app_server_protocol::GrantedPermissionProfile as V2GrantedPermissionProfile;
 use codex_app_server_protocol::HookCompletedNotification;
 use codex_app_server_protocol::HookStartedNotification;
 use codex_app_server_protocol::InterruptConversationResponse;
@@ -134,6 +133,7 @@ use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnDiffEvent;
+#[cfg(test)]
 use codex_protocol::request_permissions::PermissionGrantScope as CorePermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse as CoreRequestPermissionsResponse;
@@ -927,6 +927,10 @@ pub(crate) async fn apply_bespoke_event_handling(
                     .note_permission_requested(&conversation_id.to_string())
                     .await;
                 let requested_permissions = request.permissions.clone();
+                let request_cwd = match request.cwd.clone() {
+                    Some(cwd) => cwd,
+                    None => conversation.config_snapshot().await.cwd,
+                };
                 let params = PermissionsRequestApprovalParams {
                     thread_id: conversation_id.to_string(),
                     turn_id: request.turn_id.clone(),
@@ -937,35 +941,32 @@ pub(crate) async fn apply_bespoke_event_handling(
                 let (pending_request_id, rx) = outgoing
                     .send_request(ServerRequestPayload::PermissionsRequestApproval(params))
                     .await;
+                let pending_response = PendingRequestPermissionsResponse {
+                    call_id: request.call_id,
+                    requested_permissions,
+                    request_cwd,
+                    pending_request_id,
+                    receiver: rx,
+                    request_permissions_guard: permission_guard,
+                };
                 tokio::spawn(async move {
-                    on_request_permissions_response(
-                        request.call_id,
-                        requested_permissions,
-                        pending_request_id,
-                        rx,
-                        conversation,
-                        thread_state,
-                        permission_guard,
-                    )
-                    .await;
+                    on_request_permissions_response(pending_response, conversation, thread_state)
+                        .await;
                 });
             } else {
-                error!(
+                let message = format!(
                     "request_permissions is only supported on api v2 (call_id: {})",
                     request.call_id
                 );
-                let empty = CoreRequestPermissionsResponse {
-                    permissions: Default::default(),
-                    scope: CorePermissionGrantScope::Turn,
-                };
+                error!("{message}");
                 if let Err(err) = conversation
-                    .submit(Op::RequestPermissionsResponse {
+                    .submit(Op::RequestPermissionsFailure {
                         id: request.call_id,
-                        response: empty,
+                        message,
                     })
                     .await
                 {
-                    error!("failed to submit RequestPermissionsResponse: {err}");
+                    error!("failed to submit RequestPermissionsFailure: {err}");
                 }
             }
         }
@@ -2621,73 +2622,92 @@ fn mcp_server_elicitation_response_from_client_result(
 }
 
 async fn on_request_permissions_response(
-    call_id: String,
-    requested_permissions: CoreRequestPermissionProfile,
-    pending_request_id: RequestId,
-    receiver: oneshot::Receiver<ClientRequestResult>,
+    pending_response: PendingRequestPermissionsResponse,
     conversation: Arc<CodexThread>,
     thread_state: Arc<Mutex<ThreadState>>,
-    request_permissions_guard: ThreadWatchActiveGuard,
 ) {
+    let PendingRequestPermissionsResponse {
+        call_id,
+        requested_permissions,
+        request_cwd,
+        pending_request_id,
+        receiver,
+        request_permissions_guard,
+    } = pending_response;
     let response = receiver.await;
     resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await;
     drop(request_permissions_guard);
-    let Some(response) =
-        request_permissions_response_from_client_result(requested_permissions, response)
-    else {
+    let Some(result) = request_permissions_response_from_client_result(
+        requested_permissions,
+        response,
+        request_cwd.as_path(),
+    ) else {
         return;
     };
 
-    if let Err(err) = conversation
-        .submit(Op::RequestPermissionsResponse {
+    let op = match result {
+        Ok(response) => Op::RequestPermissionsResponse {
             id: call_id,
             response,
-        })
-        .await
-    {
-        error!("failed to submit RequestPermissionsResponse: {err}");
+        },
+        Err(message) => Op::RequestPermissionsFailure {
+            id: call_id,
+            message,
+        },
+    };
+    if let Err(err) = conversation.submit(op).await {
+        error!("failed to submit request_permissions result: {err}");
     }
+}
+
+struct PendingRequestPermissionsResponse {
+    call_id: String,
+    requested_permissions: CoreRequestPermissionProfile,
+    request_cwd: AbsolutePathBuf,
+    pending_request_id: RequestId,
+    receiver: oneshot::Receiver<ClientRequestResult>,
+    request_permissions_guard: ThreadWatchActiveGuard,
 }
 
 fn request_permissions_response_from_client_result(
     requested_permissions: CoreRequestPermissionProfile,
     response: std::result::Result<ClientRequestResult, oneshot::error::RecvError>,
-) -> Option<CoreRequestPermissionsResponse> {
+    request_cwd: &Path,
+) -> Option<Result<CoreRequestPermissionsResponse, String>> {
     let value = match response {
         Ok(Ok(value)) => value,
         Ok(Err(err)) if is_turn_transition_server_request_error(&err) => return None,
         Ok(Err(err)) => {
-            error!("request failed with client error: {err:?}");
-            return Some(CoreRequestPermissionsResponse {
-                permissions: Default::default(),
-                scope: CorePermissionGrantScope::Turn,
-            });
+            let message = format!("request_permissions failed with client error: {err:?}");
+            error!("{message}");
+            return Some(Err(message));
         }
         Err(err) => {
-            error!("request failed: {err:?}");
-            return Some(CoreRequestPermissionsResponse {
-                permissions: Default::default(),
-                scope: CorePermissionGrantScope::Turn,
-            });
+            let message = format!("request_permissions response channel failed: {err:?}");
+            error!("{message}");
+            return Some(Err(message));
         }
     };
 
-    let response = serde_json::from_value::<PermissionsRequestApprovalResponse>(value)
-        .unwrap_or_else(|err| {
-            error!("failed to deserialize PermissionsRequestApprovalResponse: {err}");
-            PermissionsRequestApprovalResponse {
-                permissions: V2GrantedPermissionProfile::default(),
-                scope: codex_app_server_protocol::PermissionGrantScope::Turn,
-            }
-        });
-    Some(CoreRequestPermissionsResponse {
+    let response = match serde_json::from_value::<PermissionsRequestApprovalResponse>(value) {
+        Ok(response) => response,
+        Err(err) => {
+            let message =
+                format!("failed to deserialize PermissionsRequestApprovalResponse: {err}");
+            error!("{message}");
+            return Some(Err(message));
+        }
+    };
+    Some(Ok(CoreRequestPermissionsResponse {
         permissions: intersect_permission_profiles(
             requested_permissions.into(),
             response.permissions.into(),
+            request_cwd,
         )
         .into(),
         scope: response.scope.to_core(),
-    })
+        strict_auto_review: response.strict_auto_review.unwrap_or(false),
+    }))
 }
 
 fn map_file_change_approval_decision(
@@ -3861,13 +3881,34 @@ mod tests {
             message: "client request resolved because the turn state was changed".to_string(),
             data: Some(serde_json::json!({ "reason": "turnTransition" })),
         };
+        let cwd = std::env::current_dir().expect("current dir");
 
         let response = request_permissions_response_from_client_result(
             CoreRequestPermissionProfile::default(),
             Ok(Err(error)),
+            cwd.as_path(),
         );
 
         assert_eq!(response, None);
+    }
+
+    #[test]
+    fn request_permissions_client_error_is_not_laundered_as_empty_grant() {
+        let error = JSONRPCErrorError {
+            code: -1,
+            message: "client failed".to_string(),
+            data: None,
+        };
+        let cwd = std::env::current_dir().expect("current dir");
+
+        let response = request_permissions_response_from_client_result(
+            CoreRequestPermissionProfile::default(),
+            Ok(Err(error)),
+            cwd.as_path(),
+        )
+        .expect("response should not be ignored");
+
+        assert!(response.is_err());
     }
 
     #[test]
@@ -3894,10 +3935,10 @@ mod tests {
             network: Some(CoreNetworkPermissions {
                 enabled: Some(true),
             }),
-            file_system: Some(CoreFileSystemPermissions {
-                read: Some(vec![absolute_path(input_path)]),
-                write: Some(vec![absolute_path(output_path)]),
-            }),
+            file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
+                Some(vec![absolute_path(input_path)]),
+                Some(vec![absolute_path(output_path)]),
+            )),
         };
         let cases = vec![
             (
@@ -3924,10 +3965,10 @@ mod tests {
                     },
                 }),
                 CoreRequestPermissionProfile {
-                    file_system: Some(CoreFileSystemPermissions {
-                        read: None,
-                        write: Some(vec![absolute_path(output_path)]),
-                    }),
+                    file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
+                        None,
+                        Some(vec![absolute_path(output_path)]),
+                    )),
                     ..CoreRequestPermissionProfile::default()
                 },
             ),
@@ -3942,22 +3983,25 @@ mod tests {
                     },
                 }),
                 CoreRequestPermissionProfile {
-                    file_system: Some(CoreFileSystemPermissions {
-                        read: Some(vec![absolute_path(input_path)]),
-                        write: Some(vec![absolute_path(output_path)]),
-                    }),
+                    file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
+                        Some(vec![absolute_path(input_path)]),
+                        Some(vec![absolute_path(output_path)]),
+                    )),
                     ..CoreRequestPermissionProfile::default()
                 },
             ),
         ];
 
         for (granted_permissions, expected_permissions) in cases {
+            let cwd = std::env::current_dir().expect("current dir");
             let response = request_permissions_response_from_client_result(
                 requested_permissions.clone(),
                 Ok(Ok(serde_json::json!({
                     "permissions": granted_permissions,
                 }))),
+                cwd.as_path(),
             )
+            .expect("response should not be ignored")
             .expect("response should be accepted");
 
             assert_eq!(
@@ -3965,6 +4009,7 @@ mod tests {
                 CoreRequestPermissionsResponse {
                     permissions: expected_permissions,
                     scope: CorePermissionGrantScope::Turn,
+                    strict_auto_review: false,
                 }
             );
         }
@@ -3972,13 +4017,16 @@ mod tests {
 
     #[test]
     fn request_permissions_response_preserves_session_scope() {
+        let cwd = std::env::current_dir().expect("current dir");
         let response = request_permissions_response_from_client_result(
             CoreRequestPermissionProfile::default(),
             Ok(Ok(serde_json::json!({
                 "scope": "session",
                 "permissions": {},
             }))),
+            cwd.as_path(),
         )
+        .expect("response should not be ignored")
         .expect("response should be accepted");
 
         assert_eq!(
@@ -3986,8 +4034,50 @@ mod tests {
             CoreRequestPermissionsResponse {
                 permissions: CoreRequestPermissionProfile::default(),
                 scope: CorePermissionGrantScope::Session,
+                strict_auto_review: false,
             }
         );
+    }
+
+    #[test]
+    fn request_permissions_response_preserves_turn_strict_auto_review() {
+        let cwd = std::env::current_dir().expect("current dir");
+        let response = request_permissions_response_from_client_result(
+            CoreRequestPermissionProfile::default(),
+            Ok(Ok(serde_json::json!({
+                "scope": "turn",
+                "strictAutoReview": true,
+                "permissions": {},
+            }))),
+            cwd.as_path(),
+        )
+        .expect("response should not be ignored")
+        .expect("response should be accepted");
+
+        assert_eq!(
+            response,
+            CoreRequestPermissionsResponse {
+                permissions: CoreRequestPermissionProfile::default(),
+                scope: CorePermissionGrantScope::Turn,
+                strict_auto_review: true,
+            }
+        );
+    }
+
+    #[test]
+    fn request_permissions_response_rejects_malformed_payload() {
+        let cwd = std::env::current_dir().expect("current dir");
+        let response = request_permissions_response_from_client_result(
+            CoreRequestPermissionProfile::default(),
+            Ok(Ok(serde_json::json!({
+                "scope": 7,
+                "permissions": {},
+            }))),
+            cwd.as_path(),
+        )
+        .expect("response should not be ignored");
+
+        assert!(response.is_err());
     }
 
     #[test]

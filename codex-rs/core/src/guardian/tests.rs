@@ -746,9 +746,32 @@ async fn routes_approval_to_guardian_requires_auto_only_review_policy() {
 
     assert!(!routes_approval_to_guardian(&turn));
 
-    config.approvals_reviewer = ApprovalsReviewer::GuardianSubagent;
+    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
     turn.config = Arc::new(config);
 
+    assert!(routes_approval_to_guardian(&turn));
+
+    turn.approval_policy
+        .set(AskForApproval::OnFailure)
+        .expect("test setup should allow updating approval policy");
+    assert!(routes_approval_to_guardian(&turn));
+
+    turn.approval_policy
+        .set(AskForApproval::UnlessTrusted)
+        .expect("test setup should allow updating approval policy");
+    assert!(routes_approval_to_guardian(&turn));
+
+    turn.approval_policy
+        .set(AskForApproval::Granular(
+            codex_protocol::protocol::GranularApprovalConfig {
+                sandbox_approval: true,
+                rules: true,
+                skill_approval: true,
+                request_permissions: true,
+                mcp_elicitations: true,
+            },
+        ))
+        .expect("test setup should allow updating approval policy");
     assert!(routes_approval_to_guardian(&turn));
 }
 
@@ -1588,7 +1611,9 @@ async fn guardian_review_session_config_preserves_parent_network_proxy() {
             }),
             ..Default::default()
         }),
-        parent_config.permissions.sandbox_policy.get(),
+        &parent_config
+            .permissions
+            .legacy_sandbox_policy(parent_config.cwd.as_path()),
     )
     .expect("network proxy spec");
     parent_config.permissions.network = Some(network.clone());
@@ -1615,8 +1640,10 @@ async fn guardian_review_session_config_preserves_parent_network_proxy() {
         Constrained::allow_only(AskForApproval::Never)
     );
     assert_eq!(
-        guardian_config.permissions.sandbox_policy,
-        Constrained::allow_only(SandboxPolicy::new_read_only_policy())
+        guardian_config
+            .permissions
+            .legacy_sandbox_policy(guardian_config.cwd.as_path()),
+        SandboxPolicy::new_read_only_policy()
     );
 }
 
@@ -1652,7 +1679,9 @@ async fn guardian_review_session_config_uses_live_network_proxy_state() {
         NetworkProxySpec::from_config_and_constraints(
             parent_network,
             /*requirements*/ None,
-            parent_config.permissions.sandbox_policy.get(),
+            &parent_config
+                .permissions
+                .legacy_sandbox_policy(parent_config.cwd.as_path()),
         )
         .expect("parent network proxy spec"),
     );

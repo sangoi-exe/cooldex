@@ -432,7 +432,11 @@ fn config_summary_entries(
         ),
         (
             "sandbox",
-            summarize_sandbox_policy(config.permissions.sandbox_policy.get()),
+            summarize_sandbox_policy(
+                &config
+                    .permissions
+                    .legacy_sandbox_policy(config.cwd.as_path()),
+            ),
         ),
     ];
     if config.model_provider.wire_api == WireApi::Responses {

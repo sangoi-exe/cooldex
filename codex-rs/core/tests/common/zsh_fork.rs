@@ -36,7 +36,10 @@ impl ZshForkRuntime {
         config.main_execve_wrapper_exe = Some(self.main_execve_wrapper_exe.clone());
         config.permissions.allow_login_shell = false;
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
     }
 }
 

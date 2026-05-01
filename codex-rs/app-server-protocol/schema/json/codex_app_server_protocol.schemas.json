@@ -5,46 +5,12 @@
       "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
       "type": "string"
     },
-    "AdditionalFileSystemPermissions": {
-      "properties": {
-        "read": {
-          "items": {
-            "$ref": "#/definitions/v2/AbsolutePathBuf"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "write": {
-          "items": {
-            "$ref": "#/definitions/v2/AbsolutePathBuf"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "AdditionalNetworkPermissions": {
-      "properties": {
-        "enabled": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
     "AdditionalPermissionProfile": {
       "properties": {
         "fileSystem": {
           "anyOf": [
             {
-              "$ref": "#/definitions/AdditionalFileSystemPermissions"
+              "$ref": "#/definitions/v2/AdditionalFileSystemPermissions"
             },
             {
               "type": "null"
@@ -54,7 +20,7 @@
         "network": {
           "anyOf": [
             {
-              "$ref": "#/definitions/AdditionalNetworkPermissions"
+              "$ref": "#/definitions/v2/AdditionalNetworkPermissions"
             },
             {
               "type": "null"
@@ -2478,7 +2444,7 @@
         "fileSystem": {
           "anyOf": [
             {
-              "$ref": "#/definitions/AdditionalFileSystemPermissions"
+              "$ref": "#/definitions/v2/AdditionalFileSystemPermissions"
             },
             {
               "type": "null"
@@ -2488,7 +2454,7 @@
         "network": {
           "anyOf": [
             {
-              "$ref": "#/definitions/AdditionalNetworkPermissions"
+              "$ref": "#/definitions/v2/AdditionalNetworkPermissions"
             },
             {
               "type": "null"
@@ -3487,7 +3453,7 @@
           "type": "string"
         },
         "permissions": {
-          "$ref": "#/definitions/RequestPermissionProfile"
+          "$ref": "#/definitions/v2/RequestPermissionProfile"
         },
         "reason": {
           "type": [
@@ -3524,6 +3490,13 @@
             }
           ],
           "default": "turn"
+        },
+        "strictAutoReview": {
+          "description": "Review every subsequent command in this turn before normal sandboxed execution.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "required": [
@@ -3544,32 +3517,6 @@
         }
       ],
       "title": "RequestId"
-    },
-    "RequestPermissionProfile": {
-      "additionalProperties": false,
-      "properties": {
-        "fileSystem": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/AdditionalFileSystemPermissions"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "network": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/AdditionalNetworkPermissions"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "type": "object"
     },
     "ReviewDecision": {
       "description": "User's decision in response to an ExecApprovalRequest.",
@@ -5355,6 +5302,59 @@
         ],
         "type": "string"
       },
+      "AdditionalFileSystemPermissions": {
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/definitions/v2/FileSystemSandboxEntry"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "globScanMaxDepth": {
+            "format": "uint",
+            "minimum": 1.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "read": {
+            "description": "Legacy read-root list. Prefer `entries` for new clients.",
+            "items": {
+              "$ref": "#/definitions/v2/AbsolutePathBuf"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "write": {
+            "description": "Legacy write-root list. Prefer `entries` for new clients.",
+            "items": {
+              "$ref": "#/definitions/v2/AbsolutePathBuf"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "AdditionalNetworkPermissions": {
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "AgentMessageDeltaNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -5781,9 +5781,10 @@
         "type": "object"
       },
       "ApprovalsReviewer": {
-        "description": "Configures who approval requests are routed to for review. Examples include sandbox escapes, blocked network access, MCP approval prompts, and ARC escalations. Defaults to `user`. `guardian_subagent` uses a carefully prompted subagent to gather relevant context and apply a risk-based decision framework before approving or denying the request.",
+        "description": "Configures who approval requests are routed to for review. Examples include sandbox escapes, blocked network access, MCP approval prompts, and ARC escalations. Defaults to `user`. `auto_review` uses a carefully prompted subagent to gather relevant context and apply a risk-based decision framework before approving or denying the request. The legacy value `guardian_subagent` is accepted for compatibility.",
         "enum": [
           "user",
+          "auto_review",
           "guardian_subagent"
         ],
         "type": "string"
@@ -8081,6 +8082,202 @@
         "title": "FileChangeOutputDeltaNotification",
         "type": "object"
       },
+      "FileSystemAccessMode": {
+        "enum": [
+          "read",
+          "write",
+          "none"
+        ],
+        "type": "string"
+      },
+      "FileSystemPath": {
+        "oneOf": [
+          {
+            "properties": {
+              "path": {
+                "$ref": "#/definitions/v2/AbsolutePathBuf"
+              },
+              "type": {
+                "enum": [
+                  "path"
+                ],
+                "title": "PathFileSystemPathType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "type"
+            ],
+            "title": "PathFileSystemPath",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "pattern": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "glob_pattern"
+                ],
+                "title": "GlobPatternFileSystemPathType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "pattern",
+              "type"
+            ],
+            "title": "GlobPatternFileSystemPath",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "special"
+                ],
+                "title": "SpecialFileSystemPathType",
+                "type": "string"
+              },
+              "value": {
+                "$ref": "#/definitions/v2/FileSystemSpecialPath"
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "title": "SpecialFileSystemPath",
+            "type": "object"
+          }
+        ]
+      },
+      "FileSystemSandboxEntry": {
+        "properties": {
+          "access": {
+            "$ref": "#/definitions/v2/FileSystemAccessMode"
+          },
+          "path": {
+            "$ref": "#/definitions/v2/FileSystemPath"
+          }
+        },
+        "required": [
+          "access",
+          "path"
+        ],
+        "type": "object"
+      },
+      "FileSystemSpecialPath": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "root"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "title": "RootFileSystemSpecialPath",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "minimal"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "title": "MinimalFileSystemSpecialPath",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "project_roots"
+                ],
+                "type": "string"
+              },
+              "subpath": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "title": "KindFileSystemSpecialPath",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "tmpdir"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "title": "TmpdirFileSystemSpecialPath",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "slash_tmp"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "title": "SlashTmpFileSystemSpecialPath",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "subpath": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "path"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "FileUpdateChange": {
         "properties": {
           "diff": {
@@ -8926,6 +9123,32 @@
               "type"
             ],
             "title": "McpToolCallGuardianApprovalReviewAction",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "permissions": {
+                "$ref": "#/definitions/v2/RequestPermissionProfile"
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "requestPermissions"
+                ],
+                "title": "RequestPermissionsGuardianApprovalReviewActionType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "permissions",
+              "type"
+            ],
+            "title": "RequestPermissionsGuardianApprovalReviewAction",
             "type": "object"
           }
         ]
@@ -10549,6 +10772,135 @@
           }
         ]
       },
+      "PermissionProfile": {
+        "oneOf": [
+          {
+            "description": "Codex owns sandbox construction for this profile.",
+            "properties": {
+              "fileSystem": {
+                "$ref": "#/definitions/v2/PermissionProfileFileSystemPermissions"
+              },
+              "network": {
+                "$ref": "#/definitions/v2/PermissionProfileNetworkPermissions"
+              },
+              "type": {
+                "enum": [
+                  "managed"
+                ],
+                "title": "ManagedPermissionProfileType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "fileSystem",
+              "network",
+              "type"
+            ],
+            "title": "ManagedPermissionProfile",
+            "type": "object"
+          },
+          {
+            "description": "Do not apply an outer sandbox.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "disabled"
+                ],
+                "title": "DisabledPermissionProfileType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "title": "DisabledPermissionProfile",
+            "type": "object"
+          },
+          {
+            "description": "Filesystem isolation is enforced by an external caller.",
+            "properties": {
+              "network": {
+                "$ref": "#/definitions/v2/PermissionProfileNetworkPermissions"
+              },
+              "type": {
+                "enum": [
+                  "external"
+                ],
+                "title": "ExternalPermissionProfileType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "network",
+              "type"
+            ],
+            "title": "ExternalPermissionProfile",
+            "type": "object"
+          }
+        ]
+      },
+      "PermissionProfileFileSystemPermissions": {
+        "oneOf": [
+          {
+            "properties": {
+              "entries": {
+                "items": {
+                  "$ref": "#/definitions/v2/FileSystemSandboxEntry"
+                },
+                "type": "array"
+              },
+              "globScanMaxDepth": {
+                "format": "uint",
+                "minimum": 1.0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "restricted"
+                ],
+                "title": "RestrictedPermissionProfileFileSystemPermissionsType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "entries",
+              "type"
+            ],
+            "title": "RestrictedPermissionProfileFileSystemPermissions",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "unrestricted"
+                ],
+                "title": "UnrestrictedPermissionProfileFileSystemPermissionsType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "title": "UnrestrictedPermissionProfileFileSystemPermissions",
+            "type": "object"
+          }
+        ]
+      },
+      "PermissionProfileNetworkPermissions": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      },
       "Personality": {
         "enum": [
           "none",
@@ -11682,6 +12034,32 @@
             "type": "integer"
           }
         ]
+      },
+      "RequestPermissionProfile": {
+        "additionalProperties": false,
+        "properties": {
+          "fileSystem": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AdditionalFileSystemPermissions"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "network": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AdditionalNetworkPermissions"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
       },
       "ResidencyRequirement": {
         "enum": [
@@ -13643,6 +14021,17 @@
               "null"
             ]
           },
+          "permissionProfile": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/PermissionProfile"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Canonical permissions override for this thread. When present, do not also set the legacy `sandbox` override."
+          },
           "sandbox": {
             "anyOf": [
               {
@@ -13713,6 +14102,18 @@
           },
           "modelProvider": {
             "type": "string"
+          },
+          "permissionProfile": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/PermissionProfile"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Canonical active permissions view for this thread."
           },
           "reasoningEffort": {
             "anyOf": [
@@ -15079,6 +15480,17 @@
               "null"
             ]
           },
+          "permissionProfile": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/PermissionProfile"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Canonical permissions override for this thread. When present, do not also set the legacy `sandbox` override."
+          },
           "personality": {
             "anyOf": [
               {
@@ -15159,6 +15571,18 @@
           },
           "modelProvider": {
             "type": "string"
+          },
+          "permissionProfile": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/PermissionProfile"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Canonical active permissions view for this thread."
           },
           "reasoningEffort": {
             "anyOf": [
@@ -15379,6 +15803,17 @@
               "null"
             ]
           },
+          "permissionProfile": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/PermissionProfile"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Canonical permissions override for this thread. When present, do not also set the legacy `sandbox` override."
+          },
           "personality": {
             "anyOf": [
               {
@@ -15469,6 +15904,18 @@
           },
           "modelProvider": {
             "type": "string"
+          },
+          "permissionProfile": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/PermissionProfile"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Canonical active permissions view for this thread."
           },
           "reasoningEffort": {
             "anyOf": [

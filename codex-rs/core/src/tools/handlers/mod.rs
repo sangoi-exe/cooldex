@@ -39,7 +39,7 @@ use crate::session::session::Session;
 pub(crate) use crate::tools::code_mode::CodeModeExecuteHandler;
 pub(crate) use crate::tools::code_mode::CodeModeWaitHandler;
 pub use apply_patch::ApplyPatchHandler;
-use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 pub use dynamic::DynamicToolHandler;
 pub use js_repl::JsReplHandler;
@@ -100,10 +100,10 @@ pub(crate) fn normalize_and_validate_additional_permissions(
     additional_permissions_allowed: bool,
     approval_policy: AskForApproval,
     sandbox_permissions: SandboxPermissions,
-    additional_permissions: Option<PermissionProfile>,
+    additional_permissions: Option<AdditionalPermissionProfile>,
     permissions_preapproved: bool,
     _cwd: &Path,
-) -> Result<Option<PermissionProfile>, String> {
+) -> Result<Option<AdditionalPermissionProfile>, String> {
     let uses_additional_permissions = matches!(
         sandbox_permissions,
         SandboxPermissions::WithAdditionalPermissions
@@ -153,15 +153,15 @@ pub(crate) fn normalize_and_validate_additional_permissions(
 
 pub(super) struct EffectiveAdditionalPermissions {
     pub sandbox_permissions: SandboxPermissions,
-    pub additional_permissions: Option<PermissionProfile>,
+    pub additional_permissions: Option<AdditionalPermissionProfile>,
     pub permissions_preapproved: bool,
 }
 
 pub(super) fn implicit_granted_permissions(
     sandbox_permissions: SandboxPermissions,
-    additional_permissions: Option<&PermissionProfile>,
+    additional_permissions: Option<&AdditionalPermissionProfile>,
     effective_additional_permissions: &EffectiveAdditionalPermissions,
-) -> Option<PermissionProfile> {
+) -> Option<AdditionalPermissionProfile> {
     if !sandbox_permissions.uses_additional_permissions()
         && !matches!(sandbox_permissions, SandboxPermissions::RequireEscalated)
         && additional_permissions.is_none()
@@ -176,8 +176,9 @@ pub(super) fn implicit_granted_permissions(
 
 pub(super) async fn apply_granted_turn_permissions(
     session: &Session,
+    cwd: &std::path::Path,
     sandbox_permissions: SandboxPermissions,
-    additional_permissions: Option<PermissionProfile>,
+    additional_permissions: Option<AdditionalPermissionProfile>,
 ) -> EffectiveAdditionalPermissions {
     if matches!(sandbox_permissions, SandboxPermissions::RequireEscalated) {
         return EffectiveAdditionalPermissions {
@@ -199,8 +200,7 @@ pub(super) async fn apply_granted_turn_permissions(
     );
     let permissions_preapproved = match (effective_permissions.as_ref(), granted_permissions) {
         (Some(effective_permissions), Some(granted_permissions)) => {
-            intersect_permission_profiles(effective_permissions.clone(), granted_permissions)
-                == *effective_permissions
+            permissions_are_preapproved(effective_permissions, granted_permissions, cwd)
         }
         _ => false,
     };
@@ -219,23 +219,37 @@ pub(super) async fn apply_granted_turn_permissions(
     }
 }
 
+fn permissions_are_preapproved(
+    effective_permissions: &AdditionalPermissionProfile,
+    granted_permissions: AdditionalPermissionProfile,
+    cwd: &Path,
+) -> bool {
+    let materialized_effective_permissions = intersect_permission_profiles(
+        effective_permissions.clone(),
+        effective_permissions.clone(),
+        cwd,
+    );
+    intersect_permission_profiles(effective_permissions.clone(), granted_permissions, cwd)
+        == materialized_effective_permissions
+}
+
 #[cfg(test)]
 mod tests {
     use super::EffectiveAdditionalPermissions;
     use super::implicit_granted_permissions;
     use super::normalize_and_validate_additional_permissions;
     use crate::sandboxing::SandboxPermissions;
+    use codex_protocol::models::AdditionalPermissionProfile;
     use codex_protocol::models::FileSystemPermissions;
     use codex_protocol::models::NetworkPermissions;
-    use codex_protocol::models::PermissionProfile;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::GranularApprovalConfig;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
-    fn network_permissions() -> PermissionProfile {
-        PermissionProfile {
+    fn network_permissions() -> AdditionalPermissionProfile {
+        AdditionalPermissionProfile {
             network: Some(NetworkPermissions {
                 enabled: Some(true),
             }),
@@ -243,14 +257,14 @@ mod tests {
         }
     }
 
-    fn file_system_permissions(path: &std::path::Path) -> PermissionProfile {
-        PermissionProfile {
-            file_system: Some(FileSystemPermissions {
-                read: None,
-                write: Some(vec![
+    fn file_system_permissions(path: &std::path::Path) -> AdditionalPermissionProfile {
+        AdditionalPermissionProfile {
+            file_system: Some(FileSystemPermissions::from_read_write_roots(
+                /*read*/ None,
+                Some(vec![
                     AbsolutePathBuf::from_absolute_path(path).expect("absolute path"),
                 ]),
-            }),
+            )),
             ..Default::default()
         }
     }

@@ -346,6 +346,7 @@ async fn process_exec_tool_call_preserves_full_buffer_capture_policy() -> Result
 
     let cwd = codex_utils_absolute_path::AbsolutePathBuf::current_dir()?;
     let sandbox_policy = SandboxPolicy::DangerFullAccess;
+    let permission_profile = PermissionProfile::from_legacy_sandbox_policy(&sandbox_policy);
     let output = process_exec_tool_call(
         ExecParams {
             command,
@@ -360,9 +361,7 @@ async fn process_exec_tool_call_preserves_full_buffer_capture_policy() -> Result
             justification: None,
             arg0: None,
         },
-        &sandbox_policy,
-        &FileSystemSandboxPolicy::from(&sandbox_policy),
-        NetworkSandboxPolicy::Enabled,
+        &permission_profile,
         &cwd,
         &None,
         /*use_legacy_landlock*/ false,
@@ -536,7 +535,9 @@ fn windows_restricted_token_rejects_split_only_filesystem_policies() {
     let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
         codex_protocol::permissions::FileSystemSandboxEntry {
             path: codex_protocol::permissions::FileSystemPath::Special {
-                value: codex_protocol::permissions::FileSystemSpecialPath::CurrentWorkingDirectory,
+                value: codex_protocol::permissions::FileSystemSpecialPath::project_roots(
+                    /*subpath*/ None,
+                ),
             },
             access: codex_protocol::permissions::FileSystemAccessMode::Write,
         },
@@ -633,7 +634,9 @@ fn windows_restricted_token_supports_full_read_split_write_read_carveouts() {
         },
         codex_protocol::permissions::FileSystemSandboxEntry {
             path: codex_protocol::permissions::FileSystemPath::Special {
-                value: codex_protocol::permissions::FileSystemSpecialPath::CurrentWorkingDirectory,
+                value: codex_protocol::permissions::FileSystemSpecialPath::project_roots(
+                    /*subpath*/ None,
+                ),
             },
             access: codex_protocol::permissions::FileSystemAccessMode::Write,
         },
@@ -723,7 +726,9 @@ fn windows_elevated_supports_split_write_read_carveouts() {
         },
         codex_protocol::permissions::FileSystemSandboxEntry {
             path: codex_protocol::permissions::FileSystemPath::Special {
-                value: codex_protocol::permissions::FileSystemSpecialPath::CurrentWorkingDirectory,
+                value: codex_protocol::permissions::FileSystemSpecialPath::project_roots(
+                    /*subpath*/ None,
+                ),
             },
             access: codex_protocol::permissions::FileSystemAccessMode::Write,
         },
@@ -777,7 +782,9 @@ fn windows_elevated_rejects_unreadable_split_carveouts() {
         },
         codex_protocol::permissions::FileSystemSandboxEntry {
             path: codex_protocol::permissions::FileSystemPath::Special {
-                value: codex_protocol::permissions::FileSystemSpecialPath::CurrentWorkingDirectory,
+                value: codex_protocol::permissions::FileSystemSpecialPath::project_roots(
+                    /*subpath*/ None,
+                ),
             },
             access: codex_protocol::permissions::FileSystemAccessMode::Write,
         },
@@ -825,7 +832,9 @@ fn windows_elevated_rejects_unreadable_globs() {
         },
         codex_protocol::permissions::FileSystemSandboxEntry {
             path: codex_protocol::permissions::FileSystemPath::Special {
-                value: codex_protocol::permissions::FileSystemSpecialPath::CurrentWorkingDirectory,
+                value: codex_protocol::permissions::FileSystemSpecialPath::project_roots(
+                    /*subpath*/ None,
+                ),
             },
             access: codex_protocol::permissions::FileSystemAccessMode::Write,
         },
@@ -875,7 +884,9 @@ fn windows_elevated_rejects_reopened_writable_descendants() {
         },
         codex_protocol::permissions::FileSystemSandboxEntry {
             path: codex_protocol::permissions::FileSystemPath::Special {
-                value: codex_protocol::permissions::FileSystemSpecialPath::CurrentWorkingDirectory,
+                value: codex_protocol::permissions::FileSystemSpecialPath::project_roots(
+                    /*subpath*/ None,
+                ),
             },
             access: codex_protocol::permissions::FileSystemAccessMode::Write,
         },
@@ -1026,11 +1037,10 @@ async fn process_exec_tool_call_respects_cancellation_token() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(1_000)).await;
         cancel_tx.cancel();
     });
+    let permission_profile = PermissionProfile::Disabled;
     let result = process_exec_tool_call(
         params,
-        &SandboxPolicy::DangerFullAccess,
-        &FileSystemSandboxPolicy::from(&SandboxPolicy::DangerFullAccess),
-        NetworkSandboxPolicy::Enabled,
+        &permission_profile,
         &cwd,
         &None,
         /*use_legacy_landlock*/ false,

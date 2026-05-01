@@ -2601,10 +2601,14 @@ impl CodexMessageProcessor {
         };
         let managed_network_requirements_enabled =
             self.config.managed_network_requirements_enabled();
+        let config_sandbox_policy = self
+            .config
+            .permissions
+            .legacy_sandbox_policy(self.config.cwd.as_path());
         let started_network_proxy = match self.config.permissions.network.as_ref() {
             Some(spec) => match spec
                 .start_proxy(
-                    self.config.permissions.sandbox_policy.get(),
+                    &config_sandbox_policy,
                     /*policy_decider*/ None,
                     /*blocked_request_observer*/ None,
                     managed_network_requirements_enabled,
@@ -2670,10 +2674,14 @@ impl CodexMessageProcessor {
             effective_file_system_sandbox_policy,
             effective_network_sandbox_policy,
         ) = match requested_policy {
-            Some(policy) => match self.config.permissions.sandbox_policy.can_set(&policy) {
+            Some(policy) => match self
+                .config
+                .permissions
+                .can_set_legacy_sandbox_policy(&policy, sandbox_cwd.as_path())
+            {
                 Ok(()) => {
                     let file_system_sandbox_policy =
-                        codex_protocol::permissions::FileSystemSandboxPolicy::from_legacy_sandbox_policy(&policy, &sandbox_cwd);
+                        codex_protocol::permissions::FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&policy, &sandbox_cwd);
                     let network_sandbox_policy =
                         codex_protocol::permissions::NetworkSandboxPolicy::from(&policy);
                     (policy, file_system_sandbox_policy, network_sandbox_policy)
@@ -2689,9 +2697,9 @@ impl CodexMessageProcessor {
                 }
             },
             None => (
-                self.config.permissions.sandbox_policy.get().clone(),
-                self.config.permissions.file_system_sandbox_policy.clone(),
-                self.config.permissions.network_sandbox_policy,
+                config_sandbox_policy,
+                self.config.permissions.file_system_sandbox_policy(),
+                self.config.permissions.network_sandbox_policy(),
             ),
         };
 
@@ -2703,6 +2711,14 @@ impl CodexMessageProcessor {
         // reachable for app-server exec flows; preserve this flag read and
         // propagation until bubblewrap has a safe writable-gitdir alternative.
         let use_legacy_landlock = self.config.features.use_legacy_landlock();
+        let effective_permission_profile =
+            codex_protocol::models::PermissionProfile::from_runtime_permissions_with_enforcement(
+                codex_protocol::models::SandboxEnforcement::from_legacy_sandbox_policy(
+                    &effective_policy,
+                ),
+                &effective_file_system_sandbox_policy,
+                effective_network_sandbox_policy,
+            );
         let size = match size.map(crate::command_exec::terminal_size_from_protocol) {
             Some(Ok(size)) => Some(size),
             Some(Err(error)) => {
@@ -2714,9 +2730,7 @@ impl CodexMessageProcessor {
 
         match codex_core::exec::build_exec_request(
             exec_params,
-            &effective_policy,
-            &effective_file_system_sandbox_policy,
-            effective_network_sandbox_policy,
+            &effective_permission_profile,
             &sandbox_cwd,
             &codex_linux_sandbox_exe,
             use_legacy_landlock,
@@ -2814,6 +2828,7 @@ impl CodexMessageProcessor {
             approval_policy,
             approvals_reviewer,
             sandbox,
+            permission_profile,
             config,
             service_name,
             base_instructions,
@@ -2826,6 +2841,14 @@ impl CodexMessageProcessor {
             session_start_source,
             persist_extended_history,
         } = params;
+        if sandbox.is_some() && permission_profile.is_some() {
+            self.send_invalid_request_error(
+                request_id,
+                "thread/start cannot combine sandbox and permissionProfile".to_string(),
+            )
+            .await;
+            return;
+        }
         let mut typesafe_overrides = self.build_thread_config_overrides(
             model,
             model_provider,
@@ -2834,6 +2857,7 @@ impl CodexMessageProcessor {
             approval_policy,
             approvals_reviewer,
             sandbox,
+            permission_profile,
             base_instructions,
             developer_instructions,
             personality,
@@ -3001,7 +3025,9 @@ impl CodexMessageProcessor {
             && !config.active_project.is_trusted()
             && (requested_sandbox_trusts_project
                 || matches!(
-                    config.permissions.sandbox_policy.get(),
+                    config
+                        .permissions
+                        .legacy_sandbox_policy(config.cwd.as_path()),
                     codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. }
                         | codex_protocol::protocol::SandboxPolicy::DangerFullAccess
                         | codex_protocol::protocol::SandboxPolicy::ExternalSandbox { .. }
@@ -3208,6 +3234,7 @@ impl CodexMessageProcessor {
                     approval_policy: config_snapshot.approval_policy.into(),
                     approvals_reviewer: config_snapshot.approvals_reviewer.into(),
                     sandbox: config_snapshot.sandbox_policy.into(),
+                    permission_profile: Some(config_snapshot.permission_profile.into()),
                     reasoning_effort: config_snapshot.reasoning_effort,
                 };
                 if listener_task_context.general_analytics_enabled {
@@ -3265,6 +3292,7 @@ impl CodexMessageProcessor {
         approval_policy: Option<codex_app_server_protocol::AskForApproval>,
         approvals_reviewer: Option<codex_app_server_protocol::ApprovalsReviewer>,
         sandbox: Option<SandboxMode>,
+        permission_profile: Option<codex_app_server_protocol::PermissionProfile>,
         base_instructions: Option<Option<String>>,
         developer_instructions: Option<Option<String>>,
         personality: Option<Personality>,
@@ -3279,6 +3307,7 @@ impl CodexMessageProcessor {
             approvals_reviewer: approvals_reviewer
                 .map(codex_app_server_protocol::ApprovalsReviewer::to_core),
             sandbox_mode: sandbox.map(SandboxMode::to_core),
+            permission_profile: permission_profile.map(Into::into),
             codex_linux_sandbox_exe: self.arg0_paths.codex_linux_sandbox_exe.clone(),
             main_execve_wrapper_exe: self.arg0_paths.main_execve_wrapper_exe.clone(),
             base_instructions,
@@ -4741,6 +4770,15 @@ impl CodexMessageProcessor {
     }
 
     async fn thread_resume(&self, request_id: ConnectionRequestId, params: ThreadResumeParams) {
+        if params.sandbox.is_some() && params.permission_profile.is_some() {
+            self.send_invalid_request_error(
+                request_id,
+                "thread/resume cannot combine sandbox and permissionProfile".to_string(),
+            )
+            .await;
+            return;
+        }
+
         if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
             && self
                 .pending_thread_unloads
@@ -4777,6 +4815,7 @@ impl CodexMessageProcessor {
             approval_policy,
             approvals_reviewer,
             sandbox,
+            permission_profile,
             config: mut request_overrides,
             base_instructions,
             developer_instructions,
@@ -4813,6 +4852,7 @@ impl CodexMessageProcessor {
             approval_policy,
             approvals_reviewer,
             sandbox,
+            permission_profile,
             base_instructions,
             developer_instructions,
             personality,
@@ -4946,6 +4986,7 @@ impl CodexMessageProcessor {
                     approval_policy: session_configured.approval_policy.into(),
                     approvals_reviewer: session_configured.approvals_reviewer.into(),
                     sandbox: session_configured.sandbox_policy.into(),
+                    permission_profile: Some(session_configured.permission_profile.into()),
                     reasoning_effort: session_configured.reasoning_effort,
                 };
                 if self.config.features.enabled(Feature::GeneralAnalytics) {
@@ -5330,12 +5371,21 @@ impl CodexMessageProcessor {
             approval_policy,
             approvals_reviewer,
             sandbox,
+            permission_profile,
             config: cli_overrides,
             base_instructions,
             developer_instructions,
             ephemeral,
             persist_extended_history,
         } = params;
+        if sandbox.is_some() && permission_profile.is_some() {
+            self.send_invalid_request_error(
+                request_id,
+                "thread/fork cannot combine sandbox and permissionProfile".to_string(),
+            )
+            .await;
+            return;
+        }
 
         let (rollout_path, source_thread_id) = if let Some(path) = path {
             (path, None)
@@ -5413,6 +5463,7 @@ impl CodexMessageProcessor {
             approval_policy,
             approvals_reviewer,
             sandbox,
+            permission_profile,
             base_instructions,
             developer_instructions,
             /*personality*/ None,
@@ -5645,6 +5696,7 @@ impl CodexMessageProcessor {
             approval_policy: session_configured.approval_policy.into(),
             approvals_reviewer: session_configured.approvals_reviewer.into(),
             sandbox: session_configured.sandbox_policy.into(),
+            permission_profile: Some(session_configured.permission_profile.into()),
             reasoning_effort: session_configured.reasoning_effort,
         };
         if self.config.features.enabled(Feature::GeneralAnalytics) {
@@ -9345,7 +9397,9 @@ impl CodexMessageProcessor {
                 Ok(config) => {
                     let setup_request = WindowsSandboxSetupRequest {
                         mode,
-                        policy: config.permissions.sandbox_policy.get().clone(),
+                        policy: config
+                            .permissions
+                            .legacy_sandbox_policy(config.cwd.as_path()),
                         policy_cwd: config.cwd.to_path_buf(),
                         command_cwd,
                         env_map: std::env::vars().collect(),
@@ -9592,6 +9646,7 @@ async fn handle_pending_thread_resume_request(
         approval_policy,
         approvals_reviewer,
         sandbox_policy,
+        permission_profile,
         cwd,
         config_path,
         reasoning_effort,
@@ -9609,6 +9664,7 @@ async fn handle_pending_thread_resume_request(
         approval_policy: approval_policy.into(),
         approvals_reviewer: approvals_reviewer.into(),
         sandbox: sandbox_policy.into(),
+        permission_profile: Some(permission_profile.into()),
         reasoning_effort,
     };
     let token_usage_thread = response.thread.clone();
@@ -9798,6 +9854,16 @@ fn collect_resume_override_mismatches(
             mismatch_details.push(format!(
                 "sandbox requested={requested_sandbox:?} active={:?}",
                 config_snapshot.sandbox_policy
+            ));
+        }
+    }
+    if let Some(requested_permission_profile) = request.permission_profile.as_ref() {
+        let requested_permission_profile: codex_protocol::models::PermissionProfile =
+            requested_permission_profile.clone().into();
+        if requested_permission_profile != config_snapshot.permission_profile {
+            mismatch_details.push(format!(
+                "permissionProfile requested={requested_permission_profile:?} active={:?}",
+                config_snapshot.permission_profile
             ));
         }
     }
@@ -11569,6 +11635,7 @@ mod tests {
             approval_policy: None,
             approvals_reviewer: None,
             sandbox: None,
+            permission_profile: None,
             config: None,
             base_instructions: None,
             developer_instructions: None,
@@ -11584,6 +11651,7 @@ mod tests {
             approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
             approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
             sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+            permission_profile: codex_protocol::models::PermissionProfile::Disabled,
             cwd: test_path_buf("/tmp").abs(),
             config_path: PathBuf::from("/tmp/config.toml"),
             ephemeral: false,
@@ -11610,10 +11678,9 @@ mod tests {
             cwd: None,
             config_path: None,
             approval_policy: Some(TurnContextApprovalPolicy::Never.into()),
-            approvals_reviewer: Some(
-                codex_app_server_protocol::ApprovalsReviewer::GuardianSubagent,
-            ),
+            approvals_reviewer: Some(codex_app_server_protocol::ApprovalsReviewer::AutoReview),
             sandbox: None,
+            permission_profile: None,
             config: None,
             base_instructions: None,
             developer_instructions: None,
@@ -11629,6 +11696,7 @@ mod tests {
             approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
             approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
             sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
+            permission_profile: codex_protocol::models::PermissionProfile::Disabled,
             cwd: AbsolutePathBuf::from_absolute_path("/tmp").expect("absolute path"),
             config_path: PathBuf::from("/tmp/config.toml"),
             ephemeral: false,
@@ -11641,7 +11709,7 @@ mod tests {
             collect_resume_override_mismatches(&request, &config_snapshot),
             vec![
                 "approval_policy requested=Never active=OnRequest".to_string(),
-                "approvals_reviewer requested=GuardianSubagent active=User".to_string(),
+                "approvals_reviewer requested=AutoReview active=User".to_string(),
             ]
         );
     }

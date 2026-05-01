@@ -468,9 +468,11 @@ pub async fn run_main_with_transport(
             range: None,
         });
     }
-    if let Some(warning) =
-        codex_core::config::system_bwrap_warning(config.permissions.sandbox_policy.get())
-    {
+    if let Some(warning) = codex_core::config::system_bwrap_warning(
+        &config
+            .permissions
+            .legacy_sandbox_policy(config.cwd.as_path()),
+    ) {
         config_warnings.push(ConfigWarningNotification {
             summary: warning,
             details: None,

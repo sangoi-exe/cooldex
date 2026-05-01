@@ -256,6 +256,10 @@ fn create_filesystem_args(
         writable_roots.push(WritableRoot {
             root: AbsolutePathBuf::from_absolute_path("/")?,
             read_only_subpaths: Vec::new(),
+            // Merge-safety anchor: synthetic full-write roots must not invent
+            // metadata-name protections; those come from the permission profile
+            // projection for concrete workspace roots.
+            protected_metadata_names: Vec::new(),
         });
     }
     let mut unreadable_roots = file_system_sandbox_policy
@@ -1144,7 +1148,7 @@ mod tests {
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
             },

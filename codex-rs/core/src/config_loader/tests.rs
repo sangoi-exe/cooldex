@@ -428,7 +428,10 @@ writable_roots = ["~/code"]
         .await?;
 
     let expected_root = AbsolutePathBuf::from_absolute_path(home.join("code"))?;
-    match config.permissions.sandbox_policy.get() {
+    match &config
+        .permissions
+        .legacy_sandbox_policy(config.cwd.as_path())
+    {
         SandboxPolicy::WorkspaceWrite { writable_roots, .. } => {
             assert_eq!(
                 writable_roots

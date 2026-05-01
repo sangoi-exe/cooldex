@@ -504,7 +504,7 @@ fn default_exec_approval_decisions(
     proposed_network_policy_amendments: Option<
         &[codex_protocol::approvals::NetworkPolicyAmendment],
     >,
-    additional_permissions: Option<&codex_protocol::models::PermissionProfile>,
+    additional_permissions: Option<&codex_protocol::models::AdditionalPermissionProfile>,
 ) -> Vec<codex_protocol::protocol::ReviewDecision> {
     ExecApprovalRequestEvent::default_available_decisions(
         network_approval_context,
@@ -530,7 +530,7 @@ struct GuardianApprovalsMode {
 fn guardian_approvals_mode() -> GuardianApprovalsMode {
     GuardianApprovalsMode {
         approval: AskForApproval::OnRequest,
-        approvals_reviewer: ApprovalsReviewer::GuardianSubagent,
+        approvals_reviewer: ApprovalsReviewer::AutoReview,
         sandbox: SandboxPolicy::new_workspace_write_policy(),
     }
 }
@@ -2291,7 +2291,7 @@ impl App {
                 service_tier: self.chat_widget.current_service_tier(),
                 approval_policy: self.config.permissions.approval_policy.value(),
                 approvals_reviewer: self.config.approvals_reviewer,
-                sandbox_policy: self.config.permissions.sandbox_policy.get().clone(),
+                permission_profile: self.config.permissions.permission_profile(),
                 cwd: thread.cwd.clone(),
                 config_path: self.config.active_user_config_path().ok(),
                 instruction_source_paths: Vec::new(),
@@ -2829,7 +2829,9 @@ impl App {
             let should_check = WindowsSandboxLevel::from_config(&app.config)
                 != WindowsSandboxLevel::Disabled
                 && matches!(
-                    app.config.permissions.sandbox_policy.get(),
+                    app.config
+                        .permissions
+                        .legacy_sandbox_policy(app.config.cwd.as_path()),
                     codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. }
                         | codex_protocol::protocol::SandboxPolicy::ReadOnly { .. }
                 )
@@ -2843,7 +2845,10 @@ impl App {
                 let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
                 let tx = app.app_event_tx.clone();
                 let logs_base_dir = app.config.codex_home.clone();
-                let sandbox_policy = app.config.permissions.sandbox_policy.get().clone();
+                let sandbox_policy = app
+                    .config
+                    .permissions
+                    .legacy_sandbox_policy(app.config.cwd.as_path());
                 Self::spawn_world_writable_scan(cwd, env_map, logs_base_dir, sandbox_policy, tx);
             }
         }
@@ -3415,7 +3420,6 @@ mod tests {
     use codex_protocol::config_types::Settings;
     use codex_protocol::models::FileSystemPermissions;
     use codex_protocol::models::NetworkPermissions;
-    use codex_protocol::models::PermissionProfile;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::Event;
@@ -9012,7 +9016,7 @@ mod tests {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                AppEvent::UpdateApprovalsReviewer(ApprovalsReviewer::GuardianSubagent)
+                AppEvent::UpdateApprovalsReviewer(ApprovalsReviewer::AutoReview)
             )),
             "expected sandbox-enable success to queue Guardian reviewer update: {events:?}"
         );
@@ -9020,7 +9024,7 @@ mod tests {
             events.iter().any(|event| matches!(
                 event,
                 AppEvent::CodexOp(Op::OverrideTurnContext {
-                    approvals_reviewer: Some(ApprovalsReviewer::GuardianSubagent),
+                    approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                     ..
                 })
             )),
@@ -9113,7 +9117,10 @@ mod tests {
                 /*capacity*/ 1,
                 ThreadSessionState {
                     approval_policy: AskForApproval::OnRequest,
-                    sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+                    permission_profile:
+                        codex_protocol::models::PermissionProfile::from_legacy_sandbox_policy(
+                            &SandboxPolicy::new_workspace_write_policy(),
+                        ),
                     rollout_path: Some(test_path_buf("/tmp/agent-rollout.jsonl")),
                     ..test_thread_session(agent_thread_id, test_path_buf("/tmp/agent"))
                 },
@@ -9165,7 +9172,10 @@ mod tests {
                 /*capacity*/ 1,
                 ThreadSessionState {
                     approval_policy: AskForApproval::OnRequest,
-                    sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+                    permission_profile:
+                        codex_protocol::models::PermissionProfile::from_legacy_sandbox_policy(
+                            &SandboxPolicy::new_workspace_write_policy(),
+                        ),
                     rollout_path: Some(PathBuf::from("/tmp/agent-rollout.jsonl")),
                     ..test_thread_session(agent_thread_id, PathBuf::from("/tmp/agent"))
                 },
@@ -9214,6 +9224,8 @@ mod tests {
             file_system: Some(AdditionalFileSystemPermissions {
                 read: Some(vec![test_absolute_path("/tmp/read-only")]),
                 write: Some(vec![test_absolute_path("/tmp/write")]),
+                glob_scan_max_depth: None,
+                entries: None,
             }),
         });
         params.proposed_network_policy_amendments = Some(vec![AppServerNetworkPolicyAmendment {
@@ -9242,14 +9254,14 @@ mod tests {
         );
         assert_eq!(
             additional_permissions,
-            Some(PermissionProfile {
+            Some(codex_protocol::models::AdditionalPermissionProfile {
                 network: Some(NetworkPermissions {
                     enabled: Some(true),
                 }),
-                file_system: Some(FileSystemPermissions {
-                    read: Some(vec![test_absolute_path("/tmp/read-only")]),
-                    write: Some(vec![test_absolute_path("/tmp/write")]),
-                }),
+                file_system: Some(FileSystemPermissions::from_read_write_roots(
+                    Some(vec![test_absolute_path("/tmp/read-only")]),
+                    Some(vec![test_absolute_path("/tmp/write")]),
+                )),
             })
         );
         assert_eq!(
@@ -9321,6 +9333,8 @@ mod tests {
                     file_system: Some(AdditionalFileSystemPermissions {
                         read: Some(vec![test_absolute_path("/tmp/read-only")]),
                         write: Some(vec![test_absolute_path("/tmp/write")]),
+                        glob_scan_max_depth: None,
+                        entries: None,
                     }),
                 },
             },
@@ -9342,10 +9356,10 @@ mod tests {
                 network: Some(NetworkPermissions {
                     enabled: Some(true),
                 }),
-                file_system: Some(FileSystemPermissions {
-                    read: Some(vec![test_absolute_path("/tmp/read-only")]),
-                    write: Some(vec![test_absolute_path("/tmp/write")]),
-                }),
+                file_system: Some(FileSystemPermissions::from_read_write_roots(
+                    Some(vec![test_absolute_path("/tmp/read-only")]),
+                    Some(vec![test_absolute_path("/tmp/write")]),
+                )),
             }
         );
     }
@@ -9369,7 +9383,10 @@ mod tests {
                 /*capacity*/ 4,
                 ThreadSessionState {
                     approval_policy: AskForApproval::OnRequest,
-                    sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+                    permission_profile:
+                        codex_protocol::models::PermissionProfile::from_legacy_sandbox_policy(
+                            &SandboxPolicy::new_workspace_write_policy(),
+                        ),
                     rollout_path: Some(test_path_buf("/tmp/agent-rollout.jsonl")),
                     ..test_thread_session(agent_thread_id, test_path_buf("/tmp/agent"))
                 },
@@ -9422,7 +9439,10 @@ mod tests {
             ThreadId::from_string("00000000-0000-0000-0000-000000000202").expect("valid thread");
         let primary_session = ThreadSessionState {
             approval_policy: AskForApproval::OnRequest,
-            sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+            permission_profile:
+                codex_protocol::models::PermissionProfile::from_legacy_sandbox_policy(
+                    &SandboxPolicy::new_workspace_write_policy(),
+                ),
             ..test_thread_session(main_thread_id, test_path_buf("/tmp/main"))
         };
 
@@ -9446,7 +9466,7 @@ mod tests {
             current_date: None,
             timezone: None,
             approval_policy: primary_session.approval_policy,
-            sandbox_policy: primary_session.sandbox_policy.clone(),
+            sandbox_policy: primary_session.legacy_sandbox_policy(),
             network: None,
             file_system_sandbox_policy: None,
             model: "gpt-agent".to_string(),
@@ -9533,7 +9553,10 @@ mod tests {
             ThreadId::from_string("00000000-0000-0000-0000-000000000302").expect("valid thread");
         let primary_session = ThreadSessionState {
             approval_policy: AskForApproval::OnRequest,
-            sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+            permission_profile:
+                codex_protocol::models::PermissionProfile::from_legacy_sandbox_policy(
+                    &SandboxPolicy::new_workspace_write_policy(),
+                ),
             ..test_thread_session(main_thread_id, test_path_buf("/tmp/main"))
         };
 
@@ -9697,6 +9720,7 @@ mod tests {
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: ApprovalsReviewer::User,
+                permission_profile: codex_protocol::models::PermissionProfile::default(),
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: test_path_buf("/tmp/project").abs(),
                 reasoning_effort: Some(ReasoningEffortConfig::High),
@@ -11167,6 +11191,7 @@ mod tests {
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: ApprovalsReviewer::User,
+                permission_profile: codex_protocol::models::PermissionProfile::default(),
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: test_path_buf("/home/user/project").abs(),
                 reasoning_effort: None,
@@ -11230,6 +11255,7 @@ mod tests {
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: ApprovalsReviewer::User,
+                permission_profile: codex_protocol::models::PermissionProfile::default(),
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: test_path_buf("/home/user/project").abs(),
                 reasoning_effort: None,
@@ -11323,6 +11349,7 @@ mod tests {
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: ApprovalsReviewer::User,
+                permission_profile: codex_protocol::models::PermissionProfile::default(),
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: test_path_buf("/home/user/project").abs(),
                 reasoning_effort: None,
@@ -11621,6 +11648,7 @@ mod tests {
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: ApprovalsReviewer::User,
+                permission_profile: codex_protocol::models::PermissionProfile::default(),
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: test_path_buf("/home/user/project").abs(),
                 reasoning_effort: None,
@@ -11971,6 +11999,7 @@ mod tests {
             service_tier: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::User,
+            permission_profile: codex_protocol::models::PermissionProfile::default(),
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             cwd: test_path_buf("/home/user/project").abs(),
             reasoning_effort: None,
@@ -12087,6 +12116,7 @@ mod tests {
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: ApprovalsReviewer::User,
+                permission_profile: codex_protocol::models::PermissionProfile::default(),
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: test_path_buf("/tmp/project").abs(),
                 reasoning_effort: None,

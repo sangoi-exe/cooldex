@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use crate::RequestId;
@@ -36,7 +37,9 @@ use codex_protocol::mcp::ResourceTemplate as McpResourceTemplate;
 use codex_protocol::mcp::Tool as McpTool;
 use codex_protocol::memory_citation::MemoryCitation as CoreMemoryCitation;
 use codex_protocol::memory_citation::MemoryCitationEntry as CoreMemoryCitationEntry;
+use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions as CoreFileSystemPermissions;
+use codex_protocol::models::ManagedFileSystemPermissions as CoreManagedFileSystemPermissions;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::NetworkPermissions as CoreNetworkPermissions;
 use codex_protocol::models::PermissionProfile as CorePermissionProfile;
@@ -46,6 +49,11 @@ use codex_protocol::openai_models::ModelAvailabilityNux as CoreModelAvailability
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::default_input_modalities;
 use codex_protocol::parse_command::ParsedCommand as CoreParsedCommand;
+use codex_protocol::permissions::FileSystemAccessMode as CoreFileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath as CoreFileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry as CoreFileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSpecialPath as CoreFileSystemSpecialPath;
+use codex_protocol::permissions::NetworkSandboxPolicy as CoreNetworkSandboxPolicy;
 use codex_protocol::plan_tool::PlanItemArg as CorePlanItemArg;
 use codex_protocol::plan_tool::StepStatus as CorePlanStepStatus;
 use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
@@ -104,7 +112,10 @@ use codex_protocol::user_input::UserInput as CoreUserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
 use schemars::r#gen::SchemaGenerator;
+use schemars::schema::InstanceType;
+use schemars::schema::Metadata;
 use schemars::schema::Schema;
+use schemars::schema::SchemaObject;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -310,24 +321,59 @@ impl From<CoreAskForApproval> for AskForApproval {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(rename_all = "snake_case", export_to = "v2/")]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, TS)]
+#[ts(
+    type = r#""user" | "auto_review" | "guardian_subagent""#,
+    export_to = "v2/"
+)]
 /// Configures who approval requests are routed to for review. Examples
 /// include sandbox escapes, blocked network access, MCP approval prompts, and
-/// ARC escalations. Defaults to `user`. `guardian_subagent` uses a carefully
+/// ARC escalations. Defaults to `user`. `auto_review` uses a carefully
 /// prompted subagent to gather relevant context and apply a risk-based
 /// decision framework before approving or denying the request.
 pub enum ApprovalsReviewer {
+    #[serde(rename = "user")]
     User,
-    GuardianSubagent,
+    #[serde(rename = "guardian_subagent", alias = "auto_review")]
+    AutoReview,
+}
+
+impl JsonSchema for ApprovalsReviewer {
+    fn schema_name() -> String {
+        "ApprovalsReviewer".to_string()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        string_enum_schema_with_description(
+            &["user", "auto_review", "guardian_subagent"],
+            "Configures who approval requests are routed to for review. Examples include sandbox escapes, blocked network access, MCP approval prompts, and ARC escalations. Defaults to `user`. `auto_review` uses a carefully prompted subagent to gather relevant context and apply a risk-based decision framework before approving or denying the request. The legacy value `guardian_subagent` is accepted for compatibility.",
+        )
+    }
+}
+
+fn string_enum_schema_with_description(values: &[&str], description: &str) -> Schema {
+    let mut schema = SchemaObject {
+        instance_type: Some(InstanceType::String.into()),
+        metadata: Some(Box::new(Metadata {
+            description: Some(description.to_string()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    schema.enum_values = Some(
+        values
+            .iter()
+            .map(|value| JsonValue::String((*value).to_string()))
+            .collect(),
+    );
+    Schema::Object(schema)
 }
 
 impl ApprovalsReviewer {
     pub fn to_core(self) -> CoreApprovalsReviewer {
         match self {
             ApprovalsReviewer::User => CoreApprovalsReviewer::User,
-            ApprovalsReviewer::GuardianSubagent => CoreApprovalsReviewer::GuardianSubagent,
+            ApprovalsReviewer::AutoReview => CoreApprovalsReviewer::AutoReview,
         }
     }
 }
@@ -336,7 +382,7 @@ impl From<CoreApprovalsReviewer> for ApprovalsReviewer {
     fn from(value: CoreApprovalsReviewer) -> Self {
         match value {
             CoreApprovalsReviewer::User => ApprovalsReviewer::User,
-            CoreApprovalsReviewer::GuardianSubagent => ApprovalsReviewer::GuardianSubagent,
+            CoreApprovalsReviewer::AutoReview => ApprovalsReviewer::AutoReview,
         }
     }
 }
@@ -1171,25 +1217,74 @@ impl From<CoreNetworkApprovalContext> for NetworkApprovalContext {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct AdditionalFileSystemPermissions {
+    /// Legacy read-root list. Prefer `entries` for new clients.
     pub read: Option<Vec<AbsolutePathBuf>>,
+    /// Legacy write-root list. Prefer `entries` for new clients.
     pub write: Option<Vec<AbsolutePathBuf>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub glob_scan_max_depth: Option<NonZeroUsize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub entries: Option<Vec<FileSystemSandboxEntry>>,
 }
 
 impl From<CoreFileSystemPermissions> for AdditionalFileSystemPermissions {
     fn from(value: CoreFileSystemPermissions) -> Self {
-        Self {
-            read: value.read,
-            write: value.write,
+        if let Some((read, write)) = value.legacy_read_write_roots() {
+            let mut entries = Vec::with_capacity(
+                read.as_ref().map_or(0, Vec::len) + write.as_ref().map_or(0, Vec::len),
+            );
+            if let Some(paths) = read.as_ref() {
+                entries.extend(paths.iter().map(|path| FileSystemSandboxEntry {
+                    path: FileSystemPath::Path { path: path.clone() },
+                    access: FileSystemAccessMode::Read,
+                }));
+            }
+            if let Some(paths) = write.as_ref() {
+                entries.extend(paths.iter().map(|path| FileSystemSandboxEntry {
+                    path: FileSystemPath::Path { path: path.clone() },
+                    access: FileSystemAccessMode::Write,
+                }));
+            }
+            Self {
+                read,
+                write,
+                glob_scan_max_depth: None,
+                entries: Some(entries),
+            }
+        } else {
+            Self {
+                read: None,
+                write: None,
+                glob_scan_max_depth: value.glob_scan_max_depth,
+                entries: Some(
+                    value
+                        .entries
+                        .into_iter()
+                        .map(FileSystemSandboxEntry::from)
+                        .collect(),
+                ),
+            }
         }
     }
 }
 
 impl From<AdditionalFileSystemPermissions> for CoreFileSystemPermissions {
     fn from(value: AdditionalFileSystemPermissions) -> Self {
-        Self {
-            read: value.read,
-            write: value.write,
-        }
+        let mut permissions = if let Some(entries) = value.entries {
+            Self {
+                entries: entries
+                    .into_iter()
+                    .map(CoreFileSystemSandboxEntry::from)
+                    .collect(),
+                glob_scan_max_depth: None,
+            }
+        } else {
+            CoreFileSystemPermissions::from_read_write_roots(value.read, value.write)
+        };
+        permissions.glob_scan_max_depth = value.glob_scan_max_depth;
+        permissions
     }
 }
 
@@ -1200,10 +1295,35 @@ pub struct AdditionalNetworkPermissions {
     pub enabled: Option<bool>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct PermissionProfileNetworkPermissions {
+    pub enabled: bool,
+}
+
 impl From<CoreNetworkPermissions> for AdditionalNetworkPermissions {
     fn from(value: CoreNetworkPermissions) -> Self {
         Self {
             enabled: value.enabled,
+        }
+    }
+}
+
+impl From<CoreNetworkSandboxPolicy> for PermissionProfileNetworkPermissions {
+    fn from(value: CoreNetworkSandboxPolicy) -> Self {
+        Self {
+            enabled: value.is_enabled(),
+        }
+    }
+}
+
+impl From<PermissionProfileNetworkPermissions> for CoreNetworkSandboxPolicy {
+    fn from(value: PermissionProfileNetworkPermissions) -> Self {
+        if value.enabled {
+            Self::Enabled
+        } else {
+            Self::Restricted
         }
     }
 }
@@ -1243,6 +1363,257 @@ impl From<RequestPermissionProfile> for CoreRequestPermissionProfile {
     }
 }
 
+v2_enum_from_core!(
+    pub enum FileSystemAccessMode from CoreFileSystemAccessMode {
+        Read,
+        Write,
+        None
+    }
+);
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(tag = "kind")]
+#[ts(export_to = "v2/")]
+pub enum FileSystemSpecialPath {
+    Root,
+    Minimal,
+    #[serde(alias = "current_working_directory")]
+    ProjectRoots {
+        subpath: Option<PathBuf>,
+    },
+    Tmpdir,
+    SlashTmp,
+    Unknown {
+        path: String,
+        subpath: Option<PathBuf>,
+    },
+}
+
+impl From<CoreFileSystemSpecialPath> for FileSystemSpecialPath {
+    fn from(value: CoreFileSystemSpecialPath) -> Self {
+        match value {
+            CoreFileSystemSpecialPath::Root => Self::Root,
+            CoreFileSystemSpecialPath::Minimal => Self::Minimal,
+            CoreFileSystemSpecialPath::ProjectRoots { subpath } => Self::ProjectRoots { subpath },
+            CoreFileSystemSpecialPath::Tmpdir => Self::Tmpdir,
+            CoreFileSystemSpecialPath::SlashTmp => Self::SlashTmp,
+            CoreFileSystemSpecialPath::Unknown { path, subpath } => Self::Unknown { path, subpath },
+        }
+    }
+}
+
+impl From<FileSystemSpecialPath> for CoreFileSystemSpecialPath {
+    fn from(value: FileSystemSpecialPath) -> Self {
+        match value {
+            FileSystemSpecialPath::Root => Self::Root,
+            FileSystemSpecialPath::Minimal => Self::Minimal,
+            FileSystemSpecialPath::ProjectRoots { subpath } => Self::ProjectRoots { subpath },
+            FileSystemSpecialPath::Tmpdir => Self::Tmpdir,
+            FileSystemSpecialPath::SlashTmp => Self::SlashTmp,
+            FileSystemSpecialPath::Unknown { path, subpath } => Self::Unknown { path, subpath },
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(tag = "type")]
+#[ts(export_to = "v2/")]
+pub enum FileSystemPath {
+    Path { path: AbsolutePathBuf },
+    GlobPattern { pattern: String },
+    Special { value: FileSystemSpecialPath },
+}
+
+impl From<CoreFileSystemPath> for FileSystemPath {
+    fn from(value: CoreFileSystemPath) -> Self {
+        match value {
+            CoreFileSystemPath::Path { path } => Self::Path { path },
+            CoreFileSystemPath::GlobPattern { pattern } => Self::GlobPattern { pattern },
+            CoreFileSystemPath::Special { value } => Self::Special {
+                value: value.into(),
+            },
+        }
+    }
+}
+
+impl From<FileSystemPath> for CoreFileSystemPath {
+    fn from(value: FileSystemPath) -> Self {
+        match value {
+            FileSystemPath::Path { path } => Self::Path { path },
+            FileSystemPath::GlobPattern { pattern } => Self::GlobPattern { pattern },
+            FileSystemPath::Special { value } => Self::Special {
+                value: value.into(),
+            },
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct FileSystemSandboxEntry {
+    pub path: FileSystemPath,
+    pub access: FileSystemAccessMode,
+}
+
+impl From<CoreFileSystemSandboxEntry> for FileSystemSandboxEntry {
+    fn from(value: CoreFileSystemSandboxEntry) -> Self {
+        Self {
+            path: value.path.into(),
+            access: value.access.into(),
+        }
+    }
+}
+
+impl From<FileSystemSandboxEntry> for CoreFileSystemSandboxEntry {
+    fn from(value: FileSystemSandboxEntry) -> Self {
+        Self {
+            path: value.path.into(),
+            access: value.access.to_core(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[ts(tag = "type")]
+#[ts(export_to = "v2/")]
+pub enum PermissionProfileFileSystemPermissions {
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    Restricted {
+        entries: Vec<FileSystemSandboxEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        glob_scan_max_depth: Option<NonZeroUsize>,
+    },
+    Unrestricted,
+}
+
+impl From<CoreManagedFileSystemPermissions> for PermissionProfileFileSystemPermissions {
+    fn from(value: CoreManagedFileSystemPermissions) -> Self {
+        match value {
+            CoreManagedFileSystemPermissions::Restricted {
+                entries,
+                glob_scan_max_depth,
+            } => Self::Restricted {
+                entries: entries
+                    .into_iter()
+                    .map(FileSystemSandboxEntry::from)
+                    .collect(),
+                glob_scan_max_depth,
+            },
+            CoreManagedFileSystemPermissions::Unrestricted => Self::Unrestricted,
+        }
+    }
+}
+
+impl From<PermissionProfileFileSystemPermissions> for CoreManagedFileSystemPermissions {
+    fn from(value: PermissionProfileFileSystemPermissions) -> Self {
+        match value {
+            PermissionProfileFileSystemPermissions::Restricted {
+                entries,
+                glob_scan_max_depth,
+            } => Self::Restricted {
+                entries: entries
+                    .into_iter()
+                    .map(CoreFileSystemSandboxEntry::from)
+                    .collect(),
+                glob_scan_max_depth,
+            },
+            PermissionProfileFileSystemPermissions::Unrestricted => Self::Unrestricted,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[ts(tag = "type")]
+#[ts(export_to = "v2/")]
+pub enum PermissionProfile {
+    /// Codex owns sandbox construction for this profile.
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    Managed {
+        network: PermissionProfileNetworkPermissions,
+        file_system: PermissionProfileFileSystemPermissions,
+    },
+    /// Do not apply an outer sandbox.
+    Disabled,
+    /// Filesystem isolation is enforced by an external caller.
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    External {
+        network: PermissionProfileNetworkPermissions,
+    },
+}
+
+impl From<CorePermissionProfile> for PermissionProfile {
+    fn from(value: CorePermissionProfile) -> Self {
+        match value {
+            CorePermissionProfile::Managed {
+                file_system,
+                network,
+            } => Self::Managed {
+                network: network.into(),
+                file_system: file_system.into(),
+            },
+            CorePermissionProfile::Disabled => Self::Disabled,
+            CorePermissionProfile::External { network } => Self::External {
+                network: network.into(),
+            },
+        }
+    }
+}
+
+impl From<PermissionProfile> for CorePermissionProfile {
+    fn from(value: PermissionProfile) -> Self {
+        match value {
+            PermissionProfile::Managed {
+                file_system,
+                network,
+            } => Self::Managed {
+                file_system: file_system.into(),
+                network: network.into(),
+            },
+            PermissionProfile::Disabled => Self::Disabled,
+            PermissionProfile::External { network } => Self::External {
+                network: network.into(),
+            },
+        }
+    }
+}
+
+pub fn resolve_session_permission_profile(
+    permission_profile: Option<PermissionProfile>,
+    sandbox: &SandboxPolicy,
+    cwd: &std::path::Path,
+) -> Result<CorePermissionProfile, String> {
+    let sandbox_policy = sandbox.to_core();
+    let Some(permission_profile) = permission_profile else {
+        return Ok(CorePermissionProfile::from_legacy_sandbox_policy_for_cwd(
+            &sandbox_policy,
+            cwd,
+        ));
+    };
+
+    let permission_profile: CorePermissionProfile = permission_profile.into();
+    // Merge-safety anchor: app-server responses carry the canonical profile plus
+    // a lossy legacy sandbox projection; validate dual payloads against the same
+    // compatibility projection that session responses emit.
+    let projected_sandbox = permission_profile.to_compatible_legacy_sandbox_policy(cwd);
+    if projected_sandbox != sandbox_policy {
+        return Err(format!(
+            "permissionProfile and sandbox disagree for cwd `{}`: permissionProfile projects to {projected_sandbox:?}, sandbox is {sandbox_policy:?}",
+            cwd.display()
+        ));
+    }
+
+    Ok(permission_profile)
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1251,8 +1622,8 @@ pub struct AdditionalPermissionProfile {
     pub file_system: Option<AdditionalFileSystemPermissions>,
 }
 
-impl From<CorePermissionProfile> for AdditionalPermissionProfile {
-    fn from(value: CorePermissionProfile) -> Self {
+impl From<CoreAdditionalPermissionProfile> for AdditionalPermissionProfile {
+    fn from(value: CoreAdditionalPermissionProfile) -> Self {
         Self {
             network: value.network.map(AdditionalNetworkPermissions::from),
             file_system: value.file_system.map(AdditionalFileSystemPermissions::from),
@@ -1260,7 +1631,7 @@ impl From<CorePermissionProfile> for AdditionalPermissionProfile {
     }
 }
 
-impl From<AdditionalPermissionProfile> for CorePermissionProfile {
+impl From<AdditionalPermissionProfile> for CoreAdditionalPermissionProfile {
     fn from(value: AdditionalPermissionProfile) -> Self {
         Self {
             network: value.network.map(CoreNetworkPermissions::from),
@@ -1281,7 +1652,7 @@ pub struct GrantedPermissionProfile {
     pub file_system: Option<AdditionalFileSystemPermissions>,
 }
 
-impl From<GrantedPermissionProfile> for CorePermissionProfile {
+impl From<GrantedPermissionProfile> for CoreAdditionalPermissionProfile {
     fn from(value: GrantedPermissionProfile) -> Self {
         Self {
             network: value.network.map(CoreNetworkPermissions::from),
@@ -2856,6 +3227,10 @@ pub struct ThreadStartParams {
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     #[ts(optional = nullable)]
     pub sandbox: Option<SandboxMode>,
+    /// Canonical permissions override for this thread. When present, do not
+    /// also set the legacy `sandbox` override.
+    #[ts(optional = nullable)]
+    pub permission_profile: Option<PermissionProfile>,
     #[ts(optional = nullable)]
     pub config: Option<HashMap<String, JsonValue>>,
     #[ts(optional = nullable)]
@@ -2937,6 +3312,9 @@ pub struct ThreadStartResponse {
     /// Reviewer currently used for approval requests on this thread.
     pub approvals_reviewer: ApprovalsReviewer,
     pub sandbox: SandboxPolicy,
+    /// Canonical active permissions view for this thread.
+    #[serde(default)]
+    pub permission_profile: Option<PermissionProfile>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -2998,6 +3376,10 @@ pub struct ThreadResumeParams {
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     #[ts(optional = nullable)]
     pub sandbox: Option<SandboxMode>,
+    /// Canonical permissions override for this thread. When present, do not
+    /// also set the legacy `sandbox` override.
+    #[ts(optional = nullable)]
+    pub permission_profile: Option<PermissionProfile>,
     #[ts(optional = nullable)]
     pub config: Option<HashMap<String, serde_json::Value>>,
     #[serde(
@@ -3043,6 +3425,9 @@ pub struct ThreadResumeResponse {
     /// Reviewer currently used for approval requests on this thread.
     pub approvals_reviewer: ApprovalsReviewer,
     pub sandbox: SandboxPolicy,
+    /// Canonical active permissions view for this thread.
+    #[serde(default)]
+    pub permission_profile: Option<PermissionProfile>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -3095,6 +3480,10 @@ pub struct ThreadForkParams {
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     #[ts(optional = nullable)]
     pub sandbox: Option<SandboxMode>,
+    /// Canonical permissions override for this thread. When present, do not
+    /// also set the legacy `sandbox` override.
+    #[ts(optional = nullable)]
+    pub permission_profile: Option<PermissionProfile>,
     #[ts(optional = nullable)]
     pub config: Option<HashMap<String, serde_json::Value>>,
     #[serde(
@@ -3140,6 +3529,9 @@ pub struct ThreadForkResponse {
     /// Reviewer currently used for approval requests on this thread.
     pub approvals_reviewer: ApprovalsReviewer,
     pub sandbox: SandboxPolicy,
+    /// Canonical active permissions view for this thread.
+    #[serde(default)]
+    pub permission_profile: Option<PermissionProfile>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -5174,6 +5566,14 @@ pub struct GuardianMcpToolCallReviewAction {
     pub tool_title: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GuardianRequestPermissionsReviewAction {
+    pub reason: Option<String>,
+    pub permissions: RequestPermissionProfile,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[ts(tag = "type", rename_all = "camelCase")]
@@ -5216,6 +5616,12 @@ pub enum GuardianApprovalReviewAction {
         connector_id: Option<String>,
         connector_name: Option<String>,
         tool_title: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    RequestPermissions {
+        reason: Option<String>,
+        permissions: RequestPermissionProfile,
     },
 }
 
@@ -5268,6 +5674,13 @@ impl From<CoreGuardianAssessmentAction> for GuardianApprovalReviewAction {
                 connector_id,
                 connector_name,
                 tool_title,
+            },
+            CoreGuardianAssessmentAction::RequestPermissions {
+                reason,
+                permissions,
+            } => Self::RequestPermissions {
+                reason,
+                permissions: permissions.into(),
             },
         }
     }
@@ -5322,6 +5735,13 @@ impl From<GuardianApprovalReviewAction> for CoreGuardianAssessmentAction {
                 connector_id,
                 connector_name,
                 tool_title,
+            },
+            GuardianApprovalReviewAction::RequestPermissions {
+                reason,
+                permissions,
+            } => Self::RequestPermissions {
+                reason,
+                permissions: permissions.into(),
             },
         }
     }
@@ -6961,6 +7381,10 @@ pub struct PermissionsRequestApprovalResponse {
     pub permissions: GrantedPermissionProfile,
     #[serde(default)]
     pub scope: PermissionGrantScope,
+    /// Review every subsequent command in this turn before normal sandboxed execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub strict_auto_review: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -7260,6 +7684,7 @@ mod tests {
     use codex_protocol::items::TurnItem;
     use codex_protocol::items::UserMessageItem;
     use codex_protocol::items::WebSearchItem;
+    use codex_protocol::models::PermissionProfile as CorePermissionProfile;
     use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
     use codex_protocol::protocol::NetworkAccess as CoreNetworkAccess;
     use codex_protocol::protocol::ReadOnlyAccess as CoreReadOnlyAccess;
@@ -7269,6 +7694,213 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::path::PathBuf;
+
+    const COMPATIBLE_PROJECTION_ENV_TEST: &str =
+        "CODEX_APP_SERVER_PROTOCOL_TEST_COMPATIBLE_PROJECTION_ENV";
+
+    #[test]
+    fn approvals_reviewer_accepts_auto_review_alias_and_serializes_legacy_wire_value() {
+        for value in ["auto_review", "guardian_subagent"] {
+            let reviewer: ApprovalsReviewer =
+                serde_json::from_value(serde_json::Value::String(value.to_string()))
+                    .expect("reviewer value should deserialize");
+            assert_eq!(reviewer, ApprovalsReviewer::AutoReview);
+        }
+
+        assert_eq!(
+            serde_json::to_value(ApprovalsReviewer::AutoReview).expect("reviewer should serialize"),
+            serde_json::Value::String("guardian_subagent".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_session_permission_profile_validates_dual_payload_equivalence() {
+        let cwd = test_path_buf("/workspace/project").abs();
+        let sandbox = SandboxPolicy::ReadOnly {
+            access: ReadOnlyAccess::default(),
+            network_access: false,
+        };
+        let expected_profile = CorePermissionProfile::from_legacy_sandbox_policy_for_cwd(
+            &sandbox.to_core(),
+            cwd.as_path(),
+        );
+
+        assert_eq!(
+            resolve_session_permission_profile(None, &sandbox, cwd.as_path())
+                .expect("legacy sandbox should resolve"),
+            expected_profile
+        );
+        assert_eq!(
+            resolve_session_permission_profile(
+                Some(PermissionProfile::from(expected_profile.clone())),
+                &sandbox,
+                cwd.as_path(),
+            )
+            .expect("equivalent dual payload should resolve"),
+            expected_profile
+        );
+
+        let mismatched_profile = CorePermissionProfile::from_legacy_sandbox_policy_for_cwd(
+            &SandboxPolicy::DangerFullAccess.to_core(),
+            cwd.as_path(),
+        );
+        let err = resolve_session_permission_profile(
+            Some(PermissionProfile::from(mismatched_profile)),
+            &sandbox,
+            cwd.as_path(),
+        )
+        .expect_err("mismatched dual payload should fail loud");
+        assert!(
+            err.contains("permissionProfile and sandbox disagree"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_session_permission_profile_accepts_compatible_legacy_projection() {
+        let cwd = test_path_buf("/workspace/project").abs();
+        let outside_write_root = test_path_buf("/var/lib/codex-cache").abs();
+        let profile = CorePermissionProfile::Managed {
+            file_system: codex_protocol::models::ManagedFileSystemPermissions::Restricted {
+                entries: vec![codex_protocol::permissions::FileSystemSandboxEntry {
+                    path: codex_protocol::permissions::FileSystemPath::Path {
+                        path: outside_write_root,
+                    },
+                    access: codex_protocol::permissions::FileSystemAccessMode::Write,
+                }],
+                glob_scan_max_depth: None,
+            },
+            network: codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+        };
+        assert!(
+            profile.to_legacy_sandbox_policy(cwd.as_path()).is_err(),
+            "profile should require lossy legacy compatibility projection"
+        );
+
+        let compatible_sandbox =
+            SandboxPolicy::from(profile.to_compatible_legacy_sandbox_policy(cwd.as_path()));
+        assert_eq!(
+            resolve_session_permission_profile(
+                Some(PermissionProfile::from(profile.clone())),
+                &compatible_sandbox,
+                cwd.as_path(),
+            )
+            .expect("compatible dual payload should resolve"),
+            profile
+        );
+
+        let mut mismatched_sandbox = compatible_sandbox;
+        let SandboxPolicy::WorkspaceWrite { network_access, .. } = &mut mismatched_sandbox else {
+            panic!("compatibility projection should be workspace-write");
+        };
+        *network_access = true;
+        let err = resolve_session_permission_profile(
+            Some(PermissionProfile::from(profile)),
+            &mismatched_sandbox,
+            cwd.as_path(),
+        )
+        .expect_err("mismatched compatible projection should fail loud");
+        assert!(
+            err.contains("permissionProfile and sandbox disagree"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_session_permission_profile_compatible_projection_is_environment_independent() {
+        if std::env::var_os(COMPATIBLE_PROJECTION_ENV_TEST).is_none() {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            for tmpdir_name in ["tmp-a", "tmp-b"] {
+                let tmpdir = temp_dir.path().join(tmpdir_name);
+                std::fs::create_dir_all(&tmpdir).expect("create tmpdir");
+                let output =
+                    std::process::Command::new(std::env::current_exe().expect("test binary"))
+                        .env(COMPATIBLE_PROJECTION_ENV_TEST, "1")
+                        .env("TMPDIR", &tmpdir)
+                        .arg("--exact")
+                        .arg(
+                            "protocol::v2::tests::resolve_session_permission_profile_compatible_projection_is_environment_independent",
+                        )
+                        .output()
+                        .expect("run compatible projection subprocess test");
+
+                assert!(
+                    output.status.success(),
+                    "compatible projection subprocess test failed\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+
+        let cwd = test_path_buf("/workspace/project").abs();
+        let outside_write_root = test_path_buf("/var/lib/codex-cache").abs();
+        let profile = CorePermissionProfile::Managed {
+            file_system: CoreManagedFileSystemPermissions::Restricted {
+                entries: vec![
+                    CoreFileSystemSandboxEntry {
+                        path: CoreFileSystemPath::Path {
+                            path: outside_write_root.clone(),
+                        },
+                        access: CoreFileSystemAccessMode::Write,
+                    },
+                    CoreFileSystemSandboxEntry {
+                        path: CoreFileSystemPath::Special {
+                            value: CoreFileSystemSpecialPath::Tmpdir,
+                        },
+                        access: CoreFileSystemAccessMode::Write,
+                    },
+                    CoreFileSystemSandboxEntry {
+                        path: CoreFileSystemPath::Special {
+                            value: CoreFileSystemSpecialPath::SlashTmp,
+                        },
+                        access: CoreFileSystemAccessMode::Write,
+                    },
+                ],
+                glob_scan_max_depth: None,
+            },
+            network: CoreNetworkSandboxPolicy::Restricted,
+        };
+        assert!(
+            profile.to_legacy_sandbox_policy(cwd.as_path()).is_err(),
+            "profile should require lossy legacy compatibility projection"
+        );
+
+        let compatible_sandbox =
+            SandboxPolicy::from(profile.to_compatible_legacy_sandbox_policy(cwd.as_path()));
+        let SandboxPolicy::WorkspaceWrite {
+            writable_roots,
+            exclude_tmpdir_env_var,
+            exclude_slash_tmp,
+            ..
+        } = &compatible_sandbox
+        else {
+            panic!("compatibility projection should be workspace-write");
+        };
+
+        assert!(writable_roots.contains(&outside_write_root));
+        assert!(!exclude_tmpdir_env_var);
+        assert!(!exclude_slash_tmp);
+        if let Some(tmpdir) = std::env::var_os("TMPDIR")
+            .filter(|tmpdir| !tmpdir.is_empty())
+            .and_then(|tmpdir| AbsolutePathBuf::from_absolute_path(PathBuf::from(tmpdir)).ok())
+        {
+            assert!(!writable_roots.contains(&tmpdir));
+        }
+        let slash_tmp = test_path_buf("/tmp").abs();
+        assert!(!writable_roots.contains(&slash_tmp));
+
+        assert_eq!(
+            resolve_session_permission_profile(
+                Some(PermissionProfile::from(profile.clone())),
+                &compatible_sandbox,
+                cwd.as_path(),
+            )
+            .expect("compatible dual payload should resolve"),
+            profile
+        );
+    }
 
     fn absolute_path_string(path: &str) -> String {
         let path = format!("/{}", path.trim_start_matches('/'));
@@ -7406,6 +8038,8 @@ mod tests {
                         AbsolutePathBuf::try_from(PathBuf::from(read_write_path))
                             .expect("path must be absolute"),
                     ]),
+                    glob_scan_max_depth: None,
+                    entries: None,
                 }),
             }
         );
@@ -7416,16 +8050,16 @@ mod tests {
                 network: Some(CoreNetworkPermissions {
                     enabled: Some(true),
                 }),
-                file_system: Some(CoreFileSystemPermissions {
-                    read: Some(vec![
+                file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
+                    Some(vec![
                         AbsolutePathBuf::try_from(PathBuf::from(read_only_path))
                             .expect("path must be absolute"),
                     ]),
-                    write: Some(vec![
+                    Some(vec![
                         AbsolutePathBuf::try_from(PathBuf::from(read_write_path))
                             .expect("path must be absolute"),
                     ]),
-                }),
+                )),
             }
         );
     }
@@ -7499,26 +8133,28 @@ mod tests {
                         AbsolutePathBuf::try_from(PathBuf::from(read_write_path))
                             .expect("path must be absolute"),
                     ]),
+                    glob_scan_max_depth: None,
+                    entries: None,
                 }),
             }
         );
 
         assert_eq!(
-            CorePermissionProfile::from(response.permissions),
-            CorePermissionProfile {
+            CoreAdditionalPermissionProfile::from(response.permissions),
+            CoreAdditionalPermissionProfile {
                 network: Some(CoreNetworkPermissions {
                     enabled: Some(true),
                 }),
-                file_system: Some(CoreFileSystemPermissions {
-                    read: Some(vec![
+                file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
+                    Some(vec![
                         AbsolutePathBuf::try_from(PathBuf::from(read_only_path))
                             .expect("path must be absolute"),
                     ]),
-                    write: Some(vec![
+                    Some(vec![
                         AbsolutePathBuf::try_from(PathBuf::from(read_write_path))
                             .expect("path must be absolute"),
                     ]),
-                }),
+                )),
             }
         );
     }
@@ -8233,7 +8869,7 @@ mod tests {
             model_auto_compact_token_limit: None,
             model_provider: None,
             approval_policy: None,
-            approvals_reviewer: Some(ApprovalsReviewer::GuardianSubagent),
+            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
             sandbox_mode: None,
             sandbox_workspace_write: None,
             forced_chatgpt_workspace_id: None,
@@ -8335,7 +8971,7 @@ mod tests {
                     model: None,
                     model_provider: None,
                     approval_policy: None,
-                    approvals_reviewer: Some(ApprovalsReviewer::GuardianSubagent),
+                    approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                     service_tier: None,
                     model_reasoning_effort: None,
                     model_reasoning_summary: None,

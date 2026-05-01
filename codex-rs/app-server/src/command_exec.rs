@@ -710,8 +710,7 @@ mod tests {
     use std::collections::HashMap;
 
     use codex_protocol::config_types::WindowsSandboxLevel;
-    use codex_protocol::permissions::FileSystemSandboxPolicy;
-    use codex_protocol::permissions::NetworkSandboxPolicy;
+    use codex_protocol::models::PermissionProfile;
     use codex_protocol::protocol::ReadOnlyAccess;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_utils_absolute_path::AbsolutePathBuf;
@@ -734,9 +733,12 @@ mod tests {
             access: ReadOnlyAccess::FullAccess,
             network_access: false,
         };
+        let cwd = AbsolutePathBuf::current_dir().expect("current dir");
+        let permission_profile =
+            PermissionProfile::from_legacy_sandbox_policy_for_cwd(&sandbox_policy, cwd.as_path());
         ExecRequest::new(
             vec!["cmd".to_string()],
-            AbsolutePathBuf::current_dir().expect("current dir"),
+            cwd,
             HashMap::new(),
             /*network*/ None,
             ExecExpiration::DefaultTimeout,
@@ -744,9 +746,7 @@ mod tests {
             SandboxType::WindowsRestrictedToken,
             WindowsSandboxLevel::Disabled,
             /*windows_sandbox_private_desktop*/ false,
-            sandbox_policy.clone(),
-            FileSystemSandboxPolicy::from(&sandbox_policy),
-            NetworkSandboxPolicy::from(&sandbox_policy),
+            permission_profile,
             /*arg0*/ None,
         )
     }
@@ -840,6 +840,9 @@ mod tests {
             access: ReadOnlyAccess::FullAccess,
             network_access: false,
         };
+        let cwd = AbsolutePathBuf::current_dir().expect("current dir");
+        let permission_profile =
+            PermissionProfile::from_legacy_sandbox_policy_for_cwd(&sandbox_policy, cwd.as_path());
 
         manager
             .start(StartCommandExecParams {
@@ -848,7 +851,7 @@ mod tests {
                 process_id: Some("proc-100".to_string()),
                 exec_request: ExecRequest::new(
                     vec!["sh".to_string(), "-lc".to_string(), "sleep 30".to_string()],
-                    AbsolutePathBuf::current_dir().expect("current dir"),
+                    cwd,
                     HashMap::new(),
                     /*network*/ None,
                     ExecExpiration::Cancellation(CancellationToken::new()),
@@ -856,9 +859,7 @@ mod tests {
                     SandboxType::None,
                     WindowsSandboxLevel::Disabled,
                     /*windows_sandbox_private_desktop*/ false,
-                    sandbox_policy.clone(),
-                    FileSystemSandboxPolicy::from(&sandbox_policy),
-                    NetworkSandboxPolicy::from(&sandbox_policy),
+                    permission_profile,
                     /*arg0*/ None,
                 ),
                 started_network_proxy: None,

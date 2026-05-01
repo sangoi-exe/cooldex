@@ -57,6 +57,7 @@ pub(super) async fn spawn_review_thread(
                 return;
             }
         };
+    let sandbox_policy = parent_turn_context.sandbox_policy();
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &review_model_info,
         available_models: &available_models,
@@ -64,7 +65,7 @@ pub(super) async fn spawn_review_thread(
         image_generation_tool_auth_allowed,
         web_search_mode: Some(review_web_search_mode),
         session_source: parent_turn_context.session_source.clone(),
-        sandbox_policy: parent_turn_context.sandbox_policy.get(),
+        sandbox_policy: &sandbox_policy,
         windows_sandbox_level: parent_turn_context.windows_sandbox_level,
     })
     .with_unified_exec_shell_mode_for_session(
@@ -121,7 +122,7 @@ pub(super) async fn spawn_review_thread(
         &session_source,
         review_turn_id.clone(),
         parent_turn_context.cwd.clone(),
-        parent_turn_context.sandbox_policy.get(),
+        &sandbox_policy,
         parent_turn_context.windows_sandbox_level,
     ));
 
@@ -150,9 +151,7 @@ pub(super) async fn spawn_review_thread(
         collaboration_mode: parent_turn_context.collaboration_mode.clone(),
         personality: parent_turn_context.personality,
         approval_policy: parent_turn_context.approval_policy.clone(),
-        sandbox_policy: parent_turn_context.sandbox_policy.clone(),
-        file_system_sandbox_policy: parent_turn_context.file_system_sandbox_policy.clone(),
-        network_sandbox_policy: parent_turn_context.network_sandbox_policy,
+        permission_profile: parent_turn_context.permission_profile(),
         network: parent_turn_context.network.clone(),
         windows_sandbox_level: parent_turn_context.windows_sandbox_level,
         shell_environment_policy: parent_turn_context.shell_environment_policy.clone(),

@@ -67,9 +67,11 @@ pub(super) fn emit_project_config_warnings(app_event_tx: &AppEventSender, config
 }
 
 pub(super) fn emit_system_bwrap_warning(app_event_tx: &AppEventSender, config: &Config) {
-    let Some(message) =
-        crate::legacy_core::config::system_bwrap_warning(config.permissions.sandbox_policy.get())
-    else {
+    let Some(message) = crate::legacy_core::config::system_bwrap_warning(
+        &config
+            .permissions
+            .legacy_sandbox_policy(config.cwd.as_path()),
+    ) else {
         return;
     };
 

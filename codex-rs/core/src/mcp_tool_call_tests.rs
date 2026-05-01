@@ -13,6 +13,10 @@ use codex_config::types::AppsConfigToml;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerToolConfig;
 use codex_model_provider::create_model_provider;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::SandboxEnforcement;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
 use core_test_support::PathExt;
@@ -1382,7 +1386,7 @@ async fn guardian_mode_skips_auto_when_annotations_do_not_require_approval() {
         .expect("test setup should allow updating approval policy");
     let mut config = (*turn_context.config).clone();
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
-    config.approvals_reviewer = ApprovalsReviewer::GuardianSubagent;
+    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
     let config = Arc::new(config);
     let models_manager = Arc::new(crate::test_support::models_manager_with_provider(
         config.codex_home.to_path_buf(),
@@ -1461,7 +1465,7 @@ async fn guardian_mode_mcp_denial_returns_rationale_message() {
         .expect("test setup should allow updating approval policy");
     let mut config = (*turn_context.config).clone();
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
-    config.approvals_reviewer = ApprovalsReviewer::GuardianSubagent;
+    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
     let config = Arc::new(config);
     let models_manager = Arc::new(crate::test_support::models_manager_with_provider(
         config.codex_home.to_path_buf(),
@@ -1818,10 +1822,13 @@ async fn full_access_mode_skips_arc_monitor_for_all_approval_modes() {
         .approval_policy
         .set(AskForApproval::Never)
         .expect("test setup should allow updating approval policy");
-    turn_context
-        .sandbox_policy
-        .set(SandboxPolicy::DangerFullAccess)
-        .expect("test setup should allow updating sandbox policy");
+    let file_system_sandbox_policy =
+        FileSystemSandboxPolicy::from(&SandboxPolicy::DangerFullAccess);
+    turn_context.permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
+        SandboxEnforcement::from_legacy_sandbox_policy(&SandboxPolicy::DangerFullAccess),
+        &file_system_sandbox_policy,
+        NetworkSandboxPolicy::from(&SandboxPolicy::DangerFullAccess),
+    );
     let mut config = (*turn_context.config).clone();
     config.chatgpt_base_url = server.uri();
     turn_context.config = Arc::new(config);
@@ -1918,7 +1925,7 @@ async fn approve_mode_routes_arc_ask_user_to_guardian_when_guardian_reviewer_is_
     let mut config = (*turn_context.config).clone();
     config.chatgpt_base_url = server.uri();
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
-    config.approvals_reviewer = ApprovalsReviewer::GuardianSubagent;
+    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
     let config = Arc::new(config);
     let models_manager = Arc::new(crate::test_support::models_manager_with_provider(
         config.codex_home.to_path_buf(),

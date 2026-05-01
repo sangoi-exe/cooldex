@@ -340,8 +340,10 @@ async fn permissions_selection_history_snapshot_full_access_to_default() {
         .approval_policy
         .set(AskForApproval::Never)
         .expect("set approval policy");
-    chat.config.permissions.sandbox_policy =
-        Constrained::allow_any(SandboxPolicy::DangerFullAccess);
+    chat.config
+        .permissions
+        .set_legacy_sandbox_policy(SandboxPolicy::DangerFullAccess, chat.config.cwd.as_path())
+        .expect("set sandbox policy");
 
     chat.open_permissions_popup();
     let popup = render_bottom_popup(&chat, /*width*/ 120);
@@ -382,8 +384,10 @@ async fn permissions_selection_emits_history_cell_when_current_is_selected() {
         .expect("set approval policy");
     chat.config
         .permissions
-        .sandbox_policy
-        .set(SandboxPolicy::new_workspace_write_policy())
+        .set_legacy_sandbox_policy(
+            SandboxPolicy::new_workspace_write_policy(),
+            chat.config.cwd.as_path(),
+        )
         .expect("set sandbox policy");
 
     chat.open_permissions_popup();
@@ -433,7 +437,7 @@ async fn permissions_selection_shows_guardian_approvals_when_feature_disabled_if
     }
     chat.set_feature_enabled(Feature::GuardianApproval, /*enabled*/ false);
     chat.config.notices.hide_full_access_warning = Some(true);
-    chat.config.approvals_reviewer = ApprovalsReviewer::GuardianSubagent;
+    chat.config.approvals_reviewer = ApprovalsReviewer::AutoReview;
     chat.config
         .permissions
         .approval_policy
@@ -441,8 +445,10 @@ async fn permissions_selection_shows_guardian_approvals_when_feature_disabled_if
         .expect("set approval policy");
     chat.config
         .permissions
-        .sandbox_policy
-        .set(SandboxPolicy::new_workspace_write_policy())
+        .set_legacy_sandbox_policy(
+            SandboxPolicy::new_workspace_write_policy(),
+            chat.config.cwd.as_path(),
+        )
         .expect("set sandbox policy");
 
     chat.open_permissions_popup();
@@ -479,7 +485,8 @@ async fn permissions_selection_marks_guardian_approvals_current_after_session_co
             model_provider_id: "test-provider".to_string(),
             service_tier: None,
             approval_policy: AskForApproval::OnRequest,
-            approvals_reviewer: ApprovalsReviewer::GuardianSubagent,
+            approvals_reviewer: ApprovalsReviewer::AutoReview,
+            permission_profile: codex_protocol::models::PermissionProfile::default(),
             sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
             cwd: test_project_path().abs(),
             reasoning_effort: None,
@@ -528,7 +535,8 @@ async fn permissions_selection_marks_guardian_approvals_current_with_custom_work
             model_provider_id: "test-provider".to_string(),
             service_tier: None,
             approval_policy: AskForApproval::OnRequest,
-            approvals_reviewer: ApprovalsReviewer::GuardianSubagent,
+            approvals_reviewer: ApprovalsReviewer::AutoReview,
+            permission_profile: codex_protocol::models::PermissionProfile::default(),
             sandbox_policy: SandboxPolicy::WorkspaceWrite {
                 writable_roots: vec![extra_root],
                 read_only_access: ReadOnlyAccess::FullAccess,
@@ -573,8 +581,10 @@ async fn permissions_selection_can_disable_guardian_approvals() {
         .expect("set approval policy");
     chat.config
         .permissions
-        .sandbox_policy
-        .set(SandboxPolicy::new_workspace_write_policy())
+        .set_legacy_sandbox_policy(
+            SandboxPolicy::new_workspace_write_policy(),
+            chat.config.cwd.as_path(),
+        )
         .expect("set sandbox policy");
 
     chat.open_permissions_popup();
@@ -614,8 +624,10 @@ async fn permissions_selection_sends_approvals_reviewer_in_override_turn_context
         .expect("set approval policy");
     chat.config
         .permissions
-        .sandbox_policy
-        .set(SandboxPolicy::new_workspace_write_policy())
+        .set_legacy_sandbox_policy(
+            SandboxPolicy::new_workspace_write_policy(),
+            chat.config.cwd.as_path(),
+        )
         .expect("set sandbox policy");
     chat.set_approvals_reviewer(ApprovalsReviewer::User);
 
@@ -650,7 +662,7 @@ async fn permissions_selection_sends_approvals_reviewer_in_override_turn_context
         Op::OverrideTurnContext {
             cwd: None,
             approval_policy: Some(AskForApproval::OnRequest),
-            approvals_reviewer: Some(ApprovalsReviewer::GuardianSubagent),
+            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
             sandbox_policy: Some(SandboxPolicy::new_workspace_write_policy()),
             windows_sandbox_level: None,
             model: None,

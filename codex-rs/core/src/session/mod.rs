@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -82,11 +83,15 @@ use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::mcp::CallToolResult;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::models::format_allow_prefixes;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::CollabAgentActivity;
 use codex_protocol::protocol::FileChange;
@@ -113,6 +118,7 @@ use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rollout::RolloutConfig;
 use codex_rollout::state_db;
+use codex_sandboxing::policy_transforms::intersect_permission_profiles;
 use codex_shell_command::parse_command::parse_command;
 use codex_terminal_detection::user_agent;
 use codex_thread_store::LocalThreadStore;
@@ -268,6 +274,7 @@ use crate::skills_watcher::SkillsWatcher;
 use crate::skills_watcher::SkillsWatcherEvent;
 use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
+use crate::state::PendingRequestPermissions;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 #[cfg(test)]
@@ -642,9 +649,7 @@ impl Codex {
             compact_prompt: config.compact_prompt.clone(),
             approval_policy: config.permissions.approval_policy.clone(),
             approvals_reviewer: config.approvals_reviewer,
-            sandbox_policy: config.permissions.sandbox_policy.clone(),
-            file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
-            network_sandbox_policy: config.permissions.network_sandbox_policy,
+            permission_profile: config.permissions.permission_profile.clone(),
             windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
             cwd: config.cwd.clone(),
             codex_home: config.codex_home.clone(),
@@ -975,9 +980,8 @@ impl Session {
             return;
         };
 
-        let spec = match spec
-            .recompute_for_sandbox_policy(session_configuration.sandbox_policy.get())
-        {
+        let sandbox_policy = session_configuration.sandbox_policy();
+        let spec = match spec.recompute_for_sandbox_policy(&sandbox_policy) {
             Ok(spec) => spec,
             Err(err) => {
                 warn!("failed to rebuild managed network proxy policy for sandbox change: {err}");
@@ -1406,7 +1410,7 @@ impl Session {
         &self,
         updates: SessionSettingsUpdate,
     ) -> ConstraintResult<()> {
-        let (previous_cwd, sandbox_policy_changed, next_cwd, codex_home, session_source) = {
+        let (previous_cwd, permission_profile_changed, next_cwd, codex_home, session_source) = {
             let mut state = self.state.lock().await;
             let updated = match state.session_configuration.apply(&updates) {
                 Ok(updated) => updated,
@@ -1417,15 +1421,15 @@ impl Session {
             };
 
             let previous_cwd = state.session_configuration.cwd.clone();
-            let sandbox_policy_changed =
-                state.session_configuration.sandbox_policy != updated.sandbox_policy;
+            let permission_profile_changed =
+                state.session_configuration.permission_profile != updated.permission_profile;
             let next_cwd = updated.cwd.clone();
             let codex_home = updated.codex_home.clone();
             let session_source = updated.session_source.clone();
             state.session_configuration = updated;
             (
                 previous_cwd,
-                sandbox_policy_changed,
+                permission_profile_changed,
                 next_cwd,
                 codex_home,
                 session_source,
@@ -1438,7 +1442,7 @@ impl Session {
             &codex_home,
             &session_source,
         );
-        if sandbox_policy_changed {
+        if permission_profile_changed {
             self.refresh_managed_network_proxy_for_current_sandbox_policy()
                 .await;
         }
@@ -1922,7 +1926,7 @@ impl Session {
         reason: Option<String>,
         network_approval_context: Option<NetworkApprovalContext>,
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
-        additional_permissions: Option<PermissionProfile>,
+        additional_permissions: Option<AdditionalPermissionProfile>,
         available_decisions: Option<Vec<ReviewDecision>>,
     ) -> ReviewDecision {
         //  command-level approvals use `call_id`.
@@ -2020,30 +2024,97 @@ impl Session {
     }
 
     pub async fn request_permissions(
-        &self,
-        turn_context: &TurnContext,
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
         call_id: String,
         args: RequestPermissionsArgs,
-    ) -> Option<RequestPermissionsResponse> {
+    ) -> Result<RequestPermissionsResponse, String> {
         match turn_context.approval_policy.value() {
             AskForApproval::Never => {
-                return Some(RequestPermissionsResponse {
-                    permissions: RequestPermissionProfile::default(),
-                    scope: PermissionGrantScope::Turn,
-                });
+                return Err(
+                    "request_permissions is disabled by approval_policy = \"never\"".to_string(),
+                );
             }
             AskForApproval::Granular(granular_config)
                 if !granular_config.allows_request_permissions() =>
             {
-                return Some(RequestPermissionsResponse {
-                    permissions: RequestPermissionProfile::default(),
-                    scope: PermissionGrantScope::Turn,
-                });
+                return Err(
+                    "request_permissions is disabled by granular.request_permissions = false"
+                        .to_string(),
+                );
             }
             AskForApproval::OnFailure
             | AskForApproval::OnRequest
             | AskForApproval::UnlessTrusted
             | AskForApproval::Granular(_) => {}
+        }
+
+        let reason = args.reason;
+        let requested_permissions = args.permissions;
+        let cwd = turn_context.cwd.clone();
+
+        // Merge-safety anchor: request_permissions Auto-review must preserve the
+        // local Result failure channel; only explicit user/Auto-review denials may
+        // serialize as an empty successful permission response.
+        if crate::guardian::routes_approval_to_guardian(turn_context.as_ref()) {
+            let originating_turn_state = {
+                let active = self.active_turn.lock().await;
+                active.as_ref().map(|active| Arc::clone(&active.turn_state))
+            };
+            let review_id = crate::guardian::new_guardian_review_id();
+            let request = crate::guardian::GuardianApprovalRequest::RequestPermissions {
+                id: call_id,
+                turn_id: turn_context.sub_id.clone(),
+                reason,
+                permissions: requested_permissions.clone(),
+            };
+            let review_rx = crate::guardian::spawn_approval_request_review_detailed(
+                Arc::clone(self),
+                Arc::clone(turn_context),
+                review_id,
+                request,
+                /*retry_reason*/ None,
+                /*external_cancel*/ None,
+            );
+            let decision = review_rx.await.unwrap_or_else(|_| {
+                crate::guardian::GuardianReviewDecision::Failed(
+                    "automatic approval review channel closed before request_permissions completed"
+                        .to_string(),
+                )
+            });
+            let response = match decision {
+                crate::guardian::GuardianReviewDecision::Approved => RequestPermissionsResponse {
+                    permissions: requested_permissions.clone(),
+                    scope: PermissionGrantScope::Turn,
+                    strict_auto_review: false,
+                },
+                crate::guardian::GuardianReviewDecision::Denied => RequestPermissionsResponse {
+                    permissions: RequestPermissionProfile::default(),
+                    scope: PermissionGrantScope::Turn,
+                    strict_auto_review: false,
+                },
+                crate::guardian::GuardianReviewDecision::TimedOut => {
+                    return Err(crate::guardian::guardian_timeout_message());
+                }
+                crate::guardian::GuardianReviewDecision::Aborted => {
+                    return Err(
+                        "automatic approval review was aborted before request_permissions completed"
+                            .to_string(),
+                    );
+                }
+                crate::guardian::GuardianReviewDecision::Failed(message) => return Err(message),
+            };
+            let response = Self::normalize_request_permissions_response(
+                requested_permissions,
+                response,
+                cwd.as_path(),
+            );
+            self.record_granted_request_permissions_for_turn(
+                &response,
+                originating_turn_state.as_ref(),
+            )
+            .await;
+            return Ok(response);
         }
 
         let (tx_response, rx_response) = oneshot::channel();
@@ -2052,7 +2123,14 @@ impl Session {
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
-                    ts.insert_pending_request_permissions(call_id.clone(), tx_response)
+                    ts.insert_pending_request_permissions(
+                        call_id.clone(),
+                        PendingRequestPermissions {
+                            tx_response,
+                            requested_permissions: requested_permissions.clone(),
+                            cwd: cwd.clone(),
+                        },
+                    )
                 }
                 None => None,
             }
@@ -2061,17 +2139,17 @@ impl Session {
             warn!("Overwriting existing pending request_permissions for call_id: {call_id}");
         }
 
-        // TODO(ccunningham): Support auto-review for request_permissions /
-        // with_additional_permissions. V0 still routes this surface through
-        // the existing manual RequestPermissions event flow.
         let event = EventMsg::RequestPermissions(RequestPermissionsEvent {
             call_id,
             turn_id: turn_context.sub_id.clone(),
-            reason: args.reason,
-            permissions: args.permissions,
+            reason,
+            permissions: requested_permissions,
+            cwd: Some(cwd),
         });
-        self.send_event(turn_context, event).await;
-        rx_response.await.ok()
+        self.send_event(turn_context.as_ref(), event).await;
+        rx_response.await.unwrap_or_else(|_| {
+            Err("request_permissions response channel closed before a response arrived".to_string())
+        })
     }
 
     pub async fn request_user_input(
@@ -2137,35 +2215,31 @@ impl Session {
         call_id: &str,
         response: RequestPermissionsResponse,
     ) {
-        let mut granted_for_session = None;
-        let entry = {
+        let (entry, originating_turn_state) = {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
                     let entry = ts.remove_pending_request_permissions(call_id);
-                    if entry.is_some() && !response.permissions.is_empty() {
-                        match response.scope {
-                            PermissionGrantScope::Turn => {
-                                ts.record_granted_permissions(response.permissions.clone().into());
-                            }
-                            PermissionGrantScope::Session => {
-                                granted_for_session = Some(response.permissions.clone());
-                            }
-                        }
-                    }
-                    entry
+                    let originating_turn_state = entry.as_ref().map(|_| Arc::clone(&at.turn_state));
+                    (entry, originating_turn_state)
                 }
-                None => None,
+                None => (None, None),
             }
         };
-        if let Some(permissions) = granted_for_session {
-            let mut state = self.state.lock().await;
-            state.record_granted_permissions(permissions.into());
-        }
         match entry {
-            Some(tx_response) => {
-                tx_response.send(response).ok();
+            Some(entry) => {
+                let response = Self::normalize_request_permissions_response(
+                    entry.requested_permissions,
+                    response,
+                    entry.cwd.as_path(),
+                );
+                self.record_granted_request_permissions_for_turn(
+                    &response,
+                    originating_turn_state.as_ref(),
+                )
+                .await;
+                entry.tx_response.send(Ok(response)).ok();
             }
             None => {
                 warn!("No pending request_permissions found for call_id: {call_id}");
@@ -2173,14 +2247,100 @@ impl Session {
         }
     }
 
-    pub(crate) async fn granted_turn_permissions(&self) -> Option<PermissionProfile> {
+    pub async fn notify_request_permissions_failure(&self, call_id: &str, message: String) {
+        let entry = {
+            let mut active = self.active_turn.lock().await;
+            match active.as_mut() {
+                Some(at) => {
+                    let mut ts = at.turn_state.lock().await;
+                    ts.remove_pending_request_permissions(call_id)
+                }
+                None => None,
+            }
+        };
+        match entry {
+            Some(entry) => {
+                entry.tx_response.send(Err(message)).ok();
+            }
+            None => {
+                warn!("No pending request_permissions found for call_id: {call_id}");
+            }
+        }
+    }
+
+    fn normalize_request_permissions_response(
+        requested_permissions: RequestPermissionProfile,
+        response: RequestPermissionsResponse,
+        cwd: &Path,
+    ) -> RequestPermissionsResponse {
+        if response.strict_auto_review && matches!(response.scope, PermissionGrantScope::Session) {
+            return RequestPermissionsResponse {
+                permissions: RequestPermissionProfile::default(),
+                scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
+            };
+        }
+
+        if response.permissions.is_empty() {
+            return response;
+        }
+
+        RequestPermissionsResponse {
+            permissions: intersect_permission_profiles(
+                requested_permissions.into(),
+                response.permissions.into(),
+                cwd,
+            )
+            .into(),
+            scope: response.scope,
+            strict_auto_review: response.strict_auto_review,
+        }
+    }
+
+    async fn record_granted_request_permissions_for_turn(
+        &self,
+        response: &RequestPermissionsResponse,
+        originating_turn_state: Option<&Arc<Mutex<crate::state::TurnState>>>,
+    ) {
+        if response.permissions.is_empty() {
+            return;
+        }
+        match response.scope {
+            PermissionGrantScope::Turn => {
+                if let Some(turn_state) = originating_turn_state {
+                    let mut ts = turn_state.lock().await;
+                    let permissions: AdditionalPermissionProfile =
+                        response.permissions.clone().into();
+                    ts.record_granted_permissions(permissions);
+                    if response.strict_auto_review {
+                        ts.enable_strict_auto_review();
+                    }
+                }
+            }
+            PermissionGrantScope::Session => {
+                let mut state = self.state.lock().await;
+                state.record_granted_permissions(response.permissions.clone().into());
+            }
+        }
+    }
+
+    pub(crate) async fn granted_turn_permissions(&self) -> Option<AdditionalPermissionProfile> {
         let active = self.active_turn.lock().await;
         let active = active.as_ref()?;
         let ts = active.turn_state.lock().await;
         ts.granted_permissions()
     }
 
-    pub(crate) async fn granted_session_permissions(&self) -> Option<PermissionProfile> {
+    pub(crate) async fn strict_auto_review_enabled_for_turn(&self) -> bool {
+        let active = self.active_turn.lock().await;
+        let Some(active) = active.as_ref() else {
+            return false;
+        };
+        let ts = active.turn_state.lock().await;
+        ts.strict_auto_review_enabled()
+    }
+
+    pub(crate) async fn granted_session_permissions(&self) -> Option<AdditionalPermissionProfile> {
         let state = self.state.lock().await;
         state.granted_permissions()
     }
@@ -2473,7 +2633,7 @@ impl Session {
         if turn_context.config.include_permissions_instructions {
             developer_sections.push(
                 DeveloperInstructions::from_policy(
-                    turn_context.sandbox_policy.get(),
+                    &turn_context.sandbox_policy(),
                     turn_context.approval_policy.value(),
                     turn_context.config.approvals_reviewer,
                     self.services.exec_policy.current().as_ref(),

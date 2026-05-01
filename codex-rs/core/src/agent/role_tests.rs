@@ -574,9 +574,12 @@ writable_roots = ["./sandbox-root"]
         false
     );
 
-    match &*config.permissions.sandbox_policy {
+    match config
+        .permissions
+        .legacy_sandbox_policy(config.cwd.as_path())
+    {
         SandboxPolicy::WorkspaceWrite { network_access, .. } => {
-            assert_eq!(*network_access, true);
+            assert_eq!(network_access, true);
         }
         other => panic!("expected workspace-write sandbox policy, got {other:?}"),
     }

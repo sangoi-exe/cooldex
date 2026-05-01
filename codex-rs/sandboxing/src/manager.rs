@@ -4,13 +4,12 @@ use crate::bwrap::WSL1_BWRAP_WARNING;
 use crate::bwrap::is_wsl1;
 use crate::landlock::CODEX_LINUX_SANDBOX_ARG0;
 use crate::landlock::allow_network_for_proxy;
-use crate::landlock::create_linux_sandbox_command_args_for_policies;
-use crate::policy_transforms::EffectiveSandboxPermissions;
-use crate::policy_transforms::effective_file_system_sandbox_policy;
-use crate::policy_transforms::effective_network_sandbox_policy;
+use crate::landlock::create_linux_sandbox_command_args_for_permission_profile;
+use crate::policy_transforms::effective_permission_profile;
 use crate::policy_transforms::should_require_platform_sandbox;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
@@ -68,7 +67,7 @@ pub struct SandboxCommand {
     pub args: Vec<String>,
     pub cwd: AbsolutePathBuf,
     pub env: HashMap<String, String>,
-    pub additional_permissions: Option<PermissionProfile>,
+    pub additional_permissions: Option<AdditionalPermissionProfile>,
 }
 
 #[derive(Debug)]
@@ -80,7 +79,7 @@ pub struct SandboxExecRequest {
     pub sandbox: SandboxType,
     pub windows_sandbox_level: WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
-    pub sandbox_policy: SandboxPolicy,
+    pub permission_profile: PermissionProfile,
     pub file_system_sandbox_policy: FileSystemSandboxPolicy,
     pub network_sandbox_policy: NetworkSandboxPolicy,
     pub arg0: Option<String>,
@@ -91,9 +90,7 @@ pub struct SandboxExecRequest {
 /// This keeps call sites self-documenting when several fields are optional.
 pub struct SandboxTransformRequest<'a> {
     pub command: SandboxCommand,
-    pub policy: &'a SandboxPolicy,
-    pub file_system_policy: &'a FileSystemSandboxPolicy,
-    pub network_policy: NetworkSandboxPolicy,
+    pub permissions: &'a PermissionProfile,
     pub sandbox: SandboxType,
     pub enforce_managed_network: bool,
     // TODO(viyatb): Evaluate switching this to Option<Arc<NetworkProxy>>
@@ -174,9 +171,7 @@ impl SandboxManager {
     ) -> Result<SandboxExecRequest, SandboxTransformError> {
         let SandboxTransformRequest {
             mut command,
-            policy,
-            file_system_policy,
-            network_policy,
+            permissions,
             sandbox,
             enforce_managed_network,
             network,
@@ -187,15 +182,10 @@ impl SandboxManager {
             windows_sandbox_private_desktop,
         } = request;
         let additional_permissions = command.additional_permissions.take();
-        let EffectiveSandboxPermissions {
-            sandbox_policy: effective_policy,
-        } = EffectiveSandboxPermissions::new(policy, additional_permissions.as_ref());
-        let effective_file_system_policy = effective_file_system_sandbox_policy(
-            file_system_policy,
-            additional_permissions.as_ref(),
-        );
-        let effective_network_policy =
-            effective_network_sandbox_policy(network_policy, additional_permissions.as_ref());
+        let effective_permission_profile =
+            effective_permission_profile(permissions, additional_permissions.as_ref());
+        let (effective_file_system_policy, effective_network_policy) =
+            effective_permission_profile.to_runtime_permissions();
         let mut argv = Vec::with_capacity(1 + command.args.len());
         argv.push(command.program);
         argv.extend(command.args.into_iter().map(OsString::from));
@@ -235,12 +225,10 @@ impl SandboxManager {
                     allow_proxy_network,
                     is_wsl1(),
                 )?;
-                let mut args = create_linux_sandbox_command_args_for_policies(
+                let mut args = create_linux_sandbox_command_args_for_permission_profile(
                     os_argv_to_strings(argv),
                     command.cwd.as_path(),
-                    &effective_policy,
-                    &effective_file_system_policy,
-                    effective_network_policy,
+                    &effective_permission_profile,
                     sandbox_policy_cwd,
                     use_legacy_landlock,
                     allow_proxy_network,
@@ -264,12 +252,25 @@ impl SandboxManager {
             sandbox,
             windows_sandbox_level,
             windows_sandbox_private_desktop,
-            sandbox_policy: effective_policy,
+            permission_profile: effective_permission_profile,
             file_system_sandbox_policy: effective_file_system_policy,
             network_sandbox_policy: effective_network_policy,
             arg0: arg0_override,
         })
     }
+}
+
+pub fn compatibility_sandbox_policy_for_permission_profile(
+    permissions: &PermissionProfile,
+    file_system_policy: &FileSystemSandboxPolicy,
+    network_policy: NetworkSandboxPolicy,
+    cwd: &Path,
+) -> SandboxPolicy {
+    permissions.to_compatible_legacy_sandbox_policy_with_runtime_permissions(
+        file_system_policy,
+        network_policy,
+        cwd,
+    )
 }
 
 #[cfg(target_os = "linux")]

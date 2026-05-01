@@ -54,6 +54,7 @@ use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_model_provider_info::WireApi;
 use codex_models_manager::bundled_models_response;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -631,7 +632,7 @@ async fn default_permissions_profile_populates_runtime_sandbox_policy() -> std::
 
     let memories_root = codex_home.path().join("memories").abs();
     assert_eq!(
-        config.permissions.file_system_sandbox_policy,
+        config.permissions.file_system_sandbox_policy(),
         FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
@@ -660,7 +661,9 @@ async fn default_permissions_profile_populates_runtime_sandbox_policy() -> std::
         ]),
     );
     assert_eq!(
-        config.permissions.sandbox_policy.get(),
+        &config
+            .permissions
+            .legacy_sandbox_policy(config.cwd.as_path()),
         &SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![memories_root],
             read_only_access: ReadOnlyAccess::Restricted {
@@ -673,7 +676,7 @@ async fn default_permissions_profile_populates_runtime_sandbox_policy() -> std::
         }
     );
     assert_eq!(
-        config.permissions.network_sandbox_policy,
+        config.permissions.network_sandbox_policy(),
         NetworkSandboxPolicy::Restricted
     );
     Ok(())
@@ -716,20 +719,13 @@ async fn project_root_glob_none_compiles_to_filesystem_pattern_entry() -> std::i
     )
     .await?;
 
-    assert_eq!(
-        config
-            .permissions
-            .file_system_sandbox_policy
-            .glob_scan_max_depth,
-        Some(2)
-    );
+    let file_system_sandbox_policy = config.permissions.file_system_sandbox_policy();
+    assert_eq!(file_system_sandbox_policy.glob_scan_max_depth, Some(2));
     let expected_pattern = AbsolutePathBuf::resolve_path_against_base("**/*.env", cwd.path())
         .to_string_lossy()
         .into_owned();
     assert!(
-        config
-            .permissions
-            .file_system_sandbox_policy
+        file_system_sandbox_policy
             .entries
             .contains(&FileSystemSandboxEntry {
                 path: FileSystemPath::GlobPattern {
@@ -739,9 +735,7 @@ async fn project_root_glob_none_compiles_to_filesystem_pattern_entry() -> std::i
             })
     );
     assert!(
-        !config
-            .permissions
-            .file_system_sandbox_policy
+        !file_system_sandbox_policy
             .entries
             .iter()
             .any(|entry| matches!(
@@ -927,7 +921,7 @@ async fn permissions_profiles_allow_unknown_special_paths() -> std::io::Result<(
     .await?;
 
     assert_eq!(
-        config.permissions.file_system_sandbox_policy,
+        config.permissions.file_system_sandbox_policy(),
         FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::unknown(
@@ -939,7 +933,9 @@ async fn permissions_profiles_allow_unknown_special_paths() -> std::io::Result<(
         }]),
     );
     assert_eq!(
-        config.permissions.sandbox_policy.get(),
+        &config
+            .permissions
+            .legacy_sandbox_policy(config.cwd.as_path()),
         &SandboxPolicy::ReadOnly {
             access: ReadOnlyAccess::Restricted {
                 include_platform_defaults: false,
@@ -977,7 +973,7 @@ async fn permissions_profiles_allow_unknown_special_paths_with_nested_entries()
     .await?;
 
     assert_eq!(
-        config.permissions.file_system_sandbox_policy,
+        config.permissions.file_system_sandbox_policy(),
         FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::unknown(":future_special_path", Some("docs".into())),
@@ -1004,11 +1000,13 @@ async fn permissions_profiles_allow_missing_filesystem_with_warning() -> std::io
     .await?;
 
     assert_eq!(
-        config.permissions.file_system_sandbox_policy,
+        config.permissions.file_system_sandbox_policy(),
         FileSystemSandboxPolicy::restricted(Vec::new())
     );
     assert_eq!(
-        config.permissions.sandbox_policy.get(),
+        &config
+            .permissions
+            .legacy_sandbox_policy(config.cwd.as_path()),
         &SandboxPolicy::ReadOnly {
             access: ReadOnlyAccess::Restricted {
                 include_platform_defaults: false,
@@ -1039,7 +1037,7 @@ async fn permissions_profiles_allow_empty_filesystem_with_warning() -> std::io::
     .await?;
 
     assert_eq!(
-        config.permissions.file_system_sandbox_policy,
+        config.permissions.file_system_sandbox_policy(),
         FileSystemSandboxPolicy::restricted(Vec::new())
     );
     assert!(
@@ -1136,14 +1134,13 @@ async fn permissions_profiles_allow_network_enablement() -> std::io::Result<()> 
     .await?;
 
     assert!(
-        config.permissions.network_sandbox_policy.is_enabled(),
+        config.permissions.network_sandbox_policy().is_enabled(),
         "expected network sandbox policy to be enabled",
     );
     assert!(
         config
             .permissions
-            .sandbox_policy
-            .get()
+            .legacy_sandbox_policy(config.cwd.as_path())
             .has_full_network_access()
     );
     Ok(())
@@ -1374,24 +1371,29 @@ exclude_slash_tmp = true
         )
         .await?;
 
-        let sandbox_policy = config.permissions.sandbox_policy.get();
+        let sandbox_policy = config
+            .permissions
+            .legacy_sandbox_policy(config.cwd.as_path());
         assert_eq!(
-            config.permissions.file_system_sandbox_policy,
-            FileSystemSandboxPolicy::from_legacy_sandbox_policy(sandbox_policy, cwd.path()),
+            config.permissions.file_system_sandbox_policy(),
+            FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+                &sandbox_policy,
+                cwd.path()
+            ),
             "case `{name}` should preserve filesystem semantics from legacy config"
         );
         assert_eq!(
-            config.permissions.network_sandbox_policy,
-            NetworkSandboxPolicy::from(sandbox_policy),
+            config.permissions.network_sandbox_policy(),
+            NetworkSandboxPolicy::from(&sandbox_policy),
             "case `{name}` should preserve network semantics from legacy config"
         );
         assert_eq!(
             config
                 .permissions
-                .file_system_sandbox_policy
-                .to_legacy_sandbox_policy(config.permissions.network_sandbox_policy, cwd.path())
+                .file_system_sandbox_policy()
+                .to_legacy_sandbox_policy(config.permissions.network_sandbox_policy(), cwd.path())
                 .unwrap_or_else(|err| panic!("case `{name}` should round-trip: {err}")),
-            sandbox_policy.clone(),
+            sandbox_policy,
             "case `{name}` should round-trip through split policies without drift"
         );
     }
@@ -1557,12 +1559,18 @@ async fn add_dir_override_extends_workspace_writable_roots() -> std::io::Result<
 
     let expected_backend = backend.abs();
     if cfg!(target_os = "windows") {
-        match config.permissions.sandbox_policy.get() {
+        match &config
+            .permissions
+            .legacy_sandbox_policy(config.cwd.as_path())
+        {
             SandboxPolicy::ReadOnly { .. } => {}
             other => panic!("expected read-only policy on Windows, got {other:?}"),
         }
     } else {
-        match config.permissions.sandbox_policy.get() {
+        match &config
+            .permissions
+            .legacy_sandbox_policy(config.cwd.as_path())
+        {
             SandboxPolicy::WorkspaceWrite { writable_roots, .. } => {
                 assert_eq!(
                     writable_roots
@@ -1620,7 +1628,10 @@ async fn workspace_write_always_includes_memories_root_once() -> std::io::Result
     .await?;
 
     if cfg!(target_os = "windows") {
-        match config.permissions.sandbox_policy.get() {
+        match &config
+            .permissions
+            .legacy_sandbox_policy(config.cwd.as_path())
+        {
             SandboxPolicy::ReadOnly { .. } => {}
             other => panic!("expected read-only policy on Windows, got {other:?}"),
         }
@@ -1631,7 +1642,10 @@ async fn workspace_write_always_includes_memories_root_once() -> std::io::Result
             memories_root.display()
         );
         let expected_memories_root = memories_root.abs();
-        match config.permissions.sandbox_policy.get() {
+        match &config
+            .permissions
+            .legacy_sandbox_policy(config.cwd.as_path())
+        {
             SandboxPolicy::WorkspaceWrite { writable_roots, .. } => {
                 assert_eq!(
                     writable_roots
@@ -1949,7 +1963,9 @@ async fn profile_sandbox_mode_overrides_base() -> std::io::Result<()> {
     .await?;
 
     assert!(matches!(
-        config.permissions.sandbox_policy.get(),
+        &config
+            .permissions
+            .legacy_sandbox_policy(config.cwd.as_path()),
         &SandboxPolicy::DangerFullAccess
     ));
 
@@ -1983,12 +1999,16 @@ async fn cli_override_takes_precedence_over_profile_sandbox_mode() -> std::io::R
 
     if cfg!(target_os = "windows") {
         assert!(matches!(
-            config.permissions.sandbox_policy.get(),
+            &config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
             SandboxPolicy::ReadOnly { .. }
         ));
     } else {
         assert!(matches!(
-            config.permissions.sandbox_policy.get(),
+            &config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
             SandboxPolicy::WorkspaceWrite { .. }
         ));
     }
@@ -4860,11 +4880,11 @@ async fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             model_provider: fixture.openai_provider.clone(),
             permissions: Permissions {
                 approval_policy: Constrained::allow_any(AskForApproval::Never),
-                sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
-                file_system_sandbox_policy: FileSystemSandboxPolicy::from(
-                    &SandboxPolicy::new_read_only_policy(),
+                permission_profile: Constrained::allow_any(
+                    PermissionProfile::from_legacy_sandbox_policy(
+                        &SandboxPolicy::new_read_only_policy(),
+                    ),
                 ),
-                network_sandbox_policy: NetworkSandboxPolicy::Restricted,
                 network: None,
                 allow_login_shell: true,
                 shell_environment_policy: ShellEnvironmentPolicy::default(),
@@ -5012,11 +5032,11 @@ async fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         model_provider: fixture.openai_custom_provider.clone(),
         permissions: Permissions {
             approval_policy: Constrained::allow_any(AskForApproval::UnlessTrusted),
-            sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
-            file_system_sandbox_policy: FileSystemSandboxPolicy::from(
-                &SandboxPolicy::new_read_only_policy(),
+            permission_profile: Constrained::allow_any(
+                PermissionProfile::from_legacy_sandbox_policy(
+                    &SandboxPolicy::new_read_only_policy(),
+                ),
             ),
-            network_sandbox_policy: NetworkSandboxPolicy::Restricted,
             network: None,
             allow_login_shell: true,
             shell_environment_policy: ShellEnvironmentPolicy::default(),
@@ -5162,11 +5182,11 @@ async fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         model_provider: fixture.openai_provider.clone(),
         permissions: Permissions {
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),
-            sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
-            file_system_sandbox_policy: FileSystemSandboxPolicy::from(
-                &SandboxPolicy::new_read_only_policy(),
+            permission_profile: Constrained::allow_any(
+                PermissionProfile::from_legacy_sandbox_policy(
+                    &SandboxPolicy::new_read_only_policy(),
+                ),
             ),
-            network_sandbox_policy: NetworkSandboxPolicy::Restricted,
             network: None,
             allow_login_shell: true,
             shell_environment_policy: ShellEnvironmentPolicy::default(),
@@ -5297,11 +5317,11 @@ async fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         model_provider: fixture.openai_provider.clone(),
         permissions: Permissions {
             approval_policy: Constrained::allow_any(AskForApproval::OnFailure),
-            sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
-            file_system_sandbox_policy: FileSystemSandboxPolicy::from(
-                &SandboxPolicy::new_read_only_policy(),
+            permission_profile: Constrained::allow_any(
+                PermissionProfile::from_legacy_sandbox_policy(
+                    &SandboxPolicy::new_read_only_policy(),
+                ),
             ),
-            network_sandbox_policy: NetworkSandboxPolicy::Restricted,
             network: None,
             allow_login_shell: true,
             shell_environment_policy: ShellEnvironmentPolicy::default(),
@@ -6052,7 +6072,9 @@ async fn test_untrusted_project_gets_unless_trusted_approval_policy() -> anyhow:
     if cfg!(target_os = "windows") {
         assert!(
             matches!(
-                config.permissions.sandbox_policy.get(),
+                &config
+                    .permissions
+                    .legacy_sandbox_policy(config.cwd.as_path()),
                 SandboxPolicy::ReadOnly { .. }
             ),
             "Expected ReadOnly on Windows"
@@ -6060,7 +6082,9 @@ async fn test_untrusted_project_gets_unless_trusted_approval_policy() -> anyhow:
     } else {
         assert!(
             matches!(
-                config.permissions.sandbox_policy.get(),
+                &config
+                    .permissions
+                    .legacy_sandbox_policy(config.cwd.as_path()),
                 SandboxPolicy::WorkspaceWrite { .. }
             ),
             "Expected WorkspaceWrite sandbox for untrusted project"
@@ -6088,7 +6112,9 @@ async fn requirements_disallowing_default_sandbox_falls_back_to_required_default
         .build()
         .await?;
     assert_eq!(
-        *config.permissions.sandbox_policy.get(),
+        config
+            .permissions
+            .legacy_sandbox_policy(config.cwd.as_path()),
         SandboxPolicy::new_read_only_policy()
     );
     Ok(())
@@ -6127,7 +6153,9 @@ async fn explicit_sandbox_mode_falls_back_when_disallowed_by_requirements() -> s
         .build()
         .await?;
     assert_eq!(
-        *config.permissions.sandbox_policy.get(),
+        config
+            .permissions
+            .legacy_sandbox_policy(config.cwd.as_path()),
         SandboxPolicy::new_read_only_policy()
     );
     Ok(())
@@ -6161,7 +6189,9 @@ async fn requirements_web_search_mode_overrides_danger_full_access_default() -> 
     assert_eq!(
         resolve_web_search_mode_for_turn(
             &config.web_search_mode,
-            config.permissions.sandbox_policy.get(),
+            &config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
         ),
         WebSearchMode::Cached,
     );
@@ -6261,6 +6291,29 @@ async fn feature_requirements_normalize_effective_feature_values() -> std::io::R
         "{:?}",
         config.startup_warnings
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn feature_requirements_accept_auto_review_as_guardian_approval_compat_key()
+-> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .cloud_requirements(CloudRequirementsLoader::new(async {
+            Ok(Some(crate::config_loader::ConfigRequirementsToml {
+                feature_requirements: Some(crate::config_loader::FeatureRequirementsToml {
+                    entries: BTreeMap::from([("auto_review".to_string(), true)]),
+                }),
+                ..Default::default()
+            }))
+        }))
+        .build()
+        .await?;
+
+    assert!(config.features.enabled(Feature::GuardianApproval));
 
     Ok(())
 }
@@ -6412,10 +6465,7 @@ approvals_reviewer = "guardian_subagent"
         .build()
         .await?;
 
-    assert_eq!(
-        config.approvals_reviewer,
-        ApprovalsReviewer::GuardianSubagent
-    );
+    assert_eq!(config.approvals_reviewer, ApprovalsReviewer::AutoReview);
     Ok(())
 }
 
@@ -6428,17 +6478,14 @@ async fn requirements_disallowing_default_approvals_reviewer_falls_back_to_requi
         .codex_home(codex_home.path().to_path_buf())
         .cloud_requirements(CloudRequirementsLoader::new(async {
             Ok(Some(crate::config_loader::ConfigRequirementsToml {
-                allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::GuardianSubagent]),
+                allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::AutoReview]),
                 ..Default::default()
             }))
         }))
         .build()
         .await?;
 
-    assert_eq!(
-        config.approvals_reviewer,
-        ApprovalsReviewer::GuardianSubagent
-    );
+    assert_eq!(config.approvals_reviewer, ApprovalsReviewer::AutoReview);
     Ok(())
 }
 
@@ -6457,17 +6504,14 @@ async fn root_approvals_reviewer_falls_back_when_disallowed_by_requirements() ->
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .cloud_requirements(CloudRequirementsLoader::new(async {
             Ok(Some(crate::config_loader::ConfigRequirementsToml {
-                allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::GuardianSubagent]),
+                allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::AutoReview]),
                 ..Default::default()
             }))
         }))
         .build()
         .await?;
 
-    assert_eq!(
-        config.approvals_reviewer,
-        ApprovalsReviewer::GuardianSubagent
-    );
+    assert_eq!(config.approvals_reviewer, ApprovalsReviewer::AutoReview);
     assert!(
         config.startup_warnings.iter().any(|warning| {
             warning
@@ -6497,17 +6541,14 @@ approvals_reviewer = "user"
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .cloud_requirements(CloudRequirementsLoader::new(async {
             Ok(Some(crate::config_loader::ConfigRequirementsToml {
-                allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::GuardianSubagent]),
+                allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::AutoReview]),
                 ..Default::default()
             }))
         }))
         .build()
         .await?;
 
-    assert_eq!(
-        config.approvals_reviewer,
-        ApprovalsReviewer::GuardianSubagent
-    );
+    assert_eq!(config.approvals_reviewer, ApprovalsReviewer::AutoReview);
     Ok(())
 }
 
@@ -6528,7 +6569,7 @@ async fn approvals_reviewer_preserves_valid_user_choice_when_allowed_by_requirem
             Ok(Some(crate::config_loader::ConfigRequirementsToml {
                 allowed_approvals_reviewers: Some(vec![
                     ApprovalsReviewer::User,
-                    ApprovalsReviewer::GuardianSubagent,
+                    ApprovalsReviewer::AutoReview,
                 ]),
                 ..Default::default()
             }))
@@ -6536,10 +6577,7 @@ async fn approvals_reviewer_preserves_valid_user_choice_when_allowed_by_requirem
         .build()
         .await?;
 
-    assert_eq!(
-        config.approvals_reviewer,
-        ApprovalsReviewer::GuardianSubagent
-    );
+    assert_eq!(config.approvals_reviewer, ApprovalsReviewer::AutoReview);
     assert!(
         config
             .startup_warnings

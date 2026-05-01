@@ -1032,9 +1032,12 @@ impl JsReplManager {
 
         let sandbox = SandboxManager::new();
         let managed_network_active = turn.network.is_some();
+        let permission_profile = turn.permission_profile();
+        let (file_system_sandbox_policy, network_sandbox_policy) =
+            permission_profile.to_runtime_permissions();
         let sandbox_type = sandbox.select_initial(
-            &turn.file_system_sandbox_policy,
-            turn.network_sandbox_policy,
+            &file_system_sandbox_policy,
+            network_sandbox_policy,
             SandboxablePreference::Auto,
             turn.windows_sandbox_level,
             managed_network_active,
@@ -1056,9 +1059,7 @@ impl JsReplManager {
         let exec_env = sandbox
             .transform(SandboxTransformRequest {
                 command,
-                policy: &turn.sandbox_policy,
-                file_system_policy: &turn.file_system_sandbox_policy,
-                network_policy: turn.network_sandbox_policy,
+                permissions: &permission_profile,
                 sandbox: sandbox_type,
                 enforce_managed_network: managed_network_active,
                 network: None,
@@ -1072,7 +1073,14 @@ impl JsReplManager {
                     .windows_sandbox_private_desktop,
             })
             .map(|request| {
-                crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options)
+                // Merge-safety anchor: js_repl is a local tool surface; keep
+                // its sandbox transform on the shared PermissionProfile path so
+                // legacy Landlock and cwd propagation stay aligned with exec.
+                crate::sandboxing::ExecRequest::from_sandbox_exec_request(
+                    request,
+                    options,
+                    turn.cwd.clone(),
+                )
             })
             .map_err(|err| format!("failed to configure sandbox for js_repl: {err}"))?;
 

@@ -38,6 +38,7 @@ use crate::message_history::HistoryEntry;
 use crate::models::BaseInstructions;
 use crate::models::ContentItem;
 use crate::models::MessagePhase;
+use crate::models::PermissionProfile;
 use crate::models::ResponseInputItem;
 use crate::models::ResponseItem;
 use crate::models::WebSearchAction;
@@ -610,6 +611,14 @@ pub enum Op {
         response: RequestPermissionsResponse,
     },
 
+    /// Fail a request_permissions tool call without laundering the failure as a denial.
+    RequestPermissionsFailure {
+        /// Call id for the in-flight request.
+        id: String,
+        /// Failure reason returned to the model/tool caller.
+        message: String,
+    },
+
     /// Resolve a dynamic tool call request.
     DynamicToolResponse {
         /// Call id for the in-flight request.
@@ -796,6 +805,7 @@ impl Op {
             Self::ResolveElicitation { .. } => "resolve_elicitation",
             Self::UserInputAnswer { .. } => "user_input_answer",
             Self::RequestPermissionsResponse { .. } => "request_permissions_response",
+            Self::RequestPermissionsFailure { .. } => "request_permissions_failure",
             Self::DynamicToolResponse { .. } => "dynamic_tool_response",
             Self::AddToHistory { .. } => "add_to_history",
             Self::GetHistoryEntryRequest { .. } => "get_history_entry_request",
@@ -1076,6 +1086,11 @@ pub struct WritableRoot {
 
     /// By construction, these subpaths are all under `root`.
     pub read_only_subpaths: Vec<AbsolutePathBuf>,
+
+    /// Workspace metadata path names that must not be created or replaced under
+    /// `root` unless the policy grants an explicit write rule for that metadata
+    /// path.
+    pub protected_metadata_names: Vec<String>,
 }
 
 impl WritableRoot {
@@ -1092,7 +1107,25 @@ impl WritableRoot {
             }
         }
 
+        if self.path_contains_protected_metadata_name(path) {
+            return false;
+        }
+
         true
+    }
+
+    fn path_contains_protected_metadata_name(&self, path: &Path) -> bool {
+        let Ok(relative_path) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+
+        let Some(first_component) = relative_path.components().next() else {
+            return false;
+        };
+
+        self.protected_metadata_names
+            .iter()
+            .any(|name| first_component.as_os_str() == std::ffi::OsStr::new(name))
     }
 }
 
@@ -1296,6 +1329,7 @@ impl SandboxPolicy {
                                 &writable_root,
                                 protect_missing_dot_codex,
                             ),
+                            protected_metadata_names: Vec::new(),
                             root: writable_root,
                         }
                     })
@@ -3740,7 +3774,11 @@ pub struct SessionConfiguredEvent {
     #[serde(default)]
     pub approvals_reviewer: ApprovalsReviewer,
 
-    /// How to sandbox commands executed in the system
+    /// Canonical active permissions view for the session.
+    pub permission_profile: PermissionProfile,
+
+    /// Legacy sandbox projection for clients that have not moved to
+    /// `permission_profile`.
     pub sandbox_policy: SandboxPolicy,
 
     /// Working directory that should be treated as the *root* of the
@@ -4843,7 +4881,7 @@ mod tests {
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
             },
@@ -4905,7 +4943,7 @@ mod tests {
         let policy = FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
             },
@@ -4956,7 +4994,7 @@ mod tests {
 
         assert_eq!(
             sorted_writable_roots(
-                FileSystemSandboxPolicy::from_legacy_sandbox_policy(&policy, cwd.path())
+                FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&policy, cwd.path())
                     .get_writable_roots_with_cwd(cwd.path())
             ),
             vec![(canonical_cwd, vec![expected_dot_codex.to_path_buf()])]
@@ -5048,9 +5086,10 @@ mod tests {
         ];
 
         for expected in policies {
-            let actual = FileSystemSandboxPolicy::from_legacy_sandbox_policy(&expected, cwd.path())
-                .to_legacy_sandbox_policy(NetworkSandboxPolicy::from(&expected), cwd.path())
-                .expect("legacy bridge should preserve legacy policy semantics");
+            let actual =
+                FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&expected, cwd.path())
+                    .to_legacy_sandbox_policy(NetworkSandboxPolicy::from(&expected), cwd.path())
+                    .expect("legacy bridge should preserve legacy policy semantics");
 
             assert_same_sandbox_policy_semantics(&expected, &actual, cwd.path());
         }
@@ -5589,7 +5628,8 @@ mod tests {
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: ApprovalsReviewer::User,
-                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                permission_profile: PermissionProfile::Disabled,
+                sandbox_policy: SandboxPolicy::DangerFullAccess,
                 cwd: test_path_buf("/home/user/project").abs(),
                 reasoning_effort: Some(ReasoningEffortConfig::default()),
                 history_log_id: 0,
@@ -5609,8 +5649,11 @@ mod tests {
                 "model_provider_id": "openai",
                 "approval_policy": "never",
                 "approvals_reviewer": "user",
+                "permission_profile": {
+                    "type": "disabled"
+                },
                 "sandbox_policy": {
-                    "type": "read-only"
+                    "type": "danger-full-access"
                 },
                 "cwd": test_path_buf("/home/user/project"),
                 "reasoning_effort": "medium",

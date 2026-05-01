@@ -378,8 +378,8 @@ async fn handle_escalate_session_with_policy(
 mod tests {
     use super::*;
     use codex_protocol::approvals::EscalationPermissions;
+    use codex_protocol::models::AdditionalPermissionProfile;
     use codex_protocol::models::NetworkPermissions;
-    use codex_protocol::models::PermissionProfile;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
@@ -922,21 +922,25 @@ mod tests {
             server,
             Arc::new(DeterministicEscalationPolicy {
                 decision: EscalationDecision::escalate(EscalationExecution::Permissions(
-                    EscalationPermissions::PermissionProfile(PermissionProfile {
-                        network: Some(NetworkPermissions {
-                            enabled: Some(true),
-                        }),
-                        ..Default::default()
-                    }),
+                    EscalationPermissions::AdditionalPermissionProfile(
+                        AdditionalPermissionProfile {
+                            network: Some(NetworkPermissions {
+                                enabled: Some(true),
+                            }),
+                            file_system: None,
+                        },
+                    ),
                 )),
             }),
             Arc::new(PermissionAssertingShellCommandExecutor {
-                expected_permissions: EscalationPermissions::PermissionProfile(PermissionProfile {
-                    network: Some(NetworkPermissions {
-                        enabled: Some(true),
-                    }),
-                    ..Default::default()
-                }),
+                expected_permissions: EscalationPermissions::AdditionalPermissionProfile(
+                    AdditionalPermissionProfile {
+                        network: Some(NetworkPermissions {
+                            enabled: Some(true),
+                        }),
+                        file_system: None,
+                    },
+                ),
             }),
             CancellationToken::new(),
             CancellationToken::new(),

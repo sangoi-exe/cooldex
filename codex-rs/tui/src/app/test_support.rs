@@ -232,7 +232,9 @@ pub(super) fn test_thread_session(thread_id: ThreadId, cwd: PathBuf) -> ThreadSe
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        permission_profile: codex_protocol::models::PermissionProfile::from_legacy_sandbox_policy(
+            &SandboxPolicy::new_read_only_policy(),
+        ),
         cwd: cwd.abs(),
         config_path: None,
         instruction_source_paths: Vec::new(),

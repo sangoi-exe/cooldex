@@ -3,7 +3,8 @@ use std::path::Path;
 use codex_protocol::approvals::GuardianAssessmentAction;
 use codex_protocol::approvals::GuardianCommandSource;
 use codex_protocol::approvals::NetworkApprovalProtocol;
-use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Serialize;
 use serde_json::Value;
@@ -18,7 +19,7 @@ pub(crate) enum GuardianApprovalRequest {
         command: Vec<String>,
         cwd: AbsolutePathBuf,
         sandbox_permissions: crate::sandboxing::SandboxPermissions,
-        additional_permissions: Option<PermissionProfile>,
+        additional_permissions: Option<AdditionalPermissionProfile>,
         justification: Option<String>,
     },
     ExecCommand {
@@ -26,7 +27,7 @@ pub(crate) enum GuardianApprovalRequest {
         command: Vec<String>,
         cwd: AbsolutePathBuf,
         sandbox_permissions: crate::sandboxing::SandboxPermissions,
-        additional_permissions: Option<PermissionProfile>,
+        additional_permissions: Option<AdditionalPermissionProfile>,
         justification: Option<String>,
         tty: bool,
     },
@@ -37,7 +38,7 @@ pub(crate) enum GuardianApprovalRequest {
         program: String,
         argv: Vec<String>,
         cwd: AbsolutePathBuf,
-        additional_permissions: Option<PermissionProfile>,
+        additional_permissions: Option<AdditionalPermissionProfile>,
     },
     ApplyPatch {
         id: String,
@@ -65,6 +66,12 @@ pub(crate) enum GuardianApprovalRequest {
         tool_description: Option<String>,
         annotations: Option<GuardianMcpAnnotations>,
     },
+    RequestPermissions {
+        id: String,
+        turn_id: String,
+        reason: Option<String>,
+        permissions: RequestPermissionProfile,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -84,7 +91,7 @@ struct CommandApprovalAction<'a> {
     cwd: &'a Path,
     sandbox_permissions: crate::sandboxing::SandboxPermissions,
     #[serde(skip_serializing_if = "Option::is_none")]
-    additional_permissions: Option<&'a PermissionProfile>,
+    additional_permissions: Option<&'a AdditionalPermissionProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     justification: Option<&'a String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -99,7 +106,7 @@ struct ExecveApprovalAction<'a> {
     argv: &'a [String],
     cwd: &'a Path,
     #[serde(skip_serializing_if = "Option::is_none")]
-    additional_permissions: Option<&'a PermissionProfile>,
+    additional_permissions: Option<&'a AdditionalPermissionProfile>,
 }
 
 #[derive(Serialize)]
@@ -123,6 +130,15 @@ struct McpToolCallApprovalAction<'a> {
     annotations: Option<&'a GuardianMcpAnnotations>,
 }
 
+#[derive(Serialize)]
+struct RequestPermissionsApprovalAction<'a> {
+    tool: &'static str,
+    turn_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a String>,
+    permissions: &'a RequestPermissionProfile,
+}
+
 fn serialize_guardian_action(value: impl Serialize) -> serde_json::Result<Value> {
     serde_json::to_value(value)
 }
@@ -132,7 +148,7 @@ fn serialize_command_guardian_action(
     command: &[String],
     cwd: &Path,
     sandbox_permissions: crate::sandboxing::SandboxPermissions,
-    additional_permissions: Option<&PermissionProfile>,
+    additional_permissions: Option<&AdditionalPermissionProfile>,
     justification: Option<&String>,
     tty: Option<bool>,
 ) -> serde_json::Result<Value> {
@@ -293,6 +309,17 @@ pub(crate) fn guardian_approval_request_to_json(
             tool_description: tool_description.as_ref(),
             annotations: annotations.as_ref(),
         }),
+        GuardianApprovalRequest::RequestPermissions {
+            id: _,
+            turn_id,
+            reason,
+            permissions,
+        } => serialize_guardian_action(RequestPermissionsApprovalAction {
+            tool: "request_permissions",
+            turn_id,
+            reason: reason.as_ref(),
+            permissions,
+        }),
     }
 }
 
@@ -352,6 +379,14 @@ pub(crate) fn guardian_assessment_action(
             connector_name: connector_name.clone(),
             tool_title: tool_title.clone(),
         },
+        GuardianApprovalRequest::RequestPermissions {
+            reason,
+            permissions,
+            ..
+        } => GuardianAssessmentAction::RequestPermissions {
+            reason: reason.clone(),
+            permissions: permissions.clone(),
+        },
     }
 }
 
@@ -360,7 +395,8 @@ pub(crate) fn guardian_request_target_item_id(request: &GuardianApprovalRequest)
         GuardianApprovalRequest::Shell { id, .. }
         | GuardianApprovalRequest::ExecCommand { id, .. }
         | GuardianApprovalRequest::ApplyPatch { id, .. }
-        | GuardianApprovalRequest::McpToolCall { id, .. } => Some(id),
+        | GuardianApprovalRequest::McpToolCall { id, .. }
+        | GuardianApprovalRequest::RequestPermissions { id, .. } => Some(id),
         GuardianApprovalRequest::NetworkAccess { .. } => None,
         #[cfg(unix)]
         GuardianApprovalRequest::Execve { id, .. } => Some(id),
@@ -372,7 +408,8 @@ pub(crate) fn guardian_request_turn_id<'a>(
     default_turn_id: &'a str,
 ) -> &'a str {
     match request {
-        GuardianApprovalRequest::NetworkAccess { turn_id, .. } => turn_id,
+        GuardianApprovalRequest::NetworkAccess { turn_id, .. }
+        | GuardianApprovalRequest::RequestPermissions { turn_id, .. } => turn_id,
         GuardianApprovalRequest::Shell { .. }
         | GuardianApprovalRequest::ExecCommand { .. }
         | GuardianApprovalRequest::ApplyPatch { .. }

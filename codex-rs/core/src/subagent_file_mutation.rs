@@ -1,6 +1,8 @@
 use crate::config::Config;
 use codex_protocol::config_types::SubagentFileMutationMode;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::models::SandboxPermissions;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -8,7 +10,6 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
-use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 
@@ -29,25 +30,32 @@ pub(crate) fn denied_action_message(action: &str) -> String {
 }
 
 pub(crate) fn permission_profile_requests_file_system_write(
-    profile: Option<&PermissionProfile>,
+    profile: Option<&AdditionalPermissionProfile>,
 ) -> bool {
     profile
         .and_then(|profile| profile.file_system.as_ref())
-        .is_some_and(|file_system| file_system.write.is_some())
+        .is_some_and(|file_system| {
+            file_system
+                .entries
+                .iter()
+                .any(|entry| entry.access == FileSystemAccessMode::Write)
+        })
 }
 
 pub(crate) fn request_permission_profile_requests_file_system_write(
     profile: &RequestPermissionProfile,
 ) -> bool {
-    profile
-        .file_system
-        .as_ref()
-        .is_some_and(|file_system| file_system.write.is_some())
+    profile.file_system.as_ref().is_some_and(|file_system| {
+        file_system
+            .entries
+            .iter()
+            .any(|entry| entry.access == FileSystemAccessMode::Write)
+    })
 }
 
 pub(crate) fn shell_request_widens_file_mutation(
     sandbox_permissions: SandboxPermissions,
-    additional_permissions: Option<&PermissionProfile>,
+    additional_permissions: Option<&AdditionalPermissionProfile>,
 ) -> bool {
     sandbox_permissions.requires_escalated_permissions()
         || permission_profile_requests_file_system_write(additional_permissions)
@@ -63,19 +71,22 @@ pub(crate) fn apply_file_mutation_mode_to_config(
     }
 
     let read_only_file_system_policy =
-        deny_file_mutation_policy(&config.permissions.file_system_sandbox_policy);
+        deny_file_mutation_policy(&config.permissions.file_system_sandbox_policy());
     let read_only_sandbox_policy = read_only_file_system_policy
         .to_legacy_sandbox_policy(
-            config.permissions.network_sandbox_policy,
+            config.permissions.network_sandbox_policy(),
             config.cwd.as_path(),
         )
         .map_err(|err| format!("failed to derive read-only sandbox policy: {err}"))?;
+    let read_only_permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
+        SandboxEnforcement::from_legacy_sandbox_policy(&read_only_sandbox_policy),
+        &read_only_file_system_policy,
+        config.permissions.network_sandbox_policy(),
+    );
     config
         .permissions
-        .sandbox_policy
-        .set(read_only_sandbox_policy)
-        .map_err(|err| format!("sandbox_policy is invalid: {err}"))?;
-    config.permissions.file_system_sandbox_policy = read_only_file_system_policy;
+        .set_permission_profile(read_only_permission_profile)
+        .map_err(|err| format!("permission_profile is invalid: {err}"))?;
     Ok(())
 }
 
@@ -86,12 +97,8 @@ pub(crate) fn restore_file_mutation_mode_to_config(
 ) -> Result<(), String> {
     config
         .permissions
-        .sandbox_policy
-        .set(sandbox_policy.clone())
-        .map_err(|err| format!("sandbox_policy is invalid: {err}"))?;
-    config.permissions.file_system_sandbox_policy =
-        FileSystemSandboxPolicy::from_legacy_sandbox_policy(sandbox_policy, config.cwd.as_path());
-    config.permissions.network_sandbox_policy = NetworkSandboxPolicy::from(sandbox_policy);
+        .set_legacy_sandbox_policy(sandbox_policy.clone(), config.cwd.as_path())
+        .map_err(|err| format!("permission_profile is invalid: {err}"))?;
     apply_file_mutation_mode_to_config(config, mode)
 }
 
@@ -134,8 +141,10 @@ mod tests {
     use super::request_permission_profile_requests_file_system_write;
     use super::restore_file_mutation_mode_to_config;
     use codex_protocol::config_types::SubagentFileMutationMode;
+    use codex_protocol::models::AdditionalPermissionProfile;
     use codex_protocol::models::FileSystemPermissions;
     use codex_protocol::models::PermissionProfile;
+    use codex_protocol::models::SandboxEnforcement;
     use codex_protocol::permissions::FileSystemAccessMode;
     use codex_protocol::permissions::FileSystemPath;
     use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -153,11 +162,10 @@ mod tests {
         let cwd = AbsolutePathBuf::from_absolute_path(tempdir.path()).expect("absolute cwd");
         let mut config = crate::config::test_config().await;
         config.cwd = cwd.clone();
-        config.permissions.network_sandbox_policy = NetworkSandboxPolicy::Enabled;
-        config.permissions.file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
+        let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
             },
@@ -168,12 +176,27 @@ mod tests {
                 access: FileSystemAccessMode::Read,
             },
         ]);
+        let sandbox_policy = file_system_sandbox_policy
+            .to_legacy_sandbox_policy(NetworkSandboxPolicy::Enabled, config.cwd.as_path())
+            .expect("profile fixture should project to legacy sandbox");
+        config
+            .permissions
+            .set_permission_profile(
+                PermissionProfile::from_runtime_permissions_with_enforcement(
+                    SandboxEnforcement::from_legacy_sandbox_policy(&sandbox_policy),
+                    &file_system_sandbox_policy,
+                    NetworkSandboxPolicy::Enabled,
+                ),
+            )
+            .expect("profile fixture should be valid");
 
         apply_file_mutation_mode_to_config(&mut config, SubagentFileMutationMode::Deny)
             .expect("deny mode should apply");
 
         assert_eq!(
-            config.permissions.sandbox_policy.get(),
+            &config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
             &SandboxPolicy::ReadOnly {
                 access: codex_protocol::protocol::ReadOnlyAccess::Restricted {
                     include_platform_defaults: true,
@@ -185,26 +208,28 @@ mod tests {
         assert!(
             !config
                 .permissions
-                .file_system_sandbox_policy
+                .file_system_sandbox_policy()
                 .can_write_path_with_cwd(tempdir.path(), tempdir.path())
         );
     }
 
     #[test]
     fn file_system_write_detection_only_flags_write_requests() {
-        let read_only = PermissionProfile {
-            file_system: Some(FileSystemPermissions {
-                read: Some(vec![]),
-                write: None,
-            }),
-            ..PermissionProfile::default()
+        let tempdir = TempDir::new().expect("tempdir");
+        let write_root = AbsolutePathBuf::from_absolute_path(tempdir.path()).expect("absolute cwd");
+        let read_only = AdditionalPermissionProfile {
+            file_system: Some(FileSystemPermissions::from_read_write_roots(
+                Some(vec![]),
+                /*write*/ None,
+            )),
+            ..AdditionalPermissionProfile::default()
         };
-        let write = PermissionProfile {
-            file_system: Some(FileSystemPermissions {
-                read: None,
-                write: Some(vec![]),
-            }),
-            ..PermissionProfile::default()
+        let write = AdditionalPermissionProfile {
+            file_system: Some(FileSystemPermissions::from_read_write_roots(
+                /*read*/ None,
+                Some(vec![write_root]),
+            )),
+            ..AdditionalPermissionProfile::default()
         };
 
         assert!(!permission_profile_requests_file_system_write(Some(
@@ -239,13 +264,15 @@ mod tests {
             SubagentFileMutationMode::Inherit
         );
         assert_eq!(
-            config.permissions.sandbox_policy.get(),
+            &config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
             &SandboxPolicy::DangerFullAccess
         );
         assert!(
             config
                 .permissions
-                .file_system_sandbox_policy
+                .file_system_sandbox_policy()
                 .can_write_path_with_cwd(tempdir.path(), tempdir.path())
         );
     }

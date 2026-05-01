@@ -2344,7 +2344,6 @@ async fn unified_exec_runs_under_sandbox() -> Result<()> {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_enforces_glob_deny_read_policy() -> Result<()> {
-    use codex_config::Constrained;
     use codex_protocol::permissions::FileSystemAccessMode;
     use codex_protocol::permissions::FileSystemPath;
     use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -2361,7 +2360,8 @@ async fn unified_exec_enforces_glob_deny_read_policy() -> Result<()> {
             .features
             .enable(Feature::UnifiedExec)
             .expect("test config should allow feature update");
-        config.permissions.sandbox_policy = Constrained::allow_any(read_only_policy_for_config);
+        let sandbox_policy = read_only_policy_for_config;
+        config.permissions.set_legacy_sandbox_policy(sandbox_policy.clone(), config.cwd.as_path()).expect("test sandbox policy should be valid");
         let mut file_system_sandbox_policy = FileSystemSandboxPolicy::default();
         file_system_sandbox_policy
             .entries
@@ -2371,7 +2371,18 @@ async fn unified_exec_enforces_glob_deny_read_policy() -> Result<()> {
                 },
                 access: FileSystemAccessMode::None,
             });
-        config.permissions.file_system_sandbox_policy = file_system_sandbox_policy;
+        config
+            .permissions
+            .set_permission_profile(
+                codex_protocol::models::PermissionProfile::from_runtime_permissions_with_enforcement(
+                    codex_protocol::models::SandboxEnforcement::from_legacy_sandbox_policy(
+                        &sandbox_policy,
+                    ),
+                    &file_system_sandbox_policy,
+                    config.permissions.network_sandbox_policy(),
+                ),
+            )
+            .expect("test permission profile should be valid");
     });
     let TestCodex {
         codex,

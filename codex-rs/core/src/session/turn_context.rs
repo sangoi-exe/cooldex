@@ -1,6 +1,8 @@
 use super::*;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
+use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::models::PermissionProfile;
 
 // Merge-safety anchor: image-generation tool exposure must follow the same ChatGPT-capable auth
 // surface as the local external-token runtime, not only the persistent ChatGPT account mode.
@@ -62,9 +64,7 @@ pub(crate) struct TurnContext {
     pub(crate) collaboration_mode: CollaborationMode,
     pub(crate) personality: Option<Personality>,
     pub(crate) approval_policy: Constrained<AskForApproval>,
-    pub(crate) sandbox_policy: Constrained<SandboxPolicy>,
-    pub(crate) file_system_sandbox_policy: FileSystemSandboxPolicy,
-    pub(crate) network_sandbox_policy: NetworkSandboxPolicy,
+    pub(crate) permission_profile: PermissionProfile,
     pub(crate) network: Option<NetworkProxy>,
     pub(crate) windows_sandbox_level: WindowsSandboxLevel,
     pub(crate) shell_environment_policy: ShellEnvironmentPolicy,
@@ -147,6 +147,7 @@ impl TurnContext {
         let available_models = models_manager
             .list_models(RefreshStrategy::OnlineIfUncached)
             .await?;
+        let sandbox_policy = self.sandbox_policy();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             available_models: &available_models,
@@ -156,7 +157,7 @@ impl TurnContext {
             )?,
             web_search_mode: self.tools_config.web_search_mode,
             session_source: self.session_source.clone(),
-            sandbox_policy: self.sandbox_policy.get(),
+            sandbox_policy: &sandbox_policy,
             windows_sandbox_level: self.windows_sandbox_level,
         })
         .with_unified_exec_shell_mode(self.tools_config.unified_exec_shell_mode.clone())
@@ -196,9 +197,7 @@ impl TurnContext {
             collaboration_mode,
             personality: self.personality,
             approval_policy: self.approval_policy.clone(),
-            sandbox_policy: self.sandbox_policy.clone(),
-            file_system_sandbox_policy: self.file_system_sandbox_policy.clone(),
-            network_sandbox_policy: self.network_sandbox_policy,
+            permission_profile: self.permission_profile.clone(),
             network: self.network.clone(),
             windows_sandbox_level: self.windows_sandbox_level,
             shell_environment_policy: self.shell_environment_policy.clone(),
@@ -236,12 +235,42 @@ impl TurnContext {
             .map_or_else(|| self.cwd.clone(), |path| self.cwd.join(path))
     }
 
+    pub(crate) fn permission_profile(&self) -> PermissionProfile {
+        self.permission_profile.clone()
+    }
+
+    pub(crate) fn sandbox_policy(&self) -> SandboxPolicy {
+        self.permission_profile
+            .to_legacy_sandbox_policy(&self.cwd)
+            .unwrap_or_else(|_| {
+                let file_system_sandbox_policy = self.file_system_sandbox_policy();
+                codex_sandboxing::compatibility_sandbox_policy_for_permission_profile(
+                    &self.permission_profile,
+                    &file_system_sandbox_policy,
+                    self.network_sandbox_policy(),
+                    &self.cwd,
+                )
+            })
+    }
+
+    pub(crate) fn file_system_sandbox_policy(&self) -> FileSystemSandboxPolicy {
+        self.permission_profile.file_system_sandbox_policy()
+    }
+
+    pub(crate) fn network_sandbox_policy(&self) -> NetworkSandboxPolicy {
+        self.permission_profile.network_sandbox_policy()
+    }
+
     pub(crate) fn file_system_sandbox_context(
         &self,
-        additional_permissions: Option<PermissionProfile>,
+        additional_permissions: Option<AdditionalPermissionProfile>,
     ) -> FileSystemSandboxContext {
+        // Merge-safety anchor: the local exec-server bridge still receives a
+        // legacy sandbox projection plus any non-legacy filesystem projection
+        // derived from the canonical profile; additional permissions remain an
+        // overlay, not the base runtime profile.
         FileSystemSandboxContext {
-            sandbox_policy: self.sandbox_policy.get().clone(),
+            sandbox_policy: self.sandbox_policy(),
             sandbox_policy_cwd: Some(self.cwd.clone()),
             file_system_sandbox_policy: self.non_legacy_file_system_sandbox_policy(),
             windows_sandbox_level: self.windows_sandbox_level,
@@ -255,16 +284,16 @@ impl TurnContext {
     }
 
     fn non_legacy_file_system_sandbox_policy(&self) -> Option<FileSystemSandboxPolicy> {
-        // Omit the derived split filesystem policy when it is equivalent to
-        // the legacy sandbox policy. This keeps turn-context payloads stable
-        // while both fields exist; once callers consume only the split policy,
-        // this comparison and the legacy projection should go away.
-        let legacy_file_system_sandbox_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy(
-            self.sandbox_policy.get(),
-            &self.cwd,
-        );
-        (self.file_system_sandbox_policy != legacy_file_system_sandbox_policy)
-            .then(|| self.file_system_sandbox_policy.clone())
+        // Omit the split filesystem policy when it is equivalent to the legacy
+        // sandbox policy for this turn cwd, keeping the current payload compact.
+        let legacy_file_system_sandbox_policy =
+            FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+                &self.sandbox_policy(),
+                self.cwd.as_path(),
+            );
+        let file_system_sandbox_policy = self.file_system_sandbox_policy();
+        (file_system_sandbox_policy != legacy_file_system_sandbox_policy)
+            .then_some(file_system_sandbox_policy)
     }
 
     pub(crate) fn compact_prompt(&self) -> &str {
@@ -281,7 +310,7 @@ impl TurnContext {
             current_date: self.current_date.clone(),
             timezone: self.timezone.clone(),
             approval_policy: self.approval_policy.value(),
-            sandbox_policy: self.sandbox_policy.get().clone(),
+            sandbox_policy: self.sandbox_policy(),
             network: self.turn_context_network_item(),
             file_system_sandbox_policy: self.non_legacy_file_system_sandbox_policy(),
             model: self.model_info.slug.clone(),
@@ -344,7 +373,7 @@ impl Session {
         per_turn_config.approvals_reviewer = session_configuration.approvals_reviewer;
         let resolved_web_search_mode = resolve_web_search_mode_for_turn(
             &per_turn_config.web_search_mode,
-            session_configuration.sandbox_policy.get(),
+            &session_configuration.sandbox_policy(),
         );
         if let Err(err) = per_turn_config
             .web_search_mode
@@ -396,6 +425,7 @@ impl Session {
         let auth_manager_for_context = auth_manager.clone();
         let provider_for_context = create_model_provider(provider, auth_manager);
         let session_telemetry_for_context = session_telemetry;
+        let sandbox_policy = session_configuration.sandbox_policy();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             available_models: &available_models,
@@ -403,7 +433,7 @@ impl Session {
             image_generation_tool_auth_allowed,
             web_search_mode: Some(per_turn_config.web_search_mode.value()),
             session_source: session_source.clone(),
-            sandbox_policy: session_configuration.sandbox_policy.get(),
+            sandbox_policy: &sandbox_policy,
             windows_sandbox_level: session_configuration.windows_sandbox_level,
         })
         .with_unified_exec_shell_mode_for_session(
@@ -429,7 +459,7 @@ impl Session {
             &session_source,
             sub_id.clone(),
             cwd.clone(),
-            session_configuration.sandbox_policy.get(),
+            &sandbox_policy,
             session_configuration.windows_sandbox_level,
         ));
         let (current_date, timezone) = local_time_context();
@@ -456,9 +486,7 @@ impl Session {
             collaboration_mode: session_configuration.collaboration_mode.clone(),
             personality: session_configuration.personality,
             approval_policy: session_configuration.approval_policy.clone(),
-            sandbox_policy: session_configuration.sandbox_policy.clone(),
-            file_system_sandbox_policy: session_configuration.file_system_sandbox_policy.clone(),
-            network_sandbox_policy: session_configuration.network_sandbox_policy,
+            permission_profile: session_configuration.permission_profile(),
             network,
             windows_sandbox_level: session_configuration.windows_sandbox_level,
             shell_environment_policy: per_turn_config.permissions.shell_environment_policy.clone(),
@@ -490,14 +518,14 @@ impl Session {
             match state.session_configuration.clone().apply(&updates) {
                 Ok(next) => {
                     let previous_cwd = state.session_configuration.cwd.clone();
-                    let sandbox_policy_changed =
-                        state.session_configuration.sandbox_policy != next.sandbox_policy;
+                    let permission_profile_changed =
+                        state.session_configuration.permission_profile != next.permission_profile;
                     let codex_home = next.codex_home.clone();
                     let session_source = next.session_source.clone();
                     state.session_configuration = next.clone();
                     Ok((
                         next,
-                        sandbox_policy_changed,
+                        permission_profile_changed,
                         previous_cwd,
                         codex_home,
                         session_source,
@@ -509,7 +537,7 @@ impl Session {
 
         let (
             session_configuration,
-            sandbox_policy_changed,
+            permission_profile_changed,
             previous_cwd,
             codex_home,
             session_source,
@@ -535,7 +563,7 @@ impl Session {
             &session_source,
         );
 
-        if sandbox_policy_changed {
+        if permission_profile_changed {
             self.refresh_managed_network_proxy_for_current_sandbox_policy()
                 .await;
         }
@@ -558,8 +586,10 @@ impl Session {
         {
             let mcp_connection_manager = self.services.mcp_connection_manager.read().await;
             mcp_connection_manager.set_approval_policy(&session_configuration.approval_policy);
-            mcp_connection_manager
-                .set_sandbox_policy(per_turn_config.permissions.sandbox_policy.get());
+            let sandbox_policy = per_turn_config
+                .permissions
+                .legacy_sandbox_policy(per_turn_config.cwd.as_path());
+            mcp_connection_manager.set_sandbox_policy(&sandbox_policy);
         }
 
         let model_info = self
@@ -605,7 +635,7 @@ impl Session {
                 .as_ref()
                 .and_then(|started_proxy| {
                     Self::managed_network_proxy_active_for_sandbox_policy(
-                        session_configuration.sandbox_policy.get(),
+                        &session_configuration.sandbox_policy(),
                     )
                     .then(|| started_proxy.proxy())
                 }),

@@ -42,14 +42,15 @@ fn build_permissions_update_item(
     }
 
     let prev = previous?;
-    if prev.sandbox_policy == *next.sandbox_policy.get()
+    let next_sandbox_policy = next.sandbox_policy();
+    if prev.sandbox_policy == next_sandbox_policy
         && prev.approval_policy == next.approval_policy.value()
     {
         return None;
     }
 
     Some(DeveloperInstructions::from_policy(
-        next.sandbox_policy.get(),
+        &next_sandbox_policy,
         next.approval_policy.value(),
         next.config.approvals_reviewer,
         exec_policy,

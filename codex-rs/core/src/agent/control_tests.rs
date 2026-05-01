@@ -2237,6 +2237,7 @@ async fn resume_agent_from_rollout_uses_session_configured_when_no_turn_context_
                 service_tier: child_snapshot.service_tier,
                 approval_policy: child_snapshot.approval_policy,
                 approvals_reviewer: child_snapshot.approvals_reviewer,
+                permission_profile: child_snapshot.permission_profile.clone(),
                 sandbox_policy: expected_sandbox_policy.clone(),
                 cwd: child_snapshot.cwd.clone(),
                 reasoning_effort: child_snapshot.reasoning_effort,

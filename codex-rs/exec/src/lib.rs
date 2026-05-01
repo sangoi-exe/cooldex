@@ -397,6 +397,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         approval_policy: Some(AskForApproval::Never),
         approvals_reviewer: None,
         sandbox_mode,
+        permission_profile: None,
         cwd: resolved_cwd,
         model_provider: model_provider.clone(),
         service_tier: None,
@@ -581,7 +582,9 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
     let default_cwd = config.cwd.to_path_buf();
     let default_approval_policy = config.permissions.approval_policy.value();
-    let default_sandbox_policy = config.permissions.sandbox_policy.get();
+    let default_sandbox_policy = config
+        .permissions
+        .legacy_sandbox_policy(config.cwd.as_path());
     let default_effort = config.model_reasoning_effort;
 
     let (initial_operation, prompt_summary) = match (command.as_ref(), prompt, images) {
@@ -722,8 +725,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     // is using.
     event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
     if !json_mode
-        && let Some(message) =
-            codex_core::config::system_bwrap_warning(config.permissions.sandbox_policy.get())
+        && let Some(message) = codex_core::config::system_bwrap_warning(&default_sandbox_policy)
     {
         event_processor.process_warning(message);
     }
@@ -934,7 +936,12 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
         cwd: Some(config.cwd.to_string_lossy().to_string()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override_from_config(config),
-        sandbox: sandbox_mode_from_policy(config.permissions.sandbox_policy.get()),
+        sandbox: sandbox_mode_from_policy(
+            &config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
+        ),
+        permission_profile: None,
         config: config_request_overrides_from_config(config),
         ephemeral: Some(config.ephemeral),
         ..ThreadStartParams::default()
@@ -949,7 +956,12 @@ fn thread_resume_params_from_config(config: &Config, thread_id: String) -> Threa
         cwd: Some(config.cwd.to_string_lossy().to_string()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override_from_config(config),
-        sandbox: sandbox_mode_from_policy(config.permissions.sandbox_policy.get()),
+        sandbox: sandbox_mode_from_policy(
+            &config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
+        ),
+        permission_profile: None,
         config: config_request_overrides_from_config(config),
         ..ThreadResumeParams::default()
     }
@@ -997,6 +1009,11 @@ fn session_configured_from_thread_start_response(
         response.service_tier,
         response.approval_policy.to_core(),
         response.approvals_reviewer.to_core(),
+        codex_app_server_protocol::resolve_session_permission_profile(
+            response.permission_profile.clone(),
+            &response.sandbox,
+            response.cwd.as_path(),
+        )?,
         response.sandbox.to_core(),
         response.cwd.clone(),
         response.reasoning_effort,
@@ -1015,6 +1032,11 @@ fn session_configured_from_thread_resume_response(
         response.service_tier,
         response.approval_policy.to_core(),
         response.approvals_reviewer.to_core(),
+        codex_app_server_protocol::resolve_session_permission_profile(
+            response.permission_profile.clone(),
+            &response.sandbox,
+            response.cwd.as_path(),
+        )?,
         response.sandbox.to_core(),
         response.cwd.clone(),
         response.reasoning_effort,
@@ -1043,6 +1065,7 @@ fn session_configured_from_thread_response(
     service_tier: Option<codex_protocol::config_types::ServiceTier>,
     approval_policy: AskForApproval,
     approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer,
+    permission_profile: codex_protocol::models::PermissionProfile,
     sandbox_policy: SandboxPolicy,
     cwd: AbsolutePathBuf,
     reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
@@ -1059,6 +1082,7 @@ fn session_configured_from_thread_response(
         service_tier,
         approval_policy,
         approvals_reviewer,
+        permission_profile,
         sandbox_policy,
         cwd,
         reasoning_effort,

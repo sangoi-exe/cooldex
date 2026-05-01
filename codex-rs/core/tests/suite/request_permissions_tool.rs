@@ -81,20 +81,20 @@ fn workspace_write_excluding_tmp() -> SandboxPolicy {
 
 fn requested_directory_write_permissions(path: &Path) -> RequestPermissionProfile {
     RequestPermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![absolute_path(path)]),
-        }),
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![absolute_path(path)]),
+        )),
         ..RequestPermissionProfile::default()
     }
 }
 
 fn normalized_directory_write_permissions(path: &Path) -> Result<RequestPermissionProfile> {
     Ok(RequestPermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![AbsolutePathBuf::try_from(path.canonicalize()?)?]),
-        }),
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![AbsolutePathBuf::try_from(path.canonicalize()?)?]),
+        )),
         ..RequestPermissionProfile::default()
     })
 }
@@ -194,7 +194,10 @@ async fn approved_folder_write_request_permissions_unblocks_later_exec_without_s
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -261,6 +264,7 @@ async fn approved_folder_write_request_permissions_unblocks_later_exec_without_s
             response: RequestPermissionsResponse {
                 permissions: normalized_requested_permissions,
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             },
         })
         .await?;
@@ -316,7 +320,10 @@ async fn approved_folder_write_request_permissions_unblocks_later_apply_patch_wi
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -380,6 +387,7 @@ async fn approved_folder_write_request_permissions_unblocks_later_apply_patch_wi
             response: RequestPermissionsResponse {
                 permissions: normalized_requested_permissions,
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             },
         })
         .await?;

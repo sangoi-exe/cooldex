@@ -1465,6 +1465,7 @@ mod tests {
                 approval_policy: v2::AskForApproval::OnFailure,
                 approvals_reviewer: v2::ApprovalsReviewer::User,
                 sandbox: v2::SandboxPolicy::DangerFullAccess,
+                permission_profile: Some(v2::PermissionProfile::Disabled),
                 reasoning_effort: None,
             },
         };
@@ -1507,6 +1508,9 @@ mod tests {
                     "approvalsReviewer": "user",
                     "sandbox": {
                         "type": "dangerFullAccess"
+                    },
+                    "permissionProfile": {
+                        "type": "disabled"
                     },
                     "reasoningEffort": null
                 }
@@ -2134,6 +2138,8 @@ mod tests {
                 file_system: Some(v2::AdditionalFileSystemPermissions {
                     read: Some(vec![absolute_path("/tmp/allowed")]),
                     write: None,
+                    glob_scan_max_depth: None,
+                    entries: None,
                 }),
             }),
             proposed_execpolicy_amendment: None,

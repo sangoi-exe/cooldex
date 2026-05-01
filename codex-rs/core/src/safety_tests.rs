@@ -178,7 +178,7 @@ fn read_only_policy_rejects_patch_with_read_only_reason() {
     let action = ApplyPatchAction::new_add_for_test(&inside_path, "".to_string());
     let sandbox_policy = SandboxPolicy::new_read_only_policy();
     let file_system_sandbox_policy =
-        FileSystemSandboxPolicy::from_legacy_sandbox_policy(&sandbox_policy, &cwd);
+        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&sandbox_policy, &cwd);
 
     assert!(!is_write_patch_constrained_to_writable_paths(
         &action,
@@ -256,7 +256,7 @@ fn explicit_read_only_subpaths_prevent_auto_approval_for_external_sandbox() {
     let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
         FileSystemSandboxEntry {
             path: FileSystemPath::Special {
-                value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
             },
             access: FileSystemAccessMode::Write,
         },
@@ -300,7 +300,7 @@ fn missing_project_dot_codex_config_requires_approval() {
         exclude_slash_tmp: true,
     };
     let file_system_sandbox_policy =
-        FileSystemSandboxPolicy::from_legacy_sandbox_policy(&sandbox_policy, &cwd);
+        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&sandbox_policy, &cwd);
 
     assert!(!is_write_patch_constrained_to_writable_paths(
         &action,

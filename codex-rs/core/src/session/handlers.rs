@@ -158,6 +158,7 @@ pub(super) async fn user_input_or_turn_inner(
                     approval_policy: Some(approval_policy),
                     approvals_reviewer,
                     sandbox_policy: Some(sandbox_policy),
+                    permission_profile: None,
                     windows_sandbox_level: None,
                     collaboration_mode,
                     reasoning_summary: summary,
@@ -412,6 +413,10 @@ pub async fn request_permissions_response(
 ) {
     sess.notify_request_permissions_response(&id, response)
         .await;
+}
+
+pub async fn request_permissions_failure(sess: &Arc<Session>, id: String, message: String) {
+    sess.notify_request_permissions_failure(&id, message).await;
 }
 
 pub async fn dynamic_tool_response(sess: &Arc<Session>, id: String, response: DynamicToolResponse) {
@@ -1167,6 +1172,10 @@ pub(super) async fn submission_loop(
                 }
                 Op::RequestPermissionsResponse { id, response } => {
                     request_permissions_response(&sess, id, response).await;
+                    false
+                }
+                Op::RequestPermissionsFailure { id, message } => {
+                    request_permissions_failure(&sess, id, message).await;
                     false
                 }
                 Op::DynamicToolResponse { id, response } => {

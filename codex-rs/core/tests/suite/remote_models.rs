@@ -172,7 +172,9 @@ async fn remote_models_config_context_window_override_clamps_to_max_context_wind
             cwd: cwd.path().to_path_buf(),
             approval_policy: config.permissions.approval_policy.value(),
             approvals_reviewer: None,
-            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
+            sandbox_policy: config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
             model: requested_model.to_string(),
             effort: None,
             summary: None,
@@ -248,7 +250,9 @@ async fn remote_models_config_override_above_max_uses_max_context_window() -> Re
             cwd: cwd.path().to_path_buf(),
             approval_policy: config.permissions.approval_policy.value(),
             approvals_reviewer: None,
-            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
+            sandbox_policy: config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
             model: requested_model.to_string(),
             effort: None,
             summary: None,
@@ -323,7 +327,9 @@ async fn remote_models_use_context_window_when_config_override_is_absent() -> Re
             cwd: cwd.path().to_path_buf(),
             approval_policy: config.permissions.approval_policy.value(),
             approvals_reviewer: None,
-            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
+            sandbox_policy: config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
             model: requested_model.to_string(),
             effort: None,
             summary: None,
@@ -411,7 +417,9 @@ async fn remote_models_long_model_slug_is_sent_with_high_reasoning() -> Result<(
             cwd: cwd.path().to_path_buf(),
             approval_policy: config.permissions.approval_policy.value(),
             approvals_reviewer: None,
-            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
+            sandbox_policy: config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
             model: requested_model.to_string(),
             effort: None,
             summary: None,
@@ -470,7 +478,9 @@ async fn namespaced_model_slug_uses_catalog_metadata_without_fallback_warning() 
             cwd: cwd.path().to_path_buf(),
             approval_policy: config.permissions.approval_policy.value(),
             approvals_reviewer: None,
-            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
+            sandbox_policy: config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
             model: requested_model.to_string(),
             effort: None,
             summary: Some(

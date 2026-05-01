@@ -211,6 +211,7 @@ impl PendingAppServerRequests {
                                 response.permissions.clone(),
                             ),
                             scope: response.scope.into(),
+                            strict_auto_review: response.strict_auto_review.then_some(true),
                         })
                         .map_err(|err| {
                             format!("failed to serialize permissions approval response: {err}")
@@ -666,12 +667,13 @@ mod tests {
                             network: Some(NetworkPermissions {
                                 enabled: Some(true),
                             }),
-                            file_system: Some(FileSystemPermissions {
-                                read: Some(vec![absolute_path(read_path)]),
-                                write: Some(vec![absolute_path(write_path)]),
-                            }),
+                            file_system: Some(FileSystemPermissions::from_read_write_roots(
+                                Some(vec![absolute_path(read_path)]),
+                                Some(vec![absolute_path(write_path)]),
+                            )),
                         },
                         scope: codex_protocol::request_permissions::PermissionGrantScope::Session,
+                        strict_auto_review: false,
                     },
                 },
             )
@@ -689,9 +691,25 @@ mod tests {
                     file_system: Some(AdditionalFileSystemPermissions {
                         read: Some(vec![absolute_path(read_path)]),
                         write: Some(vec![absolute_path(write_path)]),
+                        glob_scan_max_depth: None,
+                        entries: Some(vec![
+                            codex_app_server_protocol::FileSystemSandboxEntry {
+                                path: codex_app_server_protocol::FileSystemPath::Path {
+                                    path: absolute_path(read_path),
+                                },
+                                access: codex_app_server_protocol::FileSystemAccessMode::Read,
+                            },
+                            codex_app_server_protocol::FileSystemSandboxEntry {
+                                path: codex_app_server_protocol::FileSystemPath::Path {
+                                    path: absolute_path(write_path),
+                                },
+                                access: codex_app_server_protocol::FileSystemAccessMode::Write,
+                            },
+                        ]),
                     }),
                 },
                 scope: PermissionGrantScope::Session,
+                strict_auto_review: None,
             }
         );
 

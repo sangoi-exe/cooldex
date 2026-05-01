@@ -30,7 +30,7 @@ use crate::unified_exec::generate_chunk_id;
 use codex_features::Feature;
 use codex_otel::SessionTelemetry;
 use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
-use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TerminalInteractionEvent;
 use codex_shell_command::is_safe_command::is_known_safe_command;
@@ -63,7 +63,7 @@ pub(crate) struct ExecCommandArgs {
     #[serde(default)]
     sandbox_permissions: SandboxPermissions,
     #[serde(default)]
-    additional_permissions: Option<PermissionProfile>,
+    additional_permissions: Option<AdditionalPermissionProfile>,
     #[serde(default)]
     justification: Option<String>,
     #[serde(default)]
@@ -236,6 +236,7 @@ impl ToolHandler for UnifiedExecHandler {
                 let requested_additional_permissions = additional_permissions.clone();
                 let effective_additional_permissions = apply_granted_turn_permissions(
                     context.session.as_ref(),
+                    context.turn.cwd.as_path(),
                     sandbox_permissions,
                     additional_permissions,
                 )

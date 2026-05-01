@@ -1,11 +1,11 @@
 #[cfg(test)]
 use super::*;
 #[cfg(test)]
+use codex_protocol::models::PermissionProfile;
+#[cfg(test)]
 use codex_protocol::protocol::FileSystemSandboxPolicy;
 #[cfg(test)]
 use codex_protocol::protocol::NetworkSandboxPolicy;
-#[cfg(test)]
-use codex_protocol::protocol::ReadOnlyAccess;
 #[cfg(test)]
 use codex_protocol::protocol::SandboxPolicy;
 #[cfg(test)]
@@ -202,7 +202,9 @@ fn split_only_filesystem_policy_requires_direct_runtime_enforcement() {
     let policy = FileSystemSandboxPolicy::restricted(vec![
         codex_protocol::permissions::FileSystemSandboxEntry {
             path: codex_protocol::permissions::FileSystemPath::Special {
-                value: codex_protocol::permissions::FileSystemSpecialPath::CurrentWorkingDirectory,
+                value: codex_protocol::permissions::FileSystemSpecialPath::project_roots(
+                    /*subpath*/ None,
+                ),
             },
             access: codex_protocol::permissions::FileSystemAccessMode::Write,
         },
@@ -259,13 +261,11 @@ fn managed_proxy_preflight_argv_is_wrapped_for_full_access_policy() {
 
 #[test]
 fn managed_proxy_inner_command_includes_route_spec() {
-    let sandbox_policy = SandboxPolicy::new_read_only_policy();
+    let permission_profile = PermissionProfile::read_only();
     let args = build_inner_seccomp_command(InnerSeccompCommandArgs {
         sandbox_policy_cwd: Path::new("/tmp"),
         command_cwd: Some(Path::new("/tmp/link")),
-        sandbox_policy: &sandbox_policy,
-        file_system_sandbox_policy: &FileSystemSandboxPolicy::from(&sandbox_policy),
-        network_sandbox_policy: NetworkSandboxPolicy::Restricted,
+        permission_profile: &permission_profile,
         allow_network_for_proxy: true,
         proxy_route_spec: Some("{\"routes\":[]}".to_string()),
         command: vec!["/bin/true".to_string()],
@@ -276,21 +276,18 @@ fn managed_proxy_inner_command_includes_route_spec() {
 }
 
 #[test]
-fn inner_command_includes_split_policy_flags() {
-    let sandbox_policy = SandboxPolicy::new_read_only_policy();
+fn inner_command_includes_permission_profile_flag() {
+    let permission_profile = PermissionProfile::read_only();
     let args = build_inner_seccomp_command(InnerSeccompCommandArgs {
         sandbox_policy_cwd: Path::new("/tmp"),
         command_cwd: Some(Path::new("/tmp/link")),
-        sandbox_policy: &sandbox_policy,
-        file_system_sandbox_policy: &FileSystemSandboxPolicy::from(&sandbox_policy),
-        network_sandbox_policy: NetworkSandboxPolicy::Restricted,
+        permission_profile: &permission_profile,
         allow_network_for_proxy: false,
         proxy_route_spec: None,
         command: vec!["/bin/true".to_string()],
     });
 
-    assert!(args.iter().any(|arg| arg == "--file-system-sandbox-policy"));
-    assert!(args.iter().any(|arg| arg == "--network-sandbox-policy"));
+    assert!(args.iter().any(|arg| arg == "--permission-profile"));
     assert!(
         args.windows(2)
             .any(|window| { window == ["--command-cwd", "/tmp/link"] })
@@ -299,13 +296,11 @@ fn inner_command_includes_split_policy_flags() {
 
 #[test]
 fn non_managed_inner_command_omits_route_spec() {
-    let sandbox_policy = SandboxPolicy::new_read_only_policy();
+    let permission_profile = PermissionProfile::read_only();
     let args = build_inner_seccomp_command(InnerSeccompCommandArgs {
         sandbox_policy_cwd: Path::new("/tmp"),
         command_cwd: Some(Path::new("/tmp/link")),
-        sandbox_policy: &sandbox_policy,
-        file_system_sandbox_policy: &FileSystemSandboxPolicy::from(&sandbox_policy),
-        network_sandbox_policy: NetworkSandboxPolicy::Restricted,
+        permission_profile: &permission_profile,
         allow_network_for_proxy: false,
         proxy_route_spec: None,
         command: vec!["/bin/true".to_string()],
@@ -317,13 +312,11 @@ fn non_managed_inner_command_omits_route_spec() {
 #[test]
 fn managed_proxy_inner_command_requires_route_spec() {
     let result = std::panic::catch_unwind(|| {
-        let sandbox_policy = SandboxPolicy::new_read_only_policy();
+        let permission_profile = PermissionProfile::read_only();
         build_inner_seccomp_command(InnerSeccompCommandArgs {
             sandbox_policy_cwd: Path::new("/tmp"),
             command_cwd: Some(Path::new("/tmp/link")),
-            sandbox_policy: &sandbox_policy,
-            file_system_sandbox_policy: &FileSystemSandboxPolicy::from(&sandbox_policy),
-            network_sandbox_policy: NetworkSandboxPolicy::Restricted,
+            permission_profile: &permission_profile,
             allow_network_for_proxy: true,
             proxy_route_spec: None,
             command: vec!["/bin/true".to_string()],
@@ -333,154 +326,28 @@ fn managed_proxy_inner_command_requires_route_spec() {
 }
 
 #[test]
-fn resolve_sandbox_policies_derives_split_policies_from_legacy_policy() {
-    let sandbox_policy = SandboxPolicy::new_read_only_policy();
+fn resolve_permission_profile_derives_runtime_policies() {
+    let permission_profile = PermissionProfile::read_only();
 
-    let resolved = resolve_sandbox_policies(
-        Path::new("/tmp"),
-        Some(sandbox_policy.clone()),
-        /*file_system_sandbox_policy*/ None,
-        /*network_sandbox_policy*/ None,
-    )
-    .expect("legacy policy should resolve");
+    let resolved = resolve_permission_profile(Some(permission_profile.clone()))
+        .expect("permission profile should resolve");
 
-    assert_eq!(resolved.sandbox_policy, sandbox_policy);
+    assert_eq!(resolved.permission_profile, permission_profile);
     assert_eq!(
         resolved.file_system_sandbox_policy,
-        FileSystemSandboxPolicy::from(&sandbox_policy)
+        FileSystemSandboxPolicy::from(&SandboxPolicy::new_read_only_policy())
     );
     assert_eq!(
         resolved.network_sandbox_policy,
-        NetworkSandboxPolicy::from(&sandbox_policy)
+        NetworkSandboxPolicy::from(&SandboxPolicy::new_read_only_policy())
     );
 }
 
 #[test]
-fn resolve_sandbox_policies_derives_legacy_policy_from_split_policies() {
-    let sandbox_policy = SandboxPolicy::new_read_only_policy();
-    let file_system_sandbox_policy = FileSystemSandboxPolicy::from(&sandbox_policy);
-    let network_sandbox_policy = NetworkSandboxPolicy::from(&sandbox_policy);
+fn resolve_permission_profile_rejects_missing_configuration() {
+    let err = resolve_permission_profile(None).expect_err("missing profile should fail");
 
-    let resolved = resolve_sandbox_policies(
-        Path::new("/tmp"),
-        /*sandbox_policy*/ None,
-        Some(file_system_sandbox_policy.clone()),
-        Some(network_sandbox_policy),
-    )
-    .expect("split policies should resolve");
-
-    assert_eq!(resolved.sandbox_policy, sandbox_policy);
-    assert_eq!(
-        resolved.file_system_sandbox_policy,
-        file_system_sandbox_policy
-    );
-    assert_eq!(resolved.network_sandbox_policy, network_sandbox_policy);
-}
-
-#[test]
-fn resolve_sandbox_policies_rejects_partial_split_policies() {
-    let err = resolve_sandbox_policies(
-        Path::new("/tmp"),
-        Some(SandboxPolicy::new_read_only_policy()),
-        Some(FileSystemSandboxPolicy::default()),
-        /*network_sandbox_policy*/ None,
-    )
-    .expect_err("partial split policies should fail");
-
-    assert_eq!(err, ResolveSandboxPoliciesError::PartialSplitPolicies);
-}
-
-#[test]
-fn resolve_sandbox_policies_rejects_mismatched_legacy_and_split_inputs() {
-    let err = resolve_sandbox_policies(
-        Path::new("/tmp"),
-        Some(SandboxPolicy::new_read_only_policy()),
-        Some(FileSystemSandboxPolicy::unrestricted()),
-        Some(NetworkSandboxPolicy::Enabled),
-    )
-    .expect_err("mismatched legacy and split policies should fail");
-
-    assert!(
-        matches!(
-            err,
-            ResolveSandboxPoliciesError::MismatchedLegacyPolicy { .. }
-        ),
-        "{err}"
-    );
-}
-
-#[test]
-fn resolve_sandbox_policies_accepts_split_policies_requiring_direct_runtime_enforcement() {
-    let temp_dir = tempfile::TempDir::new().expect("tempdir");
-    let docs = temp_dir.path().join("docs");
-    std::fs::create_dir_all(&docs).expect("create docs");
-    let docs = AbsolutePathBuf::from_absolute_path(&docs).expect("absolute docs");
-    let sandbox_policy = SandboxPolicy::new_read_only_policy();
-    let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
-        codex_protocol::permissions::FileSystemSandboxEntry {
-            path: codex_protocol::permissions::FileSystemPath::Special {
-                value: codex_protocol::permissions::FileSystemSpecialPath::Root,
-            },
-            access: codex_protocol::permissions::FileSystemAccessMode::Read,
-        },
-        codex_protocol::permissions::FileSystemSandboxEntry {
-            path: codex_protocol::permissions::FileSystemPath::Path { path: docs },
-            access: codex_protocol::permissions::FileSystemAccessMode::Write,
-        },
-    ]);
-
-    let resolved = resolve_sandbox_policies(
-        temp_dir.path(),
-        Some(sandbox_policy.clone()),
-        Some(file_system_sandbox_policy.clone()),
-        Some(NetworkSandboxPolicy::Restricted),
-    )
-    .expect("split-only policy should preserve provided legacy fallback");
-
-    assert_eq!(resolved.sandbox_policy, sandbox_policy);
-    assert_eq!(
-        resolved.file_system_sandbox_policy,
-        file_system_sandbox_policy
-    );
-    assert_eq!(
-        resolved.network_sandbox_policy,
-        NetworkSandboxPolicy::Restricted
-    );
-}
-
-#[test]
-fn resolve_sandbox_policies_accepts_semantically_equivalent_workspace_write_inputs() {
-    let temp_dir = tempfile::TempDir::new().expect("tempdir");
-    let workspace = temp_dir.path().join("workspace");
-    std::fs::create_dir_all(&workspace).expect("create workspace");
-    let workspace = AbsolutePathBuf::from_absolute_path(&workspace).expect("absolute workspace");
-    let sandbox_policy = SandboxPolicy::WorkspaceWrite {
-        writable_roots: vec![workspace],
-        read_only_access: ReadOnlyAccess::FullAccess,
-        network_access: false,
-        exclude_tmpdir_env_var: false,
-        exclude_slash_tmp: false,
-    };
-    let file_system_sandbox_policy =
-        FileSystemSandboxPolicy::from(&SandboxPolicy::new_workspace_write_policy());
-
-    let resolved = resolve_sandbox_policies(
-        temp_dir.path().join("workspace").as_path(),
-        Some(sandbox_policy.clone()),
-        Some(file_system_sandbox_policy.clone()),
-        Some(NetworkSandboxPolicy::Restricted),
-    )
-    .expect("semantically equivalent legacy workspace-write policy should resolve");
-
-    assert_eq!(resolved.sandbox_policy, sandbox_policy);
-    assert_eq!(
-        resolved.file_system_sandbox_policy,
-        file_system_sandbox_policy
-    );
-    assert_eq!(
-        resolved.network_sandbox_policy,
-        NetworkSandboxPolicy::Restricted
-    );
+    assert_eq!(err, ResolvePermissionProfileError::MissingConfiguration);
 }
 
 #[test]
@@ -494,7 +361,7 @@ fn apply_seccomp_then_exec_with_legacy_landlock_panics() {
 }
 
 #[test]
-fn legacy_landlock_rejects_split_only_filesystem_policies() {
+fn legacy_landlock_rejects_permission_profiles_requiring_direct_runtime_enforcement() {
     let temp_dir = tempfile::TempDir::new().expect("tempdir");
     let docs = temp_dir.path().join("docs");
     std::fs::create_dir_all(&docs).expect("create docs");

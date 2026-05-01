@@ -55,6 +55,7 @@ use crate::bottom_pane::StatusLinePreviewData;
 use crate::bottom_pane::StatusLineSetupView;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::bottom_pane::TerminalTitleSetupView;
+use crate::bottom_pane::format_requested_permissions_rule;
 use crate::legacy_core::DEFAULT_AGENTS_MD_FILENAME;
 use crate::legacy_core::config::Config;
 use crate::legacy_core::config::Constrained;
@@ -1710,6 +1711,7 @@ impl ThreadItemRenderSource {
 fn thread_session_state_to_legacy_event(
     session: ThreadSessionState,
 ) -> codex_protocol::protocol::SessionConfiguredEvent {
+    let sandbox_policy = session.legacy_sandbox_policy();
     codex_protocol::protocol::SessionConfiguredEvent {
         session_id: session.thread_id,
         forked_from_id: session.forked_from_id,
@@ -1719,7 +1721,8 @@ fn thread_session_state_to_legacy_event(
         service_tier: session.service_tier,
         approval_policy: session.approval_policy,
         approvals_reviewer: session.approvals_reviewer,
-        sandbox_policy: session.sandbox_policy,
+        permission_profile: session.permission_profile.clone(),
+        sandbox_policy,
         cwd: session.cwd,
         reasoning_effort: session.reasoning_effort,
         history_log_id: session.history_log_id,
@@ -1983,6 +1986,7 @@ fn request_permissions_from_params(
         call_id: params.item_id,
         reason: params.reason,
         permissions: params.permissions.into(),
+        cwd: None,
     }
 }
 
@@ -2472,12 +2476,11 @@ impl ChatWidget {
         if let Err(err) = self
             .config
             .permissions
-            .sandbox_policy
-            .set(event.sandbox_policy.clone())
+            .set_permission_profile(event.permission_profile.clone())
         {
-            tracing::warn!(%err, "failed to sync sandbox_policy from SessionConfigured");
-            self.config.permissions.sandbox_policy =
-                Constrained::allow_only(event.sandbox_policy.clone());
+            tracing::warn!(%err, "failed to sync permission_profile from SessionConfigured");
+            self.config.permissions.permission_profile =
+                Constrained::allow_only(event.permission_profile.clone());
         }
         self.config.approvals_reviewer = event.approvals_reviewer;
         self.status_line_project_root_name_cache = None;
@@ -4126,6 +4129,22 @@ impl ChatWidget {
     /// render the final approved/denied history cell when guardian returns a
     /// decision.
     fn on_guardian_assessment(&mut self, ev: GuardianAssessmentEvent) {
+        let permission_request_summary = |subject: &str,
+                                          reason: &Option<String>,
+                                          permissions: &codex_protocol::request_permissions::RequestPermissionProfile| {
+                let mut summary = reason
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())
+                    .map(|reason| format!("{subject}: {reason}"))
+                    .unwrap_or_else(|| subject.to_string());
+                if let Some(rule) = format_requested_permissions_rule(permissions) {
+                    summary.push_str(" (");
+                    summary.push_str(&rule);
+                    summary.push(')');
+                }
+                summary
+            };
         let guardian_action_summary = |action: &GuardianAssessmentAction| match action {
             GuardianAssessmentAction::Command { command, .. } => Some(command.clone()),
             GuardianAssessmentAction::Execve { program, argv, .. } => {
@@ -4155,6 +4174,14 @@ impl ChatWidget {
                 let label = connector_name.as_deref().unwrap_or(server.as_str());
                 Some(format!("MCP {tool_name} on {label}"))
             }
+            GuardianAssessmentAction::RequestPermissions {
+                reason,
+                permissions,
+            } => Some(permission_request_summary(
+                "permission request",
+                reason,
+                permissions,
+            )),
         };
         let guardian_command = |action: &GuardianAssessmentAction| match action {
             GuardianAssessmentAction::Command { command, .. } => shlex::split(command)
@@ -4168,7 +4195,8 @@ impl ChatWidget {
             .filter(|command| !command.is_empty()),
             GuardianAssessmentAction::ApplyPatch { .. }
             | GuardianAssessmentAction::NetworkAccess { .. }
-            | GuardianAssessmentAction::McpToolCall { .. } => None,
+            | GuardianAssessmentAction::McpToolCall { .. }
+            | GuardianAssessmentAction::RequestPermissions { .. } => None,
         };
 
         if ev.status == GuardianAssessmentStatus::InProgress
@@ -4259,6 +4287,16 @@ impl ChatWidget {
                             "codex could access {target}"
                         ))
                     }
+                    GuardianAssessmentAction::RequestPermissions {
+                        reason,
+                        permissions,
+                    } => history_cell::new_guardian_timed_out_action_request(
+                        permission_request_summary(
+                            "codex could request permissions",
+                            reason,
+                            permissions,
+                        ),
+                    ),
                     GuardianAssessmentAction::Command { .. } => unreachable!(),
                     GuardianAssessmentAction::Execve { .. } => unreachable!(),
                 }
@@ -4297,6 +4335,14 @@ impl ChatWidget {
                         "codex to access {target}"
                     ))
                 }
+                GuardianAssessmentAction::RequestPermissions {
+                    reason,
+                    permissions,
+                } => history_cell::new_guardian_denied_action_request(permission_request_summary(
+                    "codex to request permissions",
+                    reason,
+                    permissions,
+                )),
                 GuardianAssessmentAction::Command { .. } => unreachable!(),
                 GuardianAssessmentAction::Execve { .. } => unreachable!(),
             }
@@ -6763,7 +6809,9 @@ impl ChatWidget {
             items,
             self.config.cwd.to_path_buf(),
             self.config.permissions.approval_policy.value(),
-            self.config.permissions.sandbox_policy.get().clone(),
+            self.config
+                .permissions
+                .legacy_sandbox_policy(self.config.cwd.as_path()),
             effective_mode.model().to_string(),
             effective_mode.reasoning_effort(),
             /*summary*/ None,
@@ -9715,7 +9763,10 @@ impl ChatWidget {
     pub(crate) fn open_permissions_popup(&mut self) {
         let include_read_only = cfg!(target_os = "windows");
         let current_approval = self.config.permissions.approval_policy.value();
-        let current_sandbox = self.config.permissions.sandbox_policy.get();
+        let current_sandbox = self
+            .config
+            .permissions
+            .legacy_sandbox_policy(self.config.cwd.as_path());
         let guardian_approval_enabled = self.config.features.enabled(Feature::GuardianApproval);
         let current_review_policy = self.config.approvals_reviewer;
         let mut items: Vec<SelectionItem> = Vec::new();
@@ -9740,9 +9791,9 @@ impl ChatWidget {
             }
             // Merge-safety anchor: `/permissions` must follow the shared Guardian preset owner and
             // only gate discoverability here; a currently active guardian reviewer mode must stay visible.
-            if preset.approvals_reviewer == ApprovalsReviewer::GuardianSubagent
+            if preset.approvals_reviewer == ApprovalsReviewer::AutoReview
                 && !guardian_approval_enabled
-                && current_review_policy != ApprovalsReviewer::GuardianSubagent
+                && current_review_policy != ApprovalsReviewer::AutoReview
             {
                 continue;
             }
@@ -9847,7 +9898,7 @@ impl ChatWidget {
                 is_current: Self::preset_matches_current(
                     current_approval,
                     current_review_policy,
-                    current_sandbox,
+                    &current_sandbox,
                     &preset,
                 ),
                 actions: default_actions,
@@ -10496,7 +10547,10 @@ impl ChatWidget {
             self.config.codex_home.as_path(),
             cwd.as_path(),
             &env_map,
-            self.config.permissions.sandbox_policy.get(),
+            &self
+                .config
+                .permissions
+                .legacy_sandbox_policy(self.config.cwd.as_path()),
             Some(self.config.codex_home.as_path()),
         ) {
             Ok(_) => None,
@@ -10615,10 +10669,13 @@ impl ChatWidget {
             SandboxPolicy::ReadOnly { .. } => "Read-Only mode",
             _ => "Agent mode",
         };
-        let selection_label = preset
-            .as_ref()
-            .map(|p| p.label)
-            .unwrap_or_else(|| describe_policy(self.config.permissions.sandbox_policy.get()));
+        let selection_label = preset.as_ref().map(|p| p.label).unwrap_or_else(|| {
+            let current_sandbox = self
+                .config
+                .permissions
+                .legacy_sandbox_policy(self.config.cwd.as_path());
+            describe_policy(&current_sandbox)
+        });
         let info_line = if failed_scan {
             Line::from(vec![
                 "We couldn't complete the world-writable scan, so protections cannot be verified. "
@@ -11004,7 +11061,9 @@ impl ChatWidget {
     /// Set the sandbox policy in the widget's config copy.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) fn set_sandbox_policy(&mut self, policy: SandboxPolicy) -> ConstraintResult<()> {
-        self.config.permissions.sandbox_policy.set(policy)?;
+        self.config
+            .permissions
+            .set_legacy_sandbox_policy(policy, self.config.cwd.as_path())?;
         Ok(())
     }
 

@@ -184,6 +184,11 @@ fn parse_feature_requirements(
             continue;
         }
 
+        if key == "auto_review" {
+            pinned_features.insert(Feature::GuardianApproval, enabled);
+            continue;
+        }
+
         if let Some(feature) = legacy_feature_for_key(&key) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

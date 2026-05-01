@@ -1,6 +1,7 @@
 use super::*;
 use crate::tools::sandboxing::SandboxAttempt;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
@@ -83,12 +84,12 @@ fn file_system_sandbox_context_uses_active_attempt() {
     let path = std::env::temp_dir()
         .join("apply-patch-runtime-attempt.txt")
         .abs();
-    let additional_permissions = PermissionProfile {
+    let additional_permissions = AdditionalPermissionProfile {
         network: None,
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![path.clone()]),
-            write: Some(Vec::new()),
-        }),
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![path.clone()]),
+            Some(Vec::new()),
+        )),
     };
     let req = ApplyPatchRequest {
         action: ApplyPatchAction::new_add_for_test(&path, "hello".to_string()),
@@ -102,18 +103,22 @@ fn file_system_sandbox_context_uses_active_attempt() {
         permissions_preapproved: false,
     };
     let sandbox_policy = SandboxPolicy::new_read_only_policy();
-    let mut file_system_policy =
-        FileSystemSandboxPolicy::from_legacy_sandbox_policy(&sandbox_policy, path.as_path());
+    let mut file_system_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+        &sandbox_policy,
+        path.as_path(),
+    );
     file_system_policy.entries.push(FileSystemSandboxEntry {
         path: FileSystemPath::Path { path: path.clone() },
         access: FileSystemAccessMode::None,
     });
+    let permissions = PermissionProfile::from_runtime_permissions(
+        &file_system_policy,
+        NetworkSandboxPolicy::Restricted,
+    );
     let manager = SandboxManager::new();
     let attempt = SandboxAttempt {
         sandbox: SandboxType::MacosSeatbelt,
-        policy: &sandbox_policy,
-        file_system_policy: &file_system_policy,
-        network_policy: NetworkSandboxPolicy::Restricted,
+        permissions: &permissions,
         enforce_managed_network: false,
         manager: &manager,
         sandbox_cwd: &path,
@@ -124,7 +129,8 @@ fn file_system_sandbox_context_uses_active_attempt() {
     };
 
     let sandbox = ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt)
-        .expect("sandbox context");
+        .expect("sandbox context")
+        .expect("sandbox context should be present");
 
     assert_eq!(sandbox.sandbox_policy, sandbox_policy);
     assert_eq!(sandbox.sandbox_policy_cwd, Some(path.clone()));
@@ -158,14 +164,18 @@ fn file_system_sandbox_context_omits_legacy_equivalent_policy() {
         permissions_preapproved: false,
     };
     let sandbox_policy = SandboxPolicy::new_read_only_policy();
-    let file_system_policy =
-        FileSystemSandboxPolicy::from_legacy_sandbox_policy(&sandbox_policy, path.as_path());
+    let file_system_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+        &sandbox_policy,
+        path.as_path(),
+    );
+    let permissions = PermissionProfile::from_runtime_permissions(
+        &file_system_policy,
+        NetworkSandboxPolicy::Restricted,
+    );
     let manager = SandboxManager::new();
     let attempt = SandboxAttempt {
         sandbox: SandboxType::MacosSeatbelt,
-        policy: &sandbox_policy,
-        file_system_policy: &file_system_policy,
-        network_policy: NetworkSandboxPolicy::Restricted,
+        permissions: &permissions,
         enforce_managed_network: false,
         manager: &manager,
         sandbox_cwd: &path,
@@ -176,7 +186,8 @@ fn file_system_sandbox_context_omits_legacy_equivalent_policy() {
     };
 
     let sandbox = ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt)
-        .expect("sandbox context");
+        .expect("sandbox context")
+        .expect("sandbox context should be present");
 
     assert_eq!(sandbox.sandbox_policy_cwd, Some(path));
     assert_eq!(sandbox.file_system_sandbox_policy, None);
@@ -198,14 +209,11 @@ fn no_sandbox_attempt_has_no_file_system_context() {
         additional_permissions: None,
         permissions_preapproved: false,
     };
-    let sandbox_policy = SandboxPolicy::DangerFullAccess;
-    let file_system_policy = FileSystemSandboxPolicy::from(&sandbox_policy);
+    let permissions = PermissionProfile::Disabled;
     let manager = SandboxManager::new();
     let attempt = SandboxAttempt {
         sandbox: SandboxType::None,
-        policy: &sandbox_policy,
-        file_system_policy: &file_system_policy,
-        network_policy: NetworkSandboxPolicy::Enabled,
+        permissions: &permissions,
         enforce_managed_network: false,
         manager: &manager,
         sandbox_cwd: &path,
@@ -216,7 +224,8 @@ fn no_sandbox_attempt_has_no_file_system_context() {
     };
 
     assert_eq!(
-        ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt),
+        ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt)
+            .expect("sandbox context decision"),
         None
     );
 }

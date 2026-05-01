@@ -7,6 +7,7 @@ import type { ServiceTier } from "../ServiceTier";
 import type { JsonValue } from "../serde_json/JsonValue";
 import type { ApprovalsReviewer } from "./ApprovalsReviewer";
 import type { AskForApproval } from "./AskForApproval";
+import type { PermissionProfile } from "./PermissionProfile";
 import type { SandboxMode } from "./SandboxMode";
 
 /**
@@ -45,7 +46,12 @@ configPath?: string | null, approvalPolicy?: AskForApproval | null,
  * Override where approval requests are routed for review on this thread
  * and subsequent turns.
  */
-approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null | null, developerInstructions?: string | null | null, personality?: Personality | null,
+approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null,
+/**
+ * Canonical permissions override for this thread. When present, do not
+ * also set the legacy `sandbox` override.
+ */
+permissionProfile?: PermissionProfile | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null | null, developerInstructions?: string | null | null, personality?: Personality | null,
 /**
  * If true, persist additional rollout EventMsg variants required to
  * reconstruct a richer thread history on subsequent resume/fork/read.

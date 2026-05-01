@@ -1095,8 +1095,10 @@ async fn handle_container_exec_autoapprove_from_config_records_tool_decision() {
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-            config.permissions.sandbox_policy =
-                Constrained::allow_any(SandboxPolicy::DangerFullAccess);
+            config
+                .permissions
+                .set_legacy_sandbox_policy(SandboxPolicy::DangerFullAccess, config.cwd.as_path())
+                .expect("test sandbox policy should be valid");
         })
         .build(&server)
         .await

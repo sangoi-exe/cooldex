@@ -527,7 +527,7 @@ You can optionally specify config overrides on the new turn. If specified, these
 `approvalsReviewer` accepts:
 
 - `"user"` — default. Review approval requests directly in the client.
-- `"guardian_subagent"` — route approval requests to a carefully prompted subagent, which gathers relevant context and applies a risk-based decision framework before approving or denying the request.
+- `"auto_review"` — route approval requests to the Auto-review reviewer, which gathers relevant context and applies a risk-based decision framework before approving or denying the request. The wire schema may still serialize `"guardian_subagent"` for compatibility, and clients may send either value for this reviewer.
 
 ```json
 { "method": "turn/start", "id": 30, "params": {
@@ -1154,7 +1154,9 @@ the client can offer session-scoped and/or persistent approval choices.
 
 ### Permission requests
 
-The built-in `request_permissions` tool sends an `item/permissions/requestApproval` JSON-RPC request to the client with the requested permission profile. This v2 payload mirrors the command-execution `additionalPermissions` shape: it can request network access and additional filesystem access.
+The built-in `request_permissions` tool requests additional filesystem or network permissions through the active approval route. With the default client-routed reviewer, the server emits an `item/permissions/requestApproval` JSON-RPC request to the client with the requested permission profile. When `approvalsReviewer` is `"auto_review"`, the Guardian reviewer evaluates the request internally and no manual permissions request is emitted to the client.
+
+The v2 client-routed payload mirrors the command-execution `additionalPermissions` shape: it can request network access and additional filesystem access.
 
 ```json
 {
@@ -1174,7 +1176,7 @@ The built-in `request_permissions` tool sends an `item/permissions/requestApprov
 }
 ```
 
-The client responds with `result.permissions`, which should be the granted subset of the requested permission profile. It may also set `result.scope` to `"session"` to make the grant persist for later turns in the same session; omitted or `"turn"` keeps the existing turn-scoped behavior:
+For client-routed requests, the client responds with `result.permissions`, which should be the granted subset of the requested permission profile. It may also set `result.scope` to `"session"` to make the grant persist for later turns in the same session; omitted or `"turn"` keeps the existing turn-scoped behavior:
 
 ```json
 {
@@ -1192,9 +1194,11 @@ The client responds with `result.permissions`, which should be the granted subse
 
 Only the granted subset matters on the wire. Any permissions omitted from `result.permissions` are treated as denied. Any permissions not present in the original request are ignored by the server.
 
+For Auto-review-routed requests, an approval grants the requested permission profile at turn scope, an explicit denial returns empty permissions, and timeout, abort, or reviewer failure returns an error instead of a denial-shaped empty grant.
+
 Within the same turn, granted permissions are sticky: later shell-like tool calls can automatically reuse the granted subset without reissuing a separate permission request.
 
-If the session approval policy uses `Granular` with `request_permissions: false`, standalone `request_permissions` tool calls are auto-denied and no `item/permissions/requestApproval` prompt is sent. Inline `with_additional_permissions` command requests remain controlled by `sandbox_approval`, and any previously granted permissions remain sticky for later shell-like calls in the same turn.
+If the session approval policy uses `Granular` with `request_permissions: false`, standalone `request_permissions` tool calls fail with an explicit disabled-policy error and no `item/permissions/requestApproval` prompt is sent. Inline `with_additional_permissions` command requests remain controlled by `sandbox_approval`, and any previously granted permissions remain sticky for later shell-like calls in the same turn.
 
 ### Dynamic tool calls (experimental)
 

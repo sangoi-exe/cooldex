@@ -40,7 +40,9 @@ async fn websocket_test_codex_shell_chain() -> Result<()> {
     let test = builder.build_with_websocket_server(&server).await?;
     test.submit_turn_with_policy(
         "run the echo command",
-        test.config.permissions.sandbox_policy.get().clone(),
+        test.config
+            .permissions
+            .legacy_sandbox_policy(test.config.cwd.as_path()),
     )
     .await?;
 
@@ -87,7 +89,9 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()> {
     let test = builder.build_with_websocket_server(&server).await?;
     test.submit_turn_with_policy(
         "hello",
-        test.config.permissions.sandbox_policy.get().clone(),
+        test.config
+            .permissions
+            .legacy_sandbox_policy(test.config.cwd.as_path()),
     )
     .await?;
 
@@ -137,7 +141,9 @@ async fn websocket_first_turn_handles_handshake_delay_with_startup_prewarm() -> 
     let test = builder.build_with_websocket_server(&server).await?;
     test.submit_turn_with_policy(
         "hello",
-        test.config.permissions.sandbox_policy.get().clone(),
+        test.config
+            .permissions
+            .legacy_sandbox_policy(test.config.cwd.as_path()),
     )
     .await?;
 
@@ -193,7 +199,9 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
     let test = builder.build_with_websocket_server(&server).await?;
     test.submit_turn_with_policy(
         "run the echo command",
-        test.config.permissions.sandbox_policy.get().clone(),
+        test.config
+            .permissions
+            .legacy_sandbox_policy(test.config.cwd.as_path()),
     )
     .await?;
 

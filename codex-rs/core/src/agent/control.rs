@@ -701,7 +701,9 @@ impl AgentControl {
                     ))
                 })?
         } else {
-            config.permissions.sandbox_policy.get().clone()
+            config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path())
         };
         // Merge-safety anchor: resumed child sandbox restoration must prefer the persisted
         // child-owned rollout baseline over the live caller config so a denied resumer cannot

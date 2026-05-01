@@ -231,7 +231,9 @@ impl App {
             ));
         }
         if let Some(policy) = self.runtime_sandbox_policy_override.as_ref()
-            && let Err(err) = config.permissions.sandbox_policy.set(policy.clone())
+            && let Err(err) = config
+                .permissions
+                .set_legacy_sandbox_policy(policy.clone(), config.cwd.as_path())
         {
             tracing::warn!(%err, "failed to carry forward sandbox policy override");
             self.chat_widget.add_error_message(format!(
@@ -269,7 +271,10 @@ impl App {
         user_message_prefix: &str,
         log_message: &str,
     ) -> bool {
-        if let Err(err) = config.permissions.sandbox_policy.set(policy) {
+        if let Err(err) = config
+            .permissions
+            .set_legacy_sandbox_policy(policy, config.cwd.as_path())
+        {
             tracing::warn!(error = %err, "{log_message}");
             self.chat_widget
                 .add_error_message(format!("{user_message_prefix}: {err}"));
@@ -421,9 +426,11 @@ impl App {
                 .set_approval_policy(self.config.permissions.approval_policy.value());
         }
         if sandbox_policy_override.is_some()
-            && let Err(err) = self
-                .chat_widget
-                .set_sandbox_policy(self.config.permissions.sandbox_policy.get().clone())
+            && let Err(err) = self.chat_widget.set_sandbox_policy(
+                self.config
+                    .permissions
+                    .legacy_sandbox_policy(self.config.cwd.as_path()),
+            )
         {
             tracing::error!(
                 error = %err,
@@ -753,6 +760,7 @@ mod tests {
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: ApprovalsReviewer::User,
+                permission_profile: codex_protocol::models::PermissionProfile::default(),
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: next_cwd.clone().abs(),
                 reasoning_effort: None,
@@ -809,9 +817,8 @@ mod tests {
             app.chat_widget
                 .config_ref()
                 .permissions
-                .sandbox_policy
-                .get(),
-            &guardian_approvals.sandbox
+                .legacy_sandbox_policy(app.chat_widget.config_ref().cwd.as_path()),
+            guardian_approvals.sandbox
         );
         assert_eq!(
             app.chat_widget.config_ref().approvals_reviewer,
@@ -917,17 +924,17 @@ mod tests {
             .set_enabled(Feature::GuardianApproval, /*enabled*/ true)?;
         app.chat_widget
             .set_feature_enabled(Feature::GuardianApproval, /*enabled*/ true);
-        app.config.approvals_reviewer = ApprovalsReviewer::GuardianSubagent;
+        app.config.approvals_reviewer = ApprovalsReviewer::AutoReview;
         app.chat_widget
-            .set_approvals_reviewer(ApprovalsReviewer::GuardianSubagent);
+            .set_approvals_reviewer(ApprovalsReviewer::AutoReview);
         app.config
             .permissions
             .approval_policy
             .set(AskForApproval::OnRequest)?;
-        app.config
-            .permissions
-            .sandbox_policy
-            .set(SandboxPolicy::new_workspace_write_policy())?;
+        app.config.permissions.set_legacy_sandbox_policy(
+            SandboxPolicy::new_workspace_write_policy(),
+            app.config.cwd.as_path(),
+        )?;
         app.chat_widget
             .set_approval_policy(AskForApproval::OnRequest);
         app.chat_widget
@@ -943,17 +950,14 @@ mod tests {
                 .features
                 .enabled(Feature::GuardianApproval)
         );
-        assert_eq!(
-            app.config.approvals_reviewer,
-            ApprovalsReviewer::GuardianSubagent
-        );
+        assert_eq!(app.config.approvals_reviewer, ApprovalsReviewer::AutoReview);
         assert_eq!(
             app.config.permissions.approval_policy.value(),
             AskForApproval::OnRequest
         );
         assert_eq!(
             app.chat_widget.config_ref().approvals_reviewer,
-            ApprovalsReviewer::GuardianSubagent
+            ApprovalsReviewer::AutoReview
         );
         assert_eq!(app.runtime_approval_policy_override, None);
         assert_eq!(app.runtime_sandbox_policy_override, None);
@@ -1012,9 +1016,8 @@ mod tests {
             app.chat_widget
                 .config_ref()
                 .permissions
-                .sandbox_policy
-                .get(),
-            &guardian_approvals.sandbox
+                .legacy_sandbox_policy(app.chat_widget.config_ref().cwd.as_path()),
+            guardian_approvals.sandbox
         );
         assert_eq!(
             op_rx.try_recv(),
@@ -1185,9 +1188,9 @@ guardian_approval = true
             .set_enabled(Feature::GuardianApproval, /*enabled*/ true)?;
         app.chat_widget
             .set_feature_enabled(Feature::GuardianApproval, /*enabled*/ true);
-        app.config.approvals_reviewer = ApprovalsReviewer::GuardianSubagent;
+        app.config.approvals_reviewer = ApprovalsReviewer::AutoReview;
         app.chat_widget
-            .set_approvals_reviewer(ApprovalsReviewer::GuardianSubagent);
+            .set_approvals_reviewer(ApprovalsReviewer::AutoReview);
 
         app.update_feature_flags(vec![(Feature::GuardianApproval, false)])
             .await;
@@ -1199,13 +1202,10 @@ guardian_approval = true
                 .features
                 .enabled(Feature::GuardianApproval)
         );
-        assert_eq!(
-            app.config.approvals_reviewer,
-            ApprovalsReviewer::GuardianSubagent
-        );
+        assert_eq!(app.config.approvals_reviewer, ApprovalsReviewer::AutoReview);
         assert_eq!(
             app.chat_widget.config_ref().approvals_reviewer,
-            ApprovalsReviewer::GuardianSubagent
+            ApprovalsReviewer::AutoReview
         );
         assert!(
             op_rx.try_recv().is_err(),
@@ -1258,9 +1258,9 @@ guardian_approval = true
             .set_enabled(Feature::GuardianApproval, /*enabled*/ true)?;
         app.chat_widget
             .set_feature_enabled(Feature::GuardianApproval, /*enabled*/ true);
-        app.config.approvals_reviewer = ApprovalsReviewer::GuardianSubagent;
+        app.config.approvals_reviewer = ApprovalsReviewer::AutoReview;
         app.chat_widget
-            .set_approvals_reviewer(ApprovalsReviewer::GuardianSubagent);
+            .set_approvals_reviewer(ApprovalsReviewer::AutoReview);
 
         app.update_feature_flags(vec![(Feature::GuardianApproval, false)])
             .await;
@@ -1272,13 +1272,10 @@ guardian_approval = true
                 .features
                 .enabled(Feature::GuardianApproval)
         );
-        assert_eq!(
-            app.config.approvals_reviewer,
-            ApprovalsReviewer::GuardianSubagent
-        );
+        assert_eq!(app.config.approvals_reviewer, ApprovalsReviewer::AutoReview);
         assert_eq!(
             app.chat_widget.config_ref().approvals_reviewer,
-            ApprovalsReviewer::GuardianSubagent
+            ApprovalsReviewer::AutoReview
         );
         assert!(
             op_rx.try_recv().is_err(),

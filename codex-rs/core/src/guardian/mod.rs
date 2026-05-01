@@ -25,6 +25,7 @@ use serde::Serialize;
 pub(crate) use approval_request::GuardianApprovalRequest;
 pub(crate) use approval_request::GuardianMcpAnnotations;
 pub(crate) use approval_request::guardian_approval_request_to_json;
+pub(crate) use review::GuardianReviewDecision;
 pub(crate) use review::guardian_rejection_message;
 pub(crate) use review::guardian_timeout_message;
 pub(crate) use review::is_guardian_reviewer_source;
@@ -32,6 +33,7 @@ pub(crate) use review::new_guardian_review_id;
 pub(crate) use review::review_approval_request;
 pub(crate) use review::review_approval_request_with_cancel;
 pub(crate) use review::routes_approval_to_guardian;
+pub(crate) use review::spawn_approval_request_review_detailed;
 pub(crate) use review_session::GuardianReviewSessionManager;
 
 const GUARDIAN_PREFERRED_MODEL: &str = "codex-auto-review";

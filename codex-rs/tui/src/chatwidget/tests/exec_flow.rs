@@ -1000,6 +1000,7 @@ async fn bang_shell_command_submits_run_user_shell_command_in_app_server_tui() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: codex_protocol::models::PermissionProfile::default(),
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),

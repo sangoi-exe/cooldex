@@ -16,7 +16,6 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::Submission;
-use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionsArgs;
 use codex_protocol::request_permissions::RequestPermissionsEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
@@ -794,15 +793,20 @@ async fn handle_request_permissions(
         permissions: event.permissions,
     };
     let response_fut = parent_session.request_permissions(parent_ctx, call_id.clone(), args);
-    let response =
+    let result =
         await_request_permissions_with_cancel(response_fut, parent_session, &call_id, cancel_token)
             .await;
-    let _ = codex
-        .submit(Op::RequestPermissionsResponse {
+    let op = match result {
+        Ok(response) => Op::RequestPermissionsResponse {
             id: call_id,
             response,
-        })
-        .await;
+        },
+        Err(message) => Op::RequestPermissionsFailure {
+            id: call_id,
+            message,
+        },
+    };
+    let _ = codex.submit(op).await;
 }
 
 async fn await_user_input_with_cancel<F>(
@@ -836,26 +840,20 @@ async fn await_request_permissions_with_cancel<F>(
     parent_session: &Session,
     call_id: &str,
     cancel_token: &CancellationToken,
-) -> RequestPermissionsResponse
+) -> Result<RequestPermissionsResponse, String>
 where
-    F: core::future::Future<Output = Option<RequestPermissionsResponse>>,
+    F: core::future::Future<Output = Result<RequestPermissionsResponse, String>>,
 {
     tokio::select! {
         biased;
         _ = cancel_token.cancelled() => {
-            let empty = RequestPermissionsResponse {
-                permissions: Default::default(),
-                scope: PermissionGrantScope::Turn,
-            };
+            let message = "request_permissions was cancelled before receiving a response".to_string();
             parent_session
-                .notify_request_permissions_response(call_id, empty.clone())
+                .notify_request_permissions_failure(call_id, message.clone())
                 .await;
-            empty
+            Err(message)
         }
-        response = fut => response.unwrap_or_else(|| RequestPermissionsResponse {
-            permissions: Default::default(),
-            scope: PermissionGrantScope::Turn,
-        }),
+        response = fut => response,
     }
 }
 

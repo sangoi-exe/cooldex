@@ -246,18 +246,13 @@ impl ToolRegistry {
         let otel = invocation.turn.session_telemetry.clone();
         let payload_for_response = invocation.payload.clone();
         let log_payload = payload_for_response.log_payload();
+        let sandbox_policy = invocation.turn.sandbox_policy();
         let metric_tags = [
             (
                 "sandbox",
-                sandbox_tag(
-                    &invocation.turn.sandbox_policy,
-                    invocation.turn.windows_sandbox_level,
-                ),
+                sandbox_tag(&sandbox_policy, invocation.turn.windows_sandbox_level),
             ),
-            (
-                "sandbox_policy",
-                sandbox_policy_tag(&invocation.turn.sandbox_policy),
-            ),
+            ("sandbox_policy", sandbox_policy_tag(&sandbox_policy)),
         ];
         let (mcp_server, mcp_server_origin) = match &invocation.payload {
             ToolPayload::Mcp { server, .. } => {
@@ -634,9 +629,9 @@ async fn dispatch_after_tool_use_hook(
                     success: dispatch.success,
                     duration_ms: u64::try_from(dispatch.duration.as_millis()).unwrap_or(u64::MAX),
                     mutating: dispatch.mutating,
-                    sandbox: sandbox_tag(&turn.sandbox_policy, turn.windows_sandbox_level)
+                    sandbox: sandbox_tag(&turn.sandbox_policy(), turn.windows_sandbox_level)
                         .to_string(),
-                    sandbox_policy: sandbox_policy_tag(&turn.sandbox_policy).to_string(),
+                    sandbox_policy: sandbox_policy_tag(&turn.sandbox_policy()).to_string(),
                     output_preview: dispatch.output_preview.clone(),
                 },
             },

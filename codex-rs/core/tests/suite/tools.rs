@@ -9,7 +9,6 @@ use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
-use codex_config::Constrained;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::sandboxing::SandboxPermissions;
@@ -467,7 +466,8 @@ async fn shell_enforces_glob_deny_read_policy() -> Result<()> {
     let mut builder = test_codex()
         .with_model("gpt-5.1-codex")
         .with_config(move |config| {
-            config.permissions.sandbox_policy = Constrained::allow_any(read_only_policy_for_config);
+            let sandbox_policy = read_only_policy_for_config;
+            config.permissions.set_legacy_sandbox_policy(sandbox_policy.clone(), config.cwd.as_path()).expect("test sandbox policy should be valid");
             let mut file_system_sandbox_policy = FileSystemSandboxPolicy::default();
             file_system_sandbox_policy
                 .entries
@@ -477,7 +477,18 @@ async fn shell_enforces_glob_deny_read_policy() -> Result<()> {
                     },
                     access: FileSystemAccessMode::None,
                 });
-            config.permissions.file_system_sandbox_policy = file_system_sandbox_policy;
+            config
+                .permissions
+                .set_permission_profile(
+                    codex_protocol::models::PermissionProfile::from_runtime_permissions_with_enforcement(
+                        codex_protocol::models::SandboxEnforcement::from_legacy_sandbox_policy(
+                            &sandbox_policy,
+                        ),
+                        &file_system_sandbox_policy,
+                        config.permissions.network_sandbox_policy(),
+                    ),
+                )
+                .expect("test permission profile should be valid");
         });
     let fixture = builder.build(&server).await?;
 
@@ -725,8 +736,7 @@ async fn shell_timeout_handles_background_grandchild_stdout() -> Result<()> {
     let mut builder = test_codex().with_model("gpt-5.1").with_config(|config| {
         config
             .permissions
-            .sandbox_policy
-            .set(SandboxPolicy::DangerFullAccess)
+            .set_legacy_sandbox_policy(SandboxPolicy::DangerFullAccess, config.cwd.as_path())
             .expect("set sandbox policy");
     });
     let test = builder.build(&server).await?;
@@ -821,8 +831,7 @@ async fn shell_spawn_failure_truncates_exec_error() -> Result<()> {
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|cfg| {
         cfg.permissions
-            .sandbox_policy
-            .set(SandboxPolicy::DangerFullAccess)
+            .set_legacy_sandbox_policy(SandboxPolicy::DangerFullAccess, cfg.cwd.as_path())
             .expect("set sandbox policy");
     });
     let test = builder.build(&server).await?;

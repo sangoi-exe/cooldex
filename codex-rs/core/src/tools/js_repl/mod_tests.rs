@@ -9,7 +9,9 @@ use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
@@ -24,11 +26,13 @@ use std::path::Path;
 use tempfile::tempdir;
 
 fn set_danger_full_access(turn: &mut crate::session::turn_context::TurnContext) {
-    turn.sandbox_policy
-        .set(SandboxPolicy::DangerFullAccess)
-        .expect("test setup should allow updating sandbox policy");
-    turn.file_system_sandbox_policy = FileSystemSandboxPolicy::from(turn.sandbox_policy.get());
-    turn.network_sandbox_policy = NetworkSandboxPolicy::from(turn.sandbox_policy.get());
+    let file_system_sandbox_policy =
+        FileSystemSandboxPolicy::from(&SandboxPolicy::DangerFullAccess);
+    turn.permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
+        SandboxEnforcement::from_legacy_sandbox_policy(&SandboxPolicy::DangerFullAccess),
+        &file_system_sandbox_policy,
+        NetworkSandboxPolicy::from(&SandboxPolicy::DangerFullAccess),
+    );
 }
 
 #[test]

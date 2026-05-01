@@ -734,8 +734,15 @@ pub(crate) fn build_guardian_review_session_config(
             .unwrap_or_else(guardian_policy_prompt),
     );
     guardian_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
-    guardian_config.permissions.sandbox_policy =
-        Constrained::allow_only(SandboxPolicy::new_read_only_policy());
+    guardian_config
+        .permissions
+        .set_legacy_sandbox_policy(
+            SandboxPolicy::new_read_only_policy(),
+            guardian_config.cwd.as_path(),
+        )
+        .map_err(|err| anyhow::anyhow!("guardian review sandbox policy is invalid: {err}"))?;
+    guardian_config.permissions.permission_profile =
+        Constrained::allow_only(guardian_config.permissions.permission_profile());
     if let Some(live_network_config) = live_network_config
         && guardian_config.permissions.network.is_some()
     {

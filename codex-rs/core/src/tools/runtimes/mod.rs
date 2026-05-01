@@ -8,7 +8,7 @@ use crate::exec_env::CODEX_THREAD_ID_ENV_VAR;
 use crate::path_utils;
 use crate::shell::Shell;
 use crate::tools::sandboxing::ToolError;
-use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_sandboxing::SandboxCommand;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ pub(crate) fn build_sandbox_command(
     command: &[String],
     cwd: &AbsolutePathBuf,
     env: &HashMap<String, String>,
-    additional_permissions: Option<PermissionProfile>,
+    additional_permissions: Option<AdditionalPermissionProfile>,
 ) -> Result<SandboxCommand, ToolError> {
     let (program, args) = command
         .split_first()

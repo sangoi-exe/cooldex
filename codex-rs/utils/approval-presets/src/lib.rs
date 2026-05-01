@@ -60,7 +60,7 @@ pub fn guardian_approval_preset() -> ApprovalPreset {
         label: "Guardian Approvals",
         description: "Same workspace-write permissions as Default, but eligible `on-request` approvals are routed through the guardian reviewer subagent.",
         approval: AskForApproval::OnRequest,
-        approvals_reviewer: ApprovalsReviewer::GuardianSubagent,
+        approvals_reviewer: ApprovalsReviewer::AutoReview,
         sandbox: SandboxPolicy::new_workspace_write_policy(),
     }
 }

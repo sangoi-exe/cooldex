@@ -21,8 +21,8 @@ use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::LocalFileSystem;
 use codex_exec_server::ReadDirectoryEntry;
 use codex_exec_server::RemoveOptions;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::ReadOnlyAccess;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -567,12 +567,12 @@ async fn file_system_sandboxed_write_allows_additional_write_root(use_remote: bo
     std::fs::create_dir_all(&writable_dir)?;
 
     let mut sandbox = read_only_sandbox(readable_dir);
-    sandbox.additional_permissions = Some(PermissionProfile {
+    sandbox.additional_permissions = Some(AdditionalPermissionProfile {
         network: None,
-        file_system: Some(FileSystemPermissions {
-            read: None,
-            write: Some(vec![absolute_path(writable_dir)]),
-        }),
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            /*read*/ None,
+            Some(vec![absolute_path(writable_dir)]),
+        )),
     });
 
     file_system

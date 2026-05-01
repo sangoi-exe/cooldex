@@ -35,8 +35,8 @@ use codex_apply_patch::Hunk;
 use codex_apply_patch::parse_patch_streaming;
 use codex_exec_server::ExecutorFileSystem;
 use codex_features::Feature;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::PatchApplyUpdatedEvent;
@@ -183,7 +183,7 @@ fn write_permissions_for_paths(
     file_paths: &[AbsolutePathBuf],
     file_system_sandbox_policy: &codex_protocol::permissions::FileSystemSandboxPolicy,
     cwd: &AbsolutePathBuf,
-) -> Option<PermissionProfile> {
+) -> Option<AdditionalPermissionProfile> {
     let write_paths = file_paths
         .iter()
         .map(|path| {
@@ -200,11 +200,11 @@ fn write_permissions_for_paths(
         .collect::<Result<Vec<_>, _>>()
         .ok()?;
 
-    let permissions = (!write_paths.is_empty()).then_some(PermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(write_paths),
-        }),
+    let permissions = (!write_paths.is_empty()).then_some(AdditionalPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(write_paths),
+        )),
         ..Default::default()
     })?;
 
@@ -225,12 +225,14 @@ async fn effective_patch_permissions(
         session.granted_session_permissions().await.as_ref(),
         session.granted_turn_permissions().await.as_ref(),
     );
+    let turn_file_system_sandbox_policy = turn.file_system_sandbox_policy();
     let file_system_sandbox_policy = effective_file_system_sandbox_policy(
-        &turn.file_system_sandbox_policy,
+        &turn_file_system_sandbox_policy,
         granted_permissions.as_ref(),
     );
     let effective_additional_permissions = apply_granted_turn_permissions(
         session,
+        turn.cwd.as_path(),
         crate::sandboxing::SandboxPermissions::UseDefault,
         write_permissions_for_paths(&file_paths, &file_system_sandbox_policy, &turn.cwd),
     )

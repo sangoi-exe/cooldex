@@ -59,13 +59,9 @@ impl ToolHandler for RequestPermissionsHandler {
         }
 
         let response = session
-            .request_permissions(turn.as_ref(), call_id, args)
+            .request_permissions(&turn, call_id, args)
             .await
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "request_permissions was cancelled before receiving a response".to_string(),
-                )
-            })?;
+            .map_err(FunctionCallError::RespondToModel)?;
 
         let content = serde_json::to_string(&response).map_err(|err| {
             FunctionCallError::Fatal(format!(

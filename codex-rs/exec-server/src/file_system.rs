@@ -1,7 +1,12 @@
 use async_trait::async_trait;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::NetworkAccess;
+use codex_protocol::protocol::ReadOnlyAccess;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::io;
@@ -51,7 +56,7 @@ pub struct FileSystemSandboxContext {
     pub windows_sandbox_private_desktop: bool,
     #[serde(default)]
     pub use_legacy_landlock: bool,
-    pub additional_permissions: Option<PermissionProfile>,
+    pub additional_permissions: Option<AdditionalPermissionProfile>,
 }
 
 impl FileSystemSandboxContext {
@@ -67,11 +72,77 @@ impl FileSystemSandboxContext {
         }
     }
 
+    pub fn from_permission_profile(permission_profile: PermissionProfile) -> Self {
+        Self::from_permission_profile_with_optional_cwd(permission_profile, None)
+    }
+
+    pub fn from_permission_profile_with_cwd(
+        permission_profile: PermissionProfile,
+        cwd: AbsolutePathBuf,
+    ) -> Self {
+        Self::from_permission_profile_with_optional_cwd(permission_profile, Some(cwd))
+    }
+
+    fn from_permission_profile_with_optional_cwd(
+        permission_profile: PermissionProfile,
+        cwd: Option<AbsolutePathBuf>,
+    ) -> Self {
+        let (file_system_sandbox_policy, network_sandbox_policy) =
+            permission_profile.to_runtime_permissions();
+        let projection_cwd = cwd
+            .as_ref()
+            .cloned()
+            .or_else(|| AbsolutePathBuf::current_dir().ok());
+        let sandbox_policy = projection_cwd
+            .as_ref()
+            .and_then(|cwd| {
+                permission_profile
+                    .to_legacy_sandbox_policy(cwd.as_path())
+                    .ok()
+            })
+            .unwrap_or_else(|| {
+                fallback_sandbox_policy_for_profile(&permission_profile, network_sandbox_policy)
+            });
+
+        Self {
+            sandbox_policy,
+            sandbox_policy_cwd: cwd,
+            file_system_sandbox_policy: Some(file_system_sandbox_policy),
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            windows_sandbox_private_desktop: false,
+            use_legacy_landlock: false,
+            additional_permissions: None,
+        }
+    }
+
     pub fn should_run_in_sandbox(&self) -> bool {
         matches!(
             self.sandbox_policy,
             SandboxPolicy::ReadOnly { .. } | SandboxPolicy::WorkspaceWrite { .. }
         )
+    }
+}
+
+fn fallback_sandbox_policy_for_profile(
+    permission_profile: &PermissionProfile,
+    network_sandbox_policy: NetworkSandboxPolicy,
+) -> SandboxPolicy {
+    match permission_profile.enforcement() {
+        SandboxEnforcement::Managed => SandboxPolicy::WorkspaceWrite {
+            writable_roots: Vec::new(),
+            read_only_access: ReadOnlyAccess::default(),
+            network_access: network_sandbox_policy.is_enabled(),
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        },
+        SandboxEnforcement::Disabled => SandboxPolicy::DangerFullAccess,
+        SandboxEnforcement::External => SandboxPolicy::ExternalSandbox {
+            network_access: if network_sandbox_policy.is_enabled() {
+                NetworkAccess::Enabled
+            } else {
+                NetworkAccess::Restricted
+            },
+        },
     }
 }
 

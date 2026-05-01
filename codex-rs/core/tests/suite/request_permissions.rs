@@ -6,7 +6,6 @@ use codex_core::sandboxing::SandboxPermissions;
 use codex_features::Feature;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::FileSystemPermissions;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
@@ -293,20 +292,20 @@ fn workspace_write_excluding_tmp() -> SandboxPolicy {
 
 fn requested_directory_write_permissions(path: &Path) -> RequestPermissionProfile {
     RequestPermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![absolute_path(path)]),
-        }),
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![absolute_path(path)]),
+        )),
         ..RequestPermissionProfile::default()
     }
 }
 
 fn normalized_directory_write_permissions(path: &Path) -> Result<RequestPermissionProfile> {
     Ok(RequestPermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![AbsolutePathBuf::try_from(path.canonicalize()?)?]),
-        }),
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![AbsolutePathBuf::try_from(path.canonicalize()?)?]),
+        )),
         ..RequestPermissionProfile::default()
     })
 }
@@ -323,7 +322,10 @@ async fn with_additional_permissions_requires_approval_under_on_request() -> Res
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -342,12 +344,12 @@ async fn with_additional_permissions_requires_approval_under_on_request() -> Res
     let _ = fs::remove_file(&requested_write);
     let call_id = "request_permissions_skip_approval";
     let command = "touch requested-dir/requested-but-unused.txt";
-    let requested_permissions = PermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![absolute_path(&requested_dir_canonical)]),
-        }),
-        ..Default::default()
+    let requested_permissions = RequestPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![absolute_path(&requested_dir_canonical)]),
+        )),
+        ..RequestPermissionProfile::default()
     };
     let event = shell_event_with_request_permissions(call_id, command, &requested_permissions)?;
 
@@ -373,7 +375,7 @@ async fn with_additional_permissions_requires_approval_under_on_request() -> Res
     let approval = expect_exec_approval(&test, command).await;
     assert_eq!(
         approval.additional_permissions,
-        Some(requested_permissions.clone())
+        Some(requested_permissions.clone().into())
     );
     test.codex
         .submit(Op::ExecApproval {
@@ -400,8 +402,8 @@ async fn with_additional_permissions_requires_approval_under_on_request() -> Res
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn request_permissions_tool_is_auto_denied_when_granular_request_permissions_is_disabled()
--> Result<()> {
+async fn request_permissions_tool_fails_when_granular_request_permissions_is_disabled() -> Result<()>
+{
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
@@ -418,7 +420,10 @@ async fn request_permissions_tool_is_auto_denied_when_granular_request_permissio
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::RequestPermissionsTool)
@@ -429,7 +434,7 @@ async fn request_permissions_tool_is_auto_denied_when_granular_request_permissio
     let requested_dir = test.workspace_path("request-permissions-reject");
     fs::create_dir_all(&requested_dir)?;
     let requested_permissions = requested_directory_write_permissions(&requested_dir);
-    let call_id = "request_permissions_reject_auto_denied";
+    let call_id = "request_permissions_disabled_policy_failure";
     let event = request_permissions_tool_event(
         call_id,
         "Request access through the standalone tool",
@@ -474,15 +479,13 @@ async fn request_permissions_tool_is_auto_denied_when_granular_request_permissio
         "request_permissions should not emit a prompt when granular.request_permissions is false: {event:?}"
     );
 
-    let call_output = results.single_request().function_call_output(call_id);
-    let result: RequestPermissionsResponse =
-        serde_json::from_str(call_output["output"].as_str().unwrap_or_default())?;
+    let (content, _success) = results
+        .single_request()
+        .function_call_output_content_and_success(call_id)
+        .expect("request_permissions output should be returned to the model");
     assert_eq!(
-        result,
-        RequestPermissionsResponse {
-            permissions: RequestPermissionProfile::default(),
-            scope: PermissionGrantScope::Turn,
-        }
+        content.as_deref(),
+        Some("request_permissions is disabled by granular.request_permissions = false")
     );
 
     Ok(())
@@ -500,7 +503,10 @@ async fn relative_additional_permissions_resolve_against_tool_workdir() -> Resul
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -520,12 +526,12 @@ async fn relative_additional_permissions_resolve_against_tool_workdir() -> Resul
 
     let call_id = "request_permissions_relative_workdir";
     let command = "touch relative-write.txt";
-    let expected_permissions = PermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: None,
-            write: Some(vec![absolute_path(&nested_dir_canonical)]),
-        }),
-        ..Default::default()
+    let expected_permissions = RequestPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            /*read*/ None,
+            Some(vec![absolute_path(&nested_dir_canonical)]),
+        )),
+        ..RequestPermissionProfile::default()
     };
     let event = shell_event_with_raw_request_permissions(
         call_id,
@@ -561,7 +567,7 @@ async fn relative_additional_permissions_resolve_against_tool_workdir() -> Resul
     let approval = expect_exec_approval(&test, command).await;
     assert_eq!(
         approval.additional_permissions,
-        Some(expected_permissions.clone())
+        Some(expected_permissions.clone().into())
     );
     test.codex
         .submit(Op::ExecApproval {
@@ -601,7 +607,10 @@ async fn read_only_with_additional_permissions_does_not_widen_to_unrequested_cwd
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -623,12 +632,12 @@ async fn read_only_with_additional_permissions_does_not_widen_to_unrequested_cwd
         "printf {:?} > {:?} && cat {:?}",
         "cwd-widened", unrequested_write, unrequested_write
     );
-    let requested_permissions = PermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![absolute_path(&requested_write)]),
-        }),
-        ..Default::default()
+    let requested_permissions = RequestPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![absolute_path(&requested_write)]),
+        )),
+        ..RequestPermissionProfile::default()
     };
     let event = shell_event_with_request_permissions(call_id, &command, &requested_permissions)?;
 
@@ -701,7 +710,10 @@ async fn read_only_with_additional_permissions_does_not_widen_to_unrequested_tmp
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -724,12 +736,12 @@ async fn read_only_with_additional_permissions_does_not_widen_to_unrequested_tmp
         "printf {:?} > {:?} && cat {:?}",
         "tmp-widened", tmp_write, tmp_write
     );
-    let requested_permissions = PermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![absolute_path(&requested_write)]),
-        }),
-        ..Default::default()
+    let requested_permissions = RequestPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![absolute_path(&requested_write)]),
+        )),
+        ..RequestPermissionProfile::default()
     };
     let event = shell_event_with_request_permissions(call_id, &command, &requested_permissions)?;
 
@@ -800,7 +812,10 @@ async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> 
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -824,19 +839,19 @@ async fn workspace_write_with_additional_permissions_can_write_outside_cwd() -> 
         "outside-cwd-ok", outside_write, outside_write
     );
     let requested_permissions = RequestPermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![absolute_path(outside_dir.path())]),
-        }),
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![absolute_path(outside_dir.path())]),
+        )),
         ..RequestPermissionProfile::default()
     };
     let normalized_requested_permissions = RequestPermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![AbsolutePathBuf::try_from(
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![AbsolutePathBuf::try_from(
                 outside_dir.path().canonicalize()?,
             )?]),
-        }),
+        )),
         ..RequestPermissionProfile::default()
     };
     let event = shell_event_with_request_permissions(call_id, &command, &requested_permissions)?;
@@ -904,7 +919,10 @@ async fn with_additional_permissions_denied_approval_blocks_execution() -> Resul
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -925,21 +943,21 @@ async fn with_additional_permissions_denied_approval_blocks_execution() -> Resul
         "printf {:?} > {:?} && cat {:?}",
         "should-not-write", outside_write, outside_write
     );
-    let requested_permissions = PermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![absolute_path(outside_dir.path())]),
-        }),
-        ..Default::default()
+    let requested_permissions = RequestPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![absolute_path(outside_dir.path())]),
+        )),
+        ..RequestPermissionProfile::default()
     };
-    let normalized_requested_permissions = PermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![AbsolutePathBuf::try_from(
+    let normalized_requested_permissions = RequestPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![AbsolutePathBuf::try_from(
                 outside_dir.path().canonicalize()?,
             )?]),
-        }),
-        ..Default::default()
+        )),
+        ..RequestPermissionProfile::default()
     };
     let event = shell_event_with_request_permissions(call_id, &command, &requested_permissions)?;
 
@@ -966,7 +984,7 @@ async fn with_additional_permissions_denied_approval_blocks_execution() -> Resul
     let approval = expect_exec_approval(&test, &command).await;
     assert_eq!(
         approval.additional_permissions,
-        Some(normalized_requested_permissions)
+        Some(normalized_requested_permissions.into())
     );
     test.codex
         .submit(Op::ExecApproval {
@@ -1009,7 +1027,10 @@ async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Resul
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -1028,19 +1049,19 @@ async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Resul
         "sticky-grant-ok", outside_write, outside_write
     );
     let requested_permissions = RequestPermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![absolute_path(outside_dir.path())]),
-        }),
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![absolute_path(outside_dir.path())]),
+        )),
         ..Default::default()
     };
     let normalized_requested_permissions = RequestPermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![AbsolutePathBuf::try_from(
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![AbsolutePathBuf::try_from(
                 outside_dir.path().canonicalize()?,
             )?]),
-        }),
+        )),
         ..Default::default()
     };
     let responses = mount_sse_sequence(
@@ -1088,6 +1109,7 @@ async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Resul
             response: RequestPermissionsResponse {
                 permissions: normalized_requested_permissions.clone(),
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             },
         })
         .await?;
@@ -1132,7 +1154,10 @@ async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_req
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -1202,6 +1227,7 @@ async fn request_permissions_preapprove_explicit_exec_permissions_outside_on_req
             response: RequestPermissionsResponse {
                 permissions: normalized_requested_permissions,
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             },
         })
         .await?;
@@ -1249,7 +1275,10 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Resu
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -1315,6 +1344,7 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls() -> Resu
             response: RequestPermissionsResponse {
                 permissions: normalized_requested_permissions.clone(),
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             },
         })
         .await?;
@@ -1360,7 +1390,10 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls_without_i
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::RequestPermissionsTool)
@@ -1424,6 +1457,7 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls_without_i
             response: RequestPermissionsResponse {
                 permissions: normalized_requested_permissions.clone(),
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             },
         })
         .await?;
@@ -1471,7 +1505,10 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -1492,36 +1529,36 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
     );
 
     let requested_permissions = RequestPermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![
                 absolute_path(first_dir.path()),
                 absolute_path(second_dir.path()),
             ]),
-        }),
+        )),
         ..RequestPermissionProfile::default()
     };
     let normalized_requested_permissions = RequestPermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![
                 AbsolutePathBuf::try_from(first_dir.path().canonicalize()?)?,
                 AbsolutePathBuf::try_from(second_dir.path().canonicalize()?)?,
             ]),
-        }),
+        )),
         ..RequestPermissionProfile::default()
     };
     let granted_permissions = normalized_directory_write_permissions(first_dir.path())?;
     let second_dir_permissions = requested_directory_write_permissions(second_dir.path());
-    let merged_permissions = PermissionProfile {
-        file_system: Some(FileSystemPermissions {
-            read: Some(vec![]),
-            write: Some(vec![
+    let merged_permissions = RequestPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![
                 AbsolutePathBuf::try_from(first_dir.path().canonicalize()?)?,
                 AbsolutePathBuf::try_from(second_dir.path().canonicalize()?)?,
             ]),
-        }),
-        ..Default::default()
+        )),
+        ..RequestPermissionProfile::default()
     };
 
     let responses = mount_sse_sequence(
@@ -1570,6 +1607,7 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
             response: RequestPermissionsResponse {
                 permissions: granted_permissions.clone(),
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             },
         })
         .await?;
@@ -1584,16 +1622,21 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
     let approval_file_system = approval_permissions
         .file_system
         .unwrap_or_else(|| panic!("expected filesystem permissions"));
-    assert!(approval_file_system.read.as_ref().is_none_or(Vec::is_empty));
+    let (approval_reads, approval_writes) = approval_file_system
+        .legacy_read_write_roots()
+        .unwrap_or_else(|| panic!("expected legacy read/write filesystem permissions"));
+    assert!(approval_reads.as_ref().is_none_or(Vec::is_empty));
 
-    let mut approval_writes = approval_file_system.write.unwrap_or_default();
+    let mut approval_writes = approval_writes.unwrap_or_default();
     approval_writes.sort_by_key(|path| path.display().to_string());
 
-    let mut expected_writes = merged_permissions
+    let expected_file_system = merged_permissions
         .file_system
-        .unwrap_or_else(|| panic!("expected merged filesystem permissions"))
-        .write
-        .unwrap_or_default();
+        .unwrap_or_else(|| panic!("expected merged filesystem permissions"));
+    let (_, expected_writes) = expected_file_system
+        .legacy_read_write_roots()
+        .unwrap_or_else(|| panic!("expected legacy read/write filesystem permissions"));
+    let mut expected_writes = expected_writes.unwrap_or_default();
     expected_writes.sort_by_key(|path| path.display().to_string());
 
     assert_eq!(approval_writes, expected_writes);
@@ -1630,7 +1673,10 @@ async fn request_permissions_grants_do_not_carry_across_turns() -> Result<()> {
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -1687,6 +1733,7 @@ async fn request_permissions_grants_do_not_carry_across_turns() -> Result<()> {
             response: RequestPermissionsResponse {
                 permissions: normalized_requested_permissions,
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             },
         })
         .await?;
@@ -1742,7 +1789,10 @@ async fn request_permissions_session_grants_carry_across_turns() -> Result<()> {
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config
+            .permissions
+            .set_legacy_sandbox_policy(sandbox_policy_for_config, config.cwd.as_path())
+            .expect("test sandbox policy should be valid");
         config
             .features
             .enable(Feature::ExecPermissionApprovals)
@@ -1804,6 +1854,7 @@ async fn request_permissions_session_grants_carry_across_turns() -> Result<()> {
             response: RequestPermissionsResponse {
                 permissions: normalized_requested_permissions,
                 scope: PermissionGrantScope::Session,
+                strict_auto_review: false,
             },
         })
         .await?;

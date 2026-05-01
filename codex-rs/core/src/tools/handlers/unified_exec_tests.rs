@@ -2,8 +2,8 @@ use super::*;
 use crate::shell::default_user_shell;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_workdir_base_path;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
-use codex_protocol::models::PermissionProfile;
 use codex_tools::UnifiedExecShellMode;
 use codex_tools::ZshForkConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -187,11 +187,11 @@ fn exec_command_args_resolve_relative_additional_permissions_against_workdir() -
 
     assert_eq!(
         args.additional_permissions,
-        Some(PermissionProfile {
-            file_system: Some(FileSystemPermissions {
-                read: None,
-                write: Some(vec![expected_write.abs()]),
-            }),
+        Some(AdditionalPermissionProfile {
+            file_system: Some(FileSystemPermissions::from_read_write_roots(
+                /*read*/ None,
+                Some(vec![expected_write.abs()]),
+            )),
             ..Default::default()
         })
     );

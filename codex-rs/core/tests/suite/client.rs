@@ -1646,7 +1646,9 @@ async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Re
             cwd: config.cwd.to_path_buf(),
             approval_policy: config.permissions.approval_policy.value(),
             approvals_reviewer: None,
-            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
+            sandbox_policy: config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
             model: session_configured.model.clone(),
             effort: Some(ReasoningEffort::Low),
             summary: Some(
@@ -1765,7 +1767,9 @@ async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default() 
             cwd: config.cwd.to_path_buf(),
             approval_policy: config.permissions.approval_policy.value(),
             approvals_reviewer: None,
-            sandbox_policy: config.permissions.sandbox_policy.get().clone(),
+            sandbox_policy: config
+                .permissions
+                .legacy_sandbox_policy(config.cwd.as_path()),
             model: session_configured.model,
             effort: None,
             summary: Some(ReasoningSummary::Concise),

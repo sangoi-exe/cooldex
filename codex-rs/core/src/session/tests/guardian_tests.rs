@@ -17,14 +17,22 @@ use codex_execpolicy::Evaluation;
 use codex_execpolicy::RuleMatch;
 use codex_features::Feature;
 use codex_model_provider::create_model_provider;
+use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::request_permissions::PermissionGrantScope;
+use codex_protocol::request_permissions::RequestPermissionProfile;
+use codex_protocol::request_permissions::RequestPermissionsArgs;
+use codex_protocol::request_permissions::RequestPermissionsResponse;
 use core_test_support::codex_linux_sandbox_exe_or_skip;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -37,10 +45,339 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::tempdir;
 
 fn expect_text_output(output: &FunctionToolOutput) -> String {
     function_call_output_content_items_to_text(&output.body).unwrap_or_default()
+}
+
+fn request_network_permissions() -> RequestPermissionProfile {
+    RequestPermissionProfile {
+        network: Some(NetworkPermissions {
+            enabled: Some(true),
+        }),
+        ..RequestPermissionProfile::default()
+    }
+}
+
+async fn await_request_permissions_auto_review(
+    future: impl std::future::Future<Output = Result<RequestPermissionsResponse, String>>,
+) -> Result<RequestPermissionsResponse, String> {
+    tokio::time::timeout(Duration::from_secs(15), future)
+        .await
+        .expect("request_permissions Auto-review should finish without waiting for client approval")
+}
+
+async fn configure_request_permissions_auto_review(
+    session: &mut Arc<Session>,
+    turn_context: &mut Arc<TurnContext>,
+    model_base_url: String,
+) {
+    configure_request_permissions_auto_review_with_policy(
+        session,
+        turn_context,
+        model_base_url,
+        AskForApproval::OnRequest,
+    )
+    .await;
+}
+
+async fn configure_request_permissions_auto_review_with_policy(
+    session: &mut Arc<Session>,
+    turn_context: &mut Arc<TurnContext>,
+    model_base_url: String,
+    approval_policy: AskForApproval,
+) {
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    let turn_context_raw = Arc::get_mut(turn_context).expect("single turn context ref");
+    turn_context_raw
+        .approval_policy
+        .set(approval_policy)
+        .expect("test setup should allow updating approval policy");
+    turn_context_raw
+        .features
+        .enable(Feature::GuardianApproval)
+        .expect("test setup should allow enabling guardian approvals");
+    let mut config = (*turn_context_raw.config).clone();
+    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    config.model_provider.base_url = Some(model_base_url);
+    let config = Arc::new(config);
+    let models_manager = Arc::new(crate::test_support::models_manager_with_provider(
+        config.codex_home.to_path_buf(),
+        Arc::clone(&session.services.auth_manager),
+        config.model_provider.clone(),
+    ));
+    Arc::get_mut(session)
+        .expect("single session ref")
+        .services
+        .models_manager = models_manager;
+    turn_context_raw.config = Arc::clone(&config);
+    turn_context_raw.provider = create_model_provider(
+        config.model_provider.clone(),
+        turn_context_raw.auth_manager.clone(),
+    );
+}
+
+#[tokio::test]
+async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
+    let server = start_mock_server().await;
+    let guardian_request_log = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-guardian"),
+            ev_assistant_message(
+                "msg-guardian",
+                &serde_json::json!({
+                    "risk_level": "low",
+                    "user_authorization": "high",
+                    "outcome": "allow",
+                    "rationale": "The request only enables network access for this turn.",
+                })
+                .to_string(),
+            ),
+            ev_completed("resp-guardian"),
+        ]),
+    )
+    .await;
+
+    let (mut session, mut turn_context, rx_event) = make_session_and_context_with_rx().await;
+    configure_request_permissions_auto_review(
+        &mut session,
+        &mut turn_context,
+        format!("{}/v1", server.uri()),
+    )
+    .await;
+
+    let requested_permissions = request_network_permissions();
+    let response = await_request_permissions_auto_review(session.request_permissions(
+        &turn_context,
+        "perm-call-auto-review".to_string(),
+        RequestPermissionsArgs {
+            reason: Some("need network".to_string()),
+            permissions: requested_permissions.clone(),
+        },
+    ))
+    .await;
+
+    assert_eq!(
+        response,
+        Ok(RequestPermissionsResponse {
+            permissions: requested_permissions.clone(),
+            scope: PermissionGrantScope::Turn,
+            strict_auto_review: false,
+        })
+    );
+    assert_eq!(
+        session.granted_turn_permissions().await,
+        Some(requested_permissions.into())
+    );
+
+    let guardian_request = guardian_request_log.single_request();
+    assert_eq!(guardian_request.path(), "/v1/responses");
+    assert!(guardian_request.body_contains_text("request_permissions"));
+    assert!(guardian_request.body_contains_text("need network"));
+
+    let mut saw_guardian_request_permissions = false;
+    while let Ok(event) = rx_event.try_recv() {
+        match event.msg {
+            EventMsg::GuardianAssessment(event) => {
+                saw_guardian_request_permissions |= matches!(
+                    event.action,
+                    codex_protocol::approvals::GuardianAssessmentAction::RequestPermissions { .. }
+                );
+            }
+            EventMsg::RequestPermissions(_) => {
+                panic!("Auto-review should not emit a manual request_permissions event");
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_guardian_request_permissions);
+}
+
+async fn assert_request_permissions_auto_review_routes_for_policy(
+    approval_policy: AskForApproval,
+    call_id: &str,
+) {
+    let server = start_mock_server().await;
+    let guardian_request_log = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-guardian"),
+            ev_assistant_message(
+                "msg-guardian",
+                &serde_json::json!({
+                    "risk_level": "low",
+                    "user_authorization": "high",
+                    "outcome": "allow",
+                    "rationale": "The request only enables network access for this turn.",
+                })
+                .to_string(),
+            ),
+            ev_completed("resp-guardian"),
+        ]),
+    )
+    .await;
+
+    let (mut session, mut turn_context, rx_event) = make_session_and_context_with_rx().await;
+    configure_request_permissions_auto_review_with_policy(
+        &mut session,
+        &mut turn_context,
+        format!("{}/v1", server.uri()),
+        approval_policy,
+    )
+    .await;
+
+    let requested_permissions = request_network_permissions();
+    let response = await_request_permissions_auto_review(session.request_permissions(
+        &turn_context,
+        call_id.to_string(),
+        RequestPermissionsArgs {
+            reason: Some("need network".to_string()),
+            permissions: requested_permissions.clone(),
+        },
+    ))
+    .await;
+
+    assert_eq!(
+        response,
+        Ok(RequestPermissionsResponse {
+            permissions: requested_permissions.clone(),
+            scope: PermissionGrantScope::Turn,
+            strict_auto_review: false,
+        })
+    );
+    assert_eq!(
+        session.granted_turn_permissions().await,
+        Some(requested_permissions.into())
+    );
+
+    let guardian_request = guardian_request_log.single_request();
+    assert_eq!(guardian_request.path(), "/v1/responses");
+    assert!(guardian_request.body_contains_text("request_permissions"));
+
+    let mut saw_guardian_request_permissions = false;
+    while let Ok(event) = rx_event.try_recv() {
+        match event.msg {
+            EventMsg::GuardianAssessment(event) => {
+                saw_guardian_request_permissions |= matches!(
+                    event.action,
+                    codex_protocol::approvals::GuardianAssessmentAction::RequestPermissions { .. }
+                );
+            }
+            EventMsg::RequestPermissions(_) => {
+                panic!("Auto-review should not emit a manual request_permissions event");
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_guardian_request_permissions);
+}
+
+#[tokio::test]
+async fn request_permissions_auto_review_routes_on_failure_without_client_event() {
+    assert_request_permissions_auto_review_routes_for_policy(
+        AskForApproval::OnFailure,
+        "perm-call-auto-review-on-failure",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn request_permissions_auto_review_routes_unless_trusted_without_client_event() {
+    assert_request_permissions_auto_review_routes_for_policy(
+        AskForApproval::UnlessTrusted,
+        "perm-call-auto-review-unless-trusted",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn request_permissions_guardian_denial_returns_empty_permissions() {
+    let server = start_mock_server().await;
+    let _guardian_request_log = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-guardian"),
+            ev_assistant_message(
+                "msg-guardian",
+                &serde_json::json!({
+                    "risk_level": "high",
+                    "user_authorization": "low",
+                    "outcome": "deny",
+                    "rationale": "The request is not justified.",
+                })
+                .to_string(),
+            ),
+            ev_completed("resp-guardian"),
+        ]),
+    )
+    .await;
+
+    let (mut session, mut turn_context, _rx_event) = make_session_and_context_with_rx().await;
+    configure_request_permissions_auto_review(
+        &mut session,
+        &mut turn_context,
+        format!("{}/v1", server.uri()),
+    )
+    .await;
+
+    let response = await_request_permissions_auto_review(session.request_permissions(
+        &turn_context,
+        "perm-call-denied".to_string(),
+        RequestPermissionsArgs {
+            reason: Some("need network".to_string()),
+            permissions: request_network_permissions(),
+        },
+    ))
+    .await;
+
+    assert_eq!(
+        response,
+        Ok(RequestPermissionsResponse {
+            permissions: RequestPermissionProfile::default(),
+            scope: PermissionGrantScope::Turn,
+            strict_auto_review: false,
+        })
+    );
+    assert_eq!(session.granted_turn_permissions().await, None);
+}
+
+#[tokio::test]
+async fn request_permissions_guardian_error_uses_failure_channel() {
+    let server = start_mock_server().await;
+    let _guardian_request_log = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-guardian"),
+            ev_assistant_message("msg-guardian", "not guardian json"),
+            ev_completed("resp-guardian"),
+        ]),
+    )
+    .await;
+
+    let (mut session, mut turn_context, _rx_event) = make_session_and_context_with_rx().await;
+    configure_request_permissions_auto_review(
+        &mut session,
+        &mut turn_context,
+        format!("{}/v1", server.uri()),
+    )
+    .await;
+
+    let err = await_request_permissions_auto_review(session.request_permissions(
+        &turn_context,
+        "perm-call-error".to_string(),
+        RequestPermissionsArgs {
+            reason: Some("need network".to_string()),
+            permissions: request_network_permissions(),
+        },
+    ))
+    .await
+    .expect_err("guardian parse failures should use the failure channel");
+
+    assert!(err.contains("Automatic approval review failed"));
+    assert_eq!(session.granted_turn_permissions().await, None);
 }
 
 #[tokio::test]
@@ -79,17 +416,17 @@ async fn guardian_allows_shell_additional_permissions_requests_past_policy_valid
         .features
         .enable(Feature::ExecPermissionApprovals)
         .expect("test setup should allow enabling request permissions");
-    turn_context_raw
-        .sandbox_policy
-        .set(SandboxPolicy::DangerFullAccess)
-        .expect("test setup should allow updating sandbox policy");
     // This test is about request-permissions validation, not managed sandbox
-    // policy enforcement. Widen the derived sandbox policies directly so the
+    // policy enforcement. Widen the canonical permission profile directly so the
     // command runs without depending on a platform sandbox binary.
-    turn_context_raw.file_system_sandbox_policy =
-        FileSystemSandboxPolicy::from(turn_context_raw.sandbox_policy.get());
-    turn_context_raw.network_sandbox_policy =
-        NetworkSandboxPolicy::from(turn_context_raw.sandbox_policy.get());
+    let file_system_sandbox_policy =
+        FileSystemSandboxPolicy::from(&SandboxPolicy::DangerFullAccess);
+    turn_context_raw.permission_profile =
+        PermissionProfile::from_runtime_permissions_with_enforcement(
+            SandboxEnforcement::from_legacy_sandbox_policy(&SandboxPolicy::DangerFullAccess),
+            &file_system_sandbox_policy,
+            NetworkSandboxPolicy::from(&SandboxPolicy::DangerFullAccess),
+        );
     let mut config = (*turn_context_raw.config).clone();
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
     let config = Arc::new(config);
@@ -153,7 +490,7 @@ async fn guardian_allows_shell_additional_permissions_requests_past_policy_valid
                     "workdir": Some(turn_context.cwd.to_string_lossy().to_string()),
                     "timeout_ms": params.expiration.timeout_ms(),
                     "sandbox_permissions": params.sandbox_permissions,
-                    "additional_permissions": PermissionProfile {
+                    "additional_permissions": AdditionalPermissionProfile {
                         network: Some(NetworkPermissions {
                             enabled: Some(true),
                         }),
@@ -308,7 +645,7 @@ async fn shell_handler_allows_sticky_turn_permissions_without_inline_request_per
         let mut active_turn = session.active_turn.lock().await;
         let active_turn = active_turn.as_mut().expect("active turn");
         let mut turn_state = active_turn.turn_state.lock().await;
-        turn_state.record_granted_permissions(PermissionProfile {
+        turn_state.record_granted_permissions(AdditionalPermissionProfile {
             network: Some(NetworkPermissions {
                 enabled: Some(true),
             }),

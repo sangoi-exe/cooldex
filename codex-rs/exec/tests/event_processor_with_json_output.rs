@@ -119,6 +119,7 @@ fn session_configured_produces_thread_started_event() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
+        permission_profile: codex_protocol::models::PermissionProfile::default(),
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         cwd: test_path_buf("/tmp/project").abs(),
         reasoning_effort: None,

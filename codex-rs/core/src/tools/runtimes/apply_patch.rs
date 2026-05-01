@@ -27,7 +27,7 @@ use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
-use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::FileChange;
@@ -47,7 +47,7 @@ pub struct ApplyPatchRequest {
     pub file_paths: Vec<AbsolutePathBuf>,
     pub changes: std::collections::HashMap<PathBuf, FileChange>,
     pub exec_approval_requirement: ExecApprovalRequirement,
-    pub additional_permissions: Option<PermissionProfile>,
+    pub additional_permissions: Option<AdditionalPermissionProfile>,
     pub permissions_preapproved: bool,
 }
 
@@ -125,28 +125,39 @@ impl ApplyPatchRuntime {
     fn file_system_sandbox_context_for_attempt(
         req: &ApplyPatchRequest,
         attempt: &SandboxAttempt<'_>,
-    ) -> Option<FileSystemSandboxContext> {
+    ) -> Result<Option<FileSystemSandboxContext>, ToolError> {
         if attempt.sandbox == SandboxType::None {
-            return None;
+            return Ok(None);
         }
 
-        let legacy_file_system_sandbox_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy(
-            attempt.policy,
-            attempt.sandbox_cwd,
-        );
-        let file_system_sandbox_policy = (attempt.file_system_policy
-            != &legacy_file_system_sandbox_policy)
-            .then(|| attempt.file_system_policy.clone());
+        let (base_file_system_sandbox_policy, _base_network_policy) =
+            attempt.permissions.to_runtime_permissions();
+        let sandbox_policy = attempt
+            .permissions
+            .to_legacy_sandbox_policy(attempt.sandbox_cwd.as_path())
+            .map_err(|error| {
+                ToolError::Rejected(format!(
+                    "failed to project apply_patch sandbox policy for remote filesystem: {error}"
+                ))
+            })?;
+        let legacy_file_system_sandbox_policy =
+            FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+                &sandbox_policy,
+                attempt.sandbox_cwd.as_path(),
+            );
+        let file_system_sandbox_policy = (base_file_system_sandbox_policy
+            != legacy_file_system_sandbox_policy)
+            .then_some(base_file_system_sandbox_policy);
 
-        Some(FileSystemSandboxContext {
-            sandbox_policy: attempt.policy.clone(),
+        Ok(Some(FileSystemSandboxContext {
+            sandbox_policy,
             sandbox_policy_cwd: Some(attempt.sandbox_cwd.clone()),
             file_system_sandbox_policy,
             windows_sandbox_level: attempt.windows_sandbox_level,
             windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
             use_legacy_landlock: attempt.use_legacy_landlock,
             additional_permissions: req.additional_permissions.clone(),
-        })
+        }))
     }
 
     async fn run_with_executor_filesystem(
@@ -281,7 +292,7 @@ impl ToolRuntime<ApplyPatchRequest, ExecToolCallOutput> for ApplyPatchRuntime {
         })?;
         if environment.is_remote() {
             let fs = environment.get_filesystem();
-            let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
+            let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt)?;
             return Ok(
                 Self::run_with_executor_filesystem(req, fs.as_ref(), sandbox.as_ref()).await,
             );

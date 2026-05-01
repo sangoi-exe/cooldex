@@ -23,7 +23,9 @@ use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind;
+use codex_app_server_protocol::PermissionProfile;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::SandboxMode;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SessionSource;
@@ -46,6 +48,7 @@ use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::Personality;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::PermissionProfile as CorePermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
@@ -1306,6 +1309,28 @@ async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> R
         primary.read_stream_until_notification_message("turn/started"),
     )
     .await??;
+
+    let dual_resume_id = primary
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            sandbox: Some(SandboxMode::ReadOnly),
+            permission_profile: Some(PermissionProfile::from(CorePermissionProfile::default())),
+            ..Default::default()
+        })
+        .await?;
+    let dual_resume_err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_error_message(RequestId::Integer(dual_resume_id)),
+    )
+    .await??;
+    assert!(
+        dual_resume_err
+            .error
+            .message
+            .contains("cannot combine sandbox and permissionProfile"),
+        "unexpected resume error: {}",
+        dual_resume_err.error.message
+    );
 
     let resume_id = primary
         .send_thread_resume_request(ThreadResumeParams {

@@ -11,6 +11,7 @@ use codex_protocol::protocol::GuardianUserAuthorization;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::WarningEvent;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::session::Session;
@@ -80,6 +81,26 @@ pub(super) enum GuardianReviewOutcome {
     Aborted,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GuardianReviewDecision {
+    Approved,
+    Denied,
+    TimedOut,
+    Aborted,
+    Failed(String),
+}
+
+impl GuardianReviewDecision {
+    fn into_review_decision(self) -> ReviewDecision {
+        match self {
+            Self::Approved => ReviewDecision::Approved,
+            Self::Denied | Self::Failed(_) => ReviewDecision::Denied,
+            Self::TimedOut => ReviewDecision::TimedOut,
+            Self::Aborted => ReviewDecision::Abort,
+        }
+    }
+}
+
 fn guardian_risk_level_str(level: GuardianRiskLevel) -> &'static str {
     match level {
         GuardianRiskLevel::Low => "low",
@@ -89,12 +110,17 @@ fn guardian_risk_level_str(level: GuardianRiskLevel) -> &'static str {
     }
 }
 
-/// Whether this turn should route `on-request` approval prompts through the
-/// guardian reviewer instead of surfacing them to the user. ARC may still
-/// block actions earlier in the flow.
+/// Whether this turn should route allowed approval prompts through the guardian
+/// reviewer instead of surfacing them to the user. ARC may still block actions
+/// earlier in the flow.
 pub(crate) fn routes_approval_to_guardian(turn: &TurnContext) -> bool {
-    turn.approval_policy.value() == AskForApproval::OnRequest
-        && turn.config.approvals_reviewer == ApprovalsReviewer::GuardianSubagent
+    matches!(
+        turn.approval_policy.value(),
+        AskForApproval::OnFailure
+            | AskForApproval::OnRequest
+            | AskForApproval::UnlessTrusted
+            | AskForApproval::Granular(_)
+    ) && turn.config.approvals_reviewer == ApprovalsReviewer::AutoReview
 }
 
 pub(crate) fn is_guardian_reviewer_source(
@@ -117,7 +143,7 @@ async fn run_guardian_review(
     request: GuardianApprovalRequest,
     retry_reason: Option<String>,
     external_cancel: Option<CancellationToken>,
-) -> ReviewDecision {
+) -> GuardianReviewDecision {
     let target_item_id = guardian_request_target_item_id(&request).map(str::to_string);
     let assessment_turn_id = guardian_request_turn_id(&request, &turn.sub_id).to_string();
     let action_summary = guardian_assessment_action(&request);
@@ -158,7 +184,7 @@ async fn run_guardian_review(
                 }),
             )
             .await;
-        return ReviewDecision::Abort;
+        return GuardianReviewDecision::Aborted;
     }
 
     let schema = guardian_output_schema();
@@ -173,14 +199,20 @@ async fn run_guardian_review(
     ))
     .await;
 
-    let assessment = match outcome {
-        GuardianReviewOutcome::Completed(Ok(assessment)) => assessment,
-        GuardianReviewOutcome::Completed(Err(err)) => GuardianAssessment {
-            risk_level: GuardianRiskLevel::High,
-            user_authorization: GuardianUserAuthorization::Unknown,
-            outcome: GuardianAssessmentOutcome::Deny,
-            rationale: format!("Automatic approval review failed: {err}"),
-        },
+    let (assessment, failure_message) = match outcome {
+        GuardianReviewOutcome::Completed(Ok(assessment)) => (assessment, None),
+        GuardianReviewOutcome::Completed(Err(err)) => {
+            let message = format!("Automatic approval review failed: {err}");
+            (
+                GuardianAssessment {
+                    risk_level: GuardianRiskLevel::High,
+                    user_authorization: GuardianUserAuthorization::Unknown,
+                    outcome: GuardianAssessmentOutcome::Deny,
+                    rationale: message.clone(),
+                },
+                Some(message),
+            )
+        }
         GuardianReviewOutcome::TimedOut => {
             let rationale =
                 "Automatic approval review timed out while evaluating the requested approval."
@@ -209,7 +241,7 @@ async fn run_guardian_review(
                     }),
                 )
                 .await;
-            return ReviewDecision::TimedOut;
+            return GuardianReviewDecision::TimedOut;
         }
         GuardianReviewOutcome::Aborted => {
             session
@@ -228,7 +260,7 @@ async fn run_guardian_review(
                     }),
                 )
                 .await;
-            return ReviewDecision::Abort;
+            return GuardianReviewDecision::Aborted;
         }
     };
 
@@ -289,20 +321,21 @@ async fn run_guardian_review(
         .await;
 
     if approved {
-        ReviewDecision::Approved
+        GuardianReviewDecision::Approved
+    } else if let Some(message) = failure_message {
+        GuardianReviewDecision::Failed(message)
     } else {
-        ReviewDecision::Denied
+        GuardianReviewDecision::Denied
     }
 }
 
-/// Public entrypoint for approval requests that should be reviewed by guardian.
-pub(crate) async fn review_approval_request(
+async fn review_approval_request_detailed(
     session: &Arc<Session>,
     turn: &Arc<TurnContext>,
     review_id: String,
     request: GuardianApprovalRequest,
     retry_reason: Option<String>,
-) -> ReviewDecision {
+) -> GuardianReviewDecision {
     // Box the delegated review future so callers do not inline the entire
     // guardian session state machine into their own async stack.
     Box::pin(run_guardian_review(
@@ -314,6 +347,51 @@ pub(crate) async fn review_approval_request(
         /*external_cancel*/ None,
     ))
     .await
+}
+
+pub(crate) fn spawn_approval_request_review_detailed(
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    review_id: String,
+    request: GuardianApprovalRequest,
+    retry_reason: Option<String>,
+    external_cancel: Option<CancellationToken>,
+) -> oneshot::Receiver<GuardianReviewDecision> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            let _ = tx.send(GuardianReviewDecision::Failed(
+                "failed to initialize automatic approval review runtime".to_string(),
+            ));
+            return;
+        };
+        let decision = runtime.block_on(run_guardian_review(
+            session,
+            turn,
+            review_id,
+            request,
+            retry_reason,
+            external_cancel,
+        ));
+        let _ = tx.send(decision);
+    });
+    rx
+}
+
+/// Public entrypoint for approval requests that should be reviewed by guardian.
+pub(crate) async fn review_approval_request(
+    session: &Arc<Session>,
+    turn: &Arc<TurnContext>,
+    review_id: String,
+    request: GuardianApprovalRequest,
+    retry_reason: Option<String>,
+) -> ReviewDecision {
+    review_approval_request_detailed(session, turn, review_id, request, retry_reason)
+        .await
+        .into_review_decision()
 }
 
 pub(crate) async fn review_approval_request_with_cancel(
@@ -333,6 +411,7 @@ pub(crate) async fn review_approval_request_with_cancel(
         Some(cancel_token),
     ))
     .await
+    .into_review_decision()
 }
 
 /// Runs the guardian in a locked-down reusable review session.

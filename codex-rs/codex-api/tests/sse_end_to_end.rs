@@ -196,7 +196,7 @@ async fn responses_stream_emits_aggregated_output_text_deltas() -> Result<()> {
 
     let body = build_responses_body(vec![delta1, delta2, completed]);
     let transport = FixtureSseTransport::new(body);
-    let client = ResponsesClient::new(transport, provider("openai"), NoAuth);
+    let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth));
 
     let stream = client
         .stream(

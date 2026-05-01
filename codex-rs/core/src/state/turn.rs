@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use codex_protocol::dynamic_tools::DynamicToolResponse;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
@@ -20,9 +22,9 @@ use tokio::sync::oneshot;
 use crate::prompt_gc_sidecar::PromptGcSidecar;
 use crate::session::turn_context::TurnContext;
 use crate::tasks::AnySessionTask;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsage;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 /// Metadata about the currently running turn.
 pub(crate) struct ActiveTurn {
@@ -112,15 +114,22 @@ impl ActiveTurn {
 #[derive(Default)]
 pub(crate) struct TurnState {
     pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
-    pending_request_permissions: HashMap<String, oneshot::Sender<RequestPermissionsResponse>>,
+    pending_request_permissions: HashMap<String, PendingRequestPermissions>,
     pending_user_input: HashMap<String, oneshot::Sender<RequestUserInputResponse>>,
     pending_elicitations: HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>,
     pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
     pending_input: Vec<ResponseInputItem>,
     mailbox_delivery_phase: MailboxDeliveryPhase,
-    granted_permissions: Option<PermissionProfile>,
+    granted_permissions: Option<AdditionalPermissionProfile>,
+    strict_auto_review_enabled: bool,
     pub(crate) tool_calls: u64,
     pub(crate) token_usage_at_turn_start: TokenUsage,
+}
+
+pub(crate) struct PendingRequestPermissions {
+    pub(crate) tx_response: oneshot::Sender<Result<RequestPermissionsResponse, String>>,
+    pub(crate) requested_permissions: RequestPermissionProfile,
+    pub(crate) cwd: AbsolutePathBuf,
 }
 
 impl TurnState {
@@ -151,15 +160,16 @@ impl TurnState {
     pub(crate) fn insert_pending_request_permissions(
         &mut self,
         key: String,
-        tx: oneshot::Sender<RequestPermissionsResponse>,
-    ) -> Option<oneshot::Sender<RequestPermissionsResponse>> {
-        self.pending_request_permissions.insert(key, tx)
+        pending_request_permissions: PendingRequestPermissions,
+    ) -> Option<PendingRequestPermissions> {
+        self.pending_request_permissions
+            .insert(key, pending_request_permissions)
     }
 
     pub(crate) fn remove_pending_request_permissions(
         &mut self,
         key: &str,
-    ) -> Option<oneshot::Sender<RequestPermissionsResponse>> {
+    ) -> Option<PendingRequestPermissions> {
         self.pending_request_permissions.remove(key)
     }
 
@@ -251,13 +261,21 @@ impl TurnState {
         self.mailbox_delivery_phase = phase;
     }
 
-    pub(crate) fn record_granted_permissions(&mut self, permissions: PermissionProfile) {
+    pub(crate) fn record_granted_permissions(&mut self, permissions: AdditionalPermissionProfile) {
         self.granted_permissions =
             merge_permission_profiles(self.granted_permissions.as_ref(), Some(&permissions));
     }
 
-    pub(crate) fn granted_permissions(&self) -> Option<PermissionProfile> {
+    pub(crate) fn granted_permissions(&self) -> Option<AdditionalPermissionProfile> {
         self.granted_permissions.clone()
+    }
+
+    pub(crate) fn enable_strict_auto_review(&mut self) {
+        self.strict_auto_review_enabled = true;
+    }
+
+    pub(crate) fn strict_auto_review_enabled(&self) -> bool {
+        self.strict_auto_review_enabled
     }
 }
 

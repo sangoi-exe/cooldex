@@ -475,8 +475,15 @@ mod phase2 {
                 codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(codex_home.path())
                     .expect("codex home is absolute");
             config.cwd = config.codex_home.clone();
-            config.permissions.file_system_sandbox_policy = FileSystemSandboxPolicy::unrestricted();
-            config.permissions.network_sandbox_policy = NetworkSandboxPolicy::Enabled;
+            config
+                .permissions
+                .set_permission_profile(
+                    codex_protocol::models::PermissionProfile::from_runtime_permissions(
+                        &FileSystemSandboxPolicy::unrestricted(),
+                        NetworkSandboxPolicy::Enabled,
+                    ),
+                )
+                .expect("test permission profile should be valid");
             let config = Arc::new(config);
 
             let state_db = codex_state::StateRuntime::init(
@@ -709,34 +716,31 @@ mod phase2 {
             .new_default_turn()
             .await
             .expect("create subagent turn context");
+        let turn_file_system_sandbox_policy = turn_context.file_system_sandbox_policy();
         pretty_assertions::assert_eq!(
-            turn_context.file_system_sandbox_policy,
-            FileSystemSandboxPolicy::from_legacy_sandbox_policy(
+            turn_file_system_sandbox_policy,
+            FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
                 &config_snapshot.sandbox_policy,
                 config_snapshot.cwd.as_path(),
             ),
             "consolidation subagent split filesystem policy should match the memory-root legacy policy"
         );
         assert!(
-            turn_context
-                .file_system_sandbox_policy
-                .can_write_path_with_cwd(
-                    memory_root(&harness.config.codex_home).as_path(),
-                    config_snapshot.cwd.as_path(),
-                ),
+            turn_file_system_sandbox_policy.can_write_path_with_cwd(
+                memory_root(&harness.config.codex_home).as_path(),
+                config_snapshot.cwd.as_path(),
+            ),
             "consolidation subagent should be able to write the memory root"
         );
         assert!(
-            !turn_context
-                .file_system_sandbox_policy
-                .can_write_path_with_cwd(
-                    harness.config.codex_home.join("config.toml").as_path(),
-                    config_snapshot.cwd.as_path(),
-                ),
+            !turn_file_system_sandbox_policy.can_write_path_with_cwd(
+                harness.config.codex_home.join("config.toml").as_path(),
+                config_snapshot.cwd.as_path(),
+            ),
             "consolidation subagent should not inherit codex_home write access"
         );
         pretty_assertions::assert_eq!(
-            turn_context.network_sandbox_policy,
+            turn_context.network_sandbox_policy(),
             NetworkSandboxPolicy::Restricted,
             "consolidation subagent split network policy should preserve no-network sandboxing"
         );
@@ -867,8 +871,15 @@ mod phase2 {
             .await
             .expect("enqueue global consolidation");
         let mut constrained_config = harness.config.as_ref().clone();
-        constrained_config.permissions.sandbox_policy =
-            Constrained::allow_only(SandboxPolicy::DangerFullAccess);
+        constrained_config
+            .permissions
+            .set_legacy_sandbox_policy(
+                SandboxPolicy::DangerFullAccess,
+                constrained_config.cwd.as_path(),
+            )
+            .expect("test sandbox policy should be valid");
+        constrained_config.permissions.permission_profile =
+            Constrained::allow_only(constrained_config.permissions.permission_profile());
 
         phase2::run(&harness.session, Arc::new(constrained_config)).await;
 

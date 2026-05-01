@@ -1,6 +1,5 @@
 use anyhow::Context;
 use codex_features::Feature;
-use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandEndEvent;
@@ -335,9 +334,7 @@ async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyh
 #[tokio::test]
 async fn user_shell_command_does_not_set_network_sandbox_env_var() -> anyhow::Result<()> {
     let server = responses::start_mock_server().await;
-    let mut builder = core_test_support::test_codex::test_codex().with_config(|config| {
-        config.permissions.network_sandbox_policy = NetworkSandboxPolicy::Restricted;
-    });
+    let mut builder = core_test_support::test_codex::test_codex();
     let test = builder.build(&server).await?;
 
     #[cfg(windows)]

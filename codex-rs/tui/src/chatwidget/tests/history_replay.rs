@@ -16,6 +16,7 @@ async fn resumed_initial_messages_render_history() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: codex_protocol::models::PermissionProfile::default(),
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -129,6 +130,7 @@ async fn replayed_user_message_preserves_text_elements_and_local_images() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: codex_protocol::models::PermissionProfile::default(),
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -190,6 +192,7 @@ async fn replayed_user_message_preserves_remote_image_urls() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: codex_protocol::models::PermissionProfile::default(),
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -242,8 +245,10 @@ async fn session_configured_syncs_widget_config_permissions_and_cwd() {
         .expect("set approval policy");
     chat.config
         .permissions
-        .sandbox_policy
-        .set(SandboxPolicy::new_workspace_write_policy())
+        .set_legacy_sandbox_policy(
+            SandboxPolicy::new_workspace_write_policy(),
+            chat.config.cwd.as_path(),
+        )
         .expect("set sandbox policy");
     chat.config.cwd = test_path_buf("/home/user/main").abs();
 
@@ -258,6 +263,7 @@ async fn session_configured_syncs_widget_config_permissions_and_cwd() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: codex_protocol::models::PermissionProfile::default(),
         sandbox_policy: expected_sandbox.clone(),
         cwd: expected_cwd.clone(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -278,8 +284,10 @@ async fn session_configured_syncs_widget_config_permissions_and_cwd() {
         AskForApproval::Never
     );
     assert_eq!(
-        chat.config_ref().permissions.sandbox_policy.get(),
-        &expected_sandbox
+        chat.config_ref()
+            .permissions
+            .legacy_sandbox_policy(chat.config_ref().cwd.as_path()),
+        expected_sandbox
     );
     assert_eq!(&chat.config_ref().cwd, &expected_cwd);
 }
@@ -301,6 +309,7 @@ async fn replayed_user_message_with_only_remote_images_renders_history_cell() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: codex_protocol::models::PermissionProfile::default(),
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -354,6 +363,7 @@ async fn replayed_user_message_with_only_local_images_does_not_render_history_ce
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: codex_protocol::models::PermissionProfile::default(),
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -602,6 +612,7 @@ async fn replayed_reasoning_item_hides_raw_reasoning_when_disabled() {
             service_tier: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::User,
+            permission_profile: codex_protocol::models::PermissionProfile::default(),
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             cwd: test_project_path().abs(),
             reasoning_effort: None,
@@ -649,6 +660,7 @@ async fn replayed_reasoning_item_shows_raw_reasoning_when_enabled() {
             service_tier: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::User,
+            permission_profile: codex_protocol::models::PermissionProfile::default(),
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             cwd: test_project_path().abs(),
             reasoning_effort: None,
