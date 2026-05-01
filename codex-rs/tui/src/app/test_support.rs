@@ -35,6 +35,24 @@ pub(super) fn test_absolute_path(path: &str) -> AbsolutePathBuf {
     AbsolutePathBuf::try_from(PathBuf::from(path)).expect("absolute test path")
 }
 
+pub(super) fn drain_history_cell_texts(
+    app_event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> Vec<String> {
+    let mut texts = Vec::new();
+    while let Ok(event) = app_event_rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            texts.push(
+                cell.display_lines(/*width*/ 120)
+                    .into_iter()
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+    }
+    texts
+}
+
 pub(super) fn write_test_skill(codex_home: &Path, name: &str) -> Result<PathBuf> {
     let skill_dir = codex_home.join("skills").join(name);
     std::fs::create_dir_all(&skill_dir)?;

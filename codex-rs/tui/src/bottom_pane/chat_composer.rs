@@ -124,6 +124,12 @@
 //! overall state machine, since it affects which transitions are even possible from a given UI
 //! state.
 //!
+//! # Plan-Mode Nudge
+//!
+//! `ChatWidget` decides when a draft should suggest switching to Plan mode. The composer owns only
+//! the render bit so the nudge can replace the ambient footer without adding layout height or
+//! duplicating collaboration-mode policy in this state machine.
+//!
 use crate::bottom_pane::footer::mode_indicator_line;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
@@ -189,6 +195,7 @@ use crate::bottom_pane::prompt_args::parse_slash_name;
 use crate::render::Insets;
 use crate::render::RectExt;
 use crate::render::renderable::Renderable;
+use crate::skills_helpers::skill_display_name;
 use crate::slash_command::SlashCommand;
 use crate::style::user_message_style;
 use codex_protocol::models::local_image_label_text;
@@ -231,6 +238,18 @@ fn user_input_too_large_message(actual_chars: usize) -> String {
     format!(
         "Message exceeds the maximum length of {MAX_USER_INPUT_TEXT_CHARS} characters ({actual_chars} provided)."
     )
+}
+
+fn plan_mode_nudge_line() -> Line<'static> {
+    Line::from(vec![
+        "Create a plan?".magenta(),
+        "  ".into(),
+        key_hint::shift(KeyCode::Tab).into(),
+        " use Plan mode".into(),
+        "   ".into(),
+        key_hint::plain(KeyCode::Esc).into(),
+        " dismiss".into(),
+    ])
 }
 
 /// Result returned when the user interacts with the text area.
@@ -332,6 +351,8 @@ pub(crate) struct ChatComposer {
     disable_paste_burst: bool,
     footer_mode: FooterMode,
     footer_hint_override: Option<Vec<(String, String)>>,
+    /// Whether the ambient footer row is currently replaced by the Plan-mode nudge.
+    plan_mode_nudge_visible: bool,
     remote_image_urls: Vec<String>,
     /// Tracks keyboard selection for the remote-image rows so Up/Down + Delete/Backspace
     /// can highlight and remove remote attachments from the composer UI.
@@ -476,6 +497,7 @@ impl ChatComposer {
             disable_paste_burst: false,
             footer_mode: FooterMode::ComposerEmpty,
             footer_hint_override: None,
+            plan_mode_nudge_visible: false,
             remote_image_urls: Vec::new(),
             selected_remote_image_index: None,
             pending_slash_command_history: None,
@@ -920,6 +942,19 @@ impl ChatComposer {
         self.footer_hint_override = items;
     }
 
+    pub(crate) fn set_plan_mode_nudge_visible(&mut self, visible: bool) -> bool {
+        if self.plan_mode_nudge_visible == visible {
+            return false;
+        }
+        self.plan_mode_nudge_visible = visible;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plan_mode_nudge_visible(&self) -> bool {
+        self.plan_mode_nudge_visible
+    }
+
     pub(crate) fn set_remote_image_urls(&mut self, urls: Vec<String>) {
         self.remote_image_urls = urls;
         self.selected_remote_image_index = None;
@@ -1095,6 +1130,10 @@ impl ChatComposer {
     /// Get the current composer text.
     pub(crate) fn current_text(&self) -> String {
         self.textarea.text().to_string()
+    }
+
+    pub(crate) fn input_enabled(&self) -> bool {
+        self.input_enabled
     }
 
     /// Rehydrate a history entry into the composer with shell-like cursor placement.
@@ -3341,7 +3380,7 @@ impl ChatComposer {
         let mut mentions = Vec::new();
         if let Some(skills) = self.skills.as_ref() {
             for skill in skills {
-                let display_name = skill_display_name(skill).to_string();
+                let display_name = skill_display_name(skill);
                 let description = skill_description(skill);
                 let skill_name = skill.name.clone();
                 let search_terms = if display_name == skill.name {
@@ -3557,14 +3596,6 @@ impl ChatComposer {
     }
 }
 
-fn skill_display_name(skill: &SkillMetadata) -> &str {
-    skill
-        .interface
-        .as_ref()
-        .and_then(|interface| interface.display_name.as_deref())
-        .unwrap_or(&skill.name)
-}
-
 fn skill_description(skill: &SkillMetadata) -> Option<String> {
     let description = skill
         .interface
@@ -3756,7 +3787,9 @@ impl ChatComposer {
                             show_queue_hint,
                         )
                     };
-                    let right_line = if status_line_active {
+                    let right_line = if self.plan_mode_nudge_visible {
+                        None
+                    } else if status_line_active {
                         let full =
                             mode_indicator_line(self.collaboration_mode_indicator, show_cycle_hint);
                         let compact = mode_indicator_line(
@@ -3789,8 +3822,9 @@ impl ChatComposer {
                     }
                     let can_show_left_and_context =
                         can_show_left_with_context(hint_rect, left_width, right_width);
-                    let has_override =
-                        self.footer_flash_visible() || self.footer_hint_override.is_some();
+                    let has_override = self.footer_flash_visible()
+                        || self.footer_hint_override.is_some()
+                        || self.plan_mode_nudge_visible;
                     let single_line_layout = if has_override || status_line_active {
                         None
                     } else {
@@ -3811,13 +3845,14 @@ impl ChatComposer {
                             | FooterMode::ShortcutOverlay => None,
                         }
                     };
-                    let show_right = if matches!(
-                        footer_props.mode,
-                        FooterMode::EscHint
-                            | FooterMode::HistorySearch
-                            | FooterMode::QuitShortcutReminder
-                            | FooterMode::ShortcutOverlay
-                    ) {
+                    let show_right = if self.plan_mode_nudge_visible
+                        || matches!(
+                            footer_props.mode,
+                            FooterMode::EscHint
+                                | FooterMode::HistorySearch
+                                | FooterMode::QuitShortcutReminder
+                                | FooterMode::ShortcutOverlay
+                        ) {
                         false
                     } else {
                         single_line_layout
@@ -3866,6 +3901,17 @@ impl ChatComposer {
                         }
                     } else if let Some(items) = self.footer_hint_override.as_ref() {
                         render_footer_hint_items(hint_rect, buf, items);
+                    } else if self.plan_mode_nudge_visible {
+                        let available_width =
+                            hint_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
+                        render_footer_line(
+                            hint_rect,
+                            buf,
+                            truncate_line_with_ellipsis_if_overflow(
+                                plan_mode_nudge_line(),
+                                available_width,
+                            ),
+                        );
                     } else if status_line_active {
                         if let Some(line) = truncated_status_line {
                             render_footer_line(hint_rect, buf, line);
@@ -4616,6 +4662,21 @@ mod tests {
     }
 
     #[test]
+    fn plan_mode_nudge_replaces_wide_footer_context_snapshot() {
+        snapshot_composer_state_with_width(
+            "plan_mode_nudge_replaces_wide_footer_context",
+            /*width*/ 120,
+            /*enhanced_keys_supported*/ true,
+            |composer| {
+                composer.set_collaboration_modes_enabled(/*enabled*/ true);
+                composer.set_context_window(Some(89), /*used_tokens*/ None);
+                composer.set_text_content("write a plan".to_string(), Vec::new(), Vec::new());
+                composer.set_plan_mode_nudge_visible(/*visible*/ true);
+            },
+        );
+    }
+
+    #[test]
     fn zellij_empty_composer_snapshot() {
         snapshot_zellij_composer_state("zellij_empty_composer", |_composer| {});
     }
@@ -5109,6 +5170,36 @@ mod tests {
             .expect("expected skill mention to be selected");
         assert_eq!(mention.insert_text, "$codex".to_string());
         assert_eq!(mention.path, Some(skill_path.display().to_string()));
+    }
+
+    #[test]
+    fn skill_mentions_fallback_to_plugin_qualified_display_name() {
+        let skill_path = test_path_buf("/tmp/repo/google-calendar/SKILL.md").abs();
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        composer.set_skill_mentions(Some(vec![SkillMetadata {
+            name: "google-calendar:availability".to_string(),
+            description: "Find availability and plan event changes".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            policy: None,
+            path_to_skills_md: skill_path.clone(),
+            scope: codex_protocol::protocol::SkillScope::Repo,
+        }]));
+
+        let mentions = composer.mention_items();
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].display_name, "availability (google-calendar)");
+        assert_eq!(mentions[0].insert_text, "$google-calendar:availability");
+        assert_eq!(mentions[0].path, Some(skill_path.display().to_string()));
     }
 
     #[test]

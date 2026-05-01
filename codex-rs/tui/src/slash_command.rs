@@ -101,7 +101,9 @@ impl SlashCommand {
             SlashCommand::MemoryDrop => "DO NOT USE",
             SlashCommand::MemoryUpdate => "DO NOT USE",
             SlashCommand::Model => "choose what model and reasoning effort to use",
-            SlashCommand::Fast => "toggle Fast mode to enable fastest inference at 2X plan usage",
+            SlashCommand::Fast => {
+                "toggle Fast mode to enable fastest inference with increased plan usage"
+            }
             SlashCommand::Personality => "choose a communication style for Codex",
             SlashCommand::Realtime => "toggle realtime voice mode (experimental)",
             SlashCommand::Settings => "configure realtime microphone/speaker",
@@ -237,6 +239,14 @@ mod tests {
     #[test]
     fn stop_command_is_canonical_name() {
         assert_eq!(SlashCommand::Stop.command(), "stop");
+    }
+
+    #[test]
+    fn fast_command_description_uses_current_plan_usage_copy() {
+        let description = SlashCommand::Fast.description();
+
+        assert!(description.contains("increased plan usage"));
+        assert!(!description.contains("2X plan usage"));
     }
 
     #[test]

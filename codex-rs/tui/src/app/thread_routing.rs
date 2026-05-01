@@ -653,6 +653,8 @@ impl App {
             Ok(response) => self.handle_skills_list_response(response),
             Err(err) => {
                 tracing::warn!("{failure_message}: {err:#}");
+                self.chat_widget
+                    .add_error_message(format!("{failure_message}: {err:#}"));
             }
         }
     }
@@ -1362,49 +1364,69 @@ mod tests {
     use super::*;
     use crate::app::test_support::*;
 
+    #[tokio::test]
+    async fn skills_list_failures_are_rendered_to_chat_history() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+        app.handle_skills_list_result(
+            Err(color_eyre::eyre::eyre!("startup boom")),
+            "failed to load skills on startup",
+        );
+        app.handle_skills_list_result(
+            Err(color_eyre::eyre::eyre!("refresh boom")),
+            "failed to refresh skills",
+        );
+
+        let history_texts = drain_history_cell_texts(&mut app_event_rx);
+        assert!(
+            history_texts
+                .iter()
+                .any(|text| text.contains("failed to load skills on startup: startup boom")),
+            "expected startup skills failure history cell, saw {history_texts:?}"
+        );
+        assert!(
+            history_texts
+                .iter()
+                .any(|text| text.contains("failed to refresh skills: refresh boom")),
+            "expected refresh skills failure history cell, saw {history_texts:?}"
+        );
+    }
+
     #[test]
     fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
-        assert!(
-            App::should_wait_for_initial_session(&SessionSelection::StartFresh)
-        );
-        assert!(
-            App::should_wait_for_initial_session(&SessionSelection::Exit)
-        );
-        assert!(
-            !App::should_wait_for_initial_session(&SessionSelection::Resume(
-                crate::resume_picker::SessionTarget {
-                    path: Some(PathBuf::from("/tmp/restore")),
-                    thread_id: ThreadId::new(),
-                }
-            ))
-        );
-        assert!(
-            !App::should_wait_for_initial_session(&SessionSelection::Fork(
-                crate::resume_picker::SessionTarget {
-                    path: Some(PathBuf::from("/tmp/fork")),
-                    thread_id: ThreadId::new(),
-                }
-            ))
-        );
+        assert!(App::should_wait_for_initial_session(
+            &SessionSelection::StartFresh
+        ));
+        assert!(App::should_wait_for_initial_session(
+            &SessionSelection::Exit
+        ));
+        assert!(!App::should_wait_for_initial_session(
+            &SessionSelection::Resume(crate::resume_picker::SessionTarget {
+                path: Some(PathBuf::from("/tmp/restore")),
+                thread_id: ThreadId::new(),
+            })
+        ));
+        assert!(!App::should_wait_for_initial_session(
+            &SessionSelection::Fork(crate::resume_picker::SessionTarget {
+                path: Some(PathBuf::from("/tmp/fork")),
+                thread_id: ThreadId::new(),
+            })
+        ));
     }
     #[test]
     fn startup_waiting_gate_holds_active_thread_events_until_primary_thread_configured() {
         let mut wait_for_initial_session =
             App::should_wait_for_initial_session(&SessionSelection::StartFresh);
         assert!(wait_for_initial_session);
-        assert!(
-            !App::should_handle_active_thread_events(
-                wait_for_initial_session,
-                /*has_active_thread_receiver*/ true
-            )
-        );
+        assert!(!App::should_handle_active_thread_events(
+            wait_for_initial_session,
+            /*has_active_thread_receiver*/ true
+        ));
 
-        assert!(
-            !App::should_stop_waiting_for_initial_session(
-                wait_for_initial_session,
-                /*primary_thread_id*/ None
-            )
-        );
+        assert!(!App::should_stop_waiting_for_initial_session(
+            wait_for_initial_session,
+            /*primary_thread_id*/ None
+        ));
         if App::should_stop_waiting_for_initial_session(
             wait_for_initial_session,
             Some(ThreadId::new()),
@@ -1413,12 +1435,10 @@ mod tests {
         }
         assert!(!wait_for_initial_session);
 
-        assert!(
-            App::should_handle_active_thread_events(
-                wait_for_initial_session,
-                /*has_active_thread_receiver*/ true
-            )
-        );
+        assert!(App::should_handle_active_thread_events(
+            wait_for_initial_session,
+            /*has_active_thread_receiver*/ true
+        ));
     }
     #[test]
     fn startup_waiting_gate_not_applied_for_resume_or_fork_session_selection() {
@@ -1428,24 +1448,20 @@ mod tests {
                 thread_id: ThreadId::new(),
             },
         ));
-        assert!(
-            App::should_handle_active_thread_events(
-                wait_for_resume,
-                /*has_active_thread_receiver*/ true
-            )
-        );
+        assert!(App::should_handle_active_thread_events(
+            wait_for_resume,
+            /*has_active_thread_receiver*/ true
+        ));
         let wait_for_fork = App::should_wait_for_initial_session(&SessionSelection::Fork(
             crate::resume_picker::SessionTarget {
                 path: Some(PathBuf::from("/tmp/fork")),
                 thread_id: ThreadId::new(),
             },
         ));
-        assert!(
-            App::should_handle_active_thread_events(
-                wait_for_fork,
-                /*has_active_thread_receiver*/ true
-            )
-        );
+        assert!(App::should_handle_active_thread_events(
+            wait_for_fork,
+            /*has_active_thread_receiver*/ true
+        ));
     }
     #[tokio::test]
     async fn active_non_primary_shutdown_target_returns_none_for_non_shutdown_event() -> Result<()>

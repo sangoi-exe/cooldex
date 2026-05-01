@@ -400,10 +400,12 @@ impl App {
             return;
         }
 
+        let memory_tool_was_enabled = self.config.features.enabled(Feature::MemoryTool);
         self.config = next_config;
-        let show_memory_enable_notice = feature_updates_to_apply
-            .iter()
-            .any(|(feature, enabled)| *feature == Feature::MemoryTool && *enabled);
+        let show_memory_enable_notice =
+            feature_updates_to_apply.iter().any(|(feature, enabled)| {
+                *feature == Feature::MemoryTool && *enabled && !memory_tool_was_enabled
+            });
         for (feature, effective_enabled) in feature_updates_to_apply {
             self.chat_widget
                 .set_feature_enabled(feature, effective_enabled);
@@ -852,6 +854,50 @@ mod tests {
         assert!(config.contains("sandbox_mode = \"workspace-write\""));
         Ok(())
     }
+
+    #[tokio::test]
+    async fn update_feature_flags_enabling_memory_emits_next_session_notice() -> Result<()> {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+
+        app.update_feature_flags(vec![(Feature::MemoryTool, true)])
+            .await;
+
+        let history_texts = drain_history_cell_texts(&mut app_event_rx);
+        assert!(
+            history_texts
+                .iter()
+                .any(|text| text.contains("Memories will be enabled in the next session.")),
+            "expected memory enable notice, saw {history_texts:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_feature_flags_keeps_enabled_memory_quiet() -> Result<()> {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        app.config
+            .features
+            .set_enabled(Feature::MemoryTool, /*enabled*/ true)?;
+        app.chat_widget
+            .set_feature_enabled(Feature::MemoryTool, /*enabled*/ true);
+
+        app.update_feature_flags(vec![(Feature::MemoryTool, true)])
+            .await;
+
+        let history_texts = drain_history_cell_texts(&mut app_event_rx);
+        assert!(
+            !history_texts
+                .iter()
+                .any(|text| text.contains("Memories will be enabled in the next session.")),
+            "did not expect redundant memory enable notice, saw {history_texts:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn update_feature_flags_disabling_guardian_preserves_active_guardian_review_policy()
     -> Result<()> {

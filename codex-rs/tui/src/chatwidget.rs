@@ -138,6 +138,7 @@ use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::dynamic_tools::DynamicToolCallRequest;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
+use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::local_image_label_text;
@@ -1111,6 +1112,11 @@ pub(crate) struct ChatWidget {
     pending_status_indicator_restore: bool,
     suppress_queue_autosend: bool,
     thread_id: Option<ThreadId>,
+    /// Nudge dismissals that should survive draft edits within the current thread scope.
+    ///
+    /// The nudge is only a discovery aid, so once a user dismisses it or enters Plan mode we keep it
+    /// hidden for that thread instead of resurfacing it on every matching draft.
+    dismissed_plan_mode_nudge_scopes: HashSet<PlanModeNudgeScope>,
     last_turn_id: Option<String>,
     thread_name: Option<String>,
     forked_from: Option<ThreadId>,
@@ -1664,6 +1670,24 @@ pub(crate) enum ReplayKind {
     ThreadSnapshot,
 }
 
+/// Scope used to keep Plan-mode nudge dismissal local to one conversation context.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PlanModeNudgeScope {
+    /// Drafts entered before the server has assigned a thread id.
+    NewThread,
+    /// Drafts associated with one configured thread.
+    Thread(ThreadId),
+}
+
+/// Returns whether `text` contains the standalone word `plan`.
+///
+/// Slash and shell drafts still match here so lexical matching stays separate from presentation
+/// policy.
+fn contains_plan_keyword(text: &str) -> bool {
+    text.split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .any(|word| word.eq_ignore_ascii_case("plan"))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ThreadItemRenderSource {
     Live,
@@ -2082,6 +2106,7 @@ impl ChatWidget {
     fn update_task_running_state(&mut self) {
         self.bottom_pane
             .set_task_running(self.agent_turn_running || self.mcp_startup_status.is_some());
+        self.refresh_plan_mode_nudge();
         self.refresh_terminal_title();
     }
 
@@ -2427,6 +2452,7 @@ impl ChatWidget {
         self.set_skills(/*skills*/ None);
         self.session_network_proxy = event.network_proxy.clone();
         self.thread_id = Some(event.session_id);
+        self.refresh_plan_mode_nudge();
         self.last_turn_id = None;
         self.thread_name = event.thread_name.clone();
         self.forked_from = event.forked_from_id;
@@ -3014,15 +3040,45 @@ impl ChatWidget {
 
     fn open_plan_implementation_prompt(&mut self) {
         let default_mask = collaboration_modes::default_mode_mask(self.model_catalog.as_ref());
+        let context_usage_label = self.plan_implementation_context_usage_label();
 
         self.bottom_pane
             .show_selection_view(plan_implementation::selection_view_params(
                 default_mask,
                 self.latest_proposed_plan_markdown.as_deref(),
+                context_usage_label.as_deref(),
             ));
         self.notify(Notification::PlanModePrompt {
             title: PLAN_IMPLEMENTATION_TITLE.to_string(),
         });
+    }
+
+    /// Returns a context-used label for the plan implementation prompt.
+    ///
+    /// The footer reports context remaining because it is ambient status, but this prompt asks
+    /// whether to discard prior conversation state before implementing a plan. Reporting used
+    /// context makes that cleanup tradeoff explicit without implying urgency on fresh or unknown
+    /// context windows.
+    fn plan_implementation_context_usage_label(&self) -> Option<String> {
+        let info = self.token_info.as_ref()?;
+        let percent = self.context_remaining_percent(info);
+
+        let used_tokens = self.context_used_tokens(info, percent.is_some());
+        if let Some(percent) = percent {
+            let used_percent = 100 - percent.clamp(0, 100);
+            if used_percent <= 0 {
+                return None;
+            }
+            return Some(format!("{used_percent}% used"));
+        }
+
+        if let Some(tokens) = used_tokens
+            && tokens > 0
+        {
+            return Some(format!("{} used", format_tokens_compact(tokens)));
+        }
+
+        None
     }
 
     fn has_queued_follow_up_messages(&self) -> bool {
@@ -3925,6 +3981,7 @@ impl ChatWidget {
         &mut self,
         event: UserMessageEvent,
         compare_key: PendingSteerCompareKey,
+        render_if_new: bool,
     ) {
         let rendered = Self::rendered_user_message_event_from_event(&event);
         if self
@@ -3956,9 +4013,29 @@ impl ChatWidget {
             if self.last_rendered_user_message_event.as_ref() != Some(&rendered) {
                 self.on_user_message_event(event);
             }
-        } else if self.last_rendered_user_message_event.as_ref() != Some(&rendered) {
+        } else if render_if_new && self.last_rendered_user_message_event.as_ref() != Some(&rendered)
+        {
             self.on_user_message_event(event);
         }
+    }
+
+    fn on_committed_user_message(&mut self, item: &UserMessageItem, from_replay: bool) {
+        let EventMsg::UserMessage(event) = item.as_legacy_event() else {
+            unreachable!("user message item should convert to a legacy user message");
+        };
+        if from_replay {
+            if !self.is_review_mode {
+                self.on_user_message_event(event);
+            }
+            return;
+        }
+
+        let compare_key = Self::pending_steer_compare_key_from_item(item);
+        self.handle_committed_user_message_event(
+            event,
+            compare_key,
+            /*render_if_new*/ !self.is_review_mode,
+        );
     }
 
     pub(crate) fn capture_thread_input_state(&self) -> Option<ThreadInputState> {
@@ -5064,6 +5141,7 @@ impl ChatWidget {
         self.update_due_hook_visibility();
         self.schedule_hook_timer_if_needed();
         self.bottom_pane.pre_draw_tick();
+        self.refresh_plan_mode_nudge();
         if self.should_animate_terminal_title_spinner() {
             self.refresh_terminal_title();
         }
@@ -5786,6 +5864,7 @@ impl ChatWidget {
             pending_status_indicator_restore: false,
             suppress_queue_autosend: false,
             thread_id: None,
+            dismissed_plan_mode_nudge_scopes: HashSet::new(),
             last_turn_id: None,
             thread_name: None,
             forked_from: None,
@@ -6014,6 +6093,7 @@ impl ChatWidget {
             pending_status_indicator_restore: false,
             suppress_queue_autosend: false,
             thread_id: None,
+            dismissed_plan_mode_nudge_scopes: HashSet::new(),
             last_turn_id: None,
             thread_name: None,
             forked_from: None,
@@ -6198,6 +6278,14 @@ impl ChatWidget {
             return;
         }
 
+        if matches!(key_event.code, KeyCode::Esc)
+            && key_event.kind == KeyEventKind::Press
+            && self.should_show_plan_mode_nudge()
+        {
+            self.dismiss_plan_mode_nudge();
+            return;
+        }
+
         match key_event {
             KeyEvent {
                 code: KeyCode::BackTab,
@@ -6208,6 +6296,7 @@ impl ChatWidget {
                 && self.bottom_pane.no_modal_or_popup_active() =>
             {
                 self.cycle_collaboration_mode();
+                self.refresh_plan_mode_nudge();
             }
             _ => match self.bottom_pane.handle_key_event(key_event) {
                 InputResult::Submitted {
@@ -6274,6 +6363,7 @@ impl ChatWidget {
                 InputResult::None => {}
             },
         }
+        self.refresh_plan_mode_nudge();
     }
 
     /// Attach a local image to the composer when the active model supports image inputs.
@@ -6299,6 +6389,7 @@ impl ChatWidget {
 
     pub(crate) fn apply_external_edit(&mut self, text: String) {
         self.bottom_pane.apply_external_edit(text);
+        self.refresh_plan_mode_nudge();
         self.request_redraw();
     }
 
@@ -6404,12 +6495,14 @@ impl ChatWidget {
 
     pub(crate) fn handle_paste(&mut self, text: String) {
         self.bottom_pane.handle_paste(text);
+        self.refresh_plan_mode_nudge();
     }
 
     // Returns true if caller should skip rendering this frame (a future frame is scheduled).
     pub(crate) fn handle_paste_burst_tick(&mut self, frame_requester: FrameRequester) -> bool {
         if self.bottom_pane.flush_paste_burst_if_due() {
             // A paste just flushed; request an immediate redraw and skip this frame.
+            self.refresh_plan_mode_nudge();
             self.request_redraw();
             true
         } else if self.bottom_pane.is_in_paste_burst() {
@@ -6838,54 +6931,14 @@ impl ChatWidget {
         let replay_kind = render_source.replay_kind();
         match item {
             ThreadItem::UserMessage { id, content } => {
-                let user_message = codex_protocol::items::UserMessageItem {
+                let user_message = UserMessageItem {
                     id,
                     content: content
                         .into_iter()
                         .map(codex_app_server_protocol::UserInput::into_core)
                         .collect(),
                 };
-                let codex_protocol::protocol::EventMsg::UserMessage(event) =
-                    user_message.as_legacy_event()
-                else {
-                    unreachable!("user message item should convert to a user message event");
-                };
-                if from_replay {
-                    self.on_user_message_event(event);
-                } else {
-                    let rendered = Self::rendered_user_message_event_from_event(&event);
-                    let compare_key =
-                        Self::pending_steer_compare_key_from_items(&user_message.content);
-                    if self
-                        .pending_steers
-                        .front()
-                        .is_some_and(|pending| pending.compare_key == compare_key)
-                    {
-                        if let Some(pending) = self.pending_steers.pop_front() {
-                            self.refresh_pending_input_preview();
-                            let pending_event = UserMessageEvent {
-                                message: pending.user_message.text,
-                                images: Some(pending.user_message.remote_image_urls),
-                                local_images: pending
-                                    .user_message
-                                    .local_images
-                                    .into_iter()
-                                    .map(|image| image.path)
-                                    .collect(),
-                                text_elements: pending.user_message.text_elements,
-                            };
-                            self.on_user_message_event(pending_event);
-                        } else if self.last_rendered_user_message_event.as_ref() != Some(&rendered)
-                        {
-                            tracing::warn!(
-                                "pending steer matched compare key but queue was empty when rendering committed user message"
-                            );
-                            self.on_user_message_event(event);
-                        }
-                    } else if self.last_rendered_user_message_event.as_ref() != Some(&rendered) {
-                        self.on_user_message_event(event);
-                    }
-                }
+                self.on_committed_user_message(&user_message, from_replay);
             }
             ThreadItem::AgentMessage {
                 id,
@@ -8087,12 +8140,8 @@ impl ChatWidget {
             }
             EventMsg::ItemCompleted(event) => {
                 let item = event.item;
-                if !from_replay && let codex_protocol::items::TurnItem::UserMessage(item) = &item {
-                    let EventMsg::UserMessage(event) = item.as_legacy_event() else {
-                        unreachable!("user message item should convert to a legacy user message");
-                    };
-                    let compare_key = Self::pending_steer_compare_key_from_item(item);
-                    self.handle_committed_user_message_event(event, compare_key);
+                if let codex_protocol::items::TurnItem::UserMessage(item) = &item {
+                    self.on_committed_user_message(item, from_replay);
                 }
                 if let codex_protocol::items::TurnItem::Plan(plan_item) = &item {
                     self.on_plan_item_completed(plan_item.text.clone());
@@ -11354,6 +11403,47 @@ impl ChatWidget {
         true
     }
 
+    /// Returns the dismissal scope that applies to the currently visible draft.
+    fn plan_mode_nudge_scope(&self) -> PlanModeNudgeScope {
+        self.thread_id
+            .map_or(PlanModeNudgeScope::NewThread, PlanModeNudgeScope::Thread)
+    }
+
+    /// Returns whether the current draft should replace the normal footer with the Plan-mode nudge.
+    ///
+    /// `ChatWidget` owns this policy because it can combine lexical draft matching with mode
+    /// availability, interaction state, and thread-scoped dismissal. `ChatComposer` only renders the
+    /// resulting visibility bit.
+    fn should_show_plan_mode_nudge(&self) -> bool {
+        let text = self.bottom_pane.composer_text();
+        let trimmed = text.trim_start();
+        self.collaboration_modes_enabled()
+            && collaboration_modes::plan_mask(self.model_catalog.as_ref()).is_some()
+            && self.active_mode_kind() != ModeKind::Plan
+            && self.bottom_pane.composer_input_enabled()
+            && !self.bottom_pane.is_task_running()
+            && self.bottom_pane.no_modal_or_popup_active()
+            && !trimmed.starts_with('/')
+            && !trimmed.starts_with('!')
+            && contains_plan_keyword(&text)
+            && !self
+                .dismissed_plan_mode_nudge_scopes
+                .contains(&self.plan_mode_nudge_scope())
+    }
+
+    /// Synchronizes the footer presentation with the current Plan-mode nudge policy.
+    fn refresh_plan_mode_nudge(&mut self) {
+        self.bottom_pane
+            .set_plan_mode_nudge_visible(self.should_show_plan_mode_nudge());
+    }
+
+    /// Hides the nudge for the current thread scope until the user changes conversation context.
+    fn dismiss_plan_mode_nudge(&mut self) {
+        self.dismissed_plan_mode_nudge_scopes
+            .insert(self.plan_mode_nudge_scope());
+        self.refresh_plan_mode_nudge();
+    }
+
     fn initial_collaboration_mask(
         _config: &Config,
         model_catalog: &ModelCatalog,
@@ -11496,8 +11586,13 @@ impl ChatWidget {
         {
             mask.reasoning_effort = Some(Some(effort));
         }
+        if mask.mode == Some(ModeKind::Plan) {
+            self.dismissed_plan_mode_nudge_scopes
+                .insert(self.plan_mode_nudge_scope());
+        }
         self.active_collaboration_mask = Some(mask);
         self.update_collaboration_mode_indicator();
+        self.refresh_plan_mode_nudge();
         self.refresh_model_dependent_surfaces();
         let next_mode = self.active_mode_kind();
         let next_model = self.current_model();
@@ -12083,6 +12178,7 @@ impl ChatWidget {
     ) {
         self.bottom_pane
             .set_composer_text(text, text_elements, local_image_paths);
+        self.refresh_plan_mode_nudge();
     }
 
     pub(crate) fn set_remote_image_urls(&mut self, remote_image_urls: Vec<String>) {

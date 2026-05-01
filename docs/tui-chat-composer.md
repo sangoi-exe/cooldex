@@ -38,6 +38,12 @@ The solution is to detect paste-like _bursts_ and buffer them into a single expl
 2. **Paste burst**: transient detection state for non-bracketed paste.
    - implemented by `PasteBurst`
 
+`ChatWidget` owns cross-cutting draft policy that depends on session state. For example, when a
+regular draft contains the standalone word `plan`, Plan mode is available, no task/modal/popup is
+active, and the user has not dismissed the hint for the current thread scope, `ChatWidget` asks the
+composer to replace the ambient footer with a one-line Plan-mode nudge. `ChatComposer` stores only
+that render bit; it does not decide collaboration-mode eligibility or thread-scoped dismissal.
+
 ### Key event routing
 
 `ChatComposer::handle_key_event` dispatches based on `active_popup`:

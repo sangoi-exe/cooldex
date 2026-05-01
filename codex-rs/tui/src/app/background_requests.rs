@@ -67,7 +67,7 @@ impl App {
         tokio::spawn(async move {
             let result = fetch_skills_list(request_handle, cwd)
                 .await
-                .map_err(|err| err.to_string());
+                .map_err(|err| format!("{err:#}"));
             app_event_tx.send(AppEvent::SkillsListLoaded { result });
         });
     }
