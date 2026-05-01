@@ -55,10 +55,16 @@ fn is_git_global_option_with_inline_value(arg: &str) -> bool {
 
 /// Git global options that can redirect config, repository, or helper lookup
 /// and therefore must never be auto-approved as "safe".
+///
+/// Merge-safety anchor: git global options must keep requiring a prompt so
+/// repository/config redirection cannot bypass command auto-review.
 pub(crate) fn git_global_option_requires_prompt(arg: &str) -> bool {
     matches!(
         arg,
-        "-c" | "--config-env"
+        // `-C` can redirect Git into a repo whose config runs helpers such as
+        // `core.fsmonitor` during read-only commands like `status`.
+        "-C" | "-c"
+            | "--config-env"
             | "--exec-path"
             | "--git-dir"
             | "--namespace"
@@ -66,7 +72,7 @@ pub(crate) fn git_global_option_requires_prompt(arg: &str) -> bool {
             | "--work-tree"
     ) || matches!(
         arg,
-        s if (s.starts_with("-c") && s.len() > 2)
+        s if ((s.starts_with("-C") || s.starts_with("-c")) && s.len() > 2)
             || s.starts_with("--config-env=")
             || s.starts_with("--exec-path=")
             || s.starts_with("--git-dir=")
@@ -180,5 +186,11 @@ mod tests {
     #[test]
     fn rm_f_is_dangerous() {
         assert!(command_might_be_dangerous(&vec_str(&["rm", "-f", "/"])));
+    }
+
+    #[test]
+    fn git_dash_c_requires_prompt() {
+        assert!(git_global_option_requires_prompt("-C"));
+        assert!(git_global_option_requires_prompt("-C/path/to/repo"));
     }
 }
