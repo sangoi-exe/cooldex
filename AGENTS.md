@@ -14,6 +14,17 @@ During any sync/merge with `main` and/or `upstream`, these rules are mandatory:
 8. Existing `Merge anchor:` comments are legacy debt. Whenever you touch one of those files for customization-preserving work, normalize it to `Merge-safety anchor:` in the same change.
 9. Remove from the workspace all CI/CD content under `.github` (workflows, actions, and any other pipeline artifacts).
 
+### Large-Backlog Sync Execution Canon (Mandatory)
+
+<!-- Merge-safety anchor: large-backlog upstream sync execution is tree/module/owner driven; preserve this skill-disuse and fan-in-validation boundary until the upstream-sync skills are redesigned and explicitly re-approved. -->
+
+- For the current large upstream backlog, `/home/lucas/.codex/skills/codex-upstream-commit-ledger/` and `/home/lucas/.codex/skills/codex-upstream-convergence/` are advisory/accounting helpers only. They must be disregarded as practical implementation engines until they are redesigned and explicitly re-approved for execution.
+- The allowed helper role for those skills is limited to pinned-window setup, inventory, conflict-map evidence, validation, and after-the-fact coverage accounting. Skill-generated rows, clusters, per-commit records, or ledger cursors must not select, order, or execute implementation batches for this backlog.
+- Practical implementation units for large upstream sync are tree/module/owner buckets derived from a pinned target SHA, `git merge-base master <target>`, upstream tree diff, local tree diff, and a controlled merge probe. Rows and commits are coverage/accounting units only after implementation fan-in.
+- Use one broad doctrine plan/gate for a coherent sync phase when buckets are interdependent. Do not create a separate plan/test/review loop for each upstream row, commit, or small bucket when the next bucket is expected to invalidate that validation.
+- Heavy Rust validation belongs at coherent fan-in points. Cheap hygiene checks may run between buckets, but future Cargo validation still follows `./scripts/cargo-guard.sh` and the light-first ladder below.
+- `.sangoi/reference/upstream-convergence/tree-module-sync-approach.md` is the explanatory playbook/evidence for this canon. If it conflicts with this `AGENTS.md`, this `AGENTS.md` wins.
+
 <!-- Merge-safety anchor: AGENTS.md is the canonical source for the workspace-local customization inventory and merge-policy invariants; future sync work must update this section and keep scratchpads as redirects only. -->
 
 ## Codex CLI Customization Boundary
@@ -60,7 +71,7 @@ For commentless customization-adjacent seams such as JSON schema artifacts, the 
 - `mcp-sangoi-ia` Codex service: dedicated Sangoi parsing service that consumes Codex through `codex exec` and inherited CLI runtime state. Keep it from importing `mcp-standalone`, parsing `auth.json`, carrying provider tokens, or implementing active-account selection; `AccountManager` and `AuthManager` in the CLI remain the account/auth owners. Representative files: `mcp-sangoi-ia/README.md`, `mcp-sangoi-ia/AGENTS.md`, `mcp-sangoi-ia/src/codex-exec.ts`, `mcp-sangoi-ia/src/config.ts`.
 <!-- Merge-safety anchor: local workspace keeps legacy Landlock enabled from /home/lucas/.codex/config.toml; preserve the propagation and runtime seams listed in the inventory entry below until bubblewrap has a safe writable-gitdir alternative. -->
 - `legacy Landlock override`: the local operator config keeps `features.use_legacy_landlock = true` in `/home/lucas/.codex/config.toml` so sandboxed Git metadata writes remain available until upstream ships a safe writable-`gitdir` alternative. Preserve the propagation/honor seams across app-server, core sandbox plumbing, and Linux helper/runtime. Representative files: `/home/lucas/.codex/config.toml`, `codex-rs/app-server/src/codex_message_processor.rs`, `codex-rs/core/src/exec.rs`, `codex-rs/core/src/sandboxing/mod.rs`, `codex-rs/core/src/landlock.rs`, `codex-rs/linux-sandbox/src/linux_run_main.rs`, `codex-rs/cli/src/debug_sandbox.rs`.
-- workspace sync policy and local instruction overlays: keep `.github/**` removed from this workspace, preserve the AGENTS-centric sync policy, and keep local config/instruction overlays aligned when those rules change. Representative files: `AGENTS.md`, `/home/lucas/.codex/config.toml`, diff against `upstream/main` for `.github/**`.
+- workspace sync policy and local instruction overlays: keep `.github/**` removed from this workspace, preserve the AGENTS-centric sync policy, preserve the large-backlog tree/module sync canon, and keep local config/instruction overlays aligned when those rules change. Current upstream-sync skills are not implementation authority for large-backlog work; use them only for inventory, conflict-map, validation, and coverage-accounting helpers until redesigned. Representative files: `AGENTS.md`, `.sangoi/reference/upstream-convergence/tree-module-sync-approach.md`, `/home/lucas/.codex/config.toml`, diff against `upstream/main` for `.github/**`.
 
 ## `.sangoi` Repo Boundary
 
