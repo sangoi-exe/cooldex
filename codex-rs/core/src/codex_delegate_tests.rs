@@ -157,6 +157,32 @@ async fn forward_ops_preserves_submission_trace_context() {
 }
 
 #[tokio::test]
+async fn run_codex_thread_interactive_respects_pre_cancelled_spawn() {
+    let (parent_session, parent_ctx, _rx_events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let cancel_token = CancellationToken::new();
+    cancel_token.cancel();
+
+    let result = timeout(
+        Duration::from_secs(/*secs*/ 1),
+        run_codex_thread_interactive(
+            parent_ctx.config.as_ref().clone(),
+            Arc::clone(&parent_session.services.auth_manager),
+            Arc::clone(&parent_session.services.models_manager),
+            parent_session,
+            parent_ctx,
+            cancel_token,
+            SubAgentSource::Review,
+            /*initial_history*/ None,
+        ),
+    )
+    .await
+    .expect("cancelled delegate spawn should not hang");
+
+    assert!(matches!(result, Err(CodexErr::TurnAborted)));
+}
+
+#[tokio::test]
 async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
     let (parent_session, parent_ctx, rx_events) =
         crate::session::tests::make_session_and_context_with_rx().await;
@@ -182,9 +208,12 @@ async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
             ..RequestPermissionProfile::default()
         },
         scope: PermissionGrantScope::Turn,
+        strict_auto_review: false,
     };
+    let delegated_cwd = parent_ctx.cwd.join("delegated-cwd");
     let cancel_token = CancellationToken::new();
     let request_call_id = call_id.clone();
+    let request_cwd = delegated_cwd.clone();
 
     let handle = tokio::spawn({
         let codex = Arc::clone(&codex);
@@ -206,6 +235,7 @@ async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
                         }),
                         ..RequestPermissionProfile::default()
                     },
+                    cwd: Some(request_cwd),
                 },
                 &cancel_token,
             )
@@ -221,6 +251,7 @@ async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
         panic!("expected RequestPermissions event");
     };
     assert_eq!(request.call_id, call_id.clone());
+    assert_eq!(request.cwd, Some(delegated_cwd));
 
     parent_session
         .notify_request_permissions_response(&call_id, expected_response.clone())

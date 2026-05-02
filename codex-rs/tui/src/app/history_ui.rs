@@ -1,6 +1,7 @@
-//! Terminal history and transcript UI helpers for the TUI app.
+//! Terminal history and clear-screen UI helpers for the TUI app.
 //!
-//! This module owns global history/terminal clearing helpers that operate around ChatWidget.
+//! This module owns rendering the fresh session header, clearing inline or alternate-screen UI
+//! state, and resetting transcript-related app state after `/clear` or Ctrl-L.
 
 use super::*;
 
@@ -82,10 +83,16 @@ impl App {
     }
 
     pub(super) fn reset_app_ui_state_after_clear(&mut self) {
+        self.reset_transcript_state_after_clear();
+    }
+
+    pub(super) fn reset_transcript_state_after_clear(&mut self) {
         self.overlay = None;
         self.transcript_cells.clear();
         self.deferred_history_lines.clear();
         self.has_emitted_history_lines = false;
+        self.transcript_reflow.clear();
+        self.initial_history_replay_buffer = None;
         self.backtrack = BacktrackState::default();
         self.backtrack_render_pending = false;
     }

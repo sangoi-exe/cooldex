@@ -1,9 +1,14 @@
 //! Memory subsystem for startup extraction and consolidation.
 //!
+//! Merge-safety anchor: this module is preserved as the core-local owner for
+//! Session-triggered `/update_memories` and `/drop_memories` while upstream's
+//! extracted write crate would create a dependency cycle from `codex-core`.
+//!
 //! The startup memory pipeline is split into two phases:
 //! - Phase 1: select rollouts, extract stage-1 raw memories, persist stage-1 outputs, and enqueue consolidation.
 //! - Phase 2: claim a global consolidation lock, materialize consolidation inputs, and dispatch one consolidation agent.
 
+#[cfg(test)]
 pub(crate) mod citations;
 mod control;
 mod phase1;
@@ -13,7 +18,6 @@ mod start;
 mod storage;
 #[cfg(test)]
 mod tests;
-pub(crate) mod usage;
 
 use codex_protocol::openai_models::ReasoningEffort;
 
@@ -45,9 +49,6 @@ mod phase_one {
     /// Fallback stage-1 rollout truncation limit (tokens) when model metadata
     /// does not include a valid context window.
     pub(super) const DEFAULT_STAGE_ONE_ROLLOUT_TOKEN_LIMIT: usize = 150_000;
-    /// Maximum number of tokens from `memory_summary.md` injected into memory
-    /// tool developer instructions.
-    pub(super) const MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_SUMMARY_TOKEN_LIMIT: usize = 5_000;
     /// Portion of the model effective input window reserved for the stage-1
     /// rollout input.
     ///

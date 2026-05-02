@@ -1,6 +1,7 @@
 pub(crate) mod agent_jobs;
 pub(crate) mod apply_patch;
 mod dynamic;
+mod goal;
 mod js_repl;
 mod list_dir;
 mod manage_context;
@@ -42,6 +43,7 @@ pub use apply_patch::ApplyPatchHandler;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 pub use dynamic::DynamicToolHandler;
+pub use goal::GoalHandler;
 pub use js_repl::JsReplHandler;
 pub use js_repl::JsReplResetHandler;
 pub use list_dir::ListDirHandler;
@@ -238,12 +240,19 @@ mod tests {
     use super::EffectiveAdditionalPermissions;
     use super::implicit_granted_permissions;
     use super::normalize_and_validate_additional_permissions;
+    use super::permissions_are_preapproved;
     use crate::sandboxing::SandboxPermissions;
     use codex_protocol::models::AdditionalPermissionProfile;
     use codex_protocol::models::FileSystemPermissions;
     use codex_protocol::models::NetworkPermissions;
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSpecialPath;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::GranularApprovalConfig;
+    use codex_sandboxing::policy_transforms::intersect_permission_profiles;
+    use codex_sandboxing::policy_transforms::merge_permission_profiles;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
@@ -345,5 +354,44 @@ mod tests {
         );
 
         assert_eq!(implicit_permissions, None);
+    }
+
+    #[test]
+    fn relative_deny_glob_grants_remain_preapproved_after_materialization() {
+        let cwd = tempdir().expect("tempdir");
+        let requested_permissions = AdditionalPermissionProfile {
+            file_system: Some(FileSystemPermissions {
+                entries: vec![
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                        },
+                        access: FileSystemAccessMode::Write,
+                    },
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::GlobPattern {
+                            pattern: "**/*.env".to_string(),
+                        },
+                        access: FileSystemAccessMode::None,
+                    },
+                ],
+                glob_scan_max_depth: None,
+            }),
+            ..Default::default()
+        };
+        let stored_grant = intersect_permission_profiles(
+            requested_permissions.clone(),
+            requested_permissions.clone(),
+            cwd.path(),
+        );
+        let effective_permissions =
+            merge_permission_profiles(Some(&requested_permissions), Some(&stored_grant))
+                .expect("merged permissions");
+
+        assert!(permissions_are_preapproved(
+            &effective_permissions,
+            stored_grant,
+            cwd.path(),
+        ));
     }
 }

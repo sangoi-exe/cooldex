@@ -1,3 +1,5 @@
+// Merge-safety anchor: MCP CLI management is an operator-facing config/OAuth seam; keep env-source and auth mutations routed through the canonical MCP owners.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -486,8 +488,12 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
 
     let mut entries: Vec<_> = mcp_servers.iter().collect();
     entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let auth_statuses =
-        compute_auth_statuses(mcp_servers.iter(), config.mcp_oauth_credentials_store_mode).await;
+    let auth_statuses = compute_auth_statuses(
+        mcp_servers.iter(),
+        config.mcp_oauth_credentials_store_mode,
+        /*auth*/ None,
+    )
+    .await;
 
     if list_args.json {
         let json_entries: Vec<_> = entries

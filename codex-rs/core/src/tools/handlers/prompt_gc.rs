@@ -244,7 +244,7 @@ async fn ensure_rollout_compatible_for_prompt_gc(
             INCOMPATIBLE_ROLLOUT_HISTORY_STATUS,
         )
     })?;
-    let Some(rollout_path) = session.current_rollout_path().await else {
+    let Ok(Some(rollout_path)) = session.current_rollout_path().await else {
         return Err(contract_error(
             StopReason::MissingRolloutRecorder,
             MISSING_ROLLOUT_RECORDER_STATUS,
@@ -333,9 +333,10 @@ pub(crate) async fn build_runtime_plan(
                 "prompt_gc sidecar is not active for this turn",
             )
         })?;
-    let sidecar = sidecar.lock().await;
-    let units = selectable_units_for_runtime_plan(&sidecar, &checkpoint)?;
-    drop(sidecar);
+    let units = {
+        let sidecar = sidecar.lock().await;
+        selectable_units_for_runtime_plan(&sidecar, &checkpoint)?
+    };
 
     let current_history = {
         let state = session.state.lock().await;
@@ -665,7 +666,7 @@ mod tests {
             kind: TaskKind::Regular,
             task: Arc::new(RegularTask) as Arc<dyn AnySessionTask>,
             cancellation_token: CancellationToken::new(),
-            handle: Arc::new(AbortOnDropHandle::new(tokio::spawn(async {}))),
+            handle: AbortOnDropHandle::new(tokio::spawn(async {})),
             turn_context: Arc::clone(&turn_context),
             _timer: None,
         });

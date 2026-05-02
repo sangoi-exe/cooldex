@@ -28,6 +28,8 @@ use tracing::warn;
 // and must stay aligned with customized ChatGPT account storage and refresh behavior.
 
 use crate::token_data::TokenData;
+use codex_agent_identity::AgentIdentityJwtClaims;
+use codex_agent_identity::decode_agent_identity_jwt;
 use codex_app_server_protocol::AuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_keyring_store::DefaultKeyringStore;
@@ -51,18 +53,72 @@ pub struct AuthDotJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh: Option<DateTime<Utc>>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_agent_identity_record"
+    )]
     pub agent_identity: Option<AgentIdentityAuthRecord>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct AgentIdentityAuthRecord {
+    #[serde(alias = "account_id")]
     pub workspace_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chatgpt_user_id: Option<String>,
     pub agent_runtime_id: String,
     pub agent_private_key: String,
     pub registered_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<codex_protocol::account::PlanType>,
+    #[serde(default)]
+    pub chatgpt_account_is_fedramp: bool,
+}
+
+impl AgentIdentityAuthRecord {
+    pub(crate) fn from_agent_identity_jwt(jwt: &str) -> std::io::Result<Self> {
+        let claims =
+            decode_agent_identity_jwt(jwt, /*jwks*/ None).map_err(std::io::Error::other)?;
+
+        Ok(claims.into())
+    }
+}
+
+impl From<AgentIdentityJwtClaims> for AgentIdentityAuthRecord {
+    fn from(claims: AgentIdentityJwtClaims) -> Self {
+        Self {
+            agent_runtime_id: claims.agent_runtime_id,
+            agent_private_key: claims.agent_private_key,
+            workspace_id: claims.account_id,
+            chatgpt_user_id: Some(claims.chatgpt_user_id),
+            registered_at: Utc::now().to_rfc3339(),
+            email: Some(claims.email),
+            plan_type: Some(claims.plan_type.into()),
+            chatgpt_account_is_fedramp: claims.chatgpt_account_is_fedramp,
+        }
+    }
+}
+
+fn deserialize_agent_identity_record<'de, D>(
+    deserializer: D,
+) -> Result<Option<AgentIdentityAuthRecord>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if let Some(jwt) = value.as_str() {
+        return AgentIdentityAuthRecord::from_agent_identity_jwt(jwt)
+            .map(Some)
+            .map_err(serde::de::Error::custom);
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
 }
 
 pub const AUTH_STORE_VERSION: u32 = 1;

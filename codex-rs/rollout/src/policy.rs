@@ -132,22 +132,25 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
         | EventMsg::CollabCloseEnd(_)
         | EventMsg::CollabResumeEnd(_)
         | EventMsg::DynamicToolCallRequest(_)
-        | EventMsg::DynamicToolCallResponse(_)
+        | EventMsg::DynamicToolCallResponse(_) => Some(EventPersistenceMode::Extended),
         // Merge-safety anchor: warning persistence keeps app-server thread/read
         // replay and plain-TUI reconstructed replay on the same generic-warning
         // evidence instead of splitting live-only vs replay-only owners.
-        | EventMsg::Warning(_) => Some(EventPersistenceMode::Extended),
-        EventMsg::RealtimeConversationStarted(_)
+        EventMsg::Warning(_)
+        | EventMsg::GuardianWarning(_)
+        | EventMsg::RealtimeConversationStarted(_)
         | EventMsg::RealtimeConversationSdp(_)
         | EventMsg::RealtimeConversationRealtime(_)
         | EventMsg::RealtimeConversationClosed(_)
         | EventMsg::ModelReroute(_)
+        | EventMsg::ModelVerification(_)
         | EventMsg::AgentMessageDelta(_)
         | EventMsg::AgentReasoningDelta(_)
         | EventMsg::AgentReasoningRawContentDelta(_)
         | EventMsg::AgentReasoningSectionBreak(_)
         | EventMsg::RawResponseItem(_)
         | EventMsg::SessionConfigured(_)
+        | EventMsg::ThreadGoalUpdated(_)
         | EventMsg::McpToolCallBegin(_)
         | EventMsg::WebSearchBegin(_)
         | EventMsg::ExecCommandBegin(_)

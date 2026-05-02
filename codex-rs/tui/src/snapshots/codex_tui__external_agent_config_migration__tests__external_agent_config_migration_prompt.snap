@@ -1,9 +1,7 @@
 ---
 source: tui/src/external_agent_config_migration.rs
-assertion_line: 856
 expression: rendered
 ---
-
   > External agent config detected
   We found settings from another agent that you can add to this project.
   Select what to import

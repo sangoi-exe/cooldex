@@ -18,11 +18,14 @@ pub enum SlashCommand {
     // only active local legacy slash-command canon; do not reintroduce
     // `/approvals`, `/clean`, or `/agent` peers.
     Permissions,
+    Keymap,
     #[strum(serialize = "setup-default-sandbox")]
     ElevateSandbox,
     #[strum(serialize = "sandbox-add-read-dir")]
     SandboxReadRoot,
     Experimental,
+    #[strum(to_string = "autoreview")]
+    AutoReview,
     Memories,
     Skills,
     Review,
@@ -34,9 +37,11 @@ pub enum SlashCommand {
     Compact,
     Sanitize,
     Plan,
+    Goal,
     Collab,
     #[strum(to_string = "subagents")]
     MultiAgents,
+    Side,
     // Undo,
     Copy,
     Debug,
@@ -108,16 +113,20 @@ impl SlashCommand {
             SlashCommand::Realtime => "toggle realtime voice mode (experimental)",
             SlashCommand::Settings => "configure realtime microphone/speaker",
             SlashCommand::Plan => "switch to Plan mode",
+            SlashCommand::Goal => "set or view the goal for a long-running task",
             SlashCommand::Collab => "change collaboration mode (experimental)",
             SlashCommand::MultiAgents => "switch the active subagent thread",
+            SlashCommand::Side => "start a side conversation in an ephemeral fork",
             SlashCommand::Permissions => "choose what Codex is allowed to do",
+            SlashCommand::Keymap => "remap TUI shortcuts",
             SlashCommand::ElevateSandbox => "set up elevated agent sandbox",
             SlashCommand::SandboxReadRoot => {
                 "let sandbox read a directory: /sandbox-add-read-dir <absolute_path>"
             }
             SlashCommand::Experimental => "toggle experimental features",
+            SlashCommand::AutoReview => "approve one retry of a recent auto-review denial",
             SlashCommand::Memories => "configure memory use and generation",
-            SlashCommand::Mcp => "list configured MCP tools",
+            SlashCommand::Mcp => "list configured MCP tools; use /mcp verbose for details",
             SlashCommand::Apps => "manage apps",
             SlashCommand::Accounts => "manage ChatGPT accounts",
             SlashCommand::Plugins => "browse plugins",
@@ -140,9 +149,20 @@ impl SlashCommand {
             SlashCommand::Review
                 | SlashCommand::Rename
                 | SlashCommand::Plan
+                | SlashCommand::Goal
                 | SlashCommand::Fast
+                | SlashCommand::Mcp
+                | SlashCommand::Side
                 | SlashCommand::Resume
                 | SlashCommand::SandboxReadRoot
+        )
+    }
+
+    /// Whether this command remains available inside an active side conversation.
+    pub fn available_in_side_conversation(self) -> bool {
+        matches!(
+            self,
+            SlashCommand::Copy | SlashCommand::Diff | SlashCommand::Mention | SlashCommand::Status
         )
     }
 
@@ -162,6 +182,7 @@ impl SlashCommand {
             | SlashCommand::Fast
             | SlashCommand::Personality
             | SlashCommand::Permissions
+            | SlashCommand::Keymap
             | SlashCommand::ElevateSandbox
             | SlashCommand::SandboxReadRoot
             | SlashCommand::Experimental
@@ -171,8 +192,6 @@ impl SlashCommand {
             | SlashCommand::Accounts
             | SlashCommand::Clear
             | SlashCommand::Logout
-            | SlashCommand::Title
-            | SlashCommand::Statusline
             | SlashCommand::Theme
             | SlashCommand::MemoryDrop
             | SlashCommand::MemoryUpdate => false,
@@ -186,12 +205,17 @@ impl SlashCommand {
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
             | SlashCommand::Stop
+            | SlashCommand::Goal
             | SlashCommand::Mcp
             | SlashCommand::Apps
             | SlashCommand::Plugins
+            | SlashCommand::AutoReview
+            | SlashCommand::Title
+            | SlashCommand::Statusline
             | SlashCommand::Feedback
             | SlashCommand::Quit
-            | SlashCommand::Exit => true,
+            | SlashCommand::Exit
+            | SlashCommand::Side => true,
             SlashCommand::Rollout => true,
             SlashCommand::TestApproval => true,
             SlashCommand::Realtime => true,
@@ -252,5 +276,21 @@ mod tests {
     #[test]
     fn clean_is_rejected_as_removed_alias() {
         assert!(SlashCommand::from_str("clean").is_err());
+    }
+
+    #[test]
+    fn certain_commands_are_available_during_task() {
+        assert!(SlashCommand::Goal.available_during_task());
+        assert!(SlashCommand::Title.available_during_task());
+        assert!(SlashCommand::Statusline.available_during_task());
+    }
+
+    #[test]
+    fn auto_review_command_is_autoreview() {
+        assert_eq!(SlashCommand::AutoReview.command(), "autoreview");
+        assert_eq!(
+            SlashCommand::from_str("autoreview"),
+            Ok(SlashCommand::AutoReview)
+        );
     }
 }

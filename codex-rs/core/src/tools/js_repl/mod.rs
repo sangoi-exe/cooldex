@@ -26,6 +26,7 @@ use tokio::process::ChildStdin;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::OnceCell;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing::trace;
@@ -98,10 +99,6 @@ impl JsReplHandle {
             .await
             .cloned()
     }
-
-    pub(crate) fn manager_if_initialized(&self) -> Option<Arc<JsReplManager>> {
-        self.cell.get().cloned()
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -121,17 +118,25 @@ pub struct JsExecResult {
 struct KernelState {
     child: Arc<Mutex<Child>>,
     recent_stderr: Arc<Mutex<VecDeque<String>>>,
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: KernelStdinTx,
     pending_execs: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ExecResultMessage>>>>,
     exec_contexts: Arc<Mutex<HashMap<String, ExecContext>>>,
     top_level_exec_state: TopLevelExecState,
     shutdown: CancellationToken,
 }
 
+type KernelStdinTx = mpsc::Sender<KernelStdinWrite>;
+
+struct KernelStdinWrite {
+    message: HostToKernel,
+    result_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
 #[derive(Clone)]
 struct ExecContext {
     session: Arc<Session>,
     turn: Arc<TurnContext>,
+    cancellation_token: CancellationToken,
     tracker: SharedTurnDiffTracker,
 }
 
@@ -167,6 +172,7 @@ impl TopLevelExecState {
         }
     }
 
+    #[cfg(test)]
     fn should_reset_for_interrupt(&self, turn_id: &str) -> bool {
         match self {
             Self::Idle => false,
@@ -589,6 +595,7 @@ impl JsReplManager {
         }
     }
 
+    #[cfg(test)]
     async fn turn_interrupt_requires_reset(&self, turn_id: &str) -> bool {
         self.kernel.lock().await.as_ref().is_some_and(|state| {
             state
@@ -813,6 +820,7 @@ impl JsReplManager {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn interrupt_turn_exec(&self, turn_id: &str) -> Result<bool, FunctionCallError> {
         let _permit = self.exec_lock.clone().acquire_owned().await.map_err(|_| {
             FunctionCallError::RespondToModel("js_repl execution unavailable".to_string())
@@ -847,25 +855,29 @@ impl JsReplManager {
             FunctionCallError::RespondToModel("js_repl execution unavailable".to_string())
         })?;
 
-        let (stdin, pending_execs, exec_contexts, child, recent_stderr) = {
+        let needs_kernel = { self.kernel.lock().await.is_none() };
+        if needs_kernel {
+            let dependency_env = session.dependency_env().await;
+            let mut state = self
+                .start_kernel(
+                    Arc::clone(&turn),
+                    &dependency_env,
+                    Some(session.conversation_id),
+                )
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+            state.top_level_exec_state = TopLevelExecState::FreshKernel {
+                turn_id: turn.sub_id.clone(),
+                exec_id: None,
+            };
             let mut kernel = self.kernel.lock().await;
             if kernel.is_none() {
-                let dependency_env = session.dependency_env().await;
-                let mut state = self
-                    .start_kernel(
-                        Arc::clone(&turn),
-                        &dependency_env,
-                        Some(session.conversation_id),
-                    )
-                    .await
-                    .map_err(FunctionCallError::RespondToModel)?;
-                state.top_level_exec_state = TopLevelExecState::FreshKernel {
-                    turn_id: turn.sub_id.clone(),
-                    exec_id: None,
-                };
                 *kernel = Some(state);
             }
+        }
 
+        let (stdin, pending_execs, exec_contexts, child, recent_stderr, shutdown) = {
+            let kernel = self.kernel.lock().await;
             let state = match kernel.as_ref() {
                 Some(state) => state,
                 None => {
@@ -875,11 +887,12 @@ impl JsReplManager {
                 }
             };
             (
-                Arc::clone(&state.stdin),
+                state.stdin.clone(),
                 Arc::clone(&state.pending_execs),
                 Arc::clone(&state.exec_contexts),
                 Arc::clone(&state.child),
                 Arc::clone(&state.recent_stderr),
+                state.shutdown.clone(),
             )
         };
 
@@ -892,6 +905,7 @@ impl JsReplManager {
                 ExecContext {
                     session: Arc::clone(&session),
                     turn: Arc::clone(&turn),
+                    cancellation_token: shutdown.child_token(),
                     tracker,
                 },
             );
@@ -1123,12 +1137,13 @@ impl JsReplManager {
         > = Arc::new(Mutex::new(HashMap::new()));
         let exec_contexts: Arc<Mutex<HashMap<String, ExecContext>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let stdin_arc = Arc::new(Mutex::new(stdin));
+        let (stdin_tx, stdin_rx) = mpsc::channel(16);
         let child = Arc::new(Mutex::new(child));
         let recent_stderr = Arc::new(Mutex::new(VecDeque::with_capacity(
             JS_REPL_STDERR_TAIL_LINE_LIMIT,
         )));
 
+        tokio::spawn(Self::write_stdin(stdin, stdin_rx, shutdown.clone()));
         tokio::spawn(Self::read_stdout(
             stdout,
             Arc::clone(&child),
@@ -1137,7 +1152,7 @@ impl JsReplManager {
             Arc::clone(&pending_execs),
             Arc::clone(&exec_contexts),
             Arc::clone(&self.exec_tool_calls),
-            Arc::clone(&stdin_arc),
+            stdin_tx.clone(),
             shutdown.clone(),
         ));
         if let Some(stderr) = stderr {
@@ -1153,7 +1168,7 @@ impl JsReplManager {
         Ok(KernelState {
             child,
             recent_stderr,
-            stdin: stdin_arc,
+            stdin: stdin_tx,
             pending_execs,
             exec_contexts,
             top_level_exec_state: TopLevelExecState::Idle,
@@ -1171,20 +1186,56 @@ impl JsReplManager {
     }
 
     async fn write_message(
-        stdin: &Arc<Mutex<ChildStdin>>,
+        stdin: &KernelStdinTx,
         msg: &HostToKernel,
     ) -> Result<(), FunctionCallError> {
-        let encoded = serde_json::to_string(msg).map_err(|err| {
-            FunctionCallError::RespondToModel(format!("failed to serialize kernel message: {err}"))
-        })?;
-        let mut guard = stdin.lock().await;
-        guard.write_all(encoded.as_bytes()).await.map_err(|err| {
-            FunctionCallError::RespondToModel(format!("failed to write to kernel: {err}"))
-        })?;
-        guard.write_all(b"\n").await.map_err(|err| {
-            FunctionCallError::RespondToModel(format!("failed to flush kernel message: {err}"))
-        })?;
-        Ok(())
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        stdin
+            .send(KernelStdinWrite {
+                message: msg.clone(),
+                result_tx,
+            })
+            .await
+            .map_err(|_| {
+                FunctionCallError::RespondToModel("js_repl kernel stdin closed".to_string())
+            })?;
+        match result_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(FunctionCallError::RespondToModel(error)),
+            Err(_) => Err(FunctionCallError::RespondToModel(
+                "js_repl kernel stdin writer stopped".to_string(),
+            )),
+        }
+    }
+
+    async fn write_stdin(
+        mut stdin: ChildStdin,
+        mut write_rx: mpsc::Receiver<KernelStdinWrite>,
+        shutdown: CancellationToken,
+    ) {
+        loop {
+            let Some(write) = (tokio::select! {
+                _ = shutdown.cancelled() => None,
+                write = write_rx.recv() => write,
+            }) else {
+                break;
+            };
+            let result = async {
+                let encoded = serde_json::to_string(&write.message)
+                    .map_err(|err| format!("failed to serialize kernel message: {err}"))?;
+                stdin
+                    .write_all(encoded.as_bytes())
+                    .await
+                    .map_err(|err| format!("failed to write to kernel: {err}"))?;
+                stdin
+                    .write_all(b"\n")
+                    .await
+                    .map_err(|err| format!("failed to flush kernel message: {err}"))?;
+                Ok(())
+            }
+            .await;
+            let _ = write.result_tx.send(result);
+        }
     }
 
     async fn kernel_stderr_tail_snapshot(recent_stderr: &Arc<Mutex<VecDeque<String>>>) -> String {
@@ -1240,26 +1291,6 @@ impl JsReplManager {
                 error = %err,
                 "failed to send kill signal to js_repl kernel"
             );
-            return;
-        }
-
-        match tokio::time::timeout(Duration::from_secs(2), guard.wait()).await {
-            Ok(Ok(_status)) => {}
-            Ok(Err(err)) => {
-                warn!(
-                    kernel_pid = ?pid,
-                    kill_reason = reason,
-                    error = %err,
-                    "failed while waiting for js_repl kernel exit"
-                );
-            }
-            Err(_) => {
-                warn!(
-                    kernel_pid = ?pid,
-                    kill_reason = reason,
-                    "timed out waiting for js_repl kernel to exit after kill"
-                );
-            }
         }
     }
 
@@ -1281,7 +1312,7 @@ impl JsReplManager {
         pending_execs: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ExecResultMessage>>>>,
         exec_contexts: Arc<Mutex<HashMap<String, ExecContext>>>,
         exec_tool_calls: Arc<Mutex<HashMap<String, ExecToolCalls>>>,
-        stdin: Arc<Mutex<ChildStdin>>,
+        stdin: KernelStdinTx,
         shutdown: CancellationToken,
     ) {
         let mut reader = BufReader::new(stdout).lines();
@@ -1422,7 +1453,7 @@ impl JsReplManager {
                         }
                         continue;
                     };
-                    let stdin_clone = Arc::clone(&stdin);
+                    let stdin_clone = stdin.clone();
                     let exec_contexts = Arc::clone(&exec_contexts);
                     let exec_tool_calls_for_task = Arc::clone(&exec_tool_calls);
                     let recent_stderr = Arc::clone(&recent_stderr);
@@ -1559,14 +1590,11 @@ impl JsReplManager {
             };
         }
 
-        let mcp_tools = exec
-            .session
-            .services
-            .mcp_connection_manager
-            .read()
-            .await
-            .list_all_tools()
-            .await;
+        let mcp_tools = {
+            let mcp_connection_manager = exec.session.services.mcp_connection_manager.read().await;
+            mcp_connection_manager.list_all_tools_snapshot()
+        }
+        .await;
         let router = ToolRouter::from_config(
             &exec.turn.tools_config,
             crate::tools::router::ToolRouterParams {
@@ -1648,12 +1676,14 @@ impl JsReplManager {
 
         let session = Arc::clone(&exec.session);
         let turn = Arc::clone(&exec.turn);
+        let cancellation_token = exec.cancellation_token.child_token();
         let tracker = Arc::clone(&exec.tracker);
 
         match router
             .dispatch_tool_call_with_code_mode_result(
                 session,
                 turn,
+                cancellation_token,
                 tracker,
                 call,
                 crate::tools::router::ToolCallSource::JsRepl,

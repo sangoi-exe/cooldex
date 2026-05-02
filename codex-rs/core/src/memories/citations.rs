@@ -1,3 +1,5 @@
+// Merge-safety anchor: core-local memory citations stay aligned with the
+// preserved Session-owned memory pipeline during upstream extraction sync.
 use codex_protocol::ThreadId;
 use codex_protocol::memory_citation::MemoryCitation;
 use codex_protocol::memory_citation::MemoryCitationEntry;

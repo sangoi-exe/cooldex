@@ -45,6 +45,10 @@ const ALIASES: &[Alias] = &[
         legacy_key: "memory_tool",
         feature: Feature::MemoryTool,
     },
+    Alias {
+        legacy_key: "telepathy",
+        feature: Feature::Chronicle,
+    },
 ];
 
 // Merge-safety anchor: legacy feature aliases here are the only place that may

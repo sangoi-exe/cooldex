@@ -16,6 +16,7 @@ use toml::Table;
 
 mod feature_configs;
 mod legacy;
+pub use feature_configs::AppsMcpPathOverrideConfigToml;
 pub use feature_configs::MultiAgentV2ConfigToml;
 use legacy::LegacyFeatureToggles;
 pub use legacy::legacy_feature_keys;
@@ -72,7 +73,8 @@ impl Stage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Feature {
     // Stable.
-    /// Create a ghost commit at each turn.
+    /// Removed compatibility flag retained as a no-op so old configs can
+    /// still parse `undo`.
     GhostCommit,
     /// Enable the default shell tool.
     ShellTool,
@@ -80,18 +82,20 @@ pub enum Feature {
     CodexHooks,
 
     // Experimental
-    /// Enable JavaScript REPL tools backed by a persistent Node kernel.
+    /// Removed compatibility flag for the deleted JavaScript REPL feature.
     JsRepl,
-    /// Enable a minimal JavaScript mode backed by Node's built-in vm runtime.
+    /// Enable JavaScript code mode backed by the in-process V8 runtime.
     CodeMode,
     /// Restrict model-visible tools to code mode entrypoints (`exec`, `wait`).
     CodeModeOnly,
-    /// Only expose js_repl tools directly to the model.
+    /// Removed compatibility flag for the deleted JavaScript REPL tool-only mode.
     JsReplToolsOnly,
     /// Use the single unified PTY-backed exec tool.
     UnifiedExec,
     /// Route shell tool execution through the zsh exec bridge.
     ShellZshFork,
+    /// Reflow transcript scrollback when the terminal is resized.
+    TerminalResizeReflow,
     /// Include the freeform apply_patch tool.
     ApplyPatchFreeform,
     /// Stream structured progress while apply_patch input is being generated.
@@ -127,14 +131,12 @@ pub enum Feature {
     CodexGitCommit,
     /// Enable runtime metrics snapshots via a manual reader.
     RuntimeMetrics,
-    /// Enable thread lifecycle analytics emitted via the app-server analytics pipeline.
-    GeneralAnalytics,
     /// Persist rollout metadata to a local SQLite database.
     Sqlite,
     /// Enable startup memory extraction and file-backed memory consolidation.
     MemoryTool,
-    /// Enable the Telepathy sidecar for passive screen-context memories.
-    Telepathy,
+    /// Enable the Chronicle sidecar for passive screen-context memories.
+    Chronicle,
     /// Append additional AGENTS.md guidance to user instructions.
     ChildAgentsMd,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
@@ -147,6 +149,10 @@ pub enum Feature {
     SpawnCsv,
     /// Enable apps.
     Apps,
+    /// Enable MCP apps.
+    EnableMcpApps,
+    /// Use the new path for the built-in apps MCP server.
+    AppsMcpPathOverride,
     /// Enable the tool_search tool for apps.
     ToolSearch,
     /// Always defer MCP tools behind tool_search instead of exposing small sets directly.
@@ -157,6 +163,22 @@ pub enum Feature {
     ToolSuggest,
     /// Enable plugins.
     Plugins,
+    /// Enable plugin-bundled lifecycle hooks.
+    PluginHooks,
+    /// Allow the in-app browser pane in desktop apps.
+    ///
+    /// Requirements-only gate: this should be set from requirements, not user config.
+    InAppBrowser,
+    /// Allow Browser Use agent integration in desktop apps.
+    ///
+    /// Requirements-only gate: this should be set from requirements, not user config.
+    BrowserUse,
+    /// Allow Codex Computer Use.
+    ///
+    /// Requirements-only gate: this should be set from requirements, not user config.
+    ComputerUse,
+    /// Temporary internal-only flag for PS-backed remote plugin catalog development.
+    RemotePlugin,
     /// Show the startup prompt for migrating external agent config into Codex.
     ExternalMigration,
     /// Allow the model to invoke the built-in image generation tool.
@@ -172,8 +194,10 @@ pub enum Feature {
     DefaultModeRequestUserInput,
     /// Enable automatic review for approval prompts.
     GuardianApproval,
+    /// Enable persisted thread goals and automatic goal continuation.
+    Goals,
     /// Legacy internal collaboration-mode feature marker.
-    /// The shipped runtime now treats collaboration modes as always enabled.
+    /// Kept for config backward compatibility; behavior is always collaboration-modes-enabled.
     CollaborationModes,
     /// Route MCP tool approval prompts through the MCP elicitation request path.
     ToolCallMcpElicitation,
@@ -194,6 +218,8 @@ pub enum Feature {
     TuiAppServer,
     /// Prevent idle system sleep while a turn is actively running.
     PreventIdleSleep,
+    /// Enable workspace-specific owner nudge copy and prompts in the TUI.
+    WorkspaceOwnerUsageNudge,
     /// Legacy rollout flag for Responses API WebSocket transport experiments.
     ResponsesWebsockets,
     /// Legacy rollout flag for Responses API WebSocket transport v2 experiments.
@@ -375,6 +401,15 @@ impl Features {
                 "tui_app_server" => {
                     continue;
                 }
+                "undo" => {
+                    continue;
+                }
+                "js_repl" => {
+                    continue;
+                }
+                "js_repl_tools_only" => {
+                    continue;
+                }
                 "image_detail_original" => {
                     continue;
                 }
@@ -443,10 +478,6 @@ impl Features {
         }
         if self.enabled(Feature::CodeModeOnly) && !self.enabled(Feature::CodeMode) {
             self.enable(Feature::CodeMode);
-        }
-        if self.enabled(Feature::JsReplToolsOnly) && !self.enabled(Feature::JsRepl) {
-            tracing::warn!("js_repl_tools_only requires js_repl; disabling js_repl_tools_only");
-            self.disable(Feature::JsReplToolsOnly);
         }
     }
 }
@@ -563,6 +594,8 @@ pub fn is_known_feature_key(key: &str) -> bool {
 pub struct FeaturesToml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_v2: Option<FeatureToml<MultiAgentV2ConfigToml>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apps_mcp_path_override: Option<FeatureToml<AppsMcpPathOverrideConfigToml>>,
     /// Boolean feature toggles keyed by canonical or legacy feature name.
     #[serde(flatten)]
     entries: BTreeMap<String, bool>,
@@ -580,6 +613,13 @@ impl FeaturesToml {
         let mut entries = self.entries.clone();
         if let Some(enabled) = self.multi_agent_v2.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::MultiAgentV2.key().to_string(), enabled);
+        }
+        if let Some(enabled) = self
+            .apps_mcp_path_override
+            .as_ref()
+            .and_then(FeatureToml::enabled)
+        {
+            entries.insert(Feature::AppsMcpPathOverride.key().to_string(), enabled);
         }
         entries
     }
@@ -632,7 +672,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GhostCommit,
         key: "undo",
-        stage: Stage::Stable,
+        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -662,11 +702,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::JsRepl,
         key: "js_repl",
-        stage: Stage::Experimental {
-            name: "JavaScript REPL",
-            menu_description: "Enable a persistent Node-backed JavaScript REPL for interactive website debugging and other inline JavaScript execution capabilities. Requires Node >= v22.22.0 installed.",
-            announcement: "NEW: JavaScript REPL is now available in /experimental. Enable it, then start a new chat or restart Codex to use it.",
-        },
+        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -684,8 +720,18 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::JsReplToolsOnly,
         key: "js_repl_tools_only",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Removed,
         default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::TerminalResizeReflow,
+        key: "terminal_resize_reflow",
+        stage: Stage::Experimental {
+            name: "Terminal resize reflow",
+            menu_description: "Rebuild Codex-owned transcript scrollback when the terminal width changes.",
+            announcement: "",
+        },
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::WebSearchRequest,
@@ -719,12 +765,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::GeneralAnalytics,
-        key: "general_analytics",
-        stage: Stage::Stable,
-        default_enabled: true,
-    },
-    FeatureSpec {
         id: Feature::Sqlite,
         key: "sqlite",
         stage: Stage::Removed,
@@ -741,8 +781,8 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::Telepathy,
-        key: "telepathy",
+        id: Feature::Chronicle,
+        key: "chronicle",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -849,6 +889,18 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::EnableMcpApps,
+        key: "enable_mcp_apps",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::AppsMcpPathOverride,
+        key: "apps_mcp_path_override",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::ToolSearch,
         key: "tool_search",
         stage: Stage::Stable,
@@ -863,8 +915,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::UnavailableDummyTools,
         key: "unavailable_dummy_tools",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::ToolSuggest,
@@ -877,6 +929,36 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "plugins",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::PluginHooks,
+        key: "plugin_hooks",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::InAppBrowser,
+        key: "in_app_browser",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::BrowserUse,
+        key: "browser_use",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::ComputerUse,
+        key: "computer_use",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::RemotePlugin,
+        key: "remote_plugin",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::ExternalMigration,
@@ -921,11 +1003,13 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GuardianApproval,
         key: "guardian_approval",
-        stage: Stage::Experimental {
-            name: "Guardian Approvals",
-            menu_description: "When Codex needs approval for higher-risk actions (e.g. sandbox escapes or blocked network access), this experimental toggle adds a Guardian Approvals preset so you can opt eligible on-request approvals into a carefully-prompted security reviewer subagent. Runtime routing still follows the current approval policy and approvals reviewer config. This can consume significantly more tokens because it runs a subagent on eligible approval requests.",
-            announcement: "",
-        },
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::Goals,
+        key: "goals",
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {
@@ -998,6 +1082,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         } else {
             Stage::UnderDevelopment
         },
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::WorkspaceOwnerUsageNudge,
+        key: "workspace_owner_usage_nudge",
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {

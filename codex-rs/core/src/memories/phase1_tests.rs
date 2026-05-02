@@ -1,3 +1,5 @@
+// Merge-safety anchor: phase-1 tests preserve the Session-owned extraction
+// contract while upstream memory code is split into standalone crates.
 use super::JobOutcome;
 use super::JobResult;
 use super::aggregate_stats;

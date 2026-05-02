@@ -1,3 +1,5 @@
+// Merge-safety anchor: integration-style memory tests keep the preserved
+// core-local pipeline coherent while upstream extraction is reconciled.
 use super::control::clear_memory_root_contents;
 use super::storage::rebuild_raw_memories_file_from_memories;
 use super::storage::sync_rollout_summaries_from_memories;
@@ -497,9 +499,7 @@ mod phase2 {
                 CodexAuth::from_api_key("dummy"),
                 config.model_provider.clone(),
                 config.codex_home.to_path_buf(),
-                std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
-                    /*exec_server_url*/ None,
-                )),
+                std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             );
             let (mut session, _turn_context) = make_session_and_context().await;
             session.services.state_db = Some(Arc::clone(&state_db));
@@ -673,7 +673,7 @@ mod phase2 {
         assert!(
             matches!(
                 post_dispatch_claim,
-                Phase2JobClaimOutcome::SkippedRunning | Phase2JobClaimOutcome::SkippedNotDirty
+                Phase2JobClaimOutcome::SkippedRunning | Phase2JobClaimOutcome::SkippedCooldown
             ),
             "stale-lock dispatch should either keep the reclaimed job running or finish it before re-claim"
         );
@@ -695,7 +695,8 @@ mod phase2 {
             config_snapshot.cwd.as_path(),
             memory_root(&harness.config.codex_home).as_path()
         );
-        match &config_snapshot.sandbox_policy {
+        let config_sandbox_policy = config_snapshot.sandbox_policy();
+        match &config_sandbox_policy {
             SandboxPolicy::WorkspaceWrite {
                 writable_roots,
                 network_access,
@@ -720,7 +721,7 @@ mod phase2 {
         pretty_assertions::assert_eq!(
             turn_file_system_sandbox_policy,
             FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
-                &config_snapshot.sandbox_policy,
+                &config_sandbox_policy,
                 config_snapshot.cwd.as_path(),
             ),
             "consolidation subagent split filesystem policy should match the memory-root legacy policy"
@@ -854,7 +855,7 @@ mod phase2 {
             .try_claim_global_phase2_job(ThreadId::new(), /*lease_seconds*/ 3_600)
             .await
             .expect("claim global job after empty consolidation success");
-        pretty_assertions::assert_eq!(next_claim, Phase2JobClaimOutcome::SkippedNotDirty);
+        pretty_assertions::assert_eq!(next_claim, Phase2JobClaimOutcome::SkippedCooldown);
         pretty_assertions::assert_eq!(harness.user_input_ops_count(), 0);
         let thread_ids = harness.manager.list_thread_ids().await;
         pretty_assertions::assert_eq!(thread_ids.len(), 0);
@@ -888,7 +889,7 @@ mod phase2 {
             .try_claim_global_phase2_job(ThreadId::new(), /*lease_seconds*/ 3_600)
             .await
             .expect("claim global job after sandbox policy failure");
-        pretty_assertions::assert_eq!(retry_claim, Phase2JobClaimOutcome::SkippedNotDirty);
+        pretty_assertions::assert_eq!(retry_claim, Phase2JobClaimOutcome::SkippedCooldown);
         pretty_assertions::assert_eq!(harness.user_input_ops_count(), 0);
         let thread_ids = harness.manager.list_thread_ids().await;
         pretty_assertions::assert_eq!(thread_ids.len(), 0);
@@ -910,7 +911,7 @@ mod phase2 {
             .try_claim_global_phase2_job(ThreadId::new(), /*lease_seconds*/ 3_600)
             .await
             .expect("claim global job after sync failure");
-        pretty_assertions::assert_eq!(retry_claim, Phase2JobClaimOutcome::SkippedNotDirty);
+        pretty_assertions::assert_eq!(retry_claim, Phase2JobClaimOutcome::SkippedCooldown);
         pretty_assertions::assert_eq!(harness.user_input_ops_count(), 0);
         let thread_ids = harness.manager.list_thread_ids().await;
         pretty_assertions::assert_eq!(thread_ids.len(), 0);
@@ -932,7 +933,7 @@ mod phase2 {
             .try_claim_global_phase2_job(ThreadId::new(), /*lease_seconds*/ 3_600)
             .await
             .expect("claim global job after rebuild failure");
-        pretty_assertions::assert_eq!(retry_claim, Phase2JobClaimOutcome::SkippedNotDirty);
+        pretty_assertions::assert_eq!(retry_claim, Phase2JobClaimOutcome::SkippedCooldown);
         pretty_assertions::assert_eq!(harness.user_input_ops_count(), 0);
         let thread_ids = harness.manager.list_thread_ids().await;
         pretty_assertions::assert_eq!(thread_ids.len(), 0);
@@ -1037,7 +1038,7 @@ mod phase2 {
             .expect("claim global job after spawn failure");
         pretty_assertions::assert_eq!(
             retry_claim,
-            Phase2JobClaimOutcome::SkippedNotDirty,
+            Phase2JobClaimOutcome::SkippedCooldown,
             "spawn failures should leave the job in retry backoff instead of running"
         );
         assert!(

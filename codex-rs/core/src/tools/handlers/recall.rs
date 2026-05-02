@@ -1268,6 +1268,7 @@ mod tests {
             timezone: None,
             approval_policy: AskForApproval::Never,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
+            permission_profile: None,
             network: None,
             file_system_sandbox_policy: None,
             model: "gpt-5".to_string(),
@@ -1298,6 +1299,7 @@ mod tests {
             last_agent_message: None,
             completed_at: None,
             duration_ms: None,
+            time_to_first_token_ms: None,
         }))
     }
 

@@ -1,6 +1,9 @@
+// Merge-safety anchor: Unix escalation is a sandbox/approval boundary; keep guardian routing and hook permission semantics aligned with local operator policy.
+
 use super::ShellRequest;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
+use crate::exec::cancel_when_either;
 use crate::exec::is_likely_sandbox_denied;
 use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::guardian_rejection_message;
@@ -14,10 +17,12 @@ use crate::sandboxing::ExecRequest;
 use crate::sandboxing::SandboxPermissions;
 use crate::shell::ShellType;
 use crate::tools::runtimes::build_sandbox_command;
+use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::sandboxing::PermissionRequestPayload;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
+use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use codex_execpolicy::Decision;
 use codex_execpolicy::Evaluation;
 use codex_execpolicy::MatchOptions;
@@ -113,18 +118,19 @@ pub(super) async fn try_run_zsh_fork(
         return Ok(None);
     }
 
-    let command = build_sandbox_command(
-        command,
-        &req.cwd,
-        &req.env,
-        req.additional_permissions.clone(),
-    )?;
+    let env = exec_env_for_sandbox_permissions(&req.env, req.sandbox_permissions);
+    let command =
+        build_sandbox_command(command, &req.cwd, &env, req.additional_permissions.clone())?;
     let options = ExecOptions {
         expiration: req.timeout_ms.into(),
         capture_policy: ExecCapturePolicy::ShellTool,
     };
     let sandbox_exec_request = attempt
-        .env_for(command, options, req.network.as_ref())
+        .env_for(
+            command,
+            options,
+            managed_network_for_sandbox_permissions(req.network.as_ref(), req.sandbox_permissions),
+        )
         .map_err(|err| ToolError::Codex(err.into()))?;
     let crate::sandboxing::ExecRequest {
         command,
@@ -188,7 +194,10 @@ pub(super) async fn try_run_zsh_fork(
     // to minimize the time between creating the Stopwatch and starting the
     // escalation server.
     let stopwatch = Stopwatch::new(effective_timeout);
-    let cancel_token = stopwatch.cancellation_token();
+    let mut cancel_token = stopwatch.cancellation_token();
+    if let Some(cancellation) = attempt.network_denial_cancellation_token.clone() {
+        cancel_token = cancel_when_either(cancel_token, cancellation);
+    }
     let approval_sandbox_permissions = approval_sandbox_permissions(
         req.sandbox_permissions,
         req.additional_permissions_preapproved,
@@ -400,11 +409,10 @@ impl CoreShellActionProvider {
         Ok(stopwatch
             .pause_for(async move {
                 // 1) Run PermissionRequest hooks
-                let permission_request = PermissionRequestPayload {
-                    tool_name: "Bash".to_string(),
-                    command: codex_shell_command::parse_command::shlex_join(&command),
-                    description: None,
-                };
+                let permission_request = PermissionRequestPayload::bash(
+                    codex_shell_command::parse_command::shlex_join(&command),
+                    /*description*/ None,
+                );
                 let effective_approval_id = approval_id.clone().unwrap_or_else(|| call_id.clone());
                 match run_permission_request_hooks(
                     &session,

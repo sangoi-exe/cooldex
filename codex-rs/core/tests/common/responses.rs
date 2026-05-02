@@ -541,7 +541,14 @@ impl WebSocketTestServer {
 
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(());
-        let _ = self.task.await;
+        let mut task = self.task;
+        if tokio::time::timeout(Duration::from_secs(10), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -628,6 +635,17 @@ pub fn ev_response_created(id: &str) -> Value {
         "type": "response.created",
         "response": {
             "id": id,
+        }
+    })
+}
+
+pub fn ev_model_verification_metadata(id: &str, verifications: Vec<&str>) -> Value {
+    serde_json::json!({
+        "type": "response.metadata",
+        "sequence_number": 1,
+        "response_id": id,
+        "metadata": {
+            "openai_verification_recommendation": verifications,
         }
     })
 }

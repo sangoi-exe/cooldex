@@ -1,3 +1,5 @@
+// Merge-safety anchor: citation tests preserve behavior for the core-local
+// memory pipeline during upstream extraction sync.
 use super::get_thread_id_from_citations;
 use super::parse_memory_citation;
 use codex_protocol::ThreadId;

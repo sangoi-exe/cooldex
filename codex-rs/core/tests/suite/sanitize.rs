@@ -96,6 +96,7 @@ async fn cleanup_only_sanitize_reports_no_changes_and_keeps_followup_request_fre
                 text: "after sanitize".into(),
                 text_elements: Vec::new(),
             }],
+            environments: None,
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
         })

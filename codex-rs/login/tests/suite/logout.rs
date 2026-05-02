@@ -391,4 +391,8 @@ impl AuthManagerConfig for TestAuthManagerConfig {
     fn forced_chatgpt_workspace_id(&self) -> Option<String> {
         self.forced_chatgpt_workspace_id.clone()
     }
+
+    fn chatgpt_base_url(&self) -> String {
+        "https://chatgpt.com/backend-api".to_string()
+    }
 }

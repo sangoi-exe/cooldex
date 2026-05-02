@@ -4,8 +4,11 @@ use ratatui::widgets::WidgetRef;
 
 use super::popup_consts::MAX_POPUP_ROWS;
 use super::scroll_state::ScrollState;
+use super::selection_popup_common::ColumnWidthConfig;
+use super::selection_popup_common::ColumnWidthMode;
 use super::selection_popup_common::GenericDisplayRow;
-use super::selection_popup_common::render_rows;
+use super::selection_popup_common::measure_rows_height_with_col_width_mode;
+use super::selection_popup_common::render_rows_with_col_width_mode;
 use super::slash_commands;
 use crate::render::Insets;
 use crate::render::RectExt;
@@ -17,6 +20,10 @@ use crate::slash_command::SlashCommand;
 // Hide alias commands in the default popup list so each unique action appears once.
 // `quit` is an alias of `exit`, so we skip `quit` here.
 const ALIAS_COMMANDS: &[SlashCommand] = &[SlashCommand::Quit];
+const COMMAND_COLUMN_WIDTH: ColumnWidthConfig = ColumnWidthConfig::new(
+    ColumnWidthMode::AutoAllRows,
+    /*name_column_width*/ None,
+);
 
 /// A selectable item in the popup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,10 +43,12 @@ pub(crate) struct CommandPopupFlags {
     pub(crate) connectors_enabled: bool,
     pub(crate) plugins_command_enabled: bool,
     pub(crate) fast_command_enabled: bool,
+    pub(crate) goal_command_enabled: bool,
     pub(crate) personality_command_enabled: bool,
     pub(crate) realtime_conversation_enabled: bool,
     pub(crate) audio_device_selection_enabled: bool,
     pub(crate) windows_degraded_sandbox_active: bool,
+    pub(crate) side_conversation_active: bool,
 }
 
 impl From<CommandPopupFlags> for slash_commands::BuiltinCommandFlags {
@@ -49,10 +58,12 @@ impl From<CommandPopupFlags> for slash_commands::BuiltinCommandFlags {
             connectors_enabled: value.connectors_enabled,
             plugins_command_enabled: value.plugins_command_enabled,
             fast_command_enabled: value.fast_command_enabled,
+            goal_command_enabled: value.goal_command_enabled,
             personality_command_enabled: value.personality_command_enabled,
             realtime_conversation_enabled: value.realtime_conversation_enabled,
             audio_device_selection_enabled: value.audio_device_selection_enabled,
             allow_elevate_sandbox: value.windows_degraded_sandbox_active,
+            side_conversation_active: value.side_conversation_active,
         }
     }
 }
@@ -107,10 +118,15 @@ impl CommandPopup {
     /// Determine the preferred height of the popup for a given width.
     /// Accounts for wrapped descriptions so that long tooltips don't overflow.
     pub(crate) fn calculate_required_height(&self, width: u16) -> u16 {
-        use super::selection_popup_common::measure_rows_height;
         let rows = self.rows_from_matches(self.filtered());
 
-        measure_rows_height(&rows, &self.state, MAX_POPUP_ROWS, width)
+        measure_rows_height_with_col_width_mode(
+            &rows,
+            &self.state,
+            MAX_POPUP_ROWS,
+            width,
+            COMMAND_COLUMN_WIDTH,
+        )
     }
 
     /// Compute exact/prefix matches over built-in commands,
@@ -221,7 +237,7 @@ impl CommandPopup {
 impl WidgetRef for CommandPopup {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
         let rows = self.rows_from_matches(self.filtered());
-        render_rows(
+        render_rows_with_col_width_mode(
             area.inset(Insets::tlbr(
                 /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
             )),
@@ -230,6 +246,7 @@ impl WidgetRef for CommandPopup {
             &self.state,
             MAX_POPUP_ROWS,
             "no matches",
+            COMMAND_COLUMN_WIDTH,
         );
     }
 }
@@ -299,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn subagents_keeps_the_old_picker_slot_in_default_popup_order() {
+    fn subagents_keeps_the_agent_picker_slot_in_default_popup_order() {
         let popup = CommandPopup::new(CommandPopupFlags::default());
         let cmds: Vec<&str> = popup
             .filtered_items()
@@ -317,6 +334,10 @@ mod tests {
             .iter()
             .position(|cmd| *cmd == "subagents")
             .expect("expected /subagents in default popup order");
+        let side_idx = cmds
+            .iter()
+            .position(|cmd| *cmd == "side")
+            .expect("expected /side in default popup order");
         let diff_idx = cmds
             .iter()
             .position(|cmd| *cmd == "diff")
@@ -327,7 +348,8 @@ mod tests {
             .expect("expected /copy in default popup order");
 
         assert_eq!(subagents_idx, sanitize_idx + 1);
-        assert_eq!(copy_idx, subagents_idx + 1);
+        assert_eq!(side_idx, subagents_idx + 1);
+        assert_eq!(copy_idx, side_idx + 1);
         assert_eq!(diff_idx, copy_idx + 1);
     }
 
@@ -390,10 +412,12 @@ mod tests {
             connectors_enabled: false,
             plugins_command_enabled: false,
             fast_command_enabled: false,
+            goal_command_enabled: false,
             personality_command_enabled: true,
             realtime_conversation_enabled: false,
             audio_device_selection_enabled: false,
             windows_degraded_sandbox_active: false,
+            side_conversation_active: false,
         });
         popup.on_composer_text_change("/collab".to_string());
 
@@ -410,10 +434,12 @@ mod tests {
             connectors_enabled: false,
             plugins_command_enabled: false,
             fast_command_enabled: false,
+            goal_command_enabled: false,
             personality_command_enabled: true,
             realtime_conversation_enabled: false,
             audio_device_selection_enabled: false,
             windows_degraded_sandbox_active: false,
+            side_conversation_active: false,
         });
         popup.on_composer_text_change("/plan".to_string());
 
@@ -430,10 +456,12 @@ mod tests {
             connectors_enabled: false,
             plugins_command_enabled: false,
             fast_command_enabled: false,
+            goal_command_enabled: false,
             personality_command_enabled: false,
             realtime_conversation_enabled: false,
             audio_device_selection_enabled: false,
             windows_degraded_sandbox_active: false,
+            side_conversation_active: false,
         });
         popup.on_composer_text_change("/pers".to_string());
 
@@ -457,10 +485,12 @@ mod tests {
             connectors_enabled: false,
             plugins_command_enabled: false,
             fast_command_enabled: false,
+            goal_command_enabled: false,
             personality_command_enabled: true,
             realtime_conversation_enabled: false,
             audio_device_selection_enabled: false,
             windows_degraded_sandbox_active: false,
+            side_conversation_active: false,
         });
         popup.on_composer_text_change("/personality".to_string());
 
@@ -477,10 +507,12 @@ mod tests {
             connectors_enabled: false,
             plugins_command_enabled: false,
             fast_command_enabled: false,
+            goal_command_enabled: false,
             personality_command_enabled: true,
             realtime_conversation_enabled: true,
             audio_device_selection_enabled: false,
             windows_degraded_sandbox_active: false,
+            side_conversation_active: false,
         });
         popup.on_composer_text_change("/aud".to_string());
 

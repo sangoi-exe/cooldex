@@ -15,6 +15,7 @@ pub use cli::Command;
 pub use cli::ReviewArgs;
 use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 use codex_app_server_client::EnvironmentManager;
+use codex_app_server_client::EnvironmentManagerArgs;
 use codex_app_server_client::ExecServerRuntimePaths;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
@@ -51,20 +52,20 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_requirements::cloud_requirements_loader;
+use codex_config::ConfigLoadError;
+use codex_config::LoaderOverrides;
+use codex_config::format_config_error_with_source;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
-use codex_core::config::load_config_as_toml_with_cli_overrides;
+use codex_core::config::load_config_as_toml_with_cli_and_loader_overrides;
 use codex_core::config::resolve_chatgpt_base_url_for_config_toml;
 use codex_core::config::resolve_cli_auth_credentials_store_mode_for_config_toml;
 use codex_core::config::resolve_forced_chatgpt_workspace_id_for_config_toml;
 use codex_core::config::resolve_oss_provider;
 use codex_core::config::resolve_sqlite_home_for_config_toml;
-use codex_core::config_loader::ConfigLoadError;
-use codex_core::config_loader::LoaderOverrides;
-use codex_core::config_loader::format_config_error_with_source;
 use codex_core::find_thread_meta_by_name_str;
 use codex_core::format_exec_policy_error_with_source;
 use codex_core::path_utils;
@@ -91,6 +92,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_existing_preserving_symlinks;
+use codex_utils_cli::SharedCliOptions;
 use codex_utils_oss::ensure_oss_provider_ready;
 use codex_utils_oss::get_default_model_for_oss_provider;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
@@ -218,31 +220,42 @@ fn exec_root_span() -> tracing::Span {
 }
 
 pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
+    #[allow(clippy::print_stderr)]
+    if let Some(message) = cli.removed_full_auto_warning() {
+        eprintln!("{message}");
+    }
+
     if let Err(err) = set_default_originator("codex_exec".to_string()) {
         tracing::warn!(?err, "Failed to set codex exec originator override {err:?}");
     }
 
     let Cli {
         command,
+        shared,
+        skip_git_repo_check,
+        ephemeral,
+        ignore_user_config,
+        ignore_rules,
+        removed_full_auto,
+        color,
+        last_message_file,
+        json: json_mode,
+        prompt,
+        output_schema: output_schema_path,
+        config_overrides,
+    } = cli;
+    let shared = shared.into_inner();
+    let SharedCliOptions {
         images,
         model: model_cli_arg,
         oss,
         oss_provider,
         config_profile,
-        full_auto,
+        sandbox_mode: sandbox_mode_cli_arg,
         dangerously_bypass_approvals_and_sandbox,
         cwd,
-        skip_git_repo_check,
         add_dir,
-        ephemeral,
-        color,
-        last_message_file,
-        json: json_mode,
-        sandbox_mode: sandbox_mode_cli_arg,
-        prompt,
-        output_schema: output_schema_path,
-        config_overrides,
-    } = cli;
+    } = shared;
 
     let (_stdout_with_ansi, stderr_with_ansi) = match color {
         cli::Color::Always => (true, true),
@@ -265,7 +278,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         .with_writer(std::io::stderr)
         .with_filter(env_filter);
 
-    let sandbox_mode = if full_auto {
+    let sandbox_mode = if removed_full_auto {
         Some(SandboxMode::WorkspaceWrite)
     } else if dangerously_bypass_approvals_and_sandbox {
         Some(SandboxMode::DangerFullAccess)
@@ -302,11 +315,17 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     };
 
     #[allow(clippy::print_stderr)]
-    let config_toml = match load_config_as_toml_with_cli_overrides(
+    let loader_overrides = LoaderOverrides {
+        ignore_user_config,
+        ignore_user_and_project_exec_policy_rules: ignore_rules,
+        ..Default::default()
+    };
+
+    let config_toml = match load_config_as_toml_with_cli_and_loader_overrides(
         &codex_home,
         Some(&config_cwd),
         cli_kv_overrides.clone(),
-        LoaderOverrides::default(),
+        loader_overrides.clone(),
     )
     .await
     {
@@ -355,7 +374,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         codex_home.to_path_buf(),
     );
     let run_cli_overrides = cli_kv_overrides.clone();
-    let run_loader_overrides = LoaderOverrides::default();
+    let run_loader_overrides = loader_overrides.clone();
     let run_cloud_requirements = cloud_requirements.clone();
 
     let model_provider = if oss {
@@ -421,6 +440,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     let config = ConfigBuilder::default()
         .cli_overrides(cli_kv_overrides)
         .harness_overrides(overrides)
+        .loader_overrides(loader_overrides)
         .cloud_requirements(cloud_requirements)
         .build()
         .await?;
@@ -444,7 +464,10 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         auth_credentials_store_mode: config.cli_auth_credentials_store_mode,
         forced_login_method: config.forced_login_method,
         forced_chatgpt_workspace_id: config.forced_chatgpt_workspace_id.clone(),
-    }) {
+        chatgpt_base_url: Some(config.chatgpt_base_url.clone()),
+    })
+    .await
+    {
         eprintln!("{err}");
         std::process::exit(1);
     }
@@ -505,9 +528,9 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         cloud_requirements: run_cloud_requirements,
         feedback: CodexFeedback::new(),
         log_db: None,
-        environment_manager: std::sync::Arc::new(EnvironmentManager::from_env_with_runtime_paths(
-            Some(local_runtime_paths),
-        )),
+        environment_manager: std::sync::Arc::new(
+            EnvironmentManager::new(EnvironmentManagerArgs::new(local_runtime_paths)).await,
+        ),
         config_warnings,
         session_source: SessionSource::Exec,
         enable_codex_api_key_env: true,
@@ -582,9 +605,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
     let default_cwd = config.cwd.to_path_buf();
     let default_approval_policy = config.permissions.approval_policy.value();
-    let default_sandbox_policy = config
-        .permissions
-        .legacy_sandbox_policy(config.cwd.as_path());
     let default_effort = config.model_reasoning_effort;
 
     let (initial_operation, prompt_summary) = match (command.as_ref(), prompt, images) {
@@ -725,7 +745,8 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     // is using.
     event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
     if !json_mode
-        && let Some(message) = codex_core::config::system_bwrap_warning(&default_sandbox_policy)
+        && let Some(message) =
+            codex_core::config::system_bwrap_warning(config.permissions.permission_profile.get())
     {
         event_processor.process_warning(message);
     }
@@ -745,6 +766,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             items,
             output_schema,
         } => {
+            let permission_profile = Some(config.permissions.permission_profile().into());
             let response: TurnStartResponse = send_request_with_response(
                 &client,
                 ClientRequest::TurnStart {
@@ -753,10 +775,12 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         thread_id: primary_thread_id_for_span.clone(),
                         input: items.into_iter().map(Into::into).collect(),
                         responsesapi_client_metadata: None,
+                        environments: None,
                         cwd: Some(default_cwd),
                         approval_policy: Some(default_approval_policy.into()),
                         approvals_reviewer: None,
-                        sandbox_policy: Some(default_sandbox_policy.clone().into()),
+                        sandbox_policy: None,
+                        permission_profile,
                         model: None,
                         service_tier: None,
                         effort: default_effort,
@@ -912,23 +936,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn sandbox_mode_from_policy(
-    sandbox_policy: &codex_protocol::protocol::SandboxPolicy,
-) -> Option<codex_app_server_protocol::SandboxMode> {
-    match sandbox_policy {
-        codex_protocol::protocol::SandboxPolicy::DangerFullAccess => {
-            Some(codex_app_server_protocol::SandboxMode::DangerFullAccess)
-        }
-        codex_protocol::protocol::SandboxPolicy::ReadOnly { .. } => {
-            Some(codex_app_server_protocol::SandboxMode::ReadOnly)
-        }
-        codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. } => {
-            Some(codex_app_server_protocol::SandboxMode::WorkspaceWrite)
-        }
-        codex_protocol::protocol::SandboxPolicy::ExternalSandbox { .. } => None,
-    }
-}
-
 fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
     ThreadStartParams {
         model: config.model.clone(),
@@ -936,12 +943,8 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
         cwd: Some(config.cwd.to_string_lossy().to_string()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override_from_config(config),
-        sandbox: sandbox_mode_from_policy(
-            &config
-                .permissions
-                .legacy_sandbox_policy(config.cwd.as_path()),
-        ),
-        permission_profile: None,
+        sandbox: None,
+        permission_profile: Some(config.permissions.permission_profile().into()),
         config: config_request_overrides_from_config(config),
         ephemeral: Some(config.ephemeral),
         ..ThreadStartParams::default()
@@ -956,12 +959,8 @@ fn thread_resume_params_from_config(config: &Config, thread_id: String) -> Threa
         cwd: Some(config.cwd.to_string_lossy().to_string()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override_from_config(config),
-        sandbox: sandbox_mode_from_policy(
-            &config
-                .permissions
-                .legacy_sandbox_policy(config.cwd.as_path()),
-        ),
-        permission_profile: None,
+        sandbox: None,
+        permission_profile: Some(config.permissions.permission_profile().into()),
         config: config_request_overrides_from_config(config),
         ..ThreadResumeParams::default()
     }
@@ -1131,6 +1130,9 @@ fn should_process_notification(
         ServerNotification::ModelRerouted(notification) => {
             notification.thread_id == thread_id && notification.turn_id == turn_id
         }
+        ServerNotification::ModelVerification(notification) => {
+            notification.thread_id == thread_id && notification.turn_id == turn_id
+        }
         ServerNotification::ThreadTokenUsageUpdated(notification) => {
             notification.thread_id == thread_id && notification.turn_id == turn_id
         }
@@ -1285,6 +1287,7 @@ async fn resolve_resume_thread_id(
                         source_kinds: Some(all_thread_source_kinds()),
                         archived: Some(false),
                         cwd: None,
+                        use_state_db_only: false,
                         search_term: None,
                     },
                 },
@@ -1348,6 +1351,7 @@ async fn resolve_resume_thread_id(
                     source_kinds: Some(all_thread_source_kinds()),
                     archived: Some(false),
                     cwd: None,
+                    use_state_db_only: false,
                     search_term: Some(session_id.to_string()),
                 },
             },

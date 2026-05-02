@@ -5,7 +5,6 @@ import type { ServiceTier } from "../ServiceTier";
 import type { JsonValue } from "../serde_json/JsonValue";
 import type { ApprovalsReviewer } from "./ApprovalsReviewer";
 import type { AskForApproval } from "./AskForApproval";
-import type { PermissionProfile } from "./PermissionProfile";
 import type { SandboxMode } from "./SandboxMode";
 
 /**
@@ -17,33 +16,20 @@ import type { SandboxMode } from "./SandboxMode";
  *
  * Prefer using thread_id whenever possible.
  */
-export type ThreadForkParams = { threadId: string,
-/**
- * [UNSTABLE] Specify the rollout path to fork from.
- * If specified, the thread_id param will be ignored.
- */
-path?: string | null,
-/**
+export type ThreadForkParams = {threadId: string, /**
  * Configuration overrides for the forked thread, if any.
  */
-model?: string | null, modelProvider?: string | null, serviceTier?: ServiceTier | null | null, cwd?: string | null,
-/**
+model?: string | null, modelProvider?: string | null, serviceTier?: ServiceTier | null | null, cwd?: string | null, /**
  * Optional user config file path override for the forked thread. When
  * omitted, Codex reuses the source thread's active user config path.
  */
-configPath?: string | null, approvalPolicy?: AskForApproval | null,
-/**
+configPath?: string | null, approvalPolicy?: AskForApproval | null, /**
  * Override where approval requests are routed for review on this thread
  * and subsequent turns.
  */
-approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null,
-/**
- * Canonical permissions override for this thread. When present, do not
- * also set the legacy `sandbox` override.
+approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null | null, developerInstructions?: string | null | null, ephemeral?: boolean, /**
+ * When true, return only thread metadata and live fork state without
+ * populating `thread.turns`. This is useful when the client plans to call
+ * `thread/turns/list` immediately after forking.
  */
-permissionProfile?: PermissionProfile | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null | null, developerInstructions?: string | null | null, ephemeral?: boolean,
-/**
- * If true, persist additional rollout EventMsg variants required to
- * reconstruct a richer thread history on subsequent resume/fork/read.
- */
-persistExtendedHistory: boolean, };
+excludeTurns?: boolean};

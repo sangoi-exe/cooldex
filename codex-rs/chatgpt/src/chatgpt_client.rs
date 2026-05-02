@@ -40,7 +40,11 @@ pub(crate) async fn chatgpt_get_request_with_auth<T: DeserializeOwned>(
 ) -> anyhow::Result<T> {
     let chatgpt_base_url = &config.chatgpt_base_url;
     let client = create_client();
-    let url = format!("{chatgpt_base_url}{path}");
+    let url = format!(
+        "{}/{}",
+        chatgpt_base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
 
     let mut request = client
         .get(&url)

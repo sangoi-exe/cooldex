@@ -28,6 +28,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_rollout_trace::CompactionCheckpointTracePayload;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::info;
@@ -115,7 +116,16 @@ async fn run_remote_compact_task_inner_impl(
     turn_context: &Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
 ) -> CodexResult<()> {
-    let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+    let context_compaction_item = ContextCompactionItem::new();
+    // Use the UI compaction item ID as the trace compaction ID so protocol lifecycle events,
+    // endpoint attempts, and the installed history checkpoint all have one join key.
+    let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
+        turn_context.sub_id.as_str(),
+        context_compaction_item.id.as_str(),
+        turn_context.model_info.slug.as_str(),
+        turn_context.provider.info().name.as_str(),
+    );
+    let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
     let mut history = sess.clone_history().await;
@@ -145,6 +155,10 @@ async fn run_remote_compact_task_inner_impl(
         .cloned()
         .collect();
     let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
+    // This is the exact model-visible history selected for remote compaction, after trimming and
+    // local prompt projection. The checkpoint below records it separately from the next sampling
+    // request, whose prompt will repeat current developer/context prefix items.
+    let trace_input_history = prompt_input.clone();
     let tool_router = built_tools(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -161,8 +175,8 @@ async fn run_remote_compact_task_inner_impl(
         base_instructions,
         personality: turn_context.personality,
         output_schema: None,
+        output_schema_strict: true,
     };
-
     let base_instruction_text = prompt.base_instructions.text.as_str();
     let compact_request_log_data =
         build_compact_request_log_data(&prompt.input, base_instruction_text);
@@ -183,6 +197,7 @@ async fn run_remote_compact_task_inner_impl(
                 turn_context.reasoning_effort,
                 turn_context.reasoning_summary,
                 &turn_context.session_telemetry,
+                &compaction_trace,
             )
             .await
         {
@@ -260,6 +275,13 @@ async fn run_remote_compact_task_inner_impl(
         replacement_history: Some(new_history.clone()),
         prompt_gc: None,
     };
+    // Install is the semantic boundary where the compact endpoint's output becomes live
+    // thread history. Keep it distinct from the later inference request so the reducer can
+    // still represent repeated developer/context prefix items exactly as the model saw them.
+    compaction_trace.record_installed(&CompactionCheckpointTracePayload {
+        input_history: &trace_input_history,
+        replacement_history: &new_history,
+    });
     sess.replace_compacted_history(new_history, reference_context_item, compacted_item)
         .await;
     sess.recompute_token_usage(turn_context).await;

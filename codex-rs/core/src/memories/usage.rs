@@ -1,3 +1,5 @@
+// Merge-safety anchor: memory usage detection stays aligned with the preserved
+// core-local memory pipeline and its rollout/state telemetry.
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::unified_exec::ExecCommandArgs;

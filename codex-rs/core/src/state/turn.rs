@@ -1,4 +1,6 @@
 //! Turn-scoped state and active turn metadata scaffolding.
+//!
+//! Merge-safety anchor: turn state carries permission/profile and dynamic-tool metadata; keep local runtime orchestration invariants aligned across upstream state changes.
 
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use indexmap::IndexMap;
@@ -16,6 +18,7 @@ use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use rmcp::model::RequestId;
 use tokio::sync::oneshot;
 
@@ -24,7 +27,6 @@ use crate::session::turn_context::TurnContext;
 use crate::tasks::AnySessionTask;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsage;
-use codex_utils_absolute_path::AbsolutePathBuf;
 
 /// Metadata about the currently running turn.
 pub(crate) struct ActiveTurn {
@@ -77,10 +79,15 @@ pub(crate) struct RunningTask {
     pub(crate) kind: TaskKind,
     pub(crate) task: Arc<dyn AnySessionTask>,
     pub(crate) cancellation_token: CancellationToken,
-    pub(crate) handle: Arc<AbortOnDropHandle<()>>,
+    pub(crate) handle: AbortOnDropHandle<()>,
     pub(crate) turn_context: Arc<TurnContext>,
     // Timer recorded when the task drops to capture the full turn duration.
     pub(crate) _timer: Option<codex_otel::Timer>,
+}
+
+pub(crate) struct RemovedTask {
+    pub(crate) records_turn_token_usage_on_span: bool,
+    pub(crate) active_turn_is_empty: bool,
 }
 
 impl ActiveTurn {
@@ -89,9 +96,14 @@ impl ActiveTurn {
         self.tasks.insert(sub_id, task);
     }
 
-    pub(crate) fn remove_task(&mut self, sub_id: &str) -> bool {
-        self.tasks.swap_remove(sub_id);
-        self.tasks.is_empty()
+    pub(crate) fn remove_task(&mut self, sub_id: &str) -> Option<RemovedTask> {
+        let task = self.tasks.swap_remove(sub_id)?;
+        let records_turn_token_usage_on_span = task.task.records_turn_token_usage_on_span();
+        task.handle.detach();
+        Some(RemovedTask {
+            records_turn_token_usage_on_span,
+            active_turn_is_empty: self.tasks.is_empty(),
+        })
     }
 
     pub(crate) fn drain_tasks(&mut self) -> Vec<RunningTask> {
@@ -123,6 +135,7 @@ pub(crate) struct TurnState {
     granted_permissions: Option<AdditionalPermissionProfile>,
     strict_auto_review_enabled: bool,
     pub(crate) tool_calls: u64,
+    pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
 }
 

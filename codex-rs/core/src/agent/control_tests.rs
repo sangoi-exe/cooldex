@@ -5,12 +5,14 @@ use crate::agent::agent_status_from_event;
 use crate::config::AgentRoleConfig;
 use crate::config::Config;
 use crate::config::ConfigBuilder;
-use crate::contextual_user_message::ENVIRONMENT_CONTEXT_FRAGMENT;
-use crate::contextual_user_message::SUBAGENT_NOTIFICATION_OPEN_TAG;
+use crate::context::ContextualUserFragment;
+use crate::context::EnvironmentContext;
+use crate::context::SubagentNotification;
+use crate::context::UserInstructions;
 use crate::subagent_file_mutation::apply_file_mutation_mode_to_config;
+use crate::thread_manager::thread_store_from_config;
 use assert_matches::assert_matches;
 use codex_features::Feature;
-use codex_instructions::AGENTS_MD_FRAGMENT;
 use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
 use codex_protocol::config_types::ModeKind;
@@ -72,6 +74,10 @@ fn text_input(text: &str) -> Op {
     .into()
 }
 
+fn marked_fragment_text<T: ContextualUserFragment>(body: &str) -> String {
+    format!("{}{}{}", T::START_MARKER, body, T::END_MARKER)
+}
+
 fn assistant_message(text: &str, phase: Option<MessagePhase>) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -79,8 +85,8 @@ fn assistant_message(text: &str, phase: Option<MessagePhase>) -> ResponseItem {
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
         }],
-        end_turn: None,
         phase,
+        end_turn: None,
     }
 }
 
@@ -108,9 +114,7 @@ impl AgentControlHarness {
             CodexAuth::from_api_key("dummy"),
             config.model_provider.clone(),
             config.codex_home.to_path_buf(),
-            std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
-                /*exec_server_url*/ None,
-            )),
+            std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         );
         let control = manager.agent_control();
         Self {
@@ -124,7 +128,7 @@ impl AgentControlHarness {
     async fn start_thread(&self) -> (ThreadId, Arc<CodexThread>) {
         let new_thread = self
             .manager
-            .start_thread(self.config.clone())
+            .start_thread(self.config.clone(), thread_store_from_config(&self.config))
             .await
             .expect("start thread");
         (new_thread.thread_id, new_thread.thread)
@@ -141,7 +145,7 @@ fn has_subagent_notification(history_items: &[ResponseItem]) -> bool {
         }
         content.iter().any(|content_item| match content_item {
             ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                text.contains(SUBAGENT_NOTIFICATION_OPEN_TAG)
+                SubagentNotification::matches_text(text)
             }
             ContentItem::InputImage { .. } => false,
         })
@@ -293,6 +297,7 @@ async fn on_event_updates_status_from_task_complete() {
         last_agent_message: Some("done".to_string()),
         completed_at: None,
         duration_ms: None,
+        time_to_first_token_ms: None,
     }));
     let expected = AgentStatus::Completed(Some("done".to_string()));
     assert_eq!(status, Some(expected));
@@ -443,6 +448,7 @@ async fn send_input_submits_user_message() {
     let expected = (
         thread_id,
         Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello from tests".to_string(),
                 text_elements: Vec::new(),
@@ -590,6 +596,7 @@ async fn spawn_agent_creates_thread_and_sends_prompt() {
     let expected = (
         thread_id,
         Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "spawned".to_string(),
                 text_elements: Vec::new(),
@@ -609,7 +616,28 @@ async fn spawn_agent_creates_thread_and_sends_prompt() {
 #[tokio::test]
 async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     let harness = AgentControlHarness::new().await;
-    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    let mut parent_config = harness.config.clone();
+    let _ = parent_config.features.enable(Feature::MultiAgentV2);
+    parent_config.multi_agent_v2.root_agent_usage_hint_text =
+        Some("Parent root guidance.".to_string());
+    parent_config.multi_agent_v2.subagent_usage_hint_text =
+        Some("Parent subagent guidance.".to_string());
+    let mut child_config = harness.config.clone();
+    let _ = child_config.features.enable(Feature::MultiAgentV2);
+    child_config.multi_agent_v2.root_agent_usage_hint_text =
+        Some("Child root guidance.".to_string());
+    child_config.multi_agent_v2.subagent_usage_hint_text =
+        Some("Child subagent guidance.".to_string());
+    let new_thread = harness
+        .manager
+        .start_thread(
+            parent_config.clone(),
+            thread_store_from_config(&parent_config),
+        )
+        .await
+        .expect("start parent thread");
+    let parent_thread_id = new_thread.thread_id;
+    let parent_thread = new_thread.thread;
     parent_thread
         .inject_user_message_without_turn("parent seed context".to_string())
         .await;
@@ -633,6 +661,24 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .record_conversation_items(
             turn_context.as_ref(),
             &[
+                ResponseItem::Message {
+                    id: None,
+                    role: "developer".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "Parent root guidance.".to_string(),
+                    }],
+                    end_turn: None,
+                    phase: None,
+                },
+                ResponseItem::Message {
+                    id: None,
+                    role: "developer".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "Parent subagent guidance.".to_string(),
+                    }],
+                    end_turn: None,
+                    phase: None,
+                },
                 assistant_message("parent commentary", Some(MessagePhase::Commentary)),
                 assistant_message("parent final answer", Some(MessagePhase::FinalAnswer)),
                 assistant_message("parent unknown phase", /*phase*/ None),
@@ -662,7 +708,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     let child_thread_id = harness
         .control
         .spawn_agent_with_metadata(
-            harness.config.clone(),
+            child_config,
             text_input("child task"),
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id,
@@ -674,6 +720,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
             SpawnAgentOptions {
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id.clone()),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                ..Default::default()
             },
         )
         .await
@@ -708,6 +755,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     let expected = (
         child_thread_id,
         Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "child task".to_string(),
                 text_elements: Vec::new(),
@@ -766,10 +814,14 @@ fn export_forked_subagent_response_item_preserves_agents_fragment() {
         role: "user".to_string(),
         content: vec![
             ContentItem::InputText {
-                text: AGENTS_MD_FRAGMENT.wrap("workspace rules".to_string()),
+                text: UserInstructions {
+                    directory: String::new(),
+                    text: "workspace rules".to_string(),
+                }
+                .render(),
             },
             ContentItem::InputText {
-                text: ENVIRONMENT_CONTEXT_FRAGMENT.wrap("cwd=/tmp".to_string()),
+                text: marked_fragment_text::<EnvironmentContext>("cwd=/tmp"),
             },
             ContentItem::InputText {
                 text: "plain context".to_string(),
@@ -788,7 +840,11 @@ fn export_forked_subagent_response_item_preserves_agents_fragment() {
             role: "user".to_string(),
             content: vec![
                 ContentItem::InputText {
-                    text: AGENTS_MD_FRAGMENT.wrap("workspace rules".to_string()),
+                    text: UserInstructions {
+                        directory: String::new(),
+                        text: "workspace rules".to_string(),
+                    }
+                    .render(),
                 },
                 ContentItem::InputText {
                     text: "plain context".to_string(),
@@ -882,6 +938,7 @@ async fn spawn_agent_fork_does_not_leak_parent_spawn_tool_items_into_child_histo
             SpawnAgentOptions {
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id.clone()),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                environments: None,
             },
         )
         .await
@@ -964,6 +1021,7 @@ async fn spawn_agent_fork_flushes_parent_rollout_before_loading_history() {
             SpawnAgentOptions {
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id.clone()),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                ..Default::default()
             },
         )
         .await
@@ -1088,6 +1146,7 @@ async fn spawn_agent_fork_last_n_turns_keeps_only_recent_turns() {
             SpawnAgentOptions {
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id.clone()),
                 fork_mode: Some(SpawnAgentForkMode::LastNTurns(2)),
+                ..Default::default()
             },
         )
         .await
@@ -1141,14 +1200,12 @@ async fn spawn_agent_respects_max_threads_limit() {
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
-        std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
-            /*exec_server_url*/ None,
-        )),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let control = manager.agent_control();
 
     let _ = manager
-        .start_thread(config.clone())
+        .start_thread(config.clone(), thread_store_from_config(&config))
         .await
         .expect("start thread");
 
@@ -1195,9 +1252,7 @@ async fn spawn_agent_releases_slot_after_shutdown() {
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
-        std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
-            /*exec_server_url*/ None,
-        )),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let control = manager.agent_control();
 
@@ -1240,9 +1295,7 @@ async fn spawn_agent_limit_shared_across_clones() {
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
-        std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
-            /*exec_server_url*/ None,
-        )),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let control = manager.agent_control();
     let cloned = control.clone();
@@ -1287,9 +1340,7 @@ async fn resume_agent_respects_max_threads_limit() {
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
-        std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
-            /*exec_server_url*/ None,
-        )),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let control = manager.agent_control();
 
@@ -1345,9 +1396,7 @@ async fn resume_agent_releases_slot_after_resume_failure() {
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
-        std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
-            /*exec_server_url*/ None,
-        )),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let control = manager.agent_control();
 
@@ -1465,6 +1514,7 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
                 last_agent_message: Some("done".to_string()),
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
         )
         .await;
@@ -1517,7 +1567,10 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
     let _ = tester_config.features.enable(Feature::MultiAgentV2);
     let tester_thread_id = harness
         .manager
-        .start_thread(tester_config)
+        .start_thread(
+            tester_config.clone(),
+            thread_store_from_config(&tester_config),
+        )
         .await
         .expect("tester thread should start")
         .thread_id;
@@ -1556,6 +1609,7 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
                 last_agent_message: Some("done".to_string()),
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
         )
         .await;
@@ -1752,9 +1806,7 @@ async fn resume_thread_subagent_restores_stored_nickname_and_role() {
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
-        std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
-            /*exec_server_url*/ None,
-        )),
+        std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let control = manager.agent_control();
     let harness = AgentControlHarness {
@@ -1948,7 +2000,7 @@ async fn resume_agent_from_rollout_restores_descendant_file_mutation_mode_from_r
         SubagentFileMutationMode::Deny
     );
     assert!(matches!(
-        resumed_child_snapshot.sandbox_policy,
+        resumed_child_snapshot.sandbox_policy(),
         codex_protocol::protocol::SandboxPolicy::ReadOnly { .. }
     ));
 
@@ -2020,8 +2072,8 @@ async fn resume_agent_from_rollout_restores_inherit_child_sandbox_when_resumer_i
         SubagentFileMutationMode::Inherit
     );
     assert_eq!(
-        resumed_child_snapshot.sandbox_policy,
-        child_snapshot_before_shutdown.sandbox_policy
+        resumed_child_snapshot.sandbox_policy(),
+        child_snapshot_before_shutdown.sandbox_policy()
     );
 
     let _ = harness
@@ -2088,8 +2140,8 @@ async fn resume_agent_from_rollout_restores_inherit_child_sandbox_on_direct_exec
         SubagentFileMutationMode::Inherit
     );
     assert_eq!(
-        resumed_child_snapshot.sandbox_policy,
-        child_snapshot_before_shutdown.sandbox_policy
+        resumed_child_snapshot.sandbox_policy(),
+        child_snapshot_before_shutdown.sandbox_policy()
     );
 
     let _ = harness
@@ -2180,7 +2232,7 @@ async fn resume_agent_from_rollout_uses_latest_child_turn_context_when_state_db_
         SubagentFileMutationMode::Inherit
     );
     assert_eq!(
-        resumed_child_snapshot.sandbox_policy,
+        resumed_child_snapshot.sandbox_policy(),
         expected_sandbox_policy
     );
 
@@ -2284,7 +2336,7 @@ async fn resume_agent_from_rollout_uses_session_configured_when_no_turn_context_
         SubagentFileMutationMode::Inherit
     );
     assert_eq!(
-        resumed_child_snapshot.sandbox_policy,
+        resumed_child_snapshot.sandbox_policy(),
         expected_sandbox_policy
     );
 

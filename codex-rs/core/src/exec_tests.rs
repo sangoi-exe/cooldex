@@ -1,5 +1,6 @@
 use super::*;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::models::PermissionProfile;
 use codex_sandboxing::SandboxType;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
@@ -7,6 +8,7 @@ use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tokio::time::timeout;
 
 fn make_exec_output(
     exit_code: i32,
@@ -491,7 +493,7 @@ fn windows_restricted_token_allows_legacy_workspace_write_policies() {
 }
 
 #[test]
-fn windows_elevated_allows_legacy_restricted_read_policies() {
+fn windows_elevated_allows_split_restricted_read_policies() {
     let temp_dir = tempfile::TempDir::new().expect("tempdir");
     let docs = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
         temp_dir.path().join("docs"),
@@ -499,13 +501,15 @@ fn windows_elevated_allows_legacy_restricted_read_policies() {
     .expect("absolute docs");
     std::fs::create_dir_all(docs.as_path()).expect("create docs");
     let policy = SandboxPolicy::ReadOnly {
-        access: codex_protocol::protocol::ReadOnlyAccess::Restricted {
-            readable_roots: vec![docs],
-            include_platform_defaults: false,
-        },
+        access: codex_protocol::protocol::ReadOnlyAccess::FullAccess,
         network_access: false,
     };
-    let file_system_policy = FileSystemSandboxPolicy::from(&policy);
+    let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+        codex_protocol::permissions::FileSystemSandboxEntry {
+            path: codex_protocol::permissions::FileSystemPath::Path { path: docs },
+            access: codex_protocol::permissions::FileSystemAccessMode::Read,
+        },
+    ]);
 
     assert_eq!(
         unsupported_windows_restricted_token_sandbox_reason(
@@ -661,6 +665,7 @@ fn windows_restricted_token_supports_full_read_split_write_read_carveouts() {
         ),
         Ok(Some(WindowsSandboxFilesystemOverrides {
             read_roots_override: None,
+            read_roots_include_platform_defaults: false,
             write_roots_override: None,
             additional_deny_write_paths: expected_deny_write_paths,
         }))
@@ -698,6 +703,7 @@ fn windows_elevated_supports_split_restricted_read_roots() {
         ),
         Ok(Some(WindowsSandboxFilesystemOverrides {
             read_roots_override: Some(vec![expected_docs]),
+            read_roots_include_platform_defaults: false,
             write_roots_override: None,
             additional_deny_write_paths: vec![],
         }))
@@ -752,6 +758,7 @@ fn windows_elevated_supports_split_write_read_carveouts() {
         ),
         Ok(Some(WindowsSandboxFilesystemOverrides {
             read_roots_override: None,
+            read_roots_include_platform_defaults: false,
             write_roots_override: None,
             additional_deny_write_paths: vec![
                 codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(expected_docs)
@@ -1037,22 +1044,23 @@ async fn process_exec_tool_call_respects_cancellation_token() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(1_000)).await;
         cancel_tx.cancel();
     });
-    let permission_profile = PermissionProfile::Disabled;
-    let result = process_exec_tool_call(
-        params,
-        &permission_profile,
-        &cwd,
-        &None,
-        /*use_legacy_landlock*/ false,
-        /*stdout_stream*/ None,
+    let result = timeout(
+        Duration::from_secs(5),
+        process_exec_tool_call(
+            params,
+            &PermissionProfile::Disabled,
+            &cwd,
+            &None,
+            /*use_legacy_landlock*/ false,
+            /*stdout_stream*/ None,
+        ),
     )
-    .await;
-    let output = match result {
-        Err(CodexErr::Sandbox(SandboxErr::Timeout { output })) => output,
-        other => panic!("expected timeout error, got {other:?}"),
-    };
-    assert!(output.timed_out);
-    assert_eq!(output.exit_code, EXEC_TIMEOUT_EXIT_CODE);
+    .await
+    .expect("cancellation should stop the process promptly");
+    let output = result.expect("cancellation should return a non-timeout exec result");
+    assert!(!output.timed_out);
+    assert_ne!(output.exit_code, 0);
+    assert_ne!(output.exit_code, EXEC_TIMEOUT_EXIT_CODE);
     Ok(())
 }
 

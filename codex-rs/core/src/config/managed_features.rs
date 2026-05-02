@@ -29,10 +29,46 @@ pub struct ManagedFeatures {
     pinned_features: BTreeMap<Feature, bool>,
 }
 
+impl Default for ManagedFeatures {
+    fn default() -> Self {
+        Self {
+            value: ConstrainedWithSource::new(
+                Constrained::allow_any(Features::default()),
+                /*source*/ None,
+            ),
+            pinned_features: BTreeMap::new(),
+        }
+    }
+}
+
 impl ManagedFeatures {
     pub(crate) fn from_configured(
         configured_features: Features,
         feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
+    ) -> std::io::Result<Self> {
+        Self::from_configured_with_optional_warnings(
+            configured_features,
+            feature_requirements,
+            /*startup_warnings*/ None,
+        )
+    }
+
+    pub(crate) fn from_configured_with_warnings(
+        configured_features: Features,
+        feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
+        startup_warnings: &mut Vec<String>,
+    ) -> std::io::Result<Self> {
+        Self::from_configured_with_optional_warnings(
+            configured_features,
+            feature_requirements,
+            Some(startup_warnings),
+        )
+    }
+
+    fn from_configured_with_optional_warnings(
+        configured_features: Features,
+        feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
+        _startup_warnings: Option<&mut Vec<String>>,
     ) -> std::io::Result<Self> {
         let (pinned_features, source) = match feature_requirements {
             Some(Sourced {

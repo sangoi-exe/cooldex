@@ -1,3 +1,5 @@
+// Merge-safety anchor: prompt tests keep the preserved core-local memory
+// templates aligned with /update_memories behavior.
 use super::*;
 use crate::memories::extensions::RemovedExtensionResource;
 use codex_models_manager::model_info::model_info_from_slug;

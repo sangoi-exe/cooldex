@@ -266,6 +266,8 @@ pub fn compatibility_sandbox_policy_for_permission_profile(
     network_policy: NetworkSandboxPolicy,
     cwd: &Path,
 ) -> SandboxPolicy {
+    // Merge-safety anchor: compatibility followers still need a deterministic legacy sandbox
+    // projection from the canonical PermissionProfile plus runtime policy transforms.
     permissions.to_compatible_legacy_sandbox_policy_with_runtime_permissions(
         file_system_policy,
         network_policy,

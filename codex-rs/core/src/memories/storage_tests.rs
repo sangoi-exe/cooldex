@@ -1,3 +1,5 @@
+// Merge-safety anchor: storage tests keep file-backed memory artifacts aligned
+// with the preserved core-local Session-owned pipeline.
 use super::rollout_summary_file_stem;
 use super::rollout_summary_file_stem_from_parts;
 use chrono::TimeZone;

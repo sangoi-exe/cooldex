@@ -1,18 +1,21 @@
 use super::*;
 use crate::config::Config;
 use crate::config::ConfigBuilder;
-use crate::config_loader::ConfigLayerEntry;
-use crate::config_loader::ConfigLayerStack;
-use crate::config_loader::ConfigLayerStackOrdering;
-use crate::config_loader::ConfigRequirements;
-use crate::config_loader::ConfigRequirementsToml;
-use crate::config_loader::RequirementSource;
-use crate::config_loader::Sourced;
 use codex_app_server_protocol::ConfigLayerSource;
+use codex_config::CONFIG_TOML_FILE;
+use codex_config::ConfigLayerEntry;
+use codex_config::ConfigLayerStack;
+use codex_config::ConfigLayerStackOrdering;
+use codex_config::ConfigRequirements;
+use codex_config::ConfigRequirementsToml;
+use codex_config::LoaderOverrides;
+use codex_config::RequirementSource;
 use codex_config::RequirementsExecPolicy;
+use codex_config::Sourced;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::ProjectConfig;
 use codex_protocol::config_types::TrustLevel;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -108,6 +111,14 @@ fn read_only_file_system_sandbox_policy() -> FileSystemSandboxPolicy {
     }])
 }
 
+fn workspace_write_file_system_sandbox_policy() -> FileSystemSandboxPolicy {
+    FileSystemSandboxPolicy::workspace_write(
+        &[],
+        /*exclude_tmpdir_env_var*/ false,
+        /*exclude_slash_tmp*/ false,
+    )
+}
+
 fn unrestricted_file_system_sandbox_policy() -> FileSystemSandboxPolicy {
     FileSystemSandboxPolicy::unrestricted()
 }
@@ -170,6 +181,22 @@ async fn child_uses_parent_exec_policy_when_non_exec_policy_layers_differ() {
     .expect("config layer stack");
 
     assert!(child_uses_parent_exec_policy(&parent_config, &child_config));
+}
+
+#[tokio::test]
+async fn child_does_not_use_parent_exec_policy_when_ignore_rules_differs() {
+    let (_home, parent_config) = test_config().await;
+    let mut child_config = parent_config.clone();
+    child_config.config_layer_stack = child_config
+        .config_layer_stack
+        .with_user_and_project_exec_policy_rules_ignored(
+            /*ignore_user_and_project_exec_policy_rules*/ true,
+        );
+
+    assert!(!child_uses_parent_exec_policy(
+        &parent_config,
+        &child_config
+    ));
 }
 
 #[tokio::test]
@@ -438,6 +465,73 @@ async fn ignores_policies_outside_policy_dir() {
 }
 
 #[tokio::test]
+async fn ignores_policy_files_when_config_stack_disables_exec_policy_rules() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let policy_dir = temp_dir.path().join(RULES_DIR_NAME);
+    fs::create_dir_all(&policy_dir).expect("create policy dir");
+    fs::write(
+        policy_dir.join("allow.rules"),
+        r#"prefix_rule(pattern=["curl"], decision="allow")"#,
+    )
+    .expect("write policy file");
+    let config_stack = config_stack_for_dot_codex_folder(temp_dir.path())
+        .with_user_and_project_exec_policy_rules_ignored(
+            /*ignore_user_and_project_exec_policy_rules*/ true,
+        );
+
+    let policy = load_exec_policy(&config_stack)
+        .await
+        .expect("policy result");
+
+    assert_eq!(
+        policy
+            .check_multiple([vec!["curl".to_string()]].iter(), &|_| Decision::Forbidden)
+            .decision,
+        Decision::Forbidden,
+    );
+}
+
+#[tokio::test]
+async fn ignore_user_project_rules_keeps_system_policy_files() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let config_dir = temp_dir.path().join("system");
+    let policy_dir = config_dir.join(RULES_DIR_NAME);
+    fs::create_dir_all(&policy_dir).expect("create policy dir");
+    fs::write(
+        policy_dir.join("allow.rules"),
+        r#"prefix_rule(pattern=["curl"], decision="allow")"#,
+    )
+    .expect("write policy file");
+    let config_file =
+        AbsolutePathBuf::from_absolute_path(config_dir.join(codex_config::CONFIG_TOML_FILE))
+            .expect("absolute config file");
+    let layer = ConfigLayerEntry::new(
+        ConfigLayerSource::System { file: config_file },
+        TomlValue::Table(Default::default()),
+    );
+    let config_stack = ConfigLayerStack::new(
+        vec![layer],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("ConfigLayerStack")
+    .with_user_and_project_exec_policy_rules_ignored(
+        /*ignore_user_and_project_exec_policy_rules*/ true,
+    );
+
+    let policy = load_exec_policy(&config_stack)
+        .await
+        .expect("policy result");
+
+    assert_eq!(
+        policy
+            .check_multiple([vec!["curl".to_string()]].iter(), &|_| Decision::Forbidden)
+            .decision,
+        Decision::Allow,
+    );
+}
+
+#[tokio::test]
 async fn ignores_rules_from_untrusted_project_layers() -> anyhow::Result<()> {
     let project_dir = tempdir()?;
     let policy_dir = project_dir.path().join(RULES_DIR_NAME);
@@ -586,6 +680,45 @@ fn commands_for_exec_policy_falls_back_for_whitespace_shell_script() {
     ];
 
     assert_eq!(commands_for_exec_policy(&command), (vec![command], false));
+}
+
+#[tokio::test]
+async fn ignore_user_config_keeps_user_policy_files() -> std::io::Result<()> {
+    let temp = tempdir()?;
+    let codex_home = temp.path().join("home_ignore_user_config");
+    let rules_dir = codex_home.join(RULES_DIR_NAME);
+    fs::create_dir_all(&rules_dir)?;
+    fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        "model = \"from-user-config\"\ninvalid = [",
+    )?;
+    fs::write(
+        rules_dir.join("deny-curl.rules"),
+        r#"prefix_rule(pattern=["curl"], decision="forbidden")"#,
+    )?;
+
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home)
+        .fallback_cwd(Some(temp.path().to_path_buf()))
+        .loader_overrides(LoaderOverrides {
+            ignore_user_config: true,
+            ..Default::default()
+        })
+        .build()
+        .await?;
+
+    let policy = load_exec_policy(&config.config_layer_stack)
+        .await
+        .map_err(std::io::Error::other)?;
+
+    assert_eq!(
+        policy
+            .check_multiple([vec!["curl".to_string()]].iter(), &|_| Decision::Allow)
+            .decision,
+        Decision::Forbidden,
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -870,6 +1003,65 @@ fn unmatched_on_request_uses_split_filesystem_policy_for_escalation_prompts() {
             /*used_complex_parsing*/ false,
         )
     );
+}
+
+#[test]
+fn managed_cwd_write_profile_is_not_read_only() {
+    let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            access: FileSystemAccessMode::Read,
+        },
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+            },
+            access: FileSystemAccessMode::Write,
+        },
+    ]);
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &file_system_sandbox_policy,
+        NetworkSandboxPolicy::Restricted,
+    );
+
+    assert!(!profile_is_managed_read_only(
+        &permission_profile,
+        &file_system_sandbox_policy,
+        Path::new("/tmp/project")
+    ));
+}
+
+#[test]
+fn managed_unresolvable_write_profile_is_still_read_only() {
+    let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            access: FileSystemAccessMode::Read,
+        },
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::unknown(
+                    ":future_special_path",
+                    /*subpath*/ None,
+                ),
+            },
+            access: FileSystemAccessMode::Write,
+        },
+    ]);
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &file_system_sandbox_policy,
+        NetworkSandboxPolicy::Restricted,
+    );
+
+    assert!(profile_is_managed_read_only(
+        &permission_profile,
+        &file_system_sandbox_policy,
+        Path::new("/tmp/project")
+    ));
 }
 
 #[tokio::test]
@@ -1397,7 +1589,7 @@ prefix_rule(pattern=["cat"], decision="allow")
                 command: command.clone(),
                 approval_policy,
                 sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
-                file_system_sandbox_policy: read_only_file_system_sandbox_policy(),
+                file_system_sandbox_policy: workspace_write_file_system_sandbox_policy(),
                 sandbox_permissions: SandboxPermissions::UseDefault,
                 prefix_rule: None,
             },

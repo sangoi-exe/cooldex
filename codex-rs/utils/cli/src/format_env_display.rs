@@ -3,9 +3,9 @@ use std::collections::HashMap;
 // Merge-safety anchor: MCP env display must accept stored string env-var
 // names and typed MCP env-var wrappers through the same masking path while
 // preserving sorted inline env pairs and caller-ordered sourced env vars.
-pub fn format_env_display<T: AsRef<str>>(
+pub fn format_env_display<S: AsRef<str>>(
     env: Option<&HashMap<String, String>>,
-    env_vars: &[T],
+    env_vars: &[S],
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -16,10 +16,7 @@ pub fn format_env_display<T: AsRef<str>>(
     }
 
     if !env_vars.is_empty() {
-        parts.extend(env_vars.iter().map(|var| {
-            let var = var.as_ref();
-            format!("{var}=*****")
-        }));
+        parts.extend(env_vars.iter().map(|var| format!("{}=*****", var.as_ref())));
     }
 
     if parts.is_empty() {
@@ -35,11 +32,11 @@ mod tests {
 
     #[test]
     fn returns_dash_when_empty() {
-        let empty_env_vars: &[String] = &[];
-        assert_eq!(format_env_display(/*env*/ None, empty_env_vars), "-");
+        let empty_vars: &[String] = &[];
+        assert_eq!(format_env_display(/*env*/ None, empty_vars), "-");
 
         let empty_map = HashMap::new();
-        assert_eq!(format_env_display(Some(&empty_map), empty_env_vars), "-");
+        assert_eq!(format_env_display(Some(&empty_map), empty_vars), "-");
     }
 
     #[test]

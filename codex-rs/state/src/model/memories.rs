@@ -136,14 +136,16 @@ pub struct Stage1StartupClaimParams<'a> {
 /// Result of trying to claim a phase-2 consolidation job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase2JobClaimOutcome {
-    /// The caller owns the global lock and should spawn consolidation.
+    /// The caller owns the global lock and may inspect the memory workspace.
     Claimed {
         ownership_token: String,
         /// Snapshot of `input_watermark` at claim time.
         input_watermark: i64,
     },
-    /// The global job is not pending consolidation (or is already up to date).
-    SkippedNotDirty,
+    /// The global job is in retry backoff.
+    SkippedRetryUnavailable,
+    /// The global job completed recently enough that consolidation is cooling down.
+    SkippedCooldown,
     /// Another worker currently owns a fresh global consolidation lease.
     SkippedRunning,
 }

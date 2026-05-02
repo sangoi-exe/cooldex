@@ -2,6 +2,7 @@
 // `multi_agents_common` so batch launches keep the legacy CLI child-instruction/depth contract
 // without inheriting V2-only spawn semantics.
 
+use crate::agent::control::SpawnAgentOptions;
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::status::is_final;
@@ -9,6 +10,7 @@ use crate::config::Config;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::session::turn_context::TurnEnvironment;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -537,6 +539,11 @@ async fn build_runner_options(
             "agent depth limit reached; this session cannot spawn more subagents".to_string(),
         ));
     }
+    if turn.config.agent_max_threads == Some(0) {
+        return Err(FunctionCallError::RespondToModel(
+            "agent thread limit reached; this session cannot spawn more subagents".to_string(),
+        ));
+    }
     let max_concurrency =
         normalize_concurrency(requested_concurrency, turn.config.agent_max_threads);
     let mut spawn_config = build_agent_spawn_config(turn.as_ref())?;
@@ -643,14 +650,23 @@ async fn run_agent_job_loop(
                 let thread_id = match session
                     .services
                     .agent_control
-                    .spawn_agent(
+                    .spawn_agent_with_metadata(
                         options.spawn_config.clone(),
                         items.into(),
                         Some(worker_session_source.clone()),
+                        SpawnAgentOptions {
+                            environments: Some(
+                                turn.environments
+                                    .iter()
+                                    .map(TurnEnvironment::selection)
+                                    .collect(),
+                            ),
+                            ..Default::default()
+                        },
                     )
                     .await
                 {
-                    Ok(thread_id) => thread_id,
+                    Ok(spawned_agent) => spawned_agent.thread_id,
                     Err(CodexErr::AgentLimitReached { .. }) => {
                         db.mark_agent_job_item_pending(
                             job_id.as_str(),

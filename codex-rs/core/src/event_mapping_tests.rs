@@ -188,7 +188,7 @@ fn skips_user_instructions_and_env() {
                 content: vec![ContentItem::InputText {
                     text: "# AGENTS.md instructions for test_directory\n\n<INSTRUCTIONS>\ntest_text\n</INSTRUCTIONS>".to_string(),
                 }],
-                end_turn: None,
+            end_turn: None,
             phase: None,
             },
             ResponseItem::Message {
@@ -197,7 +197,7 @@ fn skips_user_instructions_and_env() {
                 content: vec![ContentItem::InputText {
                     text: "<environment_context>test_text</environment_context>".to_string(),
                 }],
-                end_turn: None,
+            end_turn: None,
             phase: None,
             },
             ResponseItem::Message {
@@ -206,7 +206,7 @@ fn skips_user_instructions_and_env() {
                 content: vec![ContentItem::InputText {
                     text: "# AGENTS.md instructions for test_directory\n\n<INSTRUCTIONS>\ntest_text\n</INSTRUCTIONS>".to_string(),
                 }],
-                end_turn: None,
+            end_turn: None,
             phase: None,
             },
             ResponseItem::Message {
@@ -216,7 +216,7 @@ fn skips_user_instructions_and_env() {
                     text: "<skill>\n<name>demo</name>\n<path>skills/demo/SKILL.md</path>\nbody\n</skill>"
                         .to_string(),
                 }],
-                end_turn: None,
+            end_turn: None,
             phase: None,
             },
             ResponseItem::Message {
@@ -225,7 +225,7 @@ fn skips_user_instructions_and_env() {
                 content: vec![ContentItem::InputText {
                     text: "<user_shell_command>echo 42</user_shell_command>".to_string(),
                 }],
-                end_turn: None,
+            end_turn: None,
             phase: None,
             },
             ResponseItem::Message {

@@ -282,6 +282,9 @@
     }
   },
   "properties": {
+    "cwd": {
+      "$ref": "#/definitions/AbsolutePathBuf"
+    },
     "itemId": {
       "type": "string"
     },
@@ -302,6 +305,7 @@
     }
   },
   "required": [
+    "cwd",
     "itemId",
     "permissions",
     "threadId",

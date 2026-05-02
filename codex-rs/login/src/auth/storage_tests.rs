@@ -133,26 +133,62 @@ async fn file_storage_save_persists_auth_dot_json() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn file_storage_persists_agent_identity() -> anyhow::Result<()> {
+async fn file_storage_round_trips_agent_identity_auth() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let agent_identity_jwt = jwt_with_payload(json!({
+        "agent_runtime_id": "agent-runtime-id",
+        "agent_private_key": "private-key",
+        "account_id": "account-id",
+        "chatgpt_user_id": "user-id",
+        "email": "user@example.com",
+        "plan_type": "pro",
+        "chatgpt_account_is_fedramp": false,
+    }));
+    let agent_identity = AgentIdentityAuthRecord::from_agent_identity_jwt(&agent_identity_jwt)?;
     let auth_dot_json = AuthDotJson {
-        auth_mode: Some(AuthMode::Chatgpt),
+        auth_mode: Some(AuthMode::AgentIdentity),
         openai_api_key: None,
         tokens: None,
-        last_refresh: Some(Utc::now()),
-        agent_identity: Some(AgentIdentityAuthRecord {
-            workspace_id: "account-123".to_string(),
-            chatgpt_user_id: Some("user-123".to_string()),
-            agent_runtime_id: "agent_123".to_string(),
-            agent_private_key: "pkcs8-base64".to_string(),
-            registered_at: "2026-04-13T12:00:00Z".to_string(),
-        }),
+        last_refresh: None,
+        agent_identity: Some(agent_identity),
     };
 
     storage.save(&auth_store_from_legacy(auth_dot_json.clone()))?;
 
     assert_eq!(storage.load()?, Some(auth_store_from_legacy(auth_dot_json)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn file_storage_loads_agent_identity_as_jwt() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let agent_identity_jwt = jwt_with_payload(json!({
+        "agent_runtime_id": "agent-runtime-id",
+        "agent_private_key": "private-key",
+        "account_id": "account-id",
+        "chatgpt_user_id": "user-id",
+        "email": "user@example.com",
+        "plan_type": "pro",
+        "chatgpt_account_is_fedramp": false,
+    }));
+    let auth_file = get_auth_file(codex_home.path());
+    std::fs::write(
+        &auth_file,
+        serde_json::to_string_pretty(&json!({
+            "auth_mode": "agentIdentity",
+            "agent_identity": agent_identity_jwt,
+        }))?,
+    )?;
+
+    let loaded = storage.load()?;
+    let expected_record = AgentIdentityAuthRecord::from_agent_identity_jwt(&agent_identity_jwt)?;
+
+    assert_eq!(
+        loaded.expect("auth should load").agent_identity.as_ref(),
+        Some(&expected_record)
+    );
     Ok(())
 }
 
@@ -392,6 +428,14 @@ fn replace_remaining_percent_with_used_percent(
         .context("remaining_percent should exist before legacy rewrite")?;
     window.insert("used_percent".to_string(), json!(used_percent));
     Ok(())
+}
+
+fn jwt_with_payload(payload: serde_json::Value) -> String {
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header_b64 = encode(br#"{"alg":"EdDSA","typ":"JWT"}"#);
+    let payload_b64 = encode(&serde_json::to_vec(&payload).expect("payload should serialize"));
+    let signature_b64 = encode(b"sig");
+    format!("{header_b64}.{payload_b64}.{signature_b64}")
 }
 
 #[test]

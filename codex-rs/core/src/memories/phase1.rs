@@ -1,7 +1,9 @@
+// Merge-safety anchor: phase 1 remains Session-owned here so memory extraction
+// can read rollout/state context without depending on codex-memories-write.
 use crate::Prompt;
 use crate::RolloutRecorder;
 use crate::config::Config;
-use crate::contextual_user_message::is_memory_excluded_contextual_user_fragment;
+use crate::context::is_memory_excluded_contextual_user_fragment;
 use crate::memories::metrics;
 use crate::memories::phase_one;
 use crate::memories::phase_one::PRUNE_BATCH_SIZE;
@@ -23,6 +25,7 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TokenUsage;
+use codex_rollout_trace::InferenceTraceContext;
 use codex_secrets::redact_secrets;
 use futures::StreamExt;
 use serde::Deserialize;
@@ -349,6 +352,7 @@ mod job {
             }],
             tools: Vec::new(),
             parallel_tool_calls: false,
+            output_schema_strict: true,
             base_instructions: BaseInstructions {
                 text: phase_one::PROMPT.to_string(),
             },
@@ -366,6 +370,7 @@ mod job {
                 stage_one_context.reasoning_summary,
                 stage_one_context.service_tier,
                 stage_one_context.turn_metadata_header.as_deref(),
+                &InferenceTraceContext::disabled(),
             )
             .await?;
 

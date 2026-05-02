@@ -308,9 +308,10 @@ impl Session {
                 return;
             }
         };
-        let mut state = self.state.lock().await;
-        state.ensure_next_post_compact_recovery_sequence_at_least(replay.next_sequence);
-        drop(state);
+        {
+            let mut state = self.state.lock().await;
+            state.ensure_next_post_compact_recovery_sequence_at_least(replay.next_sequence);
+        }
 
         match replay.lifecycle {
             RecoveryLifecycle::Ready(item) => {

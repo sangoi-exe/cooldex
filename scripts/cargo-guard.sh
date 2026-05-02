@@ -10,6 +10,7 @@ CODEX_RS_DIR="${REPO_ROOT}/codex-rs"
 CALLER_CWD="$(pwd)"
 MIN_FREE_GIB="${CARGO_GUARD_MIN_FREE_GIB:-5}"
 MAX_CARGO_BUILD_JOBS=4
+DEFAULT_TEST_RUST_MIN_STACK=8388608
 
 log() {
     local level="$1"
@@ -30,6 +31,7 @@ Runs Cargo with a deterministic free-space guardrail for build-like commands:
   - caps guarded Cargo build parallelism at 4 jobs by default
   - rejects explicit `-j/--jobs` or `--config build.jobs=...` requests outside 1..=4
   - rejects path-style or include-based `--config` for guarded build-like commands because they can override build.jobs
+  - gives `cargo test` a default RUST_MIN_STACK=8388608 unless the caller already set RUST_MIN_STACK
   - requires at least 5 GiB free before starting a guarded build-like command
   - runs `cargo clean` only when the lowest free-space filesystem across the derived target/build dirs is below the floor
   - never runs `cargo clean` solely because the guarded Cargo command failed or was interrupted
@@ -511,6 +513,10 @@ log info "execution cwd: ${cargo_workdir}"
 log info "target-dir: ${resolved_target_dir}"
 log info "build-dir: ${resolved_build_dir}"
 log info "cargo-build-jobs: ${resolved_cargo_build_jobs} (wrapper cap ${MAX_CARGO_BUILD_JOBS})"
+if [[ "${cargo_subcommand}" == "test" ]]; then
+    resolved_rust_min_stack="${RUST_MIN_STACK:-${DEFAULT_TEST_RUST_MIN_STACK}}"
+    log info "rust-min-stack: ${resolved_rust_min_stack} (cargo test)"
+fi
 measure_guard_paths
 log info "pre-run lowest free space: ${lowest_guard_gib} GiB at ${lowest_guard_path}"
 
@@ -529,5 +535,9 @@ trap cleanup_on_exit EXIT
 
 (
     cd -- "${cargo_workdir}"
-    env CARGO_BUILD_JOBS="${resolved_cargo_build_jobs}" cargo "${cargo_args[@]}"
+    if [[ "${cargo_subcommand}" == "test" ]]; then
+        env CARGO_BUILD_JOBS="${resolved_cargo_build_jobs}" RUST_MIN_STACK="${resolved_rust_min_stack}" cargo "${cargo_args[@]}"
+    else
+        env CARGO_BUILD_JOBS="${resolved_cargo_build_jobs}" cargo "${cargo_args[@]}"
+    fi
 )

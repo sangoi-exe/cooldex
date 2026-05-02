@@ -75,6 +75,12 @@
         "inputSchema": true,
         "name": {
           "type": "string"
+        },
+        "namespace": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -438,6 +444,21 @@
         "clear"
       ],
       "type": "string"
+    },
+    "TurnEnvironmentParams": {
+      "properties": {
+        "cwd": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "environmentId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "cwd",
+        "environmentId"
+      ],
+      "type": "object"
     }
   },
   "properties": {
@@ -511,17 +532,6 @@
         "string",
         "null"
       ]
-    },
-    "permissionProfile": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/PermissionProfile"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Canonical permissions override for this thread. When present, do not also set the legacy `sandbox` override."
     },
     "personality": {
       "anyOf": [

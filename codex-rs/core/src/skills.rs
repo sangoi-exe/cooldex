@@ -1,3 +1,5 @@
+// Merge-safety anchor: skill discovery/invocation is a local prompt/tooling seam; keep scope, telemetry, and model-visible skill context bounded and canonical.
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
@@ -24,6 +26,7 @@ pub use codex_core_skills::SkillPolicy;
 pub use codex_core_skills::SkillRenderReport;
 pub use codex_core_skills::SkillsLoadInput;
 pub use codex_core_skills::SkillsManager;
+pub use codex_core_skills::build_available_skills;
 pub use codex_core_skills::build_skill_name_counts;
 pub use codex_core_skills::collect_env_var_dependencies;
 pub use codex_core_skills::config_rules;
@@ -40,7 +43,6 @@ pub use codex_core_skills::model;
 pub use codex_core_skills::remote;
 pub use codex_core_skills::render;
 pub use codex_core_skills::render::SkillRenderSideEffects;
-pub use codex_core_skills::render_skills_section;
 pub use codex_core_skills::system;
 
 pub(crate) fn skills_load_input_from_config(

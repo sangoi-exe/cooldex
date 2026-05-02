@@ -361,6 +361,11 @@ async fn thread_start_params_include_review_policy_when_review_policy_is_manual_
         params.approvals_reviewer,
         Some(codex_app_server_protocol::ApprovalsReviewer::User)
     );
+    assert_eq!(params.sandbox, None);
+    assert_eq!(
+        params.permission_profile,
+        Some(config.permissions.permission_profile().into())
+    );
 }
 
 #[tokio::test]
@@ -418,12 +423,16 @@ fn session_configured_from_thread_response_uses_review_policy_from_response() {
         approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::AutoReview,
         sandbox: codex_app_server_protocol::SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
-            read_only_access: codex_app_server_protocol::ReadOnlyAccess::FullAccess,
             network_access: false,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
         },
-        permission_profile: None,
+        permission_profile: Some(
+            codex_protocol::models::PermissionProfile::from_legacy_sandbox_policy(
+                &codex_protocol::protocol::SandboxPolicy::new_workspace_write_policy(),
+            )
+            .into(),
+        ),
         reasoning_effort: None,
     };
 

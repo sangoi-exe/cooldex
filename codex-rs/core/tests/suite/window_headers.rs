@@ -71,6 +71,7 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
         .fork_thread(
             /*snapshot*/ 0usize,
             resumed.config.clone(),
+            codex_core::thread_store_from_config(&resumed.config),
             rollout_path,
             /*persist_extended_history*/ false,
             /*parent_trace*/ None,
@@ -104,6 +105,7 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
 async fn submit_user_turn(codex: &Arc<CodexThread>, text: &str) -> Result<()> {
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: text.to_string(),
                 text_elements: Vec::new(),

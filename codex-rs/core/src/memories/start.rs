@@ -1,3 +1,5 @@
+// Merge-safety anchor: startup remains the Session entrypoint for local
+// /update_memories until the extracted memories write crate can be used safely.
 use crate::config::Config;
 use crate::memories::phase1;
 use crate::memories::phase2;

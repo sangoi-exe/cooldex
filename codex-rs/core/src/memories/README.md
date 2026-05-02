@@ -1,5 +1,7 @@
 # Memories Pipeline (Core)
 
+<!-- Merge-safety anchor: this document describes the preserved core-local Session-owned memory pipeline; the runtime prompt template files are intentionally kept byte-focused and use this note as the nearest durable anchor. -->
+
 This module runs a startup memory pipeline for eligible sessions.
 
 ## Prompt Templates

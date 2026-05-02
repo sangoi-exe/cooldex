@@ -1,3 +1,5 @@
+// Merge-safety anchor: this core-local memory pipeline stays Session-owned
+// until /update_memories can use the extracted write crate without a core cycle.
 use std::path::Path;
 
 pub async fn clear_memory_roots_contents(codex_home: &Path) -> std::io::Result<()> {

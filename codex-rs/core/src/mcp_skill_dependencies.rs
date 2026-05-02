@@ -241,7 +241,7 @@ async fn should_install_mcp_dependencies(
 ) -> bool {
     if mcp_permission_prompt_is_auto_approved(
         turn_context.approval_policy.value(),
-        &turn_context.sandbox_policy(),
+        &turn_context.permission_profile(),
     ) {
         return true;
     }

@@ -1,3 +1,7 @@
 # Merge-safety anchor: app-server protocol schemas are generated followers; keep
 # their generated-file classification aligned with schema generation changes.
 codex-rs/app-server-protocol/schema/** linguist-generated
+codex-rs/hooks/schema/generated/** linguist-generated
+# Merge-safety anchor: TUI terminal snapshots preserve rendered cell padding;
+# keep Git whitespace checks from treating expected terminal width as defects.
+codex-rs/tui/**/*.snap -whitespace

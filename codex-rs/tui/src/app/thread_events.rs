@@ -1,9 +1,9 @@
 //! Thread event buffering and replay state for the TUI app.
 //!
 //! This module owns the per-thread event store used when the TUI switches between the main
-//! conversation and subagents. It keeps buffered app-server notifications, pending interactive
-//! request replay state, active-turn tracking, saved composer state, and prompt-GC replay state
-//! close together with the replay behavior that consumes them.
+//! conversation, subagents, and side conversations. It keeps buffered app-server notifications,
+//! pending interactive request replay state, active-turn tracking, saved composer state, and
+//! prompt-GC replay state close together with the replay behavior that consumes them.
 
 use super::*;
 
@@ -163,6 +163,59 @@ impl ThreadEventStore {
         }
     }
 
+    pub(super) fn pending_replay_requests(&self) -> Vec<ServerRequest> {
+        self.buffer
+            .iter()
+            .filter_map(|event| match event {
+                ThreadBufferedEvent::Request(request)
+                    if self
+                        .pending_interactive_replay
+                        .should_replay_snapshot_request(request) =>
+                {
+                    Some(request.clone())
+                }
+                ThreadBufferedEvent::Request(_)
+                | ThreadBufferedEvent::Notification(_)
+                | ThreadBufferedEvent::HistoryEntryResponse(_)
+                | ThreadBufferedEvent::FeedbackSubmission(_) => None,
+            })
+            .collect()
+    }
+
+    pub(super) fn file_change_changes(
+        &self,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Option<Vec<codex_app_server_protocol::FileUpdateChange>> {
+        self.buffer
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                ThreadBufferedEvent::Notification(ServerNotification::ItemStarted(
+                    notification,
+                )) if turn_id_matches(turn_id, &notification.turn_id) => {
+                    file_change_item_changes(&notification.item, item_id)
+                }
+                ThreadBufferedEvent::Notification(ServerNotification::ItemCompleted(
+                    notification,
+                )) if turn_id_matches(turn_id, &notification.turn_id) => {
+                    file_change_item_changes(&notification.item, item_id)
+                }
+                ThreadBufferedEvent::Request(_)
+                | ThreadBufferedEvent::Notification(_)
+                | ThreadBufferedEvent::HistoryEntryResponse(_)
+                | ThreadBufferedEvent::FeedbackSubmission(_) => None,
+            })
+            .or_else(|| {
+                self.turns
+                    .iter()
+                    .rev()
+                    .filter(|turn| turn_id_matches(turn_id, &turn.id))
+                    .flat_map(|turn| turn.items.iter().rev())
+                    .find_map(|item| file_change_item_changes(item, item_id))
+            })
+    }
+
     pub(super) fn apply_thread_rollback(&mut self, response: &ThreadRollbackResponse) {
         self.turns = response.thread.turns.clone();
         self.buffer.clear();
@@ -214,12 +267,42 @@ impl ThreadEventStore {
             .has_pending_thread_approvals()
     }
 
+    pub(super) fn side_parent_pending_status(&self) -> Option<SideParentStatus> {
+        if self
+            .pending_interactive_replay
+            .has_pending_thread_user_input()
+        {
+            Some(SideParentStatus::NeedsInput)
+        } else if self
+            .pending_interactive_replay
+            .has_pending_thread_approvals()
+        {
+            Some(SideParentStatus::NeedsApproval)
+        } else {
+            None
+        }
+    }
+
     pub(super) fn active_turn_id(&self) -> Option<&str> {
         self.active_turn_id.as_deref()
     }
 
     pub(super) fn clear_active_turn_id(&mut self) {
         self.active_turn_id = None;
+    }
+}
+
+fn turn_id_matches(request_turn_id: &str, candidate_turn_id: &str) -> bool {
+    request_turn_id.is_empty() || request_turn_id == candidate_turn_id
+}
+
+fn file_change_item_changes(
+    item: &ThreadItem,
+    item_id: &str,
+) -> Option<Vec<codex_app_server_protocol::FileUpdateChange>> {
+    match item {
+        ThreadItem::FileChange { id, changes, .. } if id == item_id => Some(changes.clone()),
+        _ => None,
     }
 }
 
@@ -334,8 +417,9 @@ mod tests {
 
         let snapshot = store.snapshot();
         assert!(snapshot.events.is_empty());
-        assert!(!store.has_pending_thread_approvals());
+        assert_eq!(store.has_pending_thread_approvals(), false);
     }
+
     #[test]
     fn thread_event_store_rebase_preserves_hook_notifications() {
         let thread_id = ThreadId::new();

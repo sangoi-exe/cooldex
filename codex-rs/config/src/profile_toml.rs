@@ -26,6 +26,7 @@ use codex_protocol::protocol::AskForApproval;
 #[schemars(deny_unknown_fields)]
 pub struct ConfigProfile {
     pub model: Option<String>,
+    /// Optional explicit service tier preference for new turns (`fast` or `flex`).
     pub service_tier: Option<ServiceTier>,
     /// The key in the `model_providers` map identifying the
     /// [`ModelProviderInfo`] to use.
@@ -48,7 +49,8 @@ pub struct ConfigProfile {
     #[serde(default)]
     pub subagent: Option<SubagentProfileConfig>,
     pub js_repl_node_path: Option<AbsolutePathBuf>,
-    /// Ordered list of directories to search for Node modules in `js_repl`.
+    /// Deprecated: ignored.
+    #[schemars(skip)]
     pub js_repl_node_module_dirs: Option<Vec<AbsolutePathBuf>>,
     /// Optional absolute path to patched zsh used by zsh-exec-bridge-backed shell execution.
     pub zsh_path: Option<AbsolutePathBuf>,

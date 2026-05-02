@@ -85,7 +85,7 @@ impl ToolCallRuntime {
         {
             return Ok(Self::disallowed_response(&call));
         }
-        let source = self.source;
+        let source = self.source.clone();
         match self
             .handle_tool_call_with_source(call, source, cancellation_token)
             .await
@@ -109,6 +109,7 @@ impl ToolCallRuntime {
         let turn = Arc::clone(&self.turn_context);
         let tracker = Arc::clone(&self.tracker);
         let lock = Arc::clone(&self.parallel_execution);
+        let invocation_cancellation_token = cancellation_token.clone();
         let started = Instant::now();
         let display_name = call.tool_name.display();
 
@@ -139,6 +140,7 @@ impl ToolCallRuntime {
                             .dispatch_tool_call_with_code_mode_result(
                                 session,
                                 turn,
+                                invocation_cancellation_token,
                                 tracker,
                                 call.clone(),
                                 source,
@@ -192,6 +194,7 @@ impl ToolCallRuntime {
             result: Box::new(AbortedToolOutput {
                 message: Self::abort_message(call, secs),
             }),
+            post_tool_use_payload: None,
         }
     }
 

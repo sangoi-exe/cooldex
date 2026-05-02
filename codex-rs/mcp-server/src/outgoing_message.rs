@@ -231,6 +231,7 @@ mod tests {
 
     use anyhow::Result;
     use codex_protocol::ThreadId;
+    use codex_protocol::models::PermissionProfile;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::EventMsg;
@@ -304,7 +305,7 @@ mod tests {
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
-                permission_profile: codex_protocol::models::PermissionProfile::default(),
+                permission_profile: PermissionProfile::read_only(),
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: test_path_buf("/home/user/project").abs(),
                 reasoning_effort: Some(ReasoningEffort::default()),
@@ -349,7 +350,7 @@ mod tests {
             service_tier: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
-            permission_profile: codex_protocol::models::PermissionProfile::default(),
+            permission_profile: PermissionProfile::read_only(),
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             cwd: test_path_buf("/home/user/project").abs(),
             reasoning_effort: Some(ReasoningEffort::default()),
@@ -389,9 +390,7 @@ mod tests {
                 "model_provider_id": "test-provider",
                 "approval_policy": "never",
                 "approvals_reviewer": "user",
-                "sandbox_policy": {
-                    "type": "read-only"
-                },
+                "permission_profile": session_configured_event.permission_profile,
                 "cwd": test_path_buf("/home/user/project"),
                 "reasoning_effort": session_configured_event.reasoning_effort,
                 "history_log_id": session_configured_event.history_log_id,
@@ -419,7 +418,7 @@ mod tests {
             service_tier: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
-            permission_profile: codex_protocol::models::PermissionProfile::default(),
+            permission_profile: PermissionProfile::read_only(),
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             cwd: test_path_buf("/home/user/project").abs(),
             reasoning_effort: Some(ReasoningEffort::default()),
@@ -460,9 +459,7 @@ mod tests {
                 "model_provider_id": "test-provider",
                 "approval_policy": "never",
                 "approvals_reviewer": "user",
-                "sandbox_policy": {
-                    "type": "read-only"
-                },
+                "permission_profile": session_configured_event.permission_profile,
                 "cwd": test_path_buf("/home/user/project"),
                 "reasoning_effort": session_configured_event.reasoning_effort,
                 "history_log_id": session_configured_event.history_log_id,

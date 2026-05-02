@@ -2,8 +2,8 @@ use crate::codex_message_processor::ApiVersion;
 use crate::codex_message_processor::read_rollout_items_from_rollout;
 use crate::codex_message_processor::read_summary_from_rollout;
 use crate::codex_message_processor::summary_to_thread;
-use crate::error_code::INTERNAL_ERROR_CODE;
-use crate::error_code::INVALID_REQUEST_ERROR_CODE;
+use crate::error_code::internal_error;
+use crate::error_code::invalid_request;
 use crate::outgoing_message::ClientRequestResult;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::server_request_error::is_turn_transition_server_request_error;
@@ -41,15 +41,16 @@ use codex_app_server_protocol::ExecCommandApprovalResponse;
 use codex_app_server_protocol::ExecPolicyAmendment as V2ExecPolicyAmendment;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangeOutputDeltaNotification;
+use codex_app_server_protocol::FileChangePatchUpdatedNotification;
 use codex_app_server_protocol::FileChangeRequestApprovalParams;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
 use codex_app_server_protocol::FileUpdateChange;
+use codex_app_server_protocol::GuardianWarningNotification;
 use codex_app_server_protocol::HookCompletedNotification;
 use codex_app_server_protocol::HookStartedNotification;
 use codex_app_server_protocol::InterruptConversationResponse;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
-use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::McpServerElicitationAction;
 use codex_app_server_protocol::McpServerElicitationRequestParams;
 use codex_app_server_protocol::McpServerElicitationRequestResponse;
@@ -59,6 +60,7 @@ use codex_app_server_protocol::McpToolCallError;
 use codex_app_server_protocol::McpToolCallResult;
 use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::ModelReroutedNotification;
+use codex_app_server_protocol::ModelVerificationNotification;
 use codex_app_server_protocol::NetworkApprovalContext as V2NetworkApprovalContext;
 use codex_app_server_protocol::NetworkPolicyAmendment as V2NetworkPolicyAmendment;
 use codex_app_server_protocol::NetworkPolicyRuleAction as V2NetworkPolicyRuleAction;
@@ -75,6 +77,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequestPayload;
 use codex_app_server_protocol::SkillsChangedNotification;
 use codex_app_server_protocol::TerminalInteractionNotification;
+use codex_app_server_protocol::ThreadGoalUpdatedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadNameUpdatedNotification;
 use codex_app_server_protocol::ThreadRealtimeClosedNotification;
@@ -118,6 +121,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolResponse as CoreDynamicToolResponse;
 use codex_protocol::items::parse_hook_prompt_message;
+use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermissionProfile;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::Event;
@@ -175,6 +179,7 @@ pub(crate) async fn apply_bespoke_event_handling(
     outgoing: ThreadScopedOutgoingMessageSender,
     thread_state: Arc<tokio::sync::Mutex<ThreadState>>,
     thread_watch_manager: ThreadWatchManager,
+    thread_list_state_permit: Arc<tokio::sync::Semaphore>,
     api_version: ApiVersion,
     fallback_model_provider: String,
     codex_home: &Path,
@@ -219,6 +224,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::TurnComplete(turn_complete_event) => {
             // All per-thread requests are bound to a turn, so abort them.
             outgoing.abort_pending_server_requests().await;
+            respond_to_pending_interrupts(&thread_state, &outgoing, /*abort_reason*/ None).await;
             let turn_failed = thread_state.lock().await.turn_summary.last_error.is_some();
             thread_watch_manager
                 .note_turn_completed(&conversation_id.to_string(), turn_failed)
@@ -301,6 +307,22 @@ pub(crate) async fn apply_bespoke_event_handling(
                 }
                 outgoing
                     .send_server_notification(ServerNotification::ItemCompleted(notification))
+                    .await;
+            }
+        }
+        EventMsg::GuardianWarning(warning_event) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = GuardianWarningNotification {
+                    thread_id: conversation_id.to_string(),
+                    message: warning_event.message,
+                };
+                if let Some(analytics_events_client) = analytics_events_client.as_ref() {
+                    analytics_events_client.track_notification(
+                        ServerNotification::GuardianWarning(notification.clone()),
+                    );
+                }
+                outgoing
+                    .send_server_notification(ServerNotification::GuardianWarning(notification))
                     .await;
             }
         }
@@ -397,6 +419,18 @@ pub(crate) async fn apply_bespoke_event_handling(
                 };
                 outgoing
                     .send_server_notification(ServerNotification::ModelRerouted(notification))
+                    .await;
+            }
+        }
+        EventMsg::ModelVerification(event) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = ModelVerificationNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: event_turn_id.clone(),
+                    verifications: event.verifications.into_iter().map(Into::into).collect(),
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::ModelVerification(notification))
                     .await;
             }
         }
@@ -529,7 +563,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                             ))
                             .await;
                     }
-                    RealtimeEvent::ConversationItemDone { .. } => {}
+                    RealtimeEvent::ConversationItemDone { .. }
+                    | RealtimeEvent::NoopRequested(_) => {}
                     RealtimeEvent::HandoffRequested(handoff) => {
                         let notification = ThreadRealtimeItemAddedNotification {
                             thread_id: conversation_id.to_string(),
@@ -935,6 +970,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     thread_id: conversation_id.to_string(),
                     turn_id: request.turn_id.clone(),
                     item_id: request.call_id.clone(),
+                    cwd: request_cwd.clone(),
                     reason: request.reason,
                     permissions: request.permissions.into(),
                 };
@@ -974,10 +1010,12 @@ pub(crate) async fn apply_bespoke_event_handling(
             if matches!(api_version, ApiVersion::V2) {
                 let call_id = request.call_id;
                 let turn_id = request.turn_id;
+                let namespace = request.namespace;
                 let tool = request.tool;
                 let arguments = request.arguments;
                 let item = ThreadItem::DynamicToolCall {
                     id: call_id.clone(),
+                    namespace: namespace.clone(),
                     tool: tool.clone(),
                     arguments: arguments.clone(),
                     status: DynamicToolCallStatus::InProgress,
@@ -997,6 +1035,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     thread_id: conversation_id.to_string(),
                     turn_id: turn_id.clone(),
                     call_id: call_id.clone(),
+                    namespace,
                     tool: tool.clone(),
                     arguments: arguments.clone(),
                 };
@@ -1035,6 +1074,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 let duration_ms = i64::try_from(response.duration.as_millis()).ok();
                 let item = ThreadItem::DynamicToolCall {
                     id: response.call_id,
+                    namespace: response.namespace,
                     tool: response.tool,
                     arguments: response.arguments,
                     status,
@@ -1682,6 +1722,17 @@ pub(crate) async fn apply_bespoke_event_handling(
                     .await;
             }
         }
+        EventMsg::PatchApplyUpdated(event) => {
+            let notification = FileChangePatchUpdatedNotification {
+                thread_id: conversation_id.to_string(),
+                turn_id: event_turn_id.clone(),
+                item_id: event.call_id,
+                changes: convert_patch_changes(&event.changes),
+            };
+            outgoing
+                .send_server_notification(ServerNotification::FileChangePatchUpdated(notification))
+                .await;
+        }
         EventMsg::PatchApplyEnd(patch_end_event) => {
             // Until we migrate the core to be aware of a first class FileChangeItem
             // and emit the corresponding EventMsg, we repurpose the call_id as the item_id.
@@ -1838,26 +1889,12 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::TurnAborted(turn_aborted_event) => {
             // All per-thread requests are bound to a turn, so abort them.
             outgoing.abort_pending_server_requests().await;
-            let pending = {
-                let mut state = thread_state.lock().await;
-                std::mem::take(&mut state.pending_interrupts)
-            };
-            if !pending.is_empty() {
-                for (rid, ver) in pending {
-                    match ver {
-                        ApiVersion::V1 => {
-                            let response = InterruptConversationResponse {
-                                abort_reason: turn_aborted_event.reason.clone(),
-                            };
-                            outgoing.send_response(rid, response).await;
-                        }
-                        ApiVersion::V2 => {
-                            let response = TurnInterruptResponse {};
-                            outgoing.send_response(rid, response).await;
-                        }
-                    }
-                }
-            }
+            respond_to_pending_interrupts(
+                &thread_state,
+                &outgoing,
+                Some(turn_aborted_event.reason.clone()),
+            )
+            .await;
 
             thread_watch_manager
                 .note_turn_interrupted(&conversation_id.to_string())
@@ -1879,13 +1916,27 @@ pub(crate) async fn apply_bespoke_event_handling(
             };
 
             if let Some(request_id) = pending {
+                let _thread_list_state_permit = match thread_list_state_permit.acquire().await {
+                    Ok(permit) => permit,
+                    Err(err) => {
+                        outgoing
+                            .send_error(
+                                request_id,
+                                internal_error(format!(
+                                    "failed to acquire thread list state permit: {err}"
+                                )),
+                            )
+                            .await;
+                        return;
+                    }
+                };
                 let Some(rollout_path) = conversation.rollout_path() else {
-                    let error = JSONRPCErrorError {
-                        code: INVALID_REQUEST_ERROR_CODE,
-                        message: "thread has no persisted rollout".to_string(),
-                        data: None,
-                    };
-                    outgoing.send_error(request_id, error).await;
+                    outgoing
+                        .send_error(
+                            request_id,
+                            invalid_request("thread has no persisted rollout"),
+                        )
+                        .await;
                     return;
                 };
                 let response = match read_summary_from_rollout(
@@ -1916,29 +1967,29 @@ pub(crate) async fn apply_bespoke_event_handling(
                                 ThreadRollbackResponse { thread }
                             }
                             Err(err) => {
-                                let error = JSONRPCErrorError {
-                                    code: INTERNAL_ERROR_CODE,
-                                    message: format!(
-                                        "failed to load rollout `{}`: {err}",
-                                        rollout_path.display()
-                                    ),
-                                    data: None,
-                                };
-                                outgoing.send_error(request_id.clone(), error).await;
+                                outgoing
+                                    .send_error(
+                                        request_id.clone(),
+                                        internal_error(format!(
+                                            "failed to load rollout `{}`: {err}",
+                                            rollout_path.display()
+                                        )),
+                                    )
+                                    .await;
                                 return;
                             }
                         }
                     }
                     Err(err) => {
-                        let error = JSONRPCErrorError {
-                            code: INTERNAL_ERROR_CODE,
-                            message: format!(
-                                "failed to load rollout `{}`: {err}",
-                                rollout_path.display()
-                            ),
-                            data: None,
-                        };
-                        outgoing.send_error(request_id.clone(), error).await;
+                        outgoing
+                            .send_error(
+                                request_id.clone(),
+                                internal_error(format!(
+                                    "failed to load rollout `{}`: {err}",
+                                    rollout_path.display()
+                                )),
+                            )
+                            .await;
                         return;
                     }
                 };
@@ -1954,6 +2005,20 @@ pub(crate) async fn apply_bespoke_event_handling(
                 };
                 outgoing
                     .send_global_server_notification(ServerNotification::ThreadNameUpdated(
+                        notification,
+                    ))
+                    .await;
+            }
+        }
+        EventMsg::ThreadGoalUpdated(thread_goal_event) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = ThreadGoalUpdatedNotification {
+                    thread_id: thread_goal_event.thread_id.to_string(),
+                    turn_id: thread_goal_event.turn_id,
+                    goal: thread_goal_event.goal.clone().into(),
+                };
+                outgoing
+                    .send_global_server_notification(ServerNotification::ThreadGoalUpdated(
                         notification,
                     ))
                     .await;
@@ -2322,15 +2387,35 @@ async fn handle_thread_rollback_failed(
 
     if let Some(request_id) = pending_rollback {
         outgoing
-            .send_error(
-                request_id,
-                JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: message.clone(),
-                    data: None,
-                },
-            )
+            .send_error(request_id, invalid_request(message))
             .await;
+    }
+}
+
+async fn respond_to_pending_interrupts(
+    thread_state: &Arc<Mutex<ThreadState>>,
+    outgoing: &ThreadScopedOutgoingMessageSender,
+    abort_reason: Option<codex_protocol::protocol::TurnAbortReason>,
+) {
+    let pending = {
+        let mut state = thread_state.lock().await;
+        std::mem::take(&mut state.pending_interrupts)
+    };
+
+    for (rid, ver) in pending {
+        match ver {
+            ApiVersion::V1 => {
+                let Some(abort_reason) = abort_reason.clone() else {
+                    debug_assert!(false, "v1 interrupts only resolve from TurnAborted");
+                    continue;
+                };
+                let response = InterruptConversationResponse { abort_reason };
+                outgoing.send_response(rid, response).await;
+            }
+            ApiVersion::V2 => {
+                outgoing.send_response(rid, TurnInterruptResponse {}).await;
+            }
+        }
     }
 }
 
@@ -2698,15 +2783,34 @@ fn request_permissions_response_from_client_result(
             return Some(Err(message));
         }
     };
-    Some(Ok(CoreRequestPermissionsResponse {
-        permissions: intersect_permission_profiles(
+    let strict_auto_review = response.strict_auto_review.unwrap_or(false);
+    if strict_auto_review
+        && matches!(
+            response.scope,
+            codex_app_server_protocol::PermissionGrantScope::Session
+        )
+    {
+        let message =
+            "strict auto review is only supported for turn-scoped permission grants".to_string();
+        error!("{message}");
+        return Some(Err(message));
+    }
+
+    let granted_permissions: CoreAdditionalPermissionProfile = response.permissions.into();
+    let permissions = if granted_permissions.is_empty() {
+        CoreRequestPermissionProfile::default()
+    } else {
+        intersect_permission_profiles(
             requested_permissions.into(),
-            response.permissions.into(),
+            granted_permissions,
             request_cwd,
         )
-        .into(),
+        .into()
+    };
+    Some(Ok(CoreRequestPermissionsResponse {
+        permissions,
         scope: response.scope.to_core(),
-        strict_auto_review: response.strict_auto_review.unwrap_or(false),
+        strict_auto_review,
     }))
 }
 
@@ -3197,6 +3301,10 @@ mod tests {
     use codex_protocol::mcp::CallToolResult;
     use codex_protocol::models::FileSystemPermissions as CoreFileSystemPermissions;
     use codex_protocol::models::NetworkPermissions as CoreNetworkPermissions;
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSpecialPath;
     use codex_protocol::plan_tool::PlanItemArg;
     use codex_protocol::plan_tool::StepStatus;
     use codex_protocol::protocol::CollabResumeBeginEvent;
@@ -3231,6 +3339,25 @@ mod tests {
         Arc::new(Mutex::new(ThreadState::default()))
     }
 
+    fn local_thread_store_for_config(
+        config: &codex_core::config::Config,
+    ) -> Arc<dyn codex_thread_store::ThreadStore> {
+        Arc::new(codex_thread_store::LocalThreadStore::new(
+            codex_rollout::RolloutConfig::from_view(config),
+        ))
+    }
+
+    fn disabled_outgoing_sender(tx: mpsc::Sender<OutgoingEnvelope>) -> Arc<OutgoingMessageSender> {
+        Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ))
+    }
+
+    fn test_thread_list_state_permit() -> Arc<tokio::sync::Semaphore> {
+        Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1))
+    }
+
     const TEST_TURN_COMPLETED_AT: i64 = 1_716_000_456;
     const TEST_TURN_DURATION_MS: i64 = 1_234;
 
@@ -3253,6 +3380,7 @@ mod tests {
             last_agent_message: None,
             completed_at: Some(TEST_TURN_COMPLETED_AT),
             duration_ms: Some(TEST_TURN_DURATION_MS),
+            time_to_first_token_ms: None,
         }
     }
 
@@ -3346,6 +3474,7 @@ mod tests {
                 self.outgoing.clone(),
                 self.thread_state.clone(),
                 self.thread_watch_manager.clone(),
+                Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
                 ApiVersion::V2,
                 "test-provider".to_string(),
                 &self.codex_home,
@@ -3495,7 +3624,10 @@ mod tests {
         let conversation_id = ThreadId::new();
         let thread_state = new_thread_state();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -3564,7 +3696,10 @@ mod tests {
         let conversation_id = ThreadId::new();
         let thread_state = new_thread_state();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -3643,20 +3778,26 @@ mod tests {
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
                 config.codex_home.to_path_buf(),
-                Arc::new(codex_exec_server::EnvironmentManager::new(
-                    /*exec_server_url*/ None,
-                )),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             ),
         );
         let codex_core::NewThread {
             thread_id: conversation_id,
             thread: conversation,
             ..
-        } = thread_manager.start_thread(config).await?;
+        } = thread_manager
+            .start_thread(
+                config.clone(),
+                codex_core::thread_store_from_config(&config),
+            )
+            .await?;
         let thread_state = new_thread_state();
         let thread_watch_manager = ThreadWatchManager::new();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -3966,7 +4107,7 @@ mod tests {
                 }),
                 CoreRequestPermissionProfile {
                     file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
-                        None,
+                        /*read*/ None,
                         Some(vec![absolute_path(output_path)]),
                     )),
                     ..CoreRequestPermissionProfile::default()
@@ -3982,18 +4123,12 @@ mod tests {
                         "calendar": true,
                     },
                 }),
-                CoreRequestPermissionProfile {
-                    file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
-                        Some(vec![absolute_path(input_path)]),
-                        Some(vec![absolute_path(output_path)]),
-                    )),
-                    ..CoreRequestPermissionProfile::default()
-                },
+                requested_permissions.clone(),
             ),
         ];
 
+        let cwd = std::env::current_dir().expect("current dir");
         for (granted_permissions, expected_permissions) in cases {
-            let cwd = std::env::current_dir().expect("current dir");
             let response = request_permissions_response_from_client_result(
                 requested_permissions.clone(),
                 Ok(Ok(serde_json::json!({
@@ -4065,6 +4200,27 @@ mod tests {
     }
 
     #[test]
+    fn request_permissions_response_rejects_session_scoped_strict_auto_review() {
+        let cwd = std::env::current_dir().expect("current dir");
+        let response = request_permissions_response_from_client_result(
+            CoreRequestPermissionProfile::default(),
+            Ok(Ok(serde_json::json!({
+                "scope": "session",
+                "strictAutoReview": true,
+                "permissions": {
+                    "network": {
+                        "enabled": true,
+                    },
+                },
+            }))),
+            cwd.as_path(),
+        )
+        .expect("response should not be ignored");
+
+        assert!(response.is_err());
+    }
+
+    #[test]
     fn request_permissions_response_rejects_malformed_payload() {
         let cwd = std::env::current_dir().expect("current dir");
         let response = request_permissions_response_from_client_result(
@@ -4078,6 +4234,160 @@ mod tests {
         .expect("response should not be ignored");
 
         assert!(response.is_err());
+    }
+
+    #[test]
+    fn request_permissions_response_preserves_turn_scoped_strict_auto_review() {
+        let cwd = std::env::current_dir().expect("current dir");
+        let response = request_permissions_response_from_client_result(
+            CoreRequestPermissionProfile {
+                network: Some(codex_protocol::models::NetworkPermissions {
+                    enabled: Some(true),
+                }),
+                ..Default::default()
+            },
+            Ok(Ok(serde_json::json!({
+                "strictAutoReview": true,
+                "permissions": {
+                    "network": {
+                        "enabled": true,
+                    },
+                },
+            }))),
+            cwd.as_path(),
+        )
+        .expect("response should not be ignored")
+        .expect("response should be accepted");
+
+        assert_eq!(response.scope, CorePermissionGrantScope::Turn);
+        assert!(response.strict_auto_review);
+    }
+
+    #[test]
+    fn request_permissions_response_accepts_explicit_child_grant_for_requested_cwd_scope() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute cwd");
+        let child = cwd.join("child");
+        let requested_permissions = CoreRequestPermissionProfile {
+            file_system: Some(CoreFileSystemPermissions {
+                entries: vec![FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                    },
+                    access: FileSystemAccessMode::Write,
+                }],
+                glob_scan_max_depth: None,
+            }),
+            ..Default::default()
+        };
+
+        let response = request_permissions_response_from_client_result(
+            requested_permissions,
+            Ok(Ok(serde_json::json!({
+                "permissions": {
+                    "fileSystem": {
+                        "write": [child],
+                    },
+                },
+            }))),
+            cwd.as_path(),
+        )
+        .expect("response should not be ignored")
+        .expect("response should be accepted");
+
+        assert_eq!(
+            response.permissions,
+            CoreRequestPermissionProfile {
+                file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
+                    /*read*/ None,
+                    Some(vec![child]),
+                )),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn request_permissions_response_rejects_child_grant_outside_requested_cwd_scope() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let request_cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("request-cwd"))
+            .expect("absolute request cwd");
+        let later_cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("later-cwd"))
+            .expect("absolute later cwd");
+        let later_child = later_cwd.join("child");
+        let requested_permissions = CoreRequestPermissionProfile {
+            file_system: Some(CoreFileSystemPermissions {
+                entries: vec![FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                    },
+                    access: FileSystemAccessMode::Write,
+                }],
+                glob_scan_max_depth: None,
+            }),
+            ..Default::default()
+        };
+
+        let response = request_permissions_response_from_client_result(
+            requested_permissions,
+            Ok(Ok(serde_json::json!({
+                "permissions": {
+                    "fileSystem": {
+                        "write": [later_child],
+                    },
+                },
+            }))),
+            request_cwd.as_path(),
+        )
+        .expect("response should not be ignored")
+        .expect("response should be accepted");
+
+        assert_eq!(
+            response.permissions,
+            CoreRequestPermissionProfile::default()
+        );
+    }
+
+    #[test]
+    fn request_permissions_response_ignores_broader_cwd_grant_for_requested_child_path() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute cwd");
+        let child = cwd.join("child");
+        let requested_permissions = CoreRequestPermissionProfile {
+            file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
+                /*read*/ None,
+                Some(vec![child]),
+            )),
+            ..Default::default()
+        };
+
+        let response = request_permissions_response_from_client_result(
+            requested_permissions,
+            Ok(Ok(serde_json::json!({
+                "permissions": {
+                    "fileSystem": {
+                        "entries": [{
+                            "path": {
+                                "type": "special",
+                                "value": {
+                                    "kind": "project_roots",
+                                    "subpath": null
+                                }
+                            },
+                            "access": "write"
+                        }],
+                    },
+                },
+            }))),
+            cwd.as_path(),
+        )
+        .expect("response should not be ignored")
+        .expect("response should be accepted");
+
+        assert_eq!(
+            response.permissions,
+            CoreRequestPermissionProfile::default()
+        );
     }
 
     #[test]
@@ -4311,7 +4621,10 @@ mod tests {
         let conversation_id = ThreadId::new();
         let event_turn_id = "complete1".to_string();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4320,17 +4633,19 @@ mod tests {
         let thread_state = new_thread_state();
         {
             let mut state = thread_state.lock().await;
-            state.track_current_turn_event(&EventMsg::TurnStarted(
-                codex_protocol::protocol::TurnStartedEvent {
+            state.track_current_turn_event(
+                &event_turn_id,
+                &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
                     turn_id: event_turn_id.clone(),
                     started_at: Some(42),
                     model_context_window: None,
                     collaboration_mode_kind: Default::default(),
-                },
-            ));
-            state.track_current_turn_event(&EventMsg::TurnComplete(turn_complete_event(
+                }),
+            );
+            state.track_current_turn_event(
                 &event_turn_id,
-            )));
+                &EventMsg::TurnComplete(turn_complete_event(&event_turn_id)),
+            );
         }
 
         handle_turn_complete(
@@ -4375,7 +4690,10 @@ mod tests {
         )
         .await;
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4423,7 +4741,10 @@ mod tests {
         )
         .await;
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4465,7 +4786,10 @@ mod tests {
     #[tokio::test]
     async fn test_handle_turn_plan_update_emits_notification_for_v2() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4519,7 +4843,10 @@ mod tests {
         let conversation_id = ThreadId::new();
         let turn_id = "turn-123".to_string();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4608,7 +4935,10 @@ mod tests {
         let conversation_id = ThreadId::new();
         let turn_id = "turn-456".to_string();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4681,7 +5011,10 @@ mod tests {
         let thread_state = new_thread_state();
 
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4943,7 +5276,10 @@ mod tests {
     #[tokio::test]
     async fn test_handle_turn_diff_emits_v2_notification() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -4981,7 +5317,10 @@ mod tests {
     #[tokio::test]
     async fn test_handle_turn_diff_is_noop_for_v1() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -5007,7 +5346,10 @@ mod tests {
     #[tokio::test]
     async fn test_hook_prompt_raw_response_emits_item_completed() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
         let conversation_id = ThreadId::new();
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
@@ -5064,36 +5406,36 @@ mod tests {
     {
         let codex_home = TempDir::new()?;
         let config = load_default_config_for_test(&codex_home).await;
+        let thread_store = local_thread_store_for_config(&config);
         let thread_manager = Arc::new(
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
                 config.codex_home.to_path_buf(),
-                Arc::new(codex_exec_server::EnvironmentManager::new(
-                    /*exec_server_url*/ None,
-                )),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             ),
         );
         let codex_core::NewThread {
             thread_id: conversation_id,
             thread: conversation,
             ..
-        } = thread_manager.start_thread(config).await?;
+        } = thread_manager.start_thread(config, thread_store).await?;
         let thread_state = new_thread_state();
         {
             let mut state = thread_state.lock().await;
-            state.track_current_turn_event(&EventMsg::TurnStarted(
-                codex_protocol::protocol::TurnStartedEvent {
+            state.track_current_turn_event(
+                "turn-active",
+                &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
                     turn_id: "turn-active".to_string(),
                     started_at: None,
                     model_context_window: None,
                     collaboration_mode_kind: Default::default(),
-                },
-            ));
+                }),
+            );
         }
         let thread_watch_manager = ThreadWatchManager::new();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = disabled_outgoing_sender(tx);
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -5114,6 +5456,7 @@ mod tests {
             outgoing,
             thread_state,
             thread_watch_manager,
+            test_thread_list_state_permit(),
             ApiVersion::V2,
             "test-provider".to_string(),
             codex_home.path(),
@@ -5142,37 +5485,40 @@ mod tests {
     -> Result<()> {
         let codex_home = TempDir::new()?;
         let config = load_default_config_for_test(&codex_home).await;
+        let thread_store = local_thread_store_for_config(&config);
         let thread_manager = Arc::new(
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
                 config.codex_home.to_path_buf(),
-                Arc::new(codex_exec_server::EnvironmentManager::new(
-                    /*exec_server_url*/ None,
-                )),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             ),
         );
         let codex_core::NewThread {
             thread_id: conversation_id,
             thread: conversation,
             ..
-        } = thread_manager.start_thread(config).await?;
+        } = thread_manager.start_thread(config, thread_store).await?;
         let thread_state = new_thread_state();
         {
             let mut state = thread_state.lock().await;
-            state.track_current_turn_event(&EventMsg::TurnStarted(
-                codex_protocol::protocol::TurnStartedEvent {
+            state.track_current_turn_event(
+                "turn-1",
+                &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
                     turn_id: "turn-1".to_string(),
                     started_at: None,
                     model_context_window: None,
                     collaboration_mode_kind: Default::default(),
-                },
-            ));
-            state.track_current_turn_event(&EventMsg::TurnComplete(turn_complete_event("turn-1")));
+                }),
+            );
+            state.track_current_turn_event(
+                "turn-1",
+                &EventMsg::TurnComplete(turn_complete_event("turn-1")),
+            );
         }
         let thread_watch_manager = ThreadWatchManager::new();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = disabled_outgoing_sender(tx);
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -5193,6 +5539,7 @@ mod tests {
             outgoing,
             thread_state,
             thread_watch_manager,
+            test_thread_list_state_permit(),
             ApiVersion::V2,
             "test-provider".to_string(),
             codex_home.path(),
@@ -5221,39 +5568,40 @@ mod tests {
     -> Result<()> {
         let codex_home = TempDir::new()?;
         let config = load_default_config_for_test(&codex_home).await;
+        let thread_store = local_thread_store_for_config(&config);
         let thread_manager = Arc::new(
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
                 config.codex_home.to_path_buf(),
-                Arc::new(codex_exec_server::EnvironmentManager::new(
-                    /*exec_server_url*/ None,
-                )),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             ),
         );
         let codex_core::NewThread {
             thread_id: conversation_id,
             thread: conversation,
             ..
-        } = thread_manager.start_thread(config).await?;
+        } = thread_manager.start_thread(config, thread_store).await?;
         let thread_state = new_thread_state();
         {
             let mut state = thread_state.lock().await;
-            state.track_current_turn_event(&EventMsg::TurnStarted(
-                codex_protocol::protocol::TurnStartedEvent {
+            state.track_current_turn_event(
+                "turn-1",
+                &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
                     turn_id: "turn-1".to_string(),
                     started_at: None,
                     model_context_window: None,
                     collaboration_mode_kind: Default::default(),
-                },
-            ));
-            state.track_current_turn_event(&EventMsg::TurnComplete(turn_complete_event(
+                }),
+            );
+            state.track_current_turn_event(
                 "wrong-turn",
-            )));
+                &EventMsg::TurnComplete(turn_complete_event("wrong-turn")),
+            );
         }
         let thread_watch_manager = ThreadWatchManager::new();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = disabled_outgoing_sender(tx);
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -5274,6 +5622,7 @@ mod tests {
             outgoing,
             thread_state,
             thread_watch_manager,
+            test_thread_list_state_permit(),
             ApiVersion::V2,
             "test-provider".to_string(),
             codex_home.path(),
@@ -5301,36 +5650,36 @@ mod tests {
     async fn warning_events_without_truthful_turn_emit_no_notification() -> Result<()> {
         let codex_home = TempDir::new()?;
         let config = load_default_config_for_test(&codex_home).await;
+        let thread_store = local_thread_store_for_config(&config);
         let thread_manager = Arc::new(
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
                 config.codex_home.to_path_buf(),
-                Arc::new(codex_exec_server::EnvironmentManager::new(
-                    /*exec_server_url*/ None,
-                )),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             ),
         );
         let codex_core::NewThread {
             thread_id: conversation_id,
             thread: conversation,
             ..
-        } = thread_manager.start_thread(config).await?;
+        } = thread_manager.start_thread(config, thread_store).await?;
         let thread_state = new_thread_state();
         {
             let mut state = thread_state.lock().await;
-            state.track_current_turn_event(&EventMsg::UserMessage(
-                codex_protocol::protocol::UserMessageEvent {
+            state.track_current_turn_event(
+                "user-1",
+                &EventMsg::UserMessage(codex_protocol::protocol::UserMessageEvent {
                     message: "hello".to_string(),
                     images: None,
                     text_elements: Vec::new(),
                     local_images: Vec::new(),
-                },
-            ));
+                }),
+            );
         }
         let thread_watch_manager = ThreadWatchManager::new();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = disabled_outgoing_sender(tx);
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -5351,6 +5700,7 @@ mod tests {
             outgoing,
             thread_state,
             thread_watch_manager,
+            test_thread_list_state_permit(),
             ApiVersion::V2,
             "test-provider".to_string(),
             codex_home.path(),
@@ -5365,39 +5715,40 @@ mod tests {
     async fn warning_events_after_implicit_turn_complete_emit_no_notification() -> Result<()> {
         let codex_home = TempDir::new()?;
         let config = load_default_config_for_test(&codex_home).await;
+        let thread_store = local_thread_store_for_config(&config);
         let thread_manager = Arc::new(
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
                 config.codex_home.to_path_buf(),
-                Arc::new(codex_exec_server::EnvironmentManager::new(
-                    /*exec_server_url*/ None,
-                )),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             ),
         );
         let codex_core::NewThread {
             thread_id: conversation_id,
             thread: conversation,
             ..
-        } = thread_manager.start_thread(config).await?;
+        } = thread_manager.start_thread(config, thread_store).await?;
         let thread_state = new_thread_state();
         {
             let mut state = thread_state.lock().await;
-            state.track_current_turn_event(&EventMsg::UserMessage(
-                codex_protocol::protocol::UserMessageEvent {
+            state.track_current_turn_event(
+                "user-1",
+                &EventMsg::UserMessage(codex_protocol::protocol::UserMessageEvent {
                     message: "hello".to_string(),
                     images: None,
                     text_elements: Vec::new(),
                     local_images: Vec::new(),
-                },
-            ));
-            state.track_current_turn_event(&EventMsg::TurnComplete(turn_complete_event(
+                }),
+            );
+            state.track_current_turn_event(
                 "wrong-turn",
-            )));
+                &EventMsg::TurnComplete(turn_complete_event("wrong-turn")),
+            );
         }
         let thread_watch_manager = ThreadWatchManager::new();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = disabled_outgoing_sender(tx);
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -5418,6 +5769,7 @@ mod tests {
             outgoing,
             thread_state,
             thread_watch_manager,
+            test_thread_list_state_permit(),
             ApiVersion::V2,
             "test-provider".to_string(),
             codex_home.path(),
@@ -5432,38 +5784,40 @@ mod tests {
     async fn warning_events_after_implicit_turn_aborted_emit_no_notification() -> Result<()> {
         let codex_home = TempDir::new()?;
         let config = load_default_config_for_test(&codex_home).await;
+        let thread_store = local_thread_store_for_config(&config);
         let thread_manager = Arc::new(
             codex_core::test_support::thread_manager_with_models_provider_and_home(
                 CodexAuth::create_dummy_chatgpt_auth_for_testing(),
                 config.model_provider.clone(),
                 config.codex_home.to_path_buf(),
-                Arc::new(codex_exec_server::EnvironmentManager::new(
-                    /*exec_server_url*/ None,
-                )),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             ),
         );
         let codex_core::NewThread {
             thread_id: conversation_id,
             thread: conversation,
             ..
-        } = thread_manager.start_thread(config).await?;
+        } = thread_manager.start_thread(config, thread_store).await?;
         let thread_state = new_thread_state();
         {
             let mut state = thread_state.lock().await;
-            state.track_current_turn_event(&EventMsg::UserMessage(
-                codex_protocol::protocol::UserMessageEvent {
+            state.track_current_turn_event(
+                "user-1",
+                &EventMsg::UserMessage(codex_protocol::protocol::UserMessageEvent {
                     message: "hello".to_string(),
                     images: None,
                     text_elements: Vec::new(),
                     local_images: Vec::new(),
-                },
-            ));
-            state
-                .track_current_turn_event(&EventMsg::TurnAborted(turn_aborted_event("wrong-turn")));
+                }),
+            );
+            state.track_current_turn_event(
+                "wrong-turn",
+                &EventMsg::TurnAborted(turn_aborted_event("wrong-turn")),
+            );
         }
         let thread_watch_manager = ThreadWatchManager::new();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let outgoing = Arc::new(OutgoingMessageSender::new(tx));
+        let outgoing = disabled_outgoing_sender(tx);
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],
@@ -5484,6 +5838,7 @@ mod tests {
             outgoing,
             thread_state,
             thread_watch_manager,
+            test_thread_list_state_permit(),
             ApiVersion::V2,
             "test-provider".to_string(),
             codex_home.path(),

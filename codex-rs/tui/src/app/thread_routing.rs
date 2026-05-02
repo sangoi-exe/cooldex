@@ -3,6 +3,8 @@
 //! This module manages active thread channels, routes server requests and notifications into those
 //! channels, submits thread-scoped operations through the app server, and replays buffered events
 //! when the visible thread changes.
+//!
+//! Merge-safety anchor: TUI thread routing owns resume/history replay activation; preserve rollout-backed replay boundaries and buffered event semantics.
 
 use super::*;
 
@@ -185,12 +187,24 @@ impl App {
             .agent_navigation
             .active_agent_label(self.current_displayed_thread_id(), self.primary_thread_id);
         self.chat_widget.set_active_agent_label(label);
+        self.sync_side_thread_ui();
     }
 
     pub(super) async fn thread_cwd(&self, thread_id: ThreadId) -> Option<AbsolutePathBuf> {
         let channel = self.thread_event_channels.get(&thread_id)?;
         let store = channel.store.lock().await;
         store.session.as_ref().map(|session| session.cwd.clone())
+    }
+
+    async fn thread_file_change_changes(
+        &self,
+        thread_id: ThreadId,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Option<Vec<codex_app_server_protocol::FileUpdateChange>> {
+        let channel = self.thread_event_channels.get(&thread_id)?;
+        let store = channel.store.lock().await;
+        store.file_change_changes(turn_id, item_id)
     }
 
     pub(super) async fn interactive_request_for_thread_request(
@@ -263,7 +277,11 @@ impl App {
                         .thread_cwd(thread_id)
                         .await
                         .unwrap_or_else(|| self.config.cwd.clone()),
-                    changes: HashMap::new(),
+                    changes: self
+                        .thread_file_change_changes(thread_id, &params.turn_id, &params.item_id)
+                        .await
+                        .map(crate::app_server_approval_conversions::file_update_changes_to_core)
+                        .unwrap_or_default(),
                 }),
             ),
             ServerRequest::McpServerElicitationRequest { request_id, params } => {
@@ -335,6 +353,79 @@ impl App {
         }
     }
 
+    pub(super) fn push_thread_interactive_request(&mut self, request: ThreadInteractiveRequest) {
+        match request {
+            ThreadInteractiveRequest::Approval(request) => {
+                self.render_inactive_patch_preview(&request);
+                self.chat_widget.push_approval_request(request);
+            }
+            ThreadInteractiveRequest::UserInput(request) => {
+                self.chat_widget.handle_request_user_input_now(request);
+            }
+            ThreadInteractiveRequest::McpServerElicitation(request) => {
+                self.chat_widget
+                    .push_mcp_server_elicitation_request(request);
+            }
+        }
+    }
+
+    fn render_inactive_patch_preview(&mut self, request: &ApprovalRequest) {
+        let ApprovalRequest::ApplyPatch {
+            thread_label,
+            cwd,
+            changes,
+            ..
+        } = request
+        else {
+            return;
+        };
+        if thread_label.is_none() || changes.is_empty() {
+            return;
+        }
+        self.chat_widget
+            .add_to_history(history_cell::new_patch_event(changes.clone(), cwd));
+    }
+
+    pub(super) async fn pending_inactive_thread_requests(&self) -> Vec<(ThreadId, ServerRequest)> {
+        let channels: Vec<(ThreadId, Arc<Mutex<ThreadEventStore>>)> = self
+            .thread_event_channels
+            .iter()
+            .map(|(thread_id, channel)| (*thread_id, Arc::clone(&channel.store)))
+            .collect();
+
+        let mut requests = Vec::new();
+        for (thread_id, store) in channels {
+            if Some(thread_id) == self.active_thread_id {
+                continue;
+            }
+
+            let store = store.lock().await;
+            requests.extend(
+                store
+                    .pending_replay_requests()
+                    .into_iter()
+                    .map(|request| (thread_id, request)),
+            );
+        }
+        requests
+    }
+
+    pub(super) async fn surface_pending_inactive_thread_interactive_requests(&mut self) {
+        if self.active_side_parent_thread_id().is_some() {
+            return;
+        }
+
+        let requests = self.pending_inactive_thread_requests().await;
+        for (thread_id, request) in requests {
+            if let Some(request) = self
+                .interactive_request_for_thread_request(thread_id, &request)
+                .await
+            {
+                self.push_thread_interactive_request(request);
+            }
+        }
+    }
+
     pub(super) async fn submit_active_thread_op(
         &mut self,
         app_server: &mut AppServerSession,
@@ -375,6 +466,7 @@ impl App {
             if ThreadEventStore::op_can_change_pending_replay_state(&op) {
                 self.note_thread_outbound_op(thread_id, &op).await;
                 self.refresh_pending_thread_approvals().await;
+                self.refresh_side_parent_status_from_store(thread_id).await;
             }
             return Ok(());
         }
@@ -463,7 +555,7 @@ impl App {
                 cwd,
                 approval_policy,
                 approvals_reviewer,
-                sandbox_policy,
+                permission_profile,
                 model,
                 effort,
                 summary,
@@ -546,7 +638,7 @@ impl App {
                             approval_policy,
                             approvals_reviewer
                                 .unwrap_or(self.chat_widget.config_ref().approvals_reviewer),
-                            sandbox_policy.clone(),
+                            permission_profile.clone(),
                             model.to_string(),
                             effort,
                             *summary,
@@ -640,6 +732,13 @@ impl App {
                 Ok(true)
             }
             AppCommandView::OverrideTurnContext { .. } => Ok(true),
+            AppCommandView::ApproveGuardianDeniedAction { event }
+            | AppCommandView::Other(Op::ApproveGuardianDeniedAction { event }) => {
+                app_server
+                    .thread_approve_guardian_denied_action(thread_id, event)
+                    .await?;
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
@@ -681,6 +780,7 @@ impl App {
                 if ThreadEventStore::op_can_change_pending_replay_state(op) {
                     self.note_thread_outbound_op(thread_id, op).await;
                     self.refresh_pending_thread_approvals().await;
+                    self.refresh_side_parent_status_from_store(thread_id).await;
                 }
                 Ok(true)
             }
@@ -694,6 +794,7 @@ impl App {
     }
 
     pub(super) async fn refresh_pending_thread_approvals(&mut self) {
+        let side_parent_thread_id = self.active_side_parent_thread_id();
         let channels: Vec<(ThreadId, Arc<Mutex<ThreadEventStore>>)> = self
             .thread_event_channels
             .iter()
@@ -702,7 +803,8 @@ impl App {
 
         let mut pending_thread_ids = Vec::new();
         for (thread_id, store) in channels {
-            if Some(thread_id) == self.active_thread_id {
+            if Some(thread_id) == self.active_thread_id || Some(thread_id) == side_parent_thread_id
+            {
                 continue;
             }
 
@@ -722,6 +824,21 @@ impl App {
         self.chat_widget.set_pending_thread_approvals(threads);
     }
 
+    pub(super) async fn refresh_side_parent_status_from_store(&mut self, thread_id: ThreadId) {
+        let Some(channel) = self.thread_event_channels.get(&thread_id) else {
+            return;
+        };
+        let status = {
+            let store = channel.store.lock().await;
+            store.side_parent_pending_status()
+        };
+        if let Some(status) = status {
+            self.set_side_parent_status(thread_id, Some(status));
+        } else {
+            self.clear_side_parent_action_status(thread_id);
+        }
+    }
+
     pub(super) async fn enqueue_thread_notification(
         &mut self,
         thread_id: ThreadId,
@@ -735,7 +852,7 @@ impl App {
             (channel.sender.clone(), Arc::clone(&channel.store))
         };
 
-        let should_send = {
+        let (should_send, pending_status) = {
             let mut guard = store.lock().await;
             if guard.session.is_none()
                 && let Some(session) = inferred_session
@@ -743,8 +860,9 @@ impl App {
                 guard.session = Some(session);
             }
             guard.push_notification(notification.clone());
-            guard.active
+            (guard.active, guard.side_parent_pending_status())
         };
+        let notification_status_change = SideParentStatusChange::for_notification(&notification);
 
         if should_send {
             match sender.try_send(ThreadBufferedEvent::Notification(notification)) {
@@ -760,6 +878,11 @@ impl App {
                     tracing::warn!("thread {thread_id} event channel closed");
                 }
             }
+        }
+        if let Some(status) = pending_status {
+            self.set_side_parent_status(thread_id, Some(status));
+        } else if let Some(change) = notification_status_change {
+            self.apply_side_parent_status_change(thread_id, change);
         }
         self.refresh_pending_thread_approvals().await;
         Ok(())
@@ -874,11 +997,12 @@ impl App {
             (channel.sender.clone(), Arc::clone(&channel.store))
         };
 
-        let should_send = {
+        let (should_send, pending_status) = {
             let mut guard = store.lock().await;
             guard.push_request(request.clone());
-            guard.active
+            (guard.active, guard.side_parent_pending_status())
         };
+        let request_status = SideParentStatus::for_request(&request);
 
         if should_send {
             match sender.try_send(ThreadBufferedEvent::Request(request)) {
@@ -894,19 +1018,13 @@ impl App {
                     tracing::warn!("thread {thread_id} event channel closed");
                 }
             }
-        } else if let Some(request) = inactive_interactive_request {
-            match request {
-                ThreadInteractiveRequest::Approval(request) => {
-                    self.chat_widget.push_approval_request(request);
-                }
-                ThreadInteractiveRequest::McpServerElicitation(request) => {
-                    self.chat_widget
-                        .push_mcp_server_elicitation_request(request);
-                }
-                ThreadInteractiveRequest::UserInput(request) => {
-                    self.chat_widget.handle_request_user_input_now(request);
-                }
-            }
+        } else if self.active_side_parent_thread_id().is_none()
+            && let Some(request) = inactive_interactive_request
+        {
+            self.push_thread_interactive_request(request);
+        }
+        if let Some(status) = pending_status.or(request_status) {
+            self.set_side_parent_status(thread_id, Some(status));
         }
         self.refresh_pending_thread_approvals().await;
         Ok(())
@@ -978,8 +1096,18 @@ impl App {
         self.chat_widget
             .set_initial_user_message_submit_suppressed(/*suppressed*/ true);
         self.chat_widget.handle_thread_session(session);
+        let should_buffer_initial_replay =
+            self.terminal_resize_reflow_enabled() && !turns.is_empty();
+        if should_buffer_initial_replay {
+            self.app_event_tx
+                .send(AppEvent::BeginInitialHistoryReplayBuffer);
+        }
         self.chat_widget
             .replay_thread_turns(turns, ReplayKind::ResumeInitialMessages);
+        if should_buffer_initial_replay {
+            self.app_event_tx
+                .send(AppEvent::EndInitialHistoryReplayBuffer);
+        }
         let pending = std::mem::take(&mut self.pending_primary_events);
         for pending_event in pending {
             match pending_event {
@@ -1038,11 +1166,7 @@ impl App {
         is_replay_only: bool,
         snapshot: &mut ThreadEventSnapshot,
     ) {
-        let should_refresh = !is_replay_only
-            && snapshot.session.as_ref().is_none_or(|session| {
-                session.model.trim().is_empty() || session.rollout_path.is_none()
-            });
-        if !should_refresh {
+        if !self.should_refresh_snapshot_session(thread_id, is_replay_only, snapshot) {
             return;
         }
 
@@ -1064,6 +1188,19 @@ impl App {
         }
     }
 
+    pub(super) fn should_refresh_snapshot_session(
+        &self,
+        thread_id: ThreadId,
+        is_replay_only: bool,
+        snapshot: &ThreadEventSnapshot,
+    ) -> bool {
+        !is_replay_only
+            && !self.side_threads.contains_key(&thread_id)
+            && snapshot.session.as_ref().is_none_or(|session| {
+                session.model.trim().is_empty() || session.rollout_path.is_none()
+            })
+    }
+
     pub(super) async fn apply_refreshed_snapshot_thread(
         &mut self,
         thread_id: ThreadId,
@@ -1083,6 +1220,10 @@ impl App {
             .retain(ThreadEventStore::event_survives_session_refresh);
     }
 
+    /// Drains pending buffered events from the active thread receiver.
+    ///
+    /// This is called from the main loop after app events so visible thread state can catch up
+    /// without blocking on the app-server listener task.
     pub(super) async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
         let Some(mut rx) = self.active_thread_rx.take() else {
             return Ok(());
@@ -1143,8 +1284,16 @@ impl App {
         snapshot: ThreadEventSnapshot,
         resume_restored_queue: bool,
     ) {
+        let suppress_replay_notices =
+            replay_filter::snapshot_has_pending_interactive_request(&snapshot);
         if let Some(session) = snapshot.session {
-            self.chat_widget.handle_thread_session(session);
+            if self.side_threads.contains_key(&session.thread_id) {
+                self.chat_widget.handle_side_thread_session(session);
+            } else if suppress_replay_notices {
+                self.chat_widget.handle_thread_session_quiet(session);
+            } else {
+                self.chat_widget.handle_thread_session(session);
+            }
         }
         self.chat_widget
             .set_queue_autosend_suppressed(/*suppressed*/ true);
@@ -1155,6 +1304,9 @@ impl App {
                 .replay_thread_turns(snapshot.turns, ReplayKind::ThreadSnapshot);
         }
         for event in snapshot.events {
+            if suppress_replay_notices && replay_filter::event_is_notice(&event) {
+                continue;
+            }
             self.handle_thread_event_replay(event);
         }
         self.chat_widget
@@ -1199,6 +1351,7 @@ impl App {
         waiting_for_initial_session_configured && primary_thread_id.is_some()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_skills_list_response(&mut self, response: SkillsListResponse) {
         let response = list_skills_response_to_core(response);
         let cwd = self.chat_widget.config_ref().cwd.clone();
@@ -1323,8 +1476,14 @@ impl App {
                 self.active_non_primary_shutdown_target(notification)
         {
             self.mark_agent_picker_thread_closed(closed_thread_id);
-            self.select_agent_thread(tui, app_server, primary_thread_id)
-                .await?;
+            if self.side_threads.contains_key(&closed_thread_id) {
+                self.discard_closed_side_thread(closed_thread_id).await;
+                self.select_agent_thread(tui, app_server, primary_thread_id)
+                    .await?;
+            } else {
+                self.select_agent_thread_and_discard_side(tui, app_server, primary_thread_id)
+                    .await?;
+            }
             if self.active_thread_id == Some(primary_thread_id) {
                 self.chat_widget.add_info_message(
                     format!(

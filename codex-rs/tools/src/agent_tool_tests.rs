@@ -44,6 +44,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         hide_agent_type_model_reasoning: false,
         include_usage_hint: true,
         usage_hint_text: None,
+        max_concurrent_threads_per_session: Some(4),
     });
 
     let ToolSpec::Function(ResponsesApiTool {
@@ -68,6 +69,8 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     assert!(description.contains(
         "The model catalog below is informational; use the `model` and `reasoning_effort` arguments when you need direct child overrides."
     ));
+    assert!(description.contains("`max_concurrent_threads_per_session = 4`"));
+    assert!(description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
     assert!(description.contains("visible display (`visible-model`)"));
     assert!(!description.contains("hidden display (`hidden-model`)"));
     assert!(properties.contains_key("task_name"));
@@ -84,6 +87,12 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     assert_eq!(
         properties.get("agent_type"),
         Some(&JsonSchema::string(Some("role help".to_string())))
+    );
+    assert_eq!(
+        properties
+            .get("model")
+            .and_then(|schema| schema.description.as_deref()),
+        Some(SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION)
     );
     assert_eq!(
         parameters.required.as_ref(),
@@ -103,6 +112,7 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
         hide_agent_type_model_reasoning: false,
         include_usage_hint: true,
         usage_hint_text: None,
+        max_concurrent_threads_per_session: None,
     });
 
     let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = tool else {
@@ -122,6 +132,12 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
     assert!(!properties.contains_key("model"));
     assert!(!properties.contains_key("reasoning_effort"));
     assert!(!properties.contains_key("fork_turns"));
+    assert_eq!(
+        properties
+            .get("model")
+            .and_then(|schema| schema.description.as_deref()),
+        Some(SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION)
+    );
 }
 
 #[test]
@@ -132,6 +148,7 @@ fn spawn_agent_tool_v1_default_description_has_no_delegation_policy() {
         hide_agent_type_model_reasoning: false,
         include_usage_hint: true,
         usage_hint_text: None,
+        max_concurrent_threads_per_session: None,
     });
 
     let ToolSpec::Function(ResponsesApiTool { description, .. }) = tool else {
@@ -164,6 +181,7 @@ fn spawn_agent_tools_append_custom_usage_hint_text() {
         hide_agent_type_model_reasoning: false,
         include_usage_hint: true,
         usage_hint_text: usage_hint_text.clone(),
+        max_concurrent_threads_per_session: None,
     });
     let v2_tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
         available_models: &[],
@@ -171,6 +189,7 @@ fn spawn_agent_tools_append_custom_usage_hint_text() {
         hide_agent_type_model_reasoning: false,
         include_usage_hint: true,
         usage_hint_text,
+        max_concurrent_threads_per_session: None,
     });
 
     let ToolSpec::Function(ResponsesApiTool {
@@ -195,7 +214,6 @@ fn spawn_agent_tools_append_custom_usage_hint_text() {
 #[test]
 fn send_message_tool_requires_message_and_has_no_output_schema() {
     let ToolSpec::Function(ResponsesApiTool {
-        description,
         parameters,
         output_schema,
         ..
@@ -216,10 +234,6 @@ fn send_message_tool_requires_message_and_has_no_output_schema() {
     assert!(!properties.contains_key("interrupt"));
     assert!(!properties.contains_key("items"));
     assert_eq!(
-        description,
-        "Send a string message to an existing agent without triggering a new turn."
-    );
-    assert_eq!(
         properties
             .get("target")
             .and_then(|schema| schema.description.as_deref()),
@@ -235,7 +249,6 @@ fn send_message_tool_requires_message_and_has_no_output_schema() {
 #[test]
 fn followup_task_tool_requires_message_and_has_no_output_schema() {
     let ToolSpec::Function(ResponsesApiTool {
-        description,
         parameters,
         output_schema,
         ..
@@ -253,22 +266,7 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
         .expect("followup_task should use object params");
     assert!(properties.contains_key("target"));
     assert!(properties.contains_key("message"));
-    assert!(properties.contains_key("interrupt"));
     assert!(!properties.contains_key("items"));
-    assert!(description.contains(
-        "Send a string message to an existing non-root agent and trigger a turn in the target."
-    ));
-    assert!(description.contains(
-        "If interrupt=false and the target's turn has not completed, the message is queued"
-    ));
-    assert_eq!(
-        properties
-            .get("interrupt")
-            .and_then(|schema| schema.description.as_deref()),
-        Some(
-            "When true, stop the agent's current task and handle this immediately. When false (default), queue this message; if the target is already running, it starts the target's next turn after the current turn completes."
-        )
-    );
     assert_eq!(
         parameters.required.as_ref(),
         Some(&vec!["target".to_string(), "message".to_string()])

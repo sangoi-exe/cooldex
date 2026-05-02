@@ -125,6 +125,11 @@ async fn build_uploaded_local_argument_value(
             "ChatGPT auth is required to upload local files for Codex Apps tools".to_string(),
         );
     };
+    if !auth.uses_codex_backend() {
+        return Err(
+            "ChatGPT auth is required to upload local files for Codex Apps tools".to_string(),
+        );
+    }
     let upload_auth: Box<dyn AuthProvider> = if let Some(authorization_header_value) = sess
         .authorization_header_for_current_agent_task()
         .await

@@ -1,5 +1,7 @@
 //! SQLite-backed state for rollout metadata.
 //!
+//! Merge-safety anchor: state DB runtime is the durable owner for thread/account/runtime metadata; keep rollout mirroring aligned with local resume and account-state customizations.
+//!
 //! This crate is intentionally small and focused: it extracts rollout metadata
 //! from JSONL rollouts and mirrors it into a local SQLite database. Backfill
 //! orchestration and rollout scanning live in `codex-core`.
@@ -44,11 +46,17 @@ pub use model::Stage1JobClaimOutcome;
 pub use model::Stage1Output;
 pub use model::Stage1OutputRef;
 pub use model::Stage1StartupClaimParams;
+pub use model::ThreadGoal;
+pub use model::ThreadGoalStatus;
 pub use model::ThreadMetadata;
 pub use model::ThreadMetadataBuilder;
 pub use model::ThreadsPage;
+pub use runtime::DeviceKeyBindingRecord;
 pub use runtime::RemoteControlEnrollmentRecord;
 pub use runtime::ThreadFilterOptions;
+pub use runtime::ThreadGoalAccountingMode;
+pub use runtime::ThreadGoalAccountingOutcome;
+pub use runtime::ThreadGoalUpdate;
 pub use runtime::logs_db_filename;
 pub use runtime::logs_db_path;
 pub use runtime::state_db_filename;

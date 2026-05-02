@@ -15,6 +15,7 @@ use crate::legacy_core::NewThread;
 use crate::legacy_core::PromptGcActivityEdge;
 use crate::legacy_core::ThreadManager;
 use crate::legacy_core::config::Config;
+use crate::legacy_core::thread_store_from_config;
 
 const TUI_NOTIFY_CLIENT: &str = "codex-tui";
 
@@ -200,11 +201,12 @@ pub(crate) fn spawn_agent(
 
     let app_event_tx_clone = app_event_tx;
     tokio::spawn(async move {
+        let thread_store = thread_store_from_config(&config);
         let NewThread {
             thread,
             session_configured,
             ..
-        } = match server.start_thread(config).await {
+        } = match server.start_thread(config, thread_store).await {
             Ok(v) => v,
             Err(err) => {
                 let message = format!("Failed to initialize codex: {err}");

@@ -9,6 +9,7 @@ use crate::agent::control::render_input_preview;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
+use crate::session::turn_context::TurnEnvironment;
 use crate::tools::handlers::multi_agents::collab_spawn_error;
 use crate::tools::handlers::multi_agents_common::apply_requested_spawn_agent_model_overrides;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_overrides;
@@ -168,6 +169,12 @@ impl ToolHandler for Handler {
                 SpawnAgentOptions {
                     fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
                     fork_mode,
+                    environments: Some(
+                        turn.environments
+                            .iter()
+                            .map(TurnEnvironment::selection)
+                            .collect(),
+                    ),
                 },
             )
             .await
@@ -277,14 +284,12 @@ impl SpawnAgentArgs {
             ));
         }
 
-        let Some(fork_turns) = self
+        let fork_turns = self
             .fork_turns
             .as_deref()
             .map(str::trim)
             .filter(|fork_turns| !fork_turns.is_empty())
-        else {
-            return Ok(None);
-        };
+            .unwrap_or("all");
 
         if fork_turns.eq_ignore_ascii_case("none") {
             return Ok(None);

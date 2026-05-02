@@ -206,6 +206,10 @@ async fn spawn_agent_description_lists_visible_models_as_informational_catalog()
         !description.contains("A mini model can solve many tasks faster than the main model."),
         "spawn_agent description should no longer imply direct model downshifts: {description:?}"
     );
+    assert!(
+        !description.contains("A mini model can solve many tasks faster than the main model."),
+        "spawn_agent description should not encourage choosing a smaller model by default: {description:?}"
+    );
 
     Ok(())
 }

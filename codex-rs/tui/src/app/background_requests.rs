@@ -1,28 +1,27 @@
-//! Background app-server requests and async task completions for the TUI app.
+//! Background app-server requests launched by the TUI app.
 //!
-//! This module owns fire-and-forget request spawning plus completion handlers that render
-//! request results back into app history or app state.
+//! This module owns fire-and-forget fetch/write helpers for MCP inventory, skills, plugins, rate
+//! limits, add-credit nudges, and feedback uploads. Results are routed back through `AppEvent` so
+//! the main event loop remains single-threaded.
 
 use super::*;
+use codex_app_server_protocol::MarketplaceAddParams;
+use codex_app_server_protocol::MarketplaceAddResponse;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 impl App {
-    /// Spawn a background task that fetches MCP server status from the app-server
-    /// via paginated RPCs, then delivers the result back through
-    /// `AppEvent::McpInventoryLoaded`.
-    ///
-    /// The spawned task is fire-and-forget: no `JoinHandle` is stored, so a stale
-    /// result may arrive after the user has moved on. We currently accept that
-    /// tradeoff because the effect is limited to stale inventory output in history,
-    /// while request-token invalidation would add cross-cutting async state for a
-    /// low-severity path.
-    pub(super) fn fetch_mcp_inventory(&mut self, app_server: &AppServerSession) {
+    pub(super) fn fetch_mcp_inventory(
+        &mut self,
+        app_server: &AppServerSession,
+        detail: McpServerStatusDetail,
+    ) {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            let result = fetch_all_mcp_server_statuses(request_handle)
+            let result = fetch_all_mcp_server_statuses(request_handle, detail)
                 .await
                 .map_err(|err| err.to_string());
-            app_event_tx.send(AppEvent::McpInventoryLoaded { result });
+            app_event_tx.send(AppEvent::McpInventoryLoaded { result, detail });
         });
     }
 
@@ -50,6 +49,21 @@ impl App {
                 account_generation,
                 result,
             });
+        });
+    }
+
+    pub(super) fn send_add_credits_nudge_email(
+        &mut self,
+        app_server: &AppServerSession,
+        credit_type: AddCreditsNudgeCreditType,
+    ) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = send_add_credits_nudge_email(request_handle, credit_type)
+                .await
+                .map_err(|err| err.to_string());
+            app_event_tx.send(AppEvent::AddCreditsNudgeEmailFinished { result });
         });
     }
 
@@ -96,6 +110,28 @@ impl App {
                 .await
                 .map_err(|err| err.to_string());
             app_event_tx.send(AppEvent::PluginDetailLoaded { cwd, result });
+        });
+    }
+
+    pub(super) fn fetch_marketplace_add(
+        &mut self,
+        app_server: &AppServerSession,
+        cwd: PathBuf,
+        source: String,
+    ) {
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let cwd_for_event = cwd.clone();
+            let source_for_event = source.clone();
+            let result = fetch_marketplace_add(request_handle, cwd, source)
+                .await
+                .map_err(|err| format!("Failed to add marketplace: {err}"));
+            app_event_tx.send(AppEvent::MarketplaceAddLoaded {
+                cwd: cwd_for_event,
+                source: source_for_event,
+                result,
+            });
         });
     }
 
@@ -340,6 +376,7 @@ impl App {
     pub(super) fn handle_mcp_inventory_result(
         &mut self,
         result: Result<Vec<McpServerStatus>, String>,
+        detail: McpServerStatusDetail,
     ) {
         let config = self.chat_widget.config_ref().clone();
         self.chat_widget.clear_mcp_inventory_loading();
@@ -362,9 +399,7 @@ impl App {
 
         self.chat_widget
             .add_to_history(history_cell::new_mcp_tools_output_from_statuses(
-                &config,
-                &statuses,
-                McpServerStatusDetail::ToolsAndAuthOnly,
+                &config, &statuses, detail,
             ));
     }
 
@@ -384,6 +419,303 @@ impl App {
     }
 }
 
+pub(super) async fn fetch_all_mcp_server_statuses(
+    request_handle: AppServerRequestHandle,
+    detail: McpServerStatusDetail,
+) -> Result<Vec<McpServerStatus>> {
+    let mut cursor = None;
+    let mut statuses = Vec::new();
+
+    loop {
+        let request_id = RequestId::String(format!("mcp-inventory-{}", Uuid::new_v4()));
+        let response: ListMcpServerStatusResponse = request_handle
+            .request_typed(ClientRequest::McpServerStatusList {
+                request_id,
+                params: ListMcpServerStatusParams {
+                    cursor: cursor.clone(),
+                    limit: Some(100),
+                    detail: Some(detail),
+                },
+            })
+            .await
+            .wrap_err("mcpServerStatus/list failed in TUI")?;
+        statuses.extend(response.data);
+        if let Some(next_cursor) = response.next_cursor {
+            cursor = Some(next_cursor);
+        } else {
+            break;
+        }
+    }
+
+    Ok(statuses)
+}
+
+pub(super) async fn fetch_account_rate_limits(
+    request_handle: AppServerRequestHandle,
+) -> Result<Vec<RateLimitSnapshot>> {
+    let request_id = RequestId::String(format!("account-rate-limits-{}", Uuid::new_v4()));
+    let response: GetAccountRateLimitsResponse = request_handle
+        .request_typed(ClientRequest::GetAccountRateLimits {
+            request_id,
+            params: None,
+        })
+        .await
+        .wrap_err("account/rateLimits/read failed in TUI")?;
+
+    Ok(app_server_rate_limit_snapshots_to_core(response))
+}
+
+pub(super) async fn send_add_credits_nudge_email(
+    request_handle: AppServerRequestHandle,
+    credit_type: AddCreditsNudgeCreditType,
+) -> Result<codex_app_server_protocol::AddCreditsNudgeEmailStatus> {
+    let request_id = RequestId::String(format!("add-credits-nudge-{}", Uuid::new_v4()));
+    let response: codex_app_server_protocol::SendAddCreditsNudgeEmailResponse = request_handle
+        .request_typed(ClientRequest::SendAddCreditsNudgeEmail {
+            request_id,
+            params: SendAddCreditsNudgeEmailParams { credit_type },
+        })
+        .await
+        .wrap_err("account/sendAddCreditsNudgeEmail failed in TUI")?;
+
+    Ok(response.status)
+}
+
+pub(super) async fn fetch_skills_list(
+    request_handle: AppServerRequestHandle,
+    cwd: PathBuf,
+) -> Result<SkillsListResponse> {
+    let request_id = RequestId::String(format!("startup-skills-list-{}", Uuid::new_v4()));
+    // Use the cloneable request handle so startup can issue this RPC from a background task without
+    // extending a borrow of `AppServerSession` across the first frame render.
+    request_handle
+        .request_typed(ClientRequest::SkillsList {
+            request_id,
+            params: SkillsListParams {
+                cwds: vec![cwd],
+                force_reload: true,
+                per_cwd_extra_user_roots: None,
+            },
+        })
+        .await
+        .wrap_err("skills/list failed in TUI")
+}
+
+pub(super) async fn fetch_plugins_list(
+    request_handle: AppServerRequestHandle,
+    cwd: PathBuf,
+) -> Result<PluginListResponse> {
+    let cwd = AbsolutePathBuf::try_from(cwd).wrap_err("plugin list cwd must be absolute")?;
+    let request_id = RequestId::String(format!("plugin-list-{}", Uuid::new_v4()));
+    let mut response = request_handle
+        .request_typed(ClientRequest::PluginList {
+            request_id,
+            params: PluginListParams {
+                cwds: Some(vec![cwd]),
+            },
+        })
+        .await
+        .wrap_err("plugin/list failed in TUI")?;
+    hide_cli_only_plugin_marketplaces(&mut response);
+    Ok(response)
+}
+
+const CLI_HIDDEN_PLUGIN_MARKETPLACES: &[&str] = &["openai-bundled"];
+
+pub(super) fn hide_cli_only_plugin_marketplaces(response: &mut PluginListResponse) {
+    response
+        .marketplaces
+        .retain(|marketplace| !CLI_HIDDEN_PLUGIN_MARKETPLACES.contains(&marketplace.name.as_str()));
+}
+
+pub(super) async fn fetch_plugin_detail(
+    request_handle: AppServerRequestHandle,
+    params: PluginReadParams,
+) -> Result<PluginReadResponse> {
+    let request_id = RequestId::String(format!("plugin-read-{}", Uuid::new_v4()));
+    request_handle
+        .request_typed(ClientRequest::PluginRead { request_id, params })
+        .await
+        .wrap_err("plugin/read failed in TUI")
+}
+
+pub(super) async fn fetch_marketplace_add(
+    request_handle: AppServerRequestHandle,
+    cwd: PathBuf,
+    source: String,
+) -> Result<MarketplaceAddResponse> {
+    let cwd = AbsolutePathBuf::try_from(cwd).wrap_err("marketplace/add cwd must be absolute")?;
+    let source = marketplace_add_source_for_request(cwd.as_path(), source);
+    let request_id = RequestId::String(format!("marketplace-add-{}", Uuid::new_v4()));
+    request_handle
+        .request_typed(ClientRequest::MarketplaceAdd {
+            request_id,
+            params: MarketplaceAddParams {
+                source,
+                ref_name: None,
+                sparse_paths: None,
+            },
+        })
+        .await
+        .wrap_err("marketplace/add failed in TUI")
+}
+
+fn marketplace_add_source_for_request(cwd: &std::path::Path, source: String) -> String {
+    let (base_source, suffix) = if let Some((base, ref_name)) = source.rsplit_once('#') {
+        (base, Some(format!("#{ref_name}")))
+    } else if let Some((base, ref_name)) = source.rsplit_once('@') {
+        (base, Some(format!("@{ref_name}")))
+    } else {
+        (source.as_str(), None)
+    };
+
+    if matches!(base_source, "." | "..")
+        || base_source.starts_with("./")
+        || base_source.starts_with("../")
+        || base_source.starts_with(".\\")
+        || base_source.starts_with("..\\")
+    {
+        let mut resolved = AbsolutePathBuf::resolve_path_against_base(base_source, cwd)
+            .to_string_lossy()
+            .into_owned();
+        if let Some(suffix) = suffix {
+            resolved.push_str(&suffix);
+        }
+        return resolved;
+    }
+
+    source
+}
+
+pub(super) async fn fetch_plugin_install(
+    request_handle: AppServerRequestHandle,
+    marketplace_path: AbsolutePathBuf,
+    plugin_name: String,
+) -> Result<PluginInstallResponse> {
+    let request_id = RequestId::String(format!("plugin-install-{}", Uuid::new_v4()));
+    request_handle
+        .request_typed(ClientRequest::PluginInstall {
+            request_id,
+            params: PluginInstallParams {
+                marketplace_path: Some(marketplace_path),
+                remote_marketplace_name: None,
+                plugin_name,
+            },
+        })
+        .await
+        .wrap_err("plugin/install failed in TUI")
+}
+
+pub(super) async fn fetch_plugin_uninstall(
+    request_handle: AppServerRequestHandle,
+    plugin_id: String,
+) -> Result<PluginUninstallResponse> {
+    let request_id = RequestId::String(format!("plugin-uninstall-{}", Uuid::new_v4()));
+    request_handle
+        .request_typed(ClientRequest::PluginUninstall {
+            request_id,
+            params: PluginUninstallParams { plugin_id },
+        })
+        .await
+        .wrap_err("plugin/uninstall failed in TUI")
+}
+
+pub(super) async fn write_plugin_enabled(
+    request_handle: AppServerRequestHandle,
+    plugin_id: String,
+    enabled: bool,
+) -> Result<ConfigWriteResponse> {
+    let request_id = RequestId::String(format!("plugin-enable-{}", Uuid::new_v4()));
+    request_handle
+        .request_typed(ClientRequest::ConfigValueWrite {
+            request_id,
+            params: ConfigValueWriteParams {
+                key_path: format!("plugins.{plugin_id}"),
+                value: serde_json::json!({ "enabled": enabled }),
+                merge_strategy: MergeStrategy::Upsert,
+                file_path: None,
+                expected_version: None,
+            },
+        })
+        .await
+        .wrap_err("config/value/write failed while updating plugin enablement in TUI")
+}
+
+pub(super) fn build_feedback_upload_params(
+    origin_thread_id: Option<ThreadId>,
+    rollout_path: Option<PathBuf>,
+    category: FeedbackCategory,
+    reason: Option<String>,
+    turn_id: Option<String>,
+    include_logs: bool,
+) -> FeedbackUploadParams {
+    let extra_log_files = if include_logs {
+        rollout_path.map(|rollout_path| vec![rollout_path])
+    } else {
+        None
+    };
+    let tags = turn_id.map(|turn_id| BTreeMap::from([(String::from("turn_id"), turn_id)]));
+    FeedbackUploadParams {
+        classification: crate::bottom_pane::feedback_classification(category).to_string(),
+        reason,
+        thread_id: origin_thread_id.map(|thread_id| thread_id.to_string()),
+        include_logs,
+        extra_log_files,
+        tags,
+    }
+}
+
+pub(super) async fn fetch_feedback_upload(
+    request_handle: AppServerRequestHandle,
+    params: FeedbackUploadParams,
+) -> Result<FeedbackUploadResponse> {
+    let request_id = RequestId::String(format!("feedback-upload-{}", Uuid::new_v4()));
+    request_handle
+        .request_typed(ClientRequest::FeedbackUpload { request_id, params })
+        .await
+        .wrap_err("feedback/upload failed in TUI")
+}
+
+/// Convert flat `McpServerStatus` responses into the per-server maps used by the
+/// in-process MCP subsystem (tools keyed as `mcp__{server}__{tool}`, plus
+/// per-server resource/template/auth maps). Test-only because the TUI
+/// renders directly from `McpServerStatus` rather than these maps.
+#[cfg(test)]
+pub(super) type McpInventoryMaps = (
+    HashMap<String, codex_protocol::mcp::Tool>,
+    HashMap<String, Vec<codex_protocol::mcp::Resource>>,
+    HashMap<String, Vec<codex_protocol::mcp::ResourceTemplate>>,
+    HashMap<String, McpAuthStatus>,
+);
+
+#[cfg(test)]
+pub(super) fn mcp_inventory_maps_from_statuses(statuses: Vec<McpServerStatus>) -> McpInventoryMaps {
+    let mut tools = HashMap::new();
+    let mut resources = HashMap::new();
+    let mut resource_templates = HashMap::new();
+    let mut auth_statuses = HashMap::new();
+
+    for status in statuses {
+        let server_name = status.name;
+        auth_statuses.insert(
+            server_name.clone(),
+            match status.auth_status {
+                codex_app_server_protocol::McpAuthStatus::Unsupported => McpAuthStatus::Unsupported,
+                codex_app_server_protocol::McpAuthStatus::NotLoggedIn => McpAuthStatus::NotLoggedIn,
+                codex_app_server_protocol::McpAuthStatus::BearerToken => McpAuthStatus::BearerToken,
+                codex_app_server_protocol::McpAuthStatus::OAuth => McpAuthStatus::OAuth,
+            },
+        );
+        resources.insert(server_name.clone(), status.resources);
+        resource_templates.insert(server_name.clone(), status.resource_templates);
+        for (tool_name, tool) in status.tools {
+            tools.insert(format!("mcp__{server_name}__{tool_name}"), tool);
+        }
+    }
+
+    (tools, resources, resource_templates, auth_statuses)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,9 +723,39 @@ mod tests {
     use assert_matches::assert_matches;
     use codex_app_server_protocol::PluginMarketplaceEntry;
     use codex_protocol::mcp::Tool;
-    use codex_protocol::protocol::McpAuthStatus;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use pretty_assertions::assert_eq;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    fn test_absolute_path(path: &str) -> AbsolutePathBuf {
+        AbsolutePathBuf::try_from(PathBuf::from(path)).expect("absolute test path")
+    }
+
+    #[test]
+    fn marketplace_add_source_for_request_resolves_relative_local_paths() {
+        let cwd = if cfg!(windows) {
+            PathBuf::from(r"C:\workspace\project")
+        } else {
+            PathBuf::from("/workspace/project")
+        };
+
+        let resolved = marketplace_add_source_for_request(&cwd, "./marketplace".to_string());
+        assert!(std::path::Path::new(&resolved).is_absolute());
+        assert_eq!(resolved, cwd.join("marketplace").display().to_string());
+        assert_eq!(
+            marketplace_add_source_for_request(&cwd, "./marketplace#main".to_string()),
+            format!("{}#main", cwd.join("marketplace").display())
+        );
+        assert_eq!(
+            marketplace_add_source_for_request(&cwd, "owner/repo".to_string()),
+            "owner/repo"
+        );
+        assert_eq!(
+            marketplace_add_source_for_request(&cwd, "~/marketplace".to_string()),
+            "~/marketplace"
+        );
+    }
 
     #[test]
     fn hide_cli_only_plugin_marketplaces_removes_openai_bundled() {
@@ -428,6 +790,7 @@ mod tests {
             }]
         );
     }
+
     #[test]
     fn mcp_inventory_maps_prefix_tool_names_by_server() {
         let statuses = vec![
@@ -485,13 +848,16 @@ mod tests {
                 /*animations_enabled*/ false,
             )));
 
-        app.handle_mcp_inventory_result(Ok(vec![McpServerStatus {
-            name: "docs".to_string(),
-            tools: HashMap::new(),
-            resources: Vec::new(),
-            resource_templates: Vec::new(),
-            auth_status: codex_app_server_protocol::McpAuthStatus::Unsupported,
-        }]));
+        app.handle_mcp_inventory_result(
+            Ok(vec![McpServerStatus {
+                name: "docs".to_string(),
+                tools: HashMap::new(),
+                resources: Vec::new(),
+                resource_templates: Vec::new(),
+                auth_status: codex_app_server_protocol::McpAuthStatus::Unsupported,
+            }]),
+            McpServerStatusDetail::ToolsAndAuthOnly,
+        );
 
         assert_eq!(app.transcript_cells.len(), 0);
     }
@@ -520,9 +886,10 @@ mod tests {
                 .map(String::as_str),
             Some("turn-123")
         );
-        assert!(params.include_logs);
+        assert_eq!(params.include_logs, true);
         assert_eq!(params.extra_log_files, Some(vec![rollout_path]));
     }
+
     #[test]
     fn build_feedback_upload_params_omits_rollout_path_without_logs() {
         let params = build_feedback_upload_params(
@@ -538,7 +905,7 @@ mod tests {
         assert_eq!(params.reason, None);
         assert_eq!(params.thread_id, None);
         assert_eq!(params.tags, None);
-        assert!(!params.include_logs);
+        assert_eq!(params.include_logs, false);
         assert_eq!(params.extra_log_files, None);
     }
     #[tokio::test]

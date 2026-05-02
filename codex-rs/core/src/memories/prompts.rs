@@ -1,6 +1,9 @@
+// Merge-safety anchor: these prompt builders own the preserved core-local
+// memory templates; do not silently switch /update_memories to another owner.
 use crate::memories::extensions::EXTENSION_RESOURCE_RETENTION_DAYS;
 use crate::memories::extensions::RemovedExtensionResource;
 use crate::memories::memory_extensions_root;
+#[cfg(test)]
 use crate::memories::memory_root;
 use crate::memories::phase_one;
 use crate::memories::storage::rollout_summary_file_stem_from_parts;
@@ -8,6 +11,7 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_state::Phase2InputSelection;
 use codex_state::Stage1Output;
 use codex_state::Stage1OutputRef;
+#[cfg(test)]
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
@@ -15,6 +19,7 @@ use codex_utils_template::Template;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::LazyLock;
+#[cfg(test)]
 use tokio::fs;
 use tracing::warn;
 
@@ -30,6 +35,7 @@ static STAGE_ONE_INPUT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
         "memories/stage_one_input.md",
     )
 });
+#[cfg(test)]
 static MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     parse_embedded_template(
         include_str!("../../templates/memories/read_path.md"),
@@ -259,9 +265,9 @@ pub(super) fn build_stage_one_input_message(
     ])?)
 }
 
-/// Build prompt used for read path. This prompt must be added to the developer instructions. In
-/// case of large memory files, the `memory_summary.md` is truncated at
-/// [phase_one::MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_SUMMARY_TOKEN_LIMIT].
+/// Build prompt used for read-path tests. Production read-path prompt injection
+/// is owned by `codex_memories_read`.
+#[cfg(test)]
 pub(crate) async fn build_memory_tool_developer_instructions(
     codex_home: &AbsolutePathBuf,
 ) -> Option<String> {
@@ -272,10 +278,7 @@ pub(crate) async fn build_memory_tool_developer_instructions(
         .ok()?
         .trim()
         .to_string();
-    let memory_summary = truncate_text(
-        &memory_summary,
-        TruncationPolicy::Tokens(phase_one::MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_SUMMARY_TOKEN_LIMIT),
-    );
+    let memory_summary = truncate_text(&memory_summary, TruncationPolicy::Tokens(5_000));
     if memory_summary.is_empty() {
         return None;
     }

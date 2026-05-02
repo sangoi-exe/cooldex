@@ -47,6 +47,10 @@ mod tests {
         fn forced_chatgpt_workspace_id(&self) -> Option<String> {
             Some("missing-workspace".to_string())
         }
+
+        fn chatgpt_base_url(&self) -> String {
+            "https://chatgpt.com/backend-api".to_string()
+        }
     }
 
     #[tokio::test]

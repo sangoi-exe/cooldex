@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::apply_patch;
 use crate::apply_patch::InternalApplyPatchInvocation;
@@ -16,12 +18,16 @@ use crate::tools::context::ApplyPatchToolOutput;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
+use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::hook_names::HookToolName;
 use crate::tools::orchestrator::ToolOrchestrator;
+use crate::tools::registry::PostToolUsePayload;
+use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
@@ -48,6 +54,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 
 // Merge-safety anchor: apply_patch verification/approval must stay aligned with the
 // runtime split between remote executor-fs mutation and local host-local self-invocation.
+const APPLY_PATCH_ARGUMENT_DIFF_BUFFER_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct ApplyPatchHandler;
 
@@ -55,6 +62,8 @@ pub struct ApplyPatchHandler;
 struct ApplyPatchArgumentDiffConsumer {
     input: String,
     last_progress: Option<Vec<Hunk>>,
+    last_sent_at: Option<Instant>,
+    pending: Option<PatchApplyUpdatedEvent>,
 }
 
 impl ToolArgumentDiffConsumer for ApplyPatchArgumentDiffConsumer {
@@ -69,6 +78,11 @@ impl ToolArgumentDiffConsumer for ApplyPatchArgumentDiffConsumer {
         }
 
         self.push_delta(call_id, diff)
+            .map(EventMsg::PatchApplyUpdated)
+    }
+
+    fn flush_on_complete(&mut self) -> Option<EventMsg> {
+        self.flush_update_on_complete()
             .map(EventMsg::PatchApplyUpdated)
     }
 }
@@ -87,7 +101,29 @@ impl ApplyPatchArgumentDiffConsumer {
 
         let changes = convert_apply_patch_hunks_to_protocol(&hunks);
         self.last_progress = Some(hunks);
-        Some(PatchApplyUpdatedEvent { call_id, changes })
+        let event = PatchApplyUpdatedEvent { call_id, changes };
+        let now = Instant::now();
+        match self.last_sent_at {
+            Some(last_sent_at)
+                if now.duration_since(last_sent_at) < APPLY_PATCH_ARGUMENT_DIFF_BUFFER_INTERVAL =>
+            {
+                self.pending = Some(event);
+                None
+            }
+            Some(_) | None => {
+                self.pending = None;
+                self.last_sent_at = Some(now);
+                Some(event)
+            }
+        }
+    }
+
+    fn flush_update_on_complete(&mut self) -> Option<PatchApplyUpdatedEvent> {
+        let event = self.pending.take();
+        if event.is_some() {
+            self.last_sent_at = Some(Instant::now());
+        }
+        event
     }
 }
 
@@ -211,6 +247,21 @@ fn write_permissions_for_paths(
     normalize_additional_permissions(permissions).ok()
 }
 
+/// Extracts the raw patch text used as the command-shaped hook input for apply_patch.
+///
+/// The apply_patch tool can arrive as the older JSON/function shape or as a
+/// freeform custom tool call. Both represent the same file edit operation, so
+/// hooks see the raw patch body in `tool_input.command` either way.
+fn apply_patch_payload_command(payload: &ToolPayload) -> Option<String> {
+    match payload {
+        ToolPayload::Function { arguments } => parse_arguments::<ApplyPatchToolArgs>(arguments)
+            .ok()
+            .map(|args| args.input),
+        ToolPayload::Custom { input } => Some(input.clone()),
+        _ => None,
+    }
+}
+
 async fn effective_patch_permissions(
     session: &Session,
     turn: &TurnContext,
@@ -225,9 +276,9 @@ async fn effective_patch_permissions(
         session.granted_session_permissions().await.as_ref(),
         session.granted_turn_permissions().await.as_ref(),
     );
-    let turn_file_system_sandbox_policy = turn.file_system_sandbox_policy();
+    let base_file_system_sandbox_policy = turn.file_system_sandbox_policy();
     let file_system_sandbox_policy = effective_file_system_sandbox_policy(
-        &turn_file_system_sandbox_policy,
+        &base_file_system_sandbox_policy,
         granted_permissions.as_ref(),
     );
     let effective_additional_permissions = apply_granted_turn_permissions(
@@ -265,6 +316,30 @@ impl ToolHandler for ApplyPatchHandler {
 
     fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
         Some(Box::<ApplyPatchArgumentDiffConsumer>::default())
+    }
+
+    fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
+        apply_patch_payload_command(&invocation.payload).map(|command| PreToolUsePayload {
+            tool_name: HookToolName::apply_patch(),
+            tool_input: serde_json::json!({ "command": command }),
+        })
+    }
+
+    fn post_tool_use_payload(
+        &self,
+        invocation: &ToolInvocation,
+        result: &Self::Output,
+    ) -> Option<PostToolUsePayload> {
+        let tool_response =
+            result.post_tool_use_response(&invocation.call_id, &invocation.payload)?;
+        Some(PostToolUsePayload {
+            tool_name: HookToolName::apply_patch(),
+            tool_use_id: invocation.call_id.clone(),
+            tool_input: serde_json::json!({
+                "command": apply_patch_payload_command(&invocation.payload)?,
+            }),
+            tool_response,
+        })
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {

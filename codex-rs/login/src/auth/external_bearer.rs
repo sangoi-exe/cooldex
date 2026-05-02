@@ -1,3 +1,5 @@
+// Merge-safety anchor: external bearer auth must remain a request-auth input, not a second active account owner; keep refresh plumbing aligned with AccountManager/AuthManager ownership.
+
 use super::manager::ExternalAuth;
 use super::manager::ExternalAuthRefreshContext;
 use super::manager::ExternalAuthTokens;
@@ -33,6 +35,10 @@ impl ExternalAuth for BearerTokenRefresher {
         AuthMode::ApiKey
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "external bearer cache misses intentionally hold cached_token across the provider command to avoid duplicate refreshes"
+    )]
     async fn resolve(&self) -> io::Result<Option<ExternalAuthTokens>> {
         let access_token = {
             let mut cached = self.state.cached_token.lock().await;

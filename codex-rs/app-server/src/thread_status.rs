@@ -446,6 +446,22 @@ fn loaded_thread_status(runtime: &RuntimeFacts) -> ThreadStatus {
     ThreadStatus::Idle
 }
 
+pub(crate) fn resolve_thread_status(
+    status: ThreadStatus,
+    has_in_progress_turn: bool,
+) -> ThreadStatus {
+    // Running-turn events can arrive before the watch runtime state is observed by
+    // the listener loop. In that window we prefer to reflect a real active turn as
+    // `Active` instead of `Idle`/`NotLoaded`.
+    if has_in_progress_turn && matches!(status, ThreadStatus::Idle | ThreadStatus::NotLoaded) {
+        return ThreadStatus::Active {
+            active_flags: Vec::new(),
+        };
+    }
+
+    status
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,6 +699,7 @@ mod tests {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
         let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
             outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
         )));
 
         manager
@@ -725,6 +742,7 @@ mod tests {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
         let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
             outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
         )));
 
         manager
@@ -795,6 +813,7 @@ mod tests {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
         let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
             outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
         )));
         manager
             .upsert_thread(test_thread(

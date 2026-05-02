@@ -1,5 +1,12 @@
 use super::*;
 use codex_utils_approval_presets::guardian_approval_preset;
+
+use codex_protocol::models::ManagedFileSystemPermissions;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::protocol::NetworkSandboxPolicy;
 use pretty_assertions::assert_eq;
 
 // Merge-safety anchor: `/permissions` row-label assertions must follow the
@@ -58,32 +65,70 @@ async fn preset_matching_accepts_workspace_write_with_extra_roots() {
         .into_iter()
         .find(|p| p.id == "auto")
         .expect("auto preset exists");
-    let extra_root = test_path_buf("/tmp/extra").abs();
-    let current_sandbox = SandboxPolicy::WorkspaceWrite {
-        writable_roots: vec![extra_root],
-        read_only_access: Default::default(),
-        network_access: false,
-        exclude_tmpdir_env_var: false,
-        exclude_slash_tmp: false,
-    };
+    let current_profile = PermissionProfile::workspace_write_with(
+        &[test_path_buf("/tmp/extra").abs()],
+        NetworkSandboxPolicy::Restricted,
+        /*exclude_tmpdir_env_var*/ false,
+        /*exclude_slash_tmp*/ false,
+    );
+    let cwd = test_path_buf("/tmp/project").abs();
 
     assert!(
         ChatWidget::preset_matches_current(
             AskForApproval::OnRequest,
-            ApprovalsReviewer::User,
-            &current_sandbox,
-            &preset,
+            &current_profile,
+            cwd.as_path(),
+            &preset
         ),
         "WorkspaceWrite with extra roots should still match the Default preset"
     );
     assert!(
         !ChatWidget::preset_matches_current(
             AskForApproval::Never,
-            ApprovalsReviewer::User,
-            &current_sandbox,
-            &preset,
+            &current_profile,
+            cwd.as_path(),
+            &preset
         ),
         "approval mismatch should prevent matching the preset"
+    );
+}
+
+#[tokio::test]
+async fn preset_matching_does_not_treat_non_cwd_writable_profile_as_read_only() {
+    let preset = builtin_approval_presets()
+        .into_iter()
+        .find(|p| p.id == "read-only")
+        .expect("read-only preset exists");
+    let current_profile = PermissionProfile::Managed {
+        file_system: ManagedFileSystemPermissions::Restricted {
+            entries: vec![
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Root,
+                    },
+                    access: FileSystemAccessMode::Read,
+                },
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::Path {
+                        path: test_path_buf("/tmp/writable").abs(),
+                    },
+                    access: FileSystemAccessMode::Write,
+                },
+            ],
+            glob_scan_max_depth: None,
+        },
+        network: NetworkSandboxPolicy::Restricted,
+    };
+    let cwd = test_path_buf("/tmp/project").abs();
+
+    assert!(
+        !ChatWidget::preset_matches_current(
+            AskForApproval::OnRequest,
+            &current_profile,
+            cwd.as_path(),
+            &preset
+        ),
+        "profiles with any writable root should not be classified as Read Only"
     );
 }
 
@@ -206,6 +251,7 @@ async fn approvals_popup_shows_disabled_presets() {
 #[tokio::test]
 async fn approvals_popup_navigation_skips_disabled() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::GuardianApproval, /*enabled*/ false);
 
     chat.config.permissions.approval_policy =
         Constrained::new(AskForApproval::OnRequest, |candidate| match candidate {
@@ -215,25 +261,49 @@ async fn approvals_popup_navigation_skips_disabled() {
         .expect("construct constrained approval policy");
     chat.open_approvals_popup();
 
-    // The approvals popup is the active bottom-pane view; drive navigation via chat handle_key_event.
-    // Start selected at idx 0 (enabled), move down twice; the disabled option should be skipped
-    // and selection should wrap back to idx 0 (also enabled).
-    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
-    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    let mut disabled_shortcut = None;
+    let mut row_number = 0;
+    for line in popup.lines() {
+        let row = line
+            .trim_start()
+            .strip_prefix('\u{203a}')
+            .unwrap_or_else(|| line.trim_start())
+            .trim_start();
+        let mut chars = row.chars();
+        let has_numeric_shortcut =
+            chars.next().is_some_and(|ch| ch.is_ascii_digit()) && chars.next() == Some('.');
+        if has_numeric_shortcut || row.contains("(disabled)") {
+            row_number += 1;
+            if row.contains("(disabled)") {
+                disabled_shortcut = char::from_digit(row_number, 10);
+                break;
+            }
+        }
+    }
+    let disabled_shortcut = disabled_shortcut
+        .unwrap_or_else(|| panic!("expected at least one disabled selection row: {popup}"));
 
-    // Press numeric shortcut for the disabled row (3 => idx 2); should not close or accept.
-    chat.handle_key_event(KeyEvent::from(KeyCode::Char('3')));
+    for _ in 0..10 {
+        chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+        let popup = render_bottom_popup(&chat, /*width*/ 80);
+        let selected_disabled = popup
+            .lines()
+            .find(|line| line.trim_start().starts_with('\u{203a}'))
+            .expect("expected a selected selection row")
+            .contains("(disabled)");
+        assert!(
+            !selected_disabled,
+            "navigation should skip disabled rows: {popup}"
+        );
+    }
+
+    // Press the hidden numeric shortcut for a disabled row; it should not close
+    // the popup or accept the preset.
+    chat.handle_key_event(KeyEvent::from(KeyCode::Char(disabled_shortcut)));
 
     // Ensure the popup remains open and no selection actions were sent.
-    let width = 80;
-    let height = chat.desired_height(width);
-    let mut terminal =
-        ratatui::Terminal::new(VT100Backend::new(width, height)).expect("create terminal");
-    terminal.set_viewport_area(Rect::new(0, 0, width, height));
-    terminal
-        .draw(|f| chat.render(f.area(), f.buffer_mut()))
-        .expect("render approvals popup after disabled selection");
-    let screen = terminal.backend().vt100().screen().contents();
+    let screen = render_bottom_popup(&chat, /*width*/ 80);
     assert!(
         screen.contains("Update Model Permissions"),
         "popup should remain open after selecting a disabled entry"
@@ -253,7 +323,7 @@ async fn approvals_popup_navigation_skips_disabled() {
     assert!(
         app_events.iter().any(|ev| matches!(
             ev,
-            AppEvent::CodexOp(Op::OverrideTurnContext {
+            AppEvent::CodexOp(AppCommand::OverrideTurnContext {
                 approval_policy: Some(AskForApproval::OnRequest),
                 personality: None,
                 ..
@@ -264,7 +334,7 @@ async fn approvals_popup_navigation_skips_disabled() {
     assert!(
         !app_events.iter().any(|ev| matches!(
             ev,
-            AppEvent::CodexOp(Op::OverrideTurnContext {
+            AppEvent::CodexOp(AppCommand::OverrideTurnContext {
                 approval_policy: Some(AskForApproval::Never),
                 personality: None,
                 ..
@@ -342,8 +412,8 @@ async fn permissions_selection_history_snapshot_full_access_to_default() {
         .expect("set approval policy");
     chat.config
         .permissions
-        .set_legacy_sandbox_policy(SandboxPolicy::DangerFullAccess, chat.config.cwd.as_path())
-        .expect("set sandbox policy");
+        .set_permission_profile(PermissionProfile::Disabled)
+        .expect("set permission profile");
 
     chat.open_permissions_popup();
     let popup = render_bottom_popup(&chat, /*width*/ 120);
@@ -384,11 +454,8 @@ async fn permissions_selection_emits_history_cell_when_current_is_selected() {
         .expect("set approval policy");
     chat.config
         .permissions
-        .set_legacy_sandbox_policy(
-            SandboxPolicy::new_workspace_write_policy(),
-            chat.config.cwd.as_path(),
-        )
-        .expect("set sandbox policy");
+        .set_permission_profile(PermissionProfile::workspace_write())
+        .expect("set permission profile");
 
     chat.open_permissions_popup();
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
@@ -407,7 +474,7 @@ async fn permissions_selection_emits_history_cell_when_current_is_selected() {
 }
 
 #[tokio::test]
-async fn permissions_selection_hides_guardian_approvals_when_feature_disabled() {
+async fn permissions_selection_hides_auto_review_when_feature_disabled() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     #[cfg(target_os = "windows")]
     {
@@ -445,11 +512,8 @@ async fn permissions_selection_shows_guardian_approvals_when_feature_disabled_if
         .expect("set approval policy");
     chat.config
         .permissions
-        .set_legacy_sandbox_policy(
-            SandboxPolicy::new_workspace_write_policy(),
-            chat.config.cwd.as_path(),
-        )
-        .expect("set sandbox policy");
+        .set_permission_profile(PermissionProfile::workspace_write())
+        .expect("set permission profile");
 
     chat.open_permissions_popup();
     let popup = render_bottom_popup(&chat, /*width*/ 120);
@@ -462,7 +526,7 @@ async fn permissions_selection_shows_guardian_approvals_when_feature_disabled_if
 }
 
 #[tokio::test]
-async fn permissions_selection_marks_guardian_approvals_current_after_session_configured() {
+async fn permissions_selection_marks_auto_review_current_after_session_configured() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     #[cfg(target_os = "windows")]
     {
@@ -486,7 +550,7 @@ async fn permissions_selection_marks_guardian_approvals_current_after_session_co
             service_tier: None,
             approval_policy: AskForApproval::OnRequest,
             approvals_reviewer: ApprovalsReviewer::AutoReview,
-            permission_profile: codex_protocol::models::PermissionProfile::default(),
+            permission_profile: PermissionProfile::workspace_write(),
             sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
             cwd: test_project_path().abs(),
             reasoning_effort: None,
@@ -509,8 +573,7 @@ async fn permissions_selection_marks_guardian_approvals_current_after_session_co
 }
 
 #[tokio::test]
-async fn permissions_selection_marks_guardian_approvals_current_with_custom_workspace_write_details()
- {
+async fn permissions_selection_marks_auto_review_current_with_custom_workspace_write_details() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     #[cfg(target_os = "windows")]
     {
@@ -524,6 +587,13 @@ async fn permissions_selection_marks_guardian_approvals_current_with_custom_work
         .set_enabled(Feature::GuardianApproval, /*enabled*/ true);
 
     let extra_root = test_path_buf("/tmp/guardian-approvals-extra").abs();
+    let cwd = test_project_path().abs();
+    let permission_profile = PermissionProfile::workspace_write_with(
+        &[extra_root],
+        NetworkSandboxPolicy::Restricted,
+        /*exclude_tmpdir_env_var*/ false,
+        /*exclude_slash_tmp*/ false,
+    );
 
     chat.handle_codex_event(Event {
         id: "session-configured-custom-workspace".to_string(),
@@ -536,15 +606,11 @@ async fn permissions_selection_marks_guardian_approvals_current_with_custom_work
             service_tier: None,
             approval_policy: AskForApproval::OnRequest,
             approvals_reviewer: ApprovalsReviewer::AutoReview,
-            permission_profile: codex_protocol::models::PermissionProfile::default(),
-            sandbox_policy: SandboxPolicy::WorkspaceWrite {
-                writable_roots: vec![extra_root],
-                read_only_access: ReadOnlyAccess::FullAccess,
-                network_access: false,
-                exclude_tmpdir_env_var: false,
-                exclude_slash_tmp: false,
-            },
-            cwd: test_project_path().abs(),
+            permission_profile: permission_profile.clone(),
+            sandbox_policy: permission_profile
+                .to_legacy_sandbox_policy(cwd.as_path())
+                .expect("permission profile should project to legacy sandbox policy"),
+            cwd,
             reasoning_effort: None,
             history_log_id: 0,
             history_entry_count: 0,
@@ -565,7 +631,7 @@ async fn permissions_selection_marks_guardian_approvals_current_with_custom_work
 }
 
 #[tokio::test]
-async fn permissions_selection_can_disable_guardian_approvals() {
+async fn permissions_selection_can_disable_auto_review() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     #[cfg(target_os = "windows")]
     {
@@ -581,11 +647,8 @@ async fn permissions_selection_can_disable_guardian_approvals() {
         .expect("set approval policy");
     chat.config
         .permissions
-        .set_legacy_sandbox_policy(
-            SandboxPolicy::new_workspace_write_policy(),
-            chat.config.cwd.as_path(),
-        )
-        .expect("set sandbox policy");
+        .set_permission_profile(PermissionProfile::workspace_write())
+        .expect("set permission profile");
 
     chat.open_permissions_popup();
     chat.handle_key_event(KeyEvent::from(KeyCode::Up));
@@ -624,11 +687,8 @@ async fn permissions_selection_sends_approvals_reviewer_in_override_turn_context
         .expect("set approval policy");
     chat.config
         .permissions
-        .set_legacy_sandbox_policy(
-            SandboxPolicy::new_workspace_write_policy(),
-            chat.config.cwd.as_path(),
-        )
-        .expect("set sandbox policy");
+        .set_permission_profile(PermissionProfile::workspace_write())
+        .expect("set permission profile");
     chat.set_approvals_reviewer(ApprovalsReviewer::User);
 
     chat.open_permissions_popup();
@@ -652,7 +712,7 @@ async fn permissions_selection_sends_approvals_reviewer_in_override_turn_context
 
     let op = std::iter::from_fn(|| rx.try_recv().ok())
         .find_map(|event| match event {
-            AppEvent::CodexOp(op @ Op::OverrideTurnContext { .. }) => Some(op),
+            AppEvent::CodexOp(op @ AppCommand::OverrideTurnContext { .. }) => Some(op),
             _ => None,
         })
         .expect("expected OverrideTurnContext op");
@@ -663,7 +723,8 @@ async fn permissions_selection_sends_approvals_reviewer_in_override_turn_context
             cwd: None,
             approval_policy: Some(AskForApproval::OnRequest),
             approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
-            sandbox_policy: Some(SandboxPolicy::new_workspace_write_policy()),
+            sandbox_policy: None,
+            permission_profile: Some(PermissionProfile::workspace_write()),
             windows_sandbox_level: None,
             model: None,
             effort: None,

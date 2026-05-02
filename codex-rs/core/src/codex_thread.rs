@@ -1,13 +1,18 @@
 use crate::agent::AgentStatus;
 use crate::config::ConstraintResult;
 use crate::file_watcher::WatchRegistration;
+use crate::goals::GoalRuntimeEvent;
 use crate::session::Codex;
+use crate::session::SessionSettingsUpdate;
 use crate::session::SteerInputError;
 use codex_features::Feature;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::SubagentFileMutationMode;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::mcp::CallToolResult;
@@ -32,6 +37,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use rmcp::model::ReadResourceRequestParams;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
@@ -46,7 +52,6 @@ pub struct ThreadConfigSnapshot {
     pub subagent_file_mutation_mode: SubagentFileMutationMode,
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
-    pub sandbox_policy: SandboxPolicy,
     pub permission_profile: PermissionProfile,
     pub cwd: AbsolutePathBuf,
     pub config_path: PathBuf,
@@ -56,8 +61,38 @@ pub struct ThreadConfigSnapshot {
     pub session_source: SessionSource,
 }
 
+impl ThreadConfigSnapshot {
+    pub fn sandbox_policy(&self) -> SandboxPolicy {
+        let file_system_sandbox_policy = self.permission_profile.file_system_sandbox_policy();
+        codex_sandboxing::compatibility_sandbox_policy_for_permission_profile(
+            &self.permission_profile,
+            &file_system_sandbox_policy,
+            self.permission_profile.network_sandbox_policy(),
+            self.cwd.as_path(),
+        )
+    }
+}
+
+/// Turn context overrides that app-server validates before starting a turn.
+#[derive(Clone, Default)]
+pub struct CodexThreadTurnContextOverrides {
+    pub cwd: Option<PathBuf>,
+    pub approval_policy: Option<AskForApproval>,
+    pub approvals_reviewer: Option<ApprovalsReviewer>,
+    pub sandbox_policy: Option<SandboxPolicy>,
+    pub permission_profile: Option<PermissionProfile>,
+    pub windows_sandbox_level: Option<WindowsSandboxLevel>,
+    pub model: Option<String>,
+    pub effort: Option<Option<ReasoningEffort>>,
+    pub summary: Option<ReasoningSummary>,
+    pub service_tier: Option<Option<ServiceTier>>,
+    pub collaboration_mode: Option<CollaborationMode>,
+    pub personality: Option<Personality>,
+}
+
 pub struct CodexThread {
     pub(crate) codex: Codex,
+    pub(crate) session_source: SessionSource,
     rollout_path: Option<PathBuf>,
     out_of_band_elicitation_count: Mutex<u64>,
     _watch_registration: WatchRegistration,
@@ -69,10 +104,12 @@ impl CodexThread {
     pub(crate) fn new(
         codex: Codex,
         rollout_path: Option<PathBuf>,
+        session_source: SessionSource,
         watch_registration: WatchRegistration,
     ) -> Self {
         Self {
             codex,
+            session_source,
             rollout_path,
             out_of_band_elicitation_count: Mutex::new(0),
             _watch_registration: watch_registration,
@@ -85,6 +122,58 @@ impl CodexThread {
 
     pub async fn shutdown_and_wait(&self) -> CodexResult<()> {
         self.codex.shutdown_and_wait().await
+    }
+
+    /// Wait until the underlying session loop has terminated.
+    pub async fn wait_until_terminated(&self) {
+        self.codex.session_loop_termination.clone().await;
+    }
+
+    pub async fn apply_goal_resume_runtime_effects(&self) -> anyhow::Result<()> {
+        self.codex
+            .session
+            .goal_runtime_apply(GoalRuntimeEvent::ThreadResumed)
+            .await
+    }
+
+    pub async fn continue_active_goal_if_idle(&self) -> anyhow::Result<()> {
+        self.codex
+            .session
+            .goal_runtime_apply(GoalRuntimeEvent::MaybeContinueIfIdle)
+            .await
+    }
+
+    pub async fn prepare_external_goal_mutation(&self) {
+        if let Err(err) = self
+            .codex
+            .session
+            .goal_runtime_apply(GoalRuntimeEvent::ExternalMutationStarting)
+            .await
+        {
+            tracing::warn!("failed to prepare external goal mutation: {err}");
+        }
+    }
+
+    pub async fn apply_external_goal_set(&self, status: codex_state::ThreadGoalStatus) {
+        if let Err(err) = self
+            .codex
+            .session
+            .goal_runtime_apply(GoalRuntimeEvent::ExternalSet { status })
+            .await
+        {
+            tracing::warn!("failed to apply external goal status runtime effects: {err}");
+        }
+    }
+
+    pub async fn apply_external_goal_clear(&self) {
+        if let Err(err) = self
+            .codex
+            .session
+            .goal_runtime_apply(GoalRuntimeEvent::ExternalClear)
+            .await
+        {
+            tracing::warn!("failed to apply external goal clear runtime effects: {err}");
+        }
     }
 
     #[doc(hidden)]
@@ -129,6 +218,51 @@ impl CodexThread {
         self.codex
             .set_app_server_client_info(app_server_client_name, app_server_client_version)
             .await
+    }
+
+    /// Validate persistent turn context overrides without committing them.
+    pub async fn validate_turn_context_overrides(
+        &self,
+        overrides: CodexThreadTurnContextOverrides,
+    ) -> ConstraintResult<()> {
+        let CodexThreadTurnContextOverrides {
+            cwd,
+            approval_policy,
+            approvals_reviewer,
+            sandbox_policy,
+            permission_profile,
+            windows_sandbox_level,
+            model,
+            effort,
+            summary,
+            service_tier,
+            collaboration_mode,
+            personality,
+        } = overrides;
+        let collaboration_mode = if let Some(collaboration_mode) = collaboration_mode {
+            collaboration_mode
+        } else {
+            self.codex
+                .session
+                .collaboration_mode()
+                .await
+                .with_updates(model, effort, /*developer_instructions*/ None)
+        };
+
+        let updates = SessionSettingsUpdate {
+            cwd,
+            approval_policy,
+            approvals_reviewer,
+            sandbox_policy,
+            permission_profile,
+            windows_sandbox_level,
+            collaboration_mode: Some(collaboration_mode),
+            reasoning_summary: summary,
+            service_tier,
+            personality,
+            ..Default::default()
+        };
+        self.codex.session.validate_settings(&updates).await
     }
 
     /// Use sparingly: this is intended to be removed soon.
@@ -276,12 +410,24 @@ impl CodexThread {
         self.rollout_path.clone()
     }
 
+    pub async fn guardian_trunk_rollout_path(&self) -> Option<PathBuf> {
+        self.codex
+            .session
+            .guardian_review_session
+            .trunk_rollout_path()
+            .await
+    }
+
     pub fn state_db(&self) -> Option<StateDbHandle> {
         self.codex.state_db()
     }
 
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {
         self.codex.thread_config_snapshot().await
+    }
+
+    pub async fn config(&self) -> Arc<crate::config::Config> {
+        self.codex.session.get_config().await
     }
 
     pub async fn read_mcp_resource(
@@ -359,9 +505,15 @@ impl CodexThread {
 
 fn pending_message_input_item(message: &ResponseItem) -> CodexResult<ResponseInputItem> {
     match message {
-        ResponseItem::Message { role, content, .. } => Ok(ResponseInputItem::Message {
+        ResponseItem::Message {
+            role,
+            content,
+            phase,
+            ..
+        } => Ok(ResponseInputItem::Message {
             role: role.clone(),
             content: content.clone(),
+            phase: phase.clone(),
         }),
         _ => Err(CodexErr::InvalidRequest(
             "append_message only supports ResponseItem::Message".to_string(),

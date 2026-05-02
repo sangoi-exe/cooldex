@@ -1,3 +1,5 @@
+// Merge-safety anchor: realtime context assembly contributes model-visible history; keep token-bounded context and local prompt-top restoration invariants intact.
+
 use crate::compact::content_items_to_text;
 use crate::event_mapping::is_contextual_user_message_content;
 use crate::session::session::Session;
@@ -9,7 +11,6 @@ use codex_thread_store::ListThreadsParams;
 use codex_thread_store::SortDirection;
 use codex_thread_store::StoredThread;
 use codex_thread_store::ThreadSortKey;
-use codex_thread_store::ThreadStore;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
@@ -136,8 +137,10 @@ async fn load_recent_threads(sess: &Session) -> Vec<StoredThread> {
             sort_direction: SortDirection::Desc,
             allowed_sources: Vec::new(),
             model_providers: None,
+            cwd_filters: None,
             archived: false,
             search_term: None,
+            use_state_db_only: false,
         })
         .await
     {

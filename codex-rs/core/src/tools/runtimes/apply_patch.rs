@@ -12,9 +12,11 @@ use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::review_approval_request;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::execute_env;
+use crate::tools::hook_names::HookToolName;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::ExecApprovalRequirement;
+use crate::tools::sandboxing::PermissionRequestPayload;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::Sandboxable;
 use crate::tools::sandboxing::ToolCtx;
@@ -28,13 +30,13 @@ use codex_exec_server::FileSystemSandboxContext;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
-use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::ReviewDecision;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
+use codex_sandboxing::policy_transforms::effective_permission_profile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
@@ -130,33 +132,15 @@ impl ApplyPatchRuntime {
             return Ok(None);
         }
 
-        let (base_file_system_sandbox_policy, _base_network_policy) =
-            attempt.permissions.to_runtime_permissions();
-        let sandbox_policy = attempt
-            .permissions
-            .to_legacy_sandbox_policy(attempt.sandbox_cwd.as_path())
-            .map_err(|error| {
-                ToolError::Rejected(format!(
-                    "failed to project apply_patch sandbox policy for remote filesystem: {error}"
-                ))
-            })?;
-        let legacy_file_system_sandbox_policy =
-            FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
-                &sandbox_policy,
-                attempt.sandbox_cwd.as_path(),
-            );
-        let file_system_sandbox_policy = (base_file_system_sandbox_policy
-            != legacy_file_system_sandbox_policy)
-            .then_some(base_file_system_sandbox_policy);
-
+        let permissions =
+            effective_permission_profile(attempt.permissions, req.additional_permissions.as_ref());
         Ok(Some(FileSystemSandboxContext {
-            sandbox_policy,
-            sandbox_policy_cwd: Some(attempt.sandbox_cwd.clone()),
-            file_system_sandbox_policy,
+            permissions,
+            cwd: Some(attempt.sandbox_cwd.clone()),
             windows_sandbox_level: attempt.windows_sandbox_level,
             windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
             use_legacy_landlock: attempt.use_legacy_landlock,
-            additional_permissions: req.additional_permissions.clone(),
+            additional_permissions: None,
         }))
     }
 
@@ -220,13 +204,13 @@ impl Approvable<ApplyPatchRequest> for ApplyPatchRuntime {
         let changes = req.changes.clone();
         let guardian_review_id = ctx.guardian_review_id.clone();
         Box::pin(async move {
-            if req.permissions_preapproved && retry_reason.is_none() {
-                return ReviewDecision::Approved;
-            }
             if let Some(review_id) = guardian_review_id {
                 let action = ApplyPatchRuntime::build_guardian_review_request(req, ctx.call_id);
                 return review_approval_request(session, turn, review_id, action, retry_reason)
                     .await;
+            }
+            if req.permissions_preapproved && retry_reason.is_none() {
+                return ReviewDecision::Approved;
             }
             if let Some(reason) = retry_reason {
                 let rx_approve = session
@@ -277,6 +261,16 @@ impl Approvable<ApplyPatchRequest> for ApplyPatchRuntime {
         req: &ApplyPatchRequest,
     ) -> Option<ExecApprovalRequirement> {
         Some(req.exec_approval_requirement.clone())
+    }
+
+    fn permission_request_payload(
+        &self,
+        req: &ApplyPatchRequest,
+    ) -> Option<PermissionRequestPayload> {
+        Some(PermissionRequestPayload {
+            tool_name: HookToolName::apply_patch(),
+            tool_input: serde_json::json!({ "command": req.action.patch }),
+        })
     }
 }
 

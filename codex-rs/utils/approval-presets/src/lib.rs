@@ -1,8 +1,8 @@
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::SandboxPolicy;
 
-/// A UI-agnostic preset pairing approval, reviewer, and sandbox state.
+/// A UI-agnostic preset pairing approval, reviewer, and permission profile state.
 #[derive(Debug, Clone)]
 pub struct ApprovalPreset {
     /// Stable identifier for the preset.
@@ -15,11 +15,11 @@ pub struct ApprovalPreset {
     pub approval: AskForApproval,
     /// Approval reviewer to apply.
     pub approvals_reviewer: ApprovalsReviewer,
-    /// Sandbox policy to apply.
-    pub sandbox: SandboxPolicy,
+    /// Permission profile to apply.
+    pub permission_profile: PermissionProfile,
 }
 
-/// Built-in list of approval presets that pair approval, reviewer, and sandbox policy.
+/// Built-in list of approval presets that pair approval, reviewer, and permissions.
 ///
 /// Keep this UI-agnostic so it can be reused by both TUI and MCP server.
 pub fn builtin_approval_presets() -> Vec<ApprovalPreset> {
@@ -30,7 +30,7 @@ pub fn builtin_approval_presets() -> Vec<ApprovalPreset> {
             description: "Codex can read files in the current workspace. Approval is required to edit files or access the internet.",
             approval: AskForApproval::OnRequest,
             approvals_reviewer: ApprovalsReviewer::User,
-            sandbox: SandboxPolicy::new_read_only_policy(),
+            permission_profile: PermissionProfile::read_only(),
         },
         ApprovalPreset {
             id: "auto",
@@ -38,7 +38,7 @@ pub fn builtin_approval_presets() -> Vec<ApprovalPreset> {
             description: "Codex can read and edit files in the current workspace, and run commands. Approval is required to access the internet or edit other files. (Identical to Agent mode)",
             approval: AskForApproval::OnRequest,
             approvals_reviewer: ApprovalsReviewer::User,
-            sandbox: SandboxPolicy::new_workspace_write_policy(),
+            permission_profile: PermissionProfile::workspace_write(),
         },
         guardian_approval_preset(),
         ApprovalPreset {
@@ -47,7 +47,7 @@ pub fn builtin_approval_presets() -> Vec<ApprovalPreset> {
             description: "Codex can edit files outside this workspace and access the internet without asking for approval. Exercise caution when using.",
             approval: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::User,
-            sandbox: SandboxPolicy::DangerFullAccess,
+            permission_profile: PermissionProfile::Disabled,
         },
     ]
 }
@@ -61,6 +61,6 @@ pub fn guardian_approval_preset() -> ApprovalPreset {
         description: "Same workspace-write permissions as Default, but eligible `on-request` approvals are routed through the guardian reviewer subagent.",
         approval: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::AutoReview,
-        sandbox: SandboxPolicy::new_workspace_write_policy(),
+        permission_profile: PermissionProfile::workspace_write(),
     }
 }

@@ -1,8 +1,8 @@
 //! Session, resume, fork, and subagent selection lifecycle for the TUI app.
 //!
-//! This module owns high-level transitions between app-server threads: starting fresh sessions,
-//! resuming/forking saved sessions, replacing ChatWidget instances, and maintaining the agent
-//! picker cache used for multi-agent navigation.
+//! This module owns the high-level transitions between app-server threads: starting fresh sessions,
+//! resuming/forking saved sessions, replacing ChatWidget instances, and maintaining the agent picker
+//! cache used for multi-agent navigation.
 
 use super::*;
 
@@ -21,6 +21,9 @@ impl App {
             }
         }
         for thread_id in thread_ids {
+            if self.side_threads.contains_key(&thread_id) {
+                continue;
+            }
             if !self
                 .refresh_agent_picker_thread_liveness(app_server, thread_id)
                 .await
@@ -388,14 +391,24 @@ impl App {
     }
 
     pub(super) fn reset_for_thread_switch(&mut self, tui: &mut tui::Tui) -> Result<()> {
-        self.overlay = None;
-        self.transcript_cells.clear();
-        self.deferred_history_lines.clear();
-        self.has_emitted_history_lines = false;
-        self.backtrack = BacktrackState::default();
-        self.backtrack_render_pending = false;
-        tui.terminal.clear_scrollback()?;
-        tui.terminal.clear()?;
+        self.reset_transcript_state_after_clear();
+        tui.clear_pending_history_lines();
+        Self::clear_terminal_for_thread_switch(&mut tui.terminal)?;
+        Ok(())
+    }
+
+    pub(super) fn clear_terminal_for_thread_switch<B>(
+        terminal: &mut crate::custom_terminal::Terminal<B>,
+    ) -> Result<()>
+    where
+        B: Backend + Write,
+    {
+        terminal.clear_scrollback_and_visible_screen_ansi()?;
+        let mut area = terminal.viewport_area;
+        if area.y > 0 {
+            area.y = 0;
+            terminal.set_viewport_area(area);
+        }
         Ok(())
     }
 
@@ -406,6 +419,7 @@ impl App {
         self.abort_all_thread_event_listeners();
         self.thread_event_channels.clear();
         self.agent_navigation.clear();
+        self.side_threads.clear();
         self.active_thread_id = None;
         self.active_thread_rx = None;
         self.primary_thread_id = None;
@@ -623,10 +637,10 @@ impl App {
 
     pub(super) fn fresh_session_config(&self) -> Config {
         let mut config = self.config.clone();
-        config.service_tier = self.chat_widget.current_service_tier();
+        config.service_tier = self.chat_widget.configured_service_tier();
+        config.notices.fast_default_opt_out = self.chat_widget.fast_default_opt_out();
         config
     }
-
     pub(super) async fn resume_target_session(
         &mut self,
         tui: &mut tui::Tui,

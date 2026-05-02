@@ -186,6 +186,7 @@ async fn submit_turn(
     let session_model = test.session_configured.model.clone();
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: prompt.into(),
                 text_elements: Vec::new(),
@@ -195,6 +196,7 @@ async fn submit_turn(
             approval_policy,
             approvals_reviewer: Some(ApprovalsReviewer::User),
             sandbox_policy,
+            permission_profile: None,
             model: session_model,
             effort: None,
             summary: None,
@@ -283,7 +285,7 @@ async fn expect_request_permissions_event(
 fn workspace_write_excluding_tmp() -> SandboxPolicy {
     SandboxPolicy::WorkspaceWrite {
         writable_roots: vec![],
-        read_only_access: Default::default(),
+        read_only_access: codex_protocol::protocol::ReadOnlyAccess::FullAccess,
         network_access: false,
         exclude_tmpdir_env_var: true,
         exclude_slash_tmp: true,

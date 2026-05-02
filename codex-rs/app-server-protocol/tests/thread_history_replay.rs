@@ -39,6 +39,7 @@ fn replayed_shell_function_output_without_persisted_success_stays_in_progress() 
             turn_id: "turn-a".into(),
             completed_at: None,
             duration_ms: None,
+            time_to_first_token_ms: None,
             last_agent_message: None,
         })),
     ]);

@@ -114,14 +114,8 @@ pub(crate) async fn monitor_action(
         },
         None => None,
     };
-    let (authorization_header_value, account_id) = if let Some(token) =
-        read_non_empty_env_var(CODEX_ARC_MONITOR_TOKEN)
-    {
-        (
-            format!("Bearer {token}"),
-            auth.as_ref().map(|auth| auth.account_id().to_string()),
-        )
-    } else if let Some(authorization_header_value) =
+    let env_token = read_non_empty_env_var(CODEX_ARC_MONITOR_TOKEN);
+    let agent_task_authorization_header = if env_token.is_none() {
         match sess.authorization_header_for_current_agent_task().await {
             Ok(authorization_header_value) => authorization_header_value,
             Err(err) => {
@@ -132,17 +126,12 @@ pub(crate) async fn monitor_action(
                 return ArcMonitorOutcome::Ok;
             }
         }
-    {
-        (authorization_header_value, None)
     } else {
-        let Some(auth) = auth.as_ref() else {
-            return ArcMonitorOutcome::Ok;
-        };
-        (
-            auth.authorization().to_string(),
-            Some(auth.account_id().to_string()),
-        )
+        None
     };
+    if env_token.is_none() && agent_task_authorization_header.is_none() && auth.is_none() {
+        return ArcMonitorOutcome::Ok;
+    }
 
     let url = read_non_empty_env_var(CODEX_ARC_MONITOR_ENDPOINT_OVERRIDE).unwrap_or_else(|| {
         format!(
@@ -160,13 +149,21 @@ pub(crate) async fn monitor_action(
     let body =
         build_arc_monitor_request(sess, turn_context, action, protection_client_callsite).await;
     let client = build_reqwest_client();
-    let mut request = client
-        .post(&url)
-        .timeout(ARC_MONITOR_TIMEOUT)
-        .json(&body)
-        .header("authorization", authorization_header_value);
-    if let Some(account_id) = account_id {
-        request = request.header("chatgpt-account-id", account_id);
+    let mut request = client.post(&url).timeout(ARC_MONITOR_TIMEOUT).json(&body);
+    if let Some(token) = env_token {
+        request = request.bearer_auth(token);
+        if let Some(auth) = auth.as_ref() {
+            request = request.header("chatgpt-account-id", auth.account_id());
+        }
+    } else if let Some(authorization_header_value) = agent_task_authorization_header {
+        request = request.header("authorization", authorization_header_value);
+    } else if let Some(auth) = auth.as_ref() {
+        request = request
+            .header("authorization", auth.authorization())
+            .header("chatgpt-account-id", auth.account_id());
+        if auth.is_fedramp_account() {
+            request = request.header("X-OpenAI-Fedramp", "true");
+        }
     }
 
     let response = match request.send().await {
@@ -415,8 +412,8 @@ fn build_arc_monitor_message_item(
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::ToolSearchOutput { .. }
         | ResponseItem::ImageGenerationCall { .. }
-        | ResponseItem::GhostSnapshot { .. }
         | ResponseItem::Compaction { .. }
+        | ResponseItem::GhostSnapshot { .. }
         | ResponseItem::Other => None,
     }
 }

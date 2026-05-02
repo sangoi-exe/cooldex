@@ -97,28 +97,18 @@ async fn init_backend(user_agent_suffix: &str, config: &Config) -> anyhow::Resul
         request_auth.account_id()
     ));
 
-    let Some(token) = request_auth.authorization().strip_prefix("Bearer ") else {
-        eprintln!(
-            "Not signed in. Please run 'codex login' to sign in with ChatGPT, then re-run 'codex cloud'."
-        );
-        std::process::exit(1);
-    };
-    if token.is_empty() {
-        eprintln!(
-            "Not signed in. Please run 'codex login' to sign in with ChatGPT, then re-run 'codex cloud'."
-        );
-        std::process::exit(1);
+    let mut auth_provider = codex_model_provider::AuthorizationHeaderAuthProvider::new(
+        Some(request_auth.authorization().to_string()),
+        Some(request_auth.account_id().to_string()),
+    );
+    if request_auth.is_fedramp_account() {
+        auth_provider = auth_provider.with_fedramp_routing_header();
     }
-
-    http = http.with_bearer_token(token.to_string());
+    http = http.with_auth_provider(Arc::new(auth_provider));
     append_error_log(format!(
         "auth: set ChatGPT-Account-Id header: {}",
         request_auth.account_id()
     ));
-    http = http.with_chatgpt_account_id(request_auth.account_id().to_string());
-    if request_auth.is_fedramp_account() {
-        http = http.with_fedramp_routing_header();
-    }
     let headers = util::build_chatgpt_headers(&request_auth);
 
     Ok(BackendContext {

@@ -1,3 +1,5 @@
+// Merge-safety anchor: memory extension cleanup remains part of the preserved
+// core-local pipeline until the extracted write crate can own Session updates.
 use crate::memories::memory_extensions_root;
 use chrono::DateTime;
 use chrono::Duration;

@@ -7,6 +7,7 @@ use crate::bottom_pane::FeedbackAudience;
 use crate::legacy_core::append_message_history_entry;
 use crate::legacy_core::config::Config;
 use crate::legacy_core::message_history_metadata;
+use crate::permission_compat::legacy_compatible_permission_profile;
 use crate::resume_history::apply_resume_history_mode;
 use crate::status::StatusAccountDisplay;
 use crate::status::plan_type_display_name;
@@ -52,12 +53,23 @@ use codex_app_server_protocol::SkillsConfigWriteResponse;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::Thread;
+use codex_app_server_protocol::ThreadApproveGuardianDeniedActionParams;
+use codex_app_server_protocol::ThreadApproveGuardianDeniedActionResponse;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadGoalClearParams;
+use codex_app_server_protocol::ThreadGoalClearResponse;
+use codex_app_server_protocol::ThreadGoalGetParams;
+use codex_app_server_protocol::ThreadGoalGetResponse;
+use codex_app_server_protocol::ThreadGoalSetParams;
+use codex_app_server_protocol::ThreadGoalSetResponse;
+use codex_app_server_protocol::ThreadGoalStatus;
+use codex_app_server_protocol::ThreadInjectItemsParams;
+use codex_app_server_protocol::ThreadInjectItemsResponse;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadLoadedListParams;
@@ -99,6 +111,7 @@ use codex_app_server_protocol::TurnSteerResponse;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelAvailabilityNux;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelUpgrade;
@@ -109,6 +122,7 @@ use codex_protocol::protocol::ConversationStartParams;
 use codex_protocol::protocol::ConversationStartTransport;
 use codex_protocol::protocol::ConversationTextParams;
 use codex_protocol::protocol::CreditsSnapshot;
+use codex_protocol::protocol::GuardianAssessmentEvent;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::ReviewRequest;
@@ -175,12 +189,16 @@ pub(crate) struct AppServerSession {
 pub(crate) struct ThreadSessionState {
     pub(crate) thread_id: ThreadId,
     pub(crate) forked_from_id: Option<ThreadId>,
+    pub(crate) fork_parent_title: Option<String>,
     pub(crate) thread_name: Option<String>,
     pub(crate) model: String,
     pub(crate) model_provider_id: String,
     pub(crate) service_tier: Option<codex_protocol::config_types::ServiceTier>,
     pub(crate) approval_policy: AskForApproval,
     pub(crate) approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer,
+    /// Canonical active permissions for this session. Legacy app-server
+    /// responses are converted to a profile at ingestion time using the
+    /// response cwd so cached sessions do not reinterpret cwd-bound grants.
     pub(crate) permission_profile: PermissionProfile,
     pub(crate) cwd: AbsolutePathBuf,
     pub(crate) config_path: Option<PathBuf>,
@@ -360,7 +378,12 @@ impl AppServerSession {
             })
             .await
             .wrap_err("thread/resume failed during TUI bootstrap")?;
-        started_thread_from_resume_response(response, &config).await
+        let fork_parent_title = self
+            .fork_parent_title_from_app_server(response.thread.forked_from_id.as_deref())
+            .await;
+        let mut started = started_thread_from_resume_response(response, &config).await?;
+        started.session.fork_parent_title = fork_parent_title;
+        Ok(started)
     }
 
     pub(crate) async fn fork_thread(
@@ -382,13 +405,43 @@ impl AppServerSession {
             })
             .await
             .wrap_err("thread/fork failed during TUI bootstrap")?;
-        started_thread_from_fork_response(response, &config).await
+        let fork_parent_title = self
+            .fork_parent_title_from_app_server(response.thread.forked_from_id.as_deref())
+            .await;
+        let mut started = started_thread_from_fork_response(response, &config).await?;
+        started.session.fork_parent_title = fork_parent_title;
+        Ok(started)
     }
 
     fn thread_params_mode(&self) -> ThreadParamsMode {
         match &self.client {
             AppServerClient::InProcess(_) => ThreadParamsMode::Embedded,
             AppServerClient::Remote(_) => ThreadParamsMode::Remote,
+        }
+    }
+
+    async fn fork_parent_title_from_app_server(
+        &mut self,
+        forked_from_id: Option<&str>,
+    ) -> Option<String> {
+        let forked_from_id = forked_from_id?;
+        let forked_from_id = match ThreadId::from_string(forked_from_id) {
+            Ok(thread_id) => thread_id,
+            Err(err) => {
+                tracing::warn!("Failed to parse fork parent thread id from app server: {err}");
+                return None;
+            }
+        };
+
+        match self
+            .thread_read(forked_from_id, /*include_turns*/ false)
+            .await
+        {
+            Ok(thread) => thread.name,
+            Err(err) => {
+                tracing::warn!("Failed to read fork parent metadata from app server: {err}");
+                None
+            }
         }
     }
 
@@ -439,6 +492,29 @@ impl AppServerSession {
         Ok(response.thread)
     }
 
+    pub(crate) async fn thread_inject_items(
+        &mut self,
+        thread_id: ThreadId,
+        items: Vec<ResponseItem>,
+    ) -> Result<ThreadInjectItemsResponse> {
+        let items = items
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .wrap_err("failed to encode thread/inject_items payload")?;
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::ThreadInjectItems {
+                request_id,
+                params: ThreadInjectItemsParams {
+                    thread_id: thread_id.to_string(),
+                    items,
+                },
+            })
+            .await
+            .wrap_err("thread/inject_items failed during TUI side conversation setup")
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn turn_start(
         &mut self,
@@ -447,7 +523,7 @@ impl AppServerSession {
         cwd: PathBuf,
         approval_policy: AskForApproval,
         approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer,
-        sandbox_policy: SandboxPolicy,
+        permission_profile: PermissionProfile,
         model: String,
         effort: Option<codex_protocol::openai_models::ReasoningEffort>,
         summary: Option<codex_protocol::config_types::ReasoningSummary>,
@@ -457,6 +533,26 @@ impl AppServerSession {
         output_schema: Option<serde_json::Value>,
     ) -> Result<TurnStartResponse> {
         let request_id = self.next_request_id();
+        let sandbox_policy = if matches!(self.thread_params_mode(), ThreadParamsMode::Remote) {
+            let legacy_profile =
+                legacy_compatible_permission_profile(&permission_profile, cwd.as_path());
+            let policy = legacy_profile
+                .to_legacy_sandbox_policy(cwd.as_path())
+                .unwrap_or_else(|err| {
+                    unreachable!(
+                        "legacy-compatible permissions must project to legacy policy: {err}"
+                    )
+                });
+            Some(policy.into())
+        } else {
+            None
+        };
+        let permission_profile = if matches!(self.thread_params_mode(), ThreadParamsMode::Embedded)
+        {
+            Some(permission_profile.into())
+        } else {
+            None
+        };
         self.client
             .request_typed(ClientRequest::TurnStart {
                 request_id,
@@ -464,10 +560,12 @@ impl AppServerSession {
                     thread_id: thread_id.to_string(),
                     input: items.into_iter().map(Into::into).collect(),
                     responsesapi_client_metadata: None,
+                    environments: None,
                     cwd: Some(cwd),
                     approval_policy: Some(approval_policy.into()),
                     approvals_reviewer: Some(approvals_reviewer.into()),
-                    sandbox_policy: Some(sandbox_policy.into()),
+                    sandbox_policy,
+                    permission_profile,
                     model: Some(model),
                     service_tier,
                     effort,
@@ -578,6 +676,60 @@ impl AppServerSession {
         Ok(())
     }
 
+    pub(crate) async fn thread_goal_get(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Result<ThreadGoalGetResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::ThreadGoalGet {
+                request_id,
+                params: ThreadGoalGetParams {
+                    thread_id: thread_id.to_string(),
+                },
+            })
+            .await
+            .wrap_err("thread/goal/get failed in TUI")
+    }
+
+    pub(crate) async fn thread_goal_set(
+        &mut self,
+        thread_id: ThreadId,
+        objective: Option<String>,
+        status: Option<ThreadGoalStatus>,
+        token_budget: Option<Option<i64>>,
+    ) -> Result<ThreadGoalSetResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::ThreadGoalSet {
+                request_id,
+                params: ThreadGoalSetParams {
+                    thread_id: thread_id.to_string(),
+                    objective,
+                    status,
+                    token_budget,
+                },
+            })
+            .await
+            .wrap_err("thread/goal/set failed in TUI")
+    }
+
+    pub(crate) async fn thread_goal_clear(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Result<ThreadGoalClearResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::ThreadGoalClear {
+                request_id,
+                params: ThreadGoalClearParams {
+                    thread_id: thread_id.to_string(),
+                },
+            })
+            .await
+            .wrap_err("thread/goal/clear failed in TUI")
+    }
+
     pub(crate) async fn logout_account(&mut self) -> Result<()> {
         let request_id = self.next_request_id();
         let _: LogoutAccountResponse = self
@@ -641,7 +793,9 @@ impl AppServerSession {
             .client
             .request_typed(ClientRequest::LoginAccount {
                 request_id,
-                params: LoginAccountParams::Chatgpt,
+                params: LoginAccountParams::Chatgpt {
+                    codex_streamlined_login: false,
+                },
             })
             .await
             .wrap_err("account/login/start failed in TUI")?;
@@ -702,6 +856,27 @@ impl AppServerSession {
             })
             .await
             .wrap_err("thread/shellCommand failed in TUI")?;
+        Ok(())
+    }
+
+    pub(crate) async fn thread_approve_guardian_denied_action(
+        &mut self,
+        thread_id: ThreadId,
+        event: &GuardianAssessmentEvent,
+    ) -> Result<()> {
+        let request_id = self.next_request_id();
+        let _: ThreadApproveGuardianDeniedActionResponse = self
+            .client
+            .request_typed(ClientRequest::ThreadApproveGuardianDeniedAction {
+                request_id,
+                params: ThreadApproveGuardianDeniedActionParams {
+                    thread_id: thread_id.to_string(),
+                    event: serde_json::to_value(event)
+                        .wrap_err("failed to serialize Auto Review denial event")?,
+                },
+            })
+            .await
+            .wrap_err("thread/approveGuardianDeniedAction failed in TUI")?;
         Ok(())
     }
 
@@ -1032,6 +1207,9 @@ fn build_account_projection(
             feedback_audience_from_account_email(Some(email.as_str())),
             true,
         ),
+        Some(Account::AmazonBedrock {}) => {
+            (None, None, None, None, FeedbackAudience::External, false)
+        }
         None => (None, None, None, None, FeedbackAudience::External, false),
     };
     Ok(AppServerAccountProjection {
@@ -1066,13 +1244,13 @@ pub(crate) fn status_account_display_from_auth_mode(
 ) -> Option<StatusAccountDisplay> {
     match auth_mode {
         Some(AuthMode::ApiKey) => Some(StatusAccountDisplay::ApiKey),
-        Some(AuthMode::Chatgpt) | Some(AuthMode::ChatgptAuthTokens) => {
-            Some(StatusAccountDisplay::ChatGpt {
-                label,
-                email: None,
-                plan: plan_type.map(plan_type_display_name),
-            })
-        }
+        Some(AuthMode::Chatgpt)
+        | Some(AuthMode::ChatgptAuthTokens)
+        | Some(AuthMode::AgentIdentity) => Some(StatusAccountDisplay::ChatGpt {
+            label,
+            email: None,
+            plan: plan_type.map(plan_type_display_name),
+        }),
         None => None,
     }
 }
@@ -1138,18 +1316,28 @@ fn config_request_overrides_from_config(
     })
 }
 
-fn sandbox_mode_from_policy(
-    policy: SandboxPolicy,
+fn sandbox_mode_from_permission_profile(
+    permission_profile: &PermissionProfile,
+    cwd: &std::path::Path,
 ) -> Option<codex_app_server_protocol::SandboxMode> {
-    match policy {
-        SandboxPolicy::DangerFullAccess => {
+    match permission_profile {
+        PermissionProfile::Disabled => {
             Some(codex_app_server_protocol::SandboxMode::DangerFullAccess)
         }
-        SandboxPolicy::ReadOnly { .. } => Some(codex_app_server_protocol::SandboxMode::ReadOnly),
-        SandboxPolicy::WorkspaceWrite { .. } => {
-            Some(codex_app_server_protocol::SandboxMode::WorkspaceWrite)
+        PermissionProfile::External { .. } => None,
+        PermissionProfile::Managed { .. } => {
+            let file_system_policy = permission_profile.file_system_sandbox_policy();
+            if file_system_policy.has_full_disk_write_access() {
+                permission_profile
+                    .network_sandbox_policy()
+                    .is_enabled()
+                    .then_some(codex_app_server_protocol::SandboxMode::DangerFullAccess)
+            } else if file_system_policy.can_write_path_with_cwd(cwd, cwd) {
+                Some(codex_app_server_protocol::SandboxMode::WorkspaceWrite)
+            } else {
+                Some(codex_app_server_protocol::SandboxMode::ReadOnly)
+            }
         }
-        SandboxPolicy::ExternalSandbox { .. } => None,
     }
 }
 
@@ -1157,24 +1345,11 @@ fn permission_profile_override_from_config(
     config: &Config,
     thread_params_mode: ThreadParamsMode,
 ) -> Option<codex_app_server_protocol::PermissionProfile> {
-    match thread_params_mode {
-        ThreadParamsMode::Embedded => Some(config.permissions.permission_profile().into()),
-        ThreadParamsMode::Remote => None,
+    if matches!(thread_params_mode, ThreadParamsMode::Remote) {
+        return None;
     }
-}
 
-fn sandbox_mode_override_from_config(
-    config: &Config,
-    thread_params_mode: ThreadParamsMode,
-) -> Option<codex_app_server_protocol::SandboxMode> {
-    match thread_params_mode {
-        ThreadParamsMode::Embedded => None,
-        ThreadParamsMode::Remote => sandbox_mode_from_policy(
-            config
-                .permissions
-                .legacy_sandbox_policy(config.cwd.as_path()),
-        ),
-    }
+    Some(config.permissions.permission_profile().into())
 }
 
 fn thread_config_path_from_config(
@@ -1202,6 +1377,16 @@ fn thread_start_params_from_config(
     remote_cwd_override: Option<&std::path::Path>,
     session_start_source: Option<ThreadStartSource>,
 ) -> ThreadStartParams {
+    let permission_profile = permission_profile_override_from_config(config, thread_params_mode);
+    let sandbox = permission_profile
+        .is_none()
+        .then(|| {
+            sandbox_mode_from_permission_profile(
+                &config.permissions.permission_profile(),
+                config.cwd.as_path(),
+            )
+        })
+        .flatten();
     ThreadStartParams {
         model: config.model.clone(),
         model_provider: thread_params_mode.model_provider_from_config(config),
@@ -1209,8 +1394,8 @@ fn thread_start_params_from_config(
         config_path: thread_config_path_from_config(config, thread_params_mode),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override_from_config(config),
-        sandbox: sandbox_mode_override_from_config(config, thread_params_mode),
-        permission_profile: permission_profile_override_from_config(config, thread_params_mode),
+        sandbox,
+        permission_profile,
         config: config_request_overrides_from_config(config),
         base_instructions: thread_instruction_override_from_config(&config.base_instructions),
         developer_instructions: thread_instruction_override_from_config(
@@ -1229,6 +1414,16 @@ fn thread_resume_params_from_config(
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<&std::path::Path>,
 ) -> ThreadResumeParams {
+    let permission_profile = permission_profile_override_from_config(&config, thread_params_mode);
+    let sandbox = permission_profile
+        .is_none()
+        .then(|| {
+            sandbox_mode_from_permission_profile(
+                &config.permissions.permission_profile(),
+                config.cwd.as_path(),
+            )
+        })
+        .flatten();
     ThreadResumeParams {
         thread_id: thread_id.to_string(),
         model: config.model.clone(),
@@ -1237,8 +1432,8 @@ fn thread_resume_params_from_config(
         config_path: thread_config_path_from_config(&config, thread_params_mode),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override_from_config(&config),
-        sandbox: sandbox_mode_override_from_config(&config, thread_params_mode),
-        permission_profile: permission_profile_override_from_config(&config, thread_params_mode),
+        sandbox,
+        permission_profile,
         config: config_request_overrides_from_config(&config),
         base_instructions: thread_instruction_override_from_config(&config.base_instructions),
         developer_instructions: thread_instruction_override_from_config(
@@ -1255,6 +1450,16 @@ fn thread_fork_params_from_config(
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<&std::path::Path>,
 ) -> ThreadForkParams {
+    let permission_profile = permission_profile_override_from_config(&config, thread_params_mode);
+    let sandbox = permission_profile
+        .is_none()
+        .then(|| {
+            sandbox_mode_from_permission_profile(
+                &config.permissions.permission_profile(),
+                config.cwd.as_path(),
+            )
+        })
+        .flatten();
     ThreadForkParams {
         thread_id: thread_id.to_string(),
         model: config.model.clone(),
@@ -1263,8 +1468,8 @@ fn thread_fork_params_from_config(
         config_path: thread_config_path_from_config(&config, thread_params_mode),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override_from_config(&config),
-        sandbox: sandbox_mode_override_from_config(&config, thread_params_mode),
-        permission_profile: permission_profile_override_from_config(&config, thread_params_mode),
+        sandbox,
+        permission_profile,
         config: config_request_overrides_from_config(&config),
         base_instructions: thread_instruction_override_from_config(&config.base_instructions),
         developer_instructions: thread_instruction_override_from_config(
@@ -1464,10 +1669,10 @@ async fn thread_session_state_from_thread_response(
         .map_err(|err| format!("forked_from_id is invalid: {err}"))?;
     let (history_log_id, history_entry_count) = message_history_metadata(config).await;
     let history_entry_count = u64::try_from(history_entry_count).unwrap_or(u64::MAX);
-
     Ok(ThreadSessionState {
         thread_id,
         forked_from_id,
+        fork_parent_title: None,
         thread_name,
         model,
         model_provider_id,
@@ -1547,6 +1752,7 @@ mod tests {
     use codex_protocol::permissions::FileSystemAccessMode;
     use codex_protocol::permissions::FileSystemPath;
     use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSpecialPath;
     use codex_protocol::permissions::NetworkSandboxPolicy;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
@@ -1619,6 +1825,11 @@ mod tests {
         );
 
         assert_eq!(params.cwd, Some(config.cwd.to_string_lossy().to_string()));
+        assert_eq!(params.sandbox, None);
+        assert_eq!(
+            params.permission_profile,
+            Some(config.permissions.permission_profile().into())
+        );
         assert_eq!(params.model_provider, Some(config.model_provider_id));
     }
 
@@ -1928,12 +2139,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sandbox_mode_does_not_project_non_cwd_write_roots_for_remote_sessions() {
+        let cwd = test_path_buf("/workspace/project").abs();
+        let extra_root = test_path_buf("/workspace/cache").abs();
+        let permission_profile = PermissionProfile::Managed {
+            file_system: ManagedFileSystemPermissions::Restricted {
+                entries: vec![
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        access: FileSystemAccessMode::Read,
+                    },
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Path { path: extra_root },
+                        access: FileSystemAccessMode::Write,
+                    },
+                ],
+                glob_scan_max_depth: None,
+            },
+            network: NetworkSandboxPolicy::Restricted,
+        };
+
+        assert_eq!(
+            sandbox_mode_from_permission_profile(&permission_profile, cwd.as_path()),
+            Some(codex_app_server_protocol::SandboxMode::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn sandbox_mode_projects_cwd_write_for_remote_sessions() {
+        let cwd = test_path_buf("/workspace/project").abs();
+        let permission_profile = PermissionProfile::Managed {
+            file_system: ManagedFileSystemPermissions::Restricted {
+                entries: vec![
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        access: FileSystemAccessMode::Read,
+                    },
+                    FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::ProjectRoots { subpath: None },
+                        },
+                        access: FileSystemAccessMode::Write,
+                    },
+                ],
+                glob_scan_max_depth: None,
+            },
+            network: NetworkSandboxPolicy::Restricted,
+        };
+
+        assert_eq!(
+            sandbox_mode_from_permission_profile(&permission_profile, cwd.as_path()),
+            Some(codex_app_server_protocol::SandboxMode::WorkspaceWrite)
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_lifecycle_remote_params_omit_embedded_permission_profile() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = build_config(&temp_dir).await;
+        let thread_id = ThreadId::new();
+        let expected_sandbox = sandbox_mode_from_permission_profile(
+            &config.permissions.permission_profile(),
+            config.cwd.as_path(),
+        );
+
+        let start = thread_start_params_from_config(
+            &config,
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+            /*session_start_source*/ None,
+        );
+        let resume = thread_resume_params_from_config(
+            config.clone(),
+            thread_id,
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+        );
+        let fork = thread_fork_params_from_config(
+            config,
+            thread_id,
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+        );
+
+        assert_eq!(start.sandbox, expected_sandbox);
+        assert_eq!(resume.sandbox, expected_sandbox);
+        assert_eq!(fork.sandbox, expected_sandbox);
+        assert_eq!(start.permission_profile, None);
+        assert_eq!(resume.permission_profile, None);
+        assert_eq!(fork.permission_profile, None);
+    }
+
     #[tokio::test]
     async fn thread_lifecycle_params_forward_explicit_remote_cwd_override_for_remote_sessions() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = build_config(&temp_dir).await;
         let thread_id = ThreadId::new();
         let remote_cwd = PathBuf::from("repo/on/server");
+        let expected_sandbox = sandbox_mode_from_permission_profile(
+            &config.permissions.permission_profile(),
+            config.cwd.as_path(),
+        );
 
         let start = thread_start_params_from_config(
             &config,
@@ -1963,6 +2274,37 @@ mod tests {
         assert_eq!(start.config_path, None);
         assert_eq!(resume.config_path, None);
         assert_eq!(fork.config_path, None);
+        assert_eq!(start.sandbox, expected_sandbox);
+        assert_eq!(resume.sandbox, expected_sandbox);
+        assert_eq!(fork.sandbox, expected_sandbox);
+        assert_eq!(start.permission_profile, None);
+        assert_eq!(resume.permission_profile, None);
+        assert_eq!(fork.permission_profile, None);
+    }
+
+    #[tokio::test]
+    async fn thread_fork_params_forward_instruction_overrides() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = build_config(&temp_dir).await;
+        config.base_instructions = Some("Base override.".to_string());
+        config.developer_instructions = Some("Developer override.".to_string());
+        let thread_id = ThreadId::new();
+
+        let params = thread_fork_params_from_config(
+            config,
+            thread_id,
+            ThreadParamsMode::Embedded,
+            /*remote_cwd_override*/ None,
+        );
+
+        assert_eq!(
+            params.base_instructions,
+            Some(Some("Base override.".to_string()))
+        );
+        assert_eq!(
+            params.developer_instructions,
+            Some(Some("Developer override.".to_string()))
+        );
     }
 
     #[tokio::test]
@@ -2020,6 +2362,7 @@ mod tests {
         let config = build_config(&temp_dir).await;
         let thread_id = ThreadId::new();
         let forked_from_id = ThreadId::new();
+        let read_only_profile = PermissionProfile::read_only();
         let response = ThreadResumeResponse {
             thread: codex_app_server_protocol::Thread {
                 id: thread_id.to_string(),
@@ -2070,8 +2413,11 @@ mod tests {
             instruction_sources: vec![test_path_buf("/tmp/project/AGENTS.md").abs()],
             approval_policy: codex_protocol::protocol::AskForApproval::Never.into(),
             approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::User,
-            sandbox: codex_protocol::protocol::SandboxPolicy::new_read_only_policy().into(),
-            permission_profile: None,
+            sandbox: read_only_profile
+                .to_legacy_sandbox_policy(test_path_buf("/tmp/project").as_path())
+                .expect("read-only profile must be legacy-compatible")
+                .into(),
+            permission_profile: Some(read_only_profile.into()),
             reasoning_effort: None,
         };
 
@@ -2082,6 +2428,14 @@ mod tests {
         assert_eq!(
             started.session.instruction_source_paths,
             response.instruction_sources
+        );
+        assert_eq!(
+            started.session.permission_profile,
+            response
+                .permission_profile
+                .clone()
+                .map(Into::into)
+                .expect("response includes profile")
         );
         assert_eq!(started.turns.len(), 1);
         assert_eq!(started.turns[0], response.thread.turns[0]);
@@ -2258,7 +2612,7 @@ mod tests {
             /*service_tier*/ None,
             AskForApproval::Never,
             codex_protocol::config_types::ApprovalsReviewer::User,
-            PermissionProfile::from_legacy_sandbox_policy(&SandboxPolicy::new_read_only_policy()),
+            PermissionProfile::read_only(),
             test_path_buf("/tmp/project").abs(),
             config.active_user_config_path().ok(),
             Vec::new(),
@@ -2289,7 +2643,7 @@ mod tests {
             /*service_tier*/ None,
             AskForApproval::Never,
             codex_protocol::config_types::ApprovalsReviewer::User,
-            PermissionProfile::from_legacy_sandbox_policy(&SandboxPolicy::new_read_only_policy()),
+            PermissionProfile::read_only(),
             test_path_buf("/tmp/project").abs(),
             /*config_path*/ None,
             Vec::new(),

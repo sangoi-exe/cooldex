@@ -13,7 +13,10 @@ pub use codex_app_server_protocol::AppInfo;
 pub use codex_app_server_protocol::AppMetadata;
 use codex_connectors::AllConnectorsCacheKey;
 use codex_connectors::DirectoryListResponse;
-use codex_protocol::protocol::SandboxPolicy;
+use codex_exec_server::EnvironmentManager;
+use codex_exec_server::EnvironmentManagerArgs;
+use codex_exec_server::ExecServerRuntimePaths;
+use codex_protocol::models::PermissionProfile;
 use codex_tools::DiscoverableTool;
 use rmcp::model::ToolAnnotations;
 use serde::Deserialize;
@@ -21,11 +24,11 @@ use serde::de::DeserializeOwned;
 use tracing::warn;
 
 use crate::config::Config;
-use crate::config_loader::AppsRequirementsToml;
 use crate::mcp::McpManager;
 use crate::plugins::PluginsManager;
 use crate::plugins::list_tool_suggest_discoverable_plugins;
 use crate::session::INITIAL_SUBMIT_ID;
+use codex_config::AppsRequirementsToml;
 use codex_config::types::AppToolApproval;
 use codex_config::types::AppsConfigToml;
 use codex_config::types::ToolSuggestDiscoverableType;
@@ -193,6 +196,33 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_options_and_status(
     auth: Option<&ChatGptRequestAuth>,
     force_refetch: bool,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
+    // TODO: Wire callers that already own an EnvironmentManager into
+    // list_accessible_connectors_from_mcp_tools_with_environment_manager instead
+    // of constructing a temporary manager here.
+    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+        config.codex_self_exe.clone(),
+        config.codex_linux_sandbox_exe.clone(),
+    )?;
+    let environment_manager =
+        EnvironmentManager::new(EnvironmentManagerArgs::new(local_runtime_paths)).await;
+    list_accessible_connectors_from_mcp_tools_with_environment_manager(
+        config,
+        auth,
+        force_refetch,
+        &environment_manager,
+    )
+    .await
+}
+
+pub async fn list_accessible_connectors_from_mcp_tools_with_environment_manager(
+    config: &Config,
+    auth: Option<&ChatGptRequestAuth>,
+    force_refetch: bool,
+    environment_manager: &EnvironmentManager,
+) -> anyhow::Result<AccessibleConnectorsStatus> {
+    // Merge-safety anchor: Codex Apps connector discovery must use the
+    // AccountManager-owned request-auth snapshot supplied by the caller, not a
+    // hidden AuthManager or process-global token bootstrap in this leaf helper.
     if !config.features.apps_enabled_for_auth(auth.is_some()) {
         return Ok(AccessibleConnectorsStatus {
             connectors: Vec::new(),
@@ -225,27 +255,33 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_options_and_status(
         });
     }
 
-    let auth_status_entries =
-        compute_auth_statuses(mcp_servers.iter(), config.mcp_oauth_credentials_store_mode).await;
+    let auth_status_entries = compute_auth_statuses(
+        mcp_servers.iter(),
+        config.mcp_oauth_credentials_store_mode,
+        auth,
+    )
+    .await;
 
     let (tx_event, rx_event) = unbounded();
     drop(rx_event);
 
-    let (mcp_connection_manager, cancel_token) = McpConnectionManager::new(
+    let environment = environment_manager
+        .default_environment()
+        .unwrap_or_else(|| environment_manager.local_environment());
+
+    let (mut mcp_connection_manager, cancel_token) = McpConnectionManager::new(
         &mcp_servers,
         config.mcp_oauth_credentials_store_mode,
         auth_status_entries,
         &config.permissions.approval_policy,
         INITIAL_SUBMIT_ID.to_owned(),
         tx_event,
-        SandboxPolicy::new_read_only_policy(),
-        McpRuntimeEnvironment::new(
-            Arc::new(codex_exec_server::Environment::default()),
-            config.cwd.to_path_buf(),
-        ),
+        PermissionProfile::default(),
+        McpRuntimeEnvironment::new(environment, config.cwd.to_path_buf()),
         config.codex_home.to_path_buf(),
         codex_apps_tools_cache_key(auth),
         ToolPluginProvenance::default(),
+        auth,
     )
     .await;
 
@@ -312,6 +348,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_options_and_status(
     }
     let accessible_connectors =
         with_app_plugin_sources(accessible_connectors, &tool_plugin_provenance);
+    mcp_connection_manager.shutdown().await;
     Ok(AccessibleConnectorsStatus {
         connectors: accessible_connectors,
         codex_apps_ready,
@@ -383,6 +420,14 @@ async fn tool_suggest_connector_ids(config: &Config) -> HashSet<String> {
             .filter(|discoverable| discoverable.kind == ToolSuggestDiscoverableType::Connector)
             .map(|discoverable| discoverable.id.clone()),
     );
+    let disabled_connector_ids = config
+        .tool_suggest
+        .disabled_tools
+        .iter()
+        .filter(|disabled_tool| disabled_tool.kind == ToolSuggestDiscoverableType::Connector)
+        .map(|disabled_tool| disabled_tool.id.as_str())
+        .collect::<HashSet<_>>();
+    connector_ids.retain(|connector_id| !disabled_connector_ids.contains(connector_id.as_str()));
     connector_ids
 }
 
@@ -426,7 +471,11 @@ async fn chatgpt_get_request_with_auth<T: DeserializeOwned>(
     request_auth: ChatGptRequestAuth,
 ) -> anyhow::Result<T> {
     let client = create_client();
-    let url = format!("{}{}", config.chatgpt_base_url, path);
+    let url = format!(
+        "{}/{}",
+        config.chatgpt_base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
     let mut request = client
         .get(&url)
         .header("Authorization", request_auth.authorization())

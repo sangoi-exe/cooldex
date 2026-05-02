@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_protocol::models::PermissionProfile;
-use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -51,16 +50,7 @@ impl FileSystemSandboxRunner {
         request: FsHelperRequest,
     ) -> Result<FsHelperPayload, JSONRPCErrorError> {
         let cwd = sandbox_cwd(sandbox)?;
-        let mut file_system_policy =
-            sandbox
-                .file_system_sandbox_policy
-                .clone()
-                .unwrap_or_else(|| {
-                    FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
-                        &sandbox.sandbox_policy,
-                        cwd.as_path(),
-                    )
-                });
+        let mut file_system_policy = sandbox.permissions.file_system_sandbox_policy();
         // Merge-safety anchor: preserve the local legacy Landlock override by
         // keeping helper-read-root widening out of the legacy path.
         let helper_read_roots = if sandbox.use_legacy_landlock {
@@ -72,7 +62,7 @@ impl FileSystemSandboxRunner {
         normalize_file_system_policy_root_aliases(&mut file_system_policy);
         let network_policy = NetworkSandboxPolicy::Restricted;
         let permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
-            SandboxEnforcement::from_legacy_sandbox_policy(&sandbox.sandbox_policy),
+            sandbox.permissions.enforcement(),
             &file_system_policy,
             network_policy,
         );
@@ -122,23 +112,11 @@ impl FileSystemSandboxRunner {
 }
 
 fn sandbox_cwd(sandbox: &FileSystemSandboxContext) -> Result<AbsolutePathBuf, JSONRPCErrorError> {
-    if let Some(cwd) = &sandbox.sandbox_policy_cwd {
+    if let Some(cwd) = &sandbox.cwd {
         return Ok(cwd.clone());
     }
-    if sandbox
-        .file_system_sandbox_policy
-        .as_ref()
-        .is_some_and(|policy| {
-            policy.entries.iter().any(|entry| {
-                matches!(
-                    entry.path,
-                    FileSystemPath::Special {
-                        value: FileSystemSpecialPath::ProjectRoots { .. }
-                    }
-                )
-            })
-        })
-    {
+
+    if sandbox.has_cwd_dependent_permissions() {
         return Err(invalid_request(
             "file system sandbox context with dynamic permissions requires cwd".to_string(),
         ));

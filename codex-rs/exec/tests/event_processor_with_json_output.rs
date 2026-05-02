@@ -31,6 +31,7 @@ use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::WebSearchAction as ApiWebSearchAction;
 use codex_protocol::ThreadId;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::WebSearchAction;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CollabWaitReturnWhen;
@@ -119,7 +120,7 @@ fn session_configured_produces_thread_started_event() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
-        permission_profile: codex_protocol::models::PermissionProfile::default(),
+        permission_profile: PermissionProfile::read_only(),
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         cwd: test_path_buf("/tmp/project").abs(),
         reasoning_effort: None,
@@ -1418,6 +1419,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                     input_tokens: 10,
                     cached_input_tokens: 3,
                     output_tokens: 29,
+                    reasoning_output_tokens: 7,
                 },
             })],
             status: CodexStatus::InitiateShutdown,

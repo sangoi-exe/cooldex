@@ -1,3 +1,5 @@
+// Merge-safety anchor: file-backed memory storage is preserved here as the
+// core-local follower of the Session-owned memory pipeline.
 use codex_state::Stage1Output;
 use std::collections::HashSet;
 use std::fmt::Write as _;

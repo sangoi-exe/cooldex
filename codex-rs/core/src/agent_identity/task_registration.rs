@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+// Merge-safety anchor: task assertions remain bound to the active ChatGPT
+// account identity so request-auth headers cannot fall back to process globals.
 use anyhow::Context;
 use anyhow::Result;
 use codex_login::AgentIdentityAuthRecord;
@@ -250,8 +252,8 @@ mod tests {
 
     #[tokio::test]
     async fn register_task_skips_when_feature_is_disabled() {
-        let auth_manager =
-            AuthManager::from_auth_for_testing(make_chatgpt_auth("account-123", Some("user-123")));
+        let auth = make_chatgpt_auth("account-123", Some("user-123")).await;
+        let auth_manager = AuthManager::from_auth_for_testing(auth.clone_auth());
         let manager = AgentIdentityManager::new_for_tests(
             auth_manager,
             /*feature_enabled*/ false,
@@ -280,15 +282,22 @@ mod tests {
         let server = MockServer::start().await;
         let chatgpt_base_url = server.uri();
         mount_human_biscuit(&server, &chatgpt_base_url, "agent-123").await;
-        let auth = make_chatgpt_auth("account-123", Some("user-123"));
-        let auth_manager = AuthManager::from_auth_for_testing(auth.clone());
+        let auth = make_chatgpt_auth("account-123", Some("user-123")).await;
+        let auth_manager = AuthManager::from_auth_for_testing(auth.clone_auth());
         let manager = AgentIdentityManager::new_for_tests(
             auth_manager,
             /*feature_enabled*/ true,
             chatgpt_base_url,
             SessionSource::Cli,
         );
-        let stored_identity = seed_stored_identity(&manager, &auth, "agent-123", "account-123");
+        let manager_auth = manager
+            .auth_manager
+            .auth()
+            .await
+            .expect("load manager auth")
+            .expect("manager auth");
+        let stored_identity =
+            seed_stored_identity(&manager, &manager_auth, "agent-123", "account-123");
         let encrypted_task_id =
             encrypt_task_id_for_identity(&stored_identity, "task_123").expect("task ciphertext");
 
@@ -326,16 +335,22 @@ mod tests {
         let server = MockServer::start().await;
         let chatgpt_base_url = format!("{}/backend-api", server.uri());
         mount_human_biscuit(&server, &chatgpt_base_url, "agent-fallback").await;
-        let auth = make_chatgpt_auth("account-123", Some("user-123"));
-        let auth_manager = AuthManager::from_auth_for_testing(auth.clone());
+        let auth = make_chatgpt_auth("account-123", Some("user-123")).await;
+        let auth_manager = AuthManager::from_auth_for_testing(auth.clone_auth());
         let manager = AgentIdentityManager::new_for_tests(
             auth_manager,
             /*feature_enabled*/ true,
             chatgpt_base_url,
             SessionSource::Cli,
         );
+        let manager_auth = manager
+            .auth_manager
+            .auth()
+            .await
+            .expect("load manager auth")
+            .expect("manager auth");
         let stored_identity =
-            seed_stored_identity(&manager, &auth, "agent-fallback", "account-123");
+            seed_stored_identity(&manager, &manager_auth, "agent-fallback", "account-123");
         let encrypted_task_id = encrypt_task_id_for_identity(&stored_identity, "task_fallback")
             .expect("task ciphertext");
 
@@ -364,9 +379,9 @@ mod tests {
         let server = MockServer::start().await;
         let chatgpt_base_url = server.uri();
         mount_human_biscuit(&server, &chatgpt_base_url, "agent-123").await;
-        let binding_auth = make_chatgpt_auth("account-123", Some("user-123"));
-        let auth_manager =
-            AuthManager::from_auth_for_testing(make_chatgpt_auth("account-456", Some("user-456")));
+        let binding_auth = make_chatgpt_auth("account-123", Some("user-123")).await;
+        let manager_auth = make_chatgpt_auth("account-456", Some("user-456")).await;
+        let auth_manager = AuthManager::from_auth_for_testing(manager_auth.clone_auth());
         let manager = AgentIdentityManager::new_for_tests(
             auth_manager,
             /*feature_enabled*/ true,
@@ -392,7 +407,7 @@ mod tests {
             .await;
 
         let task = manager
-            .register_task_for_binding(binding_auth, binding)
+            .register_task_for_binding(binding_auth.clone_auth(), binding)
             .await
             .unwrap()
             .expect("task should be registered");
@@ -412,8 +427,8 @@ mod tests {
 
     #[tokio::test]
     async fn task_matches_current_binding_rejects_stale_auth_binding() {
-        let auth_manager =
-            AuthManager::from_auth_for_testing(make_chatgpt_auth("account-456", Some("user-456")));
+        let auth = make_chatgpt_auth("account-456", Some("user-456")).await;
+        let auth_manager = AuthManager::from_auth_for_testing(auth.clone_auth());
         let manager = AgentIdentityManager::new_for_tests(
             auth_manager,
             /*feature_enabled*/ true,
@@ -498,7 +513,26 @@ mod tests {
         Ok(BASE64_STANDARD.encode(ciphertext))
     }
 
-    fn make_chatgpt_auth(account_id: &str, user_id: Option<&str>) -> CodexAuth {
+    struct TestChatgptAuth {
+        auth: CodexAuth,
+        _auth_home: tempfile::TempDir,
+    }
+
+    impl TestChatgptAuth {
+        fn clone_auth(&self) -> CodexAuth {
+            self.auth.clone()
+        }
+    }
+
+    impl std::ops::Deref for TestChatgptAuth {
+        type Target = CodexAuth;
+
+        fn deref(&self) -> &Self::Target {
+            &self.auth
+        }
+    }
+
+    async fn make_chatgpt_auth(account_id: &str, user_id: Option<&str>) -> TestChatgptAuth {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let auth_json = AuthDotJson {
             auth_mode: Some(ApiAuthMode::Chatgpt),
@@ -521,9 +555,18 @@ mod tests {
         };
         let store = codex_login::AuthStore::from_legacy(auth_json);
         save_auth(tempdir.path(), &store, AuthCredentialsStoreMode::File).expect("save auth");
-        CodexAuth::from_auth_storage(tempdir.path(), AuthCredentialsStoreMode::File)
-            .expect("load auth")
-            .expect("auth")
+        let auth = CodexAuth::from_auth_storage(
+            tempdir.path(),
+            AuthCredentialsStoreMode::File,
+            /*chatgpt_base_url*/ None,
+        )
+        .await
+        .expect("load auth")
+        .expect("auth");
+        TestChatgptAuth {
+            auth,
+            _auth_home: tempdir,
+        }
     }
 
     fn fake_id_token(account_id: &str, user_id: Option<&str>) -> String {

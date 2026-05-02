@@ -6,7 +6,6 @@ import type { ServiceTier } from "../ServiceTier";
 import type { JsonValue } from "../serde_json/JsonValue";
 import type { ApprovalsReviewer } from "./ApprovalsReviewer";
 import type { AskForApproval } from "./AskForApproval";
-import type { PermissionProfile } from "./PermissionProfile";
 import type { SandboxMode } from "./SandboxMode";
 import type { ThreadStartSource } from "./ThreadStartSource";
 
@@ -18,16 +17,4 @@ configPath?: string | null, approvalPolicy?: AskForApproval | null, /**
  * Override where approval requests are routed for review on this thread
  * and subsequent turns.
  */
-approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null, /**
- * Canonical permissions override for this thread. When present, do not
- * also set the legacy `sandbox` override.
- */
-permissionProfile?: PermissionProfile | null, config?: { [key in string]?: JsonValue } | null, serviceName?: string | null, baseInstructions?: string | null | null, developerInstructions?: string | null | null, personality?: Personality | null, ephemeral?: boolean | null, sessionStartSource?: ThreadStartSource | null, /**
- * If true, opt into emitting raw Responses API items on the event stream.
- * This is for internal use only (e.g. Codex Cloud).
- */
-experimentalRawEvents: boolean, /**
- * If true, persist additional rollout EventMsg variants required to
- * reconstruct a richer thread history on resume/fork/read.
- */
-persistExtendedHistory: boolean};
+approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null, config?: { [key in string]?: JsonValue } | null, serviceName?: string | null, baseInstructions?: string | null | null, developerInstructions?: string | null | null, personality?: Personality | null, ephemeral?: boolean | null, sessionStartSource?: ThreadStartSource | null};

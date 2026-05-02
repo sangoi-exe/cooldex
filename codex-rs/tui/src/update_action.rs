@@ -1,3 +1,5 @@
+// Merge-safety anchor: update actions are operator-facing install commands; keep platform-specific guidance aligned with shipped CLI packaging policy.
+
 #[cfg(any(not(debug_assertions), test))]
 use codex_install_context::InstallContext;
 #[cfg(any(not(debug_assertions), test))]
@@ -59,7 +61,7 @@ impl UpdateAction {
 }
 
 #[cfg(not(debug_assertions))]
-pub(crate) fn get_update_action() -> Option<UpdateAction> {
+pub fn get_update_action() -> Option<UpdateAction> {
     UpdateAction::from_install_context(InstallContext::current())
 }
 

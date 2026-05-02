@@ -2,6 +2,8 @@
 // single CLI-owned child-spawn config owner reused by legacy collab, MultiAgentV2, and agent jobs.
 use crate::config::Config;
 use crate::config::ConfigOverrides;
+use crate::config::DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
+use crate::config::MAX_MULTI_AGENT_V2_WAIT_TIMEOUT_MS;
 use crate::config::deserialize_config_toml_with_base;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
@@ -30,9 +32,9 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 /// Minimum wait timeout to prevent tight polling loops from burning CPU.
-pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
+pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
-pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = 3600 * 1000;
+pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = MAX_MULTI_AGENT_V2_WAIT_TIMEOUT_MS;
 
 pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
     match payload {
@@ -220,7 +222,7 @@ fn apply_child_prompt_overrides(config: &mut Config) {
 pub(crate) async fn finalize_spawn_agent_prompt_config(
     config: &mut Config,
     turn: &TurnContext,
-    models_manager: &ModelsManager,
+    models_manager: &dyn ModelsManager,
 ) {
     // Merge-safety anchor: role/profile reloads rebuild `Config` from persisted layers, which can
     // restore the lead post-compact ritual. Normalize the child prompt after the final reload so
@@ -332,7 +334,7 @@ pub(crate) fn reject_full_fork_spawn_overrides(
 ) -> Result<(), FunctionCallError> {
     if agent_type.is_some() || model.is_some() || reasoning_effort.is_some() {
         return Err(FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without fork_context/fork_turns=all.".to_string(),
+            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
         ));
     }
     Ok(())
@@ -461,8 +463,7 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
             .services
             .models_manager
             .list_models(RefreshStrategy::Offline)
-            .await
-            .map_err(collab_spawn_error)?;
+            .await;
         let selected_model_name = find_spawn_agent_model_name(&available_models, requested_model)?;
         let selected_model_info = session
             .services

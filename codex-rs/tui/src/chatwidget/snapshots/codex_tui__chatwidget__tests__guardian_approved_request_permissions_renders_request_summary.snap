@@ -1,0 +1,17 @@
+---
+source: tui/src/chatwidget/tests/guardian.rs
+assertion_line: 264
+expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
+---
+
+
+
+✔ Request approved for permission request: Need write access for generated
+  report assets. (write `/tmp/reports`)
+
+• Working (0s • esc to interrupt)
+
+
+› Ask Codex to do anything
+
+  gpt-5.5 default · /tmp/project

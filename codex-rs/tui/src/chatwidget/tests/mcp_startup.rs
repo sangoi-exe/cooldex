@@ -1,4 +1,7 @@
 use super::*;
+use codex_protocol::protocol::McpStartupCompleteEvent;
+use codex_protocol::protocol::McpStartupStatus;
+use codex_protocol::protocol::McpStartupUpdateEvent;
 use pretty_assertions::assert_eq;
 
 // Merge-safety anchor: MCP startup warning assertions and the directly coupled

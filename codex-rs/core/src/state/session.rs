@@ -1,7 +1,5 @@
 //! Session-wide mutable state.
 
-use codex_instructions::AGENTS_MD_FRAGMENT;
-use codex_instructions::SKILL_FRAGMENT;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
@@ -10,8 +8,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::agent_identity::RegisteredAgentTask;
+use crate::context::is_agent_or_skill_instructions_fragment;
+use crate::context::is_prompt_gc_contextual_fragment;
 use crate::context_manager::ContextManager;
-use crate::contextual_user_message::is_prompt_gc_contextual_fragment;
 use crate::response_item_utils::is_unified_exec_output_frame;
 use crate::response_item_utils::is_unified_exec_token_qty_marker_line;
 use crate::rid::rid_to_string;
@@ -592,9 +591,7 @@ impl SessionState {
 fn prune_category_for_item(item: &ResponseItem) -> PruneCategory {
     match item {
         ResponseItem::Message { role, content, .. } if role == "user" => {
-            if first_text(content).is_some_and(|text| {
-                AGENTS_MD_FRAGMENT.matches_text(text) || SKILL_FRAGMENT.matches_text(text)
-            }) {
+            if content.iter().any(is_agent_or_skill_instructions_fragment) {
                 PruneCategory::UserInstructions
             } else if is_environment_context_message(content) {
                 PruneCategory::EnvironmentContext

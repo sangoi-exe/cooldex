@@ -46,12 +46,14 @@ use base64::Engine;
 use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::McpServerStatusDetail;
 use codex_config::types::McpServerTransportConfig;
+use codex_mcp::qualified_mcp_tool_name_prefix;
 use codex_otel::RuntimeMetricsSummary;
 use codex_protocol::account::PlanType;
-use codex_protocol::config_types::ServiceTier;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceTemplate;
+use codex_protocol::models::ManagedFileSystemPermissions;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::WebSearchAction;
 use codex_protocol::models::local_image_label_text;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -62,7 +64,6 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::McpAuthStatus;
 use codex_protocol::protocol::McpInvocation;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
@@ -77,6 +78,7 @@ use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::style::Styled;
 use ratatui::style::Stylize;
+use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use std::any::Any;
@@ -97,26 +99,6 @@ pub(crate) use hook_cell::HookCell;
 pub(crate) use hook_cell::new_active_hook_cell;
 pub(crate) use hook_cell::new_completed_hook_cell;
 
-fn qualified_mcp_tool_name_prefix(server_name: &str) -> String {
-    let raw = format!("mcp__{server_name}__");
-    let mut sanitized = String::with_capacity(raw.len());
-    for character in raw.chars() {
-        if character.is_ascii_alphanumeric() || character == '_' {
-            sanitized.push(character);
-        } else {
-            sanitized.push('_');
-        }
-    }
-    if sanitized.is_empty() {
-        "_".to_string()
-    } else {
-        sanitized
-    }
-}
-
-/// Represents an event to display in the conversation history. Returns its
-/// `Vec<Line<'static>>` representation to make it easier to display in a
-/// scrollable list.
 /// A single renderable unit of conversation history.
 ///
 /// Each cell produces logical `Line`s and reports how many viewport
@@ -210,6 +192,9 @@ impl Renderable for Box<dyn HistoryCell> {
                 .saturating_sub(usize::from(area.height));
             u16::try_from(overflow).unwrap_or(u16::MAX)
         };
+        // Active-cell content can reflow dramatically during resize/stream updates. Clear the
+        // entire draw area first so stale glyphs from previous frames never linger.
+        Clear.render(area, buf);
         paragraph.scroll((y, 0)).render(area, buf);
     }
     fn desired_height(&self, width: u16) -> u16 {
@@ -427,7 +412,7 @@ impl ReasoningSummaryCell {
         let mut lines: Vec<Line<'static>> = Vec::new();
         append_markdown(
             &self.content,
-            Some((width as usize).saturating_sub(2)),
+            crate::width::usable_content_width_u16(width, /*reserved_cols*/ 2),
             Some(self.cwd.as_path()),
             &mut lines,
         );
@@ -498,6 +483,57 @@ impl HistoryCell for AgentMessageCell {
 
     fn is_stream_continuation(&self) -> bool {
         !self.is_first_line
+    }
+}
+
+/// A consolidated agent message cell that stores raw markdown source and re-renders from it.
+///
+/// After a stream finalizes, the `ConsolidateAgentMessage` handler in `App`
+/// replaces the contiguous run of `AgentMessageCell`s with a single
+/// `AgentMarkdownCell`. On terminal resize, `display_lines(width)` re-renders
+/// from source via `append_markdown`.
+///
+/// The cell snapshots `cwd` at construction so local file-link display remains aligned with the
+/// session that produced the message. Reusing the current process cwd during reflow would make old
+/// transcript content change meaning after a later `/cd` or resumed session.
+#[derive(Debug)]
+pub(crate) struct AgentMarkdownCell {
+    markdown_source: String,
+    cwd: PathBuf,
+}
+
+impl AgentMarkdownCell {
+    /// Create a finalized source-backed assistant message cell.
+    ///
+    /// `markdown_source` must be the raw source accumulated by the stream controller, not already
+    /// wrapped terminal lines. Passing rendered lines here would make future resize reflow preserve
+    /// stale wrapping instead of repairing it.
+    pub(crate) fn new(markdown_source: String, cwd: &Path) -> Self {
+        Self {
+            markdown_source,
+            cwd: cwd.to_path_buf(),
+        }
+    }
+}
+
+impl HistoryCell for AgentMarkdownCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let Some(wrap_width) =
+            crate::width::usable_content_width_u16(width, /*reserved_cols*/ 2)
+        else {
+            return prefix_lines(vec![Line::default()], "• ".dim(), "  ".into());
+        };
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        // Re-render markdown from source at the current width. Reserve 2 columns for the "• " /
+        // " " prefix prepended below.
+        crate::markdown::append_markdown(
+            &self.markdown_source,
+            Some(wrap_width),
+            Some(self.cwd.as_path()),
+            &mut lines,
+        );
+        prefix_lines(lines, "• ".dim(), "  ".into())
     }
 }
 
@@ -1203,7 +1239,7 @@ pub(crate) fn new_session_info(
         model,
         reasoning_effort,
         approval_policy,
-        sandbox_policy,
+        permission_profile,
         ..
     } = event;
     // Header box rendered as history (so it appears at the very top)
@@ -1214,7 +1250,7 @@ pub(crate) fn new_session_info(
         config.cwd.to_path_buf(),
         CODEX_CLI_VERSION,
     )
-    .with_yolo_mode(has_yolo_permissions(approval_policy, &sandbox_policy));
+    .with_yolo_mode(has_yolo_permissions(approval_policy, &permission_profile));
     let mut parts: Vec<Box<dyn HistoryCell>> = vec![Box::new(header)];
 
     if is_first_event {
@@ -1255,12 +1291,7 @@ pub(crate) fn new_session_info(
     } else {
         if config.show_tooltips
             && let Some(tooltips) = tooltip_override
-                .or_else(|| {
-                    tooltips::get_tooltip(
-                        auth_plan,
-                        matches!(config.service_tier, Some(ServiceTier::Fast)),
-                    )
-                })
+                .or_else(|| tooltips::get_tooltip(auth_plan, show_fast_status))
                 .map(|tip| TooltipHistoryCell::new(tip, &config.cwd))
         {
             parts.push(Box::new(tooltips));
@@ -1281,14 +1312,23 @@ pub(crate) fn new_session_info(
 pub(crate) fn is_yolo_mode(config: &Config) -> bool {
     has_yolo_permissions(
         config.permissions.approval_policy.value(),
-        &config
-            .permissions
-            .legacy_sandbox_policy(config.cwd.as_path()),
+        &config.permissions.permission_profile(),
     )
 }
 
-fn has_yolo_permissions(approval_policy: AskForApproval, sandbox_policy: &SandboxPolicy) -> bool {
-    approval_policy == AskForApproval::Never && *sandbox_policy == SandboxPolicy::DangerFullAccess
+fn has_yolo_permissions(
+    approval_policy: AskForApproval,
+    permission_profile: &PermissionProfile,
+) -> bool {
+    approval_policy == AskForApproval::Never
+        && matches!(
+            permission_profile,
+            PermissionProfile::Disabled
+                | PermissionProfile::Managed {
+                    file_system: ManagedFileSystemPermissions::Unrestricted,
+                    network: codex_protocol::protocol::NetworkSandboxPolicy::Enabled,
+                }
+        )
 }
 
 pub(crate) fn new_user_prompt(
@@ -2032,6 +2072,50 @@ pub(crate) fn new_rate_limit_warning_event(message: String) -> PrefixedWrappedHi
     PrefixedWrappedHistoryCell::new(message.yellow(), "⚠  ".yellow(), "  ")
 }
 
+const TRUSTED_ACCESS_FOR_CYBER_URL: &str = "https://chatgpt.com/cyber";
+
+#[derive(Debug)]
+pub(crate) struct CyberPolicyNoticeCell;
+
+pub(crate) fn new_cyber_policy_error_event() -> CyberPolicyNoticeCell {
+    CyberPolicyNoticeCell
+}
+
+impl HistoryCell for CyberPolicyNoticeCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(
+            vec![
+                "ⓘ ".cyan(),
+                "This chat was flagged for possible cybersecurity risk".bold(),
+            ]
+            .into(),
+        );
+
+        let wrap_width = width.saturating_sub(2).max(1) as usize;
+        let body = Line::from(vec![
+            "  If this seems wrong, try rephrasing your request. To get authorized for security work, join the "
+                .dim(),
+            "Trusted Access for Cyber".cyan().underlined(),
+            " program.".dim(),
+        ]);
+        let wrapped = adaptive_wrap_line(
+            &body,
+            RtOptions::new(wrap_width).subsequent_indent("  ".into()),
+        );
+        push_owned_lines(&wrapped, &mut lines);
+        lines.push(
+            vec![
+                "  ".into(),
+                TRUSTED_ACCESS_FOR_CYBER_URL.cyan().underlined(),
+            ]
+            .into(),
+        );
+
+        lines
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct DeprecationNoticeCell {
     summary: String,
@@ -2294,6 +2378,18 @@ pub(crate) fn new_mcp_tools_output_from_statuses(
         let header: Vec<Span<'static>> = vec!["  • ".into(), server.clone().into()];
 
         lines.push(header.into());
+        if matches!(detail, McpServerStatusDetail::Full) {
+            let enabled = cfg.map(|cfg| cfg.enabled).unwrap_or(true);
+            let status_text = if enabled {
+                "enabled".green()
+            } else {
+                "disabled".red()
+            };
+            lines.push(vec!["    • Status: ".into(), status_text].into());
+            if let Some(reason) = cfg.and_then(|cfg| cfg.disabled_reason.as_ref()) {
+                lines.push(vec!["    • Reason: ".into(), reason.to_string().dim()].into());
+            }
+        }
         let auth_status = status
             .map(|status| match status.auth_status {
                 codex_app_server_protocol::McpAuthStatus::Unsupported => McpAuthStatus::Unsupported,
@@ -2644,6 +2740,10 @@ pub(crate) fn new_plan_update(update: UpdatePlanArgs) -> PlanUpdateCell {
 }
 
 /// Create a proposed-plan cell that snapshots the session cwd for later markdown rendering.
+///
+/// The plan body is stored as raw markdown so terminal resize reflow can render it again at the
+/// current width. Callers should use `new_proposed_plan_stream` only for transient live streaming
+/// cells, then consolidate to this source-backed cell when the plan is complete.
 pub(crate) fn new_proposed_plan(plan_markdown: String, cwd: &Path) -> ProposedPlanCell {
     ProposedPlanCell {
         plan_markdown,
@@ -2651,6 +2751,10 @@ pub(crate) fn new_proposed_plan(plan_markdown: String, cwd: &Path) -> ProposedPl
     }
 }
 
+/// Create a transient proposed-plan stream cell from already rendered lines.
+///
+/// Stream cells are display fragments, not source-backed history. They should be replaced by
+/// `ProposedPlanCell` during consolidation before relying on resize reflow for finalized history.
 pub(crate) fn new_proposed_plan_stream(
     lines: Vec<Line<'static>>,
     is_stream_continuation: bool,
@@ -2661,6 +2765,10 @@ pub(crate) fn new_proposed_plan_stream(
     }
 }
 
+/// Finalized proposed-plan history that can render itself again for a new width.
+///
+/// This is the source-backed counterpart to `ProposedPlanStreamCell`. It owns raw markdown and the
+/// session cwd needed for stable local-link rendering during later transcript reflow.
 #[derive(Debug)]
 pub(crate) struct ProposedPlanCell {
     plan_markdown: String,
@@ -2668,6 +2776,11 @@ pub(crate) struct ProposedPlanCell {
     cwd: PathBuf,
 }
 
+/// Transient proposed-plan history emitted while a plan is still streaming.
+///
+/// The lines are already rendered for the stream's current width. A finalized transcript should not
+/// keep these cells after consolidation, because they cannot re-render their source on a later
+/// terminal resize.
 #[derive(Debug)]
 pub(crate) struct ProposedPlanStreamCell {
     lines: Vec<Line<'static>>,
@@ -2909,7 +3022,7 @@ pub struct FinalMessageSeparator {
     runtime_metrics: Option<RuntimeMetricsSummary>,
 }
 impl FinalMessageSeparator {
-    /// Creates a separator; `elapsed_seconds` typically comes from the status indicator timer.
+    /// Creates a separator; completed turns should pass protocol turn duration when available.
     pub(crate) fn new(
         elapsed_seconds: Option<u64>,
         runtime_metrics: Option<RuntimeMetricsSummary>,
@@ -3076,6 +3189,7 @@ mod tests {
     use crate::exec_cell::ExecCell;
     use crate::legacy_core::config::Config;
     use crate::legacy_core::config::ConfigBuilder;
+    use crate::wrapping::word_wrap_lines;
     use codex_config::types::McpServerConfig;
     use codex_config::types::McpServerDisabledReason;
     use codex_otel::RuntimeMetricTotals;
@@ -3091,6 +3205,8 @@ mod tests {
     use codex_protocol::protocol::SessionConfiguredEvent;
     use dirs::home_dir;
     use pretty_assertions::assert_eq;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -3276,7 +3392,7 @@ mod tests {
             service_tier: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
-            permission_profile: codex_protocol::models::PermissionProfile::default(),
+            permission_profile: PermissionProfile::read_only(),
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             cwd: test_path_buf("/tmp/project").abs(),
             reasoning_effort: None,
@@ -3462,6 +3578,20 @@ mod tests {
             },
         ]);
         let rendered = render_lines(&cell.display_lines(/*width*/ 40)).join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn cyber_policy_error_event_snapshot() {
+        let cell = new_cyber_policy_error_event();
+        let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn cyber_policy_error_event_narrow_snapshot() {
+        let cell = new_cyber_policy_error_event();
+        let rendered = render_lines(&cell.display_lines(/*width*/ 36)).join("\n");
         insta::assert_snapshot!(rendered);
     }
 
@@ -3658,6 +3788,61 @@ mod tests {
             &statuses,
             McpServerStatusDetail::ToolsAndAuthOnly,
         );
+        let rendered = render_lines(&cell.display_lines(/*width*/ 120)).join("\n");
+
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_output_from_statuses_renders_verbose_inventory() {
+        let mut config = test_config().await;
+        let plugin_docs =
+            stdio_server_config("docs-server", vec!["--stdio"], /*env*/ None, vec![]);
+        let servers = HashMap::from([("plugin_docs".to_string(), plugin_docs)]);
+        config
+            .mcp_servers
+            .set(servers)
+            .expect("test mcp servers should accept any configuration");
+
+        let statuses = vec![McpServerStatus {
+            name: "plugin_docs".to_string(),
+            tools: HashMap::from([(
+                "lookup".to_string(),
+                Tool {
+                    description: None,
+                    name: "lookup".to_string(),
+                    title: None,
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                    output_schema: None,
+                    annotations: None,
+                    icons: None,
+                    meta: None,
+                },
+            )]),
+            resources: vec![Resource {
+                annotations: None,
+                description: None,
+                mime_type: None,
+                name: "docs".to_string(),
+                size: None,
+                title: Some("Docs".to_string()),
+                uri: "file:///docs".to_string(),
+                icons: None,
+                meta: None,
+            }],
+            resource_templates: vec![ResourceTemplate {
+                annotations: None,
+                uri_template: "file:///docs/{id}".to_string(),
+                name: "doc-template".to_string(),
+                title: Some("Doc Template".to_string()),
+                description: None,
+                mime_type: None,
+            }],
+            auth_status: codex_app_server_protocol::McpAuthStatus::Unsupported,
+        }];
+
+        let cell =
+            new_mcp_tools_output_from_statuses(&config, &statuses, McpServerStatusDetail::Full);
         let rendered = render_lines(&cell.display_lines(/*width*/ 120)).join("\n");
 
         insta::assert_snapshot!(rendered);
@@ -4338,6 +4523,31 @@ mod tests {
 
         let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
         insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn yolo_mode_includes_managed_full_access_profiles() {
+        let permission_profile = PermissionProfile::Managed {
+            file_system: ManagedFileSystemPermissions::Unrestricted,
+            network: codex_protocol::protocol::NetworkSandboxPolicy::Enabled,
+        };
+
+        assert!(has_yolo_permissions(
+            AskForApproval::Never,
+            &permission_profile
+        ));
+    }
+
+    #[test]
+    fn yolo_mode_excludes_external_sandbox_profiles() {
+        let permission_profile = PermissionProfile::External {
+            network: codex_protocol::protocol::NetworkSandboxPolicy::Enabled,
+        };
+
+        assert!(!has_yolo_permissions(
+            AskForApproval::Never,
+            &permission_profile
+        ));
     }
 
     #[test]
@@ -5125,6 +5335,213 @@ mod tests {
                 "⚠ Feature flag `foo`".to_string(),
                 "Use flag `bar` instead.".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn agent_markdown_cell_renders_source_at_different_widths() {
+        let source =
+            "A long agent message that should wrap differently when the terminal width changes.\n";
+        let cell = AgentMarkdownCell::new(source.to_string(), &test_cwd());
+
+        let lines_80 = render_lines(&cell.display_lines(/*width*/ 80));
+        assert!(
+            lines_80.first().is_some_and(|line| line.starts_with("• ")),
+            "first line should start with bullet prefix: {:?}",
+            lines_80[0]
+        );
+
+        let lines_32 = render_lines(&cell.display_lines(/*width*/ 32));
+        assert!(
+            lines_32.len() > lines_80.len(),
+            "narrower width should produce more wrapped lines: {lines_32:?}",
+        );
+    }
+
+    #[test]
+    fn agent_markdown_cell_narrow_width_shows_prefix_only() {
+        let source = "narrow width coverage\n";
+        let cell = AgentMarkdownCell::new(source.to_string(), &test_cwd());
+
+        let lines = render_lines(&cell.display_lines(/*width*/ 2));
+        assert_eq!(lines, vec!["• ".to_string()]);
+    }
+
+    #[test]
+    fn wrapped_and_prefixed_cells_handle_tiny_widths() {
+        let user_cell = UserHistoryCell {
+            message: "tiny width coverage for wrapped user history".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        };
+        let agent_message_cell = AgentMessageCell::new(
+            vec!["tiny width agent line".into()],
+            /*is_first_line*/ true,
+        );
+        let reasoning_cell = ReasoningSummaryCell::new(
+            "Plan".to_string(),
+            "Reasoning summary content for tiny widths.".to_string(),
+            &test_cwd(),
+            /*transcript_only*/ false,
+        );
+        let agent_markdown_cell =
+            AgentMarkdownCell::new("tiny width agent markdown line\n".to_string(), &test_cwd());
+
+        for width in 1..=4 {
+            assert!(
+                !user_cell.display_lines(width).is_empty(),
+                "user cell should render at width {width}",
+            );
+            assert!(
+                !agent_message_cell.display_lines(width).is_empty(),
+                "agent message cell should render at width {width}",
+            );
+            assert!(
+                !reasoning_cell.display_lines(width).is_empty(),
+                "reasoning cell should render at width {width}",
+            );
+            assert!(
+                !agent_markdown_cell.display_lines(width).is_empty(),
+                "agent markdown cell should render at width {width}",
+            );
+        }
+    }
+
+    #[test]
+    fn render_clears_area_when_cell_content_shrinks() {
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+
+        let first: Box<dyn HistoryCell> = Box::new(PlainHistoryCell::new(vec![
+            Line::from("STALE ROW 1"),
+            Line::from("STALE ROW 2"),
+            Line::from("STALE ROW 3"),
+            Line::from("STALE ROW 4"),
+        ]));
+        first.render(area, &mut buf);
+
+        let second: Box<dyn HistoryCell> =
+            Box::new(PlainHistoryCell::new(vec![Line::from("fresh")]));
+        second.render(area, &mut buf);
+
+        let mut rendered_rows: Vec<String> = Vec::new();
+        for y in 0..area.height {
+            let mut row = String::new();
+            for x in 0..area.width {
+                row.push_str(buf.cell((x, y)).expect("cell should exist").symbol());
+            }
+            rendered_rows.push(row);
+        }
+
+        assert!(
+            rendered_rows.iter().all(|row| !row.contains("STALE")),
+            "rendered buffer should not retain stale glyphs: {rendered_rows:?}",
+        );
+        assert!(
+            rendered_rows
+                .first()
+                .is_some_and(|row| row.contains("fresh")),
+            "expected fresh content in first row: {rendered_rows:?}",
+        );
+    }
+
+    #[test]
+    fn agent_markdown_cell_survives_insert_history_rewrap() {
+        let source = "\
+  Canary rollout remained at limited traffic longer than planned because p95
+  latency briefly regressed during cold-cache periods.
+  Regional expansion succeeded with stable error rates, though internal
+  analytics lagged temporarily.
+  ";
+        let cell = AgentMarkdownCell::new(source.to_string(), &test_cwd());
+        let width: u16 = 80;
+        let lines = cell.display_lines(width);
+
+        // Simulate what insert_history_lines does: word_wrap_lines with
+        // the terminal width and no indent.
+        let rewrapped = word_wrap_lines(&lines, width as usize);
+        let before = render_lines(&lines);
+        let after = render_lines(&rewrapped);
+        assert_eq!(
+            before, after,
+            "word_wrap_lines should not alter lines that already fit within width"
+        );
+    }
+
+    /// Simulate the consolidation backward-walk logic from `App::handle_event`
+    /// to verify it correctly identifies and replaces `AgentMessageCell` runs.
+    #[test]
+    fn consolidation_walker_replaces_agent_message_cells() {
+        use std::sync::Arc;
+
+        // Build a transcript with: [UserCell, AgentMsg(head), AgentMsg(cont), AgentMsg(cont)]
+        let user = Arc::new(UserHistoryCell {
+            message: "hello".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>;
+        let head = Arc::new(AgentMessageCell::new(
+            vec![Line::from("line 1")],
+            /*is_first_line*/ true,
+        )) as Arc<dyn HistoryCell>;
+        let cont1 = Arc::new(AgentMessageCell::new(
+            vec![Line::from("line 2")],
+            /*is_first_line*/ false,
+        )) as Arc<dyn HistoryCell>;
+        let cont2 = Arc::new(AgentMessageCell::new(
+            vec![Line::from("line 3")],
+            /*is_first_line*/ false,
+        )) as Arc<dyn HistoryCell>;
+
+        let mut transcript_cells: Vec<Arc<dyn HistoryCell>> =
+            vec![user.clone(), head, cont1, cont2];
+
+        // Run the same consolidation logic as the handler.
+        let source = "line 1\nline 2\nline 3\n".to_string();
+        let end = transcript_cells.len();
+        let mut start = end;
+        while start > 0
+            && transcript_cells[start - 1].is_stream_continuation()
+            && transcript_cells[start - 1]
+                .as_any()
+                .is::<AgentMessageCell>()
+        {
+            start -= 1;
+        }
+        if start > 0
+            && transcript_cells[start - 1]
+                .as_any()
+                .is::<AgentMessageCell>()
+            && !transcript_cells[start - 1].is_stream_continuation()
+        {
+            start -= 1;
+        }
+
+        assert_eq!(
+            start, 1,
+            "should find all 3 agent cells starting at index 1"
+        );
+        assert_eq!(end, 4);
+
+        // Splice.
+        let consolidated: Arc<dyn HistoryCell> =
+            Arc::new(AgentMarkdownCell::new(source, &test_cwd()));
+        transcript_cells.splice(start..end, std::iter::once(consolidated));
+
+        assert_eq!(transcript_cells.len(), 2, "should be [user, consolidated]");
+
+        // Verify first cell is still the user cell.
+        assert!(
+            transcript_cells[0].as_any().is::<UserHistoryCell>(),
+            "first cell should be UserHistoryCell"
+        );
+
+        // Verify second cell is AgentMarkdownCell.
+        assert!(
+            transcript_cells[1].as_any().is::<AgentMarkdownCell>(),
+            "second cell should be AgentMarkdownCell"
         );
     }
 }

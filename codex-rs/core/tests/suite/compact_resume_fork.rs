@@ -60,29 +60,6 @@ fn json_fragment(text: &str) -> String {
         .to_string()
 }
 
-fn filter_out_ghost_snapshot_entries(items: &[Value]) -> Vec<Value> {
-    items
-        .iter()
-        .filter(|item| !is_ghost_snapshot_message(item))
-        .cloned()
-        .collect()
-}
-
-fn is_ghost_snapshot_message(item: &Value) -> bool {
-    if item.get("type").and_then(Value::as_str) != Some("message") {
-        return false;
-    }
-    if item.get("role").and_then(Value::as_str) != Some("user") {
-        return false;
-    }
-    item.get("content")
-        .and_then(Value::as_array)
-        .and_then(|content| content.first())
-        .and_then(|entry| entry.get("text"))
-        .and_then(Value::as_str)
-        .is_some_and(|text| text.trim_start().starts_with("<ghost_snapshot>"))
-}
-
 fn normalize_line_endings_str(text: &str) -> String {
     if text.contains('\r') {
         text.replace("\r\n", "\n").replace('\r', "\n")
@@ -158,7 +135,7 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     // 1. Arrange mocked SSE responses for the initial compact/resume/fork flow.
     let server = MockServer::start().await;
     let request_log = mount_initial_flow(&server).await;
-    let expected_model = "gpt-5.1-codex";
+    let expected_model = "gpt-5.4";
     // 2. Start a new conversation and drive it through the compact/resume/fork steps.
     let (_home, config, manager, base) =
         start_test_conversation(&server, Some(expected_model)).await;
@@ -366,15 +343,13 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
     let resume_input_array = input_after_resume
         .as_array()
         .expect("input after resume should be an array");
-    let compact_filtered = filter_out_ghost_snapshot_entries(compact_input_array);
-    let resume_filtered = filter_out_ghost_snapshot_entries(resume_input_array);
     assert!(
-        compact_filtered.len() <= resume_filtered.len(),
+        compact_input_array.len() <= resume_input_array.len(),
         "after-resume input should have at least as many items as after-compact"
     );
     assert_eq!(
-        compact_filtered.as_slice(),
-        &resume_filtered[..compact_filtered.len()]
+        compact_input_array.as_slice(),
+        &resume_input_array[..compact_input_array.len()]
     );
     let first_request_user_texts = json_message_input_texts(&requests[0], "user");
     let first_turn_user_index = first_request_user_texts
@@ -538,7 +513,7 @@ async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
         return Ok(());
     }
 
-    const MODEL: &str = "gpt-5.1-codex";
+    const MODEL: &str = "gpt-5.4";
     const TURN_ONE_USER: &str = "turn 1 user";
     const TURN_TWO_USER: &str = "turn 2 user";
     const FOLLOWUP_USER: &str = "follow-up user";
@@ -575,6 +550,7 @@ async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: None,
             effort: None,
@@ -803,6 +779,7 @@ async fn start_test_conversation(
 async fn user_turn(conversation: &Arc<CodexThread>, text: &str) {
     conversation
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: text.into(),
                 text_elements: Vec::new(),
@@ -848,6 +825,7 @@ async fn resume_conversation(
     );
     Box::pin(manager.resume_thread_from_rollout(
         config.clone(),
+        codex_core::thread_store_from_config(config),
         path,
         auth_manager,
         /*parent_trace*/ None,
@@ -867,6 +845,7 @@ async fn fork_thread(
     Box::pin(manager.fork_thread(
         nth_user_message,
         config.clone(),
+        codex_core::thread_store_from_config(config),
         path,
         /*persist_extended_history*/ false,
         /*parent_trace*/ None,

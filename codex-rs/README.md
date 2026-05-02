@@ -1,5 +1,7 @@
 # Codex CLI (Rust Implementation)
 
+<!-- Merge-safety anchor: Rust CLI docs are an operator-facing shipped surface; keep install/config guidance aligned with workspace-local CLI customization boundaries. -->
+
 We provide Codex CLI as a standalone executable to ensure a zero-dependency install.
 
 ## Installing Codex
@@ -59,18 +61,21 @@ To test to see what happens when a command is run under the sandbox provided by 
 
 ```
 # macOS
-codex sandbox macos [--full-auto] [--log-denials] [COMMAND]...
+codex sandbox macos [--log-denials] [COMMAND]...
 
 # Linux
-codex sandbox linux [--full-auto] [COMMAND]...
+codex sandbox linux [COMMAND]...
 
 # Windows
-codex sandbox windows [--full-auto] [COMMAND]...
+codex sandbox windows [COMMAND]...
 
 # Legacy aliases
-codex debug seatbelt [--full-auto] [--log-denials] [COMMAND]...
-codex debug landlock [--full-auto] [COMMAND]...
+codex debug seatbelt [--log-denials] [COMMAND]...
+codex debug landlock [COMMAND]...
 ```
+
+To try a writable legacy sandbox mode with these commands, pass an explicit config override such
+as `-c 'sandbox_mode="workspace-write"'`.
 
 ### Selecting a sandbox policy via `--sandbox`
 

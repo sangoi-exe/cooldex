@@ -1,8 +1,7 @@
 //! Startup warnings, model migration prompts, and bootstrap prompt helpers.
 //!
-//! These helpers run before or during `App::run` bootstrap. They translate configuration and
-//! model catalog state into one-time TUI prompts or warning cells without owning the main event
-//! loop.
+//! These helpers run before or during `App::run` bootstrap. They translate configuration and model
+//! catalog state into one-time TUI prompts or warning cells without owning the main event loop.
 
 use super::*;
 
@@ -68,9 +67,7 @@ pub(super) fn emit_project_config_warnings(app_event_tx: &AppEventSender, config
 
 pub(super) fn emit_system_bwrap_warning(app_event_tx: &AppEventSender, config: &Config) {
     let Some(message) = crate::legacy_core::config::system_bwrap_warning(
-        &config
-            .permissions
-            .legacy_sandbox_policy(config.cwd.as_path()),
+        config.permissions.permission_profile.get(),
     ) else {
         return;
     };
@@ -118,6 +115,15 @@ pub(super) fn should_show_model_migration_prompt(
     }
 
     false
+}
+
+pub(super) fn target_preset_for_upgrade<'a>(
+    available_models: &'a [ModelPreset],
+    target_model: &str,
+) -> Option<&'a ModelPreset> {
+    available_models
+        .iter()
+        .find(|preset| preset.model == target_model && preset.show_in_picker)
 }
 
 pub(super) const MODEL_AVAILABILITY_NUX_MAX_SHOW_COUNT: u32 = 4;
@@ -286,7 +292,6 @@ pub(super) async fn handle_model_migration_prompt_if_needed(
 
     None
 }
-
 pub(super) fn normalize_harness_overrides_for_cwd(
     mut overrides: ConfigOverrides,
     base_cwd: &AbsolutePathBuf,
@@ -308,6 +313,9 @@ pub(super) fn normalize_harness_overrides_for_cwd(
 mod tests {
     use super::*;
     use crate::app::test_support::*;
+    use crate::test_support::PathBufExt;
+    use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     #[test]
@@ -332,32 +340,20 @@ mod tests {
     async fn model_migration_prompt_only_shows_for_deprecated_models() {
         let seen = BTreeMap::new();
         assert!(should_show_model_migration_prompt(
-            "gpt-5",
-            "gpt-5.2-codex",
+            "gpt-5.2",
+            "gpt-5.4",
             &seen,
             &all_model_presets()
         ));
         assert!(should_show_model_migration_prompt(
-            "gpt-5-codex",
-            "gpt-5.2-codex",
-            &seen,
-            &all_model_presets()
-        ));
-        assert!(should_show_model_migration_prompt(
-            "gpt-5-codex-mini",
-            "gpt-5.2-codex",
-            &seen,
-            &all_model_presets()
-        ));
-        assert!(should_show_model_migration_prompt(
-            "gpt-5.1-codex",
-            "gpt-5.2-codex",
+            "gpt-5.3-codex",
+            "gpt-5.4",
             &seen,
             &all_model_presets()
         ));
         assert!(!should_show_model_migration_prompt(
-            "gpt-5.1-codex",
-            "gpt-5.1-codex",
+            "gpt-5.3-codex",
+            "gpt-5.3-codex",
             &seen,
             &all_model_presets()
         ));
@@ -370,10 +366,10 @@ mod tests {
         });
         let target = presets
             .iter_mut()
-            .find(|preset| preset.model == "gpt-5")
+            .find(|preset| preset.model == "gpt-5.4")
             .expect("target preset present");
         target.availability_nux = Some(ModelAvailabilityNux {
-            message: "gpt-5 is available".to_string(),
+            message: "gpt-5.4 is available".to_string(),
         });
 
         let selected = select_model_availability_nux(&presets, &model_availability_nux_config(&[]));
@@ -381,8 +377,8 @@ mod tests {
         assert_eq!(
             selected,
             Some(StartupTooltipOverride {
-                model_slug: "gpt-5".to_string(),
-                message: "gpt-5 is available".to_string(),
+                model_slug: "gpt-5.4".to_string(),
+                message: "gpt-5.4 is available".to_string(),
             })
         );
     }
@@ -394,29 +390,29 @@ mod tests {
         });
         let gpt_5 = presets
             .iter_mut()
-            .find(|preset| preset.model == "gpt-5")
-            .expect("gpt-5 preset present");
+            .find(|preset| preset.model == "gpt-5.4")
+            .expect("gpt-5.4 preset present");
         gpt_5.availability_nux = Some(ModelAvailabilityNux {
-            message: "gpt-5 is available".to_string(),
+            message: "gpt-5.4 is available".to_string(),
         });
         let gpt_5_2 = presets
             .iter_mut()
-            .find(|preset| preset.model == "gpt-5.2")
-            .expect("gpt-5.2 preset present");
+            .find(|preset| preset.model == "gpt-5.4-mini")
+            .expect("gpt-5.4-mini preset present");
         gpt_5_2.availability_nux = Some(ModelAvailabilityNux {
-            message: "gpt-5.2 is available".to_string(),
+            message: "gpt-5.4-mini is available".to_string(),
         });
 
         let selected = select_model_availability_nux(
             &presets,
-            &model_availability_nux_config(&[("gpt-5", MODEL_AVAILABILITY_NUX_MAX_SHOW_COUNT)]),
+            &model_availability_nux_config(&[("gpt-5.4", MODEL_AVAILABILITY_NUX_MAX_SHOW_COUNT)]),
         );
 
         assert_eq!(
             selected,
             Some(StartupTooltipOverride {
-                model_slug: "gpt-5.2".to_string(),
-                message: "gpt-5.2 is available".to_string(),
+                model_slug: "gpt-5.4-mini".to_string(),
+                message: "gpt-5.4-mini is available".to_string(),
             })
         );
     }
@@ -428,15 +424,15 @@ mod tests {
         });
         let first = presets
             .iter_mut()
-            .find(|preset| preset.model == "gpt-5")
-            .expect("gpt-5 preset present");
+            .find(|preset| preset.model == "gpt-5.4-mini")
+            .expect("gpt-5.4-mini preset present");
         first.availability_nux = Some(ModelAvailabilityNux {
             message: "first".to_string(),
         });
         let second = presets
             .iter_mut()
-            .find(|preset| preset.model == "gpt-5.2")
-            .expect("gpt-5.2 preset present");
+            .find(|preset| preset.model == "gpt-5.4")
+            .expect("gpt-5.4 preset present");
         second.availability_nux = Some(ModelAvailabilityNux {
             message: "second".to_string(),
         });
@@ -446,7 +442,7 @@ mod tests {
         assert_eq!(
             selected,
             Some(StartupTooltipOverride {
-                model_slug: "gpt-5.2".to_string(),
+                model_slug: "gpt-5.4".to_string(),
                 message: "second".to_string(),
             })
         );
@@ -459,15 +455,15 @@ mod tests {
         });
         let target = presets
             .iter_mut()
-            .find(|preset| preset.model == "gpt-5")
+            .find(|preset| preset.model == "gpt-5.4")
             .expect("target preset present");
         target.availability_nux = Some(ModelAvailabilityNux {
-            message: "gpt-5 is available".to_string(),
+            message: "gpt-5.4 is available".to_string(),
         });
 
         let selected = select_model_availability_nux(
             &presets,
-            &model_availability_nux_config(&[("gpt-5", MODEL_AVAILABILITY_NUX_MAX_SHOW_COUNT)]),
+            &model_availability_nux_config(&[("gpt-5.4", MODEL_AVAILABILITY_NUX_MAX_SHOW_COUNT)]),
         );
 
         assert_eq!(selected, None);
@@ -475,16 +471,16 @@ mod tests {
     #[tokio::test]
     async fn model_migration_prompt_respects_seen_mapping_and_self_target() {
         let mut seen = BTreeMap::new();
-        seen.insert("gpt-5".to_string(), "gpt-5.1".to_string());
+        seen.insert("gpt-5.2".to_string(), "gpt-5.4".to_string());
         assert!(!should_show_model_migration_prompt(
-            "gpt-5",
-            "gpt-5.1",
+            "gpt-5.2",
+            "gpt-5.4",
             &seen,
             &all_model_presets()
         ));
         assert!(!should_show_model_migration_prompt(
-            "gpt-5.1",
-            "gpt-5.1",
+            "gpt-5.4",
+            "gpt-5.4",
             &seen,
             &all_model_presets()
         ));
@@ -494,7 +490,7 @@ mod tests {
         let mut available = all_model_presets();
         let mut current = available
             .iter()
-            .find(|preset| preset.model == "gpt-5-codex")
+            .find(|preset| preset.model == "gpt-5.2")
             .cloned()
             .expect("preset present");
         current.upgrade = Some(ModelUpgrade {
@@ -504,7 +500,7 @@ mod tests {
             upgrade_copy: None,
             migration_markdown: None,
         });
-        available.retain(|preset| preset.model != "gpt-5-codex");
+        available.retain(|preset| preset.model != "gpt-5.2");
         available.push(current.clone());
 
         assert!(!should_show_model_migration_prompt(
@@ -519,16 +515,16 @@ mod tests {
         let mut with_hidden_target = all_model_presets();
         let target = with_hidden_target
             .iter_mut()
-            .find(|preset| preset.model == "gpt-5.2-codex")
+            .find(|preset| preset.model == "gpt-5.4")
             .expect("target preset present");
         target.show_in_picker = false;
 
         assert!(!should_show_model_migration_prompt(
-            "gpt-5-codex",
-            "gpt-5.2-codex",
+            "gpt-5.2",
+            "gpt-5.4",
             &BTreeMap::new(),
             &with_hidden_target,
         ));
-        assert!(target_preset_for_upgrade(&with_hidden_target, "gpt-5.2-codex").is_none());
+        assert!(target_preset_for_upgrade(&with_hidden_target, "gpt-5.4").is_none());
     }
 }

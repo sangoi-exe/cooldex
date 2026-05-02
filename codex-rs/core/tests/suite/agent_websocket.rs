@@ -38,13 +38,8 @@ async fn websocket_test_codex_shell_chain() -> Result<()> {
     let mut builder = test_codex().with_windows_cmd_shell();
 
     let test = builder.build_with_websocket_server(&server).await?;
-    test.submit_turn_with_policy(
-        "run the echo command",
-        test.config
-            .permissions
-            .legacy_sandbox_policy(test.config.cwd.as_path()),
-    )
-    .await?;
+    test.submit_turn_with_policy("run the echo command", test.config.legacy_sandbox_policy())
+        .await?;
 
     let connection = server.single_connection();
     assert_eq!(connection.len(), 2);
@@ -87,13 +82,8 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()> {
 
     let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
-    test.submit_turn_with_policy(
-        "hello",
-        test.config
-            .permissions
-            .legacy_sandbox_policy(test.config.cwd.as_path()),
-    )
-    .await?;
+    test.submit_turn_with_policy("hello", test.config.legacy_sandbox_policy())
+        .await?;
 
     assert_eq!(server.handshakes().len(), 1);
     let connection = server.single_connection();
@@ -139,13 +129,8 @@ async fn websocket_first_turn_handles_handshake_delay_with_startup_prewarm() -> 
 
     let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
-    test.submit_turn_with_policy(
-        "hello",
-        test.config
-            .permissions
-            .legacy_sandbox_policy(test.config.cwd.as_path()),
-    )
-    .await?;
+    test.submit_turn_with_policy("hello", test.config.legacy_sandbox_policy())
+        .await?;
 
     assert_eq!(server.handshakes().len(), 1);
     let connection = server.single_connection();
@@ -197,13 +182,8 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
     });
 
     let test = builder.build_with_websocket_server(&server).await?;
-    test.submit_turn_with_policy(
-        "run the echo command",
-        test.config
-            .permissions
-            .legacy_sandbox_policy(test.config.cwd.as_path()),
-    )
-    .await?;
+    test.submit_turn_with_policy("run the echo command", test.config.legacy_sandbox_policy())
+        .await?;
 
     let connection = server.single_connection();
     assert_eq!(connection.len(), 3);
