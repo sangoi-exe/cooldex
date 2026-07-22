@@ -74,11 +74,13 @@ This checkpoint adds no Rust, schema, wire, or product behavior. The current req
 set for later implementation review is:
 
 1. bounded context continuity, including an args-less bounded `recall` surface;
-2. explicit MultiAgentV2 policy, namespace-correct guidance, and atomic full-history
-   parent identity;
+2. explicit MultiAgentV2 policy, tool-contract parity, and atomic full-history parent
+   identity;
 3. one instance-owned local app-server child lifecycle for each eligible TUI instance;
 4. one V2-only `subagent_instructions_file` configuration seam; and
-5. one `include_global_agents_md` gate that affects only global instruction inclusion.
+5. one `include_global_agents_md` gate over the complete global instruction provider; and
+6. one stateful Responses-to-Cursor gateway owned by `cooldex-auth-proxy` without a Rust
+   Cursor backend or embedded Cursor runtime.
 
 The PRD/RFC in the separate `.sangoi` repository owns requirement detail and deferred
 implementation decisions. Do not infer shipped behavior from this inventory.
@@ -423,10 +425,14 @@ Last reviewed: 2026-07-22 on `master-refactor-v2` at upstream base
 
 - `/home/lucas/work/codex/AGENTS.md` — local policy, exact upstream core, active mirror,
   and root map.
-- `/home/lucas/work/codex/.sangoi/planning/2026-07-22-refresh-master-refactor-v2-upstream-policy.md`
+- `/home/lucas/work/codex/.sangoi/planning/2026-07-22-tighten-master-refactor-v2-product-contracts.md`
   — canonical active implementation plan.
 - `/home/lucas/work/codex/.sangoi/reference/areas/master-refactor-v2-prd-rfc.md` — current
   product requirements and architecture boundary.
+- `/home/lucas/work/codex/.sangoi/chatgpt-pro/cursor-artefatos/` — approved supporting
+  Cursor input artifacts; the RFC, not this directory, owns product decisions.
+- `/home/lucas/work/cooldex-auth-proxy` — read-only current owner for the planned Cursor
+  gateway runtime.
 - `/home/lucas/work/codex/codex-rs/tui/src/bottom_pane/AGENTS.md` — current subtree
   instruction owner.
 
