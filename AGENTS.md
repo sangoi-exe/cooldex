@@ -48,7 +48,10 @@ Bookkeeping topology: `split`
   runtime implementation deferred. The checkpoint also ignores the extracted Cursor
   installation, versions only the two approved research artifacts, removes Windows
   `Zone.Identifier` metadata, and grounds the Cursor contract in a pinned current CLI
-  package used strictly as source evidence.
+  package used strictly as source evidence. The independent AgentService route remains
+  disabled unless written employer/Anysphere authority permits the exact
+  client/schema/probe activity; the supported SDK is documented but remains outside this
+  product route because it would own the Cursor runtime/harness.
 - Confirmed paraphrased user-request summary: Keep the freshly rebuilt
   `master-refactor-v2` branch and its important root instructions, repair the PRD/RFC
   according to the supplied ChatGPT Pro review, and add a planned Cursor integration in
