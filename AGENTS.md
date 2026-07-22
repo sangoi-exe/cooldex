@@ -24,11 +24,13 @@ Bookkeeping topology: `split`
 - Do not fix an upstream bug or suspected upstream bug in this fork unless direct causal
   evidence shows that it affects the local harness, an approved island or its minimal
   seam, agent runtime performance, or token/context consumption.
-- Outside those four exceptions, search the upstream issue tracker first. React with a
-  thumbs-up to an existing matching issue; otherwise file a new issue with the current
-  matching template under `.github/ISSUE_TEMPLATE/`, a redacted reproduction, and the
-  required environment/version evidence. Do not add a local workaround, backport, or
-  regression-test owner for that defect.
+- Outside those four exceptions, first reproduce or otherwise verify the suspected defect
+  on current upstream without relying on fork-owned behavior. Then search the upstream
+  issue tracker: react with a thumbs-up to an existing matching issue, or file a new issue
+  with the current matching template under `.github/ISSUE_TEMPLATE/`, a redacted
+  reproduction, and the required environment/version evidence. If current upstream does
+  not reproduce the defect, reclassify it before any action instead of reporting it as an
+  upstream bug. Do not add a local workaround, backport, or regression-test owner.
 - Meeting an exception makes a local fix eligible for scoped planning; it does not widen
   the current task automatically.
 
