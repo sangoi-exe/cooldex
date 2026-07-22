@@ -54,9 +54,9 @@ Bookkeeping topology: `split`
   instructions and PRD/RFC concisely, and make upstream defects outside the
   harness/islands/performance/token exceptions issue-only rather than fork fixes.
 - Major stop conditions:
-  - Stop if `upstream/main` no longer resolves to
-    `6e5a2d6b8d148a5554fdceb6f399ca45bd1c78d9` before ref mutation or publication;
-    changing the target requires fresh recon and a plan amendment.
+  - The finite current-upstream cutoff is `6e5a2d6b8d148a5554fdceb6f399ca45bd1c78d9`,
+    frozen by the fresh fetched and remote read that admitted this Challenger. Later
+    upstream advances are observation-only for this task and do not reopen the target.
   - Stop if root or `.sangoi` branch identity changes, new task-relevant contamination
     appears, or a planned compare-and-swap ref update does not match its recorded old
     OID.
