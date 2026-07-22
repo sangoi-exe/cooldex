@@ -46,8 +46,9 @@ Bookkeeping topology: `split`
   identified in the five existing fork requirements, adds a sixth requirement for a
   stateful Responses-to-Cursor gateway owned by `cooldex-auth-proxy`, and keeps every
   runtime implementation deferred. The checkpoint also ignores the extracted Cursor
-  installation, versions only the two approved research artifacts, and removes Windows
-  `Zone.Identifier` metadata.
+  installation, versions only the two approved research artifacts, removes Windows
+  `Zone.Identifier` metadata, and grounds the Cursor contract in a pinned current CLI
+  package used strictly as source evidence.
 - Confirmed paraphrased user-request summary: Keep the freshly rebuilt
   `master-refactor-v2` branch and its important root instructions, repair the PRD/RFC
   according to the supplied ChatGPT Pro review, and add a planned Cursor integration in
@@ -55,7 +56,10 @@ Bookkeeping topology: `split`
   while the proxy translates statefully to Cursor. Do not add a Cursor backend to Rust
   or use a hosts-file MITM. Treat Remote Compaction V2 as part of the normal
   `/responses` translation contract, ignore the large extracted Cursor tree, version the
-  two substantive ChatGPT Pro artifacts, and delete all `Zone.Identifier` files.
+  two substantive ChatGPT Pro artifacts, and delete all `Zone.Identifier` files. Use the
+  current official Cursor CLI package as the primary static protocol and probe source
+  because it is smaller and closer to the supported headless client than the IDE bundle,
+  but never embed, invoke, or depend on that CLI in the product runtime.
 - Major stop conditions:
   - Stop if either branch, the locked Git objects, the delimited upstream `AGENTS.md`
     core, or the separate `.sangoi` repository differs from the identities below.
