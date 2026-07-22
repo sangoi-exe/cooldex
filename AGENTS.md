@@ -1,3 +1,89 @@
+# Cooldex Workspace Rules
+
+Bookkeeping topology: `split`
+
+## Local Baseline
+
+- When the operator says `main`, use the local branch named `main`.
+- The supported operator path is WSL with ChatGPT Pro authentication through ordinary
+  `codex`/`cdx` TUI or exec sessions.
+- Current upstream structure and behavior are the baseline. Add only approved fork-owned
+  islands and the smallest native seams required to reach them.
+- Keep `.github/**` and upstream API/wire behavior upstream-owned unless the current user
+  explicitly changes that scope.
+- Resolve upstream conflicts manually from the canonical owner outward. Do not use
+  whole-side conflict selection or preserve obsolete local paths through aliases,
+  wrappers, dual reads, or fallback adapters.
+- Stop when branch identity, locked Git objects, the separate `.sangoi` repository,
+  upstream instruction bytes, or review authority differs from the active plan.
+- The delimited upstream core below must remain byte-identical to the blob named by its
+  opening marker. Local policy belongs outside that core.
+
+## Upstream Defect Policy
+
+- Do not fix an upstream bug or suspected upstream bug in this fork unless direct causal
+  evidence shows that it affects the local harness, an approved island or its minimal
+  seam, agent runtime performance, or token/context consumption.
+- Outside those four exceptions, search the upstream issue tracker first. React with a
+  thumbs-up to an existing matching issue; otherwise file a new issue with the current
+  matching template under `.github/ISSUE_TEMPLATE/`, a redacted reproduction, and the
+  required environment/version evidence. Do not add a local workaround, backport, or
+  regression-test owner for that defect.
+- Meeting an exception makes a local fix eligible for scoped planning; it does not widen
+  the current task automatically.
+
+## Active Plan Mirror
+
+<!-- task-bookkeeping:mirror:begin -->
+- Status: active
+- Mode: `Doctrine`.
+- Root branch: `master-refactor-v2`.
+- `.sangoi` branch: `master-refactor-v2`.
+- Canonical plan: `.sangoi/planning/2026-07-22-refresh-master-refactor-v2-upstream-policy.md`.
+- What we are creating: Rebuild `master-refactor-v2` directly on the current
+  `upstream/main`, keep only the small root governance layer and current fork
+  requirements, replace the bloated PRD/RFC with a concise current-upstream design, and
+  establish an upstream-bug policy that permits local fixes only for direct harness,
+  approved-island, agent-performance, or token/context impact. The prior custom
+  instruction checker and its proof architecture are deleted with no replacement.
+- Confirmed paraphrased user-request summary: Synchronize local `main` with current
+  `upstream/main`, recreate `master-refactor-v2` from that exact base, remove the
+  checker and documentation bloat created by the prior session, rewrite the root
+  instructions and PRD/RFC concisely, and make upstream defects outside the
+  harness/islands/performance/token exceptions issue-only rather than fork fixes.
+- Major stop conditions:
+  - Stop if `upstream/main` no longer resolves to
+    `963cda85aa2a4cfb85e52d771d22d9f3069951fa` before ref mutation or publication;
+    changing the target requires fresh recon and a plan amendment.
+  - Stop if root or `.sangoi` branch identity changes, new task-relevant contamination
+    appears, or a planned compare-and-swap ref update does not match its recorded old
+    OID.
+<!-- task-bookkeeping:mirror:end -->
+
+## Planned Fork Requirements — Not Shipped
+
+This checkpoint adds no Rust, schema, wire, or product behavior. The current requirement
+set for later implementation review is:
+
+1. bounded context continuity, including an args-less bounded `recall` surface;
+2. explicit MultiAgentV2 policy, namespace-correct guidance, and atomic full-history
+   parent identity;
+3. one instance-owned local app-server child lifecycle for each eligible TUI instance;
+4. one V2-only `subagent_instructions_file` configuration seam; and
+5. one `include_global_agents_md` gate that affects only global instruction inclusion.
+
+The PRD/RFC in the separate `.sangoi` repository owns requirement detail and deferred
+implementation decisions. Do not infer shipped behavior from this inventory.
+
+## Repository Boundaries
+
+- `.sangoi/` is a separate Git repository and is intentionally ignored by the root
+  repository. Commit, inspect, and publish its artifacts from the inner repository.
+- Name both branch/OID pairs whenever a task owns artifacts in both repositories.
+- Root commits materially authored by Codex include the exact trailer
+  `Co-authored-by: Codex <codex@openai.com>` unless the user explicitly says otherwise.
+
+<!-- upstream-agents-core:begin blob=faa57cc0db48123e1011f1eb47692cd3bbbcfc3a source=upstream/main -->
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:
@@ -320,3 +406,20 @@ Tests and features must support Linux, macOS and Windows unless feature is expli
 
 Codex supports running connected app-server and exec-server on different operating systems. See the
 `$remote-tests` skill for details about integration testing these configurations.
+<!-- upstream-agents-core:end -->
+
+## Cooldex Root Atlas
+
+Last reviewed: 2026-07-22 on `master-refactor-v2` at upstream base
+`963cda85aa2a4cfb85e52d771d22d9f3069951fa`.
+
+- `/home/lucas/work/codex/AGENTS.md` — local policy, exact upstream core, active mirror,
+  and root map.
+- `/home/lucas/work/codex/.sangoi/planning/2026-07-22-refresh-master-refactor-v2-upstream-policy.md`
+  — canonical active implementation plan.
+- `/home/lucas/work/codex/.sangoi/reference/areas/master-refactor-v2-prd-rfc.md` — current
+  product requirements and architecture boundary.
+- `/home/lucas/work/codex/codex-rs/tui/src/bottom_pane/AGENTS.md` — current subtree
+  instruction owner.
+
+This Atlas is an owner index, not a call graph or a claim that planned behavior ships.
