@@ -37,22 +37,28 @@ Bookkeeping topology: `split`
 ## Active Plan Mirror
 
 <!-- task-bookkeeping:mirror:begin -->
-- Status: no active plan.
-- Completed mode: `Doctrine`.
+- Status: active
+- Mode: `Doctrine`.
 - Root branch: `master-refactor-v2`.
 - `.sangoi` branch: `master-refactor-v2`.
-- Completed plan: `.sangoi/planning/2026-07-22-refresh-master-refactor-v2-upstream-policy.md`.
-- Completed outcome: Rebuilt `master-refactor-v2` directly on the current
-  `upstream/main`, kept only the small root governance layer and current fork
-  requirements, replaced the bloated PRD/RFC with a concise current-upstream design, and
-  established an upstream-bug policy that permits local fixes only for direct harness,
-  approved-island, agent-performance, or token/context impact. The prior custom
-  instruction checker and its proof architecture were deleted with no replacement.
-- Completed user-request summary: Synchronize local `main` with current `upstream/main`,
-  recreate `master-refactor-v2` from that exact base, remove the checker and
-  documentation bloat created by the prior session, rewrite the root instructions and
-  PRD/RFC concisely, and make upstream defects outside the
-  harness/islands/performance/token exceptions issue-only rather than fork fixes.
+- Canonical plan: `.sangoi/planning/2026-07-22-tighten-master-refactor-v2-product-contracts.md`.
+- What we are creating: A reviewed documentation checkpoint that closes the ambiguity
+  identified in the five existing fork requirements, adds a sixth requirement for a
+  stateful Responses-to-Cursor gateway owned by `cooldex-auth-proxy`, and keeps every
+  runtime implementation deferred. The checkpoint also ignores the extracted Cursor
+  installation, versions only the two approved research artifacts, and removes Windows
+  `Zone.Identifier` metadata.
+- Confirmed paraphrased user-request summary: Keep the freshly rebuilt
+  `master-refactor-v2` branch and its important root instructions, repair the PRD/RFC
+  according to the supplied ChatGPT Pro review, and add a planned Cursor integration in
+  which ordinary Cooldex continues speaking the Responses API to the local auth proxy
+  while the proxy translates statefully to Cursor. Do not add a Cursor backend to Rust
+  or use a hosts-file MITM. Treat Remote Compaction V2 as part of the normal
+  `/responses` translation contract, ignore the large extracted Cursor tree, version the
+  two substantive ChatGPT Pro artifacts, and delete all `Zone.Identifier` files.
+- Major stop conditions:
+  - Stop if either branch, the locked Git objects, the delimited upstream `AGENTS.md`
+    core, or the separate `.sangoi` repository differs from the identities below.
 <!-- task-bookkeeping:mirror:end -->
 
 ## Planned Fork Requirements — Not Shipped
