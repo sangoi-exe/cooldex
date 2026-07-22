@@ -37,28 +37,24 @@ Bookkeeping topology: `split`
 ## Active Plan Mirror
 
 <!-- task-bookkeeping:mirror:begin -->
-- Status: active
-- Mode: `Doctrine`.
+- Status: no active plan.
+- Completed mode: `Doctrine`.
 - Root branch: `master-refactor-v2`.
 - `.sangoi` branch: `master-refactor-v2`.
-- Canonical plan: `.sangoi/planning/2026-07-22-tighten-master-refactor-v2-product-contracts.md`.
-- What we are creating: A reviewed documentation checkpoint that makes the five original
+- Completed plan: `.sangoi/planning/2026-07-22-tighten-master-refactor-v2-product-contracts.md`.
+- Completed outcome: A reviewed documentation checkpoint that makes the five original
   fork requirements decision-complete while keeping every runtime implementation
   deferred. The previously planned Cursor gateway is no longer an active requirement:
   its two approved artifacts and the ignore rule remain as deferred evidence only, with
   no probe, runtime, configuration, or acceptance contract. The checkpoint preserves the
   root testing guidance, upstream core, upstream-first policy, and issue-only handling
   for unrelated upstream defects.
-- Confirmed paraphrased user-request summary: Keep the freshly rebuilt
-  `master-refactor-v2` branch and its important root instructions, finish the supplied
-  PRD/RFC corrections for the five original requirements, remove the Cursor workaround
-  from active product scope, retain its approved artifacts in standby, and publish the
-  reviewed root and `.sangoi` documentation checkpoints. Do not change Rust, the proxy
-  runtime, public wire behavior, or unrelated workspace state.
-- Major stop conditions:
-  - Stop if either branch, the locked Git objects, the byte-delimited upstream
-    `AGENTS.md` core, or the separate `.sangoi` repository differs from the identities
-    below.
+- Completed user-request summary: Keep the freshly rebuilt `master-refactor-v2` branch
+  and its important root instructions, finish the supplied PRD/RFC corrections for the
+  five original requirements, remove the Cursor workaround from active product scope,
+  retain its approved artifacts in standby, and publish the reviewed root and `.sangoi`
+  documentation checkpoints. Do not change Rust, the proxy runtime, public wire
+  behavior, or unrelated workspace state.
 <!-- task-bookkeeping:mirror:end -->
 
 ## Planned Fork Requirements — Not Shipped
