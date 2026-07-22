@@ -55,7 +55,7 @@ Bookkeeping topology: `split`
   harness/islands/performance/token exceptions issue-only rather than fork fixes.
 - Major stop conditions:
   - Stop if `upstream/main` no longer resolves to
-    `963cda85aa2a4cfb85e52d771d22d9f3069951fa` before ref mutation or publication;
+    `6e5a2d6b8d148a5554fdceb6f399ca45bd1c78d9` before ref mutation or publication;
     changing the target requires fresh recon and a plan amendment.
   - Stop if root or `.sangoi` branch identity changes, new task-relevant contamination
     appears, or a planned compare-and-swap ref update does not match its recorded old
@@ -413,7 +413,7 @@ Codex supports running connected app-server and exec-server on different operati
 ## Cooldex Root Atlas
 
 Last reviewed: 2026-07-22 on `master-refactor-v2` at upstream base
-`963cda85aa2a4cfb85e52d771d22d9f3069951fa`.
+`6e5a2d6b8d148a5554fdceb6f399ca45bd1c78d9`.
 
 - `/home/lucas/work/codex/AGENTS.md` — local policy, exact upstream core, active mirror,
   and root map.
