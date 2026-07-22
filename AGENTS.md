@@ -37,29 +37,22 @@ Bookkeeping topology: `split`
 ## Active Plan Mirror
 
 <!-- task-bookkeeping:mirror:begin -->
-- Status: active
-- Mode: `Doctrine`.
+- Status: no active plan.
+- Completed mode: `Doctrine`.
 - Root branch: `master-refactor-v2`.
 - `.sangoi` branch: `master-refactor-v2`.
-- Canonical plan: `.sangoi/planning/2026-07-22-refresh-master-refactor-v2-upstream-policy.md`.
-- What we are creating: Rebuild `master-refactor-v2` directly on the current
-  `upstream/main`, keep only the small root governance layer and current fork
-  requirements, replace the bloated PRD/RFC with a concise current-upstream design, and
-  establish an upstream-bug policy that permits local fixes only for direct harness,
+- Completed plan: `.sangoi/planning/2026-07-22-refresh-master-refactor-v2-upstream-policy.md`.
+- Completed outcome: Rebuilt `master-refactor-v2` directly on the current
+  `upstream/main`, kept only the small root governance layer and current fork
+  requirements, replaced the bloated PRD/RFC with a concise current-upstream design, and
+  established an upstream-bug policy that permits local fixes only for direct harness,
   approved-island, agent-performance, or token/context impact. The prior custom
-  instruction checker and its proof architecture are deleted with no replacement.
-- Confirmed paraphrased user-request summary: Synchronize local `main` with current
-  `upstream/main`, recreate `master-refactor-v2` from that exact base, remove the
-  checker and documentation bloat created by the prior session, rewrite the root
-  instructions and PRD/RFC concisely, and make upstream defects outside the
+  instruction checker and its proof architecture were deleted with no replacement.
+- Completed user-request summary: Synchronize local `main` with current `upstream/main`,
+  recreate `master-refactor-v2` from that exact base, remove the checker and
+  documentation bloat created by the prior session, rewrite the root instructions and
+  PRD/RFC concisely, and make upstream defects outside the
   harness/islands/performance/token exceptions issue-only rather than fork fixes.
-- Major stop conditions:
-  - The finite current-upstream cutoff is `6e5a2d6b8d148a5554fdceb6f399ca45bd1c78d9`,
-    frozen by the fresh fetched and remote read that admitted this Challenger. Later
-    upstream advances are observation-only for this task and do not reopen the target.
-  - Stop if root or `.sangoi` branch identity changes, new task-relevant contamination
-    appears, or a planned compare-and-swap ref update does not match its recorded old
-    OID.
 <!-- task-bookkeeping:mirror:end -->
 
 ## Planned Fork Requirements — Not Shipped
