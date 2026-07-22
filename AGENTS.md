@@ -42,30 +42,23 @@ Bookkeeping topology: `split`
 - Root branch: `master-refactor-v2`.
 - `.sangoi` branch: `master-refactor-v2`.
 - Canonical plan: `.sangoi/planning/2026-07-22-tighten-master-refactor-v2-product-contracts.md`.
-- What we are creating: A reviewed documentation checkpoint that closes the ambiguity
-  identified in the five existing fork requirements, adds a sixth requirement for a
-  stateful Responses-to-Cursor gateway owned by `cooldex-auth-proxy`, and keeps every
-  runtime implementation deferred. The checkpoint also ignores the extracted Cursor
-  installation, versions only the two approved input artifacts, removes Windows
-  `Zone.Identifier` metadata, and grounds the Cursor contract in a pinned current CLI
-  fact snapshot used strictly as technical input. The protocol facts are direct task
-  input; their acquisition method is outside this plan and any future refresh is a
-  separate Fast-path handoff. The supported SDK is documented but remains outside this
-  product route because it would own the Cursor runtime/harness.
+- What we are creating: A reviewed documentation checkpoint that makes the five original
+  fork requirements decision-complete while keeping every runtime implementation
+  deferred. The previously planned Cursor gateway is no longer an active requirement:
+  its two approved artifacts and the ignore rule remain as deferred evidence only, with
+  no probe, runtime, configuration, or acceptance contract. The checkpoint preserves the
+  root testing guidance, upstream core, upstream-first policy, and issue-only handling
+  for unrelated upstream defects.
 - Confirmed paraphrased user-request summary: Keep the freshly rebuilt
-  `master-refactor-v2` branch and its important root instructions, repair the PRD/RFC
-  according to the supplied ChatGPT Pro review, and add a planned Cursor integration in
-  which ordinary Cooldex continues speaking the Responses API to the local auth proxy
-  while the proxy translates statefully to Cursor. Do not add a Cursor backend to Rust
-  or use a hosts-file MITM. Treat Remote Compaction V2 as part of the normal
-  `/responses` translation contract, ignore the large extracted Cursor tree, version the
-  two substantive ChatGPT Pro artifacts, and delete all `Zone.Identifier` files. Consume
-  the distilled current Cursor CLI facts directly, keep their acquisition outside this
-  plan as a separate Fast-path concern, and never embed, invoke, or depend on that CLI
-  in product runtime.
+  `master-refactor-v2` branch and its important root instructions, finish the supplied
+  PRD/RFC corrections for the five original requirements, remove the Cursor workaround
+  from active product scope, retain its approved artifacts in standby, and publish the
+  reviewed root and `.sangoi` documentation checkpoints. Do not change Rust, the proxy
+  runtime, public wire behavior, or unrelated workspace state.
 - Major stop conditions:
-  - Stop if either branch, the locked Git objects, the delimited upstream `AGENTS.md`
-    core, or the separate `.sangoi` repository differs from the identities below.
+  - Stop if either branch, the locked Git objects, the byte-delimited upstream
+    `AGENTS.md` core, or the separate `.sangoi` repository differs from the identities
+    below.
 <!-- task-bookkeeping:mirror:end -->
 
 ## Planned Fork Requirements — Not Shipped
@@ -78,9 +71,7 @@ set for later implementation review is:
    identity;
 3. one instance-owned local app-server child lifecycle for each eligible TUI instance;
 4. one V2-only `subagent_instructions_file` configuration seam; and
-5. one `include_global_agents_md` gate over the complete global instruction provider; and
-6. one stateful Responses-to-Cursor gateway owned by `cooldex-auth-proxy` without a Rust
-   Cursor backend or embedded Cursor runtime.
+5. one `include_global_agents_md` gate over the complete global instruction provider.
 
 The PRD/RFC in the separate `.sangoi` repository owns requirement detail and deferred
 implementation decisions. Do not infer shipped behavior from this inventory.
@@ -429,10 +420,8 @@ Last reviewed: 2026-07-22 on `master-refactor-v2` at upstream base
   — canonical active implementation plan.
 - `/home/lucas/work/codex/.sangoi/reference/areas/master-refactor-v2-prd-rfc.md` — current
   product requirements and architecture boundary.
-- `/home/lucas/work/codex/.sangoi/chatgpt-pro/cursor-artefatos/` — approved supporting
-  Cursor input artifacts; the RFC, not this directory, owns product decisions.
-- `/home/lucas/work/cooldex-auth-proxy` — read-only current owner for the planned Cursor
-  gateway runtime.
+- `/home/lucas/work/codex/.sangoi/chatgpt-pro/cursor-artefatos/` — deferred historical
+  Cursor inputs; they are not active product authority or runtime dependencies.
 - `/home/lucas/work/codex/codex-rs/tui/src/bottom_pane/AGENTS.md` — current subtree
   instruction owner.
 
