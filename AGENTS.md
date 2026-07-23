@@ -44,14 +44,15 @@ Bookkeeping topology: `split`
 - Canonical plan: `.sangoi/planning/2026-07-22-implement-master-refactor-v2-requirements.md`.
 - What we are creating: A current-upstream implementation of six approved Cooldex
   requirements: deterministic bounded args-less `recall`; bounded automatic
-  post-compaction recovery as transient developer context; explicit MultiAgentV2 policy
-  and tool-contract parity; atomic full-history identity with one validated
-  child-instruction snapshot; a complete global AGENTS provider gate; and one WSL/Linux
-  interactive-TUI-owned app-server child lifecycle. The five already committed runtime
-  tranches remain the baseline. This strategy epoch restores the omitted Cargo safety
-  island, incorporates the pending V2 resident-identity review fix, and ports the
-  recovery behavior from its historical semantic source into current owners without
-  copying the old unbounded Prompt-GC implementation.
+  post-compaction recovery as transient developer context with one nested marker and one
+  terminal application proof; explicit MultiAgentV2 policy and tool-contract parity;
+  atomic full-history identity with one validated child-instruction snapshot; a complete
+  global AGENTS provider gate; and one WSL/Linux interactive-TUI-owned app-server child
+  lifecycle. The five already committed runtime tranches remain the baseline. This
+  strategy epoch restores the omitted Cargo safety island, incorporates the pending V2
+  resident-identity review fix, and ports the recovery behavior from its historical
+  semantic source into current owners without copying the old unbounded Prompt-GC
+  implementation.
 - Confirmed paraphrased user-request summary: Preserve the five current-upstream
   implementation tranches, restore `cargo-guard` and the blast-radius tooling before any
   further Rust command, then add the automatic post-compaction recovery island because
