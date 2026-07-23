@@ -203,6 +203,33 @@ async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe {
     probe_with(configure_turn, ToolPlanInputs::default()).await
 }
 
+#[tokio::test]
+async fn recall_is_a_strict_plain_args_less_tool() {
+    let plan = probe(|_| {}).await;
+    plan.assert_visible_contains(&["recall"]);
+    plan.assert_registered_contains(&["recall"]);
+    let ToolSpec::Function(ResponsesApiTool {
+        name,
+        strict,
+        parameters,
+        ..
+    }) = plan.visible_spec("recall")
+    else {
+        panic!("recall should be a plain function tool");
+    };
+
+    assert_eq!(name, "recall");
+    assert!(*strict);
+    assert_eq!(
+        serde_json::to_value(parameters).expect("serialize recall parameters"),
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    );
+}
+
 fn set_feature(turn: &mut TurnContext, feature: Feature, enabled: bool) {
     let mut config = (*turn.config).clone();
     if enabled {

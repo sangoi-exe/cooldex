@@ -153,6 +153,19 @@ pub struct LoadThreadHistoryParams {
     pub include_archived: bool,
 }
 
+/// Parameters for a bounded newest-to-oldest read of one thread's canonical rollout.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadRolloutTailParams {
+    /// Thread id to load.
+    pub thread_id: ThreadId,
+    /// Whether archived threads are eligible.
+    pub include_archived: bool,
+    /// Maximum physical source bytes the store may read.
+    pub max_bytes: u64,
+    /// Maximum nonblank rollout records the store may inspect.
+    pub max_records: usize,
+}
+
 /// Persisted rollout history for a thread, without any filesystem path requirement.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredThreadHistory {
@@ -173,6 +186,23 @@ pub struct StoredModelContext {
     pub thread_id: ThreadId,
     /// Persisted rollout items in replay order.
     pub items: Vec<RolloutItem>,
+}
+
+/// Bounded canonical rollout items returned in replay order.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StoredRolloutTail {
+    /// Thread id represented by the rollout tail.
+    pub thread_id: ThreadId,
+    /// Persisted rollout items in replay order.
+    pub items: Vec<RolloutItem>,
+    /// Whether the read reached the canonical beginning of the thread history.
+    pub reached_start: bool,
+    /// Physical source bytes read while producing this result.
+    pub bytes_read: u64,
+    /// Nonblank rollout records inspected while producing this result.
+    pub records_read: usize,
+    /// Physical lineage segments inspected while producing this result.
+    pub segments_read: usize,
 }
 
 /// Parameters for reading a thread summary and optionally its replay history.

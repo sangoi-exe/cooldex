@@ -23,11 +23,13 @@ use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
 use crate::ListThreadsParams;
+use crate::LoadRolloutTailParams;
 use crate::LoadThreadHistoryParams;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
 use crate::StoredModelContext;
+use crate::StoredRolloutTail;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadMetadataPatch;
@@ -57,6 +59,7 @@ mod tests {
     use crate::ThreadPersistenceMetadata;
     use crate::ThreadSortKey;
     use codex_protocol::models::BaseInstructions;
+    use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::SessionSource;
 
     #[tokio::test]
@@ -350,6 +353,73 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn bounded_rollout_tail_reports_limits_and_order() {
+        let store = InMemoryThreadStore::default();
+        let thread_id = ThreadId::default();
+        store
+            .create_thread(create_thread_params(thread_id, ThreadHistoryMode::Legacy))
+            .await
+            .expect("create thread");
+        let first = RolloutItem::Compacted(CompactedItem {
+            message: "first".to_string(),
+            replacement_history: Some(Vec::new()),
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        });
+        let second = RolloutItem::Compacted(CompactedItem {
+            message: "second".to_string(),
+            replacement_history: Some(Vec::new()),
+            window_number: Some(2),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        });
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id,
+                items: vec![first.clone(), second.clone()],
+            })
+            .await
+            .expect("append history");
+
+        let complete = store
+            .load_rollout_tail(LoadRolloutTailParams {
+                thread_id,
+                include_archived: false,
+                max_bytes: 1024 * 1024,
+                max_records: 8,
+            })
+            .await
+            .expect("load complete tail");
+        assert_eq!(
+            serde_json::to_value(complete.items).expect("serialize complete tail"),
+            serde_json::to_value(vec![first, second.clone()]).expect("serialize expected tail")
+        );
+        assert!(complete.reached_start);
+        assert_eq!(complete.records_read, 3);
+        assert_eq!(complete.segments_read, 1);
+
+        let limited = store
+            .load_rollout_tail(LoadRolloutTailParams {
+                thread_id,
+                include_archived: false,
+                max_bytes: 1024 * 1024,
+                max_records: 1,
+            })
+            .await
+            .expect("load record-limited tail");
+        assert_eq!(
+            serde_json::to_value(limited.items).expect("serialize limited tail"),
+            serde_json::to_value(vec![second]).expect("serialize expected limited tail")
+        );
+        assert!(!limited.reached_start);
+        assert_eq!(limited.records_read, 1);
+        assert_eq!(limited.segments_read, 1);
+    }
+
     fn create_thread_params(
         thread_id: ThreadId,
         history_mode: ThreadHistoryMode,
@@ -411,6 +481,7 @@ pub struct InMemoryThreadStoreCalls {
     pub discard_thread: usize,
     pub load_history: usize,
     pub load_latest_model_context: usize,
+    pub load_rollout_tail: usize,
     pub read_thread: usize,
     pub read_thread_with_history: usize,
     pub read_thread_by_rollout_path: usize,
@@ -578,6 +649,61 @@ impl InMemoryThreadStore {
         })
     }
 
+    async fn load_rollout_tail(
+        &self,
+        params: LoadRolloutTailParams,
+    ) -> ThreadStoreResult<StoredRolloutTail> {
+        let mut state = self.state.lock().await;
+        state.calls.load_rollout_tail += 1;
+        let history =
+            state
+                .histories
+                .get(&params.thread_id)
+                .ok_or(ThreadStoreError::ThreadNotFound {
+                    thread_id: params.thread_id,
+                })?;
+        let mut items = Vec::new();
+        let mut bytes_read = 0_u64;
+        let mut records_read = 0_usize;
+        let mut reached_start = history.is_empty();
+
+        for (index, item) in history.iter().enumerate().rev() {
+            if records_read == params.max_records {
+                break;
+            }
+            let serialized =
+                serde_json::to_vec(item).map_err(|err| ThreadStoreError::Internal {
+                    message: format!("failed to serialize in-memory rollout record: {err}"),
+                })?;
+            let record_bytes = u64::try_from(serialized.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            let remaining_bytes = params.max_bytes.saturating_sub(bytes_read);
+            if record_bytes > remaining_bytes {
+                bytes_read = params.max_bytes;
+                break;
+            }
+            bytes_read += record_bytes;
+            records_read += 1;
+            if !matches!(item, RolloutItem::SessionMeta(_)) {
+                items.push(item.clone());
+            }
+            if index == 0 {
+                reached_start = true;
+            }
+        }
+        items.reverse();
+
+        Ok(StoredRolloutTail {
+            thread_id: params.thread_id,
+            items,
+            reached_start,
+            bytes_read,
+            records_read,
+            segments_read: 1,
+        })
+    }
+
     async fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreResult<StoredThread> {
         let mut state = self.state.lock().await;
         state.calls.read_thread += 1;
@@ -721,6 +847,13 @@ impl ThreadStore for InMemoryThreadStore {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
         Box::pin(InMemoryThreadStore::load_latest_model_context(self, params))
+    }
+
+    fn load_rollout_tail(
+        &self,
+        params: LoadRolloutTailParams,
+    ) -> ThreadStoreFuture<'_, StoredRolloutTail> {
+        Box::pin(InMemoryThreadStore::load_rollout_tail(self, params))
     }
 
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {

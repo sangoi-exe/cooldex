@@ -19,10 +19,13 @@ pub enum ScanOutcome<T> {
 /// Read-only scanner for newline-delimited JSON records, starting from the end.
 pub struct ReverseJsonlScanner<R> {
     reader: R,
+    scan_start: u64,
     next_chunk_end: u64,
     chunk_position: usize,
     chunk: Vec<u8>,
     record_reversed: Vec<u8>,
+    bytes_read: u64,
+    reached_start: bool,
 }
 
 impl<R> ReverseJsonlScanner<R>
@@ -38,7 +41,24 @@ where
     ///
     /// This lets callers scan a frozen JSONL prefix without reading records appended after that
     /// prefix was captured.
-    pub fn new_at(mut reader: R, end_byte_offset: u64) -> io::Result<Self> {
+    pub fn new_at(reader: R, end_byte_offset: u64) -> io::Result<Self> {
+        Self::new_at_with_start(reader, end_byte_offset, /*scan_start*/ 0)
+    }
+
+    /// Creates a reverse scanner whose physical reads are capped to `max_bytes`.
+    ///
+    /// If the byte limit lands inside a record, that partial record is discarded. Callers can
+    /// inspect [`Self::reached_start`] to distinguish an exhausted source from a bounded cutoff.
+    pub fn new_at_with_byte_limit(
+        reader: R,
+        end_byte_offset: u64,
+        max_bytes: u64,
+    ) -> io::Result<Self> {
+        let scan_start = end_byte_offset.saturating_sub(max_bytes);
+        Self::new_at_with_start(reader, end_byte_offset, scan_start)
+    }
+
+    fn new_at_with_start(mut reader: R, end_byte_offset: u64, scan_start: u64) -> io::Result<Self> {
         let file_len = reader.seek(SeekFrom::End(0))?;
         if end_byte_offset > file_len {
             return Err(io::Error::new(
@@ -46,13 +66,32 @@ where
                 "reverse JSONL scan end is past the file",
             ));
         }
+        if scan_start > end_byte_offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reverse JSONL scan start is past its end",
+            ));
+        }
         Ok(Self {
             reader,
+            scan_start,
             next_chunk_end: end_byte_offset,
             chunk_position: 0,
             chunk: vec![0; READ_CHUNK_SIZE],
             record_reversed: Vec::new(),
+            bytes_read: 0,
+            reached_start: end_byte_offset == 0,
         })
+    }
+
+    /// Returns the number of physical source bytes read by this scanner.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Returns whether scanning reached the real beginning of the source.
+    pub fn reached_start(&self) -> bool {
+        self.reached_start
     }
 
     /// Scans the next nonblank record.
@@ -65,7 +104,11 @@ where
     {
         loop {
             let Some(byte) = self.read_previous_byte()? else {
-                return Ok(self.finish_record());
+                if self.reached_start {
+                    return Ok(self.finish_record());
+                }
+                self.record_reversed.clear();
+                return Ok(None);
             };
 
             if byte != b'\n' {
@@ -81,16 +124,19 @@ where
 
     fn read_previous_byte(&mut self) -> io::Result<Option<u8>> {
         if self.chunk_position == 0 {
-            if self.next_chunk_end == 0 {
+            if self.next_chunk_end == self.scan_start {
+                self.reached_start = self.scan_start == 0;
                 return Ok(None);
             }
 
-            let read_size = usize::try_from(self.next_chunk_end.min(READ_CHUNK_SIZE as u64))
+            let unread_bytes = self.next_chunk_end - self.scan_start;
+            let read_size = usize::try_from(unread_bytes.min(READ_CHUNK_SIZE as u64))
                 .map_err(io::Error::other)?;
             self.next_chunk_end -= read_size as u64;
             self.reader.seek(SeekFrom::Start(self.next_chunk_end))?;
             self.reader.read_exact(&mut self.chunk[..read_size])?;
             self.chunk_position = read_size;
+            self.bytes_read += read_size as u64;
         }
 
         self.chunk_position -= 1;

@@ -211,6 +211,7 @@ mod input_queue;
 mod mcp;
 mod mcp_runtime;
 pub(crate) mod multi_agents;
+pub(crate) mod recall;
 mod review;
 mod rollout_budget;
 mod rollout_reconstruction;
@@ -1390,6 +1391,7 @@ impl Session {
             first_window_id,
             previous_window_id,
             window_id,
+            latest_surviving_compaction_index: _,
         } = self
             .reconstruct_history_from_rollout(turn_context, rollout_items)
             .await;

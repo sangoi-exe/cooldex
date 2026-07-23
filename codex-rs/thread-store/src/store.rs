@@ -13,6 +13,7 @@ use crate::ItemPage;
 use crate::ListItemsParams;
 use crate::ListThreadsParams;
 use crate::ListTurnsParams;
+use crate::LoadRolloutTailParams;
 use crate::LoadThreadHistoryParams;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
@@ -20,6 +21,7 @@ use crate::ResumeThreadParams;
 use crate::SearchThreadOccurrencesParams;
 use crate::SearchThreadsParams;
 use crate::StoredModelContext;
+use crate::StoredRolloutTail;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadOccurrenceSearchPage;
@@ -90,6 +92,18 @@ pub trait ThreadStore: Any + Send + Sync {
         Box::pin(async {
             Err(ThreadStoreError::Unsupported {
                 operation: "load_latest_model_context",
+            })
+        })
+    }
+
+    /// Reads a bounded tail of the current thread's canonical rollout.
+    fn load_rollout_tail(
+        &self,
+        _params: LoadRolloutTailParams,
+    ) -> ThreadStoreFuture<'_, StoredRolloutTail> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "load_rollout_tail",
             })
         })
     }

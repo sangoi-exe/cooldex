@@ -16,6 +16,7 @@ pub(super) struct RolloutReconstruction {
     pub(super) first_window_id: Option<Uuid>,
     pub(super) previous_window_id: Option<Uuid>,
     pub(super) window_id: Option<Uuid>,
+    pub(super) latest_surviving_compaction_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +52,13 @@ struct ActiveReplaySegment<'a> {
     world_state_replay: Vec<&'a RolloutItem>,
     base_replacement_history: Option<&'a [ResponseItem]>,
     window: Option<ReconstructedWindow>,
+    latest_compaction_index: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct SurvivingCompaction<'a> {
+    replacement_history: Option<&'a [ResponseItem]>,
+    latest_index: Option<usize>,
 }
 
 fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&str>) -> bool {
@@ -60,7 +68,7 @@ fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&s
 
 fn finalize_active_segment<'a>(
     active_segment: ActiveReplaySegment<'a>,
-    base_replacement_history: &mut Option<&'a [ResponseItem]>,
+    surviving_compaction: &mut SurvivingCompaction<'a>,
     previous_turn_settings: &mut Option<PreviousTurnSettings>,
     reference_context_item: &mut TurnReferenceContextItem,
     world_state_replay: &mut Vec<&'a RolloutItem>,
@@ -81,14 +89,18 @@ fn finalize_active_segment<'a>(
 
     // A surviving replacement-history checkpoint is a complete history base. Once we
     // know the newest surviving one, older rollout items do not affect rebuilt history.
-    if base_replacement_history.is_none()
+    if surviving_compaction.replacement_history.is_none()
         && let Some(segment_base_replacement_history) = active_segment.base_replacement_history
     {
-        *base_replacement_history = Some(segment_base_replacement_history);
+        surviving_compaction.replacement_history = Some(segment_base_replacement_history);
     }
 
     if window.is_none() {
         *window = active_segment.window;
+    }
+
+    if surviving_compaction.latest_index.is_none() {
+        surviving_compaction.latest_index = active_segment.latest_compaction_index;
     }
 
     // `previous_turn_settings` come from the newest surviving user turn that established them.
@@ -136,7 +148,7 @@ impl Session {
                 _ => None,
             })
         };
-        let mut base_replacement_history: Option<&[ResponseItem]> = None;
+        let mut surviving_compaction = SurvivingCompaction::default();
         let mut previous_turn_settings = None;
         let mut reference_context_item = TurnReferenceContextItem::NeverSet;
         let mut world_state_replay = Vec::new();
@@ -156,6 +168,9 @@ impl Session {
                 RolloutItem::Compacted(compacted) => {
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    if active_segment.latest_compaction_index.is_none() {
+                        active_segment.latest_compaction_index = Some(index);
+                    }
                     active_segment.world_state_replay.push(item);
                     if active_segment.window.is_none()
                         && let Some(window_number) = compacted.window_number
@@ -259,7 +274,7 @@ impl Session {
                     {
                         finalize_active_segment(
                             active_segment,
-                            &mut base_replacement_history,
+                            &mut surviving_compaction,
                             &mut previous_turn_settings,
                             &mut reference_context_item,
                             &mut world_state_replay,
@@ -283,7 +298,7 @@ impl Session {
                 | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
             }
 
-            if base_replacement_history.is_some()
+            if surviving_compaction.replacement_history.is_some()
                 && previous_turn_settings.is_some()
                 && !matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
             {
@@ -297,7 +312,7 @@ impl Session {
         if let Some(active_segment) = active_segment.take() {
             finalize_active_segment(
                 active_segment,
-                &mut base_replacement_history,
+                &mut surviving_compaction,
                 &mut previous_turn_settings,
                 &mut reference_context_item,
                 &mut world_state_replay,
@@ -316,7 +331,7 @@ impl Session {
 
         let mut history = ContextManager::new();
         let mut saw_legacy_compaction_without_replacement_history = false;
-        if let Some(base_replacement_history) = base_replacement_history {
+        if let Some(base_replacement_history) = surviving_compaction.replacement_history {
             history.replace(base_replacement_history.to_vec());
         }
         // Materialize exact history semantics from the replay-derived suffix. The eventual lazy
@@ -436,6 +451,7 @@ impl Session {
             first_window_id: window.first_id,
             previous_window_id: window.previous_id,
             window_id: window.id,
+            latest_surviving_compaction_index: surviving_compaction.latest_index,
         }
     }
 }

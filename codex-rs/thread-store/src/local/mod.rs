@@ -6,6 +6,7 @@ mod list_threads;
 mod live_writer;
 mod model_context;
 mod read_thread;
+mod rollout_tail;
 // This lands before the reader PRs that consume the shared lineage resolver.
 #[allow(dead_code)]
 mod rollout_lineage;
@@ -41,6 +42,7 @@ use crate::ItemPage;
 use crate::ListItemsParams;
 use crate::ListThreadsParams;
 use crate::ListTurnsParams;
+use crate::LoadRolloutTailParams;
 use crate::LoadThreadHistoryParams;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
@@ -48,6 +50,7 @@ use crate::ResumeThreadParams;
 use crate::SearchThreadOccurrencesParams;
 use crate::SearchThreadsParams;
 use crate::StoredModelContext;
+use crate::StoredRolloutTail;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadOccurrenceSearchPage;
@@ -348,6 +351,13 @@ impl ThreadStore for LocalThreadStore {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
         Box::pin(async move { model_context::load_latest_model_context(self, params).await })
+    }
+
+    fn load_rollout_tail(
+        &self,
+        params: LoadRolloutTailParams,
+    ) -> ThreadStoreFuture<'_, StoredRolloutTail> {
+        Box::pin(async move { rollout_tail::load_rollout_tail(self, params).await })
     }
 
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {

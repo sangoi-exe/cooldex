@@ -122,7 +122,7 @@ impl RolloutLineageSegment {
     }
 }
 
-async fn validate_cutoff_bounds(
+pub(super) async fn validate_cutoff_bounds(
     requested_thread_id: ThreadId,
     rollout_path: &Path,
     end: &HistoryPosition,
