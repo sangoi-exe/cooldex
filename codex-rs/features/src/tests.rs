@@ -400,6 +400,7 @@ fn multi_agent_v2_feature_config_deserializes_table() {
         r#"
 [multi_agent_v2]
 enabled = true
+policy = "proactive"
 max_concurrent_threads_per_session = 4
 min_wait_timeout_ms = 2500
 max_wait_timeout_ms = 120000
@@ -425,6 +426,7 @@ non_code_mode_only = true
         features.multi_agent_v2,
         Some(crate::FeatureToml::Config(crate::MultiAgentV2ConfigToml {
             enabled: Some(true),
+            policy: Some(crate::MultiAgentV2Policy::Proactive),
             max_concurrent_threads_per_session: Some(4),
             min_wait_timeout_ms: Some(2500),
             max_wait_timeout_ms: Some(120000),
@@ -440,6 +442,17 @@ non_code_mode_only = true
             non_code_mode_only: Some(true),
         }))
     );
+}
+
+#[test]
+fn multi_agent_v2_policy_rejects_unknown_values() {
+    toml::from_str::<FeaturesToml>(
+        r#"
+[multi_agent_v2]
+policy = "custom"
+"#,
+    )
+    .expect_err("unknown multi-agent v2 policy should fail");
 }
 
 #[test]

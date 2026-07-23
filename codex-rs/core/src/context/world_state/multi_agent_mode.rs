@@ -2,30 +2,43 @@ use super::PreviousSectionState;
 use super::WorldStateSection;
 use crate::context::ContextualUserFragment;
 use crate::context::multi_agent_mode_instructions::MultiAgentModeInstructions;
+use crate::context::multi_agent_mode_instructions::bounded_mode_and_explanation;
 use codex_protocol::config_types::MultiAgentMode;
-use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::truncate_text;
 use serde::Deserialize;
 use serde::Serialize;
 
-const MULTI_AGENT_MODE_MAX_TOKENS: usize = 400;
+/// Effective built-in policy and optional explanatory text for one V2 turn.
+pub(crate) struct EffectiveMultiAgentMode {
+    mode: MultiAgentMode,
+    explanation: Option<String>,
+}
+
+impl EffectiveMultiAgentMode {
+    pub(crate) fn new(mode: MultiAgentMode, explanation: Option<String>) -> Self {
+        Self { mode, explanation }
+    }
+}
 
 /// Effective multi-agent mode currently visible to the model.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct MultiAgentModeState {
     mode: Option<MultiAgentMode>,
+    explanation: Option<String>,
 }
 
 impl MultiAgentModeState {
-    pub(crate) fn new(mode: Option<MultiAgentMode>) -> Self {
+    pub(crate) fn new(effective: Option<EffectiveMultiAgentMode>) -> Self {
+        let Some(effective) = effective else {
+            return Self {
+                mode: None,
+                explanation: None,
+            };
+        };
+        let (mode, explanation) =
+            bounded_mode_and_explanation(effective.mode, effective.explanation.as_deref());
         Self {
-            mode: mode.map(|mode| match mode {
-                MultiAgentMode::Custom(hint_text) => MultiAgentMode::Custom(truncate_text(
-                    &hint_text,
-                    TruncationPolicy::Tokens(MULTI_AGENT_MODE_MAX_TOKENS),
-                )),
-                mode @ (MultiAgentMode::ExplicitRequestOnly | MultiAgentMode::Proactive) => mode,
-            }),
+            mode: Some(mode),
+            explanation,
         }
     }
 }
@@ -54,23 +67,24 @@ impl WorldStateSection for MultiAgentModeState {
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,
     ) -> Option<Box<dyn ContextualUserFragment>> {
-        let mode = match (&self.mode, previous) {
+        let (mode, explanation) = match (&self.mode, previous) {
             (Some(mode), PreviousSectionState::Known(previous))
-                if previous.mode.as_ref() == Some(mode) =>
+                if previous.mode.as_ref() == Some(mode)
+                    && previous.explanation == self.explanation =>
             {
                 return None;
             }
-            (Some(mode), _) => mode.clone(),
+            (Some(mode), _) => (mode.clone(), self.explanation.clone()),
             (None, PreviousSectionState::Known(previous))
                 if previous.mode == Some(MultiAgentMode::Proactive) =>
             {
-                MultiAgentMode::ExplicitRequestOnly
+                (MultiAgentMode::ExplicitRequestOnly, None)
             }
-            (None, PreviousSectionState::Unknown) => MultiAgentMode::ExplicitRequestOnly,
+            (None, PreviousSectionState::Unknown) => (MultiAgentMode::ExplicitRequestOnly, None),
             (None, PreviousSectionState::Absent | PreviousSectionState::Known(_)) => return None,
         };
 
-        MultiAgentModeInstructions::from_mode(mode)
+        MultiAgentModeInstructions::new(mode, explanation.as_deref())
             .map(|instructions| Box::new(instructions) as Box<dyn ContextualUserFragment>)
     }
 }

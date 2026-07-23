@@ -5,7 +5,16 @@ use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_token_count;
 
 fn state(mode: Option<MultiAgentMode>) -> MultiAgentModeState {
-    MultiAgentModeState::new(mode)
+    MultiAgentModeState::new(
+        mode.map(|mode| EffectiveMultiAgentMode::new(mode, /*explanation*/ None)),
+    )
+}
+
+fn state_with_explanation(mode: MultiAgentMode, explanation: &str) -> MultiAgentModeState {
+    MultiAgentModeState::new(Some(EffectiveMultiAgentMode::new(
+        mode,
+        Some(explanation.to_string()),
+    )))
 }
 
 #[test]
@@ -21,6 +30,10 @@ fn snapshots() {
         "use a custom policy".to_string(),
     )));
     let empty = state(Some(MultiAgentMode::Custom(String::new())));
+    let explained = state_with_explanation(
+        MultiAgentMode::ExplicitRequestOnly,
+        "This explains the selected policy.",
+    );
 
     insta::assert_snapshot!(render_section_cases(&[
         (Absent, Absent),
@@ -32,6 +45,8 @@ fn snapshots() {
         (Known(&explicit), Known(&inactive)),
         (Known(&explicit), Known(&custom)),
         (Known(&custom), Known(&empty)),
+        (Known(&explicit), Known(&explained)),
+        (Known(&explained), Known(&explicit)),
         (Unknown, Known(&explicit)),
         (Unknown, Known(&inactive)),
     ]));
@@ -41,8 +56,11 @@ fn snapshots() {
 fn persisted_mode_is_restored_only_when_missing_from_history() {
     let state = state(Some(MultiAgentMode::ExplicitRequestOnly));
     let retained: ResponseItem = ContextualUserFragment::into(
-        MultiAgentModeInstructions::from_mode(MultiAgentMode::ExplicitRequestOnly)
-            .expect("explicit mode should render"),
+        MultiAgentModeInstructions::new(
+            MultiAgentMode::ExplicitRequestOnly,
+            /*explanation*/ None,
+        )
+        .expect("explicit mode should render"),
     );
     let mut world_state = WorldState::default();
     world_state.add_section(state);
@@ -66,16 +84,33 @@ fn persisted_mode_is_restored_only_when_missing_from_history() {
 }
 
 #[test]
-fn custom_mode_is_bounded_before_snapshot_and_rendering() {
+fn custom_mode_and_explanation_are_bounded_before_snapshot_and_rendering() {
     let state = state(Some(MultiAgentMode::Custom("custom mode ".repeat(1_000))));
     let Some(MultiAgentMode::Custom(snapshot_mode)) = state.snapshot().mode else {
         panic!("expected custom multi-agent mode")
     };
-    assert!(approx_token_count(&snapshot_mode) < 1_000);
+    assert!(approx_token_count(&snapshot_mode) <= 400);
 
     let rendered = state
         .render_diff(PreviousSectionState::Absent)
         .expect("custom mode should render")
         .render();
-    assert!(approx_token_count(&rendered) < 1_000);
+    assert!(approx_token_count(&rendered) <= 400);
+
+    let explained = state_with_explanation(
+        MultiAgentMode::Proactive,
+        "long explanation ".repeat(1_000).as_str(),
+    );
+    let snapshot = explained.snapshot();
+    assert!(
+        snapshot
+            .explanation
+            .as_deref()
+            .is_some_and(|explanation| approx_token_count(explanation) <= 400)
+    );
+    let rendered = explained
+        .render_diff(PreviousSectionState::Absent)
+        .expect("explained mode should render")
+        .render();
+    assert!(approx_token_count(&rendered) <= 400);
 }

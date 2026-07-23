@@ -71,6 +71,7 @@ use codex_core_plugins::PluginsManager;
 use codex_exec_server::LOCAL_FS;
 use codex_features::Feature;
 use codex_features::FeaturesToml;
+use codex_features::MultiAgentV2Policy;
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_model_provider_info::WireApi;
@@ -10591,6 +10592,7 @@ async fn multi_agent_v2_config_from_feature_table() -> std::io::Result<()> {
         codex_home.path().join(CONFIG_TOML_FILE),
         r#"[features.multi_agent_v2]
 enabled = true
+policy = "proactive"
 max_concurrent_threads_per_session = 5
 min_wait_timeout_ms = 2500
 max_wait_timeout_ms = 120000
@@ -10616,6 +10618,7 @@ max_concurrent_threads_per_session = 9
         .await?;
 
     assert!(config.features.enabled(Feature::MultiAgentV2));
+    assert_eq!(config.multi_agent_v2.policy, MultiAgentV2Policy::Proactive);
     assert_eq!(config.multi_agent_v2.max_concurrent_threads_per_session, 5);
     assert_eq!(config.multi_agent_v2.min_wait_timeout_ms, 2500);
     assert_eq!(config.multi_agent_v2.max_wait_timeout_ms, 120000);
@@ -10753,19 +10756,29 @@ fn multi_agent_v2_exposes_model_overrides_by_default() {
 }
 
 #[test]
-fn multi_agent_v2_preserves_empty_mode_hint_override() {
+fn multi_agent_v2_defaults_policy_and_normalizes_mode_explanation() {
     let config_toml = toml::from_str(
         r#"[features.multi_agent_v2]
-multi_agent_mode_hint_text = ""
+multi_agent_mode_hint_text = "  Explain this policy.  "
 "#,
     )
     .expect("multi-agent v2 config should parse");
 
     let expected = MultiAgentV2Config {
-        multi_agent_mode_hint_text: Some(String::new()),
+        multi_agent_mode_hint_text: Some("Explain this policy.".to_string()),
         ..resolve_multi_agent_v2_config(&ConfigToml::default())
     };
     assert_eq!(resolve_multi_agent_v2_config(&config_toml), expected);
+
+    let empty_config_toml = toml::from_str(
+        r#"[features.multi_agent_v2]
+multi_agent_mode_hint_text = "   "
+"#,
+    )
+    .expect("empty multi-agent v2 explanation should parse");
+    let empty = resolve_multi_agent_v2_config(&empty_config_toml);
+    assert_eq!(empty.policy, MultiAgentV2Policy::ExplicitRequestOnly);
+    assert_eq!(empty.multi_agent_mode_hint_text, None);
 }
 
 #[tokio::test]

@@ -28,6 +28,7 @@ use codex_tools::ToolSpec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
+use super::multi_agent_v2_handler;
 use crate::config::CurrentTimeReminderConfig;
 use crate::environment_selection::TurnEnvironmentState;
 use crate::session::step_context::StepContext;
@@ -36,6 +37,7 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::handlers::McpHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
+use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::override_tool_exposure;
 use crate::tools::router::ToolRouter;
@@ -1479,6 +1481,30 @@ async fn multi_agent_v2_can_use_configured_tool_namespace() {
             "expected {tool_name} in agents namespace"
         );
     }
+}
+
+#[test]
+fn multi_agent_v2_namespace_wrapper_preserves_the_plain_tool_contract() {
+    let plain = multi_agent_v2_handler(SendMessageHandlerV2, /*namespace*/ None);
+    let namespaced = multi_agent_v2_handler(SendMessageHandlerV2, Some("agents"));
+
+    assert_eq!(plain.tool_name(), ToolName::plain("send_message"));
+    assert_eq!(
+        namespaced.tool_name(),
+        ToolName::namespaced("agents", "send_message")
+    );
+    let ToolSpec::Function(plain_spec) = plain.spec() else {
+        panic!("plain multi-agent v2 handler should expose a function")
+    };
+    let ToolSpec::Namespace(namespace) = namespaced.spec() else {
+        panic!("namespaced multi-agent v2 handler should expose a namespace")
+    };
+    let [ResponsesApiNamespaceTool::Function(namespaced_spec)] = namespace.tools.as_slice() else {
+        panic!("multi-agent v2 namespace should contain the same single function")
+    };
+
+    assert_eq!(namespace.name, "agents");
+    assert_eq!(namespaced_spec, &plain_spec);
 }
 
 #[tokio::test]

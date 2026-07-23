@@ -240,6 +240,7 @@ where
 mod tests {
     use super::*;
     use codex_config::test_support::CloudConfigBundleFixture;
+    use codex_features::MultiAgentV2Policy;
     use codex_models_manager::bundled_models_response;
     use pretty_assertions::assert_eq;
     use std::path::Path;
@@ -340,6 +341,7 @@ mod tests {
             multi_agent_v2,
             FeatureToml::Config(MultiAgentV2ConfigToml {
                 enabled: Some(false),
+                policy: Some(MultiAgentV2Policy::ExplicitRequestOnly),
                 max_concurrent_threads_per_session: Some(_),
                 min_wait_timeout_ms: Some(_),
                 max_wait_timeout_ms: Some(_),

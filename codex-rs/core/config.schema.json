@@ -1806,6 +1806,9 @@
         "non_code_mode_only": {
           "type": "boolean"
         },
+        "policy": {
+          "$ref": "#/definitions/MultiAgentV2Policy"
+        },
         "root_agent_usage_hint_text": {
           "type": "string"
         },
@@ -1827,6 +1830,14 @@
         }
       },
       "type": "object"
+    },
+    "MultiAgentV2Policy": {
+      "description": "Selects the built-in MultiAgentV2 delegation policy.",
+      "enum": [
+        "explicit_request_only",
+        "proactive"
+      ],
+      "type": "string"
     },
     "NetworkDomainPermissionToml": {
       "enum": [

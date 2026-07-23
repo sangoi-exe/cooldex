@@ -1,6 +1,7 @@
 use anyhow::Result;
 use codex_core::config::Config;
 use codex_features::Feature;
+use codex_features::MultiAgentV2Policy;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
@@ -24,7 +25,7 @@ use serde_json::json;
 
 const NO_SPAWN_TEXT: &str = "Any earlier instruction enabling proactive multi-agent delegation no longer applies. Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
 const PROACTIVE_TEXT: &str = "Proactive multi-agent delegation is active.";
-const CUSTOM_MODE_HINT_TEXT: &str = "Use the configured delegation policy.";
+const MODE_EXPLANATION_TEXT: &str = "Use the configured delegation policy.";
 const ROOT_USAGE_HINT_TEXT: &str = "Root usage hint.";
 
 fn add_ultra_reasoning(model_info: &mut ModelInfo) {
@@ -43,10 +44,14 @@ fn configure_multi_agent_v2(config: &mut Config) {
         .expect("test config should allow feature update");
 }
 
-// Configuring a custom mode hint also enables multi-agent V2 for the test.
-fn configure_custom_mode_hint(config: &mut Config) {
+fn configure_mode_explanation(config: &mut Config) {
     configure_multi_agent_v2(config);
-    config.multi_agent_v2.multi_agent_mode_hint_text = Some(CUSTOM_MODE_HINT_TEXT.to_string());
+    config.multi_agent_v2.multi_agent_mode_hint_text = Some(MODE_EXPLANATION_TEXT.to_string());
+}
+
+fn configure_proactive(config: &mut Config) {
+    configure_multi_agent_v2(config);
+    config.multi_agent_v2.policy = MultiAgentV2Policy::Proactive;
 }
 
 fn configure_ultra(config: &mut Config) {
@@ -93,7 +98,7 @@ async fn submit_turn(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ultra_reasoning_uses_max_and_proactive_mode() -> Result<()> {
+async fn ultra_reasoning_uses_max_without_changing_the_default_policy() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -122,14 +127,14 @@ async fn ultra_reasoning_uses_max_and_proactive_mode() -> Result<()> {
             count_containing(&texts, NO_SPAWN_TEXT),
             count_containing(&texts, PROACTIVE_TEXT),
         ),
-        (0, 1)
+        (1, 0)
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configured_mode_hint_uses_custom_mode_across_reasoning_efforts() -> Result<()> {
+async fn configured_explanation_keeps_explicit_policy_across_reasoning_efforts() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -147,7 +152,7 @@ async fn configured_mode_hint_uses_custom_mode_across_reasoning_efforts() -> Res
     .await;
     let test = test_codex()
         .with_model_info_override("gpt-5.4", add_ultra_reasoning)
-        .with_config(configure_custom_mode_hint)
+        .with_config(configure_mode_explanation)
         .build(&server)
         .await?;
     submit_turn(&test.codex, "explicit", Some(ReasoningEffort::High)).await?;
@@ -160,18 +165,58 @@ async fn configured_mode_hint_uses_custom_mode_across_reasoning_efforts() -> Res
     let second_texts = developer_texts(&second_input);
     let instruction_counts = |texts: &[&str]| {
         (
-            count_containing(texts, CUSTOM_MODE_HINT_TEXT),
+            count_containing(texts, MODE_EXPLANATION_TEXT),
             count_containing(texts, NO_SPAWN_TEXT),
             count_containing(texts, PROACTIVE_TEXT),
         )
     };
-    assert_eq!(instruction_counts(&first_texts), (1, 0, 0));
-    assert_eq!(instruction_counts(&second_texts), (1, 0, 0));
+    assert_eq!(instruction_counts(&first_texts), (1, 1, 0));
+    assert_eq!(instruction_counts(&second_texts), (1, 1, 0));
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_configured_mode_hint_emits_no_mode_message() -> Result<()> {
+async fn proactive_policy_is_independent_of_reasoning_effort() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        (1..=2)
+            .map(|index| {
+                sse(vec![
+                    ev_response_created(&format!("resp-{index}")),
+                    ev_completed(&format!("resp-{index}")),
+                ])
+            })
+            .collect(),
+    )
+    .await;
+    let test = test_codex()
+        .with_model_info_override("gpt-5.4", add_ultra_reasoning)
+        .with_config(configure_proactive)
+        .build(&server)
+        .await?;
+
+    submit_turn(&test.codex, "high", Some(ReasoningEffort::High)).await?;
+    submit_turn(&test.codex, "ultra", Some(ReasoningEffort::Ultra)).await?;
+
+    for request in responses.requests() {
+        let input = request.input();
+        let texts = developer_texts(&input);
+        assert_eq!(
+            (
+                count_containing(&texts, NO_SPAWN_TEXT),
+                count_containing(&texts, PROACTIVE_TEXT),
+            ),
+            (0, 1)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_configured_explanation_still_emits_the_selected_policy() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -198,14 +243,14 @@ async fn empty_configured_mode_hint_emits_no_mode_message() -> Result<()> {
             count_containing(&texts, NO_SPAWN_TEXT),
             count_containing(&texts, PROACTIVE_TEXT),
         ),
-        (0, 0, 0)
+        (1, 1, 0)
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn changing_configured_mode_hint_to_empty_emits_no_update() -> Result<()> {
+async fn removing_configured_explanation_emits_a_policy_update() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -222,7 +267,7 @@ async fn changing_configured_mode_hint_to_empty_emits_no_update() -> Result<()> 
     )
     .await;
     let initial = test_codex()
-        .with_config(configure_custom_mode_hint)
+        .with_config(configure_mode_explanation)
         .build(&server)
         .await?;
     let home = initial.home.clone();
@@ -251,16 +296,18 @@ async fn changing_configured_mode_hint_to_empty_emits_no_update() -> Result<()> 
         (
             count_containing(&first_texts, MULTI_AGENT_MODE_OPEN_TAG),
             count_containing(&resumed_texts, MULTI_AGENT_MODE_OPEN_TAG),
-            count_containing(&resumed_texts, CUSTOM_MODE_HINT_TEXT),
+            count_containing(&first_texts, NO_SPAWN_TEXT),
+            count_containing(&resumed_texts, MODE_EXPLANATION_TEXT),
+            count_containing(&resumed_texts, NO_SPAWN_TEXT),
         ),
-        (1, 1, 1)
+        (1, 2, 1, 1, 2)
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_mode_change_appends_mode_without_reappending_usage_hint() -> Result<()> {
+async fn reasoning_change_does_not_change_policy_or_reappend_usage_hint() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -291,8 +338,8 @@ async fn live_mode_change_appends_mode_without_reappending_usage_hint() -> Resul
         .clone()
         .expect("rollout path");
 
-    submit_turn(&test.codex, "proactive", /*effort*/ None).await?;
-    submit_turn(&test.codex, "explicit", Some(ReasoningEffort::High)).await?;
+    submit_turn(&test.codex, "ultra", /*effort*/ None).await?;
+    submit_turn(&test.codex, "high", Some(ReasoningEffort::High)).await?;
 
     let requests = responses.requests();
     let first_input = requests[0].input();
@@ -303,8 +350,8 @@ async fn live_mode_change_appends_mode_without_reappending_usage_hint() -> Resul
         .expect("initial usage hint");
     let mode_index = first_texts
         .iter()
-        .position(|text| text.contains(PROACTIVE_TEXT))
-        .expect("initial proactive mode");
+        .position(|text| text.contains(NO_SPAWN_TEXT))
+        .expect("initial explicit-request-only policy");
     assert!(hint_index < mode_index);
 
     let second_input = requests[1].input();
@@ -315,7 +362,7 @@ async fn live_mode_change_appends_mode_without_reappending_usage_hint() -> Resul
             count_containing(&second_texts, PROACTIVE_TEXT),
             count_containing(&second_texts, NO_SPAWN_TEXT),
         ),
-        (1, 1, 1),
+        (1, 0, 1),
     );
     test.codex.ensure_rollout_materialized().await;
     test.codex.flush_rollout().await?;
@@ -332,16 +379,13 @@ async fn live_mode_change_appends_mode_without_reappending_usage_hint() -> Resul
                 .cloned()
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        recorded_modes,
-        [json!("proactive"), json!("explicitRequestOnly")]
-    );
+    assert_eq!(recorded_modes, [json!("explicitRequestOnly")]);
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn leaving_ultra_after_cold_resume_emits_explicit_mode() -> Result<()> {
+async fn policy_change_after_cold_resume_emits_explicit_mode() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -359,7 +403,10 @@ async fn leaving_ultra_after_cold_resume_emits_explicit_mode() -> Result<()> {
     .await;
     let initial = test_codex()
         .with_model_info_override("gpt-5.4", add_ultra_reasoning)
-        .with_config(configure_ultra)
+        .with_config(|config| {
+            configure_proactive(config);
+            config.model_reasoning_effort = Some(ReasoningEffort::Ultra);
+        })
         .build(&server)
         .await?;
     let home = initial.home.clone();
@@ -374,7 +421,7 @@ async fn leaving_ultra_after_cold_resume_emits_explicit_mode() -> Result<()> {
 
     let mut resume_builder = test_codex()
         .with_model_info_override("gpt-5.4", add_ultra_reasoning)
-        .with_config(configure_ultra);
+        .with_config(configure_multi_agent_v2);
     let resumed = resume_builder.resume(&server, home, rollout_path).await?;
     submit_turn(&resumed.codex, "after resume", Some(ReasoningEffort::High)).await?;
 

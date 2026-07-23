@@ -31,6 +31,7 @@ pub(crate) use apps_instructions::AppsInstructionsState;
 pub(crate) use collaboration_mode::CollaborationModeState;
 pub(crate) use environment::EnvironmentsState;
 pub(crate) use environments_instructions::EnvironmentsInstructionsState;
+pub(crate) use multi_agent_mode::EffectiveMultiAgentMode;
 pub(crate) use multi_agent_mode::MultiAgentModeState;
 pub(crate) use permissions::PermissionsState;
 pub(crate) use plugins_instructions::PluginsInstructionsState;
