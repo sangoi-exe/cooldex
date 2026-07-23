@@ -1,0 +1,22 @@
+[package]
+name = "codex-utils-process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["process"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

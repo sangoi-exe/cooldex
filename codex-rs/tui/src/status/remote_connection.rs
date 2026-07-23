@@ -13,7 +13,7 @@ pub(crate) fn remote_connection_status_value(
     server_version: Option<&str>,
 ) -> Option<RemoteConnectionStatus> {
     let endpoint = match app_server_target {
-        AppServerTarget::Embedded => return None,
+        AppServerTarget::Embedded | AppServerTarget::InstanceChild => return None,
         AppServerTarget::LocalDaemon { endpoint } | AppServerTarget::Remote { endpoint } => {
             endpoint
         }

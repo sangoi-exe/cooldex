@@ -5,13 +5,12 @@ use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
 use codex_app_server_transport::REMOTE_CONTROL_DISABLED_ENV_VAR;
+use codex_utils_process::ProcessIdentity;
 
 use super::PidBackend;
 use super::PidCommandKind;
 use super::PidFileState;
 use super::PidLogTail;
-use super::PidRecord;
-use super::read_process_start_time;
 use super::read_stderr_log_tail;
 use super::stderr_log_file_for_pid_file;
 use super::try_lock_file;
@@ -125,14 +124,9 @@ async fn stale_record_cleanup_preserves_replacement_record() {
         pid_file.clone(),
         /*remote_control_enabled*/ false,
     );
-    let stale = PidRecord {
-        pid: 1,
-        process_start_time: "old".to_string(),
-    };
-    let replacement = PidRecord {
-        pid: 2,
-        process_start_time: "new".to_string(),
-    };
+    let stale = ProcessIdentity::from_parts(1, "old".to_string()).expect("stale identity");
+    let replacement =
+        ProcessIdentity::from_parts(2, "new".to_string()).expect("replacement identity");
     tokio::fs::write(
         &pid_file,
         serde_json::to_vec(&replacement).expect("serialize replacement"),
@@ -161,10 +155,9 @@ async fn stop_reaps_untracked_app_server_child() {
         .spawn()
         .expect("spawn app-server shim");
     let pid = child.id();
-    let record = PidRecord {
-        pid,
-        process_start_time: read_process_start_time(pid).await.expect("start time"),
-    };
+    let record = ProcessIdentity::capture(pid)
+        .await
+        .expect("process identity");
     tokio::fs::write(
         &pid_file,
         serde_json::to_vec(&record).expect("serialize pid"),

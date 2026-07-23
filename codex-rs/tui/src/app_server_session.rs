@@ -5,6 +5,8 @@
 
 mod fs;
 
+#[cfg(target_os = "linux")]
+use crate::app_server_instance::AppServerInstance;
 use crate::bottom_pane::FeedbackAudience;
 use crate::legacy_core::config::Config;
 use crate::permission_compat::legacy_compatible_permission_profile;
@@ -18,6 +20,7 @@ use codex_app_server_client::AppServerClient;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_client::AppServerPath;
 use codex_app_server_client::AppServerRequestHandle;
+use codex_app_server_client::RemoteAppServerEndpoint;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AskForApproval;
@@ -185,6 +188,8 @@ pub(crate) struct AppServerBootstrap {
 
 pub(crate) struct AppServerSession {
     client: AppServerClient,
+    #[cfg(target_os = "linux")]
+    instance_supervisor: Option<AppServerInstance>,
     next_request_id: i64,
     remote_cwd_override: Option<PathBuf>,
     thread_params_mode: ThreadParamsMode,
@@ -257,6 +262,8 @@ impl AppServerSession {
     pub(crate) fn new(client: AppServerClient, thread_params_mode: ThreadParamsMode) -> Self {
         Self {
             client,
+            #[cfg(target_os = "linux")]
+            instance_supervisor: None,
             next_request_id: 1,
             remote_cwd_override: None,
             thread_params_mode,
@@ -266,6 +273,16 @@ impl AppServerSession {
             managed_new_thread_defaults: None,
             external_agent_config_import_completion_pending: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new_instance_child(
+        client: AppServerClient,
+        supervisor: AppServerInstance,
+    ) -> Self {
+        let mut session = Self::new(client, ThreadParamsMode::Embedded);
+        session.instance_supervisor = Some(supervisor);
+        session
     }
 
     pub(crate) fn with_remote_cwd_override(mut self, remote_cwd_override: Option<PathBuf>) -> Self {
@@ -282,7 +299,32 @@ impl AppServerSession {
     }
 
     pub(crate) fn uses_embedded_app_server(&self) -> bool {
-        matches!(&self.client, AppServerClient::InProcess(_))
+        matches!(&self.client, AppServerClient::InProcess(_)) || self.is_instance_child()
+    }
+
+    pub(crate) fn is_instance_child(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.instance_supervisor.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn instance_child_endpoint(&self) -> Option<RemoteAppServerEndpoint> {
+        #[cfg(target_os = "linux")]
+        {
+            self.instance_supervisor
+                .as_ref()
+                .map(AppServerInstance::endpoint)
+                .cloned()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     pub(crate) fn codex_home_path(
@@ -1263,8 +1305,44 @@ impl AppServerSession {
         self.client.resolve_server_request(request_id, result).await
     }
 
-    pub(crate) async fn shutdown(self) -> std::io::Result<()> {
-        self.client.shutdown().await
+    pub(crate) async fn shutdown(mut self) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        let instance_supervisor = self.instance_supervisor.take();
+        #[cfg(target_os = "linux")]
+        let client_shutdown_started_at = Instant::now();
+        #[cfg(target_os = "linux")]
+        let client_result = if instance_supervisor.is_some() {
+            match tokio::time::timeout(Duration::from_secs(5), self.client.shutdown()).await {
+                Ok(result) => result,
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out closing instance-owned app-server client",
+                )),
+            }
+        } else {
+            self.client.shutdown().await
+        };
+        #[cfg(not(target_os = "linux"))]
+        let client_result = self.client.shutdown().await;
+        #[cfg(target_os = "linux")]
+        let supervisor_result = match instance_supervisor {
+            Some(supervisor) => {
+                supervisor
+                    .shutdown_after_client(client_shutdown_started_at.elapsed())
+                    .await
+            }
+            None => Ok(()),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let supervisor_result: std::io::Result<()> = Ok(());
+
+        match (client_result, supervisor_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
+            (Err(client_err), Err(supervisor_err)) => Err(std::io::Error::other(format!(
+                "app-server client shutdown failed: {client_err}; child shutdown failed: {supervisor_err}"
+            ))),
+        }
     }
 
     pub(crate) fn request_handle(&self) -> AppServerRequestHandle {

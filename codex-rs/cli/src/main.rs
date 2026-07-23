@@ -68,6 +68,7 @@ use doctor::DoctorCommand;
 use state_db_recovery as local_state_db;
 
 use codex_config::LoaderOverrides;
+use codex_config::types::AppServerMode;
 use codex_core::build_models_manager;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -537,6 +538,10 @@ struct AppServerCommand {
     /// Enable remote control for this app-server process without changing persistence.
     #[arg(long = "remote-control", hide = true)]
     remote_control: bool,
+
+    /// Internal marker for an app-server child owned by one interactive TUI.
+    #[arg(long = "instance-child", hide = true)]
+    instance_child: bool,
 
     /// Controls whether analytics are enabled by default.
     ///
@@ -1104,6 +1109,7 @@ async fn cli_main(
                 listen,
                 stdio,
                 remote_control,
+                instance_child,
                 analytics_default_enabled,
                 auth,
             } = app_server_cli;
@@ -1114,6 +1120,11 @@ async fn cli_main(
                 root_remote_auth_token_env.as_deref(),
                 subcommand.as_ref(),
             )?;
+            validate_instance_child_app_server_command(
+                instance_child,
+                remote_control,
+                subcommand.is_some(),
+            )?;
             match subcommand {
                 None => {
                     let transport = if stdio {
@@ -1123,28 +1134,40 @@ async fn cli_main(
                     };
                     let auth = auth.try_into_settings()?;
                     let runtime_options = codex_app_server::AppServerRuntimeOptions {
-                        remote_control_startup_mode: match (remote_control, remote_control_disabled)
-                        {
-                            (true, _) => {
-                                codex_app_server::RemoteControlStartupMode::EnabledEphemeral
+                        remote_control_startup_mode: if instance_child {
+                            codex_app_server::RemoteControlStartupMode::DisabledEphemeral
+                        } else {
+                            match (remote_control, remote_control_disabled) {
+                                (true, _) => {
+                                    codex_app_server::RemoteControlStartupMode::EnabledEphemeral
+                                }
+                                (false, true) => {
+                                    codex_app_server::RemoteControlStartupMode::DisabledEphemeral
+                                }
+                                (false, false) => {
+                                    codex_app_server::RemoteControlStartupMode::ResolvePersisted
+                                }
                             }
-                            (false, true) => {
-                                codex_app_server::RemoteControlStartupMode::DisabledEphemeral
-                            }
-                            (false, false) => {
-                                codex_app_server::RemoteControlStartupMode::ResolvePersisted
-                            }
+                        },
+                        launch_mode: if instance_child {
+                            codex_app_server::AppServerLaunchMode::InstanceChild
+                        } else {
+                            codex_app_server::AppServerLaunchMode::Direct
                         },
                         ..Default::default()
                     };
                     codex_app_server::run_main_with_transport_options(
                         arg0_paths.clone(),
                         root_config_overrides,
-                        LoaderOverrides::default(),
+                        loader_overrides_for_profile(interactive.config_profile_v2.as_ref())?,
                         strict_config,
                         analytics_default_enabled,
                         transport,
-                        codex_protocol::protocol::SessionSource::VSCode,
+                        if instance_child {
+                            codex_protocol::protocol::SessionSource::Cli
+                        } else {
+                            codex_protocol::protocol::SessionSource::VSCode
+                        },
                         auth,
                         runtime_options,
                     )
@@ -1677,6 +1700,11 @@ fn profile_v2_for_subcommand<'a>(
         | Subcommand::Unarchive(_)
         | Subcommand::Fork(_)
         | Subcommand::Mcp(_)
+        | Subcommand::AppServer(AppServerCommand {
+            subcommand: None,
+            instance_child: true,
+            ..
+        })
         | Subcommand::Sandbox(_)
         | Subcommand::Debug(DebugCommand {
             subcommand: DebugSubcommand::PromptInput(_),
@@ -1685,6 +1713,20 @@ fn profile_v2_for_subcommand<'a>(
             "--profile only applies to runtime commands and `codex mcp`: `codex`, `codex exec`, `codex review`, `codex resume`, `codex archive`, `codex delete`, `codex unarchive`, `codex fork`, `codex mcp`, `codex sandbox`, and `codex debug prompt-input`."
         ),
     }
+}
+
+fn validate_instance_child_app_server_command(
+    instance_child: bool,
+    remote_control: bool,
+    has_subcommand: bool,
+) -> anyhow::Result<()> {
+    if instance_child && has_subcommand {
+        anyhow::bail!("internal instance-child marker cannot be used with app-server tooling");
+    }
+    if instance_child && remote_control {
+        anyhow::bail!("internal instance-child app-server cannot enable remote control");
+    }
+    Ok(())
 }
 
 async fn run_exec_server_command(
@@ -1706,6 +1748,7 @@ async fn run_exec_server_command(
             .environment_id
             .ok_or_else(|| anyhow::anyhow!("--environment-id is required when --remote is set"))?;
         let config = load_exec_server_config(root_config_overrides, strict_config).await?;
+        reject_instance_child_mode(&config, "exec-server")?;
         let (_otel, telemetry) = exec_server_telemetry::init(Some(&config));
         let auth_provider =
             load_exec_server_remote_auth_provider(&config, &base_url, cmd.use_agent_identity_auth)
@@ -1726,6 +1769,9 @@ async fn run_exec_server_command(
         Ok(())
     } else {
         let config_result = load_exec_server_config(root_config_overrides, strict_config).await;
+        if let Ok(config) = config_result.as_ref() {
+            reject_instance_child_mode(config, "exec-server")?;
+        }
         let config = if strict_config {
             Some(config_result?)
         } else {
@@ -1831,6 +1877,18 @@ async fn load_exec_server_config(
         .strict_config(strict_config)
         .build()
         .await?)
+}
+
+fn reject_instance_child_mode(
+    config: &codex_core::config::Config,
+    entrypoint: &str,
+) -> anyhow::Result<()> {
+    if config.tui_app_server_mode == AppServerMode::InstanceChild {
+        anyhow::bail!(
+            "`tui.app_server_mode = \"instance_child\"` is not available for {entrypoint}"
+        );
+    }
+    Ok(())
 }
 
 async fn load_exec_server_remote_auth(
@@ -1982,6 +2040,7 @@ async fn run_debug_prompt_input_command(
         .loader_overrides(loader_overrides)
         .build()
         .await?;
+    reject_instance_child_mode(&config, "debug prompt-input")?;
 
     let mut input = shared
         .images
@@ -2783,6 +2842,20 @@ mod tests {
             profile_v2_for_args(&["codex", "--profile", "work", "sandbox"])
                 .expect("sandbox supports config profile")
                 .as_deref(),
+            Some("work")
+        );
+        assert_eq!(
+            profile_v2_for_args(&[
+                "codex",
+                "--profile",
+                "work",
+                "app-server",
+                "--instance-child",
+                "--listen",
+                "unix:///tmp/instance.sock",
+            ])
+            .expect("internal instance child supports config profile")
+            .as_deref(),
             Some("work")
         );
     }
@@ -3834,6 +3907,46 @@ mod tests {
     fn app_server_stdio_flag_parses() {
         let app_server = app_server_from_args(["codex", "app-server", "--stdio"].as_ref());
         assert!(app_server.stdio);
+    }
+
+    #[test]
+    fn app_server_instance_child_marker_is_hidden_and_parses() {
+        let app_server = app_server_from_args(
+            [
+                "codex",
+                "app-server",
+                "--instance-child",
+                "--listen",
+                "unix:///tmp/instance.sock",
+            ]
+            .as_ref(),
+        );
+        assert!(app_server.instance_child);
+
+        let mut command = MultitoolCli::command();
+        let help = command
+            .find_subcommand_mut("app-server")
+            .expect("app-server subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("instance-child"));
+    }
+
+    #[test]
+    fn app_server_instance_child_marker_rejects_tooling_and_remote_control() {
+        let tooling_err = validate_instance_child_app_server_command(
+            /*instance_child*/ true, /*remote_control*/ false,
+            /*has_subcommand*/ true,
+        )
+        .expect_err("internal marker should reject app-server tooling");
+        assert!(tooling_err.to_string().contains("app-server tooling"));
+
+        let remote_control_err = validate_instance_child_app_server_command(
+            /*instance_child*/ true, /*remote_control*/ true,
+            /*has_subcommand*/ false,
+        )
+        .expect_err("internal marker should reject remote control");
+        assert!(remote_control_err.to_string().contains("remote control"));
     }
 
     #[test]

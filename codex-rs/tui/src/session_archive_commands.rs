@@ -253,8 +253,10 @@ async fn start_app_server_for_archive_command(
     } = options;
     let loader_overrides = LoaderOverrides::default();
     let strict_config = cli.strict_config;
-    let raw_overrides = cli.config_overrides.raw_overrides.clone();
-    let overrides_cli = CliConfigOverrides { raw_overrides };
+    let raw_config_overrides = cli.config_overrides.raw_overrides.clone();
+    let overrides_cli = CliConfigOverrides {
+        raw_overrides: raw_config_overrides.clone(),
+    };
     let cli_kv_overrides = overrides_cli
         .parse_overrides()
         .map_err(|err| eyre!("failed to parse -c overrides: {err}"))?;
@@ -275,20 +277,14 @@ async fn start_app_server_for_archive_command(
         strict_config,
         cli.bypass_hook_trust,
     );
-    let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
-        super::maybe_probe_default_daemon_socket(codex_home.as_path()).await
-    } else {
-        None
-    };
-    let app_server_target = super::app_server_target_for_launch(
-        explicit_remote_endpoint,
-        default_daemon,
-        reuse_implicit_local_daemon,
-    );
-    let remote_cwd_override = cli
-        .cwd
-        .clone()
-        .filter(|_| app_server_target.uses_remote_workspace());
+    let provisional_app_server_target =
+        explicit_remote_endpoint
+            .as_ref()
+            .map_or(super::AppServerTarget::Embedded, |endpoint| {
+                super::AppServerTarget::Remote {
+                    endpoint: endpoint.clone(),
+                }
+            });
 
     let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
         arg0_paths.codex_self_exe.clone(),
@@ -301,7 +297,7 @@ async fn start_app_server_for_archive_command(
         .wrap_err("failed to initialize environment manager")?;
     let config_cwd = super::config_cwd_for_app_server_target(
         cli.cwd.as_deref(),
-        &app_server_target,
+        &provisional_app_server_target,
         &environment_manager,
     )
     .wrap_err("failed to resolve config cwd")?;
@@ -328,6 +324,36 @@ async fn start_app_server_for_archive_command(
     .await
     .wrap_err("failed to load config.toml")?;
     let config_toml = &bootstrap_config.config_toml;
+    let app_server_mode = config_toml
+        .tui
+        .as_ref()
+        .map(|tui| tui.app_server_mode)
+        .unwrap_or_default();
+    if explicit_remote_endpoint.is_none()
+        && app_server_mode == codex_config::types::AppServerMode::InstanceChild
+    {
+        return Err(eyre!(
+            "`tui.app_server_mode = \"instance_child\"` is not available for archive, delete, or unarchive commands"
+        ));
+    }
+    let default_daemon = if explicit_remote_endpoint.is_none()
+        && app_server_mode == codex_config::types::AppServerMode::Upstream
+        && reuse_implicit_local_daemon
+    {
+        super::maybe_probe_default_daemon_socket(codex_home.as_path()).await
+    } else {
+        None
+    };
+    let app_server_target = super::app_server_target_for_launch(
+        explicit_remote_endpoint,
+        default_daemon,
+        reuse_implicit_local_daemon,
+        app_server_mode,
+    );
+    let remote_cwd_override = cli
+        .cwd
+        .clone()
+        .filter(|_| app_server_target.uses_remote_workspace());
     let chatgpt_base_url = config_toml
         .chatgpt_base_url
         .clone()
@@ -392,6 +418,7 @@ async fn start_app_server_for_archive_command(
         &app_server_target,
         arg0_paths,
         config,
+        raw_config_overrides,
         cli_kv_overrides,
         loader_overrides,
         strict_config,
@@ -402,8 +429,5 @@ async fn start_app_server_for_archive_command(
         environment_manager,
     )
     .await?;
-    Ok(
-        AppServerSession::new(app_server, app_server_target.thread_params_mode())
-            .with_remote_cwd_override(remote_cwd_override),
-    )
+    Ok(app_server.with_remote_cwd_override(remote_cwd_override))
 }

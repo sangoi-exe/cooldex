@@ -57,6 +57,7 @@ use codex_config::ConfigLoadError;
 use codex_config::ConfigLoadOptions;
 use codex_config::LoaderOverrides;
 use codex_config::format_config_error_with_source;
+use codex_config::types::AppServerMode;
 use codex_core::StateDbHandle;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
@@ -464,6 +465,11 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         build_config,
     )
     .await?;
+    if config.tui_app_server_mode == AppServerMode::InstanceChild {
+        anyhow::bail!(
+            "`tui.app_server_mode = \"instance_child\"` is not available for exec or review"
+        );
+    }
     let resume_approvals_reviewer_override = cli_kv_overrides
         .iter()
         .any(|(key, _)| key == "approvals_reviewer")

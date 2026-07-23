@@ -10,6 +10,7 @@ use anyhow::bail;
 use clap::Parser;
 use codex_core_api::AbsolutePathBuf;
 use codex_core_api::AltScreenMode;
+use codex_core_api::AppServerMode;
 use codex_core_api::ApprovalsReviewer;
 use codex_core_api::Arg0DispatchPaths;
 use codex_core_api::AskForApproval;
@@ -227,6 +228,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         tui_terminal_title: None,
         tui_theme: None,
         tui_raw_output_mode: false,
+        tui_app_server_mode: AppServerMode::Upstream,
         tui_pet: None,
         tui_pet_anchor: TuiPetAnchor::Composer,
         terminal_resize_reflow: TerminalResizeReflowConfig::default(),

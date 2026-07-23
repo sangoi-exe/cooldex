@@ -1376,26 +1376,30 @@ async fn full_history_v2_fork_preserves_parent_instruction_items_without_new_hin
     let mut expected_final_answer =
         assistant_message("parent final answer", Some(MessagePhase::FinalAnswer));
     expected_final_answer.set_turn_id_if_missing(&turn_context.sub_id);
+    let mut expected_root_guidance = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "Parent root guidance.".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    expected_root_guidance.set_turn_id_if_missing(&turn_context.sub_id);
+    let mut expected_subagent_guidance = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "Parent subagent guidance.".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    expected_subagent_guidance.set_turn_id_if_missing(&turn_context.sub_id);
     let expected_history = [
         expected_parent_seed,
-        ResponseItem::Message {
-            id: None,
-            role: "developer".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "Parent root guidance.".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::Message {
-            id: None,
-            role: "developer".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "Parent subagent guidance.".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
+        expected_root_guidance,
+        expected_subagent_guidance,
         expected_final_answer,
     ];
     assert_eq!(

@@ -6,6 +6,7 @@ use std::io::Result as IoResult;
 use std::sync::Arc;
 
 use codex_arg0::Arg0DispatchPaths;
+use codex_config::types::AppServerMode;
 use codex_core::config::ConfigBuilder;
 use codex_core::resolve_installation_id;
 use codex_exec_server::EnvironmentManager;
@@ -77,6 +78,12 @@ pub async fn run_main(
         .map_err(|e| {
             std::io::Error::new(ErrorKind::InvalidData, format!("error loading config: {e}"))
         })?;
+    if config.tui_app_server_mode == AppServerMode::InstanceChild {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "`tui.app_server_mode = \"instance_child\"` is not available for the MCP server",
+        ));
+    }
     set_default_client_residency_requirement(config.enforce_residency.value());
     let otel = codex_core::otel_init::build_provider(
         &config,

@@ -155,6 +155,25 @@
       },
       "type": "object"
     },
+    "AppServerMode": {
+      "description": "Selects how an interactive TUI obtains its local app-server.",
+      "oneOf": [
+        {
+          "description": "Preserve the upstream implicit-daemon-or-embedded selection.",
+          "enum": [
+            "upstream"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Spawn one private app-server child owned by this TUI instance.",
+          "enum": [
+            "instance_child"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "AppToolApproval": {
       "enum": [
         "auto",
@@ -3165,6 +3184,15 @@
           "default": true,
           "description": "Enable animations (welcome screen, shimmer effects, spinners). Defaults to `true`.",
           "type": "boolean"
+        },
+        "app_server_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AppServerMode"
+            }
+          ],
+          "default": "upstream",
+          "description": "Controls how an ordinary interactive TUI obtains its local app-server. Defaults to `upstream`."
         },
         "keymap": {
           "allOf": [

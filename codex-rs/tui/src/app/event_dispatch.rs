@@ -70,6 +70,7 @@ impl App {
                 let picker_app_server = match crate::start_app_server_for_picker(
                     &self.config,
                     &self.app_server_target,
+                    app_server.instance_child_endpoint(),
                     self.state_db.clone(),
                     self.environment_manager.clone(),
                 )

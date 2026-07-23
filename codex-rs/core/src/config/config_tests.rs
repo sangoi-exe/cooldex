@@ -37,6 +37,7 @@ use codex_config::permissions_toml::NetworkToml;
 use codex_config::permissions_toml::PermissionProfileToml;
 use codex_config::permissions_toml::PermissionsToml;
 use codex_config::permissions_toml::WorkspaceRootsToml;
+use codex_config::types::AppServerMode;
 use codex_config::types::AppToolApproval;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::BundledSkillsConfig;
@@ -940,6 +941,7 @@ fn config_toml_deserializes_model_availability_nux() {
             show_tooltips: true,
             vim_mode_default: false,
             raw_output_mode: false,
+            app_server_mode: AppServerMode::Upstream,
             alternate_screen: AltScreenMode::default(),
             status_line: None,
             status_line_use_colors: true,
@@ -1099,6 +1101,71 @@ async fn runtime_config_uses_tui_raw_output_mode() {
     .expect("load config");
 
     assert!(cfg.tui_raw_output_mode);
+}
+
+#[test]
+fn tui_app_server_mode_defaults_to_upstream() {
+    let parsed: ConfigToml = toml::from_str("[tui]\n").expect("deserialize empty [tui] table");
+
+    assert_eq!(
+        parsed
+            .tui
+            .expect("config should include tui section")
+            .app_server_mode,
+        AppServerMode::Upstream
+    );
+}
+
+#[test]
+fn tui_app_server_mode_deserializes_instance_child() {
+    let parsed: ConfigToml = toml::from_str(
+        r#"
+        [tui]
+        app_server_mode = "instance_child"
+        "#,
+    )
+    .expect("deserialize instance_child app-server mode");
+
+    assert_eq!(
+        parsed
+            .tui
+            .expect("config should include tui section")
+            .app_server_mode,
+        AppServerMode::InstanceChild
+    );
+}
+
+#[test]
+fn tui_app_server_mode_rejects_unknown_values() {
+    let err = toml::from_str::<ConfigToml>(
+        r#"
+        [tui]
+        app_server_mode = "daemon"
+        "#,
+    )
+    .expect_err("unknown app-server mode should fail");
+
+    assert!(err.to_string().contains("unknown variant `daemon`"));
+}
+
+#[tokio::test]
+async fn runtime_config_uses_tui_app_server_mode() {
+    let cfg_toml: ConfigToml = toml::from_str(
+        r#"
+        [tui]
+        app_server_mode = "instance_child"
+        "#,
+    )
+    .expect("deserialize instance_child app-server mode");
+    let cfg = Config::load_from_base_config_with_overrides(
+        cfg_toml,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("load config");
+
+    assert_eq!(cfg.tui_app_server_mode, AppServerMode::InstanceChild);
 }
 
 #[test]
@@ -3832,6 +3899,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             show_tooltips: true,
             vim_mode_default: false,
             raw_output_mode: false,
+            app_server_mode: AppServerMode::Upstream,
             alternate_screen: AltScreenMode::Auto,
             status_line: None,
             status_line_use_colors: true,

@@ -2080,6 +2080,7 @@ dependencies = [
  "codex-http-client",
  "codex-uds",
  "codex-utils-home-dir",
+ "codex-utils-process",
  "futures",
  "libc",
  "pretty_assertions",
@@ -4143,6 +4144,7 @@ dependencies = [
  "chrono",
  "clap",
  "codex-ansi-escape",
+ "codex-app-server",
  "codex-app-server-client",
  "codex-app-server-protocol",
  "codex-arg0",
@@ -4182,6 +4184,7 @@ dependencies = [
  "codex-utils-path",
  "codex-utils-path-uri",
  "codex-utils-plugins",
+ "codex-utils-process",
  "codex-utils-sandbox-summary",
  "codex-utils-sleep-inhibitor",
  "codex-utils-string",
@@ -4401,6 +4404,16 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "codex-utils-process"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
  "tokio",
 ]
 

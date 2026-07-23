@@ -1224,6 +1224,11 @@ See the Codex keymap documentation for supported actions and examples."
                         match app_server_event {
                             Some(event) => app.handle_app_server_event(&app_server, event).await,
                             None => {
+                                if app_server.is_instance_child() {
+                                    break Err(color_eyre::eyre::eyre!(
+                                        "instance-owned app-server event stream closed unexpectedly"
+                                    ));
+                                }
                                 listen_for_app_server_events = false;
                                 tracing::warn!("app-server event stream closed");
                             }
@@ -1244,7 +1249,7 @@ See the Codex keymap documentation for supported actions and examples."
             }
         };
         if let Err(err) = app_server.shutdown().await {
-            tracing::warn!(error = %err, "failed to shut down embedded app server");
+            tracing::warn!(error = %err, "failed to shut down app server");
         }
         let clear_pet_result = tui.clear_ambient_pet_image();
         let clear_result = tui.terminal.clear();

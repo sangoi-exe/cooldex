@@ -33,6 +33,7 @@ use codex_config::loader::load_config_layers_state;
 use codex_config::loader::project_trust_key;
 use codex_config::permissions_toml::PermissionsToml;
 use codex_config::sandbox_mode_requirement_for_permission_profile;
+use codex_config::types::AppServerMode;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_config::types::AuthKeyringBackendKind;
@@ -759,6 +760,9 @@ pub struct Config {
 
     /// Start the TUI in raw scrollback mode for copy-friendly transcript output.
     pub tui_raw_output_mode: bool,
+
+    /// Selects the local app-server ownership mode for an interactive TUI.
+    pub tui_app_server_mode: AppServerMode,
 
     /// Start the TUI in the specified collaboration mode (plan/default).
 
@@ -4261,6 +4265,11 @@ impl Config {
                 .as_ref()
                 .map(|t| t.raw_output_mode)
                 .unwrap_or(false),
+            tui_app_server_mode: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.app_server_mode)
+                .unwrap_or_default(),
             tui_alternate_screen: cfg
                 .tui
                 .as_ref()

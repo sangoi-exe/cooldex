@@ -43,6 +43,7 @@ use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadError;
 use codex_config::LoaderOverrides;
 use codex_config::format_config_error_with_source;
+use codex_config::types::AppServerMode;
 use codex_config::types::ResumeCwdMode;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
@@ -94,6 +95,8 @@ mod app_event;
 mod app_event_sender;
 mod app_info;
 mod app_server_approval_conversions;
+#[cfg(target_os = "linux")]
+mod app_server_instance;
 mod app_server_session;
 mod approval_events;
 mod ascii_animation;
@@ -265,6 +268,7 @@ async fn start_embedded_app_server(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AppServerTarget {
     Embedded,
+    InstanceChild,
     LocalDaemon { endpoint: RemoteAppServerEndpoint },
     Remote { endpoint: RemoteAppServerEndpoint },
 }
@@ -304,9 +308,9 @@ async fn init_state_db_for_app_server_target(
                 format!("{err:#}"),
             ))
         }),
-        AppServerTarget::LocalDaemon { .. } | AppServerTarget::Remote { .. } => {
-            Ok(state_db::get_state_db(config).await)
-        }
+        AppServerTarget::InstanceChild
+        | AppServerTarget::LocalDaemon { .. }
+        | AppServerTarget::Remote { .. } => Ok(state_db::get_state_db(config).await),
     }
 }
 
@@ -460,6 +464,7 @@ async fn start_app_server(
     target: &AppServerTarget,
     arg0_paths: Arg0DispatchPaths,
     config: Config,
+    raw_config_overrides: Vec<String>,
     cli_kv_overrides: Vec<(String, toml::Value)>,
     loader_overrides: LoaderOverrides,
     strict_config: bool,
@@ -468,7 +473,7 @@ async fn start_app_server(
     log_db: Option<log_db::LogDbLayer>,
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
-) -> color_eyre::Result<AppServerClient> {
+) -> color_eyre::Result<AppServerSession> {
     match target {
         AppServerTarget::Embedded => start_embedded_app_server(
             arg0_paths,
@@ -483,9 +488,55 @@ async fn start_app_server(
             environment_manager,
         )
         .await
-        .map(AppServerClient::InProcess),
+        .map(AppServerClient::InProcess)
+        .map(|client| AppServerSession::new(client, ThreadParamsMode::Embedded)),
+        AppServerTarget::InstanceChild => {
+            #[cfg(target_os = "linux")]
+            {
+                let codex_exe = arg0_paths.codex_self_exe.ok_or_else(|| {
+                    color_eyre::eyre::eyre!(
+                        "instance-owned app-server requires the current Codex executable path"
+                    )
+                })?;
+                let started = app_server_instance::AppServerInstance::start(
+                    app_server_instance::InstanceChildLaunch {
+                        codex_exe,
+                        codex_home: config.codex_home.clone(),
+                        raw_config_overrides,
+                        profile: loader_overrides.user_config_profile.clone(),
+                        strict_config,
+                    },
+                )
+                .await?;
+                Ok(AppServerSession::new_instance_child(
+                    started.client,
+                    started.supervisor,
+                ))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (
+                    arg0_paths,
+                    config,
+                    raw_config_overrides,
+                    cli_kv_overrides,
+                    loader_overrides,
+                    strict_config,
+                    cloud_config_bundle,
+                    feedback,
+                    log_db,
+                    state_db,
+                    environment_manager,
+                );
+                color_eyre::eyre::bail!(
+                    "`tui.app_server_mode = \"instance_child\"` is supported only on Linux/WSL"
+                );
+            }
+        }
         AppServerTarget::LocalDaemon { endpoint } | AppServerTarget::Remote { endpoint } => {
-            connect_remote_app_server(endpoint.clone()).await
+            connect_remote_app_server(endpoint.clone())
+                .await
+                .map(|client| AppServerSession::new(client, target.thread_params_mode()))
         }
     }
 }
@@ -493,13 +544,24 @@ async fn start_app_server(
 pub(crate) async fn start_app_server_for_picker(
     config: &Config,
     target: &AppServerTarget,
+    instance_child_endpoint: Option<RemoteAppServerEndpoint>,
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
 ) -> color_eyre::Result<AppServerSession> {
-    let app_server = start_app_server(
+    if let Some(endpoint) = instance_child_endpoint {
+        let client = connect_remote_app_server(endpoint).await?;
+        return Ok(AppServerSession::new(client, ThreadParamsMode::Embedded));
+    }
+    if matches!(target, AppServerTarget::InstanceChild) {
+        color_eyre::eyre::bail!(
+            "instance-owned app-server picker connection requires the owning TUI endpoint"
+        );
+    }
+    start_app_server(
         target,
         Arg0DispatchPaths::default(),
         config.clone(),
+        Vec::new(),
         Vec::new(),
         LoaderOverrides::default(),
         /*strict_config*/ false,
@@ -509,11 +571,7 @@ pub(crate) async fn start_app_server_for_picker(
         state_db,
         environment_manager,
     )
-    .await?;
-    Ok(AppServerSession::new(
-        app_server,
-        target.thread_params_mode(),
-    ))
+    .await
 }
 
 #[cfg(test)]
@@ -524,6 +582,7 @@ pub(crate) async fn start_embedded_app_server_for_picker(
     start_app_server_for_picker(
         config,
         &AppServerTarget::Embedded,
+        None,
         state_db,
         Arc::new(EnvironmentManager::default_for_tests()),
     )
@@ -589,7 +648,7 @@ async fn shutdown_app_server_if_present(app_server: Option<AppServerSession>) {
     if let Some(app_server) = app_server
         && let Err(err) = app_server.shutdown().await
     {
-        warn!(%err, "Failed to shut down temporary embedded app server");
+        warn!(%err, "Failed to shut down app server");
     }
 }
 
@@ -870,9 +929,11 @@ fn app_server_target_for_launch(
     explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
     default_daemon_socket: Option<AbsolutePathBuf>,
     can_reuse_implicit_local_daemon: bool,
+    app_server_mode: AppServerMode,
 ) -> AppServerTarget {
     match explicit_remote_endpoint {
         Some(endpoint) => AppServerTarget::Remote { endpoint },
+        None if app_server_mode == AppServerMode::InstanceChild => AppServerTarget::InstanceChild,
         None if can_reuse_implicit_local_daemon => {
             default_daemon_socket.map_or(AppServerTarget::Embedded, |socket_path| {
                 AppServerTarget::LocalDaemon {
@@ -978,27 +1039,23 @@ pub async fn run_main(
         strict_config,
         cli.bypass_hook_trust,
     );
-    let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
-        maybe_probe_default_daemon_socket(&codex_home).await
-    } else {
-        None
-    };
-    let app_server_target = app_server_target_for_launch(
-        explicit_remote_endpoint,
-        default_daemon,
-        reuse_implicit_local_daemon,
-    );
-    let remote_cwd_override = cli
-        .cwd
-        .clone()
-        .filter(|_| app_server_target.uses_remote_workspace());
+    let instance_child_loader_overrides_replayable =
+        loader_overrides_are_default(&loader_overrides);
+    let provisional_app_server_target =
+        explicit_remote_endpoint
+            .as_ref()
+            .map_or(AppServerTarget::Embedded, |endpoint| {
+                AppServerTarget::Remote {
+                    endpoint: endpoint.clone(),
+                }
+            });
 
     let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
     let environment_manager =
-        if should_load_configured_environments(&loader_overrides, &app_server_target) {
+        if should_load_configured_environments(&loader_overrides, &provisional_app_server_target) {
             EnvironmentManager::from_codex_home(codex_home.clone(), Some(local_runtime_paths)).await
         } else {
             EnvironmentManager::from_env(Some(local_runtime_paths)).await
@@ -1006,8 +1063,11 @@ pub async fn run_main(
         .map(Arc::new)
         .map_err(std::io::Error::other)?;
     let cwd = cli.cwd.clone();
-    let config_cwd =
-        config_cwd_for_app_server_target(cwd.as_deref(), &app_server_target, &environment_manager)?;
+    let config_cwd = config_cwd_for_app_server_target(
+        cwd.as_deref(),
+        &provisional_app_server_target,
+        &environment_manager,
+    )?;
     let mut loader_overrides = loader_overrides;
     if let Some(profile_v2) = cli.config_profile_v2.as_ref() {
         let user_config_path = resolve_profile_v2_config_path(&codex_home, profile_v2);
@@ -1025,6 +1085,48 @@ pub async fn run_main(
     )
     .await;
     let bootstrap_config_toml = &bootstrap_config.config_toml;
+    let app_server_mode = bootstrap_config_toml
+        .tui
+        .as_ref()
+        .map(|tui| tui.app_server_mode)
+        .unwrap_or_default();
+    if explicit_remote_endpoint.is_none() && app_server_mode == AppServerMode::InstanceChild {
+        #[cfg(not(target_os = "linux"))]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "`tui.app_server_mode = \"instance_child\"` is supported only on Linux/WSL",
+        ));
+        if !instance_child_loader_overrides_replayable {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "`tui.app_server_mode = \"instance_child\"` cannot replay this invocation's config loader overrides",
+            ));
+        }
+        if cli.bypass_hook_trust {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "`tui.app_server_mode = \"instance_child\"` cannot replay --dangerously-bypass-hook-trust",
+            ));
+        }
+    }
+    let default_daemon = if explicit_remote_endpoint.is_none()
+        && app_server_mode == AppServerMode::Upstream
+        && reuse_implicit_local_daemon
+    {
+        maybe_probe_default_daemon_socket(&codex_home).await
+    } else {
+        None
+    };
+    let app_server_target = app_server_target_for_launch(
+        explicit_remote_endpoint,
+        default_daemon,
+        reuse_implicit_local_daemon,
+        app_server_mode,
+    );
+    let remote_cwd_override = cli
+        .cwd
+        .clone()
+        .filter(|_| app_server_target.uses_remote_workspace());
 
     let chatgpt_base_url = bootstrap_config_toml
         .chatgpt_base_url
@@ -1327,6 +1429,7 @@ async fn run_ratatui_app(
     environment_manager: Arc<EnvironmentManager>,
 ) -> color_eyre::Result<AppExitInfo> {
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
+    let raw_config_overrides = cli.config_overrides.raw_overrides.clone();
     color_eyre::install()?;
 
     tooltips::announcement::prewarm();
@@ -1379,6 +1482,7 @@ async fn run_ratatui_app(
         &app_server_target,
         arg0_paths.clone(),
         initial_config.clone(),
+        raw_config_overrides.clone(),
         cli_kv_overrides.clone(),
         loader_overrides.clone(),
         strict_config,
@@ -1390,7 +1494,7 @@ async fn run_ratatui_app(
     )
     .await
     {
-        Ok(app_server) => AppServerSession::new(app_server, app_server_target.thread_params_mode()),
+        Ok(app_server) => app_server,
         Err(err) => {
             terminal_restore_guard.restore_silently();
             session_log::log_session_end();
@@ -1548,18 +1652,34 @@ async fn run_ratatui_app(
                 None => resume_picker::SessionSelection::StartFresh,
             }
         } else if cli.fork_picker {
-            let Some(app_server) = app_server.take() else {
+            let Some(startup_app_server) = app_server.as_ref() else {
                 unreachable!("app server should be initialized for --fork picker");
+            };
+            let picker_app_server = if startup_app_server.is_instance_child() {
+                start_app_server_for_picker(
+                    &config,
+                    &app_server_target,
+                    startup_app_server.instance_child_endpoint(),
+                    state_db.clone(),
+                    environment_manager.clone(),
+                )
+                .await?
+            } else {
+                let Some(picker_app_server) = app_server.take() else {
+                    unreachable!("non-instance app server should still be available");
+                };
+                picker_app_server
             };
             match resume_picker::run_fork_picker_with_app_server(
                 &mut tui,
                 &config,
                 cli.fork_show_all,
-                app_server,
+                picker_app_server,
             )
             .await?
             {
                 resume_picker::SessionSelection::Exit => {
+                    shutdown_app_server_if_present(app_server.take()).await;
                     terminal_restore_guard.restore_silently();
                     session_log::log_session_end();
                     return Ok(AppExitInfo {
@@ -1608,19 +1728,35 @@ async fn run_ratatui_app(
             None => resume_picker::SessionSelection::StartFresh,
         }
     } else if cli.resume_picker {
-        let Some(app_server) = app_server.take() else {
+        let Some(startup_app_server) = app_server.as_ref() else {
             unreachable!("app server should be initialized for --resume picker");
+        };
+        let picker_app_server = if startup_app_server.is_instance_child() {
+            start_app_server_for_picker(
+                &config,
+                &app_server_target,
+                startup_app_server.instance_child_endpoint(),
+                state_db.clone(),
+                environment_manager.clone(),
+            )
+            .await?
+        } else {
+            let Some(picker_app_server) = app_server.take() else {
+                unreachable!("non-instance app server should still be available");
+            };
+            picker_app_server
         };
         match resume_picker::run_resume_picker_with_app_server(
             &mut tui,
             &config,
             cli.resume_show_all,
             cli.resume_include_non_interactive,
-            app_server,
+            picker_app_server,
         )
         .await?
         {
             resume_picker::SessionSelection::Exit => {
+                shutdown_app_server_if_present(app_server.take()).await;
                 terminal_restore_guard.restore_silently();
                 session_log::log_session_end();
                 return Ok(AppExitInfo {
@@ -1651,6 +1787,7 @@ async fn run_ratatui_app(
     {
         Ok(ResolveCwdOutcome::Continue(cwd)) => cwd,
         Ok(ResolveCwdOutcome::Exit) => {
+            shutdown_app_server_if_present(app_server.take()).await;
             terminal_restore_guard.restore_silently();
             session_log::log_session_end();
             return Ok(AppExitInfo {
@@ -1662,6 +1799,7 @@ async fn run_ratatui_app(
             });
         }
         Err(err) => {
+            shutdown_app_server_if_present(app_server.take()).await;
             terminal_restore_guard.restore_silently();
             session_log::log_session_end();
             return Err(err);
@@ -1745,6 +1883,7 @@ async fn run_ratatui_app(
             &app_server_target,
             arg0_paths,
             config.clone(),
+            raw_config_overrides,
             cli_kv_overrides.clone(),
             loader_overrides.clone(),
             strict_config,
@@ -1756,10 +1895,7 @@ async fn run_ratatui_app(
         )
         .await
         {
-            Ok(app_server) => {
-                AppServerSession::new(app_server, app_server_target.thread_params_mode())
-                    .with_remote_cwd_override(remote_cwd_override.clone())
-            }
+            Ok(app_server) => app_server.with_remote_cwd_override(remote_cwd_override.clone()),
             Err(err) => {
                 terminal_restore_guard.restore_silently();
                 session_log::log_session_end();
@@ -1770,11 +1906,13 @@ async fn run_ratatui_app(
 
     // Persistent app-server resumes may attach to an already-running thread,
     // where resume config overrides are ignored.
-    let is_persistent_resume = !matches!(&app_server_target, AppServerTarget::Embedded)
-        && matches!(
-            &session_selection,
-            resume_picker::SessionSelection::Resume(_)
-        );
+    let is_persistent_resume = matches!(
+        &app_server_target,
+        AppServerTarget::LocalDaemon { .. } | AppServerTarget::Remote { .. }
+    ) && matches!(
+        &session_selection,
+        resume_picker::SessionSelection::Resume(_)
+    );
     let bypass_hook_trust_for_startup_review = config.bypass_hook_trust && !is_persistent_resume;
     let hooks_request_handle = app_server.request_handle();
     let hooks_cwd = config.cwd.to_path_buf();
@@ -2252,6 +2390,7 @@ mod tests {
             let mut app_server = start_app_server_for_picker(
                 &final_config,
                 &AppServerTarget::Embedded,
+                None,
                 state_db,
                 Arc::new(EnvironmentManager::default_for_tests()),
             )
@@ -2490,6 +2629,7 @@ mod tests {
             /*explicit_remote_endpoint*/ None,
             Some(socket_path.clone()),
             /*can_reuse_implicit_local_daemon*/ true,
+            AppServerMode::Upstream,
         );
 
         assert_eq!(
@@ -2512,6 +2652,7 @@ mod tests {
             Some(explicit_endpoint.clone()),
             Some(AbsolutePathBuf::relative_to_current_dir("default.sock")?),
             /*can_reuse_implicit_local_daemon*/ false,
+            AppServerMode::InstanceChild,
         );
 
         assert_eq!(
@@ -2533,10 +2674,25 @@ mod tests {
             /*explicit_remote_endpoint*/ None,
             Some(socket_path),
             /*can_reuse_implicit_local_daemon*/ false,
+            AppServerMode::Upstream,
         );
 
         assert_eq!(target, AppServerTarget::Embedded);
         Ok(())
+    }
+
+    #[test]
+    fn app_server_target_for_launch_selects_instance_child_without_remote() {
+        let target = app_server_target_for_launch(
+            /*explicit_remote_endpoint*/ None,
+            /*default_daemon_socket*/ None,
+            /*can_reuse_implicit_local_daemon*/ true,
+            AppServerMode::InstanceChild,
+        );
+
+        assert_eq!(target, AppServerTarget::InstanceChild);
+        assert!(!target.uses_remote_workspace());
+        assert_eq!(target.thread_params_mode(), ThreadParamsMode::Embedded);
     }
 
     #[test]

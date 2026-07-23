@@ -306,11 +306,8 @@ pub enum Personality {
     Pragmatic,
 }
 
-/// Controls the effective multi-agent delegation instructions for a turn.
-///
-/// `custom` remains available for upstream persisted/runtime state. MultiAgentV2 public
-/// configuration selects one of the built-in policies and treats optional hint text only as an
-/// explanation of that policy.
+/// Controls the effective multi-agent delegation instructions for a turn. `custom` means the
+/// configured mode hint defines the policy instead of a built-in policy.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Display, JsonSchema, TS, Default)]
 #[serde(rename_all = "camelCase", from = "MultiAgentModeWire")]
 #[ts(rename_all = "camelCase")]

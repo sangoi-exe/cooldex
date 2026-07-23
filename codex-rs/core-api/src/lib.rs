@@ -11,6 +11,7 @@ pub use codex_config::ConfigLayerStack;
 pub use codex_config::config_toml::ProjectConfig;
 pub use codex_config::config_toml::RealtimeAudioConfig;
 pub use codex_config::config_toml::RealtimeConfig;
+pub use codex_config::types::AppServerMode;
 pub use codex_config::types::AuthCredentialsStoreMode;
 pub use codex_config::types::AuthKeyringBackendKind;
 pub use codex_config::types::History;

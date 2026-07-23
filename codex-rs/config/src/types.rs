@@ -686,6 +686,17 @@ pub struct ModelAvailabilityNuxConfig {
 /// Fallback resize-reflow row cap when Codex cannot identify a terminal-specific scrollback size.
 pub const DEFAULT_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS: usize = 1_000;
 
+/// Selects how an interactive TUI obtains its local app-server.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AppServerMode {
+    /// Preserve the upstream implicit-daemon-or-embedded selection.
+    #[default]
+    Upstream,
+    /// Spawn one private app-server child owned by this TUI instance.
+    InstanceChild,
+}
+
 /// Collection of settings that are specific to the TUI.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -712,6 +723,11 @@ pub struct Tui {
     /// Defaults to `false`.
     #[serde(default)]
     pub raw_output_mode: bool,
+
+    /// Controls how an ordinary interactive TUI obtains its local app-server.
+    /// Defaults to `upstream`.
+    #[serde(default)]
+    pub app_server_mode: AppServerMode,
 
     /// Controls whether the TUI uses the terminal's alternate screen buffer.
     ///

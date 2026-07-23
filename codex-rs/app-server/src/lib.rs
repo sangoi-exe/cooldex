@@ -7,6 +7,7 @@ use codex_config::LoaderOverrides;
 use codex_config::NoopThreadConfigLoader;
 use codex_config::RemoteThreadConfigLoader;
 use codex_config::ThreadConfigLoader;
+use codex_config::types::AppServerMode;
 use codex_core::config::Config;
 use codex_core::resolve_installation_id;
 use codex_login::AuthManager;
@@ -428,11 +429,20 @@ pub enum PluginStartupTasks {
     Skip,
 }
 
+/// Identifies whether app-server was launched directly or by one owning TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppServerLaunchMode {
+    #[default]
+    Direct,
+    InstanceChild,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppServerRuntimeOptions {
     pub plugin_startup_tasks: PluginStartupTasks,
     pub remote_control_startup_mode: RemoteControlStartupMode,
     pub install_shutdown_signal_handler: bool,
+    pub launch_mode: AppServerLaunchMode,
 }
 
 impl Default for AppServerRuntimeOptions {
@@ -441,8 +451,41 @@ impl Default for AppServerRuntimeOptions {
             plugin_startup_tasks: PluginStartupTasks::Start,
             remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
             install_shutdown_signal_handler: true,
+            launch_mode: AppServerLaunchMode::Direct,
         }
     }
+}
+
+fn validate_app_server_launch_mode(
+    configured_mode: AppServerMode,
+    launch_mode: AppServerLaunchMode,
+    transport: &AppServerTransport,
+) -> std::io::Result<()> {
+    match (configured_mode, launch_mode) {
+        (AppServerMode::Upstream, AppServerLaunchMode::Direct)
+        | (AppServerMode::InstanceChild, AppServerLaunchMode::InstanceChild) => {}
+        (AppServerMode::InstanceChild, AppServerLaunchMode::Direct) => {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "`tui.app_server_mode = \"instance_child\"` is supported only when launched by an ordinary interactive TUI",
+            ));
+        }
+        (AppServerMode::Upstream, AppServerLaunchMode::InstanceChild) => {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "internal instance-child launch requires `tui.app_server_mode = \"instance_child\"`",
+            ));
+        }
+    }
+    if launch_mode == AppServerLaunchMode::InstanceChild
+        && !matches!(transport, AppServerTransport::UnixSocket { .. })
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "internal instance-child launch requires a Unix socket transport",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -540,6 +583,12 @@ pub async fn run_main_with_transport_options(
             })?
         }
     };
+
+    validate_app_server_launch_mode(
+        config.tui_app_server_mode,
+        runtime_options.launch_mode,
+        &transport,
+    )?;
 
     let otel = codex_core::otel_init::build_provider(
         &config,
@@ -677,7 +726,8 @@ pub async fn run_main_with_transport_options(
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
 
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
-    let shutdown_when_no_connections = single_client_mode;
+    let shutdown_when_no_connections =
+        single_client_mode || runtime_options.launch_mode == AppServerLaunchMode::InstanceChild;
     let graceful_signal_restart_enabled =
         runtime_options.install_shutdown_signal_handler && !single_client_mode;
     let mut app_server_client_name_rx = None;
@@ -1333,11 +1383,15 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
 
 #[cfg(test)]
 mod tests {
+    use super::AppServerLaunchMode;
+    use super::AppServerTransport;
     use super::LogFormat;
     #[cfg(debug_assertions)]
     use super::loader_overrides_with_test_user_config_file;
+    use super::validate_app_server_launch_mode;
     #[cfg(debug_assertions)]
     use codex_config::LoaderOverrides;
+    use codex_config::types::AppServerMode;
     #[cfg(debug_assertions)]
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
@@ -1358,6 +1412,52 @@ mod tests {
         assert_eq!(LogFormat::from_env_value(Some("")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("text")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("jsonl")), LogFormat::Default);
+    }
+
+    #[test]
+    fn launch_mode_validation_keeps_direct_upstream_behavior() {
+        validate_app_server_launch_mode(
+            AppServerMode::Upstream,
+            AppServerLaunchMode::Direct,
+            &AppServerTransport::Stdio,
+        )
+        .expect("direct upstream app-server should remain valid");
+    }
+
+    #[test]
+    fn launch_mode_validation_rejects_direct_instance_child_config() {
+        let err = validate_app_server_launch_mode(
+            AppServerMode::InstanceChild,
+            AppServerLaunchMode::Direct,
+            &AppServerTransport::Stdio,
+        )
+        .expect_err("direct launch should reject instance-child config");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("ordinary interactive TUI"));
+    }
+
+    #[test]
+    fn launch_mode_validation_rejects_mismatched_marker_and_transport() {
+        let mode_err = validate_app_server_launch_mode(
+            AppServerMode::Upstream,
+            AppServerLaunchMode::InstanceChild,
+            &AppServerTransport::Stdio,
+        )
+        .expect_err("internal marker should require matching config");
+        assert!(
+            mode_err
+                .to_string()
+                .contains("requires `tui.app_server_mode")
+        );
+
+        let transport_err = validate_app_server_launch_mode(
+            AppServerMode::InstanceChild,
+            AppServerLaunchMode::InstanceChild,
+            &AppServerTransport::Stdio,
+        )
+        .expect_err("internal marker should require Unix transport");
+        assert!(transport_err.to_string().contains("Unix socket"));
     }
 
     #[cfg(debug_assertions)]
