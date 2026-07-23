@@ -57,9 +57,11 @@ Bookkeeping topology: `split`
   unrelated upstream defects, complete cumulative review and bookkeeping, and publish
   both the root and separate `.sangoi` branches.
 - Major stop conditions:
-  - Stop if the root or `.sangoi` branch, the locked Git objects, the byte-delimited
-    upstream `AGENTS.md` core, or the separate-repository topology differs from the
-    identities recorded below.
+  - Stop if the root or `.sangoi` branch stops descending from the locked pre-plan
+    baselines, the target-upstream object moves before rebase, the byte-delimited
+    upstream `AGENTS.md` core changes, or the separate-repository topology differs from
+    the identities recorded below. Plan, mirror, Gate-state, and implementation
+    checkpoint commits are expected descendants, not baseline drift.
 <!-- task-bookkeeping:mirror:end -->
 
 ## Planned Fork Requirements — Not Shipped
