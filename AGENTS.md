@@ -415,7 +415,7 @@ Codex supports running connected app-server and exec-server on different operati
 ## Cooldex Root Atlas
 
 Last reviewed: 2026-07-22 on `master-refactor-v2` at upstream base
-`6e5a2d6b8d148a5554fdceb6f399ca45bd1c78d9`.
+`44d76c6a6dd04fa2efc302b906ac8774267a1272`.
 
 - `/home/lucas/work/codex/AGENTS.md` — local policy, exact upstream core, active mirror,
   and root map.
