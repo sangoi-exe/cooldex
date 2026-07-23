@@ -8,6 +8,14 @@ retries = 1
 [profile.default.junit]
 path = "junit.xml"
 
+# Merge-safety anchor: local guard/just recipes depend on these disk-aware
+# profiles, so upstream profile additions must not replace them.
+[profile.local-safe]
+fail-fast = false
+
+[profile.local-disk-tight]
+fail-fast = false
+
 [profile.local]
 inherits = "default"
 

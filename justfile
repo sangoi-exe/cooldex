@@ -7,6 +7,9 @@ set windows-shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.envir
 rust_min_stack := "8388608" # 8 MiB
 python := if os_family() == "windows" { "python" } else { "python3" }
 
+# Merge-safety anchor: build-like Cargo just recipes route through
+# scripts/cargo-guard.sh so resource limits, cleanup, and receipts stay centralized.
+
 # Display help
 help:
     just -l
@@ -14,11 +17,11 @@ help:
 # `codex`
 alias c := codex
 codex *args:
-    cargo run --bin codex -- {args}
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo run --bin codex -- {args}
 
 # `codex exec`
 exec *args:
-    cargo run --bin codex -- exec {args}
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo run --bin codex -- exec {args}
 
 # Start `codex exec-server` and run codex-tui.
 [no-cd]
@@ -29,16 +32,16 @@ tui-with-exec-server *args:
 
 # Run the CLI version of the file-search crate.
 file-search *args:
-    cargo run --bin codex-file-search -- {args}
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo run --bin codex-file-search -- {args}
 
 # Run the standalone code-mode host from source.
 code-mode-host *args:
-    cargo run --bin codex-code-mode-host -- {args}
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo run --bin codex-code-mode-host -- {args}
 
 # Build the CLI and run the app-server test client
 app-server-test-client *args:
-    cargo build -p codex-cli
-    cargo run -p codex-app-server-test-client -- --codex-bin ./target/debug/codex {args}
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo build --target-dir ./target -p codex-cli --bin codex
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo run -p codex-app-server-test-client -- --codex-bin ./target/debug/codex {args}
 
 # Format the justfile, Rust, Bazel/Starlark, Python SDK code, and Python scripts.
 fmt:
@@ -49,10 +52,17 @@ fmt-check:
     @{{ python }} ../scripts/format.py --check
 
 fix *args:
-    cargo clippy --fix --tests --allow-dirty {args}
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-clippy}" bash ../scripts/cargo-guard.sh cargo clippy --fix --tests --allow-dirty {args}
 
 clippy *args:
-    cargo clippy --tests {args}
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-clippy}" bash ../scripts/cargo-guard.sh cargo clippy --tests {args}
+
+clippy-strict *args:
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-clippy}" bash ../scripts/cargo-guard.sh cargo clippy {args} -- -D warnings
+
+check-strict *args:
+    RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-D warnings" \
+        CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-check}" bash ../scripts/cargo-guard.sh cargo check {args}
 
 [unix]
 install:
@@ -72,18 +82,76 @@ install:
     cargo fetch
     exit $LASTEXITCODE
 
-# Run nextest with --no-fail-fast so all tests are run.
+# Run nextest through the checked-in resource and nextest profiles.
 #
-# Run `cargo install --locked cargo-nextest` if you don't have it installed.
+# Install cargo-nextest externally if it is not already available.
 # Prefer this for routine local runs. Workspace crate features are banned, so
 # there should be no need to add `--all-features`.
 [unix]
 test *args:
-    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast "$@"
+    NEXTEST_PROFILE="${NEXTEST_PROFILE:-local-safe}"; \
+    resource_profile="${CARGO_GUARD_RESOURCE_PROFILE:-workspace_nextest}"; \
+    if [ "$NEXTEST_PROFILE" = "local-disk-tight" ] && [ -z "${CARGO_GUARD_RESOURCE_PROFILE:-}" ]; then \
+        resource_profile="workspace_nextest_tight"; \
+    fi; \
+    RUST_MIN_STACK={{ rust_min_stack }} CARGO_GUARD_RESOURCE_PROFILE="$resource_profile" bash ../scripts/cargo-guard.sh cargo nextest run --profile "$NEXTEST_PROFILE" {args}
 
 [windows]
 test *args:
     $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast @($args | Select-Object -Skip 1)
+
+validate *args:
+    ../scripts/cargo-guard.sh verify --changed --mode standard {args}
+
+validate-resume *args:
+    ../scripts/cargo-guard.sh verify --changed --mode standard --resume --explain-skip {args}
+
+validate-partial-from index *args:
+    @echo "PARTIAL / NOT FINAL VALIDATION: rerunning validation tail from command {{ index }} only."
+    ../scripts/cargo-guard.sh verify --changed --mode standard --from-index "{{ index }}" --explain-skip {args}
+
+validate-partial-failed *args:
+    @echo "PARTIAL / NOT FINAL VALIDATION: rerunning only previously failed validation commands."
+    ../scripts/cargo-guard.sh verify --changed --mode standard --only-failed --explain-skip {args}
+
+validate-strict *args:
+    ../scripts/cargo-guard.sh verify --changed --mode strict {args}
+
+validate-strict-resume *args:
+    ../scripts/cargo-guard.sh verify --changed --mode strict --resume --explain-skip {args}
+
+validate-strict-partial-from index *args:
+    @echo "PARTIAL / NOT FINAL VALIDATION: rerunning strict validation tail from command {{ index }} only."
+    ../scripts/cargo-guard.sh verify --changed --mode strict --from-index "{{ index }}" --explain-skip {args}
+
+validate-strict-partial-failed *args:
+    @echo "PARTIAL / NOT FINAL VALIDATION: rerunning only previously failed strict validation commands."
+    ../scripts/cargo-guard.sh verify --changed --mode strict --only-failed --explain-skip {args}
+
+validate-plan *args:
+    ../scripts/cargo-guard.sh plan --changed --mode standard {args}
+
+validate-cli:
+    ../scripts/cargo-guard.sh verify --surface cli --mode strict
+
+build-codex-bin:
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo build -p codex-cli --bin codex
+
+check-codex-bin:
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-check}" bash ../scripts/cargo-guard.sh cargo check -p codex-cli --bin codex
+    just check-strict -p codex-cli --bin codex
+
+strict-codex-bin:
+    just clippy-strict -p codex-cli --bin codex
+    just check-strict -p codex-cli --bin codex
+
+smoke-codex-bin:
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo build -p codex-cli --bin codex
+    target_dir="$(bash ../scripts/cargo-guard.sh cargo metadata --format-version=1 --no-deps --quiet | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')" && \
+        "$target_dir/debug/codex" --version && \
+        "$target_dir/debug/codex" --help && \
+        "$target_dir/debug/codex" exec --help && \
+        "$target_dir/debug/codex" app-server --help
 
 # Run from the repository root so scripts that resolve paths from `cwd` see
 # the same layout they use in GitHub Actions.
@@ -93,7 +161,7 @@ test-github-scripts:
 
 # Run explicit workspace benchmark targets.
 bench *args:
-    cargo bench --workspace --bench '*' {args}
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo bench --workspace --bench '*' {args}
 
 # Run benchmark targets once to ensure they start successfully.
 bench-smoke:
@@ -165,19 +233,25 @@ build-for-release:
 
 # Run the MCP server
 mcp-server-run *args:
-    cargo run -p codex-mcp-server -- {args}
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo run -p codex-mcp-server -- {args}
 
 # Regenerate the json schema for config.toml from the current config types.
 write-config-schema:
-    cargo run -p codex-core --bin codex-write-config-schema
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo run -p codex-core --bin codex-write-config-schema
 
 # Regenerate vendored app-server protocol schema artifacts.
 write-app-server-schema *args:
-    cargo run -p codex-app-server-protocol --bin write_schema_fixtures -- {args}
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo run -p codex-app-server-protocol --bin write_schema_fixtures -- {args}
 
 [no-cd]
 write-hooks-schema:
-    cargo run --manifest-path {{ justfile_directory() }}/codex-rs/Cargo.toml -p codex-hooks --bin write_hooks_schema_fixtures
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash {{ justfile_directory() }}/scripts/cargo-guard.sh cargo run --manifest-path {{ justfile_directory() }}/codex-rs/Cargo.toml -p codex-hooks --bin write_hooks_schema_fixtures
+
+test-cargo-guard:
+    bash ../scripts/test-cargo-guard.sh
+
+test-cargo-validate:
+    python3 ../scripts/test-cargo-validate.py
 
 # Run the argument-comment Dylint checks across codex-rs.
 [no-cd]
@@ -196,7 +270,7 @@ argument-comment-lint-from-source *args:
 # Tail logs from the state SQLite database
 [unix]
 log *args:
-    if [ "${1:-}" = "--" ]; then shift; fi; cargo run -p codex-state --bin logs_client -- "$@"
+    if [ "${1:-}" = "--" ]; then shift; fi; CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo run -p codex-state --bin logs_client -- "$@"
 
 [windows]
 log *args:

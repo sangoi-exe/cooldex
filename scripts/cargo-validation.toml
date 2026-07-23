@@ -1,0 +1,552 @@
+# Merge-safety anchor: this declarative map is the source of truth for deterministic
+# cargo-validate package, surface, generator, self-test, receipt, and resource-profile selection.
+schema_version = 1
+
+[defaults]
+standard_mode = "standard"
+unknown_rust_path_policy = "package-plus-cli-strict"
+workspace_features_policy = "deny-routine-all-features"
+history_sample_limit = 20
+
+[receipts]
+dir = ".sangoi/validation"
+
+[resource_profiles.check]
+reserve_free_pct = 0
+reserve_free_gib = 5
+abort_free_pct = 0
+abort_free_gib = 5
+monitor = true
+cargo_jobs_mode = "auto"
+cargo_jobs_default = "min"
+cargo_jobs_min = 4
+cargo_jobs_max = 16
+cargo_jobs_hard_max = 16
+cargo_jobs_cpu_pct = 80
+cargo_jobs_cpu_reserve = 4
+cargo_jobs_mem_per_job_mib = 1280
+cargo_jobs_mem_reserve_mib = 8192
+cargo_jobs_low_disk_max = 4
+
+[resource_profiles.check_tests]
+reserve_free_pct = 0
+reserve_free_gib = 5
+abort_free_pct = 0
+abort_free_gib = 5
+monitor = true
+cargo_jobs_mode = "auto"
+cargo_jobs_default = "min"
+cargo_jobs_min = 4
+cargo_jobs_max = 12
+cargo_jobs_hard_max = 16
+cargo_jobs_cpu_pct = 70
+cargo_jobs_cpu_reserve = 4
+cargo_jobs_mem_per_job_mib = 2048
+cargo_jobs_mem_reserve_mib = 10240
+cargo_jobs_low_disk_max = 4
+
+[resource_profiles.test_no_run]
+reserve_free_pct = 0
+reserve_free_gib = 5
+abort_free_pct = 0
+abort_free_gib = 5
+monitor = true
+cargo_jobs_mode = "auto"
+cargo_jobs_default = "min"
+cargo_jobs_min = 4
+cargo_jobs_max = 10
+cargo_jobs_hard_max = 16
+cargo_jobs_cpu_pct = 65
+cargo_jobs_cpu_reserve = 4
+cargo_jobs_mem_per_job_mib = 3072
+cargo_jobs_mem_reserve_mib = 12288
+cargo_jobs_low_disk_max = 4
+
+[resource_profiles.package_test]
+reserve_free_pct = 0
+reserve_free_gib = 5
+abort_free_pct = 0
+abort_free_gib = 5
+monitor = true
+# Original runtime values were test_threads = 4 and low_disk_test_threads_max = 2.
+# Keep runtime tests serialized until telemetry proves a safe higher thread cap.
+test_threads = 1
+low_disk_test_threads_max = 1
+cargo_jobs_mode = "auto"
+cargo_jobs_default = "min"
+cargo_jobs_min = 4
+cargo_jobs_max = 8
+cargo_jobs_hard_max = 16
+cargo_jobs_cpu_pct = 60
+cargo_jobs_cpu_reserve = 4
+cargo_jobs_mem_per_job_mib = 3072
+cargo_jobs_mem_reserve_mib = 12288
+cargo_jobs_low_disk_max = 4
+
+[resource_profiles.clippy]
+reserve_free_pct = 0
+reserve_free_gib = 5
+abort_free_pct = 0
+abort_free_gib = 5
+monitor = true
+cargo_jobs_mode = "auto"
+cargo_jobs_default = "min"
+cargo_jobs_min = 4
+cargo_jobs_max = 10
+cargo_jobs_hard_max = 16
+cargo_jobs_cpu_pct = 65
+cargo_jobs_cpu_reserve = 4
+cargo_jobs_mem_per_job_mib = 2560
+cargo_jobs_mem_reserve_mib = 10240
+cargo_jobs_low_disk_max = 4
+
+[resource_profiles.build]
+reserve_free_pct = 0
+reserve_free_gib = 5
+abort_free_pct = 0
+abort_free_gib = 5
+monitor = true
+cargo_jobs_mode = "auto"
+cargo_jobs_default = "min"
+cargo_jobs_min = 4
+cargo_jobs_max = 12
+cargo_jobs_hard_max = 16
+cargo_jobs_cpu_pct = 70
+cargo_jobs_cpu_reserve = 4
+cargo_jobs_mem_per_job_mib = 2048
+cargo_jobs_mem_reserve_mib = 10240
+cargo_jobs_low_disk_max = 4
+
+[resource_profiles.workspace_nextest]
+reserve_free_pct = 0
+reserve_free_gib = 5
+abort_free_pct = 0
+abort_free_gib = 5
+monitor = true
+# Original runtime values were test_threads = 4 and low_disk_test_threads_max = 2.
+# Keep runtime tests serialized until telemetry proves a safe higher thread cap.
+test_threads = 1
+low_disk_test_threads_max = 1
+cargo_jobs_mode = "auto"
+cargo_jobs_default = "min"
+cargo_jobs_min = 4
+cargo_jobs_max = 8
+cargo_jobs_hard_max = 16
+cargo_jobs_cpu_pct = 55
+cargo_jobs_cpu_reserve = 4
+cargo_jobs_mem_per_job_mib = 3584
+cargo_jobs_mem_reserve_mib = 14336
+cargo_jobs_low_disk_max = 4
+
+[resource_profiles.workspace_nextest_tight]
+reserve_free_pct = 0
+reserve_free_gib = 5
+abort_free_pct = 0
+abort_free_gib = 5
+monitor = true
+# Original runtime values were test_threads = 2 and low_disk_test_threads_max = 2.
+# Keep runtime tests serialized until telemetry proves a safe higher thread cap.
+test_threads = 1
+low_disk_test_threads_max = 1
+cargo_jobs_mode = "auto"
+cargo_jobs_default = "min"
+cargo_jobs_min = 3
+cargo_jobs_max = 6
+cargo_jobs_hard_max = 12
+cargo_jobs_cpu_pct = 50
+cargo_jobs_cpu_reserve = 4
+cargo_jobs_mem_per_job_mib = 4096
+cargo_jobs_mem_reserve_mib = 16384
+cargo_jobs_low_disk_max = 3
+
+# Feature profiles are intentionally absent until a package needs one. Add entries
+# in this shape instead of letting agents invent --features by hand:
+#
+# [[package_features]]
+# package = "codex-example"
+# profiles = { standard = [[]], strict = [[]] }
+
+[[package_features]]
+package = "codex-code-mode"
+profiles = { standard = [[]], strict = [[]] }
+
+[[package_features]]
+package = "codex-tui"
+profiles = { standard = [[]], strict = [[]] }
+
+[[package_features]]
+package = "codex-v8-poc"
+profiles = { standard = [[]], strict = [[]] }
+
+[commands.write-config-schema]
+argv = ["just", "write-config-schema"]
+profile = "build"
+
+[commands.write-app-server-schema]
+argv = ["just", "write-app-server-schema"]
+profile = "build"
+
+[commands.write-hooks-schema]
+argv = ["just", "write-hooks-schema"]
+profile = "build"
+
+[commands.bazel-lock-update]
+argv = ["just", "bazel-lock-update"]
+profile = "build"
+
+[commands.bazel-lock-check]
+argv = ["just", "bazel-lock-check"]
+
+[commands.guard-syntax]
+argv = ["bash", "-n", "scripts/cargo-guard.sh"]
+
+[commands.guard-test-syntax]
+argv = ["bash", "-n", "scripts/test-cargo-guard.sh"]
+
+[commands.just-summary]
+argv = ["just", "--summary"]
+
+[commands.nextest-config-check]
+argv = ["python3", "-c", "from pathlib import Path; import tomllib; text = Path('codex-rs/.config/nextest.toml').read_text(); config = tomllib.loads(text); profiles = config.get('profile', {}); assert profiles['local-safe']['fail-fast'] is False; assert 'test-threads' not in profiles['local-safe']; assert profiles['local-disk-tight']['fail-fast'] is False; assert 'test-threads' not in profiles['local-disk-tight']; assert text.count('codex-windows-sandbox') == 1; assert text.count('windows_sandbox_legacy_sessions') == 2; print('nextest config checks ok')"]
+
+[commands.validate-py-compile]
+argv = ["python3", "-m", "py_compile", "scripts/cargo-validate.py"]
+
+[commands.validate-tests]
+argv = ["python3", "scripts/test-cargo-validate.py"]
+
+[commands.guard-tests]
+argv = ["just", "test-cargo-guard"]
+
+[commands.first-party-runtime-support-bins]
+argv = ["./scripts/cargo-guard.sh", "cargo", "build", "-p", "codex-cli", "--bin", "codex", "-p", "codex-rmcp-client", "--bin", "test_stdio_server", "--bin", "test_streamable_http_server", "-p", "codex-exec", "--bin", "codex-exec", "-p", "codex-linux-sandbox", "--bin", "codex-linux-sandbox", "-p", "codex-shell-escalation", "--bin", "codex-execve-wrapper"]
+profile = "build"
+
+[commands.validate-plan-self]
+argv = ["./scripts/cargo-guard.sh", "plan", "--file", "scripts/cargo-validate.py", "--mode", "standard", "--no-receipt"]
+
+[[surfaces]]
+name = "cli"
+target_args = ["-p", "codex-cli", "--bin", "codex"]
+strict_recipes = ["strict-codex-bin"]
+smoke_recipes = ["smoke-codex-bin"]
+
+[[surfaces]]
+name = "tui"
+target_args = ["-p", "codex-tui"]
+
+[[surfaces]]
+name = "exec"
+target_args = ["-p", "codex-exec"]
+
+[[surfaces]]
+name = "app_server"
+target_args = ["-p", "codex-app-server"]
+
+[[surfaces]]
+name = "app_server_protocol"
+target_args = ["-p", "codex-app-server-protocol"]
+
+[[surfaces]]
+name = "config_schema"
+target_args = ["-p", "codex-config"]
+
+[[surfaces]]
+name = "hooks_schema"
+target_args = ["-p", "codex-hooks"]
+
+[[surfaces]]
+name = "sandbox_linux"
+target_args = ["-p", "codex-sandboxing"]
+
+[[surfaces]]
+name = "auth"
+target_args = ["-p", "codex-login"]
+
+[[surfaces]]
+name = "validation_tooling"
+
+[[surfaces]]
+name = "nextest_config"
+
+[[path_rules]]
+patterns = ["codex-rs/cli/**"]
+packages = ["codex-cli"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/core/src/config/**"]
+packages = ["codex-core"]
+surfaces = ["cli", "config_schema"]
+flags = ["runtime"]
+generators = ["write-config-schema"]
+
+[[path_rules]]
+patterns = ["codex-rs/core/**"]
+packages = ["codex-core"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/core-api/**"]
+packages = ["codex-core-api"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/tui/**"]
+packages = ["codex-tui"]
+surfaces = ["cli", "tui"]
+flags = ["runtime", "snapshots"]
+
+[[path_rules]]
+patterns = ["codex-rs/app-server/**"]
+packages = ["codex-app-server"]
+surfaces = ["cli", "app_server"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/app-server-transport/**"]
+packages = ["codex-app-server-transport"]
+surfaces = ["app_server"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/app-server-protocol/**"]
+packages = ["codex-app-server-protocol"]
+surfaces = ["app_server_protocol"]
+flags = ["runtime"]
+generators = ["write-app-server-schema"]
+
+[[path_rules]]
+patterns = ["codex-rs/analytics/**"]
+packages = ["codex-analytics"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/exec/**"]
+packages = ["codex-exec"]
+surfaces = ["cli", "exec"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/features/**"]
+packages = ["codex-features"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/protocol/**"]
+packages = ["codex-protocol"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/tools/**"]
+packages = ["codex-tools"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/codex-mcp/**"]
+packages = ["codex-mcp"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/file-system/**"]
+packages = ["codex-file-system"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/login/**"]
+packages = ["codex-login"]
+surfaces = ["cli", "auth"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/model-provider/**"]
+packages = ["codex-model-provider"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/backend-client/**"]
+packages = ["codex-backend-client"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/chatgpt/**"]
+packages = ["codex-chatgpt"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/cloud-config/**"]
+packages = ["codex-cloud-config"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/cloud-tasks/**"]
+packages = ["codex-cloud-tasks"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/sandboxing/**"]
+packages = ["codex-sandboxing"]
+surfaces = ["cli", "sandbox_linux"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/linux-sandbox/**"]
+packages = ["codex-linux-sandbox"]
+surfaces = ["cli", "sandbox_linux"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/config/**"]
+packages = ["codex-config"]
+surfaces = ["cli", "config_schema"]
+flags = ["runtime"]
+generators = ["write-config-schema"]
+
+[[path_rules]]
+patterns = ["codex-rs/thread-manager-sample/**"]
+packages = ["codex-thread-manager-sample"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/test-binary-support/**"]
+packages = ["codex-test-binary-support"]
+surfaces = ["cli"]
+
+# Merge-safety anchor: strict range validation must not rely on the
+# unknown-package CLI fallback for known workspace package roots. Keep this list
+# explicit so new package roots still fail closed until classified.
+[[path_rules]]
+patterns = [
+  "codex-rs/agent-graph-store/**",
+  "codex-rs/agent-identity/**",
+  "codex-rs/app-server-client/**",
+  "codex-rs/app-server-daemon/**",
+  "codex-rs/app-server-test-client/**",
+  "codex-rs/apply-patch/**",
+  "codex-rs/arg0/**",
+  "codex-rs/code-mode/**",
+  "codex-rs/code-mode-host/**",
+  "codex-rs/code-mode-protocol/**",
+  "codex-rs/codex-api/**",
+  "codex-rs/codex-backend-openapi-models/**",
+  "codex-rs/codex-client/**",
+  "codex-rs/codex-home/**",
+  "codex-rs/connectors/**",
+  "codex-rs/context-fragments/**",
+  "codex-rs/core-plugins/**",
+  "codex-rs/core-skills/**",
+  "codex-rs/exec-server/**",
+  "codex-rs/exec-server-protocol/**",
+  "codex-rs/execpolicy/**",
+  "codex-rs/ext/agent/**",
+  "codex-rs/ext/connectors/**",
+  "codex-rs/ext/extension-api/**",
+  "codex-rs/ext/goal/**",
+  "codex-rs/ext/image-generation/**",
+  "codex-rs/ext/items/**",
+  "codex-rs/ext/mcp/**",
+  "codex-rs/ext/memories/**",
+  "codex-rs/ext/skills/**",
+  "codex-rs/ext/web-search/**",
+  "codex-rs/external-agent-migration/**",
+  "codex-rs/external-agent-sessions/**",
+  "codex-rs/feedback/**",
+  "codex-rs/git-utils/**",
+  "codex-rs/http-client/**",
+  "codex-rs/install-context/**",
+  "codex-rs/mcp-server/**",
+  "codex-rs/memories/write/**",
+  "codex-rs/model-provider-info/**",
+  "codex-rs/models-manager/**",
+  "codex-rs/network-proxy/**",
+  "codex-rs/otel/**",
+  "codex-rs/plugin/**",
+  "codex-rs/prompts/**",
+  "codex-rs/response-debug-context/**",
+  "codex-rs/rmcp-client/**",
+  "codex-rs/rollout/**",
+  "codex-rs/rollout-trace/**",
+  "codex-rs/shell-command/**",
+  "codex-rs/state/**",
+  "codex-rs/thread-store/**",
+  "codex-rs/utils/cli/**",
+  "codex-rs/utils/home-dir/**",
+  "codex-rs/utils/output-truncation/**",
+  "codex-rs/utils/path-uri/**",
+  "codex-rs/utils/plugins/**",
+  "codex-rs/websocket-client/**",
+  "codex-rs/windows-sandbox-rs/**",
+]
+surfaces = ["cli"]
+
+[[path_rules]]
+patterns = ["codex-rs/hooks/**"]
+packages = ["codex-hooks"]
+surfaces = ["hooks_schema"]
+flags = ["runtime"]
+generators = ["write-hooks-schema"]
+
+[[path_rules]]
+patterns = ["codex-rs/.config/nextest.toml"]
+surfaces = ["nextest_config"]
+commands = ["nextest-config-check"]
+
+[[path_rules]]
+patterns = ["codex-rs/**/tests/**", "codex-rs/**/benches/**", "codex-rs/**/snapshots/**", "codex-rs/**/fixtures/**"]
+flags = ["test_scope", "runtime"]
+
+[[path_rules]]
+patterns = ["codex-rs/Cargo.toml"]
+surfaces = ["cli"]
+flags = ["manifest_changed", "test_scope"]
+prep_commands = ["bazel-lock-update"]
+commands = ["bazel-lock-check"]
+
+[[path_rules]]
+patterns = ["codex-rs/**/Cargo.toml"]
+flags = ["manifest_changed", "test_scope"]
+prep_commands = ["bazel-lock-update"]
+commands = ["bazel-lock-check"]
+
+[[path_rules]]
+patterns = ["codex-rs/Cargo.lock", "MODULE.bazel.lock"]
+commands = ["bazel-lock-check"]
+
+[[path_rules]]
+patterns = ["BUILD.bazel", "codex-rs/**/BUILD.bazel", "MODULE.bazel"]
+flags = ["bazel"]
+commands = ["bazel-lock-check"]
+
+[[path_rules]]
+patterns = ["scripts/cargo-guard.sh"]
+surfaces = ["validation_tooling"]
+commands = ["guard-syntax", "guard-tests"]
+
+[[path_rules]]
+patterns = ["scripts/test-cargo-guard.sh"]
+surfaces = ["validation_tooling"]
+commands = ["guard-test-syntax", "guard-tests"]
+
+[[path_rules]]
+patterns = ["justfile"]
+commands = ["just-summary", "validate-plan-self"]
+
+[[path_rules]]
+patterns = ["scripts/cargo-validate.py", "scripts/cargo-validation.toml", "scripts/test-cargo-validate.py"]
+surfaces = ["validation_tooling"]
+commands = ["validate-py-compile", "validate-tests", "validate-plan-self"]

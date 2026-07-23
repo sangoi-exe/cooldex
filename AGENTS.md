@@ -94,6 +94,24 @@ shipped behavior from this inventory.
 - Root commits materially authored by Codex include the exact trailer
   `Co-authored-by: Codex <codex@openai.com>` unless the user explicitly says otherwise.
 
+## Guarded Rust Validation
+
+- On the supported WSL/Linux operator path, route every Cargo build, test, check, lint,
+  run, benchmark, and generator command through `./scripts/cargo-guard.sh` or a root
+  `just` recipe that delegates to that wrapper. Raw Cargo execution is not valid Cooldex
+  workspace evidence.
+- `scripts/cargo-validation.toml` owns resource profiles, job caps, one-thread runtime-test
+  limits, and receipt placement under `.sangoi/validation/`. Missing guard, policy,
+  profile, or receipt ownership fails closed.
+- For every Rust code change, run
+  `scripts/cooldex/rust-blast-radius-guard.py` from the workspace root against each
+  changed symbol or owning file/line before editing when possible and again after each
+  changed Rust file. Final evidence uses uncapped output. Treat the report as an impact
+  inventory, not behavioral proof, and manually account for followers it misses.
+- The active canonical plan owns the reviewer-before-Cargo boundary. Its explicitly listed
+  fake-command and fixture-only safety checks may run before that gate; no Cargo command,
+  guarded validation plan, or build-like recipe may do so.
+
 <!-- upstream-agents-core:begin blob=faa57cc0db48123e1011f1eb47692cd3bbbcfc3a source=upstream/main -->
 # Rust/codex-rs
 
