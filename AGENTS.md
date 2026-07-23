@@ -42,42 +42,48 @@ Bookkeeping topology: `split`
 - Root branch: `master-refactor-v2`.
 - `.sangoi` branch: `master-refactor-v2`.
 - Canonical plan: `.sangoi/planning/2026-07-22-implement-master-refactor-v2-requirements.md`.
-- What we are creating: A current-upstream implementation of the five approved Cooldex
-  requirements: bounded args-less `recall`; explicit MultiAgentV2 policy and
-  tool-contract parity; atomic full-history identity with one validated
+- What we are creating: A current-upstream implementation of six approved Cooldex
+  requirements: deterministic bounded args-less `recall`; bounded automatic
+  post-compaction recovery as transient developer context; explicit MultiAgentV2 policy
+  and tool-contract parity; atomic full-history identity with one validated
   child-instruction snapshot; a complete global AGENTS provider gate; and one WSL/Linux
-  interactive-TUI-owned app-server child lifecycle. The work lands as five reviewable
-  runtime tranches, preserves upstream behavior by default, changes no app-server wire
-  shape, and leaves the Cursor gateway on standby.
-- Confirmed paraphrased user-request summary: Fast-forward local `main` exactly to
-  current `upstream/main`, rebase `master-refactor-v2` while preserving its important
-  root instructions and documentation, then implement all five reviewed RFC requirements
-  under one canonical plan with coherent internal tranches. Include generated
-  configuration and direct test followers, do not revive the Cursor route or fix
-  unrelated upstream defects, complete cumulative review and bookkeeping, and publish
-  both the root and separate `.sangoi` branches.
+  interactive-TUI-owned app-server child lifecycle. The five already committed runtime
+  tranches remain the baseline. This strategy epoch restores the omitted Cargo safety
+  island, incorporates the pending V2 resident-identity review fix, and ports the
+  recovery behavior from its historical semantic source into current owners without
+  copying the old unbounded Prompt-GC implementation.
+- Confirmed paraphrased user-request summary: Preserve the five current-upstream
+  implementation tranches, restore `cargo-guard` and the blast-radius tooling before any
+  further Rust command, then add the automatic post-compaction recovery island because
+  the current compacted prompt can present retained user messages as though they were a
+  new user request. The recovery must cover compact, resume, fork, and rollback, remain
+  bounded, reuse current rollout reconstruction and `recall`, avoid Cursor and unrelated
+  upstream fixes, pass cumulative review and guarded validation, and publish both
+  repositories.
 - Major stop conditions:
-  - Stop if the root or `.sangoi` branch stops descending from the locked pre-plan
-    baselines, the target-upstream object moves before rebase, the byte-delimited
-    upstream `AGENTS.md` core changes, or the separate-repository topology differs from
-    the identities recorded below. Plan, mirror, Gate-state, and implementation
-    checkpoint commits are expected descendants, not baseline drift.
+  - Stop if the root branch is not `master-refactor-v2` at or descending from
+    `cab2f303ba84755b2714368d1e10804faf56c709`, or the inner branch is not
+    `master-refactor-v2` at or descending from
+    `780f67501321ea2a886c55f64e788ae0824f3527`.
 <!-- task-bookkeeping:mirror:end -->
 
 ## Planned Fork Requirements — Not Shipped
 
-This checkpoint adds no Rust, schema, wire, or product behavior. The current requirement
-set for later implementation review is:
+This inventory does not claim that unreviewed local checkpoints are shipped. The current
+six-requirement set is:
 
 1. bounded context continuity, including an args-less bounded `recall` surface;
-2. explicit MultiAgentV2 policy, tool-contract parity, and atomic full-history parent
+2. bounded automatic post-compaction recovery as transient developer context across
+   compact, resume, full-history fork, and rollback;
+3. explicit MultiAgentV2 policy, tool-contract parity, and atomic full-history parent
    identity;
-3. one instance-owned local app-server child lifecycle for each eligible TUI instance;
-4. one V2-only `subagent_instructions_file` configuration seam; and
-5. one `include_global_agents_md` gate over the complete global instruction provider.
+4. one instance-owned local app-server child lifecycle for each eligible TUI instance;
+5. one V2-only `subagent_instructions_file` configuration seam; and
+6. one `include_global_agents_md` gate over the complete global instruction provider.
 
-The PRD/RFC in the separate `.sangoi` repository owns requirement detail and deferred
-implementation decisions. Do not infer shipped behavior from this inventory.
+The PRD/RFC in the separate `.sangoi` repository owns requirement detail. The canonical
+active plan owns implementation status, evidence, Gates, and publication. Do not infer
+shipped behavior from this inventory.
 
 ## Repository Boundaries
 
@@ -414,7 +420,7 @@ Codex supports running connected app-server and exec-server on different operati
 
 ## Cooldex Root Atlas
 
-Last reviewed: 2026-07-22 on `master-refactor-v2` at upstream base
+Last reviewed: 2026-07-23 on `master-refactor-v2` at upstream base
 `44d76c6a6dd04fa2efc302b906ac8774267a1272`.
 
 - `/home/lucas/work/codex/AGENTS.md` — local policy, exact upstream core, active mirror,
