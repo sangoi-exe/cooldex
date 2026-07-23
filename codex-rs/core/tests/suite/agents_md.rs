@@ -7,6 +7,7 @@ use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::REMOTE_ENVIRONMENT_ID;
 use codex_features::Feature;
 use codex_home::CodexHomeUserInstructionsProvider;
+use codex_home::GlobalInstructionsMode;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
@@ -445,6 +446,51 @@ async fn selected_environment_sources_match_model_visible_instructions() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn excluding_global_provider_preserves_project_instructions() -> Result<()> {
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("exclude-global-response"),
+            ev_completed("exclude-global-response"),
+        ]),
+    )
+    .await;
+    let home = Arc::new(TempDir::new()?);
+    write_global_file(
+        home.as_ref(),
+        GLOBAL_AGENTS_OVERRIDE_FILENAME,
+        GLOBAL_INSTRUCTIONS,
+    )?;
+
+    let mut builder = test_codex()
+        .with_home(home)
+        .with_config(|config| config.include_global_agents_md = false)
+        .with_workspace_setup(|cwd, fs| async move {
+            fs.write_file(
+                &PathUri::from_host_native_path(cwd.join(GLOBAL_AGENTS_FILENAME))?,
+                PROJECT_INSTRUCTIONS.as_bytes().to_vec(),
+                /*sandbox*/ None,
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    let project_source = test.config.cwd.join(GLOBAL_AGENTS_FILENAME);
+
+    assert_eq!(
+        test.codex.instruction_sources().await,
+        vec![PathUri::from_abs_path(&project_source)]
+    );
+    test.submit_turn("inspect project instructions only")
+        .await?;
+    let expected = expected_instruction_fragment(&test.config.cwd, PROJECT_INSTRUCTIONS);
+    assert_single_instruction_fragment(&response_mock.single_request(), &expected);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loads_user_instructions_without_a_primary_environment() -> Result<()> {
     let server = start_mock_server().await;
     let response_mock = mount_sse_once(
@@ -459,9 +505,10 @@ async fn loads_user_instructions_without_a_primary_environment() -> Result<()> {
     let global_source =
         write_global_file(home.as_ref(), GLOBAL_AGENTS_FILENAME, GLOBAL_INSTRUCTIONS)?;
     let provider = Arc::new(RecordingUserInstructionsProvider::new(Arc::new(
-        CodexHomeUserInstructionsProvider::new(AbsolutePathBuf::try_from(
-            home.path().to_path_buf(),
-        )?),
+        CodexHomeUserInstructionsProvider::new(
+            AbsolutePathBuf::try_from(home.path().to_path_buf())?,
+            GlobalInstructionsMode::Include,
+        ),
     )));
 
     let mut builder = test_codex()
@@ -657,9 +704,10 @@ async fn multi_environment_thread_loads_every_project_and_keeps_creation_snapsho
     let global_source =
         write_global_file(home.as_ref(), GLOBAL_AGENTS_FILENAME, GLOBAL_INSTRUCTIONS)?;
     let provider = Arc::new(RecordingUserInstructionsProvider::new(Arc::new(
-        CodexHomeUserInstructionsProvider::new(AbsolutePathBuf::try_from(
-            home.path().to_path_buf(),
-        )?),
+        CodexHomeUserInstructionsProvider::new(
+            AbsolutePathBuf::try_from(home.path().to_path_buf())?,
+            GlobalInstructionsMode::Include,
+        ),
     )));
     let local_root = TempDir::new()?;
     let local_source = local_root.path().join(GLOBAL_AGENTS_FILENAME);

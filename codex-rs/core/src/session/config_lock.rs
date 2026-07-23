@@ -144,6 +144,7 @@ fn save_config_resolved_fields(
     lock_config.include_collaboration_mode_instructions =
         Some(config.include_collaboration_mode_instructions);
     lock_config.include_environment_context = Some(config.include_environment_context);
+    lock_config.include_global_agents_md = Some(config.include_global_agents_md);
     lock_config.background_terminal_max_timeout = Some(config.background_terminal_max_timeout);
 
     // Feature aliases and feature configs need to be written in their resolved
@@ -502,6 +503,21 @@ sandbox_private_desktop = false
         };
 
         assert_eq!(multi_agent_v2.subagent_instructions_file, None);
+    }
+
+    #[tokio::test]
+    async fn lock_persists_global_agents_provider_gate() {
+        let mut session_configuration =
+            crate::session::tests::make_session_configuration_for_tests().await;
+        let mut config = (*session_configuration.original_config_do_not_use).clone();
+        config.include_global_agents_md = false;
+        session_configuration.original_config_do_not_use = Arc::new(config);
+
+        let lockfile = session_configuration
+            .to_config_lockfile_toml()
+            .expect("config lock should serialize");
+
+        assert_eq!(lockfile.config.include_global_agents_md, Some(false));
     }
 
     #[tokio::test]

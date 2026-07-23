@@ -5325,6 +5325,10 @@
       "description": "Whether to inject the `<environment_context>` user block.",
       "type": "boolean"
     },
+    "include_global_agents_md": {
+      "description": "Whether to load global AGENTS instructions from the Codex home directory.",
+      "type": "boolean"
+    },
     "include_permissions_instructions": {
       "description": "Whether to inject the `<permissions instructions>` developer block.",
       "type": "boolean"

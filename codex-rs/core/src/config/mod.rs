@@ -714,6 +714,9 @@ pub struct Config {
     /// Whether to inject the `<environment_context>` user block.
     pub include_environment_context: bool,
 
+    /// Whether root threads load global AGENTS instructions from the Codex home directory.
+    pub include_global_agents_md: bool,
+
     /// Compact prompt override.
     pub compact_prompt: Option<String>,
 
@@ -3888,6 +3891,7 @@ impl Config {
             .and_then(|skills| skills.include_instructions)
             .unwrap_or(true);
         let include_environment_context = cfg.include_environment_context.unwrap_or(true);
+        let include_global_agents_md = cfg.include_global_agents_md.unwrap_or(true);
         let guardian_policy_config =
             guardian_policy_config_from_requirements(config_layer_stack.requirements_toml())
                 .or_else(|| {
@@ -4093,6 +4097,7 @@ impl Config {
             orchestrator_skills_enabled,
             orchestrator_mcp_enabled,
             include_environment_context,
+            include_global_agents_md,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.
             cli_auth_credentials_store_mode: resolve_cli_auth_credentials_store_mode(

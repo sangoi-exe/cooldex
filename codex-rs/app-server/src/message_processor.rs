@@ -281,6 +281,9 @@ impl MessageProcessor {
                 ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(
                     config.codex_home.clone(),
+                    codex_home::GlobalInstructionsMode::from_include_global_agents_md(
+                        config.include_global_agents_md,
+                    ),
                 )),
                 Some(analytics_events_client.clone()),
                 Arc::clone(&thread_store),

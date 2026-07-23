@@ -10,11 +10,13 @@ use tempfile::TempDir;
 
 use super::CodexHomeUserInstructionsProvider;
 use super::DEFAULT_AGENTS_MD_FILENAME;
+use super::GlobalInstructionsMode;
 use super::LOCAL_AGENTS_MD_FILENAME;
 
 fn provider(home: &TempDir) -> CodexHomeUserInstructionsProvider {
     CodexHomeUserInstructionsProvider::new(
         AbsolutePathBuf::try_from(home.path().to_path_buf()).expect("absolute temp dir"),
+        GlobalInstructionsMode::Include,
     )
 }
 
@@ -58,6 +60,22 @@ async fn missing_files_return_no_instructions() {
 
     assert_eq!(
         provider(&home).load_user_instructions().await,
+        LoadedUserInstructions::default()
+    );
+}
+
+#[tokio::test]
+async fn exclude_returns_no_instructions_before_reading_candidates() {
+    let home = TempDir::new().expect("temp dir");
+    create_symlink_loop(&home.path().join(LOCAL_AGENTS_MD_FILENAME));
+    fs::write(home.path().join(DEFAULT_AGENTS_MD_FILENAME), "default").expect("write default");
+    let provider = CodexHomeUserInstructionsProvider::new(
+        AbsolutePathBuf::try_from(home.path().to_path_buf()).expect("absolute temp dir"),
+        GlobalInstructionsMode::Exclude,
+    );
+
+    assert_eq!(
+        provider.load_user_instructions().await,
         LoadedUserInstructions::default()
     );
 }

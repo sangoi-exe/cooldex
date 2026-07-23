@@ -621,6 +621,9 @@ impl TestCodexBuilder {
             self.user_instructions_provider.clone().unwrap_or_else(|| {
                 Arc::new(CodexHomeUserInstructionsProvider::new(
                     config.codex_home.clone(),
+                    codex_home::GlobalInstructionsMode::from_include_global_agents_md(
+                        config.include_global_agents_md,
+                    ),
                 ))
             });
         let auth_manager = codex_core::test_support::auth_manager_from_auth(auth.clone());

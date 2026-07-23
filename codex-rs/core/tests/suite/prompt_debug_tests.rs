@@ -32,6 +32,9 @@ async fn build_prompt_input_includes_context_and_user_message() -> Result<()> {
         .await?;
     let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
         config.codex_home.clone(),
+        codex_home::GlobalInstructionsMode::from_include_global_agents_md(
+            config.include_global_agents_md,
+        ),
     ));
     let input = build_prompt_input(
         config,

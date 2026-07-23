@@ -128,6 +128,9 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     let installation_id = resolve_installation_id(&config.codex_home).await?;
     let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
         config.codex_home.clone(),
+        codex_core_api::GlobalInstructionsMode::from_include_global_agents_md(
+            config.include_global_agents_md,
+        ),
     ));
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install_image_generation_extension(&mut extensions, auth_manager.clone(), |config: &Config| {
@@ -211,6 +214,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         orchestrator_skills_enabled: false,
         orchestrator_mcp_enabled: false,
         include_environment_context: false,
+        include_global_agents_md: true,
         compact_prompt: None,
         notify: None,
         tui_notifications: TuiNotificationSettings::default(),

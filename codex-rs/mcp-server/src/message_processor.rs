@@ -65,6 +65,9 @@ impl MessageProcessor {
         .await;
         let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
             config.codex_home.clone(),
+            codex_home::GlobalInstructionsMode::from_include_global_agents_md(
+                config.include_global_agents_md,
+            ),
         ));
         let mut extensions = ExtensionRegistryBuilder::<Config>::new();
         codex_git_attribution::install(

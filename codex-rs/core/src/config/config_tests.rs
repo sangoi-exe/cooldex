@@ -7182,6 +7182,28 @@ async fn for_config_writes_selected_user_config_file() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn profile_v2_can_override_global_agents_md_provider_gate() -> anyhow::Result<()> {
+    let codex_home = TempDir::new()?;
+    let base_config = codex_home.path().join(CONFIG_TOML_FILE);
+    let selected_config = codex_home.path().join("work.config.toml");
+    tokio::fs::write(&base_config, "include_global_agents_md = true\n").await?;
+    tokio::fs::write(&selected_config, "include_global_agents_md = false\n").await?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .loader_overrides(LoaderOverrides {
+            user_config_path: Some(selected_config.abs()),
+            user_config_profile: Some("work".parse().expect("profile-v2 name")),
+            ..LoaderOverrides::without_managed_config_for_tests()
+        })
+        .build()
+        .await?;
+
+    assert!(!config.include_global_agents_md);
+    Ok(())
+}
+
 #[test]
 fn profile_v2_config_path_resolves_validated_names() -> anyhow::Result<()> {
     let codex_home = TempDir::new()?;
@@ -10398,6 +10420,47 @@ include_instructions = false
     assert!(!config.include_collaboration_mode_instructions);
     assert!(!config.include_skill_instructions);
     assert!(!config.include_environment_context);
+    Ok(())
+}
+
+#[tokio::test]
+async fn global_agents_md_provider_defaults_to_include_and_can_be_disabled() -> std::io::Result<()>
+{
+    let codex_home = TempDir::new()?;
+    let default_config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await?;
+    assert_eq!(
+        (
+            default_config.include_global_agents_md,
+            codex_home::GlobalInstructionsMode::from_include_global_agents_md(
+                default_config.include_global_agents_md,
+            ),
+        ),
+        (true, codex_home::GlobalInstructionsMode::Include)
+    );
+
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        "include_global_agents_md = false\n",
+    )?;
+    let excluded_config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await?;
+    assert_eq!(
+        (
+            excluded_config.include_global_agents_md,
+            codex_home::GlobalInstructionsMode::from_include_global_agents_md(
+                excluded_config.include_global_agents_md,
+            ),
+        ),
+        (false, codex_home::GlobalInstructionsMode::Exclude)
+    );
+
     Ok(())
 }
 

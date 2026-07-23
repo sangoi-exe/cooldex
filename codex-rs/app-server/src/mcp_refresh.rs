@@ -333,6 +333,9 @@ enabled = false
                 ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(
                     good_config.codex_home.clone(),
+                    codex_home::GlobalInstructionsMode::from_include_global_agents_md(
+                        good_config.include_global_agents_md,
+                    ),
                 )),
                 /*analytics_events_client*/ None,
                 Arc::clone(&thread_store),
