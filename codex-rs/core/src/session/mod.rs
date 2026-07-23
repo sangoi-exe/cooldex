@@ -11,6 +11,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use crate::agent::AgentControl;
+use crate::agent::AgentIdentitySnapshot;
 use crate::agent::AgentStatus;
 use crate::agent::agent_status_from_event;
 use crate::agent::status::is_final;
@@ -1527,6 +1528,25 @@ impl Session {
     pub(crate) async fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
         let state = self.state.lock().await;
         state.session_configuration.thread_config_snapshot()
+    }
+
+    pub(crate) async fn agent_identity_snapshot(&self) -> AgentIdentitySnapshot {
+        let state = self.state.lock().await;
+        let configuration = &state.session_configuration;
+        AgentIdentitySnapshot::capture(
+            configuration.session_source.get_agent_role(),
+            configuration
+                .original_config_do_not_use
+                .model_provider_id
+                .clone(),
+            configuration.provider.clone(),
+            configuration.collaboration_mode.model().to_string(),
+            configuration.collaboration_mode.reasoning_effort(),
+            configuration.model_reasoning_summary,
+            configuration.base_instructions.clone(),
+            configuration.developer_instructions.clone(),
+            configuration.service_tier.clone(),
+        )
     }
 
     pub(crate) async fn set_app_server_client_info(

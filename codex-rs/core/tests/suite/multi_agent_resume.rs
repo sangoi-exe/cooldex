@@ -15,6 +15,7 @@ use core_test_support::test_codex::test_codex;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
@@ -30,6 +31,7 @@ const ROLE_NAME: &str = "durable_worker";
 const ROLE_MODEL: &str = "gpt-5.4";
 const ROLE_MODEL_PROVIDER_ID: &str = "mock";
 const ROLE_DEVELOPER_INSTRUCTIONS: &str = "Keep the durable worker role configuration.";
+const CHILD_BASE_INSTRUCTIONS: &str = "Use the validated child instruction snapshot.";
 
 fn decoded_body(request: &wiremock::Request) -> Option<Vec<u8>> {
     let is_zstd = request
@@ -77,6 +79,7 @@ fn configure_multi_agent_v2_with_role(
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
+    config.multi_agent_v2.subagent_instructions = Some(Arc::from(CHILD_BASE_INSTRUCTIONS));
     let role_path = config.codex_home.join("durable-worker-role.toml");
     std::fs::write(
         &role_path,
@@ -96,7 +99,8 @@ fn configure_multi_agent_v2_with_role(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Result<()> {
+async fn resident_eviction_preserves_v2_identity_on_first_followup_without_role_reread()
+-> Result<()> {
     let server = start_mock_server().await;
     let spawn_args = serde_json::to_string(&json!({
         "message": INITIAL_TASK,
@@ -131,7 +135,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
         ]),
     )
     .await;
-    mount_sse_once_match(
+    let spawn_result_request = mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
             body_contains(request, SPAWN_CALL_ID)
@@ -151,12 +155,6 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     });
     let initial = initial_builder.build_with_auto_env(&server).await?;
     let root_thread_id = initial.session_configured.thread_id;
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .codex
-        .rollout_path()
-        .expect("root rollout path")
-        .to_path_buf();
     initial.submit_turn(INITIAL_PROMPT).await?;
 
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -171,7 +169,10 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
             break thread_id;
         }
         if Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for spawned worker");
+            anyhow::bail!(
+                "timed out waiting for spawned worker; spawn result: {:?}",
+                spawn_result_request.function_call_output_text(SPAWN_CALL_ID)
+            );
         }
         sleep(Duration::from_millis(10)).await;
     };
@@ -192,6 +193,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     assert!(initial_child_request.requests().iter().any(|request| {
         request.body_contains_text(INITIAL_TASK)
             && request.body_contains_text(ROLE_DEVELOPER_INSTRUCTIONS)
+            && request.body_json()["instructions"] == CHILD_BASE_INSTRUCTIONS
     }));
     let initial_worker_config = worker_thread.config_snapshot().await;
     let initial_worker_role_config = (
@@ -211,8 +213,16 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     );
     worker_thread.flush_rollout().await?;
     initial.codex.flush_rollout().await?;
+    worker_thread.shutdown_and_wait().await?;
     drop(worker_thread);
-    drop(initial);
+    assert!(
+        initial
+            .thread_manager
+            .remove_thread(&worker_thread_id)
+            .await
+            .is_some()
+    );
+    std::fs::remove_file(initial.config.codex_home.join("durable-worker-role.toml"))?;
 
     let followup_args = serde_json::to_string(&json!({
         "target": "worker",
@@ -260,30 +270,35 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     )
     .await;
 
-    let resumed_model_provider_base_url = format!("{}/v1", server.uri());
-    let mut resume_builder = test_codex().with_config(move |config| {
-        configure_multi_agent_v2_with_role(config, &resumed_model_provider_base_url);
-    });
-    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
     assert_eq!(
-        resumed.thread_manager.list_thread_ids().await,
+        initial.thread_manager.list_thread_ids().await,
         vec![root_thread_id]
     );
     assert!(
-        resumed
+        initial
             .thread_manager
             .get_thread(worker_thread_id)
             .await
             .is_err()
     );
 
-    resumed.submit_turn(FOLLOWUP_PROMPT).await?;
+    initial.submit_turn(FOLLOWUP_PROMPT).await?;
 
-    assert!(followup_child_request.requests().iter().any(|request| {
-        request.body_contains_text(FOLLOWUP_TASK)
-            && request.body_contains_text(ROLE_DEVELOPER_INSTRUCTIONS)
-    }));
-    let reloaded_worker = resumed
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if followup_child_request.requests().iter().any(|request| {
+            request.body_contains_text(FOLLOWUP_TASK)
+                && request.body_contains_text(ROLE_DEVELOPER_INSTRUCTIONS)
+                && request.body_json()["instructions"] == CHILD_BASE_INSTRUCTIONS
+        }) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for reloaded worker request with preserved identity");
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    let reloaded_worker = initial
         .thread_manager
         .get_thread(worker_thread_id)
         .await

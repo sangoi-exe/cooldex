@@ -49,51 +49,72 @@ async fn handle_spawn_agent(
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
     let fork_mode = args.fork_mode()?;
+    let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
+    if is_full_history_fork {
+        reject_v2_full_history_identity_overrides(
+            args.agent_type.as_deref(),
+            args.model.as_deref(),
+            args.reasoning_effort.as_ref(),
+            args.service_tier.as_deref(),
+        )?;
+    }
     let role_name = args
         .agent_type
         .as_deref()
         .map(str::trim)
         .filter(|role| !role.is_empty());
+    let expected_identity = if is_full_history_fork {
+        Some(session.agent_identity_snapshot().await)
+    } else {
+        None
+    };
 
     let message = message_content(args.message)?;
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
-    if let Some(service_tier) = args.service_tier.as_ref() {
-        config.service_tier = Some(service_tier.clone());
-    }
-    let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
-    if is_full_history_fork {
-        reject_full_fork_agent_type_override(role_name)?;
-    }
-    apply_requested_spawn_agent_model_overrides(
-        &session,
-        turn.as_ref(),
-        &mut config,
-        args.model.as_deref(),
-        args.reasoning_effort.clone(),
-    )
-    .await?;
     if !is_full_history_fork {
+        if let Some(service_tier) = args.service_tier.as_ref() {
+            config.service_tier = Some(service_tier.clone());
+        }
+        apply_requested_spawn_agent_model_overrides(
+            &session,
+            turn.as_ref(),
+            &mut config,
+            args.model.as_deref(),
+            args.reasoning_effort.clone(),
+        )
+        .await?;
         apply_spawn_agent_role(&session, &mut config, role_name).await?;
+        apply_spawn_agent_service_tier(
+            &session,
+            &mut config,
+            turn.config.service_tier.as_deref(),
+            args.service_tier.as_deref(),
+        )
+        .await?;
+        apply_spawn_agent_base_instructions(&session, &mut config).await?;
     }
-    apply_spawn_agent_service_tier(
-        &session,
-        &mut config,
-        turn.config.service_tier.as_deref(),
-        args.service_tier.as_deref(),
-    )
-    .await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
 
-    let spawn_source = thread_spawn_source(
+    let source_role = if is_full_history_fork {
+        None
+    } else {
+        role_name
+    };
+    let mut spawn_source = thread_spawn_source(
         session.thread_id,
         &turn.session_source,
         child_depth,
-        role_name,
+        source_role,
         Some(args.task_name.clone()),
     )?;
+    if let Some(identity) = expected_identity.as_ref() {
+        identity
+            .apply(&mut config, &mut spawn_source)
+            .map_err(collab_spawn_error)?;
+    }
     let new_agent_path = spawn_source.get_agent_path().ok_or_else(|| {
         FunctionCallError::RespondToModel(
             "spawned agent is missing a canonical task name".to_string(),
@@ -125,6 +146,29 @@ async fn handle_spawn_agent(
     .await
     .map_err(collab_spawn_error)?;
     let new_thread_id = spawned_agent.thread_id;
+    if let Some(expected_identity) = expected_identity.as_ref() {
+        let actual_identity = session
+            .services
+            .agent_control
+            .get_agent_identity_snapshot(new_thread_id)
+            .await;
+        if actual_identity.as_ref() != Some(expected_identity) {
+            let _ = session
+                .services
+                .agent_control
+                .shutdown_live_agent(new_thread_id)
+                .await;
+            return Err(FunctionCallError::RespondToModel(
+                "spawned full-history agent identity did not match the parent identity".to_string(),
+            ));
+        }
+    }
+    let role_tag = spawned_agent
+        .metadata
+        .agent_role
+        .as_deref()
+        .unwrap_or(DEFAULT_ROLE_NAME)
+        .to_string();
     let agent_snapshot = session
         .services
         .agent_control
@@ -145,11 +189,10 @@ async fn handle_spawn_agent(
         },
     )
     .await;
-    let role_tag = role_name.unwrap_or(DEFAULT_ROLE_NAME);
     turn.session_telemetry.counter(
         "codex.multi_agent.spawn",
         /*inc*/ 1,
-        &[("role", role_tag), ("version", "v2")],
+        &[("role", role_tag.as_str()), ("version", "v2")],
     );
     let task_name = String::from(new_agent_path);
 

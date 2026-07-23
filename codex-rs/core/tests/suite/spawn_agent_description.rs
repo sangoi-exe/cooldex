@@ -32,6 +32,7 @@ use test_case::test_case;
 use tokio::time::sleep;
 
 const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
+const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
 const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
 
 fn spawn_agent_description(body: &Value) -> Option<String> {
@@ -302,5 +303,70 @@ async fn configured_agent_roles_control_spawn_agent_type(
         spawn_agent_exposes_agent_type(&response.single_request().body_json(), namespace),
         has_agent_role
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_spawn_agent_guidance_schema_and_runtime_identity_contract_match() -> Result<()> {
+    let server = start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Collab)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
+            config.multi_agent_v2.hide_spawn_agent_metadata = false;
+            config.agent_roles.insert(
+                "worker".to_string(),
+                AgentRoleConfig {
+                    description: Some("Worker role".to_string()),
+                    config_file: None,
+                    nickname_candidates: None,
+                },
+            );
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn("hello").await?;
+
+    let body = response.single_request().body_json();
+    let tool = namespace_child_tool(&body, MULTI_AGENT_V2_NAMESPACE, SPAWN_AGENT_TOOL_NAME)
+        .expect("V2 spawn_agent tool should be present");
+    let description = tool["description"]
+        .as_str()
+        .expect("spawn_agent description");
+    assert!(description.contains("inherit the parent agent type, provider, model"));
+    assert!(description.contains("base instructions, developer instructions, and service tier"));
+    assert!(description.contains(
+        "They reject `agent_type`, `model`, `reasoning_effort`, and `service_tier` overrides."
+    ));
+    let properties = tool
+        .pointer("/parameters/properties")
+        .and_then(Value::as_object)
+        .expect("spawn_agent properties");
+    for field in ["agent_type", "model", "reasoning_effort", "service_tier"] {
+        assert!(
+            properties[field]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("Full-history forks reject")),
+            "{field} must describe the same full-history rejection enforced by runtime"
+        );
+    }
+    assert!(
+        properties["fork_turns"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("rejects identity overrides"))
+    );
+
     Ok(())
 }

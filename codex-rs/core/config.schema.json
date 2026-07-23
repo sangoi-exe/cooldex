@@ -1812,6 +1812,10 @@
         "root_agent_usage_hint_text": {
           "type": "string"
         },
+        "subagent_instructions_file": {
+          "description": "Base instructions loaded once for partial- and no-history V2 child sessions.",
+          "type": "string"
+        },
         "subagent_usage_hint_text": {
           "type": "string"
         },

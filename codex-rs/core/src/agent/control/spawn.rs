@@ -1,7 +1,5 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
-use crate::agent::role::apply_role_to_config;
-use crate::config::PermissionProfileSnapshot;
 use codex_extension_api::ExtensionDataInit;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
@@ -257,9 +255,16 @@ impl AgentControl {
             self.touch_loaded_v2_residency(&state, thread_id).await;
             return Ok(());
         }
-        if self.state.agent_metadata_for_thread(thread_id).is_none() {
-            return Err(CodexErr::ThreadNotFound(thread_id));
-        }
+        let identity_snapshot = self
+            .state
+            .agent_metadata_for_thread(thread_id)
+            .ok_or(CodexErr::ThreadNotFound(thread_id))?
+            .identity_snapshot
+            .ok_or_else(|| {
+                CodexErr::InvalidRequest(format!(
+                    "agent {thread_id} was restored without a live identity snapshot; spawn a new agent before sending follow-up work"
+                ))
+            })?;
 
         let stored_thread = state
             .read_stored_thread(ReadThreadParams {
@@ -281,45 +286,10 @@ impl AgentControl {
         if initial_history.get_multi_agent_version() != Some(MultiAgentVersion::V2) {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
-        let (session_source, _) = initial_history
+        let (mut session_source, _) = initial_history
             .get_resumed_session_sources()
             .unwrap_or((stored_source, None));
-        if let Some(role_name) = session_source.get_agent_role() {
-            let runtime_approval_policy = config.permissions.approval_policy.value();
-            let runtime_approvals_reviewer = config.approvals_reviewer;
-            let runtime_cwd = config.cwd.clone();
-            let runtime_permission_profile = match config.permissions.active_permission_profile() {
-                Some(active_permission_profile) => {
-                    PermissionProfileSnapshot::active_with_profile_workspace_roots(
-                        config.permissions.permission_profile().clone(),
-                        active_permission_profile,
-                        config.permissions.profile_workspace_roots().to_vec(),
-                    )
-                }
-                None => PermissionProfileSnapshot::legacy(
-                    config.permissions.permission_profile().clone(),
-                ),
-            };
-
-            apply_role_to_config(&mut config, Some(&role_name))
-                .await
-                .map_err(CodexErr::InvalidRequest)?;
-            config
-                .permissions
-                .approval_policy
-                .set(runtime_approval_policy)
-                .map_err(|err| {
-                    CodexErr::InvalidRequest(format!("approval_policy is invalid: {err}"))
-                })?;
-            config.approvals_reviewer = runtime_approvals_reviewer;
-            config.cwd = runtime_cwd;
-            config
-                .permissions
-                .set_permission_profile_from_session_snapshot(runtime_permission_profile)
-                .map_err(|err| {
-                    CodexErr::InvalidRequest(format!("permission_profile is invalid: {err}"))
-                })?;
-        }
+        identity_snapshot.apply(&mut config, &mut session_source)?;
         let residency_slot = self
             .reserve_v2_residency_slot(&state, &config, Some(thread_id))
             .await?;
@@ -475,6 +445,10 @@ impl AgentControl {
             (None, _, _) => Box::pin(state.spawn_new_thread(config.clone(), self.clone())).await?,
         };
         agent_metadata.agent_id = Some(new_thread.thread_id);
+        if multi_agent_version == MultiAgentVersion::V2 {
+            agent_metadata.identity_snapshot =
+                Some(new_thread.thread.session.agent_identity_snapshot().await);
+        }
         reservation.commit(agent_metadata.clone());
         if let Some(residency_slot) = residency_slot {
             residency_slot.commit(new_thread.thread_id);
@@ -625,8 +599,10 @@ impl AgentControl {
             forked_rollout_items =
                 truncate_rollout_to_last_n_fork_turns(&forked_rollout_items, *last_n_turns);
         }
+        let filter_multi_agent_v2_usage_hints = multi_agent_version == MultiAgentVersion::V2
+            && !matches!(fork_mode, SpawnAgentForkMode::FullHistory);
         let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> =
-            if multi_agent_version == MultiAgentVersion::V2 {
+            if filter_multi_agent_v2_usage_hints {
                 let parent_config = parent_thread.session.get_config().await;
                 [
                     parent_config
@@ -647,6 +623,8 @@ impl AgentControl {
         let preserve_reference_context_item = matches!(fork_mode, SpawnAgentForkMode::FullHistory);
         forked_rollout_items.retain(|item| {
             keep_forked_rollout_item(item, preserve_reference_context_item)
+                && !(multi_agent_version == MultiAgentVersion::V2
+                    && matches!(item, RolloutItem::SessionMeta(_)))
                 && !matches!(
                     item,
                     RolloutItem::ResponseItem(response_item)
@@ -669,28 +647,19 @@ impl AgentControl {
                 )
             });
         }
-        for item in &mut forked_rollout_items {
-            if let RolloutItem::Compacted(compacted) = item
-                && let Some(replacement_history) = compacted.replacement_history.as_mut()
-            {
-                replacement_history.retain(|response_item| {
-                    !is_multi_agent_v2_usage_hint_message(
-                        response_item,
-                        &multi_agent_v2_usage_hint_texts_to_filter,
-                    )
-                });
+        if filter_multi_agent_v2_usage_hints {
+            for item in &mut forked_rollout_items {
+                if let RolloutItem::Compacted(compacted) = item
+                    && let Some(replacement_history) = compacted.replacement_history.as_mut()
+                {
+                    replacement_history.retain(|response_item| {
+                        !is_multi_agent_v2_usage_hint_message(
+                            response_item,
+                            &multi_agent_v2_usage_hint_texts_to_filter,
+                        )
+                    });
+                }
             }
-        }
-        if preserve_reference_context_item
-            && multi_agent_version == MultiAgentVersion::V2
-            && let Some(subagent_usage_hint_text) =
-                config.multi_agent_v2.subagent_usage_hint_text.clone()
-            && let Some(subagent_usage_hint_message) =
-                crate::context_manager::updates::build_developer_update_item(vec![
-                    subagent_usage_hint_text,
-                ])
-        {
-            forked_rollout_items.push(RolloutItem::ResponseItem(subagent_usage_hint_message));
         }
         let mut thread_extension_init = ExtensionDataInit::new();
         thread_extension_init.insert(selected_capability_roots);

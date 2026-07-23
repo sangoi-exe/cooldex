@@ -19,6 +19,8 @@ use codex_config::ConfigLayerStackOrdering;
 use codex_config::config_toml::ConfigToml;
 use codex_config::loader::resolve_relative_paths_in_config_toml;
 use codex_exec_server::LOCAL_FS;
+use codex_features::Feature;
+use codex_features::FeatureToml;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -68,6 +70,16 @@ async fn apply_role_to_config_inner(
         .is_some_and(toml::map::Map::is_empty)
     {
         return Ok(());
+    }
+    if role_layer_toml
+        .get("features")
+        .and_then(|features| features.get("multi_agent_v2"))
+        .and_then(|multi_agent_v2| multi_agent_v2.get("subagent_instructions_file"))
+        .is_some()
+    {
+        return Err(anyhow!(
+            "agent role configs cannot set features.multi_agent_v2.subagent_instructions_file"
+        ));
     }
     let preserve_current_provider = role_layer_toml.get("model_provider").is_none();
     let preserve_current_service_tier = role_layer_toml.get("service_tier").is_none();
@@ -135,11 +147,25 @@ mod reload {
         preserve_current_provider: bool,
         preserve_current_service_tier: bool,
     ) -> anyhow::Result<Config> {
+        let role_disables_multi_agent_v2 = role_layer_toml
+            .get("features")
+            .and_then(|features| features.get("multi_agent_v2"))
+            .and_then(|multi_agent_v2| match multi_agent_v2 {
+                TomlValue::Boolean(enabled) => Some(!enabled),
+                TomlValue::Table(config) => config
+                    .get("enabled")
+                    .and_then(TomlValue::as_bool)
+                    .map(|enabled| !enabled),
+                _ => None,
+            })
+            .unwrap_or(false);
         let preserve_current_model = role_layer_toml.get("model").is_none();
         let preserve_current_reasoning_effort =
             role_layer_toml.get("model_reasoning_effort").is_none();
         let config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
-        let merged_config = deserialize_effective_config(config, &config_layer_stack)?;
+        let mut merged_config = deserialize_effective_config(config, &config_layer_stack)?;
+        clear_subagent_instructions_file(&mut merged_config);
+        let subagent_instructions = config.multi_agent_v2.subagent_instructions.clone();
 
         let mut next_config = Config::load_config_with_layer_stack(
             LOCAL_FS.as_ref(),
@@ -159,7 +185,30 @@ mod reload {
                 .model_reasoning_effort
                 .clone_from(&config.model_reasoning_effort);
         }
+        if subagent_instructions.is_some() {
+            if role_disables_multi_agent_v2 {
+                return Err(anyhow!(
+                    "agent role config cannot disable MultiAgentV2 while a subagent instruction snapshot is active"
+                ));
+            }
+            next_config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .map_err(|err| anyhow!(err))?;
+        }
+        next_config.multi_agent_v2.subagent_instructions = subagent_instructions;
         Ok(next_config)
+    }
+
+    fn clear_subagent_instructions_file(config: &mut ConfigToml) {
+        let Some(FeatureToml::Config(multi_agent_v2)) = config
+            .features
+            .as_mut()
+            .and_then(|features| features.multi_agent_v2.as_mut())
+        else {
+            return;
+        };
+        multi_agent_v2.subagent_instructions_file = None;
     }
 
     fn build_config_layer_stack(

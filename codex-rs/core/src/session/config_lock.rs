@@ -477,6 +477,34 @@ sandbox_private_desktop = false
     }
 
     #[tokio::test]
+    async fn lock_omits_live_subagent_instruction_snapshot() {
+        let mut session_configuration =
+            crate::session::tests::make_session_configuration_for_tests().await;
+        let mut config = (*session_configuration.original_config_do_not_use).clone();
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("MultiAgentV2 should be enableable in tests");
+        config.multi_agent_v2.subagent_instructions = Some(Arc::from("validated child snapshot"));
+        session_configuration.original_config_do_not_use = Arc::new(config);
+
+        let lockfile = session_configuration
+            .to_config_lockfile_toml()
+            .expect("config lock should serialize");
+        let FeatureToml::Config(multi_agent_v2) = lockfile
+            .config
+            .features
+            .expect("features should be materialized")
+            .multi_agent_v2
+            .expect("MultiAgentV2 should be materialized")
+        else {
+            panic!("MultiAgentV2 should use its typed config shape");
+        };
+
+        assert_eq!(multi_agent_v2.subagent_instructions_file, None);
+    }
+
+    #[tokio::test]
     async fn lock_drops_unmanaged_model_catalog_input() {
         let codex_home = tempfile::tempdir().expect("create temp dir");
         let catalog_path = codex_home.path().join("user-models.json");

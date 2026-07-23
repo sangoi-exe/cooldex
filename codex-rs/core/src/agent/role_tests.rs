@@ -366,6 +366,74 @@ async fn apply_role_takes_precedence_over_existing_session_flags_for_same_key() 
     assert_eq!(session_flags_layer_count(&config), before_layers + 1);
 }
 
+#[tokio::test]
+async fn apply_role_preserves_live_subagent_instruction_snapshot_without_rereading_config() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    config.multi_agent_v2.subagent_instructions = Some(Arc::from("child snapshot"));
+    let role_path = write_role_config(
+        &home,
+        "snapshot-role.toml",
+        "developer_instructions = \"Stay focused\"",
+    )
+    .await;
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    apply_role_to_config(&mut config, Some("custom"))
+        .await
+        .expect("custom role should preserve the live child instruction snapshot");
+
+    assert!(config.features.enabled(Feature::MultiAgentV2));
+    assert_eq!(
+        config.multi_agent_v2.subagent_instructions.as_deref(),
+        Some("child snapshot")
+    );
+    assert_eq!(
+        config.developer_instructions.as_deref(),
+        Some("Stay focused")
+    );
+}
+
+#[tokio::test]
+async fn apply_role_rejects_disabling_v2_with_live_subagent_instruction_snapshot() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    config.multi_agent_v2.subagent_instructions = Some(Arc::from("child snapshot"));
+    let role_path = write_role_config(
+        &home,
+        "disabled-v2-role.toml",
+        "[features.multi_agent_v2]\nenabled = false",
+    )
+    .await;
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    let err = apply_role_to_config(&mut config, Some("custom"))
+        .await
+        .expect_err("role must not disable V2 while the child instruction snapshot is active");
+
+    assert_eq!(err, AGENT_TYPE_UNAVAILABLE_ERROR);
+}
+
 #[cfg_attr(windows, ignore)]
 #[tokio::test]
 async fn apply_role_skills_config_disables_skill_for_spawned_agent() {

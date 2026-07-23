@@ -10806,6 +10806,105 @@ subagent_usage_hint_text = ""
 }
 
 #[tokio::test]
+async fn multi_agent_v2_loads_one_validated_subagent_instruction_snapshot() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"[features.multi_agent_v2]
+enabled = true
+subagent_instructions_file = "child.md"
+"#,
+    )?;
+    std::fs::write(
+        codex_home.path().join("child.md"),
+        b"\xEF\xBB\xBFChild snapshot instructions.\n",
+    )?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await?;
+    std::fs::write(
+        codex_home.path().join("child.md"),
+        "Changed after config load.",
+    )?;
+
+    assert_eq!(
+        config.multi_agent_v2.subagent_instructions.as_deref(),
+        Some("Child snapshot instructions.\n")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn multi_agent_v2_rejects_subagent_instruction_file_when_disabled() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"[features.multi_agent_v2]
+enabled = false
+subagent_instructions_file = "child.md"
+"#,
+    )?;
+    std::fs::write(codex_home.path().join("child.md"), "Child instructions.")?;
+
+    let error = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await
+        .expect_err("disabled MultiAgentV2 must reject subagent instructions");
+
+    assert_eq!(
+        error.to_string(),
+        "features.multi_agent_v2.subagent_instructions_file requires MultiAgentV2 to be enabled"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn multi_agent_v2_rejects_invalid_subagent_instruction_files() -> std::io::Result<()> {
+    let invalid_cases = [
+        ("missing", None, "failed to inspect"),
+        ("empty", Some(Vec::new()), "is empty"),
+        ("whitespace", Some(b" \n\t".to_vec()), "is empty"),
+        ("non_utf8", Some(vec![0xFF]), "must be UTF-8"),
+        (
+            "oversize",
+            Some(vec![b'x'; SUBAGENT_INSTRUCTIONS_SENTINEL_BYTES]),
+            "exceeds the 32768-byte limit",
+        ),
+    ];
+
+    for (case_name, contents, expected_error) in invalid_cases {
+        let codex_home = TempDir::new()?;
+        std::fs::write(
+            codex_home.path().join(CONFIG_TOML_FILE),
+            r#"[features.multi_agent_v2]
+enabled = true
+subagent_instructions_file = "child.md"
+"#,
+        )?;
+        if let Some(contents) = contents {
+            std::fs::write(codex_home.path().join("child.md"), contents)?;
+        }
+
+        let error = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(codex_home.path().to_path_buf()))
+            .build()
+            .await
+            .expect_err("invalid subagent instructions must fail config load");
+        assert!(
+            error.to_string().contains(expected_error),
+            "case {case_name} returned unexpected error: {error}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn multi_agent_v2_uses_agents_max_concurrent_threads_per_session() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(

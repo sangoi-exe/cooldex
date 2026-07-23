@@ -410,6 +410,7 @@ usage_hint_text = "Custom delegation guidance."
 root_agent_usage_hint_text = "Root guidance."
 subagent_usage_hint_text = "Subagent guidance."
 multi_agent_mode_hint_text = "Custom mode guidance."
+subagent_instructions_file = "child.md"
 tool_namespace = "agents"
 hide_spawn_agent_metadata = true
 expose_spawn_agent_model_overrides = true
@@ -436,6 +437,7 @@ non_code_mode_only = true
             root_agent_usage_hint_text: Some("Root guidance.".to_string()),
             subagent_usage_hint_text: Some("Subagent guidance.".to_string()),
             multi_agent_mode_hint_text: Some("Custom mode guidance.".to_string()),
+            subagent_instructions_file: Some(std::path::PathBuf::from("child.md")),
             tool_namespace: Some("agents".to_string()),
             hide_spawn_agent_metadata: Some(true),
             expose_spawn_agent_model_overrides: Some(true),

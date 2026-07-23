@@ -75,7 +75,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     assert!(description.contains("Spawns an agent to work on the specified task."));
     assert!(description.contains("The spawned agent will have the same tools as you"));
     assert!(!description.contains("max_concurrent_threads_per_session"));
-    assert!(description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
+    assert!(description.contains(SPAWN_AGENT_V2_FULL_HISTORY_IDENTITY_GUIDANCE));
     assert!(
         description
             .contains("Available model overrides (optional; inherited parent model is preferred):")
@@ -98,21 +98,43 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     assert!(!properties.contains_key("fork_context"));
     assert_eq!(
         properties
+            .get("agent_type")
+            .and_then(|schema| schema.description.as_deref()),
+        Some(
+            "Agent type override for the new agent. Full-history forks reject this field; set `fork_turns` to `none` or a positive integer when an explicit override is needed.\nrole help"
+        )
+    );
+    assert_eq!(
+        properties
+            .get("fork_turns")
+            .and_then(|schema| schema.description.as_deref()),
+        Some(
+            "Optional history mode. Omitted or `all` uses a full-history fork with the parent's atomic identity and rejects identity overrides. Use `none` or a positive integer string such as `3` when an identity override is needed."
+        )
+    );
+    assert_eq!(
+        properties
             .get("model")
             .and_then(|schema| schema.description.as_deref()),
-        Some(SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION)
+        Some(
+            "Model override for the new agent. Full-history forks reject this field; use `fork_turns=\"none\"` or a positive integer when an explicit override is needed."
+        )
     );
     assert_eq!(
         properties
             .get("reasoning_effort")
             .and_then(|schema| schema.description.as_deref()),
-        Some("Reasoning effort override for the new agent. Omit to inherit the parent effort.")
+        Some(
+            "Reasoning effort override for the new agent. Full-history forks reject this field; use `fork_turns=\"none\"` or a positive integer when an explicit override is needed."
+        )
     );
     assert_eq!(
         properties
             .get("service_tier")
             .and_then(|schema| schema.description.as_deref()),
-        Some(SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION)
+        Some(
+            "Service tier override for the new agent. Full-history forks reject this field; use `fork_turns=\"none\"` or a positive integer when an explicit override is needed."
+        )
     );
     assert_eq!(
         parameters.required.as_ref(),
@@ -264,7 +286,7 @@ fn spawn_agent_tool_keeps_model_controls_when_spawn_metadata_is_hidden() {
     assert!(properties.contains_key("model"));
     assert!(properties.contains_key("reasoning_effort"));
     assert!(!properties.contains_key("service_tier"));
-    assert!(!description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
+    assert!(description.contains(SPAWN_AGENT_V2_FULL_HISTORY_IDENTITY_GUIDANCE));
     assert!(description.contains("Available model overrides"));
 }
 
@@ -296,7 +318,7 @@ fn spawn_agent_tool_hides_model_controls_without_override_exposure() {
     for property in ["agent_type", "model", "reasoning_effort", "service_tier"] {
         assert!(!properties.contains_key(property));
     }
-    assert!(!description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
+    assert!(description.contains(SPAWN_AGENT_V2_FULL_HISTORY_IDENTITY_GUIDANCE));
     assert!(!description.contains("Available model overrides"));
 }
 

@@ -42,6 +42,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use test_case::test_case;
@@ -64,8 +65,7 @@ const REQUESTED_MODEL: &str = "gpt-5.4";
 const REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 const V2_DEFAULT_MODEL: &str = "gpt-5.6-terra";
 const V2_DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
-const V2_REQUESTED_MODEL: &str = "gpt-5.6-sol";
-const V2_REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
+const CONFIGURED_CHILD_INSTRUCTIONS: &str = "Use the configured V2 child snapshot.";
 const ROLE_MODEL: &str = "gpt-5.4";
 const ROLE_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 const SUBAGENT_START_CONTEXT: &str = "subagent start context reaches child";
@@ -379,12 +379,30 @@ async fn wait_for_request_with_model(
     }
 }
 
+async fn wait_for_child_request(
+    mock: &core_test_support::responses::ResponseMock,
+) -> Result<ResponsesRequest> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(request) = mock.requests().into_iter().find(|request| {
+            request.body_contains_text(CHILD_PROMPT) && !request.body_contains_text(SPAWN_CALL_ID)
+        }) {
+            return Ok(request);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for spawned child request");
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn setup_turn_one_with_spawned_child(
     server: &MockServer,
     child_response_delay: Option<Duration>,
 ) -> Result<(TestCodex, String)> {
     let (test, spawned_id, _child_request_log) = setup_turn_one_with_custom_spawned_child(
         server,
+        MULTI_AGENT_V1_NAMESPACE,
         json!({
             "message": CHILD_PROMPT,
         }),
@@ -398,6 +416,7 @@ async fn setup_turn_one_with_spawned_child(
 
 async fn setup_turn_one_with_custom_spawned_child(
     server: &MockServer,
+    namespace: &str,
     spawn_args: serde_json::Value,
     child_response_delay: Option<Duration>,
     wait_for_parent_notification: bool,
@@ -416,12 +435,7 @@ async fn setup_turn_one_with_custom_spawned_child(
         |req: &wiremock::Request| body_contains(req, TURN_1_PROMPT),
         sse(vec![
             ev_response_created("resp-turn1-1"),
-            ev_function_call_with_namespace(
-                SPAWN_CALL_ID,
-                MULTI_AGENT_V1_NAMESPACE,
-                "spawn_agent",
-                &spawn_args,
-            ),
+            ev_function_call_with_namespace(SPAWN_CALL_ID, namespace, "spawn_agent", &spawn_args),
             ev_completed("resp-turn1-1"),
         ]),
     )
@@ -509,6 +523,7 @@ async fn spawn_child_and_capture_snapshot(
 ) -> Result<ThreadConfigSnapshot> {
     let (test, spawned_id, _child_request_log) = setup_turn_one_with_custom_spawned_child(
         server,
+        MULTI_AGENT_V1_NAMESPACE,
         spawn_args,
         /*child_response_delay*/ None,
         /*wait_for_parent_notification*/ false,
@@ -976,18 +991,8 @@ async fn spawned_child_receives_forked_parent_context(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum FullHistoryV2ModelSelection {
-    ConfiguredDefault,
-    ExplicitOverride,
-}
-
-#[test_case(FullHistoryV2ModelSelection::ConfiguredDefault; "configured default with omitted fork_turns")]
-#[test_case(FullHistoryV2ModelSelection::ExplicitOverride; "explicit override with fork_turns all")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_context(
-    selection: FullHistoryV2ModelSelection,
-) -> Result<()> {
+async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_context() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -1001,27 +1006,10 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
         ]),
     )
     .await;
-    let (spawn_args, expected_model, expected_reasoning_effort) = match selection {
-        FullHistoryV2ModelSelection::ConfiguredDefault => (
-            json!({
-                "message": CHILD_PROMPT,
-                "task_name": "worker",
-            }),
-            V2_DEFAULT_MODEL,
-            V2_DEFAULT_REASONING_EFFORT,
-        ),
-        FullHistoryV2ModelSelection::ExplicitOverride => (
-            json!({
-                "message": CHILD_PROMPT,
-                "task_name": "worker",
-                "fork_turns": "all",
-                "model": V2_REQUESTED_MODEL,
-                "reasoning_effort": V2_REQUESTED_REASONING_EFFORT,
-            }),
-            V2_REQUESTED_MODEL,
-            V2_REQUESTED_REASONING_EFFORT,
-        ),
-    };
+    let spawn_args = json!({
+        "message": CHILD_PROMPT,
+        "task_name": "worker",
+    });
     let spawn_args = serde_json::to_string(&spawn_args)?;
     let spawn_turn = mount_sse_once_match(
         &server,
@@ -1073,27 +1061,145 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
         config.model_reasoning_effort = Some(INHERITED_REASONING_EFFORT);
         config.agent_default_subagent_model = Some(V2_DEFAULT_MODEL.to_string());
         config.agent_default_subagent_reasoning_effort = Some(V2_DEFAULT_REASONING_EFFORT);
+        config.multi_agent_v2.subagent_instructions =
+            Some(Arc::from(CONFIGURED_CHILD_INSTRUCTIONS));
     });
     let test = builder.build(&server).await?;
 
     test.submit_turn(TURN_0_FORK_PROMPT).await?;
-    let _ = seed_turn.single_request();
+    let parent_request = seed_turn.single_request();
+    let parent_body = parent_request.body_json();
+    let parent_instructions = parent_request.instructions_text();
     test.submit_turn(TURN_1_PROMPT).await?;
     let _ = spawn_turn.single_request();
 
-    let child_request = wait_for_request_with_model(&child_request_log, expected_model).await?;
+    let child_request = wait_for_child_request(&child_request_log).await?;
     assert!(child_request.body_contains_text(TURN_0_FORK_PROMPT));
     let child_body = child_request.body_json();
+    assert_eq!(child_request.instructions_text(), parent_instructions);
+    assert_ne!(
+        child_request.instructions_text(),
+        CONFIGURED_CHILD_INSTRUCTIONS
+    );
     assert_eq!(
         (
             child_body["model"].clone(),
             child_body["reasoning"]["effort"].clone(),
         ),
         (
-            json!(expected_model),
-            json!(expected_reasoning_effort.to_string()),
+            parent_body["model"].clone(),
+            parent_body["reasoning"]["effort"].clone(),
         )
     );
+    assert_ne!(child_body["model"], V2_DEFAULT_MODEL);
+
+    Ok(())
+}
+
+#[test_case("none", false; "no history")]
+#[test_case("1", true; "partial history")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_v2_non_full_history_child_uses_configured_instruction_snapshot(
+    fork_turns: &str,
+    expects_parent_turn: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let (_test, _spawned_id, child_request_log) = setup_turn_one_with_custom_spawned_child(
+        &server,
+        MULTI_AGENT_V2_NAMESPACE,
+        json!({
+            "message": CHILD_PROMPT,
+            "task_name": "worker",
+            "fork_turns": fork_turns,
+        }),
+        /*child_response_delay*/ None,
+        /*wait_for_parent_notification*/ false,
+        |builder| {
+            builder.with_config(|config| {
+                config
+                    .features
+                    .enable(Feature::MultiAgentV2)
+                    .expect("test config should allow feature update");
+                config.base_instructions = Some("parent config base instructions".to_string());
+                config.multi_agent_v2.subagent_instructions =
+                    Some(Arc::from(CONFIGURED_CHILD_INSTRUCTIONS));
+            })
+        },
+    )
+    .await?;
+
+    let child_request = wait_for_child_request(&child_request_log).await?;
+    assert_eq!(
+        child_request.instructions_text(),
+        CONFIGURED_CHILD_INSTRUCTIONS
+    );
+    assert_eq!(
+        child_request.body_contains_text(TURN_1_PROMPT),
+        expects_parent_turn
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_v2_no_history_child_uses_final_model_default_instructions() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let (test, _spawned_id, child_request_log) = setup_turn_one_with_custom_spawned_child(
+        &server,
+        MULTI_AGENT_V2_NAMESPACE,
+        json!({
+            "message": CHILD_PROMPT,
+            "task_name": "worker",
+            "model": V2_DEFAULT_MODEL,
+            "fork_turns": "none",
+        }),
+        /*child_response_delay*/ None,
+        /*wait_for_parent_notification*/ false,
+        |builder| {
+            builder.with_config(|config| {
+                config
+                    .features
+                    .enable(Feature::MultiAgentV2)
+                    .expect("test config should allow feature update");
+                config.base_instructions = Some("parent config base instructions".to_string());
+            })
+        },
+    )
+    .await?;
+
+    let child_request = wait_for_child_request(&child_request_log).await?;
+    assert_eq!(child_request.body_json()["model"], V2_DEFAULT_MODEL);
+    let final_model_info = bundled_models_response()?
+        .models
+        .into_iter()
+        .find(|model| model.slug == V2_DEFAULT_MODEL)
+        .expect("final child model should exist in the bundled catalog");
+    let expected_instructions = final_model_info.get_model_instructions(test.config.personality);
+    let child_body = child_request.body_json();
+    let sent_instructions = child_body["instructions"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            child_body["input"].as_array().and_then(|items| {
+                items.iter().find_map(|item| {
+                    (item["role"] == "developer")
+                        .then(|| item["content"].as_array())
+                        .flatten()
+                        .and_then(|content| {
+                            content
+                                .iter()
+                                .find_map(|entry| entry["text"].as_str().map(str::to_string))
+                        })
+                })
+            })
+        })
+        .expect("child request should carry resolved base instructions");
+    assert_eq!(sent_instructions, expected_instructions);
+    assert_ne!(sent_instructions, "parent config base instructions");
 
     Ok(())
 }
@@ -1219,6 +1325,7 @@ async fn spawned_agent_uses_summary_support_for_final_model(
 
     let (_test, _spawned_id, child_request_log) = setup_turn_one_with_custom_spawned_child(
         &server,
+        MULTI_AGENT_V1_NAMESPACE,
         json!({
             "message": CHILD_PROMPT,
             "model": REQUESTED_MODEL,

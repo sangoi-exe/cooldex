@@ -303,6 +303,19 @@ impl AgentControl {
         Some(thread.config_snapshot().await)
     }
 
+    pub(crate) async fn get_agent_identity_snapshot(
+        &self,
+        agent_id: ThreadId,
+    ) -> Option<crate::agent::AgentIdentitySnapshot> {
+        let Ok(state) = self.upgrade() else {
+            return None;
+        };
+        let Ok(thread) = state.get_thread(agent_id).await else {
+            return None;
+        };
+        Some(thread.session.agent_identity_snapshot().await)
+    }
+
     pub(crate) async fn resolve_agent_reference(
         &self,
         _current_thread_id: ThreadId,
@@ -539,6 +552,7 @@ impl AgentControl {
             agent_path,
             agent_nickname,
             agent_role,
+            identity_snapshot: None,
         })
     }
 

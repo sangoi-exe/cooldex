@@ -20,6 +20,7 @@ const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str =
     "Model override for the new agent. Omit unless an explicit override is needed.";
 const SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION: &str =
     "Service tier override for the new agent. Omit unless explicitly requested.";
+const SPAWN_AGENT_V2_FULL_HISTORY_IDENTITY_GUIDANCE: &str = "Full-history forks (`fork_turns` omitted or set to `all`) inherit the parent agent type, provider, model, reasoning effort, reasoning summary, base instructions, developer instructions, and service tier as one identity. They reject `agent_type`, `model`, `reasoning_effort`, and `service_tier` overrides. Use `fork_turns=\"none\"` or a positive integer when an identity override is needed.";
 const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
 
 #[derive(Debug, Clone)]
@@ -103,9 +104,7 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
     let available_models_description = options.expose_spawn_agent_model_overrides.then(|| {
         spawn_agent_models_description(&options.available_models, options.multi_agent_version)
     });
-    let inherited_model_guidance = (options.expose_spawn_agent_model_overrides
-        && !options.hide_agent_type_model_reasoning)
-        .then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE);
+    let inherited_model_guidance = Some(SPAWN_AGENT_V2_FULL_HISTORY_IDENTITY_GUIDANCE);
     let mut properties = spawn_agent_common_properties_v2(&options.agent_type_description);
     if !options.expose_agent_type {
         properties.remove("agent_type");
@@ -640,33 +639,32 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
         (
             "agent_type".to_string(),
             JsonSchema::string(Some(format!(
-                "Agent type override for the new agent. Omit unless explicitly asked. Set `fork_turns` to `none` or a positive integer when an explicit override is needed.\n{agent_type_description}"
+                "Agent type override for the new agent. Full-history forks reject this field; set `fork_turns` to `none` or a positive integer when an explicit override is needed.\n{agent_type_description}"
             ))),
         ),
         (
             "fork_turns".to_string(),
             JsonSchema::string(Some(
-                "Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
+                "Optional history mode. Omitted or `all` uses a full-history fork with the parent's atomic identity and rejects identity overrides. Use `none` or a positive integer string such as `3` when an identity override is needed."
                     .to_string(),
             )),
         ),
         (
             "model".to_string(),
-            JsonSchema::string(Some(
-                SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION.to_string(),
-            )),
+            JsonSchema::string(Some("Model override for the new agent. Full-history forks reject this field; use `fork_turns=\"none\"` or a positive integer when an explicit override is needed.".to_string())),
         ),
         (
             "reasoning_effort".to_string(),
             JsonSchema::string(Some(
-                "Reasoning effort override for the new agent. Omit to inherit the parent effort."
+                "Reasoning effort override for the new agent. Full-history forks reject this field; use `fork_turns=\"none\"` or a positive integer when an explicit override is needed."
                     .to_string(),
             )),
         ),
         (
             "service_tier".to_string(),
             JsonSchema::string(Some(
-                SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION.to_string(),
+                "Service tier override for the new agent. Full-history forks reject this field; use `fork_turns=\"none\"` or a positive integer when an explicit override is needed."
+                    .to_string(),
             )),
         ),
     ])
@@ -765,7 +763,7 @@ Only call this tool for a concrete, bounded subtask that can run independently a
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
 
-Note that passing `fork_turns="none"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns="all"` will provide the subagent with all surrounding context."#
+Passing `fork_turns="none"` will not pass surrounding context. Omitted `fork_turns` and `fork_turns="all"` copy full history and the parent's atomic identity; use a positive integer to copy only the most recent turns while resolving a child identity."#
     );
 
     if let Some(usage_hint_text) = usage_hint_text {

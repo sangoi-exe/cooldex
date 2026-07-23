@@ -213,6 +213,31 @@ pub(crate) fn reject_full_fork_agent_type_override(
     Ok(())
 }
 
+pub(crate) fn reject_v2_full_history_identity_overrides(
+    agent_type: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<&ReasoningEffort>,
+    service_tier: Option<&str>,
+) -> Result<(), FunctionCallError> {
+    let present = [
+        agent_type.map(|_| "agent_type"),
+        model.map(|_| "model"),
+        reasoning_effort.map(|_| "reasoning_effort"),
+        service_tier.map(|_| "service_tier"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if present.is_empty() {
+        return Ok(());
+    }
+
+    Err(FunctionCallError::RespondToModel(format!(
+        "Full-history forks inherit agent_type, model, reasoning_effort, and service_tier from the parent; remove these identity overrides ({}) or set fork_turns to none or a positive integer",
+        present.join(", ")
+    )))
+}
+
 /// Copies runtime-only turn state onto a child config before it is handed to `AgentControl`.
 ///
 /// These values are chosen by the live turn rather than persisted config, so leaving them stale
@@ -392,6 +417,30 @@ pub(crate) async fn apply_spawn_agent_role(
         &model_info.supported_reasoning_levels,
         &reasoning_effort,
     )
+}
+
+pub(crate) async fn apply_spawn_agent_base_instructions(
+    session: &Session,
+    config: &mut Config,
+) -> Result<(), FunctionCallError> {
+    if let Some(instructions) = config.multi_agent_v2.subagent_instructions.as_ref() {
+        config.base_instructions = Some(instructions.to_string());
+        return Ok(());
+    }
+
+    config.base_instructions = None;
+    let model = config.model.clone().ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "spawn_agent could not resolve the child model for base instructions".to_string(),
+        )
+    })?;
+    let model_info = session
+        .services
+        .models_manager
+        .get_model_info(&model, &config.to_models_manager_config())
+        .await;
+    config.base_instructions = Some(model_info.get_model_instructions(config.personality));
+    Ok(())
 }
 
 fn find_spawn_agent_model_name(

@@ -116,6 +116,8 @@ pub use codex_thread_store::ExtraConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use codex_utils_path_uri::PathUri;
+use codex_utils_string::approx_token_count;
+use futures::StreamExt;
 use rmcp::model::ElicitationCapability;
 use rmcp::model::FormElicitationCapability;
 use rmcp::model::UrlElicitationCapability;
@@ -249,7 +251,7 @@ Payload:
 ```
 You may also see them addressed as to=/root/..., which indicates your identity is /root/...
 "#;
-const DEFAULT_MULTI_AGENT_V2_MODEL_OVERRIDE_USAGE_HINT_TEXT: &str = "Full-history forks (`fork_turns` omitted or `\"all\"`) inherit the parent model and reasoning effort and do not accept overrides. Only set `model` or `reasoning_effort` when explicitly requested by the user, applicable `AGENTS.md` instructions, or skill instructions; when doing so, set `fork_turns` to `\"none\"` or a positive integer string.";
+const DEFAULT_MULTI_AGENT_V2_MODEL_OVERRIDE_USAGE_HINT_TEXT: &str = "Full-history forks (`fork_turns` omitted or `\"all\"`) inherit the parent's atomic identity and reject `agent_type`, `model`, `reasoning_effort`, and `service_tier` overrides. Only set an identity override when explicitly requested by the user, applicable `AGENTS.md` instructions, or skill instructions; when doing so, set `fork_turns` to `\"none\"` or a positive integer string.";
 const DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "collaboration";
 const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Note that collaboration tools cannot be called from inside `functions.exec`. Call `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, and `list_agents` only as direct tool calls using the recipient shown in their tool definitions, such as `to=functions.collaboration.spawn_agent`, since they are intentionally absent from the `functions.exec` `tools.*` namespace. Available tools in `functions.exec` are explicitly described with a `tools` namespace in the developer message.
 
@@ -1176,6 +1178,8 @@ pub struct MultiAgentV2Config {
     pub root_agent_usage_hint_text: Option<String>,
     pub subagent_usage_hint_text: Option<String>,
     pub multi_agent_mode_hint_text: Option<String>,
+    #[serde(skip)]
+    pub subagent_instructions: Option<Arc<str>>,
     pub tool_namespace: Option<String>,
     pub hide_spawn_agent_metadata: bool,
     pub expose_spawn_agent_model_overrides: bool,
@@ -1200,6 +1204,7 @@ impl MultiAgentV2Config {
                 max_concurrent_threads_per_session,
             )),
             multi_agent_mode_hint_text: None,
+            subagent_instructions: None,
             tool_namespace: Some(DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE.to_string()),
             hide_spawn_agent_metadata: true,
             expose_spawn_agent_model_overrides: true,
@@ -2618,11 +2623,141 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
         root_agent_usage_hint_text,
         subagent_usage_hint_text,
         multi_agent_mode_hint_text,
+        subagent_instructions: None,
         tool_namespace,
         hide_spawn_agent_metadata,
         expose_spawn_agent_model_overrides,
         non_code_mode_only,
     }
+}
+
+const SUBAGENT_INSTRUCTIONS_MAX_BYTES: usize = 32 * 1024;
+const SUBAGENT_INSTRUCTIONS_SENTINEL_BYTES: usize = SUBAGENT_INSTRUCTIONS_MAX_BYTES + 1;
+const SUBAGENT_INSTRUCTIONS_MAX_TOKENS: usize = 10_000;
+
+async fn load_multi_agent_v2_subagent_instructions(
+    fs: &dyn ExecutorFileSystem,
+    config_toml: &ConfigToml,
+    features: &ManagedFeatures,
+    codex_home: &AbsolutePathBuf,
+) -> std::io::Result<Option<Arc<str>>> {
+    let Some(raw_path) = multi_agent_v2_toml_config(config_toml.features.as_ref())
+        .and_then(|config| config.subagent_instructions_file.as_ref())
+    else {
+        return Ok(None);
+    };
+
+    if !features.enabled(Feature::MultiAgentV2) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "features.multi_agent_v2.subagent_instructions_file requires MultiAgentV2 to be enabled",
+        ));
+    }
+
+    let path = AbsolutePathBuf::resolve_path_against_base(raw_path, codex_home.as_path());
+    let path_uri = PathUri::from_abs_path(&path);
+    let metadata = fs.get_metadata(&path_uri, /*sandbox*/ None).await.map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed to inspect features.multi_agent_v2.subagent_instructions_file {}: {err}",
+                path.display()
+            ),
+        )
+    })?;
+    if !metadata.is_file {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "features.multi_agent_v2.subagent_instructions_file is not a file: {}",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.size > SUBAGENT_INSTRUCTIONS_MAX_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "features.multi_agent_v2.subagent_instructions_file exceeds the {SUBAGENT_INSTRUCTIONS_MAX_BYTES}-byte limit: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    let mut stream = fs
+        .read_file_stream(&path_uri, /*sandbox*/ None)
+        .await
+        .map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to read features.multi_agent_v2.subagent_instructions_file {}: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.size)
+            .unwrap_or(SUBAGENT_INSTRUCTIONS_SENTINEL_BYTES)
+            .min(SUBAGENT_INSTRUCTIONS_SENTINEL_BYTES),
+    );
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to read features.multi_agent_v2.subagent_instructions_file {}: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        let remaining = SUBAGENT_INSTRUCTIONS_SENTINEL_BYTES.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if bytes.len() >= SUBAGENT_INSTRUCTIONS_SENTINEL_BYTES {
+            break;
+        }
+    }
+    if bytes.len() > SUBAGENT_INSTRUCTIONS_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "features.multi_agent_v2.subagent_instructions_file exceeds the {SUBAGENT_INSTRUCTIONS_MAX_BYTES}-byte limit: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    let contents = std::str::from_utf8(bytes).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "features.multi_agent_v2.subagent_instructions_file must be UTF-8 ({}): {err}",
+                path.display()
+            ),
+        )
+    })?;
+    if contents.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "features.multi_agent_v2.subagent_instructions_file is empty: {}",
+                path.display()
+            ),
+        ));
+    }
+    let token_count = approx_token_count(contents);
+    if token_count > SUBAGENT_INSTRUCTIONS_MAX_TOKENS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "features.multi_agent_v2.subagent_instructions_file exceeds the {SUBAGENT_INSTRUCTIONS_MAX_TOKENS}-token estimate: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    Ok(Some(Arc::from(contents)))
 }
 
 fn resolve_token_budget_config(
@@ -3540,7 +3675,14 @@ impl Config {
         let experimental_request_user_input_enabled =
             resolve_experimental_request_user_input_enabled(&cfg);
         let code_mode = resolve_code_mode_config(&cfg);
-        let multi_agent_v2 = resolve_multi_agent_v2_config(&cfg);
+        let mut multi_agent_v2 = resolve_multi_agent_v2_config(&cfg);
+        multi_agent_v2.subagent_instructions = load_multi_agent_v2_subagent_instructions(
+            fs,
+            &cfg,
+            &features,
+            &codex_home,
+        )
+        .await?;
         let token_budget = resolve_token_budget_config(&cfg, &features)?;
         let rollout_budget = resolve_rollout_budget_config(&cfg, &features)?;
         let current_time_reminder = resolve_current_time_reminder_config(&cfg, &features)?;

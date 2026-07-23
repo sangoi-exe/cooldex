@@ -25,6 +25,7 @@ use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Settings;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
@@ -32,6 +33,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ErrorEvent;
@@ -648,7 +650,7 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
                 depth: 1,
                 agent_path: Some(agent_path.clone()),
                 agent_nickname: None,
-                agent_role: None,
+                agent_role: Some("worker".to_string()),
             })),
             SpawnAgentOptions {
                 parent_thread_id: Some(parent_thread_id),
@@ -662,6 +664,7 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
         .get_thread(spawned_agent.thread_id)
         .await
         .expect("child thread should exist");
+    let expected_identity = child_thread.session.agent_identity_snapshot().await;
     child_thread
         .inject_response_items(vec![assistant_message(
             "child persisted",
@@ -694,16 +697,53 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
         Ok(_) => panic!("expected thread to be removed"),
     }
 
+    let mut reload_config = harness.config.clone();
+    reload_config.model = Some("identity-drift-model".to_string());
+    reload_config.model_provider_id = "identity-drift-provider".to_string();
+    reload_config.model_provider.name = "Identity drift provider".to_string();
+    reload_config.model_reasoning_effort = Some(ReasoningEffort::Low);
+    reload_config.model_reasoning_summary = Some(ReasoningSummary::Concise);
+    reload_config.base_instructions = Some("Identity drift base instructions.".to_string());
+    reload_config.developer_instructions =
+        Some("Identity drift developer instructions.".to_string());
+    reload_config.service_tier = Some("identity-drift-tier".to_string());
+    reload_config
+        .permissions
+        .approval_policy
+        .set(AskForApproval::Never)
+        .expect("reload approval policy should be accepted");
+    reload_config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+    reload_config
+        .permissions
+        .set_permission_profile(PermissionProfile::Disabled)
+        .expect("reload permission profile should be accepted");
+    reload_config.cwd = reload_config.codex_home.clone();
+
     harness
         .control
-        .ensure_v2_agent_loaded(harness.config.clone(), spawned_agent.thread_id)
+        .ensure_v2_agent_loaded(reload_config.clone(), spawned_agent.thread_id)
         .await
         .expect("known v2 agent should reload");
-    let _ = harness
+    let reloaded_child = harness
         .manager
         .get_thread(spawned_agent.thread_id)
         .await
         .expect("reloaded child thread should exist");
+    assert_eq!(
+        reloaded_child.session.agent_identity_snapshot().await,
+        expected_identity
+    );
+    let reloaded_snapshot = reloaded_child.config_snapshot().await;
+    assert_eq!(reloaded_snapshot.approval_policy, AskForApproval::Never);
+    assert_eq!(
+        reloaded_snapshot.approvals_reviewer,
+        ApprovalsReviewer::AutoReview
+    );
+    assert_eq!(
+        reloaded_snapshot.permission_profile,
+        PermissionProfile::Disabled
+    );
+    assert_eq!(reloaded_snapshot.cwd(), &reload_config.cwd);
 
     let communication = InterAgentCommunication::new(
         AgentPath::root(),
@@ -821,6 +861,21 @@ async fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
     );
     assert_thread_not_loaded(&resumed_manager, worker_thread_id).await;
     assert_thread_not_loaded(&resumed_manager, reviewer_thread_id).await;
+    // This direct AgentControl resume bypasses ThreadManager's root metadata-restore hook.
+    resumed_control
+        .restore_v2_agent_metadata(&harness.config, parent_thread_id)
+        .await;
+    let error = resumed_control
+        .ensure_v2_agent_loaded(harness.config.clone(), worker_thread_id)
+        .await
+        .expect_err("restored V2 metadata without a live identity snapshot must not reload");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "agent {worker_thread_id} was restored without a live identity snapshot; spawn a new agent before sending follow-up work"
+        )
+    );
+    assert_thread_not_loaded(&resumed_manager, worker_thread_id).await;
 }
 
 #[tokio::test]
@@ -1193,7 +1248,7 @@ async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_prov
 }
 
 #[tokio::test]
-async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
+async fn full_history_v2_fork_preserves_parent_instruction_items_without_new_hint() {
     let harness = AgentControlHarness::new().await;
     let mut parent_config = harness.config.clone();
     let _ = parent_config.features.enable(Feature::MultiAgentV2);
@@ -1323,21 +1378,30 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     expected_final_answer.set_turn_id_if_missing(&turn_context.sub_id);
     let expected_history = [
         expected_parent_seed,
-        expected_final_answer,
         ResponseItem::Message {
             id: None,
             role: "developer".to_string(),
             content: vec![ContentItem::InputText {
-                text: "Child subagent guidance.".to_string(),
+                text: "Parent root guidance.".to_string(),
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
+        ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "Parent subagent guidance.".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        expected_final_answer,
     ];
     assert_eq!(
         strip_response_item_ids(history.raw_items()),
         strip_response_item_ids(&expected_history),
-        "full-history forked child history should replace parent usage hints with the child subagent hint while filtering non-final assistant/tool chatter"
+        "full-history V2 child should preserve parent instruction items without adding a child hint while still filtering non-final assistant/tool chatter"
     );
     assert_eq!(
         serde_json::to_value(child_thread.session.reference_context_item().await)
@@ -1378,8 +1442,10 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .expect("no-hint child thread should be registered");
     let no_hint_history = no_hint_child_thread.session.clone_history().await;
     assert!(
-        !history_contains_text(no_hint_history.raw_items(), "Child subagent guidance."),
-        "full-history forked child should not add empty subagent guidance"
+        history_contains_text(no_hint_history.raw_items(), "Parent root guidance.")
+            && history_contains_text(no_hint_history.raw_items(), "Parent subagent guidance.")
+            && !history_contains_text(no_hint_history.raw_items(), "Child subagent guidance."),
+        "full-history V2 child should preserve parent hints and never append child guidance"
     );
 
     let expected = (
@@ -1419,7 +1485,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
 }
 
 #[tokio::test]
-async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
+async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history() {
     let harness = AgentControlHarness::new().await;
     let mut parent_config = harness.config.clone();
     let _ = parent_config.features.enable(Feature::MultiAgentV2);
@@ -1503,7 +1569,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
             },
         )
         .await
-        .expect("forked spawn should sanitize compacted usage hints")
+        .expect("forked spawn should preserve compacted usage hints")
         .thread_id;
 
     let child_thread = harness
@@ -1517,12 +1583,12 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
         "forked child history should retain compacted non-hint content"
     );
     assert!(
-        !history_contains_text(history.raw_items(), "Parent root guidance."),
-        "forked child history should strip stale parent hints from compacted replacement history"
+        history_contains_text(history.raw_items(), "Parent root guidance."),
+        "full-history V2 child should preserve parent hints in compacted replacement history"
     );
     assert!(
-        history_contains_text(history.raw_items(), "Child subagent guidance."),
-        "full-history forked child should add the child subagent hint after compacted-history sanitization"
+        !history_contains_text(history.raw_items(), "Child subagent guidance."),
+        "full-history V2 child should not append child guidance after compacted history"
     );
 
     let _ = harness

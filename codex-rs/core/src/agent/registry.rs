@@ -1,3 +1,4 @@
+use crate::agent::AgentIdentitySnapshot;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
@@ -38,6 +39,7 @@ pub(crate) struct AgentMetadata {
     pub(crate) agent_path: Option<AgentPath>,
     pub(crate) agent_nickname: Option<String>,
     pub(crate) agent_role: Option<String>,
+    pub(crate) identity_snapshot: Option<AgentIdentitySnapshot>,
 }
 
 fn format_agent_nickname(name: &str, nickname_reset_count: usize) -> String {
