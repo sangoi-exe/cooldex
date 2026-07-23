@@ -37,24 +37,29 @@ Bookkeeping topology: `split`
 ## Active Plan Mirror
 
 <!-- task-bookkeeping:mirror:begin -->
-- Status: no active plan.
-- Completed mode: `Doctrine`.
+- Status: active
+- Mode: `Doctrine`.
 - Root branch: `master-refactor-v2`.
 - `.sangoi` branch: `master-refactor-v2`.
-- Completed plan: `.sangoi/planning/2026-07-22-tighten-master-refactor-v2-product-contracts.md`.
-- Completed outcome: A reviewed documentation checkpoint that makes the five original
-  fork requirements decision-complete while keeping every runtime implementation
-  deferred. The previously planned Cursor gateway is no longer an active requirement:
-  its two approved artifacts and the ignore rule remain as deferred evidence only, with
-  no probe, runtime, configuration, or acceptance contract. The checkpoint preserves the
-  root testing guidance, upstream core, upstream-first policy, and issue-only handling
-  for unrelated upstream defects.
-- Completed user-request summary: Keep the freshly rebuilt `master-refactor-v2` branch
-  and its important root instructions, finish the supplied PRD/RFC corrections for the
-  five original requirements, remove the Cursor workaround from active product scope,
-  retain its approved artifacts in standby, and publish the reviewed root and `.sangoi`
-  documentation checkpoints. Do not change Rust, the proxy runtime, public wire
-  behavior, or unrelated workspace state.
+- Canonical plan: `.sangoi/planning/2026-07-22-implement-master-refactor-v2-requirements.md`.
+- What we are creating: A current-upstream implementation of the five approved Cooldex
+  requirements: bounded args-less `recall`; explicit MultiAgentV2 policy and
+  tool-contract parity; atomic full-history identity with one validated
+  child-instruction snapshot; a complete global AGENTS provider gate; and one WSL/Linux
+  interactive-TUI-owned app-server child lifecycle. The work lands as five reviewable
+  runtime tranches, preserves upstream behavior by default, changes no app-server wire
+  shape, and leaves the Cursor gateway on standby.
+- Confirmed paraphrased user-request summary: Fast-forward local `main` exactly to
+  current `upstream/main`, rebase `master-refactor-v2` while preserving its important
+  root instructions and documentation, then implement all five reviewed RFC requirements
+  under one canonical plan with coherent internal tranches. Include generated
+  configuration and direct test followers, do not revive the Cursor route or fix
+  unrelated upstream defects, complete cumulative review and bookkeeping, and publish
+  both the root and separate `.sangoi` branches.
+- Major stop conditions:
+  - Stop if the root or `.sangoi` branch, the locked Git objects, the byte-delimited
+    upstream `AGENTS.md` core, or the separate-repository topology differs from the
+    identities recorded below.
 <!-- task-bookkeeping:mirror:end -->
 
 ## Planned Fork Requirements — Not Shipped
@@ -412,7 +417,7 @@ Last reviewed: 2026-07-22 on `master-refactor-v2` at upstream base
 
 - `/home/lucas/work/codex/AGENTS.md` — local policy, exact upstream core, active mirror,
   and root map.
-- `/home/lucas/work/codex/.sangoi/planning/2026-07-22-tighten-master-refactor-v2-product-contracts.md`
+- `/home/lucas/work/codex/.sangoi/planning/2026-07-22-implement-master-refactor-v2-requirements.md`
   — canonical active implementation plan.
 - `/home/lucas/work/codex/.sangoi/reference/areas/master-refactor-v2-prd-rfc.md` — current
   product requirements and architecture boundary.
