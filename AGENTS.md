@@ -43,16 +43,18 @@ Bookkeeping topology: `split`
 - `.sangoi` branch: `master-refactor-v2`.
 - Canonical plan: `.sangoi/planning/2026-07-22-implement-master-refactor-v2-requirements.md`.
 - What we are creating: A current-upstream implementation of six approved Cooldex
-  requirements: deterministic bounded args-less `recall`; bounded automatic
-  post-compaction recovery as transient developer context with one nested marker and one
-  terminal application proof; explicit MultiAgentV2 policy and tool-contract parity;
-  atomic full-history identity with one validated child-instruction snapshot; a complete
-  global AGENTS provider gate; and one WSL/Linux interactive-TUI-owned app-server child
-  lifecycle. The five already committed runtime tranches remain the baseline. This
-  strategy epoch restores the omitted Cargo safety island, incorporates the pending V2
-  resident-identity review fix, and ports the recovery behavior from its historical
-  semantic source into current owners without copying the old unbounded Prompt-GC
-  implementation.
+  requirements: deterministic bounded args-less `recall`; canonical post-compaction
+  context rebasing before assistant-generated history; a small transient developer
+  boundary with separately bounded user-authority recall and an atomic native tool-batch
+  continuity tail; explicit MultiAgentV2 policy and tool-contract parity; atomic
+  full-history identity with one validated child-instruction snapshot; a complete global
+  AGENTS provider gate; and one WSL/Linux interactive-TUI-owned app-server child
+  lifecycle. Recovery application is at-least-once and idempotent: a failed or
+  unavailable durable append leaves recovery pending. The five already committed runtime
+  tranches remain the baseline. This strategy epoch restores the omitted Cargo safety
+  island, incorporates the pending V2 resident-identity review fix, and ports the
+  recovery behavior from its historical semantic source into current owners without
+  copying the old unbounded Prompt-GC implementation.
 - Confirmed paraphrased user-request summary: Preserve the five current-upstream
   implementation tranches, restore `cargo-guard` and the blast-radius tooling before any
   further Rust command, then add the automatic post-compaction recovery island because
@@ -66,6 +68,8 @@ Bookkeeping topology: `split`
     `cab2f303ba84755b2714368d1e10804faf56c709`, or the inner branch is not
     `master-refactor-v2` at or descending from
     `780f67501321ea2a886c55f64e788ae0824f3527`.
+  - Do not add same-session live `AGENTS.md` refresh; the current user explicitly
+    excluded it from this firebreak.
 <!-- task-bookkeeping:mirror:end -->
 
 ## Planned Fork Requirements — Not Shipped
@@ -74,8 +78,8 @@ This inventory does not claim that unreviewed local checkpoints are shipped. The
 six-requirement set is:
 
 1. bounded context continuity, including an args-less bounded `recall` surface;
-2. bounded automatic post-compaction recovery as transient developer context across
-   compact, resume, full-history fork, and rollback;
+2. canonical prompt rebasing plus bounded post-compaction boundary, recall, and native
+   tool-batch continuity across compact, resume, full-history fork, and rollback;
 3. explicit MultiAgentV2 policy, tool-contract parity, and atomic full-history parent
    identity;
 4. one instance-owned local app-server child lifecycle for each eligible TUI instance;
@@ -108,9 +112,13 @@ shipped behavior from this inventory.
   changed symbol or owning file/line before editing when possible and again after each
   changed Rust file. Final evidence uses uncapped output. Treat the report as an impact
   inventory, not behavioral proof, and manually account for followers it misses.
-- The active canonical plan owns the reviewer-before-Cargo boundary. Its explicitly listed
-  fake-command and fixture-only safety checks may run before that gate; no Cargo command,
-  guarded validation plan, or build-like recipe may do so.
+- Run targeted guarded compile/tests before final review so the reviewer evaluates a
+  compiled, targeted-green object. Cumulative validation remains post-review unless the
+  active task explicitly requires otherwise.
+- The first ordinary validation of a review object must run the complete collector before
+  ordinary failures are fixed. `verify` keeps going by default; use `--fail-fast` only for
+  an explicit diagnostic reason, then use `--resume`, `--from-index`, or `--only-failed`
+  for subsequent iterations.
 
 <!-- upstream-agents-core:begin blob=faa57cc0db48123e1011f1eb47692cd3bbbcfc3a source=upstream/main -->
 # Rust/codex-rs
