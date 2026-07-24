@@ -37,12 +37,12 @@ Bookkeeping topology: `split`
 ## Active Plan Mirror
 
 <!-- task-bookkeeping:mirror:begin -->
-- Status: active
-- Mode: `Doctrine`.
+- Status: no active plan.
+- Completed mode: `Doctrine`.
 - Root branch: `master-refactor-v2`.
 - `.sangoi` branch: `master-refactor-v2`.
-- Canonical plan: `.sangoi/planning/2026-07-22-implement-master-refactor-v2-requirements.md`.
-- What we are creating: A current-upstream implementation of six approved Cooldex
+- Completed plan: `.sangoi/planning/2026-07-22-implement-master-refactor-v2-requirements.md`.
+- Completed outcome: A current-upstream implementation of six approved Cooldex
   requirements: deterministic bounded args-less `recall`; canonical post-compaction
   context rebasing before assistant-generated history; a small transient developer
   boundary with separately bounded user-authority recall and an atomic native tool-batch
@@ -55,21 +55,13 @@ Bookkeeping topology: `split`
   island, incorporates the pending V2 resident-identity review fix, and ports the
   recovery behavior from its historical semantic source into current owners without
   copying the old unbounded Prompt-GC implementation.
-- Confirmed paraphrased user-request summary: Preserve the five current-upstream
-  implementation tranches, restore `cargo-guard` and the blast-radius tooling before any
-  further Rust command, then add the automatic post-compaction recovery island because
-  the current compacted prompt can present retained user messages as though they were a
-  new user request. The recovery must cover compact, resume, fork, and rollback, remain
-  bounded, reuse current rollout reconstruction and `recall`, avoid Cursor and unrelated
-  upstream fixes, pass cumulative review and guarded validation, and publish both
-  repositories.
-- Major stop conditions:
-  - Stop if the root branch is not `master-refactor-v2` at or descending from
-    `cab2f303ba84755b2714368d1e10804faf56c709`, or the inner branch is not
-    `master-refactor-v2` at or descending from
-    `780f67501321ea2a886c55f64e788ae0824f3527`.
-  - Do not add same-session live `AGENTS.md` refresh; the current user explicitly
-    excluded it from this firebreak.
+- Completed user-request summary: Preserve the five current-upstream implementation
+  tranches, restore `cargo-guard` and the blast-radius tooling before any further Rust
+  command, then add the automatic post-compaction recovery island because the current
+  compacted prompt can present retained user messages as though they were a new user
+  request. The recovery must cover compact, resume, fork, and rollback, remain bounded,
+  reuse current rollout reconstruction and `recall`, avoid Cursor and unrelated upstream
+  fixes, pass cumulative review and guarded validation, and publish both repositories.
 <!-- task-bookkeeping:mirror:end -->
 
 ## Planned Fork Requirements — Not Shipped
