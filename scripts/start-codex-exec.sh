@@ -101,10 +101,15 @@ remote_repo_root="$HOME/code/codex-sync"
 remote_codex_rs="$remote_repo_root/codex-rs"
 
 cd "${remote_codex_rs}"
-cargo build -p codex-cli --bin codex
+CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" \
+  bash ../scripts/cargo-guard.sh cargo build -p codex-cli --bin codex
+remote_target_dir="$(
+  bash ../scripts/cargo-guard.sh cargo metadata --format-version=1 --no-deps --quiet |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+)"
 
 rm -f "${remote_exec_server_log_path}" "${remote_exec_server_pid_path}"
-nohup ./target/debug/codex exec-server --listen ws://127.0.0.1:0 \
+nohup "${remote_target_dir}/debug/codex" exec-server --listen ws://127.0.0.1:0 \
   >"${remote_exec_server_log_path}" 2>&1 &
 remote_exec_server_pid="$!"
 echo "${remote_exec_server_pid}" >"${remote_exec_server_pid_path}"

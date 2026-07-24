@@ -504,6 +504,41 @@ assert_file_contains "${CURRENT_OUT}" 'resource-profile: workspace_nextest_tight
 assert_file_contains "${CURRENT_LOG}" 'args=nextest run --profile local-disk-tight --build-jobs 3 --test-threads 1 '
 
 begin_case
+helper_log="$(dirname -- "${CURRENT_LOG}")/tui-with-exec-server.log"
+mkdir -p -- "${CURRENT_TARGET_DIR}/debug"
+cat >"${CURRENT_TARGET_DIR}/debug/codex" <<'EOF_FAKE_CODEX'
+#!/usr/bin/env bash
+set -euo pipefail
+{
+    printf 'codex|pwd=%s|args=' "$(pwd)"
+    printf '%q ' "$@"
+    printf '\n'
+} >>"${FAKE_TUI_HELPER_LOG:?FAKE_TUI_HELPER_LOG is required}"
+printf 'ws://127.0.0.1:3210\n'
+exec sleep 30
+EOF_FAKE_CODEX
+cat >"${CURRENT_TARGET_DIR}/debug/codex-tui" <<'EOF_FAKE_CODEX_TUI'
+#!/usr/bin/env bash
+set -euo pipefail
+{
+    printf 'codex-tui|pwd=%s|url=%s|args=' \
+        "$(pwd)" \
+        "${CODEX_EXEC_SERVER_URL:-unset}"
+    printf '%q ' "$@"
+    printf '\n'
+} >>"${FAKE_TUI_HELPER_LOG:?FAKE_TUI_HELPER_LOG is required}"
+EOF_FAKE_CODEX_TUI
+chmod +x "${CURRENT_TARGET_DIR}/debug/codex" "${CURRENT_TARGET_DIR}/debug/codex-tui"
+export FAKE_TUI_HELPER_LOG="${helper_log}"
+export CODEX_EXEC_SERVER_START_TIMEOUT_SECONDS=2
+expect_command_ok just tui-with-exec-server smoke-arg
+unset FAKE_TUI_HELPER_LOG CODEX_EXEC_SERVER_START_TIMEOUT_SECONDS
+assert_file_contains "${CURRENT_LOG}" 'args=build -p codex-cli --bin codex -p codex-tui --bin codex-tui '
+assert_file_not_contains "${CURRENT_LOG}" 'args=run( |$)'
+assert_file_contains "${helper_log}" 'codex\|pwd=.*/codex-rs\|args=exec-server --listen ws://127[.]0[.]0[.]1:0 '
+assert_file_contains "${helper_log}" 'codex-tui\|pwd=.*/codex-rs\|url=ws://127[.]0[.]0[.]1:3210\|args=-c mcp_oauth_credentials_store=file smoke-arg '
+
+begin_case
 export CARGO_GUARD_RESOURCE_PROFILE=missing
 expect_fail cargo check -p codex-core
 assert_file_contains "${CURRENT_OUT}" 'failed to load resource profile missing'

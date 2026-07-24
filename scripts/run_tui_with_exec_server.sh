@@ -4,6 +4,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo_root="$repo_root/codex-rs"
+cargo_guard="$repo_root/scripts/cargo-guard.sh"
 listen_url="${CODEX_EXEC_SERVER_LISTEN_URL:-ws://127.0.0.1:0}"
 start_timeout_seconds="${CODEX_EXEC_SERVER_START_TIMEOUT_SECONDS:-120}"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-tui-with-exec-server.XXXXXX")"
@@ -24,7 +25,30 @@ trap cleanup EXIT INT TERM HUP
 
 (
   cd "$cargo_root"
-  cargo run -p codex-cli --bin codex -- exec-server --listen "$listen_url"
+  CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" \
+    bash "$cargo_guard" cargo build \
+      -p codex-cli --bin codex \
+      -p codex-tui --bin codex-tui
+)
+
+target_dir="$(
+  cd "$cargo_root"
+  bash "$cargo_guard" cargo metadata --format-version=1 --no-deps --quiet |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+)"
+codex_bin="$target_dir/debug/codex"
+codex_tui_bin="$target_dir/debug/codex-tui"
+
+for binary in "$codex_bin" "$codex_tui_bin"; do
+  if [[ ! -x "$binary" ]]; then
+    echo "guarded Cargo build did not produce executable $binary" >&2
+    exit 1
+  fi
+done
+
+(
+  cd "$cargo_root"
+  "$codex_bin" exec-server --listen "$listen_url"
 ) >"$stdout_log" 2>"$stderr_log" &
 server_pid="$!"
 
@@ -58,4 +82,4 @@ export CODEX_EXEC_SERVER_URL="$exec_server_url"
 echo "Starting codex-tui with CODEX_EXEC_SERVER_URL=$CODEX_EXEC_SERVER_URL" >&2
 
 cd "$cargo_root"
-cargo run -p codex-tui --bin codex-tui -- -c mcp_oauth_credentials_store=file "$@"
+"$codex_tui_bin" -c mcp_oauth_credentials_store=file "$@"

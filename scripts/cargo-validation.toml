@@ -427,6 +427,12 @@ patterns = ["codex-rs/test-binary-support/**"]
 packages = ["codex-test-binary-support"]
 surfaces = ["cli"]
 
+[[path_rules]]
+patterns = ["codex-rs/utils/process/**"]
+packages = ["codex-utils-process"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
 # Merge-safety anchor: strict range validation must not rely on the
 # unknown-package CLI fallback for known workspace package roots. Keep this list
 # explicit so new package roots still fail closed until classified.

@@ -80,6 +80,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-tools": "tools",
             "codex-tui": "tui",
             "codex-unmapped-fixture": "unmapped-fixture",
+            "codex-utils-process": "utils/process",
             "codex-websocket-client": "websocket-client",
         }
         packages = []
@@ -980,6 +981,37 @@ class CargoValidateTests(unittest.TestCase):
             ["just", "clippy-strict", "-p", "codex-test-binary-support"], commands
         )
         self.assertIn(["just", "strict-codex-bin"], commands)
+
+    def test_process_crate_paths_have_explicit_cli_runtime_rule(self) -> None:
+        paths = (
+            "codex-rs/utils/process/Cargo.toml",
+            "codex-rs/utils/process/src/lib.rs",
+            "codex-rs/utils/process/src/process_tests.rs",
+        )
+
+        for file_path in paths:
+            with self.subTest(file_path=file_path):
+                plan = self.plan_json("--file", file_path, "--mode", "strict")
+                commands = self.command_lines(plan)
+                self.assertEqual([], plan["warnings"])
+                self.assertIn("codex-utils-process", plan["selected_packages"])
+                self.assertIn("cli", plan["selected_surfaces"])
+                self.assertIn("runtime", plan["flags"])
+                self.assertIn(
+                    [
+                        "./scripts/cargo-guard.sh",
+                        "cargo",
+                        "check",
+                        "-p",
+                        "codex-utils-process",
+                    ],
+                    commands,
+                )
+                self.assertIn(
+                    ["just", "clippy-strict", "-p", "codex-utils-process"],
+                    commands,
+                )
+                self.assertIn(["just", "strict-codex-bin"], commands)
 
     def test_core_api_path_has_explicit_cli_rule(self) -> None:
         plan = self.plan_json(

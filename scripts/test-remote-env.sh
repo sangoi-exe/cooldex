@@ -25,7 +25,7 @@ setup_remote_env() {
   local remote_exec_server_stdout_path
 
   container_name="${CODEX_TEST_REMOTE_ENV_CONTAINER_NAME:-codex-remote-test-env-local-$(date +%s)-${RANDOM}}"
-  codex_binary_path="${CARGO_TARGET_DIR:-${REPO_ROOT}/codex-rs/target}/debug/codex"
+  codex_binary_path=""
 
   if ! command -v docker >/dev/null 2>&1; then
     echo "docker is required (Colima or Docker Desktop)" >&2
@@ -44,8 +44,14 @@ setup_remote_env() {
 
   (
     cd "${REPO_ROOT}/codex-rs"
-    cargo build -p codex-cli --bin codex
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" \
+      bash ../scripts/cargo-guard.sh cargo build -p codex-cli --bin codex
   )
+  codex_binary_path="$(
+    cd "${REPO_ROOT}/codex-rs"
+    bash ../scripts/cargo-guard.sh cargo metadata --format-version=1 --no-deps --quiet |
+      python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+  )/debug/codex"
 
   if [[ ! -f "${codex_binary_path}" ]]; then
     echo "codex binary not found at ${codex_binary_path}" >&2

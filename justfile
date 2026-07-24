@@ -67,7 +67,7 @@ check-strict *args:
 [unix]
 install:
     rustup show active-toolchain
-    cargo fetch
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo fetch
 
 [windows]
 install:

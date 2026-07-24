@@ -24,6 +24,12 @@ Last reviewed: 2026-07-23.
 - The retired `scripts/cooldex/native-diff-budget.sh` is intentionally absent and is not a validation gate, proof owner, seam selector, or progress metric.
 - `scripts/cargo-validation.toml` resource profiles own build-job bounds and runtime-thread caps. Official profiles keep runtime tests serialized at one thread, restore the historical build-job max/hard caps, and set `cargo_jobs_default = "min"` so ordinary runs use the profile minimum unless a lower/equal inline Cargo/nextest build-job override is explicit.
 - `cargo-guard.sh` rejects inline Cargo/nextest build-job values above the selected cap, but inline values below or equal to that cap are allowed and should not require temporary profile edits.
+- Supported WSL/Linux developer helpers must build through `cargo-guard.sh`. Helpers
+  that start long-lived Codex processes build first under the guard, resolve the
+  effective Cargo target directory, and then launch the built binaries outside the
+  guard so the build lock is not held for the process lifetime.
+- `test-cargo-guard.sh` executes the real `tui-with-exec-server` just recipe with fake
+  Cargo and fake built binaries so the transitive helper route remains covered.
 - Planner-driven `verify` defaults to `--telemetry-level full`; direct guarded Cargo commands and known profiled `just` recipes that invoke `cargo-guard.sh` receive TSV paths under `.sangoi/validation/command-logs/**` beside stdout/stderr logs. Non-Cargo commands do not get fake telemetry artifacts. Use `summary` for lighter receipt metadata, `debug` for per-process rustc detail rows, and `off` only when telemetry is intentionally disabled.
 - `cargo-validate.py` keeps pre-review mechanical materialization separate from validation: `prep-plan`/`prep` may run tree-mutating formatter, generator, and lock-refresh commands before review, while `plan`/`verify` must stay non-mutating validation actions.
 <!-- Merge-safety anchor: keep selector provenance and this local validation map aligned so committed package deletions remain plannable without weakening unknown-path failures. -->
