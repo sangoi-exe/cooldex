@@ -6,6 +6,7 @@ use crate::config::DEFAULT_AGENT_MAX_DEPTH;
 use crate::function_tool::FunctionCallError;
 use crate::init_state_db;
 use crate::local_agent_graph_store_from_state_db;
+use crate::session::session::SessionSettingsUpdate;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
@@ -2128,6 +2129,184 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
     .expect("parent should receive one completion notification per child turn");
 
     assert_eq!(notifications.len(), 2);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_followup_task_rejects_loaded_agent_without_tree_identity_snapshot() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = turn.config.as_ref().clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow multi-agent v2");
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("test config should allow sqlite");
+    let state_db = init_state_db(&config)
+        .await
+        .expect("sqlite state db should initialize");
+    let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Some(state_db),
+    );
+    let root = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    set_turn_config(&mut turn, config.clone());
+    let mut session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "boot worker",
+                "task_name": "worker"
+            })),
+        ))
+        .await
+        .expect("spawn worker");
+    let agent_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+        .await
+        .expect("worker should resolve");
+    manager
+        .get_thread(agent_id)
+        .await
+        .expect("worker should remain globally loaded");
+
+    let restored_control = manager.agent_control();
+    restored_control
+        .restore_v2_agent_metadata(&config, root.thread_id)
+        .await;
+    Arc::get_mut(&mut session)
+        .expect("test session should have no other owners")
+        .services
+        .agent_control = restored_control;
+
+    let Err(err) = FollowupTaskHandlerV2
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "followup_task",
+            function_payload(json!({
+                "target": "worker",
+                "message": "continue"
+            })),
+        ))
+        .await
+    else {
+        panic!("followup must reject restored metadata without a live identity snapshot");
+    };
+
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(format!(
+            "collab tool failed: agent {agent_id} was restored without a live identity snapshot; spawn a new agent before sending follow-up work"
+        ))
+    );
+    assert!(!manager.captured_ops().iter().any(|(thread_id, op)| {
+        *thread_id == agent_id
+            && matches!(
+                op,
+                Op::InterAgentCommunication { communication }
+                    if communication.encrypted_content.as_deref() == Some("continue")
+                        && communication.trigger_turn
+            )
+    }));
+}
+
+#[tokio::test]
+async fn multi_agent_v2_followup_task_rejects_loaded_agent_with_mismatched_identity_snapshot() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let mut config = turn.config.as_ref().clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow multi-agent v2");
+    set_turn_config(&mut turn, config.clone());
+    let root = manager
+        .start_thread(StartThreadOptions::new(config))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "boot worker",
+                "task_name": "worker"
+            })),
+        ))
+        .await
+        .expect("spawn worker");
+    let agent_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, "worker")
+        .await
+        .expect("worker should resolve");
+    let worker = manager
+        .get_thread(agent_id)
+        .await
+        .expect("worker should remain globally loaded");
+    worker
+        .session
+        .update_settings(SessionSettingsUpdate {
+            service_tier: Some(Some("identity-drift-tier".to_string())),
+            ..Default::default()
+        })
+        .await
+        .expect("test identity drift should be accepted");
+
+    let Err(err) = FollowupTaskHandlerV2
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "followup_task",
+            function_payload(json!({
+                "target": "worker",
+                "message": "continue"
+            })),
+        ))
+        .await
+    else {
+        panic!("followup must reject a loaded agent with mismatched identity");
+    };
+
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(format!(
+            "collab tool failed: agent {agent_id} is loaded with an identity that does not match its live identity snapshot; spawn a new agent before sending follow-up work"
+        ))
+    );
+    assert!(!manager.captured_ops().iter().any(|(thread_id, op)| {
+        *thread_id == agent_id
+            && matches!(
+                op,
+                Op::InterAgentCommunication { communication }
+                    if communication.encrypted_content.as_deref() == Some("continue")
+                        && communication.trigger_turn
+            )
+    }));
 }
 
 #[tokio::test]

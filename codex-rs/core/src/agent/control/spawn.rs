@@ -1,5 +1,7 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
+use crate::CodexThread;
+use crate::agent::AgentIdentitySnapshot;
 use codex_extension_api::ExtensionDataInit;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
@@ -119,6 +121,19 @@ async fn load_agent_model_context(
                 .items,
         )),
     }
+}
+
+async fn verify_loaded_v2_agent_identity(
+    loaded_thread: &CodexThread,
+    thread_id: ThreadId,
+    identity_snapshot: &AgentIdentitySnapshot,
+) -> CodexResult<()> {
+    if loaded_thread.session.agent_identity_snapshot().await != *identity_snapshot {
+        return Err(CodexErr::InvalidRequest(format!(
+            "agent {thread_id} is loaded with an identity that does not match its live identity snapshot; spawn a new agent before sending follow-up work"
+        )));
+    }
+    Ok(())
 }
 
 impl AgentControl {
@@ -251,20 +266,40 @@ impl AgentControl {
         thread_id: ThreadId,
     ) -> CodexResult<()> {
         let state = self.upgrade()?;
-        if state.get_thread(thread_id).await.is_ok() {
+        let loaded_thread = state.get_thread(thread_id).await.ok();
+        if loaded_thread
+            .as_ref()
+            .is_some_and(|thread| thread.multi_agent_version() != Some(MultiAgentVersion::V2))
+        {
+            return Ok(());
+        }
+        let agent_metadata = self
+            .state
+            .agent_metadata_for_thread(thread_id)
+            .ok_or(CodexErr::ThreadNotFound(thread_id))?;
+        let identity_snapshot = match agent_metadata.identity_snapshot {
+            Some(identity_snapshot) => identity_snapshot,
+            None if agent_metadata
+                .agent_path
+                .as_ref()
+                .is_some_and(AgentPath::is_root) =>
+            {
+                if state.get_thread(thread_id).await.is_ok() {
+                    return Ok(());
+                }
+                return Err(CodexErr::ThreadNotFound(thread_id));
+            }
+            None => {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "agent {thread_id} was restored without a live identity snapshot; spawn a new agent before sending follow-up work"
+                )));
+            }
+        };
+        if let Some(loaded_thread) = loaded_thread {
+            verify_loaded_v2_agent_identity(&loaded_thread, thread_id, &identity_snapshot).await?;
             self.touch_loaded_v2_residency(&state, thread_id).await;
             return Ok(());
         }
-        let identity_snapshot = self
-            .state
-            .agent_metadata_for_thread(thread_id)
-            .ok_or(CodexErr::ThreadNotFound(thread_id))?
-            .identity_snapshot
-            .ok_or_else(|| {
-                CodexErr::InvalidRequest(format!(
-                    "agent {thread_id} was restored without a live identity snapshot; spawn a new agent before sending follow-up work"
-                ))
-            })?;
 
         let stored_thread = state
             .read_stored_thread(ReadThreadParams {
@@ -322,8 +357,10 @@ impl AgentControl {
                 Ok(())
             }
             Err(err) => {
-                if state.get_thread(thread_id).await.is_ok() {
+                if let Ok(loaded_thread) = state.get_thread(thread_id).await {
                     drop(residency_slot);
+                    verify_loaded_v2_agent_identity(&loaded_thread, thread_id, &identity_snapshot)
+                        .await?;
                     self.touch_loaded_v2_residency(&state, thread_id).await;
                     return Ok(());
                 }
