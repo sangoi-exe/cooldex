@@ -11,7 +11,6 @@ use crate::config::ConfigBuilder;
 use crate::context::ContextualUserFragment;
 use crate::context::SubagentNotification;
 use crate::init_state_db;
-use crate::state::PostCompactRecoveryRuntimeState;
 use crate::thread_manager::StartThreadOptions;
 use assert_matches::assert_matches;
 use codex_extension_api::ExtensionDataInit;
@@ -1196,13 +1195,23 @@ async fn spawn_agent_without_fork_from_paginated_parent_stays_fresh_and_paginate
     .expect("read child session metadata");
     assert_eq!(meta.meta.history_mode, ThreadHistoryMode::Paginated);
     assert_eq!(meta.meta.subagent_history_start_ordinal, None);
-    let child_state = child_thread.session.state.lock().await;
-    assert_eq!(
-        child_state.post_compact_recovery,
-        PostCompactRecoveryRuntimeState::Absent,
+    let child_rollout = std::fs::read_to_string(
+        child_thread
+            .rollout_path()
+            .expect("child rollout should exist"),
+    )
+    .expect("read child rollout")
+    .lines()
+    .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse child rollout line"))
+    .collect::<Vec<_>>();
+    assert!(
+        !child_rollout.iter().any(|line| matches!(
+            &line.item,
+            RolloutItem::Compacted(compacted)
+                if compacted.post_compact_recovery.is_some()
+        )),
         "fork_turns=none must not inherit parent recovery state"
     );
-    drop(child_state);
 
     let _ = harness
         .control
@@ -1228,9 +1237,7 @@ fn partial_fork_drops_application_proof_when_its_compaction_is_outside_owned_his
     let owned_compaction = RolloutItem::Compacted(CompactedItem {
         message: "owned compacted history".to_string(),
         replacement_history: Some(vec![ResponseItem::Message {
-            id: Some(ResponseItemId::from_server(
-                owned_boundary_id.to_string(),
-            )),
+            id: Some(ResponseItemId::from_server(owned_boundary_id.to_string())),
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
                 text: "owned compaction boundary".to_string(),
@@ -1239,12 +1246,8 @@ fn partial_fork_drops_application_proof_when_its_compaction_is_outside_owned_his
             internal_chat_message_metadata_passthrough: None,
         }]),
         window_number: Some(2),
-        first_window_id: Some(
-            "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000".to_string(),
-        ),
-        previous_window_id: Some(
-            "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),
-        ),
+        first_window_id: Some("019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000".to_string()),
+        previous_window_id: Some("019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string()),
         window_id: Some(owned_window_id.to_string()),
         post_compact_recovery: Some(PostCompactRecoveryMarker {
             boundary_item_id: owned_boundary_id.to_string(),
@@ -1276,12 +1279,8 @@ fn partial_fork_drops_application_proof_when_its_compaction_is_outside_owned_his
 
     assert_eq!(
         serde_json::to_value(items).expect("serialize retained partial history"),
-        serde_json::to_value(vec![
-            owned_compaction,
-            owned_application,
-            user_message,
-        ])
-        .expect("serialize expected partial history")
+        serde_json::to_value(vec![owned_compaction, owned_application, user_message,])
+            .expect("serialize expected partial history")
     );
 }
 
@@ -1342,14 +1341,42 @@ async fn full_history_fork_inherits_pending_post_compact_recovery() {
         .get_thread(child_thread_id)
         .await
         .expect("child thread should be registered");
-    let child_state = child_thread.session.state.lock().await;
-    let pending = child_state
-        .post_compact_recovery
-        .pending_identity()
+    child_thread.ensure_rollout_materialized().await;
+    child_thread
+        .flush_rollout()
+        .await
+        .expect("child rollout should flush");
+    let child_rollout = std::fs::read_to_string(
+        child_thread
+            .rollout_path()
+            .expect("child rollout should exist"),
+    )
+    .expect("read child rollout")
+    .lines()
+    .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse child rollout line"))
+    .collect::<Vec<_>>();
+    let pending = child_rollout
+        .iter()
+        .find_map(|line| match &line.item {
+            RolloutItem::Compacted(compacted) => {
+                compacted.post_compact_recovery.as_ref().map(|marker| {
+                    (
+                        compacted.window_id.as_deref(),
+                        marker.boundary_item_id.as_str(),
+                    )
+                })
+            }
+            _ => None,
+        })
         .expect("full-history fork should inherit pending recovery");
-    assert_eq!(pending.compaction_window_id, compaction_window_id);
-    assert_eq!(pending.boundary_item_id, boundary_item_id);
-    drop(child_state);
+    assert_eq!(pending.0, Some(compaction_window_id.as_str()));
+    assert_eq!(pending.1, boundary_item_id);
+    assert!(
+        !child_rollout
+            .iter()
+            .any(|line| matches!(&line.item, RolloutItem::PostCompactRecoveryApplied(_))),
+        "full-history fork must not synthesize an application proof"
+    );
 
     let _ = harness
         .control
