@@ -9679,6 +9679,61 @@ async fn turn_complete_flushes_terminal_event_after_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_compact_recovery_successful_task_without_sampling_response_does_not_consume() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    let identity = install_test_post_compact_recovery(session.as_ref()).await;
+
+    session
+        .spawn_task(Arc::clone(&turn_context), Vec::new(), CompletingTask)
+        .await;
+
+    let completed = timeout(Duration::from_secs(2), async {
+        loop {
+            match rx.recv().await.expect("event").msg {
+                EventMsg::Error(error) => {
+                    panic!("successful no-inference task emitted an error: {error:?}");
+                }
+                EventMsg::TurnComplete(completed) => break completed,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("successful no-inference task should complete the turn");
+
+    assert_eq!(completed.turn_id, turn_context.sub_id);
+    assert_eq!(completed.last_agent_message, None);
+    assert_eq!(completed.error, None);
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .pending_identity(),
+        Some(&identity)
+    );
+
+    let items = session
+        .live_thread()
+        .expect("test live thread")
+        .load_history(/*include_archived*/ false)
+        .await
+        .expect("load persisted history")
+        .items;
+    assert!(!items
+        .iter()
+        .any(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_))));
+
+    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 3).await;
+    assert_eq!(3, calls.flush_thread);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_compact_recovery_unexpected_task_error_after_response_preserves_upstream_events_and_writes_no_application()
 {
     let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
