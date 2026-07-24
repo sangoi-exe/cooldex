@@ -9,16 +9,9 @@ pub(crate) struct PostCompactRecoveryIdentity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PostCompactRecoverySamplingProof {
-    identity: PostCompactRecoveryIdentity,
-    turn_id: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingPostCompactRecovery {
     identity: PostCompactRecoveryIdentity,
     packet: Option<PostCompactRecoveryContext>,
-    sampling_proof: Option<PostCompactRecoverySamplingProof>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -43,14 +36,6 @@ pub(crate) enum PostCompactRecoveryFailureClass {
     UnsupportedLegacy,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PostCompactRecoveryTurnOutcome {
-    Successful,
-    Aborted,
-    UnexpectedTaskError,
-    TerminalError,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum PostCompactRecoveryRuntimeState {
     #[default]
@@ -64,7 +49,6 @@ impl PostCompactRecoveryRuntimeState {
         Self::Pending(PendingPostCompactRecovery {
             identity,
             packet: None,
-            sampling_proof: None,
         })
     }
 
@@ -119,69 +103,24 @@ impl PostCompactRecoveryRuntimeState {
         }
     }
 
-    pub(crate) fn record_sampling_success(
-        &mut self,
+    pub(crate) fn application_for_sampling_success(
+        &self,
         identity: &PostCompactRecoveryIdentity,
         turn_id: &str,
-    ) -> Result<(), PostCompactRecoveryFailureClass> {
+    ) -> Result<PostCompactRecoveryAppliedItem, PostCompactRecoveryFailureClass> {
         match self {
             Self::Blocked(failure) => Err(*failure),
-            Self::Pending(pending) if pending.identity == *identity => {
-                let proof = PostCompactRecoverySamplingProof {
-                    identity: identity.clone(),
+            Self::Pending(pending)
+                if pending.identity == *identity && !turn_id.trim().is_empty() =>
+            {
+                Ok(PostCompactRecoveryAppliedItem {
+                    compaction_window_id: identity.compaction_window_id.clone(),
+                    boundary_item_id: identity.boundary_item_id.clone(),
                     turn_id: turn_id.to_string(),
-                };
-                match pending.sampling_proof.as_ref() {
-                    Some(existing) if existing != &proof => {
-                        Err(PostCompactRecoveryFailureClass::BoundaryMismatch)
-                    }
-                    Some(_) => Ok(()),
-                    None => {
-                        pending.sampling_proof = Some(proof);
-                        Ok(())
-                    }
-                }
+                })
             }
             Self::Absent | Self::Pending(_) => {
                 Err(PostCompactRecoveryFailureClass::BoundaryMismatch)
-            }
-        }
-    }
-
-    pub(crate) fn clear_sampling_proof_for_turn(&mut self, turn_id: &str) {
-        if let Self::Pending(pending) = self
-            && pending
-                .sampling_proof
-                .as_ref()
-                .is_some_and(|proof| proof.turn_id == turn_id)
-        {
-            pending.sampling_proof = None;
-        }
-    }
-
-    pub(crate) fn application_candidate(
-        &self,
-        turn_id: &str,
-        outcome: PostCompactRecoveryTurnOutcome,
-    ) -> Result<Option<PostCompactRecoveryAppliedItem>, PostCompactRecoveryFailureClass> {
-        if !matches!(outcome, PostCompactRecoveryTurnOutcome::Successful) {
-            return Ok(None);
-        }
-        match self {
-            Self::Absent => Ok(None),
-            Self::Blocked(failure) => Err(*failure),
-            Self::Pending(pending) => {
-                let Some(proof) = pending.sampling_proof.as_ref() else {
-                    return Ok(None);
-                };
-                if proof.identity != pending.identity || proof.turn_id != turn_id {
-                    return Err(PostCompactRecoveryFailureClass::BoundaryMismatch);
-                }
-                Ok(Some(PostCompactRecoveryAppliedItem {
-                    compaction_window_id: pending.identity.compaction_window_id.clone(),
-                    boundary_item_id: pending.identity.boundary_item_id.clone(),
-                    turn_id: proof.turn_id.clone(),
-                }))
             }
         }
     }
@@ -193,13 +132,9 @@ impl PostCompactRecoveryRuntimeState {
         let Self::Pending(pending) = self else {
             return Err(PostCompactRecoveryFailureClass::BoundaryMismatch);
         };
-        let Some(proof) = pending.sampling_proof.as_ref() else {
-            return Err(PostCompactRecoveryFailureClass::BoundaryMismatch);
-        };
         if pending.identity.compaction_window_id != applied.compaction_window_id
             || pending.identity.boundary_item_id != applied.boundary_item_id
-            || proof.identity != pending.identity
-            || proof.turn_id != applied.turn_id
+            || applied.turn_id.trim().is_empty()
         {
             return Err(PostCompactRecoveryFailureClass::BoundaryMismatch);
         }

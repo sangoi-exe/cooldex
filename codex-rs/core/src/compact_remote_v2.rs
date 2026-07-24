@@ -9,6 +9,7 @@ use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
 use crate::compact::compaction_status_from_result;
+use crate::compact_continuity_tail::append_remote_v2_mid_turn_continuity_tail;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote::process_compacted_history;
@@ -286,14 +287,23 @@ async fn run_remote_compact_task_inner_impl(
         build_v2_compacted_history(&prompt_input, compaction_output);
     analytics_details.retained_image_count = Some(retained_images);
     let (new_window_number, new_window_ids) = sess.prepare_auto_compact_window().await;
-    let (new_history, world_state_baseline) =
-        process_compacted_history(
-            sess.as_ref(),
-            compacted_history,
-            &initial_context_injection,
-            new_window_ids,
-        )
-        .await;
+    let (mut new_history, world_state_baseline) = process_compacted_history(
+        sess.as_ref(),
+        compacted_history,
+        &initial_context_injection,
+        new_window_ids,
+    )
+    .await;
+    if matches!(
+        initial_context_injection,
+        InitialContextInjection::BeforeLastUserMessage { .. }
+    ) {
+        append_remote_v2_mid_turn_continuity_tail(
+            &mut new_history,
+            &prompt_input,
+            compaction_turn_context.as_ref(),
+        );
+    }
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,

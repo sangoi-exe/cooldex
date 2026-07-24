@@ -86,6 +86,65 @@ async fn loads_complete_rollout_in_replay_order() {
 }
 
 #[tokio::test]
+async fn loads_legacy_fork_with_copied_source_session_metadata() {
+    let home = TempDir::new().expect("temp dir");
+    let parent_uuid = Uuid::from_u128(/*v*/ 3020);
+    let parent_path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-04-00",
+        parent_uuid,
+        ThreadHistoryMode::Legacy,
+    )
+    .expect("write parent rollout");
+    let parent_meta = fs::read_to_string(parent_path)
+        .expect("read parent rollout")
+        .lines()
+        .next()
+        .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse parent metadata"))
+        .map(|line| line.item)
+        .expect("parent metadata line");
+
+    let child_uuid = Uuid::from_u128(/*v*/ 3021);
+    let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child id");
+    let child_path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-04-01",
+        child_uuid,
+        ThreadHistoryMode::Legacy,
+    )
+    .expect("write child rollout");
+    let mut expected_items = fs::read_to_string(child_path.as_path())
+        .expect("read child rollout")
+        .lines()
+        .skip(1)
+        .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse child rollout item"))
+        .map(|line| line.item)
+        .collect::<Vec<_>>();
+    append_line(child_path.as_path(), 1, parent_meta);
+    append_line(child_path.as_path(), 2, message("child visible"));
+    expected_items.push(message("child visible"));
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let tail = store
+        .load_rollout_tail(LoadRolloutTailParams {
+            thread_id: child_id,
+            include_archived: false,
+            max_bytes: 1024 * 1024,
+            max_records: 16,
+        })
+        .await
+        .expect("load legacy fork tail");
+
+    assert_eq!(
+        serde_json::to_value(tail.items).expect("serialize actual tail"),
+        serde_json::to_value(expected_items).expect("serialize expected tail")
+    );
+    assert!(tail.reached_start);
+    assert_eq!(tail.records_read, 4);
+    assert_eq!(tail.segments_read, 1);
+}
+
+#[tokio::test]
 async fn loads_frozen_parent_lineage_before_the_child_delta() {
     let home = TempDir::new().expect("temp dir");
     let parent_uuid = Uuid::from_u128(/*v*/ 3010);
@@ -242,6 +301,56 @@ async fn rejects_malformed_rollout_records() {
 
     assert!(matches!(err, ThreadStoreError::Internal { .. }));
     assert!(err.to_string().contains("rejected rollout record"));
+}
+
+#[tokio::test]
+async fn rejects_rollout_whose_physical_first_record_is_not_session_metadata() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 3005);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-02-04",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write rollout");
+    let canonical_meta = fs::read_to_string(path.as_path())
+        .expect("read rollout")
+        .lines()
+        .next()
+        .map(str::to_string)
+        .expect("session metadata line");
+    let misplaced_message = RolloutLine {
+        timestamp: "2025-01-03T13:00:00Z".to_string(),
+        ordinal: Some(1),
+        item: message("misplaced head"),
+    };
+    fs::write(
+        path.as_path(),
+        format!(
+            "{}\n{canonical_meta}\n",
+            serde_json::to_string(&misplaced_message).expect("serialize misplaced message")
+        ),
+    )
+    .expect("write malformed rollout");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let err = store
+        .load_rollout_tail(LoadRolloutTailParams {
+            thread_id,
+            include_archived: false,
+            max_bytes: 1024 * 1024,
+            max_records: 16,
+        })
+        .await
+        .expect_err("non-metadata head should fail");
+
+    assert!(matches!(err, ThreadStoreError::Internal { .. }));
+    assert!(
+        err.to_string()
+            .contains("session metadata is not the first record")
+    );
 }
 
 fn set_history_base(path: &std::path::Path, history_base: HistoryPosition) {

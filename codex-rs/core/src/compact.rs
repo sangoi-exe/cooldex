@@ -356,12 +356,8 @@ async fn run_compact_task_inner_impl(
     let (window_number, window_ids) = sess.prepare_auto_compact_window().await;
 
     let (initial_context, world_state_baseline) =
-        build_compaction_initial_context(
-            sess.as_ref(),
-            &initial_context_injection,
-            window_ids,
-        )
-        .await;
+        build_compaction_initial_context(sess.as_ref(), &initial_context_injection, window_ids)
+            .await;
     if !initial_context.is_empty() {
         new_history =
             insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
@@ -586,9 +582,24 @@ pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
             )
             .then_some(i)
         });
-    let insertion_index = last_real_user_index
+    let mut insertion_index = last_real_user_index
         .or(last_user_or_summary_index)
         .or(last_compaction_index);
+
+    if insertion_index.is_none()
+        && compacted_history
+            .iter()
+            .any(|item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"))
+    {
+        insertion_index = Some(0);
+    }
+    if insertion_index.is_some_and(|index| {
+        compacted_history[..index]
+            .iter()
+            .any(|item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"))
+    }) {
+        insertion_index = Some(0);
+    }
 
     // Re-inject canonical context from the current session since we stripped it
     // from the pre-compaction history. Prefer placing it before the last real

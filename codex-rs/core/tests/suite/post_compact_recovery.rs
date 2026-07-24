@@ -1,3 +1,4 @@
+use super::compact::COMPACT_WARNING_MESSAGE;
 use std::fs;
 use std::path::Path;
 
@@ -7,6 +8,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
@@ -16,8 +18,9 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
-use core_test_support::responses::start_websocket_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::streaming_sse::StreamingSseChunk;
+use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
@@ -49,8 +52,12 @@ fn read_rollout_items(path: &Path) -> Vec<RolloutItem> {
         .collect()
 }
 
-fn recovery_fragment(request: &ResponsesRequest) -> (usize, String) {
-    let matches = request
+fn matching_recovery_fragments(
+    request: &ResponsesRequest,
+    expected_role: &str,
+    marker: &str,
+) -> Vec<(usize, String)> {
+    request
         .input()
         .into_iter()
         .enumerate()
@@ -61,17 +68,43 @@ fn recovery_fragment(request: &ResponsesRequest) -> (usize, String) {
                 .and_then(|content| content.first())
                 .and_then(|content| content.get("text"))
                 .and_then(serde_json::Value::as_str)?;
-            (item.get("role").and_then(serde_json::Value::as_str) == Some("developer")
-                && text.starts_with("<post_compact_recovery>"))
+            (item.get("role").and_then(serde_json::Value::as_str) == Some(expected_role)
+                && text.starts_with(marker))
             .then(|| (index, text.to_string()))
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn recovery_fragment(
+    request: &ResponsesRequest,
+    expected_role: &str,
+    marker: &str,
+) -> (usize, String) {
+    let matches = matching_recovery_fragments(request, expected_role, marker);
     assert_eq!(
         matches.len(),
         1,
-        "request should contain exactly one recovery developer item"
+        "request should contain exactly one {expected_role} item starting with {marker}"
     );
     matches.into_iter().next().expect("one recovery fragment")
+}
+
+fn recovery_fragments(request: &ResponsesRequest) -> ((usize, String), Option<(usize, String)>) {
+    let mut recall = matching_recovery_fragments(request, "user", "<post_compact_recall>");
+    assert!(
+        recall.len() <= 1,
+        "request should contain at most one post-compact recall item"
+    );
+    (
+        recovery_fragment(request, "developer", "<post_compact_recovery>"),
+        recall.pop(),
+    )
+}
+
+fn assert_no_recovery_fragments(request: &ResponsesRequest) {
+    let serialized = serde_json::to_string(&request.input()).expect("serialize request input");
+    assert!(!serialized.contains("<post_compact_recovery>"));
+    assert!(!serialized.contains("<post_compact_recall>"));
 }
 
 fn assert_pending_marker_without_application(items: &[RolloutItem]) {
@@ -91,54 +124,45 @@ fn assert_pending_marker_without_application(items: &[RolloutItem]) {
     );
 }
 
-async fn seed_and_compact(
-    codex: &codex_core::CodexConversation,
-) -> Result<()> {
-    codex.submit(user_turn(FIRST_USER)).await?;
-    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-    codex.submit(Op::Compact).await?;
-    wait_for_event(codex, |event| matches!(event, EventMsg::Warning(_))).await;
-    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-    Ok(())
+async fn wait_for_successful_turn_complete(codex: &codex_core::CodexThread) {
+    let EventMsg::TurnComplete(completed) =
+        wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await
+    else {
+        unreachable!("predicate guarantees a turn complete event");
+    };
+    assert_eq!(completed.error, None);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn post_compact_recovery_websocket_stream_return_without_response_records_no_sampling_success(
-) -> Result<()> {
-    skip_if_no_network!(Ok(()));
-    let server = start_websocket_server(vec![vec![
-        vec![
-            ev_response_created("first"),
-            ev_assistant_message("first-message", FIRST_REPLY),
-            ev_completed("first"),
-        ],
-        vec![
-            ev_response_created("compact"),
-            ev_assistant_message("compact-message", SUMMARY),
-            ev_completed("compact"),
-        ],
-        Vec::new(),
-    ]])
-    .await;
-    let mut builder = test_codex().with_config(|config| {
-        config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
-        config.model_provider.request_max_retries = Some(0);
-        config.model_provider.stream_max_retries = Some(0);
-    });
-    let test = builder.build_with_websocket_server(&server).await?;
-    let rollout_path = test
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
+async fn wait_for_failed_turn_complete(codex: &codex_core::CodexThread) {
+    let EventMsg::Error(error) =
+        wait_for_event(codex, |event| matches!(event, EventMsg::Error(_))).await
+    else {
+        unreachable!("predicate guarantees an error event");
+    };
+    let EventMsg::TurnComplete(completed) =
+        wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await
+    else {
+        unreachable!("predicate guarantees a turn complete event");
+    };
+    assert_eq!(completed.error.as_ref(), Some(&error));
+}
 
-    seed_and_compact(&test.codex).await?;
-    test.codex.submit(user_turn(LIVE_USER)).await?;
-    wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
-    wait_for_event(&test.codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-
-    assert_pending_marker_without_application(&read_rollout_items(&rollout_path));
-    server.shutdown().await;
+async fn seed_and_compact(codex: &codex_core::CodexThread) -> Result<()> {
+    codex.submit(user_turn(FIRST_USER)).await?;
+    wait_for_successful_turn_complete(codex).await;
+    codex.submit(Op::Compact).await?;
+    let EventMsg::Warning(WarningEvent { message }) = wait_for_event(codex, |event| {
+        matches!(
+            event,
+            EventMsg::Warning(WarningEvent { message }) if message == COMPACT_WARNING_MESSAGE
+        )
+    })
+    .await
+    else {
+        unreachable!("predicate guarantees a compact warning event");
+    };
+    assert_eq!(message, COMPACT_WARNING_MESSAGE);
+    wait_for_successful_turn_complete(codex).await;
     Ok(())
 }
 
@@ -146,27 +170,30 @@ async fn post_compact_recovery_websocket_stream_return_without_response_records_
 async fn post_compact_recovery_transport_failure_before_response_records_no_sampling_success()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
-    let server = start_mock_server().await;
-    mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
+    let (server, _) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
                 ev_assistant_message("first-message", FIRST_REPLY),
                 ev_completed("first"),
             ]),
-            sse(vec![
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
                 ev_assistant_message("compact-message", SUMMARY),
                 ev_completed("compact"),
             ]),
-        ],
-    )
+        }],
+    ])
     .await;
     let mut builder = test_codex().with_config(|config| {
+        config.model_provider.name = "OpenAI-compatible test provider".to_string();
         config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
         config.model_provider.request_max_retries = Some(0);
         config.model_provider.stream_max_retries = Some(0);
     });
-    let test = builder.build(&server).await?;
+    let test = builder.build_with_streaming_server(&server).await?;
     let rollout_path = test
         .session_configured
         .rollout_path
@@ -176,15 +203,14 @@ async fn post_compact_recovery_transport_failure_before_response_records_no_samp
     seed_and_compact(&test.codex).await?;
     server.shutdown().await;
     test.codex.submit(user_turn(LIVE_USER)).await?;
-    wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
-    wait_for_event(&test.codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_failed_turn_complete(&test.codex).await;
 
     assert_pending_marker_without_application(&read_rollout_items(&rollout_path));
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn post_compact_recovery_retry_and_tool_continuation_reuse_byte_identical_fragment()
+async fn post_compact_recovery_retry_reuses_fragments_and_sampling_success_consumes_once()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
@@ -212,6 +238,7 @@ async fn post_compact_recovery_retry_and_tool_continuation_reuse_byte_identical_
     )
     .await;
     let mut builder = test_codex().with_config(|config| {
+        config.model_provider.name = "OpenAI-compatible test provider".to_string();
         config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
         config.model_provider.request_max_retries = Some(0);
         config.model_provider.stream_max_retries = Some(1);
@@ -225,20 +252,25 @@ async fn post_compact_recovery_retry_and_tool_continuation_reuse_byte_identical_
 
     seed_and_compact(&test.codex).await?;
     test.codex.submit(user_turn(LIVE_USER)).await?;
-    wait_for_event(&test.codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn_complete(&test.codex).await;
 
     let requests = requests.requests();
     assert_eq!(requests.len(), 5);
-    let (failed_index, failed_fragment) = recovery_fragment(&requests[2]);
-    let (retry_index, retry_fragment) = recovery_fragment(&requests[3]);
-    let (continuation_index, continuation_fragment) = recovery_fragment(&requests[4]);
-    assert_eq!(failed_fragment, retry_fragment);
-    assert_eq!(retry_fragment, continuation_fragment);
+    let ((failed_boundary_index, failed_boundary), failed_recall) =
+        recovery_fragments(&requests[2]);
+    let ((retry_boundary_index, retry_boundary), retry_recall) = recovery_fragments(&requests[3]);
+    assert_eq!(failed_boundary, retry_boundary);
+    assert_eq!(failed_recall, retry_recall);
+    assert_no_recovery_fragments(&requests[4]);
 
     let items = read_rollout_items(&rollout_path);
     assert!(
         !serde_json::to_string(&items)?.contains("<post_compact_recovery>"),
         "the transient recovery packet must never enter persisted rollout items"
+    );
+    assert!(
+        !serde_json::to_string(&items)?.contains("<post_compact_recall>"),
+        "the transient recall packet must never enter persisted rollout items"
     );
     let compacted = items
         .iter()
@@ -252,10 +284,17 @@ async fn post_compact_recovery_retry_and_tool_continuation_reuse_byte_identical_
         .post_compact_recovery
         .as_ref()
         .expect("recovery marker");
-    for (request, recovery_index) in [
-        (&requests[2], failed_index),
-        (&requests[3], retry_index),
-        (&requests[4], continuation_index),
+    for (request, recovery_index, recall_index) in [
+        (
+            &requests[2],
+            failed_boundary_index,
+            failed_recall.as_ref().map(|(index, _)| *index),
+        ),
+        (
+            &requests[3],
+            retry_boundary_index,
+            retry_recall.as_ref().map(|(index, _)| *index),
+        ),
     ] {
         let boundary_index = request
             .input()
@@ -266,6 +305,9 @@ async fn post_compact_recovery_retry_and_tool_continuation_reuse_byte_identical_
             })
             .expect("prompt should retain exact compaction boundary item");
         assert_eq!(recovery_index, boundary_index + 1);
+        if let Some(recall_index) = recall_index {
+            assert_eq!(recall_index, boundary_index + 2);
+        }
     }
 
     let application_items = items

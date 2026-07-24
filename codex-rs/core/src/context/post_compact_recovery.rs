@@ -7,6 +7,8 @@ use super::RecallContext;
 
 const OPEN_MARKER: &str = "<post_compact_recovery>";
 const CLOSE_MARKER: &str = "</post_compact_recovery>";
+const RECALL_OPEN_MARKER: &str = "<post_compact_recall>";
+const RECALL_CLOSE_MARKER: &str = "</post_compact_recall>";
 const MAX_PACKET_BYTES: usize = 40 * 1024;
 const MAX_PACKET_TOKENS: usize = 9_000;
 
@@ -23,6 +25,12 @@ pub(crate) enum PostCompactRecoveryContextError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PostCompactRecoveryContext {
     body: String,
+    recall: Option<PostCompactRecallContext>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PostCompactRecallContext {
+    body: String,
 }
 
 #[derive(Serialize)]
@@ -30,7 +38,6 @@ struct PostCompactRecoveryDocument<'a> {
     compaction_window_id: &'a str,
     boundary_item_id: &'a str,
     runtime_boundary: RuntimeBoundary,
-    recall: Value,
 }
 
 #[derive(Serialize)]
@@ -46,10 +53,8 @@ impl PostCompactRecoveryContext {
     pub(crate) fn new(
         compaction_window_id: &str,
         boundary_item_id: &str,
-        recall: &RecallContext,
+        recall: Option<&RecallContext>,
     ) -> Result<Self, PostCompactRecoveryContextError> {
-        let recall = serde_json::from_str(recall.json())
-            .map_err(PostCompactRecoveryContextError::RecallParse)?;
         let document = PostCompactRecoveryDocument {
             compaction_window_id,
             boundary_item_id,
@@ -60,18 +65,36 @@ impl PostCompactRecoveryContext {
                 prior_work: "do_not_restart",
                 mid_turn_continuation: "resume_interrupted_turn",
             },
-            recall,
         };
         let json = serde_json::to_string(&document)
             .map_err(PostCompactRecoveryContextError::Serialization)?;
         let body = format!("\n{}\n", escape_historical_delimiters(&json));
-        let rendered = format!("{OPEN_MARKER}{body}{CLOSE_MARKER}");
-        if rendered.len() > MAX_PACKET_BYTES
-            || approx_token_count(&rendered) > MAX_PACKET_TOKENS
-        {
+        let recall = recall.map(PostCompactRecallContext::new).transpose()?;
+        let context = Self { body, recall };
+        let mut rendered = context.render();
+        if let Some(recall) = context.recall.as_ref() {
+            rendered.push_str(&recall.render());
+        }
+        if rendered.len() > MAX_PACKET_BYTES || approx_token_count(&rendered) > MAX_PACKET_TOKENS {
             return Err(PostCompactRecoveryContextError::PacketCap);
         }
-        Ok(Self { body })
+        Ok(context)
+    }
+
+    pub(crate) fn recall(&self) -> Option<&PostCompactRecallContext> {
+        self.recall.as_ref()
+    }
+}
+
+impl PostCompactRecallContext {
+    fn new(recall: &RecallContext) -> Result<Self, PostCompactRecoveryContextError> {
+        let recall: Value = serde_json::from_str(recall.json())
+            .map_err(PostCompactRecoveryContextError::RecallParse)?;
+        let json = serde_json::to_string(&recall)
+            .map_err(PostCompactRecoveryContextError::Serialization)?;
+        Ok(Self {
+            body: format!("\n{}\n", escape_historical_delimiters(&json)),
+        })
     }
 }
 
@@ -86,6 +109,24 @@ impl ContextualUserFragment for PostCompactRecoveryContext {
 
     fn type_markers() -> (&'static str, &'static str) {
         (OPEN_MARKER, CLOSE_MARKER)
+    }
+
+    fn body(&self) -> String {
+        self.body.clone()
+    }
+}
+
+impl ContextualUserFragment for PostCompactRecallContext {
+    fn role(&self) -> &'static str {
+        "user"
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        Self::type_markers()
+    }
+
+    fn type_markers() -> (&'static str, &'static str) {
+        (RECALL_OPEN_MARKER, RECALL_CLOSE_MARKER)
     }
 
     fn body(&self) -> String {

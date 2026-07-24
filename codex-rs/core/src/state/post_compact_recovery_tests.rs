@@ -9,89 +9,55 @@ fn identity() -> PostCompactRecoveryIdentity {
 }
 
 #[test]
-fn non_successful_outcomes_are_not_application_candidates() {
-    for outcome in [
-        PostCompactRecoveryTurnOutcome::Aborted,
-        PostCompactRecoveryTurnOutcome::UnexpectedTaskError,
-        PostCompactRecoveryTurnOutcome::TerminalError,
+fn sampling_success_builds_application_without_clearing_pending_state() {
+    let identity = identity();
+    let state = PostCompactRecoveryRuntimeState::pending(identity.clone());
+
+    let application = state
+        .application_for_sampling_success(&identity, "turn_with_response")
+        .expect("matching sampling success");
+
+    assert_eq!(state.pending_identity(), Some(&identity));
+    assert_eq!(
+        application,
+        PostCompactRecoveryAppliedItem {
+            compaction_window_id: identity.compaction_window_id,
+            boundary_item_id: identity.boundary_item_id,
+            turn_id: "turn_with_response".to_string(),
+        }
+    );
+}
+
+#[test]
+fn sampling_success_rejects_mismatched_identity_or_empty_turn() {
+    let identity = identity();
+    let state = PostCompactRecoveryRuntimeState::pending(identity.clone());
+    let different_identity = PostCompactRecoveryIdentity {
+        compaction_window_id: identity.compaction_window_id.clone(),
+        boundary_item_id: "different-boundary".to_string(),
+    };
+
+    for result in [
+        state.application_for_sampling_success(&different_identity, "turn_with_response"),
+        state.application_for_sampling_success(&identity, ""),
     ] {
-        let identity = identity();
-        let mut state = PostCompactRecoveryRuntimeState::pending(identity.clone());
-        state
-            .record_sampling_success(&identity, "turn_with_response")
-            .expect("matching response proof");
-
-        let candidate = state
-            .application_candidate("turn_with_response", outcome)
-            .expect("non-successful turns should leave recovery pending");
-
-        assert_eq!(candidate, None);
-        assert_eq!(state.pending_identity(), Some(&identity));
+        assert_eq!(
+            result.expect_err("invalid sampling identity must fail"),
+            PostCompactRecoveryFailureClass::BoundaryMismatch
+        );
     }
 }
 
 #[test]
-fn successful_candidate_rejects_mismatched_turn_id() {
+fn matching_durable_application_clears_pending_state() {
     let identity = identity();
     let mut state = PostCompactRecoveryRuntimeState::pending(identity.clone());
-    state
-        .record_sampling_success(&identity, "turn_with_response")
-        .expect("matching response proof");
-
-    let failure = state
-        .application_candidate(
-            "different_turn",
-            PostCompactRecoveryTurnOutcome::Successful,
-        )
-        .expect_err("a different finalizing turn must not consume recovery");
-
-    assert_eq!(failure, PostCompactRecoveryFailureClass::BoundaryMismatch);
-    assert_eq!(state.pending_identity(), Some(&identity));
-}
-
-#[test]
-fn post_compact_recovery_application_candidate_does_not_clear_before_durability() {
-    let identity = identity();
-    let mut state = PostCompactRecoveryRuntimeState::pending(identity.clone());
-    state
-        .record_sampling_success(&identity, "turn_with_response")
-        .expect("matching response proof");
-
-    let candidate = state
-        .application_candidate(
-            "turn_with_response",
-            PostCompactRecoveryTurnOutcome::Successful,
-        )
-        .expect("matching application candidate")
-        .expect("successful inference should yield a candidate");
-
-    assert_eq!(state.pending_identity(), Some(&identity));
-    state.block(PostCompactRecoveryFailureClass::CanonicalPersistenceIndeterminate);
-    assert_eq!(
-        state.blocked_failure(),
-        Some(PostCompactRecoveryFailureClass::CanonicalPersistenceIndeterminate)
-    );
-    assert_eq!(candidate.compaction_window_id, identity.compaction_window_id);
-    assert_eq!(candidate.boundary_item_id, identity.boundary_item_id);
-}
-
-#[test]
-fn post_compact_recovery_matching_durable_application_clears_pending_state() {
-    let identity = identity();
-    let mut state = PostCompactRecoveryRuntimeState::pending(identity.clone());
-    state
-        .record_sampling_success(&identity, "turn_with_response")
-        .expect("matching response proof");
-    let candidate = state
-        .application_candidate(
-            "turn_with_response",
-            PostCompactRecoveryTurnOutcome::Successful,
-        )
-        .expect("matching application candidate")
-        .expect("successful inference should yield a candidate");
+    let application = state
+        .application_for_sampling_success(&identity, "turn_with_response")
+        .expect("matching sampling success");
 
     state
-        .clear_after_application(&candidate)
+        .clear_after_application(&application)
         .expect("durable matching application should clear recovery");
 
     assert_eq!(state, PostCompactRecoveryRuntimeState::Absent);

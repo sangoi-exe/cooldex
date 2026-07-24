@@ -119,11 +119,7 @@ fn latest_compaction_owns_recovery_after_multiple_windows() {
         Some(latest_boundary_id),
         Some(vec![boundary_item(latest_boundary_id)]),
     );
-    let state = reconstruct(&[
-        older,
-        application(WINDOW_ID, BOUNDARY_ID, TURN_ID),
-        latest,
-    ]);
+    let state = reconstruct(&[older, application(WINDOW_ID, BOUNDARY_ID, TURN_ID), latest]);
 
     assert_eq!(
         state
@@ -155,16 +151,13 @@ fn generic_turn_complete_without_application_does_not_consume() {
 }
 
 #[test]
-fn duplicate_or_mismatched_application_blocks() {
+fn duplicate_matching_application_is_idempotent_but_mismatch_blocks() {
     let duplicate = reconstruct(&[
         marked_compaction(),
         application(WINDOW_ID, BOUNDARY_ID, TURN_ID),
         application(WINDOW_ID, BOUNDARY_ID, TURN_ID),
     ]);
-    assert_eq!(
-        duplicate.blocked_failure(),
-        Some(PostCompactRecoveryFailureClass::MalformedApplicationProof)
-    );
+    assert_eq!(duplicate, PostCompactRecoveryRuntimeState::Absent);
 
     let mismatched = reconstruct(&[
         marked_compaction(),
@@ -188,10 +181,7 @@ fn duplicate_or_mismatched_application_blocks() {
     );
 
     let empty_turn_id = reconstruct_with_application_turn(
-        &[
-            marked_compaction(),
-            application(WINDOW_ID, BOUNDARY_ID, ""),
-        ],
+        &[marked_compaction(), application(WINDOW_ID, BOUNDARY_ID, "")],
         Some(""),
     );
     assert_eq!(
@@ -236,10 +226,7 @@ fn stable_pre_feature_compaction_is_repairable_but_ambiguous_legacy_is_not() {
     let duplicate_boundary = reconstruct(&[compaction(
         Some(WINDOW_ID),
         None,
-        Some(vec![
-            boundary_item(BOUNDARY_ID),
-            boundary_item(BOUNDARY_ID),
-        ]),
+        Some(vec![boundary_item(BOUNDARY_ID), boundary_item(BOUNDARY_ID)]),
     )]);
     assert_eq!(
         duplicate_boundary.blocked_failure(),

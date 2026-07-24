@@ -34,10 +34,7 @@ pub(super) fn reconstruct_post_compact_recovery(
             })
     else {
         return if replay.iter().any(|replay_item| {
-            matches!(
-                replay_item.item,
-                RolloutItem::PostCompactRecoveryApplied(_)
-            )
+            matches!(replay_item.item, RolloutItem::PostCompactRecoveryApplied(_))
         }) {
             PostCompactRecoveryRuntimeState::Blocked(
                 PostCompactRecoveryFailureClass::MalformedApplicationProof,
@@ -74,32 +71,38 @@ pub(super) fn reconstruct_post_compact_recovery(
             _ => None,
         })
         .collect::<Vec<_>>();
-    match applications.as_slice() {
-        [] => PostCompactRecoveryRuntimeState::pending(identity),
-        [(applied, containing_turn_id)] => {
-            if applied.compaction_window_id.is_empty()
-                || applied.boundary_item_id.is_empty()
-                || applied.turn_id.is_empty()
-                || containing_turn_id.is_none()
-                || *containing_turn_id != Some(applied.turn_id.as_str())
-            {
-                return PostCompactRecoveryRuntimeState::Blocked(
-                    PostCompactRecoveryFailureClass::MalformedApplicationProof,
-                );
-            }
-            if applied.compaction_window_id != identity.compaction_window_id
-                || applied.boundary_item_id != identity.boundary_item_id
-            {
-                return PostCompactRecoveryRuntimeState::Blocked(
-                    PostCompactRecoveryFailureClass::BoundaryMismatch,
-                );
-            }
-            PostCompactRecoveryRuntimeState::Absent
-        }
-        _ => PostCompactRecoveryRuntimeState::Blocked(
-            PostCompactRecoveryFailureClass::MalformedApplicationProof,
-        ),
+    if applications.is_empty() {
+        return PostCompactRecoveryRuntimeState::pending(identity);
     }
+    let (first_application, _) = applications[0];
+    for (applied, containing_turn_id) in applications {
+        if applied.compaction_window_id.is_empty()
+            || applied.boundary_item_id.is_empty()
+            || applied.turn_id.is_empty()
+            || containing_turn_id.is_none()
+            || containing_turn_id != Some(applied.turn_id.as_str())
+        {
+            return PostCompactRecoveryRuntimeState::Blocked(
+                PostCompactRecoveryFailureClass::MalformedApplicationProof,
+            );
+        }
+        if applied.compaction_window_id != identity.compaction_window_id
+            || applied.boundary_item_id != identity.boundary_item_id
+        {
+            return PostCompactRecoveryRuntimeState::Blocked(
+                PostCompactRecoveryFailureClass::BoundaryMismatch,
+            );
+        }
+        if applied.compaction_window_id != first_application.compaction_window_id
+            || applied.boundary_item_id != first_application.boundary_item_id
+            || applied.turn_id != first_application.turn_id
+        {
+            return PostCompactRecoveryRuntimeState::Blocked(
+                PostCompactRecoveryFailureClass::MalformedApplicationProof,
+            );
+        }
+    }
+    PostCompactRecoveryRuntimeState::Absent
 }
 
 fn identity_from_compaction(

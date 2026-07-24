@@ -183,16 +183,11 @@ fn scan_rollout_segment(
                 ));
             }
         };
+        let reached_start = scanner.reached_start();
         match line.item {
-            RolloutItem::SessionMeta(meta) => {
-                if session_meta.replace(meta).is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("duplicate session metadata in {}", path.display()),
-                    ));
-                }
-            }
-            _ if session_meta.is_some() => {
+            RolloutItem::SessionMeta(meta) if reached_start => session_meta = Some(meta),
+            RolloutItem::SessionMeta(_) => {}
+            _ if reached_start => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(

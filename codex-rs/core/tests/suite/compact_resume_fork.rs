@@ -101,9 +101,7 @@ fn normalize_compact_prompts(requests: &mut [Value]) {
     for request in requests {
         if let Some(input) = request.get_mut("input").and_then(Value::as_array_mut) {
             input.retain(|item| {
-                if item.get("type").and_then(Value::as_str) != Some("message")
-                    || item.get("role").and_then(Value::as_str) != Some("user")
-                {
+                if item.get("type").and_then(Value::as_str) != Some("message") {
                     return true;
                 }
                 let Some(content) = item.get("content").and_then(Value::as_array) else {
@@ -116,6 +114,15 @@ fn normalize_compact_prompts(requests: &mut [Value]) {
                     .get("text")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                if text.starts_with("<post_compact_recall>") {
+                    return false;
+                }
+                if item.get("role").and_then(Value::as_str) == Some("developer") {
+                    return !text.starts_with("<post_compact_recovery>");
+                }
+                if item.get("role").and_then(Value::as_str) != Some("user") {
+                    return true;
+                }
                 let normalized_text = normalize_line_endings_str(text);
                 !(text.is_empty() || normalized_text == normalized_summary_prompt)
             });
@@ -784,7 +791,7 @@ async fn user_turn(conversation: &Arc<CodexThread>, text: &str) {
         })
         .await
         .expect("submit user turn");
-    wait_for_event(conversation, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn_complete(conversation).await;
 }
 
 async fn compact_conversation(conversation: &Arc<CodexThread>) {
@@ -803,7 +810,18 @@ async fn compact_conversation(conversation: &Arc<CodexThread>) {
         panic!("expected warning event after compact");
     };
     assert_eq!(message, COMPACT_WARNING_MESSAGE);
-    wait_for_event(conversation, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_successful_turn_complete(conversation).await;
+}
+
+async fn wait_for_successful_turn_complete(conversation: &Arc<CodexThread>) {
+    let EventMsg::TurnComplete(completed) = wait_for_event(conversation, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await
+    else {
+        unreachable!("predicate guarantees a turn complete event");
+    };
+    assert_eq!(completed.error, None);
 }
 
 fn fetch_conversation_path(conversation: &Arc<CodexThread>) -> std::path::PathBuf {

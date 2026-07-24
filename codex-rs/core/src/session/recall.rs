@@ -67,6 +67,7 @@ struct RecallBoundary {
 #[derive(Clone, Copy, Serialize)]
 struct RecallSourceRead {
     reached_start: bool,
+    reached_recall_origin: bool,
     bytes_read: u64,
     records_read: usize,
     segments_read: usize,
@@ -85,6 +86,7 @@ struct RecallDocument<'a> {
     source: RecallSourceRead,
     truncated: bool,
     omitted_groups: usize,
+    excluded_native_continuity_pairs: usize,
     groups: &'a [RecallGroup],
 }
 
@@ -134,22 +136,24 @@ impl Session {
             });
         }
         let thread_id = self.thread_id.to_string();
-        let source = RecallSourceRead {
+        let mut source = RecallSourceRead {
             reached_start: tail.reached_start,
+            reached_recall_origin: false,
             bytes_read: tail.bytes_read,
             records_read: tail.records_read,
             segments_read: tail.segments_read,
         };
-        if !tail.reached_start {
-            return unavailable_context(&thread_id, RecallAvailability::WorkLimit, source)
-                .map_err(RecallContextError::from);
-        }
 
         let reconstruction = self
             .reconstruct_history_from_rollout(turn_context, tail.items.as_slice())
             .await;
         let Some(boundary_index) = reconstruction.latest_surviving_compaction_index else {
-            return unavailable_context(&thread_id, RecallAvailability::NoCompaction, source)
+            let availability = if tail.reached_start {
+                RecallAvailability::NoCompaction
+            } else {
+                RecallAvailability::WorkLimit
+            };
+            return unavailable_context(&thread_id, availability, source)
                 .map_err(RecallContextError::from);
         };
         let compacted = tail
@@ -166,23 +170,91 @@ impl Session {
             })
             .map_err(RecallContextError::from)?;
 
-        if compacted.replacement_history.is_none() && tail.segments_read != 1 {
-            return unavailable_context(
-                &thread_id,
-                RecallAvailability::UnsupportedLegacy,
-                source,
-            )
-            .map_err(RecallContextError::from);
-        }
-
         let prefix = self
             .reconstruct_history_from_rollout(turn_context, &tail.items[..boundary_index])
             .await;
+        source.reached_recall_origin = match compacted.previous_window_id.as_deref() {
+            None => tail.reached_start,
+            Some(expected_previous_window_id) => {
+                let previous_boundary_index = match prefix.latest_surviving_compaction_index {
+                    Some(previous_boundary_index) => previous_boundary_index,
+                    None if !tail.reached_start => {
+                        return unavailable_context(
+                            &thread_id,
+                            RecallAvailability::WorkLimit,
+                            source,
+                        )
+                        .map_err(RecallContextError::from);
+                    }
+                    None => {
+                        return Err(RecallContextError::Build(anyhow::anyhow!(
+                            "compaction window {} names missing predecessor {expected_previous_window_id}",
+                            compacted.window_id.as_deref().unwrap_or("<unknown>")
+                        )));
+                    }
+                };
+                let previous = tail.items[..boundary_index]
+                    .get(previous_boundary_index)
+                    .and_then(|item| match item {
+                        RolloutItem::Compacted(previous) => Some(previous),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "rollout reconstruction selected non-compaction predecessor index {previous_boundary_index}"
+                        )
+                    })
+                    .map_err(RecallContextError::from)?;
+                let actual_previous_window_id = previous.window_id.as_deref().ok_or_else(|| {
+                    RecallContextError::Build(anyhow::anyhow!(
+                        "compaction predecessor at index {previous_boundary_index} has no window id"
+                    ))
+                })?;
+                if actual_previous_window_id != expected_previous_window_id {
+                    return Err(RecallContextError::Build(anyhow::anyhow!(
+                        "compaction predecessor mismatch: expected {expected_previous_window_id}, found {actual_previous_window_id}"
+                    )));
+                }
+                true
+            }
+        };
+        if !source.reached_recall_origin {
+            return unavailable_context(&thread_id, RecallAvailability::WorkLimit, source)
+                .map_err(RecallContextError::from);
+        }
+
+        if compacted.replacement_history.is_none() && tail.segments_read != 1 {
+            return unavailable_context(&thread_id, RecallAvailability::UnsupportedLegacy, source)
+                .map_err(RecallContextError::from);
+        }
+
+        let native_continuity_pairs = compacted
+            .replacement_history
+            .as_deref()
+            .map(complete_native_continuity_pair_keys)
+            .unwrap_or_default();
+        let excluded_native_continuity_pairs = native_continuity_pairs.len();
+        let history = prefix
+            .history
+            .into_iter()
+            .filter(|item| {
+                call_pair_key(item)
+                    .or_else(|| output_pair_key(item))
+                    .is_none_or(|key| !native_continuity_pairs.contains(&key))
+            })
+            .collect();
         let (groups, incomplete_groups) =
-            group_history(prefix.history).map_err(RecallContextError::from)?;
+            group_history(history).map_err(RecallContextError::from)?;
         let boundary = recall_boundary(boundary_index, compacted);
-        available_context(&thread_id, source, &boundary, groups, incomplete_groups)
-            .map_err(RecallContextError::from)
+        available_context(
+            &thread_id,
+            source,
+            &boundary,
+            groups,
+            incomplete_groups,
+            excluded_native_continuity_pairs,
+        )
+        .map_err(RecallContextError::from)
     }
 }
 
@@ -213,6 +285,7 @@ fn unavailable_context(
         source,
         truncated: false,
         omitted_groups: 0,
+        excluded_native_continuity_pairs: 0,
         groups: &[],
     };
     Ok(RecallContext::new(serde_json::to_string(&document)?))
@@ -224,6 +297,7 @@ fn available_context(
     boundary: &RecallBoundary,
     groups: Vec<RecallGroup>,
     incomplete_groups: usize,
+    excluded_native_continuity_pairs: usize,
 ) -> anyhow::Result<RecallContext> {
     let mut selected_start = groups.len();
     let mut selected_count = 0_usize;
@@ -237,6 +311,7 @@ fn available_context(
             source,
             truncated: omitted_groups > 0,
             omitted_groups,
+            excluded_native_continuity_pairs,
             groups: &groups[proposed_start..],
         };
         let serialized = serde_json::to_string(&document)?;
@@ -257,6 +332,7 @@ fn available_context(
         source,
         truncated: omitted_groups > 0,
         omitted_groups,
+        excluded_native_continuity_pairs,
         groups: &groups[selected_start..],
     };
     let serialized = serde_json::to_string(&document)?;
@@ -266,6 +342,26 @@ fn available_context(
         anyhow::bail!("recall metadata exceeds its result limits");
     }
     Ok(RecallContext::new(serialized))
+}
+
+fn complete_native_continuity_pair_keys(items: &[ResponseItem]) -> HashSet<PairKey> {
+    let Some(compaction_index) = items
+        .iter()
+        .rposition(|item| matches!(item, ResponseItem::Compaction { .. }))
+    else {
+        return HashSet::new();
+    };
+    let mut calls = HashSet::new();
+    let mut outputs = HashSet::new();
+    for item in &items[compaction_index + 1..] {
+        if let Some(key) = call_pair_key(item) {
+            calls.insert(key);
+        }
+        if let Some(key) = output_pair_key(item) {
+            outputs.insert(key);
+        }
+    }
+    calls.intersection(&outputs).cloned().collect()
 }
 
 fn group_history(items: Vec<ResponseItem>) -> anyhow::Result<(Vec<RecallGroup>, usize)> {

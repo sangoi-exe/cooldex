@@ -77,7 +77,6 @@ use tracing::Span;
 use crate::connectors::AppInfo;
 use crate::rollout::recorder::RolloutRecorder;
 use crate::state::ActiveTurn;
-use crate::state::PostCompactRecoveryTurnOutcome;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
@@ -2931,18 +2930,22 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
     else {
         panic!("expected resumed rollout history");
     };
-    let persisted_compaction = resumed.history.iter().rev().find_map(|item| match item {
-        RolloutItem::Compacted(compacted) => Some(compacted),
-        RolloutItem::SessionMeta(_)
-        | RolloutItem::ResponseItem(_)
-        | RolloutItem::InterAgentCommunication(_)
-        | RolloutItem::InterAgentCommunicationMetadata { .. }
-        | RolloutItem::PostCompactRecoveryApplied(_)
-        | RolloutItem::TurnContext(_)
-        | RolloutItem::WorldState(_)
-        | RolloutItem::EventMsg(_) => None,
-    })
-    .expect("persisted compacted item");
+    let persisted_compaction = resumed
+        .history
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(compacted) => Some(compacted),
+            RolloutItem::SessionMeta(_)
+            | RolloutItem::ResponseItem(_)
+            | RolloutItem::InterAgentCommunication(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::PostCompactRecoveryApplied(_)
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::EventMsg(_) => None,
+        })
+        .expect("persisted compacted item");
     let persisted_replacement_history = persisted_compaction.replacement_history.as_ref();
     assert_eq!(
         persisted_replacement_history.map(Vec::as_slice),
@@ -3009,6 +3012,7 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
+        | RolloutItem::PostCompactRecoveryApplied(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
         | RolloutItem::EventMsg(_) => None,
@@ -9331,46 +9335,6 @@ impl SessionTask for CompletingTask {
     }
 }
 
-#[derive(Clone, Copy)]
-struct UnexpectedErrorAfterSamplingTask;
-
-impl SessionTask for UnexpectedErrorAfterSamplingTask {
-    fn kind(&self) -> TaskKind {
-        TaskKind::Regular
-    }
-
-    fn span_name(&self) -> &'static str {
-        "session_task.unexpected_error_after_sampling"
-    }
-
-    async fn run(
-        self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
-        ctx: Arc<TurnContext>,
-        _input: Vec<TurnInput>,
-        _cancellation_token: CancellationToken,
-    ) -> SessionTaskResult {
-        let session = session.clone_session();
-        let mut state = session.state.lock().await;
-        // The request loop owns this transition in production; this task isolates
-        // finalizer behavior after a completed recovery-bearing response.
-        let identity = state
-            .post_compact_recovery
-            .pending_identity()
-            .cloned()
-            .expect("test recovery should be pending");
-        state
-            .post_compact_recovery
-            .record_sampling_success(&identity, &ctx.sub_id)
-            .expect("sampling proof should match pending recovery");
-        drop(state);
-
-        Err(CodexErr::Fatal(
-            "injected unexpected task error after sampling".to_string(),
-        ))
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalEventKind {
     TurnComplete,
@@ -9457,9 +9421,7 @@ async fn recv_terminal_event(
     .expect("terminal event should be delivered")
 }
 
-async fn install_test_post_compact_recovery(
-    session: &Session,
-) -> PostCompactRecoveryIdentity {
+async fn install_test_post_compact_recovery(session: &Session) -> PostCompactRecoveryIdentity {
     let (window_number, window_ids) = session.prepare_auto_compact_window().await;
     session
         .replace_compacted_history(
@@ -9725,148 +9687,11 @@ async fn post_compact_recovery_successful_task_without_sampling_response_does_no
         .await
         .expect("load persisted history")
         .items;
-    assert!(!items
-        .iter()
-        .any(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_))));
-
-    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 3).await;
-    assert_eq!(3, calls.flush_thread);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn post_compact_recovery_unexpected_task_error_after_response_preserves_upstream_events_and_writes_no_application()
-{
-    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
-    let store = attach_in_memory_thread_store(
-        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
-    )
-    .await;
-    let identity = install_test_post_compact_recovery(session.as_ref()).await;
-
-    session
-        .spawn_task(
-            Arc::clone(&turn_context),
-            Vec::new(),
-            UnexpectedErrorAfterSamplingTask,
-        )
-        .await;
-
-    let mut saw_error = false;
-    let completed = timeout(Duration::from_secs(2), async {
-        loop {
-            match rx.recv().await.expect("event").msg {
-                EventMsg::Error(_) => saw_error = true,
-                EventMsg::TurnComplete(completed) => break completed,
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("unexpected task error should still complete the turn");
-
-    assert!(!saw_error, "upstream finalization should remain warning-only");
-    assert_eq!(completed.turn_id, turn_context.sub_id);
-    assert_eq!(completed.last_agent_message, None);
-    assert_eq!(completed.error, None);
-
-    let state = session.state.lock().await;
-    assert_eq!(
-        state.post_compact_recovery.pending_identity(),
-        Some(&identity)
-    );
-    assert_eq!(
-        state
-            .post_compact_recovery
-            .application_candidate(
-                &turn_context.sub_id,
-                PostCompactRecoveryTurnOutcome::Successful,
-            )
-            .expect("cleared proof should leave recovery pending"),
-        None
-    );
-    drop(state);
-
-    let items = session
-        .live_thread()
-        .expect("test live thread")
-        .load_history(/*include_archived*/ false)
-        .await
-        .expect("load persisted history")
-        .items;
-    assert!(items.iter().any(|item| matches!(
-        item,
-        RolloutItem::Compacted(compacted) if compacted.post_compact_recovery.is_some()
-    )));
-    assert!(!items
-        .iter()
-        .any(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_))));
-
-    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 3).await;
-    assert_eq!(3, calls.flush_thread);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn post_compact_recovery_finalizer_rejects_marker_turn_identity_mismatch() {
-    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
-    let store = attach_in_memory_thread_store(
-        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
-    )
-    .await;
-    let identity = install_test_post_compact_recovery(session.as_ref()).await;
-    session
-        .state
-        .lock()
-        .await
-        .post_compact_recovery
-        .record_sampling_success(&identity, "different-turn")
-        .expect("mismatched finalizer fixture should retain a valid sampling proof");
-
-    session
-        .spawn_task(Arc::clone(&turn_context), Vec::new(), CompletingTask)
-        .await;
-
-    let mut recovery_error = None;
-    let completed = timeout(Duration::from_secs(2), async {
-        loop {
-            match rx.recv().await.expect("event").msg {
-                EventMsg::Error(error) => recovery_error = Some(error),
-                EventMsg::TurnComplete(completed) => break completed,
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("identity mismatch should terminate the turn");
-
-    let recovery_error = recovery_error.expect("identity mismatch should emit one error");
     assert!(
-        recovery_error
-            .message
-            .contains("post-compact recovery application proof is invalid")
+        !items
+            .iter()
+            .any(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_)))
     );
-    assert_eq!(completed.turn_id, turn_context.sub_id);
-    assert_eq!(completed.last_agent_message, None);
-    assert!(completed.error.is_some());
-    assert_eq!(
-        session
-            .state
-            .lock()
-            .await
-            .post_compact_recovery
-            .blocked_failure(),
-        Some(PostCompactRecoveryFailureClass::BoundaryMismatch)
-    );
-
-    let items = session
-        .live_thread()
-        .expect("test live thread")
-        .load_history(/*include_archived*/ false)
-        .await
-        .expect("load persisted history")
-        .items;
-    assert!(!items
-        .iter()
-        .any(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_))));
 
     let calls = wait_for_flush_count(&store, /*expected_flushes*/ 3).await;
     assert_eq!(3, calls.flush_thread);

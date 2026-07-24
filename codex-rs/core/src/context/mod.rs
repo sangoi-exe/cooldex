@@ -65,6 +65,7 @@ pub use permissions_instructions::ApprovalPromptContext;
 pub use permissions_instructions::PermissionsInstructions;
 pub(crate) use personality_spec_instructions::PersonalitySpecInstructions;
 pub(crate) use plugin_instructions::PluginInstructions;
+pub(crate) use post_compact_recovery::PostCompactRecallContext;
 pub(crate) use post_compact_recovery::PostCompactRecoveryContext;
 pub(crate) use post_compact_recovery::PostCompactRecoveryContextError;
 pub(crate) use realtime_delegation::RealtimeDelegation;

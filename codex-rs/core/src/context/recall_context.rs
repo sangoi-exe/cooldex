@@ -1,6 +1,6 @@
 use super::ContextualUserFragment;
 
-/// One inert, bounded historical context result returned by the explicit `recall` tool.
+/// One bounded historical context result returned by the explicit `recall` tool.
 pub(crate) struct RecallContext {
     json: String,
 }

@@ -708,3 +708,62 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
     ];
     assert_eq!(refreshed, expected);
 }
+
+#[test]
+fn insert_initial_context_precedes_assistant_only_compacted_history() {
+    let assistant = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "assistant compact note".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let developer = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "fresh instructions".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let refreshed = insert_initial_context_before_last_real_user_or_summary(
+        vec![assistant.clone()],
+        vec![developer.clone()],
+    );
+
+    assert_eq!(refreshed, vec![developer, assistant]);
+}
+
+#[test]
+fn insert_initial_context_moves_to_front_when_assistant_precedes_user_anchor() {
+    let assistant = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "assistant compact note".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let user = user_message("retained user");
+    let developer = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "fresh instructions".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let refreshed = insert_initial_context_before_last_real_user_or_summary(
+        vec![assistant.clone(), user.clone()],
+        vec![developer.clone()],
+    );
+
+    assert_eq!(refreshed, vec![developer, assistant, user]);
+}

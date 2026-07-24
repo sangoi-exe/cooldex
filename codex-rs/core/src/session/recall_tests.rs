@@ -48,6 +48,25 @@ fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> R
     })
 }
 
+fn compacted_window(
+    message: &str,
+    replacement_history: Vec<ResponseItem>,
+    window_number: u64,
+    first_window_id: &str,
+    previous_window_id: Option<&str>,
+    window_id: &str,
+) -> RolloutItem {
+    RolloutItem::Compacted(CompactedItem {
+        message: message.to_string(),
+        replacement_history: Some(replacement_history),
+        window_number: Some(window_number),
+        first_window_id: Some(first_window_id.to_string()),
+        previous_window_id: previous_window_id.map(ToString::to_string),
+        window_id: Some(window_id.to_string()),
+        post_compact_recovery: None,
+    })
+}
+
 fn tail(thread_id: codex_protocol::ThreadId, items: Vec<RolloutItem>) -> StoredRolloutTail {
     StoredRolloutTail {
         thread_id,
@@ -234,6 +253,105 @@ async fn selects_the_latest_of_multiple_surviving_compactions() {
 }
 
 #[tokio::test]
+async fn bounded_tail_reaches_previous_compaction_without_reaching_session_start() {
+    const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
+    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
+    let (session, turn_context) = make_session_and_context().await;
+    let call = ResponseItem::FunctionCall {
+        id: None,
+        name: "shell".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: "continuity-call".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "continuity-call".to_string(),
+        output: FunctionCallOutputPayload::from_text("continuity output".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut stored_tail = tail(
+        session.thread_id,
+        vec![
+            compacted_window(
+                "first",
+                Vec::new(),
+                1,
+                FIRST_WINDOW_ID,
+                None,
+                FIRST_WINDOW_ID,
+            ),
+            RolloutItem::ResponseItem(message("assistant", "between compactions")),
+            RolloutItem::ResponseItem(call.clone()),
+            RolloutItem::ResponseItem(output.clone()),
+            compacted_window(
+                "latest",
+                vec![
+                    ResponseItem::Compaction {
+                        id: None,
+                        encrypted_content: "opaque".to_string(),
+                        internal_chat_message_metadata_passthrough: None,
+                    },
+                    call,
+                    output,
+                ],
+                2,
+                FIRST_WINDOW_ID,
+                Some(FIRST_WINDOW_ID),
+                CURRENT_WINDOW_ID,
+            ),
+        ],
+    );
+    stored_tail.reached_start = false;
+
+    let context = session
+        .build_recall_context(&turn_context, stored_tail)
+        .await
+        .expect("previous compaction should complete the bounded recall window");
+    let value = parsed(&context);
+
+    assert_eq!(value["availability"], "available");
+    assert_eq!(value["source"]["reached_start"], false);
+    assert_eq!(value["source"]["reached_recall_origin"], true);
+    assert_eq!(value["excluded_native_continuity_pairs"], 1);
+    assert_eq!(value["groups"].as_array().expect("groups").len(), 1);
+    assert_eq!(
+        value["groups"][0]["items"][0]["content"][0]["text"],
+        "between compactions"
+    );
+}
+
+#[tokio::test]
+async fn bounded_tail_without_named_previous_compaction_reports_work_limit() {
+    const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
+    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
+    let (session, turn_context) = make_session_and_context().await;
+    let mut stored_tail = tail(
+        session.thread_id,
+        vec![
+            RolloutItem::ResponseItem(message("assistant", "bounded suffix only")),
+            compacted_window(
+                "latest",
+                Vec::new(),
+                2,
+                FIRST_WINDOW_ID,
+                Some(FIRST_WINDOW_ID),
+                CURRENT_WINDOW_ID,
+            ),
+        ],
+    );
+    stored_tail.reached_start = false;
+
+    let context = session
+        .build_recall_context(&turn_context, stored_tail)
+        .await
+        .expect("bounded source should report its incomplete origin");
+
+    assert_eq!(parsed(&context)["availability"], "work_limit");
+}
+
+#[tokio::test]
 async fn reports_unavailable_source_and_missing_compaction() {
     let (session, turn_context) = make_session_and_context().await;
     let mut incomplete = tail(session.thread_id, Vec::new());
@@ -358,7 +476,7 @@ async fn post_compact_recovery_cross_thread_tail_is_rejected_before_sampling() {
     let other_thread = codex_protocol::ThreadId::new();
     assert_ne!(other_thread, session.thread_id);
 
-    let error = session
+    let result = session
         .build_recall_context(
             &turn_context,
             tail(
@@ -366,8 +484,10 @@ async fn post_compact_recovery_cross_thread_tail_is_rejected_before_sampling() {
                 vec![compacted("other thread summary", Some(Vec::new()))],
             ),
         )
-        .await
-        .expect_err("cross-thread bounded tail must be rejected");
+        .await;
+    let Err(error) = result else {
+        panic!("cross-thread bounded tail must be rejected");
+    };
 
     assert!(
         error.to_string().contains(&other_thread.to_string()),
@@ -393,14 +513,11 @@ async fn post_compact_recovery_raw_rollout_receipt_data_is_not_projected() {
                         message: RECEIPT_SENTINEL.to_string(),
                         codex_error_info: None,
                     })),
-                    RolloutItem::PostCompactRecoveryApplied(
-                        PostCompactRecoveryAppliedItem {
-                            compaction_window_id:
-                                "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),
-                            boundary_item_id: "msg_boundary".to_string(),
-                            turn_id: "turn_consuming".to_string(),
-                        },
-                    ),
+                    RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
+                        compaction_window_id: "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),
+                        boundary_item_id: "msg_boundary".to_string(),
+                        turn_id: "turn_consuming".to_string(),
+                    }),
                     RolloutItem::ResponseItem(message("assistant", "model-visible history")),
                     compacted("summary", Some(Vec::new())),
                 ],
