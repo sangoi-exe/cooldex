@@ -77,6 +77,7 @@ use tracing::Span;
 use crate::connectors::AppInfo;
 use crate::rollout::recorder::RolloutRecorder;
 use crate::state::ActiveTurn;
+use crate::state::PostCompactRecoveryTurnOutcome;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
@@ -1818,6 +1819,7 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
         first_window_id: Some(first_window_id.to_string()),
         previous_window_id: Some(previous_window_id.to_string()),
         window_id: Some(window_id.to_string()),
+        post_compact_recovery: None,
     })];
 
     let reconstructed = session
@@ -2910,7 +2912,8 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
 
     session
         .start_new_context_window(&step_context, world_state)
-        .await;
+        .await
+        .expect("new context window should persist");
 
     let live_history = session.clone_history().await;
     assert!(!live_history.raw_items().is_empty());
@@ -2928,19 +2931,34 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
     else {
         panic!("expected resumed rollout history");
     };
-    let persisted_replacement_history = resumed.history.iter().rev().find_map(|item| match item {
-        RolloutItem::Compacted(compacted) => compacted.replacement_history.as_ref(),
+    let persisted_compaction = resumed.history.iter().rev().find_map(|item| match item {
+        RolloutItem::Compacted(compacted) => Some(compacted),
         RolloutItem::SessionMeta(_)
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::PostCompactRecoveryApplied(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
         | RolloutItem::EventMsg(_) => None,
-    });
+    })
+    .expect("persisted compacted item");
+    let persisted_replacement_history = persisted_compaction.replacement_history.as_ref();
     assert_eq!(
         persisted_replacement_history.map(Vec::as_slice),
-        Some(live_history.raw_items())
+        Some(live_history.raw_items()),
+    );
+    assert_eq!(
+        persisted_compaction
+            .post_compact_recovery
+            .as_ref()
+            .expect("token-budget compaction recovery marker")
+            .boundary_item_id,
+        persisted_replacement_history
+            .and_then(|history| history.last())
+            .and_then(ResponseItem::id)
+            .expect("persisted replacement boundary")
+            .as_str(),
     );
 }
 
@@ -3549,6 +3567,7 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
             first_window_id: Some(first_window_id.to_string()),
             previous_window_id: Some(previous_window_id.to_string()),
             window_id: Some(compacted_window_id.to_string()),
+            post_compact_recovery: None,
         }),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: compact_turn_id,
@@ -9312,6 +9331,46 @@ impl SessionTask for CompletingTask {
     }
 }
 
+#[derive(Clone, Copy)]
+struct UnexpectedErrorAfterSamplingTask;
+
+impl SessionTask for UnexpectedErrorAfterSamplingTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.unexpected_error_after_sampling"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<SessionTaskContext>,
+        ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        let session = session.clone_session();
+        let mut state = session.state.lock().await;
+        // The request loop owns this transition in production; this task isolates
+        // finalizer behavior after a completed recovery-bearing response.
+        let identity = state
+            .post_compact_recovery
+            .pending_identity()
+            .cloned()
+            .expect("test recovery should be pending");
+        state
+            .post_compact_recovery
+            .record_sampling_success(&identity, &ctx.sub_id)
+            .expect("sampling proof should match pending recovery");
+        drop(state);
+
+        Err(CodexErr::Fatal(
+            "injected unexpected task error after sampling".to_string(),
+        ))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalEventKind {
     TurnComplete,
@@ -9396,6 +9455,42 @@ async fn recv_terminal_event(
     })
     .await
     .expect("terminal event should be delivered")
+}
+
+async fn install_test_post_compact_recovery(
+    session: &Session,
+) -> PostCompactRecoveryIdentity {
+    let (window_number, window_ids) = session.prepare_auto_compact_window().await;
+    session
+        .replace_compacted_history(
+            vec![ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "compacted recovery boundary".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }],
+            None,
+            None,
+            CompactedHistoryMetadata {
+                message: "compacted recovery boundary".to_string(),
+                window_number,
+                window_ids,
+            },
+        )
+        .await
+        .expect("install recovery-aware compacted history");
+
+    session
+        .state
+        .lock()
+        .await
+        .post_compact_recovery
+        .pending_identity()
+        .cloned()
+        .expect("compaction should install pending recovery")
 }
 
 #[derive(Clone, Copy)]
@@ -9581,6 +9676,145 @@ async fn turn_complete_flushes_terminal_event_after_delivery() {
     // 2. Terminal-event flush after TurnComplete is appended.
     let calls = wait_for_flush_count(&store, /*expected_flushes*/ 2).await;
     assert_eq!(2, calls.flush_thread);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_compact_recovery_unexpected_task_error_after_response_preserves_upstream_events_and_writes_no_application()
+{
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    let identity = install_test_post_compact_recovery(session.as_ref()).await;
+
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            UnexpectedErrorAfterSamplingTask,
+        )
+        .await;
+
+    let mut saw_error = false;
+    let completed = timeout(Duration::from_secs(2), async {
+        loop {
+            match rx.recv().await.expect("event").msg {
+                EventMsg::Error(_) => saw_error = true,
+                EventMsg::TurnComplete(completed) => break completed,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("unexpected task error should still complete the turn");
+
+    assert!(!saw_error, "upstream finalization should remain warning-only");
+    assert_eq!(completed.turn_id, turn_context.sub_id);
+    assert_eq!(completed.last_agent_message, None);
+    assert_eq!(completed.error, None);
+
+    let state = session.state.lock().await;
+    assert_eq!(
+        state.post_compact_recovery.pending_identity(),
+        Some(&identity)
+    );
+    assert_eq!(
+        state
+            .post_compact_recovery
+            .application_candidate(
+                &turn_context.sub_id,
+                PostCompactRecoveryTurnOutcome::Successful,
+            )
+            .expect("cleared proof should leave recovery pending"),
+        None
+    );
+    drop(state);
+
+    let items = session
+        .live_thread()
+        .expect("test live thread")
+        .load_history(/*include_archived*/ false)
+        .await
+        .expect("load persisted history")
+        .items;
+    assert!(items.iter().any(|item| matches!(
+        item,
+        RolloutItem::Compacted(compacted) if compacted.post_compact_recovery.is_some()
+    )));
+    assert!(!items
+        .iter()
+        .any(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_))));
+
+    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 3).await;
+    assert_eq!(3, calls.flush_thread);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_compact_recovery_finalizer_rejects_marker_turn_identity_mismatch() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let store = attach_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    let identity = install_test_post_compact_recovery(session.as_ref()).await;
+    session
+        .state
+        .lock()
+        .await
+        .post_compact_recovery
+        .record_sampling_success(&identity, "different-turn")
+        .expect("mismatched finalizer fixture should retain a valid sampling proof");
+
+    session
+        .spawn_task(Arc::clone(&turn_context), Vec::new(), CompletingTask)
+        .await;
+
+    let mut recovery_error = None;
+    let completed = timeout(Duration::from_secs(2), async {
+        loop {
+            match rx.recv().await.expect("event").msg {
+                EventMsg::Error(error) => recovery_error = Some(error),
+                EventMsg::TurnComplete(completed) => break completed,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("identity mismatch should terminate the turn");
+
+    let recovery_error = recovery_error.expect("identity mismatch should emit one error");
+    assert!(
+        recovery_error
+            .message
+            .contains("post-compact recovery application proof is invalid")
+    );
+    assert_eq!(completed.turn_id, turn_context.sub_id);
+    assert_eq!(completed.last_agent_message, None);
+    assert!(completed.error.is_some());
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .blocked_failure(),
+        Some(PostCompactRecoveryFailureClass::BoundaryMismatch)
+    );
+
+    let items = session
+        .live_thread()
+        .expect("test live thread")
+        .load_history(/*include_archived*/ false)
+        .await
+        .expect("load persisted history")
+        .items;
+    assert!(!items
+        .iter()
+        .any(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_))));
+
+    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 3).await;
+    assert_eq!(3, calls.flush_thread);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10692,7 +10926,14 @@ async fn sample_rollout(
     let user_messages1 = collect_user_messages(&snapshot1);
     let rebuilt1 = compact::build_compacted_history(Vec::new(), &user_messages1, summary1);
     live_history.replace(rebuilt1);
-    let (window_number, window_ids) = session.advance_auto_compact_window().await;
+    let (window_number, window_ids) = session.prepare_auto_compact_window().await;
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .install_auto_compact_window(window_number, window_ids)
+    );
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
         message: summary1.to_string(),
         replacement_history: None,
@@ -10700,6 +10941,7 @@ async fn sample_rollout(
         first_window_id: Some(window_ids.first_window_id.to_string()),
         previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
         window_id: Some(window_ids.window_id.to_string()),
+        post_compact_recovery: None,
     }));
 
     let user2 = ResponseItem::Message {
@@ -10739,7 +10981,14 @@ async fn sample_rollout(
     let user_messages2 = collect_user_messages(&snapshot2);
     let rebuilt2 = compact::build_compacted_history(Vec::new(), &user_messages2, summary2);
     live_history.replace(rebuilt2);
-    let (window_number, window_ids) = session.advance_auto_compact_window().await;
+    let (window_number, window_ids) = session.prepare_auto_compact_window().await;
+    assert!(
+        session
+            .state
+            .lock()
+            .await
+            .install_auto_compact_window(window_number, window_ids)
+    );
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
         message: summary2.to_string(),
         replacement_history: None,
@@ -10747,6 +10996,7 @@ async fn sample_rollout(
         first_window_id: Some(window_ids.first_window_id.to_string()),
         previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
         window_id: Some(window_ids.window_id.to_string()),
+        post_compact_recovery: None,
     }));
 
     let user3 = ResponseItem::Message {

@@ -159,6 +159,7 @@ fn ignores_legacy_abort_without_turn_id_and_context_only_records() {
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        post_compact_recovery: None,
     }));
 
     assert!(aborted.is_empty());

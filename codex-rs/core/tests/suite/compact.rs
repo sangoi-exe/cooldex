@@ -680,6 +680,17 @@ async fn summarize_context_three_requests_and_instructions() {
                 regular_turn_context_count += 1;
             }
             RolloutItem::Compacted(ci) if ci.message == expected_summary_message => {
+                let marker = ci
+                    .post_compact_recovery
+                    .as_ref()
+                    .expect("local compaction recovery marker");
+                let boundary = ci
+                    .replacement_history
+                    .as_ref()
+                    .and_then(|history| history.last())
+                    .and_then(ResponseItem::id)
+                    .expect("local compaction replacement boundary");
+                assert_eq!(marker.boundary_item_id, boundary.as_str());
                 saw_compacted_summary = true;
             }
             _ => {}

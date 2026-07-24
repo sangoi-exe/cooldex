@@ -792,6 +792,15 @@ fn replacement_history_from_rollout(path: &Path) -> Result<Value> {
             && compacted.message.is_empty()
             && let Some(items) = compacted.replacement_history
         {
+            let marker = compacted
+                .post_compact_recovery
+                .as_ref()
+                .expect("remote-v2 compaction recovery marker");
+            let boundary = items
+                .last()
+                .and_then(ResponseItem::id)
+                .expect("remote-v2 compaction replacement boundary");
+            assert_eq!(marker.boundary_item_id, boundary.as_str());
             let values = items
                 .into_iter()
                 .map(|item| serde_json::to_value(item).expect("serialize replacement item"))

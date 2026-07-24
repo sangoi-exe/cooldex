@@ -212,6 +212,7 @@ mod input_queue;
 mod mcp;
 mod mcp_runtime;
 pub(crate) mod multi_agents;
+mod post_compact_recovery;
 pub(crate) mod recall;
 mod review;
 mod rollout_budget;
@@ -318,6 +319,9 @@ use crate::skills::SkillLoadOutcome;
 use crate::state::AutoCompactWindowIds;
 use crate::state::AutoCompactWindowSnapshot;
 use crate::state::PendingRequestPermissions;
+use crate::state::PostCompactRecoveryFailureClass;
+use crate::state::PostCompactRecoveryIdentity;
+use crate::state::PostCompactRecoveryRuntimeState;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 #[cfg(test)]
@@ -367,6 +371,7 @@ use codex_protocol::protocol::ModelRerouteEvent;
 use codex_protocol::protocol::ModelRerouteReason;
 use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::ModelVerificationEvent;
+use codex_protocol::protocol::PostCompactRecoveryMarker;
 use codex_protocol::protocol::NetworkApprovalContext;
 use codex_protocol::protocol::NonSteerableTurnKind;
 use codex_protocol::protocol::Op;
@@ -1393,6 +1398,7 @@ impl Session {
             previous_window_id,
             window_id,
             latest_surviving_compaction_index: _,
+            post_compact_recovery,
         } = self
             .reconstruct_history_from_rollout(turn_context, rollout_items)
             .await;
@@ -1418,6 +1424,7 @@ impl Session {
                     window_id,
                 },
             );
+            state.post_compact_recovery = post_compact_recovery;
             state.set_previous_turn_settings(previous_turn_settings.clone());
         }
         let prefix_tokens = if matches!(
@@ -3097,8 +3104,29 @@ impl Session {
         reference_context_item: Option<TurnContextItem>,
         world_state_baseline: Option<Arc<WorldState>>,
         metadata: CompactedHistoryMetadata,
-    ) {
+    ) -> CodexResult<()> {
         let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
+        if items
+            .iter()
+            .any(|item| item.id().is_none_or(|id| id.is_empty()))
+        {
+            return Err(CodexErr::Fatal(
+                "compaction replacement history contains an item without a stable ID".to_string(),
+            ));
+        }
+        let boundary_item_id = items
+            .last()
+            .and_then(ResponseItem::id)
+            .map(ToString::to_string)
+            .ok_or_else(|| {
+                CodexErr::Fatal(
+                    "compaction replacement history has no stable boundary item".to_string(),
+                )
+            })?;
+        let recovery_identity = PostCompactRecoveryIdentity {
+            compaction_window_id: metadata.window_ids.window_id.to_string(),
+            boundary_item_id: boundary_item_id.clone(),
+        };
         let compacted_item = CompactedItem {
             message: metadata.message,
             replacement_history: Some(items.clone()),
@@ -3109,34 +3137,74 @@ impl Session {
                 .previous_window_id
                 .map(|id| id.to_string()),
             window_id: Some(metadata.window_ids.window_id.to_string()),
+            post_compact_recovery: Some(PostCompactRecoveryMarker { boundary_item_id }),
         };
-        // Compaction starts a new history window, so its WorldState baseline must be full.
-        let mut world_state_item = None;
+        let world_state_snapshot = world_state_baseline
+            .as_ref()
+            .map(|world_state| world_state.snapshot());
+        let mut rollout_items = Vec::with_capacity(3);
+        rollout_items.push(RolloutItem::Compacted(compacted_item));
+        if let Some(snapshot) = world_state_snapshot.as_ref() {
+            rollout_items.push(RolloutItem::WorldState(WorldStateItem::full(
+                snapshot.clone().into_value(),
+            )));
+        }
+        if let Some(turn_context_item) = reference_context_item.clone() {
+            rollout_items.push(RolloutItem::TurnContext(turn_context_item));
+        }
+
         {
-            let mut state = self.state.lock().await;
-            state.replace_history(items, reference_context_item.clone());
-            if let Some(world_state) = world_state_baseline {
-                let snapshot = world_state.snapshot();
-                world_state_item = Some(WorldStateItem::full(snapshot.clone().into_value()));
-                state.history.set_world_state_baseline(snapshot);
+            let state = self.state.lock().await;
+            if let Some(failure) = state.post_compact_recovery.blocked_failure() {
+                return Err(CodexErr::Fatal(format!(
+                    "post-compact recovery is blocked: {failure}"
+                )));
+            }
+            if !state.can_install_auto_compact_window(
+                metadata.window_number,
+                metadata.window_ids,
+            ) {
+                return Err(CodexErr::Fatal(
+                    "prepared auto-compact window no longer matches live session state".to_string(),
+                ));
             }
         }
 
-        self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-            .await;
-        // Persist the baseline after the replacement history that established it.
-        if let Some(world_state_item) = world_state_item {
-            self.persist_rollout_items(&[RolloutItem::WorldState(world_state_item)])
-                .await;
+        let live_thread = self
+            .live_thread_for_persistence("install compacted history")
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        if let Err(error) = live_thread.append_items_durably(&rollout_items).await {
+            let mut state = self.state.lock().await;
+            state.post_compact_recovery.block(
+                PostCompactRecoveryFailureClass::CanonicalPersistenceIndeterminate,
+            );
+            return Err(CodexErr::Fatal(format!(
+                "failed to durably install compacted history: {error}"
+            )));
         }
-        if let Some(turn_context_item) = reference_context_item {
-            self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item)])
-                .await;
-        }
+
         {
             let mut state = self.state.lock().await;
+            if !state.install_auto_compact_window(
+                metadata.window_number,
+                metadata.window_ids,
+            ) {
+                state.post_compact_recovery.block(
+                    PostCompactRecoveryFailureClass::CanonicalPersistenceIndeterminate,
+                );
+                return Err(CodexErr::Fatal(
+                    "durable compaction could not be installed into live session state".to_string(),
+                ));
+            }
+            state.replace_history(items, reference_context_item);
+            if let Some(snapshot) = world_state_snapshot {
+                state.history.set_world_state_baseline(snapshot);
+            }
+            state.post_compact_recovery =
+                PostCompactRecoveryRuntimeState::pending(recovery_identity);
             state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
         }
+        Ok(())
     }
 
     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
@@ -3266,16 +3334,35 @@ impl Session {
         world_state: &WorldState,
         mcp: &McpRuntimeSnapshot,
     ) -> Vec<ResponseItem> {
+        let auto_compact_window_ids = {
+            let state = self.state.lock().await;
+            state.auto_compact_window_ids()
+        };
+        self.build_initial_context_with_world_state_and_mcp_for_window(
+            turn_context,
+            world_state,
+            mcp,
+            auto_compact_window_ids,
+        )
+        .await
+    }
+
+    pub(crate) async fn build_initial_context_with_world_state_and_mcp_for_window(
+        &self,
+        turn_context: &TurnContext,
+        world_state: &WorldState,
+        mcp: &McpRuntimeSnapshot,
+        auto_compact_window_ids: AutoCompactWindowIds,
+    ) -> Vec<ResponseItem> {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
         let mut separate_developer_sections = Vec::<String>::new();
-        let (previous_turn_settings, base_instructions, session_source, auto_compact_window_ids) = {
+        let (previous_turn_settings, base_instructions, session_source) = {
             let state = self.state.lock().await;
             (
                 state.previous_turn_settings(),
                 state.session_configuration.base_instructions.clone(),
                 state.session_configuration.session_source.clone(),
-                state.auto_compact_window_ids(),
             )
         };
         if let Some(model_switch_message) =
@@ -3544,9 +3631,9 @@ impl Session {
         format!("{thread_id}:{window_number}")
     }
 
-    pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
-        let mut state = self.state.lock().await;
-        state.advance_auto_compact_window()
+    pub(crate) async fn prepare_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
+        let state = self.state.lock().await;
+        state.prepare_auto_compact_window()
     }
 
     pub(crate) async fn request_new_context_window(&self) {
@@ -3563,18 +3650,19 @@ impl Session {
         &self,
         step_context: &StepContext,
         world_state: Arc<WorldState>,
-    ) -> u64 {
+    ) -> CodexResult<u64> {
         let turn_context = step_context.turn.as_ref();
         let window = {
-            let mut state = self.state.lock().await;
-            state.start_new_context_window()
+            let state = self.state.lock().await;
+            state.prepare_auto_compact_window()
         };
         let (window_number, window_ids) = window;
         let context_items = self
-            .build_initial_context_with_world_state_and_mcp(
+            .build_initial_context_with_world_state_and_mcp_for_window(
                 turn_context,
                 world_state.as_ref(),
                 step_context.mcp.as_ref(),
+                window_ids,
             )
             .await;
         let turn_context_item = turn_context.to_turn_context_item();
@@ -3588,9 +3676,9 @@ impl Session {
                 window_ids,
             },
         )
-        .await;
+        .await?;
         self.recompute_token_usage(turn_context).await;
-        window_number
+        Ok(window_number)
     }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {

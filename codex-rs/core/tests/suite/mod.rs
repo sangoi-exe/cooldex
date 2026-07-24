@@ -100,6 +100,7 @@ mod pending_input;
 mod permissions_messages;
 mod personality;
 mod plugins;
+mod post_compact_recovery;
 mod prompt_cache_key;
 mod prompt_caching;
 mod prompt_debug_tests;

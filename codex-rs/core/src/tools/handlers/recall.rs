@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use codex_protocol::models::ResponseInputItem;
-use codex_thread_store::LoadRolloutTailParams;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolName;
@@ -12,8 +11,6 @@ use serde_json::Value as JsonValue;
 use crate::context::ContextualUserFragment;
 use crate::context::RecallContext;
 use crate::function_tool::FunctionCallError;
-use crate::session::recall::RECALL_SOURCE_MAX_BYTES;
-use crate::session::recall::RECALL_SOURCE_MAX_RECORDS;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -93,26 +90,8 @@ impl ToolExecutor<ToolInvocation> for RecallHandler {
                 }
             };
             let _: RecallArgs = parse_arguments(arguments.as_str())?;
-            session.flush_rollout().await.map_err(|err| {
-                FunctionCallError::Fatal(format!("failed to flush current rollout: {err}"))
-            })?;
-            let tail = session
-                .services
-                .thread_store
-                .load_rollout_tail(LoadRolloutTailParams {
-                    thread_id: session.thread_id,
-                    include_archived: true,
-                    max_bytes: RECALL_SOURCE_MAX_BYTES,
-                    max_records: RECALL_SOURCE_MAX_RECORDS,
-                })
-                .await
-                .map_err(|err| {
-                    FunctionCallError::Fatal(format!(
-                        "failed to read bounded current-thread rollout: {err}"
-                    ))
-                })?;
             let context = session
-                .build_recall_context(turn.as_ref(), tail)
+                .load_current_thread_recall_context(turn.as_ref())
                 .await
                 .map_err(|err| {
                     FunctionCallError::Fatal(format!("failed to build recall result: {err:#}"))

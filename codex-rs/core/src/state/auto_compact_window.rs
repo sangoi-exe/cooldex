@@ -74,14 +74,44 @@ impl AutoCompactWindow {
         self.ids = ids;
     }
 
-    pub(super) fn advance(&mut self) -> (u64, AutoCompactWindowIds) {
-        self.window_number = self.window_number.saturating_add(1);
-        self.ids.previous_window_id = Some(self.ids.window_id);
-        self.ids.window_id = Uuid::now_v7();
+    pub(super) fn prepare_advance(&self) -> (u64, AutoCompactWindowIds) {
+        (
+            self.window_number.saturating_add(1),
+            AutoCompactWindowIds {
+                first_window_id: self.ids.first_window_id,
+                previous_window_id: Some(self.ids.window_id),
+                window_id: Uuid::now_v7(),
+            },
+        )
+    }
+
+    pub(super) fn can_install_prepared_advance(
+        &self,
+        window_number: u64,
+        ids: AutoCompactWindowIds,
+    ) -> bool {
+        window_number == self.window_number.saturating_add(1)
+            && ids.first_window_id == self.ids.first_window_id
+            && ids.previous_window_id == Some(self.ids.window_id)
+            && ids.window_id != self.ids.window_id
+            && ids.window_id.get_version_num() == 7
+    }
+
+    pub(super) fn install_prepared_advance(
+        &mut self,
+        window_number: u64,
+        ids: AutoCompactWindowIds,
+    ) -> bool {
+        if !self.can_install_prepared_advance(window_number, ids) {
+            return false;
+        }
+        self.window_number = window_number;
+        self.ids = ids;
         self.new_context_window_requested = false;
+        self.prefill_input_tokens = None;
         self.token_budget_reminder_delivered = false;
         self.auto_compact_fallback_delivered = false;
-        (self.window_number, self.ids)
+        true
     }
 
     pub(super) fn claim_token_budget_reminder(&mut self) -> bool {
@@ -182,7 +212,9 @@ mod tests {
         assert!(window.take_new_context_window_request());
         assert!(!window.take_new_context_window_request());
         window.request_new_context_window();
-        let (window_number, ids) = window.advance();
+        let (window_number, ids) = window.prepare_advance();
+        assert!(window.can_install_prepared_advance(window_number, ids));
+        assert!(window.install_prepared_advance(window_number, ids));
         assert_eq!(window_number, 4);
         assert_eq!(window.window_number(), 4);
         assert_eq!(window.ids(), ids);

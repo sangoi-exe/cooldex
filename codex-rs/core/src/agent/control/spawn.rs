@@ -3,6 +3,7 @@ use super::*;
 use crate::CodexThread;
 use crate::agent::AgentIdentitySnapshot;
 use codex_extension_api::ExtensionDataInit;
+use std::collections::HashSet;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
 
@@ -76,8 +77,46 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
         // from the parent's durable baseline. Truncated forks drop part of that prompt,
         // so they must rebuild context on their first child turn.
         RolloutItem::TurnContext(_) | RolloutItem::WorldState(_) => preserve_reference_context_item,
-        RolloutItem::Compacted(_) | RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => true,
+        RolloutItem::Compacted(_)
+        | RolloutItem::PostCompactRecoveryApplied(_)
+        | RolloutItem::EventMsg(_)
+        | RolloutItem::SessionMeta(_) => true,
     }
+}
+
+pub(super) fn drop_unowned_recovery_applications(items: &mut Vec<RolloutItem>) {
+    let owned_recovery_identities = items
+        .iter()
+        .filter_map(|item| {
+            let RolloutItem::Compacted(compacted) = item else {
+                return None;
+            };
+            let compaction_window_id = compacted.window_id.as_ref()?;
+            let boundary_item_id = compacted
+                .post_compact_recovery
+                .as_ref()
+                .map(|marker| marker.boundary_item_id.as_str())
+                .or_else(|| {
+                    compacted
+                        .replacement_history
+                        .as_ref()?
+                        .last()?
+                        .id()
+                        .map(|item_id| item_id.as_str())
+                })?;
+            Some((
+                compaction_window_id.clone(),
+                boundary_item_id.to_string(),
+            ))
+        })
+        .collect::<HashSet<_>>();
+    items.retain(|item| match item {
+        RolloutItem::PostCompactRecoveryApplied(applied) => owned_recovery_identities.contains(&(
+            applied.compaction_window_id.clone(),
+            applied.boundary_item_id.clone(),
+        )),
+        _ => true,
+    });
 }
 
 fn is_multi_agent_v2_usage_hint_message(item: &ResponseItem, usage_hint_texts: &[String]) -> bool {
@@ -671,6 +710,9 @@ impl AgentControl {
                         )
                 )
         });
+        if !preserve_reference_context_item {
+            drop_unowned_recovery_applications(&mut forked_rollout_items);
+        }
         if destination_history_mode == Some(ThreadHistoryMode::Paginated) {
             forked_rollout_items.retain(|item| {
                 !matches!(

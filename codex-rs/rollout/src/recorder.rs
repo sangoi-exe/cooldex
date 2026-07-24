@@ -2000,6 +2000,7 @@ async fn resume_candidate_matches_cwd(
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)
+            | RolloutItem::PostCompactRecoveryApplied(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::EventMsg(_) => None,
         })

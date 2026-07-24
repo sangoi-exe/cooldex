@@ -42,6 +42,7 @@ use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::McpRuntimeSnapshot;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
+use crate::session::post_compact_recovery::PreparedPostCompactRecovery;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
@@ -1162,6 +1163,20 @@ pub(crate) fn build_prompt(
     }
 }
 
+struct PreparedSamplingPrompt {
+    prompt: Prompt,
+    post_compact_recovery: Option<PreparedPostCompactRecovery>,
+}
+
+impl PreparedSamplingPrompt {
+    fn into_original_input(mut self) -> CodexResult<Vec<ResponseItem>> {
+        if let Some(recovery) = self.post_compact_recovery {
+            recovery.remove_from_input(&mut self.prompt.input)?;
+        }
+        Ok(self.prompt.input)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(deprecated)]
 #[instrument(level = "trace",
@@ -1204,20 +1219,26 @@ async fn run_sampling_request(
     let mut initial_input = Some(input);
     let mut original_input = None;
     loop {
-        let prompt_input = if let Some(input) = initial_input.take() {
+        let mut prompt_input = if let Some(input) = initial_input.take() {
             input
         } else {
             sess.clone_history()
                 .await
                 .for_prompt(&turn_context.model_info.input_modalities)
         };
-        let prompt = build_prompt(
-            prompt_input,
-            router.as_ref(),
-            turn_context.as_ref(),
-            base_instructions.clone(),
-        );
-        let err = match try_run_sampling_request(
+        let post_compact_recovery = sess
+            .prepare_post_compact_recovery(turn_context.as_ref(), &mut prompt_input)
+            .await?;
+        let prepared_prompt = PreparedSamplingPrompt {
+            prompt: build_prompt(
+                prompt_input,
+                router.as_ref(),
+                turn_context.as_ref(),
+                base_instructions.clone(),
+            ),
+            post_compact_recovery,
+        };
+        let sampling_result = try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
             Arc::clone(&turn_context),
@@ -1225,13 +1246,21 @@ async fn run_sampling_request(
             client_session,
             responses_metadata,
             Arc::clone(&turn_diff_tracker),
-            &prompt,
+            &prepared_prompt.prompt,
             cancellation_token.child_token(),
         )
-        .await
-        {
+        .await;
+        let err = match sampling_result {
             Ok(output) => {
-                return Ok((output, original_input.unwrap_or(prompt.input)));
+                if let Some(recovery) = prepared_prompt.post_compact_recovery.as_ref() {
+                    sess.record_post_compact_recovery_sampling_success(
+                        recovery.identity(),
+                        &turn_context.sub_id,
+                    )
+                    .await?;
+                }
+                let attempt_input = prepared_prompt.into_original_input()?;
+                return Ok((output, original_input.unwrap_or(attempt_input)));
             }
             Err(CodexErr::ContextWindowExceeded) => {
                 sess.set_total_tokens_full(&turn_context).await;
@@ -1248,7 +1277,7 @@ async fn run_sampling_request(
         };
 
         if original_input.is_none() {
-            original_input = Some(prompt.input);
+            original_input = Some(prepared_prompt.into_original_input()?);
         }
 
         if !err.is_retryable() {

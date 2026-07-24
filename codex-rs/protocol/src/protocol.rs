@@ -3016,6 +3016,7 @@ fn multi_agent_version_from_items(
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)
+            | RolloutItem::PostCompactRecoveryApplied(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::EventMsg(_) => None,
         })
@@ -3198,6 +3199,7 @@ pub enum RolloutItem {
         trigger_turn: bool,
     },
     Compacted(CompactedItem),
+    PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem),
     TurnContext(TurnContextItem),
     WorldState(WorldStateItem),
     EventMsg(EventMsg),
@@ -3238,6 +3240,21 @@ pub struct CompactedItem {
     /// UUIDv7 identity of this context window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_id: Option<String>,
+    /// Boundary identity required to restore the live continuation after compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_compact_recovery: Option<PostCompactRecoveryMarker>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct PostCompactRecoveryMarker {
+    pub boundary_item_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct PostCompactRecoveryAppliedItem {
+    pub compaction_window_id: String,
+    pub boundary_item_id: String,
+    pub turn_id: String,
 }
 
 impl From<CompactedItem> for ResponseItem {

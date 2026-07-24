@@ -19,11 +19,13 @@ async fn process_compacted_history_with_test_session(
     let step_context =
         crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
     let world_state = Arc::new(session.build_world_state_for_step(&step_context).await);
+    let (_, window_ids) = session.prepare_auto_compact_window().await;
     let initial_context = session
-        .build_initial_context_with_world_state_and_mcp(
+        .build_initial_context_with_world_state_and_mcp_for_window(
             &turn_context,
             world_state.as_ref(),
             step_context.mcp.as_ref(),
+            window_ids,
         )
         .await;
     let initial_context_injection = InitialContextInjection::BeforeLastUserMessage {
@@ -34,6 +36,7 @@ async fn process_compacted_history_with_test_session(
         &session,
         compacted_history,
         &initial_context_injection,
+        window_ids,
     )
     .await;
     (refreshed, initial_context)

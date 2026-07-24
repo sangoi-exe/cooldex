@@ -54,6 +54,7 @@ mod tests {
     use super::*;
     use crate::ListItemsParams;
     use crate::ListTurnsParams;
+    use crate::LiveThread;
     use crate::SortDirection;
     use crate::StoredTurnItemsView;
     use crate::ThreadPersistenceMetadata;
@@ -368,6 +369,7 @@ mod tests {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            post_compact_recovery: None,
         });
         let second = RolloutItem::Compacted(CompactedItem {
             message: "second".to_string(),
@@ -376,6 +378,7 @@ mod tests {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            post_compact_recovery: None,
         });
         store
             .append_items(AppendThreadItemsParams {
@@ -418,6 +421,131 @@ mod tests {
         assert!(!limited.reached_start);
         assert_eq!(limited.records_read, 1);
         assert_eq!(limited.segments_read, 1);
+    }
+
+    #[tokio::test]
+    async fn durable_append_does_not_promote_metadata_projection_failure() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let thread_id = ThreadId::default();
+        let thread_store: Arc<dyn ThreadStore> = store.clone();
+        let live_thread = LiveThread::create(
+            thread_store,
+            create_thread_params(thread_id, ThreadHistoryMode::Legacy),
+        )
+        .await
+        .expect("create live thread");
+        store.state.lock().await.fail_update_thread_metadata = true;
+        let item = RolloutItem::Compacted(CompactedItem {
+            message: "durable despite metadata failure".to_string(),
+            replacement_history: Some(Vec::new()),
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+            post_compact_recovery: None,
+        });
+
+        live_thread
+            .append_items_durably(std::slice::from_ref(&item))
+            .await
+            .expect("canonical append and flush should remain successful");
+
+        assert_eq!(
+            store.calls().await,
+            InMemoryThreadStoreCalls {
+                create_thread: 1,
+                append_items: 1,
+                flush_thread: 1,
+                update_thread_metadata: 1,
+                ..Default::default()
+            }
+        );
+        let history = store
+            .load_history(LoadThreadHistoryParams {
+                thread_id,
+                include_archived: true,
+            })
+            .await
+            .expect("canonical history remains readable");
+        assert_eq!(
+            serde_json::to_value(history.items.last()).expect("serialize stored item"),
+            serde_json::to_value(Some(&item)).expect("serialize expected item")
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_append_failure_never_attempts_flush() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let thread_id = ThreadId::default();
+        let thread_store: Arc<dyn ThreadStore> = store.clone();
+        let live_thread = LiveThread::create(
+            thread_store,
+            create_thread_params(thread_id, ThreadHistoryMode::Legacy),
+        )
+        .await
+        .expect("create live thread");
+        store.state.lock().await.fail_append_items = true;
+        let item = RolloutItem::Compacted(CompactedItem {
+            message: "must not become visible".to_string(),
+            replacement_history: Some(Vec::new()),
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+            post_compact_recovery: None,
+        });
+
+        live_thread
+            .append_items_durably(&[item])
+            .await
+            .expect_err("injected canonical append failure must propagate");
+
+        assert_eq!(
+            store.calls().await,
+            InMemoryThreadStoreCalls {
+                create_thread: 1,
+                append_items: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_flush_failure_never_projects_metadata() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let thread_id = ThreadId::default();
+        let thread_store: Arc<dyn ThreadStore> = store.clone();
+        let live_thread = LiveThread::create(
+            thread_store,
+            create_thread_params(thread_id, ThreadHistoryMode::Legacy),
+        )
+        .await
+        .expect("create live thread");
+        store.state.lock().await.fail_flush_thread = true;
+        let item = RolloutItem::Compacted(CompactedItem {
+            message: "flush must fail before metadata projection".to_string(),
+            replacement_history: Some(Vec::new()),
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+            post_compact_recovery: None,
+        });
+
+        live_thread
+            .append_items_durably(&[item])
+            .await
+            .expect_err("injected canonical flush failure must propagate");
+
+        assert_eq!(
+            store.calls().await,
+            InMemoryThreadStoreCalls {
+                create_thread: 1,
+                append_items: 1,
+                flush_thread: 1,
+                ..Default::default()
+            }
+        );
     }
 
     fn create_thread_params(
@@ -510,6 +638,12 @@ struct InMemoryThreadStoreState {
     metadata_updates: HashMap<ThreadId, ThreadMetadataPatch>,
     names: HashMap<ThreadId, Option<String>>,
     rollout_paths: HashMap<PathBuf, ThreadId>,
+    #[cfg(test)]
+    fail_update_thread_metadata: bool,
+    #[cfg(test)]
+    fail_append_items: bool,
+    #[cfg(test)]
+    fail_flush_thread: bool,
 }
 
 impl InMemoryThreadStore {
@@ -601,6 +735,12 @@ impl InMemoryThreadStore {
             return Ok(());
         }
         state.calls.append_items += 1;
+        #[cfg(test)]
+        if state.fail_append_items {
+            return Err(ThreadStoreError::Internal {
+                message: "injected canonical append failure".to_string(),
+            });
+        }
         state
             .histories
             .entry(params.thread_id)
@@ -759,6 +899,12 @@ impl InMemoryThreadStore {
     ) -> ThreadStoreResult<StoredThread> {
         let mut state = self.state.lock().await;
         state.calls.update_thread_metadata += 1;
+        #[cfg(test)]
+        if state.fail_update_thread_metadata {
+            return Err(ThreadStoreError::Internal {
+                message: "injected metadata projection failure".to_string(),
+            });
+        }
         if let Some(name) = params.patch.name.clone() {
             state.names.insert(params.thread_id, name);
         }
@@ -816,7 +962,14 @@ impl ThreadStore for InMemoryThreadStore {
 
     fn flush_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            self.state.lock().await.calls.flush_thread += 1;
+            let mut state = self.state.lock().await;
+            state.calls.flush_thread += 1;
+            #[cfg(test)]
+            if state.fail_flush_thread {
+                return Err(ThreadStoreError::Internal {
+                    message: "injected canonical flush failure".to_string(),
+                });
+            }
             Ok(())
         })
     }

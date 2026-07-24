@@ -3,12 +3,15 @@ use super::*;
 use super::tests::build_world_state_from_turn_context;
 use super::tests::make_session_and_context;
 use codex_protocol::AgentPath;
+use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::PostCompactRecoveryAppliedItem;
+use codex_protocol::protocol::PostCompactRecoveryMarker;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
@@ -18,6 +21,8 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::path::PathBuf;
 use uuid::Uuid;
+
+use crate::state::PostCompactRecoveryRuntimeState;
 
 fn user_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
@@ -170,6 +175,170 @@ async fn record_initial_history_restores_world_state_baseline() {
     assert_eq!(
         session.clone_history().await.raw_items(),
         expected_history.as_slice(),
+    );
+}
+
+#[tokio::test]
+async fn record_initial_history_restores_pending_post_compact_recovery() {
+    let (session, turn_context) = make_session_and_context().await;
+    let compaction_window_id = Uuid::now_v7().to_string();
+    let boundary_item_id = "msg_resume_recovery_boundary";
+    let replacement_history = vec![ResponseItem::Message {
+        id: Some(ResponseItemId::from_server(boundary_item_id.to_string())),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "retained resume context".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let rollout_items = completed_user_turn_rollout(
+        turn_context.to_turn_context_item(),
+        vec![RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: Some(replacement_history.clone()),
+            window_number: Some(1),
+            first_window_id: Some(compaction_window_id.clone()),
+            previous_window_id: None,
+            window_id: Some(compaction_window_id.clone()),
+            post_compact_recovery: Some(PostCompactRecoveryMarker {
+                boundary_item_id: boundary_item_id.to_string(),
+            }),
+        })],
+    );
+
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: session.thread_id,
+            history: Arc::new(rollout_items),
+            rollout_path: Some(PathBuf::from("/tmp/post-compact-recovery-resume.jsonl")),
+        }))
+        .await;
+
+    assert_eq!(
+        session.clone_history().await.raw_items(),
+        replacement_history.as_slice()
+    );
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .pending_identity()
+            .expect("resume should restore pending recovery"),
+        &PostCompactRecoveryIdentity {
+            compaction_window_id,
+            boundary_item_id: boundary_item_id.to_string(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn post_compact_recovery_rollback_of_consuming_turn_restores_pending() {
+    let (session, turn_context) = make_session_and_context().await;
+    let compaction_window_id = Uuid::now_v7().to_string();
+    let boundary_item_id = "msg_compaction_boundary";
+    let consuming_turn_id = "turn-consuming-recovery";
+    let replacement_history = vec![ResponseItem::Message {
+        id: Some(ResponseItemId::from_server(boundary_item_id.to_string())),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "retained historical message".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let mut rollout_items = vec![
+        RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: Some(replacement_history),
+            window_number: Some(1),
+            first_window_id: Some(compaction_window_id.clone()),
+            previous_window_id: None,
+            window_id: Some(compaction_window_id.clone()),
+            post_compact_recovery: Some(PostCompactRecoveryMarker {
+                boundary_item_id: boundary_item_id.to_string(),
+            }),
+        }),
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: consuming_turn_id.to_string(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                client_id: None,
+                message: "live continuation".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+                ..Default::default()
+            },
+        )),
+        RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
+            compaction_window_id: compaction_window_id.clone(),
+            boundary_item_id: boundary_item_id.to_string(),
+            turn_id: consuming_turn_id.to_string(),
+        }),
+    ];
+
+    let consumed_without_turn_complete = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+    assert_eq!(
+        consumed_without_turn_complete.post_compact_recovery,
+        PostCompactRecoveryRuntimeState::Absent,
+        "a durable application proof remains authoritative across a crash before TurnComplete"
+    );
+
+    rollout_items.push(
+        RolloutItem::EventMsg(EventMsg::TurnComplete(
+            codex_protocol::protocol::TurnCompleteEvent {
+                turn_id: consuming_turn_id.to_string(),
+                last_agent_message: None,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            },
+        )),
+    );
+
+    let consumed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+    assert_eq!(
+        consumed.post_compact_recovery,
+        PostCompactRecoveryRuntimeState::Absent
+    );
+
+    rollout_items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+        codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+    )));
+    let restored = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+    assert_eq!(
+        restored
+            .post_compact_recovery
+            .pending_identity()
+            .expect("rolled-back consuming turn should restore pending recovery")
+            .compaction_window_id,
+        compaction_window_id
+    );
+    assert_eq!(
+        restored
+            .post_compact_recovery
+            .pending_identity()
+            .expect("rolled-back consuming turn should restore pending recovery")
+            .boundary_item_id,
+        boundary_item_id
     );
 }
 
@@ -969,6 +1138,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            post_compact_recovery: None,
         }),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
             codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
@@ -996,6 +1166,10 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
             .expect("serialize seeded reference context item"),
         serde_json::to_value(Some(previous_context_item))
             .expect("serialize expected reference context item")
+    );
+    assert_eq!(
+        session.state.lock().await.post_compact_recovery,
+        PostCompactRecoveryRuntimeState::Absent
     );
 }
 
@@ -1029,6 +1203,7 @@ async fn record_initial_history_resumed_does_not_seed_reference_context_item_aft
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            post_compact_recovery: None,
         }),
     ];
 
@@ -1098,6 +1273,7 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
             first_window_id: Some(compacted_first_window_id.to_string()),
             previous_window_id: Some(compacted_previous_window_id.to_string()),
             window_id: Some(compacted_window_id.to_string()),
+            post_compact_recovery: None,
         }),
     ];
 
@@ -1133,6 +1309,7 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                post_compact_recovery: None,
             }),
             RolloutItem::WorldState(WorldStateItem::full(json!({
                 "environment": {"status": "starting", "cwd": "/workspace"}
@@ -1180,6 +1357,7 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            post_compact_recovery: None,
         }),
     ];
 
@@ -1207,6 +1385,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            post_compact_recovery: None,
         }),
     ];
 
@@ -1242,6 +1421,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            post_compact_recovery: None,
         }),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
@@ -1343,6 +1523,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            post_compact_recovery: None,
         }),
         RolloutItem::TurnContext(previous_context_item),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
@@ -1505,6 +1686,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            post_compact_recovery: None,
         }),
     ];
 
@@ -1753,6 +1935,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            post_compact_recovery: None,
         }),
     ];
 
@@ -1924,6 +2107,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            post_compact_recovery: None,
         }),
         // A newer TurnStarted replaces the incomplete compacted turn without a matching
         // completion/abort for the old one.

@@ -4,6 +4,11 @@ use crate::context_manager::is_user_turn_boundary;
 use codex_protocol::protocol::SessionContextWindow;
 use uuid::Uuid;
 
+mod post_compact_recovery;
+
+use post_compact_recovery::PostCompactRecoveryReplayItem;
+use post_compact_recovery::reconstruct_post_compact_recovery;
+
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
 // the resume/fork hydration metadata derived from the same replay.
 #[derive(Debug)]
@@ -17,6 +22,7 @@ pub(super) struct RolloutReconstruction {
     pub(super) previous_window_id: Option<Uuid>,
     pub(super) window_id: Option<Uuid>,
     pub(super) latest_surviving_compaction_index: Option<usize>,
+    pub(super) post_compact_recovery: crate::state::PostCompactRecoveryRuntimeState,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -53,6 +59,7 @@ struct ActiveReplaySegment<'a> {
     base_replacement_history: Option<&'a [ResponseItem]>,
     window: Option<ReconstructedWindow>,
     latest_compaction_index: Option<usize>,
+    post_compact_recovery_replay: Vec<&'a RolloutItem>,
 }
 
 #[derive(Debug, Default)]
@@ -72,6 +79,7 @@ fn finalize_active_segment<'a>(
     previous_turn_settings: &mut Option<PreviousTurnSettings>,
     reference_context_item: &mut TurnReferenceContextItem,
     world_state_replay: &mut Vec<&'a RolloutItem>,
+    post_compact_recovery_replay: &mut Vec<PostCompactRecoveryReplayItem<'a>>,
     window: &mut Option<ReconstructedWindow>,
     pending_rollback_turns: &mut usize,
 ) {
@@ -85,7 +93,14 @@ fn finalize_active_segment<'a>(
         return;
     }
 
+    let recovery_turn_id = active_segment.turn_id.clone();
     world_state_replay.extend(active_segment.world_state_replay);
+    post_compact_recovery_replay.extend(
+        active_segment
+            .post_compact_recovery_replay
+            .into_iter()
+            .map(|item| PostCompactRecoveryReplayItem::new(item, recovery_turn_id.clone())),
+    );
 
     // A surviving replacement-history checkpoint is a complete history base. Once we
     // know the newest surviving one, older rollout items do not affect rebuilt history.
@@ -152,6 +167,7 @@ impl Session {
         let mut previous_turn_settings = None;
         let mut reference_context_item = TurnReferenceContextItem::NeverSet;
         let mut world_state_replay = Vec::new();
+        let mut post_compact_recovery_replay = Vec::new();
         let mut window = None;
         // Rollback is "drop the newest N user turns". While scanning in reverse, that becomes
         // "skip the next N user-turn segments we finalize".
@@ -172,6 +188,7 @@ impl Session {
                         active_segment.latest_compaction_index = Some(index);
                     }
                     active_segment.world_state_replay.push(item);
+                    active_segment.post_compact_recovery_replay.push(item);
                     if active_segment.window.is_none()
                         && let Some(window_number) = compacted.window_number
                     {
@@ -263,6 +280,11 @@ impl Session {
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     active_segment.world_state_replay.push(item);
                 }
+                RolloutItem::PostCompactRecoveryApplied(_) => {
+                    let active_segment =
+                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    active_segment.post_compact_recovery_replay.push(item);
+                }
                 RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
                     // `TurnStarted` is the oldest boundary of the active reverse segment.
                     if active_segment.as_ref().is_some_and(|active_segment| {
@@ -270,14 +292,18 @@ impl Session {
                             active_segment.turn_id.as_deref(),
                             Some(event.turn_id.as_str()),
                         )
-                    }) && let Some(active_segment) = active_segment.take()
+                    }) && let Some(mut active_segment) = active_segment.take()
                     {
+                        if active_segment.turn_id.is_none() {
+                            active_segment.turn_id = Some(event.turn_id.clone());
+                        }
                         finalize_active_segment(
                             active_segment,
                             &mut surviving_compaction,
                             &mut previous_turn_settings,
                             &mut reference_context_item,
                             &mut world_state_replay,
+                            &mut post_compact_recovery_replay,
                             &mut window,
                             &mut pending_rollback_turns,
                         );
@@ -316,6 +342,7 @@ impl Session {
                 &mut previous_turn_settings,
                 &mut reference_context_item,
                 &mut world_state_replay,
+                &mut post_compact_recovery_replay,
                 &mut window,
                 &mut pending_rollback_turns,
             );
@@ -383,7 +410,8 @@ impl Session {
                 RolloutItem::EventMsg(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::WorldState(_)
-                | RolloutItem::SessionMeta(_) => {}
+                | RolloutItem::SessionMeta(_)
+                | RolloutItem::PostCompactRecoveryApplied(_) => {}
             }
         }
 
@@ -430,6 +458,7 @@ impl Session {
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::PostCompactRecoveryApplied(_)
                 | RolloutItem::EventMsg(_) => {
                     unreachable!("only world-state replay items are collected")
                 }
@@ -442,6 +471,8 @@ impl Session {
             previous_id: None,
             id: None,
         });
+        let post_compact_recovery =
+            reconstruct_post_compact_recovery(post_compact_recovery_replay);
         RolloutReconstruction {
             history: history.into_raw_items(),
             previous_turn_settings,
@@ -452,6 +483,7 @@ impl Session {
             previous_window_id: window.previous_id,
             window_id: window.id,
             latest_surviving_compaction_index: surviving_compaction.latest_index,
+            post_compact_recovery,
         }
     }
 }

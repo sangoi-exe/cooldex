@@ -2,7 +2,9 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::PostCompactRecoveryAppliedItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -42,6 +44,7 @@ fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> R
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        post_compact_recovery: None,
     })
 }
 
@@ -347,4 +350,69 @@ async fn applies_serialized_output_limits_deterministically() {
     assert_eq!(value["groups"].as_array().expect("groups").len(), 0);
     assert_eq!(value["omitted_groups"], 1);
     assert_eq!(value["truncated"], true);
+}
+
+#[tokio::test]
+async fn post_compact_recovery_cross_thread_tail_is_rejected_before_sampling() {
+    let (session, turn_context) = make_session_and_context().await;
+    let other_thread = codex_protocol::ThreadId::new();
+    assert_ne!(other_thread, session.thread_id);
+
+    let error = session
+        .build_recall_context(
+            &turn_context,
+            tail(
+                other_thread,
+                vec![compacted("other thread summary", Some(Vec::new()))],
+            ),
+        )
+        .await
+        .expect_err("cross-thread bounded tail must be rejected");
+
+    assert!(
+        error.to_string().contains(&other_thread.to_string()),
+        "error should identify the rejected tail owner: {error:#}"
+    );
+    assert!(
+        error.to_string().contains(&session.thread_id.to_string()),
+        "error should identify the live session owner: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn post_compact_recovery_raw_rollout_receipt_data_is_not_projected() {
+    const RECEIPT_SENTINEL: &str = "GATE_RECEIPT_MUST_REMAIN_RAW_ROLLOUT_DATA";
+    let (session, turn_context) = make_session_and_context().await;
+    let context = session
+        .build_recall_context(
+            &turn_context,
+            tail(
+                session.thread_id,
+                vec![
+                    RolloutItem::EventMsg(EventMsg::Error(ErrorEvent {
+                        message: RECEIPT_SENTINEL.to_string(),
+                        codex_error_info: None,
+                    })),
+                    RolloutItem::PostCompactRecoveryApplied(
+                        PostCompactRecoveryAppliedItem {
+                            compaction_window_id:
+                                "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),
+                            boundary_item_id: "msg_boundary".to_string(),
+                            turn_id: "turn_consuming".to_string(),
+                        },
+                    ),
+                    RolloutItem::ResponseItem(message("assistant", "model-visible history")),
+                    compacted("summary", Some(Vec::new())),
+                ],
+            ),
+        )
+        .await
+        .expect("build bounded recall without raw rollout metadata");
+
+    assert!(!context.json().contains(RECEIPT_SENTINEL));
+    assert!(!context.json().contains("post_compact_recovery_applied"));
+    assert!(
+        context.json().contains("model-visible history"),
+        "model-visible response items should remain projected"
+    );
 }

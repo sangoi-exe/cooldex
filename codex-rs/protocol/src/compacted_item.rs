@@ -26,6 +26,7 @@ impl<'de> Deserialize<'de> for CompactedItem {
             first_window_id: serialized.first_window_id,
             previous_window_id: serialized.previous_window_id,
             window_id,
+            post_compact_recovery: serialized.post_compact_recovery,
         })
     }
 }
@@ -43,6 +44,8 @@ struct SerializedCompactedItem {
     previous_window_id: Option<String>,
     #[serde(default)]
     window_id: Option<SerializedWindowId>,
+    #[serde(default)]
+    post_compact_recovery: Option<crate::protocol::PostCompactRecoveryMarker>,
 }
 
 #[derive(Deserialize)]
@@ -55,6 +58,8 @@ enum SerializedWindowId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::PostCompactRecoveryAppliedItem;
+    use crate::protocol::RolloutItem;
     use anyhow::Result;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -68,6 +73,7 @@ mod tests {
             first_window_id: Some("019b3f6e-0000-7000-8000-000000000001".to_string()),
             previous_window_id: Some("019b3f6e-0000-7000-8000-000000000002".to_string()),
             window_id: Some("019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string()),
+            post_compact_recovery: None,
         };
 
         assert_eq!(
@@ -99,7 +105,85 @@ mod tests {
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                post_compact_recovery: None,
             }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_compact_recovery_marker_only_locked_old_reader_ignores_marker() -> Result<()> {
+        #[derive(Deserialize)]
+        struct LockedOldSerializedCompactedItem {
+            message: String,
+            #[serde(default)]
+            replacement_history: Option<Vec<ResponseItem>>,
+            #[serde(default)]
+            window_number: Option<u64>,
+            #[serde(default)]
+            first_window_id: Option<String>,
+            #[serde(default)]
+            previous_window_id: Option<String>,
+            #[serde(default)]
+            window_id: Option<SerializedWindowId>,
+        }
+
+        let current = json!({
+            "message": "summary",
+            "replacement_history": [],
+            "window_number": 1,
+            "first_window_id": "019b3f6e-0000-7000-8000-000000000001",
+            "previous_window_id": "019b3f6e-0000-7000-8000-000000000001",
+            "window_id": "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
+            "post_compact_recovery": {
+                "boundary_item_id": "msg_boundary"
+            }
+        });
+
+        let LockedOldSerializedCompactedItem {
+            message,
+            replacement_history,
+            window_number,
+            first_window_id,
+            previous_window_id,
+            window_id,
+        } = serde_json::from_value::<LockedOldSerializedCompactedItem>(current)?;
+        assert_eq!(message, "summary");
+        assert_eq!(replacement_history, Some(Vec::new()));
+        assert_eq!(window_number, Some(1));
+        assert_eq!(
+            first_window_id.as_deref(),
+            Some("019b3f6e-0000-7000-8000-000000000001")
+        );
+        assert_eq!(
+            previous_window_id.as_deref(),
+            Some("019b3f6e-0000-7000-8000-000000000001")
+        );
+        let Some(SerializedWindowId::Id(window_id)) = window_id else {
+            panic!("locked reader should preserve the current string window id");
+        };
+        assert_eq!(window_id, "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001");
+        Ok(())
+    }
+
+    #[test]
+    fn post_compact_recovery_applied_serializes_exact_internal_tag() -> Result<()> {
+        let item = RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
+            compaction_window_id: "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),
+            boundary_item_id: "msg_boundary".to_string(),
+            turn_id: "turn_consuming".to_string(),
+        });
+
+        assert_eq!(
+            serde_json::to_value(item)?,
+            json!({
+                "type": "post_compact_recovery_applied",
+                "payload": {
+                    "compaction_window_id": "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
+                    "boundary_item_id": "msg_boundary",
+                    "turn_id": "turn_consuming"
+                }
+            })
         );
         Ok(())
     }

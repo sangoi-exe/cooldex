@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 
 use super::AdditionalContextStore;
+use super::PostCompactRecoveryRuntimeState;
 use super::auto_compact_window::AutoCompactWindow;
 use super::auto_compact_window::AutoCompactWindowIds;
 use super::auto_compact_window::AutoCompactWindowSnapshot;
@@ -36,6 +37,7 @@ pub(crate) struct SessionState {
     previous_turn_settings: Option<PreviousTurnSettings>,
     /// Runtime accounting state for the active auto-compaction window.
     auto_compact_window: AutoCompactWindow,
+    pub(crate) post_compact_recovery: PostCompactRecoveryRuntimeState,
     /// Startup prewarmed session prepared during session initialization.
     pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
     pub(crate) current_time_reminder: CurrentTimeReminderState,
@@ -69,6 +71,7 @@ impl SessionState {
             additional_context: AdditionalContextStore::default(),
             previous_turn_settings: None,
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
+            post_compact_recovery: PostCompactRecoveryRuntimeState::Absent,
             startup_prewarm: None,
             current_time_reminder: CurrentTimeReminderState::default(),
             active_connector_selection: HashSet::new(),
@@ -183,8 +186,26 @@ impl SessionState {
         self.auto_compact_window.restore(window_number, ids);
     }
 
-    pub(crate) fn advance_auto_compact_window(&mut self) -> (u64, AutoCompactWindowIds) {
-        self.auto_compact_window.advance()
+    pub(crate) fn prepare_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
+        self.auto_compact_window.prepare_advance()
+    }
+
+    pub(crate) fn can_install_auto_compact_window(
+        &self,
+        window_number: u64,
+        ids: AutoCompactWindowIds,
+    ) -> bool {
+        self.auto_compact_window
+            .can_install_prepared_advance(window_number, ids)
+    }
+
+    pub(crate) fn install_auto_compact_window(
+        &mut self,
+        window_number: u64,
+        ids: AutoCompactWindowIds,
+    ) -> bool {
+        self.auto_compact_window
+            .install_prepared_advance(window_number, ids)
     }
 
     pub(crate) fn request_new_context_window(&mut self) {
@@ -193,12 +214,6 @@ impl SessionState {
 
     pub(crate) fn take_new_context_window_request(&mut self) -> bool {
         self.auto_compact_window.take_new_context_window_request()
-    }
-
-    pub(crate) fn start_new_context_window(&mut self) -> (u64, AutoCompactWindowIds) {
-        let window = self.auto_compact_window.advance();
-        self.auto_compact_window.clear_prefill();
-        window
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {

@@ -8,6 +8,7 @@ use chrono::Utc;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::GitInfo;
+use codex_protocol::protocol::PostCompactRecoveryAppliedItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
@@ -210,6 +211,7 @@ fn builder_from_items_falls_back_to_filename() {
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        post_compact_recovery: None,
     })];
 
     let builder = builder_from_items(items.as_slice(), path.as_path()).expect("builder");
@@ -226,6 +228,48 @@ fn builder_from_items_falls_back_to_filename() {
     );
 
     assert_eq!(builder, expected);
+}
+
+#[test]
+fn post_compact_recovery_current_projections_ignore_internal_metadata() {
+    let dir = tempdir().expect("tempdir");
+    let uuid = Uuid::new_v4();
+    let path = dir
+        .path()
+        .join(format!("rollout-2026-01-27T12-34-56-{uuid}.jsonl"));
+    let item = RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
+        compaction_window_id: "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),
+        boundary_item_id: "msg_boundary".to_string(),
+        turn_id: "turn_consuming".to_string(),
+    });
+
+    assert!(
+        crate::policy::is_persisted_rollout_item(&item, ThreadHistoryMode::Paginated),
+        "the application proof must remain canonical persisted history"
+    );
+    assert_eq!(
+        crate::model_context::ModelContextScan::default().push(item.clone()),
+        crate::model_context::ModelContextScanProgress::Continue,
+        "internal recovery metadata must not satisfy a model-context cutoff"
+    );
+
+    let builder =
+        builder_from_items(std::slice::from_ref(&item), path.as_path()).expect("builder");
+    let naive = NaiveDateTime::parse_from_str("2026-01-27T12-34-56", "%Y-%m-%dT%H-%M-%S")
+        .expect("timestamp");
+    let created_at = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
+        .with_nanosecond(0)
+        .expect("nanosecond");
+    let expected = ThreadMetadataBuilder::new(
+        ThreadId::from_string(&uuid.to_string()).expect("thread id"),
+        path,
+        created_at,
+        SessionSource::default(),
+    );
+    assert_eq!(
+        builder, expected,
+        "internal recovery metadata must not become thread metadata"
+    );
 }
 
 #[tokio::test]

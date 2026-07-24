@@ -2656,6 +2656,15 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
             && compacted.message.is_empty()
             && let Some(replacement_history) = compacted.replacement_history.as_ref()
         {
+            let marker = compacted
+                .post_compact_recovery
+                .as_ref()
+                .expect("remote compaction recovery marker");
+            let boundary = replacement_history
+                .last()
+                .and_then(ResponseItem::id)
+                .expect("remote compaction replacement boundary");
+            assert_eq!(marker.boundary_item_id, boundary.as_str());
             let has_compaction_item = replacement_history.iter().any(|item| {
                 matches!(
                     item,

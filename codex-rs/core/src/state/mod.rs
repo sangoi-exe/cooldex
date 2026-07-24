@@ -1,5 +1,6 @@
 mod additional_context;
 mod auto_compact_window;
+mod post_compact_recovery;
 mod service;
 mod session;
 mod turn;
@@ -7,6 +8,10 @@ mod turn;
 pub(crate) use additional_context::AdditionalContextStore;
 pub(crate) use auto_compact_window::AutoCompactWindowIds;
 pub(crate) use auto_compact_window::AutoCompactWindowSnapshot;
+pub(crate) use post_compact_recovery::PostCompactRecoveryFailureClass;
+pub(crate) use post_compact_recovery::PostCompactRecoveryIdentity;
+pub(crate) use post_compact_recovery::PostCompactRecoveryRuntimeState;
+pub(crate) use post_compact_recovery::PostCompactRecoveryTurnOutcome;
 pub(crate) use service::SessionServices;
 pub(crate) use session::SessionState;
 pub(crate) use turn::ActiveTurn;

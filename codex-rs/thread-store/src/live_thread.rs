@@ -212,6 +212,48 @@ impl LiveThread {
         Ok(())
     }
 
+    /// Appends one canonical history batch and waits until it is durable/readable.
+    ///
+    /// Rebuildable metadata remains a projection: a projection failure after the
+    /// canonical flush is logged and left pending for a later retry.
+    pub async fn append_items_durably(&self, raw_items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        let items = self.persist_appended_items(raw_items).await?;
+        self.flush_history().await?;
+        if items.is_empty() {
+            return Ok(());
+        }
+        let update = self
+            .metadata_sync
+            .lock()
+            .await
+            .observe_appended_items(items.as_slice());
+        if let Some(update) = update {
+            match self
+                .thread_store
+                .update_thread_metadata(UpdateThreadMetadataParams {
+                    thread_id: self.thread_id,
+                    patch: update.patch.clone(),
+                    include_archived: true,
+                })
+                .await
+            {
+                Ok(_) => {
+                    self.metadata_sync
+                        .lock()
+                        .await
+                        .mark_pending_update_applied(&update);
+                }
+                Err(err) => {
+                    warn!(
+                        thread_id = %self.thread_id,
+                        "durable rollout flush succeeded but thread metadata projection remains pending: {err}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn persist_appended_items(
         &self,
         raw_items: &[RolloutItem],
@@ -245,8 +287,14 @@ impl LiveThread {
         self.flush_pending_metadata_update().await
     }
 
+    /// Flushes only canonical history, without making rebuildable metadata part
+    /// of the durability result.
+    pub async fn flush_history(&self) -> ThreadStoreResult<()> {
+        self.thread_store.flush_thread(self.thread_id).await
+    }
+
     pub async fn flush(&self) -> ThreadStoreResult<()> {
-        self.thread_store.flush_thread(self.thread_id).await?;
+        self.flush_history().await?;
         self.flush_pending_metadata_update_for_existing_history()
             .await
     }

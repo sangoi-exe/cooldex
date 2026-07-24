@@ -11,6 +11,7 @@ use crate::config::ConfigBuilder;
 use crate::context::ContextualUserFragment;
 use crate::context::SubagentNotification;
 use crate::init_state_db;
+use crate::state::PostCompactRecoveryRuntimeState;
 use crate::thread_manager::StartThreadOptions;
 use assert_matches::assert_matches;
 use codex_extension_api::ExtensionDataInit;
@@ -40,6 +41,8 @@ use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::PostCompactRecoveryAppliedItem;
+use codex_protocol::protocol::PostCompactRecoveryMarker;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource;
@@ -227,6 +230,7 @@ async fn persisted_originator(thread: &CodexThread) -> String {
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::EventMsg(_)
             | RolloutItem::Compacted(_)
+            | RolloutItem::PostCompactRecoveryApplied(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::TurnContext(_) => None,
         })
@@ -1126,6 +1130,36 @@ async fn spawn_agent_without_fork_from_paginated_parent_stays_fresh_and_paginate
     parent_thread
         .inject_user_message_without_turn("parent-only context".to_string())
         .await;
+    let compaction_window_id = uuid::Uuid::now_v7().to_string();
+    let boundary_item_id = "msg_parent_recovery_boundary";
+    parent_thread
+        .session
+        .persist_rollout_items(&[RolloutItem::Compacted(CompactedItem {
+            message: "parent summary".to_string(),
+            replacement_history: Some(vec![ResponseItem::Message {
+                id: Some(ResponseItemId::from_server(boundary_item_id.to_string())),
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "parent recovery boundary".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }]),
+            window_number: Some(1),
+            first_window_id: Some(compaction_window_id.clone()),
+            previous_window_id: None,
+            window_id: Some(compaction_window_id),
+            post_compact_recovery: Some(PostCompactRecoveryMarker {
+                boundary_item_id: boundary_item_id.to_string(),
+            }),
+        })])
+        .await;
+    parent_thread.session.ensure_rollout_materialized().await;
+    parent_thread
+        .session
+        .flush_rollout()
+        .await
+        .expect("parent rollout should flush");
 
     let child_thread_id = harness
         .spawn_anonymous_child(
@@ -1162,6 +1196,160 @@ async fn spawn_agent_without_fork_from_paginated_parent_stays_fresh_and_paginate
     .expect("read child session metadata");
     assert_eq!(meta.meta.history_mode, ThreadHistoryMode::Paginated);
     assert_eq!(meta.meta.subagent_history_start_ordinal, None);
+    let child_state = child_thread.session.state.lock().await;
+    assert_eq!(
+        child_state.post_compact_recovery,
+        PostCompactRecoveryRuntimeState::Absent,
+        "fork_turns=none must not inherit parent recovery state"
+    );
+    drop(child_state);
+
+    let _ = harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("child shutdown should submit");
+    let _ = parent_thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("parent shutdown should submit");
+}
+
+#[test]
+fn partial_fork_drops_application_proof_when_its_compaction_is_outside_owned_history() {
+    let unowned_application =
+        RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
+            compaction_window_id: "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),
+            boundary_item_id: "msg_boundary".to_string(),
+            turn_id: "turn_consuming".to_string(),
+        });
+    let owned_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
+    let owned_boundary_id = "msg_owned_boundary";
+    let owned_compaction = RolloutItem::Compacted(CompactedItem {
+        message: "owned compacted history".to_string(),
+        replacement_history: Some(vec![ResponseItem::Message {
+            id: Some(ResponseItemId::from_server(
+                owned_boundary_id.to_string(),
+            )),
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "owned compaction boundary".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }]),
+        window_number: Some(2),
+        first_window_id: Some(
+            "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000".to_string(),
+        ),
+        previous_window_id: Some(
+            "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),
+        ),
+        window_id: Some(owned_window_id.to_string()),
+        post_compact_recovery: Some(PostCompactRecoveryMarker {
+            boundary_item_id: owned_boundary_id.to_string(),
+        }),
+    });
+    let owned_application =
+        RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
+            compaction_window_id: owned_window_id.to_string(),
+            boundary_item_id: owned_boundary_id.to_string(),
+            turn_id: "turn_owned_consuming".to_string(),
+        });
+    let user_message = RolloutItem::ResponseItem(ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "owned partial history".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let mut items = vec![
+        unowned_application,
+        owned_compaction.clone(),
+        owned_application.clone(),
+        user_message.clone(),
+    ];
+
+    spawn::drop_unowned_recovery_applications(&mut items);
+
+    assert_eq!(
+        serde_json::to_value(items).expect("serialize retained partial history"),
+        serde_json::to_value(vec![
+            owned_compaction,
+            owned_application,
+            user_message,
+        ])
+        .expect("serialize expected partial history")
+    );
+}
+
+#[tokio::test]
+async fn full_history_fork_inherits_pending_post_compact_recovery() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    let parent_spawn_call_id = "spawn-call-pending-recovery".to_string();
+    let compaction_window_id = uuid::Uuid::now_v7().to_string();
+    let boundary_item_id = "msg_compaction_boundary";
+    let boundary = ResponseItem::Message {
+        id: Some(ResponseItemId::from_server(boundary_item_id.to_string())),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "retained parent context".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let turn_context = parent_thread.session.new_default_turn().await;
+    parent_thread
+        .session
+        .persist_rollout_items(&[
+            RolloutItem::Compacted(CompactedItem {
+                message: "summary".to_string(),
+                replacement_history: Some(vec![boundary]),
+                window_number: Some(1),
+                first_window_id: Some(compaction_window_id.clone()),
+                previous_window_id: None,
+                window_id: Some(compaction_window_id.clone()),
+                post_compact_recovery: Some(PostCompactRecoveryMarker {
+                    boundary_item_id: boundary_item_id.to_string(),
+                }),
+            }),
+            RolloutItem::TurnContext(turn_context.to_turn_context_item()),
+            RolloutItem::ResponseItem(spawn_agent_call(&parent_spawn_call_id)),
+        ])
+        .await;
+    parent_thread.session.ensure_rollout_materialized().await;
+    parent_thread
+        .session
+        .flush_rollout()
+        .await
+        .expect("parent rollout should flush");
+
+    let child_thread_id = harness
+        .spawn_anonymous_child(
+            parent_thread_id,
+            SpawnAgentOptions {
+                fork_parent_spawn_call_id: Some(parent_spawn_call_id),
+                fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                ..Default::default()
+            },
+        )
+        .await;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should be registered");
+    let child_state = child_thread.session.state.lock().await;
+    let pending = child_state
+        .post_compact_recovery
+        .pending_identity()
+        .expect("full-history fork should inherit pending recovery");
+    assert_eq!(pending.compaction_window_id, compaction_window_id);
+    assert_eq!(pending.boundary_item_id, boundary_item_id);
+    drop(child_state);
 
     let _ = harness
         .control
@@ -1197,6 +1385,7 @@ async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_prov
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                post_compact_recovery: None,
             }),
             RolloutItem::ResponseItem(ResponseItem::Message {
                 id: None,
@@ -1542,6 +1731,7 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                post_compact_recovery: None,
             }),
             RolloutItem::TurnContext(turn_context.to_turn_context_item()),
             RolloutItem::ResponseItem(spawn_agent_call(&parent_spawn_call_id)),

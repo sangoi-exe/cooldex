@@ -32,6 +32,8 @@ use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
+use crate::state::PostCompactRecoveryFailureClass;
+use crate::state::PostCompactRecoveryTurnOutcome;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
 use codex_analytics::TurnProfileFact;
@@ -46,6 +48,7 @@ use codex_otel::TURN_TOKEN_USAGE_METRIC;
 use codex_otel::TURN_TOOL_CALL_METRIC;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
@@ -582,12 +585,24 @@ impl Session {
         turn_context: Arc<TurnContext>,
         task_result: SessionTaskResult,
     ) {
-        let (last_agent_message, abort_reason) = match task_result {
-            Ok(last_agent_message) => (last_agent_message, None),
-            Err(CodexErr::TurnAborted) => (None, Some(TurnAbortReason::Interrupted)),
+        let (mut last_agent_message, abort_reason, task_outcome) = match task_result {
+            Ok(last_agent_message) => (
+                last_agent_message,
+                None,
+                PostCompactRecoveryTurnOutcome::Successful,
+            ),
+            Err(CodexErr::TurnAborted) => (
+                None,
+                Some(TurnAbortReason::Interrupted),
+                PostCompactRecoveryTurnOutcome::Aborted,
+            ),
             Err(err) => {
                 warn!(%err, "session task returned an unexpected error");
-                (None, None)
+                (
+                    None,
+                    None,
+                    PostCompactRecoveryTurnOutcome::UnexpectedTaskError,
+                )
             }
         };
         turn_context
@@ -780,6 +795,28 @@ impl Session {
                 turn_id: turn_context.sub_id.clone(),
                 profile,
             });
+        let task_outcome = if matches!(
+            task_outcome,
+            PostCompactRecoveryTurnOutcome::Successful
+        ) && turn_context.terminal_error.lock().await.is_some()
+        {
+            PostCompactRecoveryTurnOutcome::TerminalError
+        } else {
+            task_outcome
+        };
+        if let Err(err) = self
+            .finalize_post_compact_recovery(&turn_context.sub_id, task_outcome)
+            .await
+        {
+            warn!(%err, "failed to finalize post-compact recovery");
+            self.track_turn_codex_error(turn_context.as_ref(), &err);
+            self.send_event(
+                turn_context.as_ref(),
+                EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
+            )
+            .await;
+            last_agent_message = None;
+        }
         let event = if let Some(reason) = abort_reason {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
@@ -840,6 +877,72 @@ impl Session {
         }
     }
 
+    async fn finalize_post_compact_recovery(
+        &self,
+        turn_id: &str,
+        outcome: PostCompactRecoveryTurnOutcome,
+    ) -> CodexResult<()> {
+        let candidate = {
+            let mut state = self.state.lock().await;
+            match state
+                .post_compact_recovery
+                .application_candidate(turn_id, outcome)
+            {
+                Ok(Some(candidate)) => Some(candidate),
+                Ok(None) => {
+                    state
+                        .post_compact_recovery
+                        .clear_sampling_proof_for_turn(turn_id);
+                    None
+                }
+                Err(failure) => {
+                    state.post_compact_recovery.block(failure);
+                    return Err(CodexErr::Fatal(format!(
+                        "post-compact recovery application proof is invalid: {failure}"
+                    )));
+                }
+            }
+        };
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        let live_thread = match self.live_thread_for_persistence(
+            "append the post-compact recovery application proof",
+        ) {
+            Ok(live_thread) => live_thread,
+            Err(error) => {
+                self.state.lock().await.post_compact_recovery.block(
+                    PostCompactRecoveryFailureClass::CanonicalPersistenceIndeterminate,
+                );
+                return Err(CodexErr::Fatal(error.to_string()));
+            }
+        };
+        if let Err(error) = live_thread
+            .append_items_durably(&[RolloutItem::PostCompactRecoveryApplied(
+                candidate.clone(),
+            )])
+            .await
+        {
+            self.state.lock().await.post_compact_recovery.block(
+                PostCompactRecoveryFailureClass::CanonicalPersistenceIndeterminate,
+            );
+            return Err(CodexErr::Fatal(format!(
+                "failed to persist post-compact recovery application proof: {error}"
+            )));
+        }
+        let mut state = self.state.lock().await;
+        if let Err(failure) = state
+            .post_compact_recovery
+            .clear_after_application(&candidate)
+        {
+            state.post_compact_recovery.block(failure);
+            return Err(CodexErr::Fatal(format!(
+                "durable post-compact recovery proof no longer matches live state: {failure}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn take_active_turn(&self) -> Option<ActiveTurn> {
         let mut active = self.active_turn.lock().await;
         active.take()
@@ -865,6 +968,11 @@ impl Session {
 
     async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {
         let sub_id = task.turn_context.sub_id.clone();
+        self.state
+            .lock()
+            .await
+            .post_compact_recovery
+            .clear_sampling_proof_for_turn(&sub_id);
         if task.cancellation_token.is_cancelled() {
             return;
         }

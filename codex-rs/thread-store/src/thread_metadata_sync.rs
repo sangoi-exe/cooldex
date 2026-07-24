@@ -297,7 +297,8 @@ impl ThreadMetadataSync {
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
-                | RolloutItem::WorldState(_) => {}
+                | RolloutItem::WorldState(_)
+                | RolloutItem::PostCompactRecoveryApplied(_) => {}
             }
         }
         Some(update)
@@ -543,6 +544,7 @@ mod tests {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            post_compact_recovery: None,
         });
 
         let first = sync

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::RolloutItem;
+use codex_thread_store::LoadRolloutTailParams;
 use codex_thread_store::StoredRolloutTail;
 use codex_utils_output_truncation::approx_token_count;
 use serde::Serialize;
@@ -17,6 +18,25 @@ pub(crate) const RECALL_SOURCE_MAX_RECORDS: usize = 8_192;
 const RECALL_RESULT_MAX_BYTES: usize = 32 * 1024;
 const RECALL_RESULT_MAX_GROUPS: usize = 64;
 const RECALL_RESULT_MAX_TOKENS: usize = 8_000;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RecallContextError {
+    #[error("bounded rollout tail belongs to {actual}, not {expected}")]
+    ThreadMismatch {
+        expected: codex_protocol::ThreadId,
+        actual: codex_protocol::ThreadId,
+    },
+    #[error(transparent)]
+    Build(#[from] anyhow::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RecallLoadError {
+    #[error("failed to read bounded current-thread rollout: {0:#}")]
+    Source(anyhow::Error),
+    #[error(transparent)]
+    Context(#[from] RecallContextError),
+}
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,17 +96,42 @@ enum PairKey {
 }
 
 impl Session {
+    pub(crate) async fn load_current_thread_recall_context(
+        &self,
+        turn_context: &TurnContext,
+    ) -> Result<RecallContext, RecallLoadError> {
+        if let Some(live_thread) = self.live_thread() {
+            live_thread
+                .flush_history()
+                .await
+                .map_err(|err| RecallLoadError::Source(anyhow::Error::new(err)))?;
+        }
+        let tail = self
+            .services
+            .thread_store
+            .load_rollout_tail(LoadRolloutTailParams {
+                thread_id: self.thread_id,
+                include_archived: true,
+                max_bytes: RECALL_SOURCE_MAX_BYTES,
+                max_records: RECALL_SOURCE_MAX_RECORDS,
+            })
+            .await
+            .map_err(|err| RecallLoadError::Source(anyhow::Error::new(err)))?;
+        self.build_recall_context(turn_context, tail)
+            .await
+            .map_err(RecallLoadError::from)
+    }
+
     pub(crate) async fn build_recall_context(
         &self,
         turn_context: &TurnContext,
         tail: StoredRolloutTail,
-    ) -> anyhow::Result<RecallContext> {
+    ) -> Result<RecallContext, RecallContextError> {
         if tail.thread_id != self.thread_id {
-            anyhow::bail!(
-                "bounded rollout tail belongs to {}, not {}",
-                tail.thread_id,
-                self.thread_id
-            );
+            return Err(RecallContextError::ThreadMismatch {
+                expected: self.thread_id,
+                actual: tail.thread_id,
+            });
         }
         let thread_id = self.thread_id.to_string();
         let source = RecallSourceRead {
@@ -96,14 +141,16 @@ impl Session {
             segments_read: tail.segments_read,
         };
         if !tail.reached_start {
-            return unavailable_context(&thread_id, RecallAvailability::WorkLimit, source);
+            return unavailable_context(&thread_id, RecallAvailability::WorkLimit, source)
+                .map_err(RecallContextError::from);
         }
 
         let reconstruction = self
             .reconstruct_history_from_rollout(turn_context, tail.items.as_slice())
             .await;
         let Some(boundary_index) = reconstruction.latest_surviving_compaction_index else {
-            return unavailable_context(&thread_id, RecallAvailability::NoCompaction, source);
+            return unavailable_context(&thread_id, RecallAvailability::NoCompaction, source)
+                .map_err(RecallContextError::from);
         };
         let compacted = tail
             .items
@@ -116,18 +163,26 @@ impl Session {
                 anyhow::anyhow!(
                     "rollout reconstruction selected non-compaction index {boundary_index}"
                 )
-            })?;
+            })
+            .map_err(RecallContextError::from)?;
 
         if compacted.replacement_history.is_none() && tail.segments_read != 1 {
-            return unavailable_context(&thread_id, RecallAvailability::UnsupportedLegacy, source);
+            return unavailable_context(
+                &thread_id,
+                RecallAvailability::UnsupportedLegacy,
+                source,
+            )
+            .map_err(RecallContextError::from);
         }
 
         let prefix = self
             .reconstruct_history_from_rollout(turn_context, &tail.items[..boundary_index])
             .await;
-        let (groups, incomplete_groups) = group_history(prefix.history)?;
+        let (groups, incomplete_groups) =
+            group_history(prefix.history).map_err(RecallContextError::from)?;
         let boundary = recall_boundary(boundary_index, compacted);
         available_context(&thread_id, source, &boundary, groups, incomplete_groups)
+            .map_err(RecallContextError::from)
     }
 }
 
