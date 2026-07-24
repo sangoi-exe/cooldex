@@ -23,6 +23,8 @@ const RECALL_RESULT_MAX_BYTES: usize = 32 * 1024;
 const RECALL_RESULT_MAX_GROUPS: usize = 64;
 const RECALL_RESULT_MAX_TOKENS: usize = 8_000;
 const RECALL_DIAGNOSTIC_MAX_BYTES: usize = 1_024;
+const RECALL_METADATA_OMITTED_MESSAGE: &str =
+    "recall source metadata exceeded its result limits and was omitted";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RecallContextError {
@@ -277,6 +279,28 @@ impl Session {
                         "compaction predecessor mismatch: expected {expected_previous_window_id}, found {actual_previous_window_id}"
                     )));
                 }
+                if previous.replacement_history.is_none() {
+                    if !tail.reached_start {
+                        return unavailable_context(
+                            &thread_id,
+                            RecallAvailability::WorkLimit,
+                            source,
+                            None,
+                            None,
+                        )
+                        .map_err(RecallContextError::from);
+                    }
+                    if tail.segments_read != 1 {
+                        return unavailable_context(
+                            &thread_id,
+                            RecallAvailability::UnsupportedLegacy,
+                            source,
+                            None,
+                            None,
+                        )
+                        .map_err(RecallContextError::from);
+                    }
+                }
                 true
             }
         };
@@ -358,7 +382,7 @@ fn unavailable_context(
         thread_id,
         availability,
         boundary: None,
-        source,
+        source: source.clone(),
         diagnostic_class,
         diagnostic_message,
         truncated: false,
@@ -366,9 +390,40 @@ fn unavailable_context(
         excluded_native_continuity_pairs: 0,
         groups: &[],
     };
-    Ok(RecallContext::unavailable(serde_json::to_string(
-        &document,
-    )?))
+    let serialized = serde_json::to_string(&document)?;
+    if recall_result_fits(serialized.as_str()) {
+        return Ok(RecallContext::unavailable(serialized));
+    }
+
+    let fallback = RecallDocument {
+        thread_id,
+        availability,
+        boundary: None,
+        source: RecallSourceRead {
+            reached_start: source.reached_start,
+            reached_recall_origin: source.reached_recall_origin,
+            bytes_read: source.bytes_read,
+            records_read: source.records_read,
+            segments_read: source.segments_read,
+            path: None,
+            line: source.line,
+            byte_offset: source.byte_offset,
+            ordinal: source.ordinal,
+            record_type: None,
+            event_type: None,
+        },
+        diagnostic_class,
+        diagnostic_message: Some(RECALL_METADATA_OMITTED_MESSAGE),
+        truncated: true,
+        omitted_groups: 0,
+        excluded_native_continuity_pairs: 0,
+        groups: &[],
+    };
+    let serialized = serde_json::to_string(&fallback)?;
+    if !recall_result_fits(serialized.as_str()) {
+        anyhow::bail!("fixed unavailable recall result exceeds its limits");
+    }
+    Ok(RecallContext::unavailable(serialized))
 }
 
 fn available_context(
@@ -397,9 +452,7 @@ fn available_context(
             groups: &groups[proposed_start..],
         };
         let serialized = serde_json::to_string(&document)?;
-        if serialized.len() > RECALL_RESULT_MAX_BYTES
-            || approx_token_count(&serialized) > RECALL_RESULT_MAX_TOKENS
-        {
+        if !recall_result_fits(serialized.as_str()) {
             break;
         }
         selected_start = proposed_start;
@@ -420,12 +473,15 @@ fn available_context(
         groups: &groups[selected_start..],
     };
     let serialized = serde_json::to_string(&document)?;
-    if serialized.len() > RECALL_RESULT_MAX_BYTES
-        || approx_token_count(&serialized) > RECALL_RESULT_MAX_TOKENS
-    {
+    if !recall_result_fits(serialized.as_str()) {
         anyhow::bail!("recall metadata exceeds its result limits");
     }
     Ok(RecallContext::new(serialized))
+}
+
+fn recall_result_fits(serialized: &str) -> bool {
+    serialized.len() <= RECALL_RESULT_MAX_BYTES
+        && approx_token_count(serialized) <= RECALL_RESULT_MAX_TOKENS
 }
 
 pub(crate) fn unavailable_recall_context_for_error(

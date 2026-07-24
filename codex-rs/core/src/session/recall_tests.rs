@@ -89,6 +89,24 @@ fn compacted_window(
     })
 }
 
+fn legacy_compacted_window(
+    message: &str,
+    window_number: u64,
+    first_window_id: &str,
+    previous_window_id: Option<&str>,
+    window_id: &str,
+) -> RolloutItem {
+    RolloutItem::Compacted(CompactedItem {
+        message: message.to_string(),
+        replacement_history: None,
+        window_number: Some(window_number),
+        first_window_id: Some(first_window_id.to_string()),
+        previous_window_id: previous_window_id.map(ToString::to_string),
+        window_id: Some(window_id.to_string()),
+        post_compact_recovery: None,
+    })
+}
+
 fn tail(thread_id: codex_protocol::ThreadId, items: Vec<RolloutItem>) -> StoredRecallRolloutTail {
     StoredRecallRolloutTail {
         thread_id,
@@ -448,6 +466,118 @@ async fn bounded_tail_without_named_previous_compaction_reports_work_limit() {
 }
 
 #[tokio::test]
+async fn bounded_tail_with_legacy_predecessor_reports_work_limit() {
+    const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
+    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
+    let (session, turn_context) = make_session_and_context().await;
+    let mut stored_tail = tail(
+        session.thread_id,
+        vec![
+            legacy_compacted_window(
+                "legacy predecessor",
+                1,
+                FIRST_WINDOW_ID,
+                None,
+                FIRST_WINDOW_ID,
+            ),
+            RolloutItem::ResponseItem(message("assistant", "bounded legacy suffix")),
+            compacted_window(
+                "current",
+                Vec::new(),
+                2,
+                FIRST_WINDOW_ID,
+                Some(FIRST_WINDOW_ID),
+                CURRENT_WINDOW_ID,
+            ),
+        ],
+    );
+    stored_tail.reached_start = false;
+
+    let context = session
+        .build_recall_context(&turn_context, stored_tail)
+        .await
+        .expect("legacy predecessor should require complete source chronology");
+    let value = parsed(&context);
+
+    assert_eq!(value["availability"], "work_limit");
+    assert_eq!(value["source"]["reached_recall_origin"], false);
+}
+
+#[tokio::test]
+async fn bounded_tail_with_legacy_current_and_predecessor_reports_work_limit() {
+    const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
+    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
+    let (session, turn_context) = make_session_and_context().await;
+    let mut stored_tail = tail(
+        session.thread_id,
+        vec![
+            legacy_compacted_window(
+                "legacy predecessor",
+                1,
+                FIRST_WINDOW_ID,
+                None,
+                FIRST_WINDOW_ID,
+            ),
+            RolloutItem::ResponseItem(message("assistant", "bounded legacy suffix")),
+            legacy_compacted_window(
+                "legacy current",
+                2,
+                FIRST_WINDOW_ID,
+                Some(FIRST_WINDOW_ID),
+                CURRENT_WINDOW_ID,
+            ),
+        ],
+    );
+    stored_tail.reached_start = false;
+
+    let context = session
+        .build_recall_context(&turn_context, stored_tail)
+        .await
+        .expect("legacy current window should not legitimize an incomplete predecessor");
+
+    assert_eq!(parsed(&context)["availability"], "work_limit");
+}
+
+#[tokio::test]
+async fn bounded_legacy_current_accepts_a_self_contained_modern_predecessor() {
+    const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
+    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
+    let (session, turn_context) = make_session_and_context().await;
+    let mut stored_tail = tail(
+        session.thread_id,
+        vec![
+            compacted_window(
+                "modern predecessor",
+                Vec::new(),
+                1,
+                FIRST_WINDOW_ID,
+                None,
+                FIRST_WINDOW_ID,
+            ),
+            RolloutItem::ResponseItem(message("assistant", "bounded modern suffix")),
+            legacy_compacted_window(
+                "legacy current",
+                2,
+                FIRST_WINDOW_ID,
+                Some(FIRST_WINDOW_ID),
+                CURRENT_WINDOW_ID,
+            ),
+        ],
+    );
+    stored_tail.reached_start = false;
+
+    let context = session
+        .build_recall_context(&turn_context, stored_tail)
+        .await
+        .expect("replacement history should provide a complete bounded origin");
+    let value = parsed(&context);
+
+    assert_eq!(value["availability"], "available");
+    assert_eq!(value["boundary"]["kind"], "legacy");
+    assert_eq!(value["source"]["reached_recall_origin"], true);
+}
+
+#[tokio::test]
 async fn reports_unavailable_source_and_missing_compaction() {
     let (session, turn_context) = make_session_and_context().await;
     let mut incomplete = tail(session.thread_id, Vec::new());
@@ -511,6 +641,45 @@ async fn reports_projected_historical_schema_drift_without_reconstruction() {
     assert_eq!(value["source"]["ordinal"], 17);
     assert_eq!(value["source"]["record_type"], "response_item");
     assert_eq!(value["groups"].as_array().expect("groups").len(), 0);
+}
+
+#[tokio::test]
+async fn oversized_source_metadata_uses_a_fixed_bounded_unavailable_result() {
+    let (session, turn_context) = make_session_and_context().await;
+    let oversized = "x".repeat(RECALL_RESULT_MAX_BYTES);
+    let mut stored_tail = tail(session.thread_id, Vec::new());
+    stored_tail.reached_start = false;
+    stored_tail.source_issue = Some(RecallRolloutSourceIssue {
+        kind: RecallRolloutSourceIssueKind::UnsupportedSchema,
+        path: Some(oversized.clone().into()),
+        line: Some(7),
+        byte_offset: Some(1234),
+        ordinal: Some(17),
+        record_type: Some(oversized.clone()),
+        event_type: Some(oversized),
+        message: "historical response item drift".to_string(),
+    });
+
+    let context = session
+        .build_recall_context(&turn_context, stored_tail)
+        .await
+        .expect("oversized source metadata should use a fixed bounded fallback");
+    let value = parsed(&context);
+
+    assert!(!context.is_available());
+    assert!(context.json().len() <= RECALL_RESULT_MAX_BYTES);
+    assert!(approx_token_count(context.json()) <= RECALL_RESULT_MAX_TOKENS);
+    assert_eq!(value["availability"], "unsupported_schema");
+    assert_eq!(value["diagnostic_class"], "historical_schema_drift");
+    assert_eq!(value["diagnostic_message"], RECALL_METADATA_OMITTED_MESSAGE);
+    assert_eq!(value["truncated"], true);
+    assert_eq!(value["source"]["path"], Value::Null);
+    assert_eq!(value["source"]["line"], 7);
+    assert_eq!(value["source"]["byte_offset"], 1234);
+    assert_eq!(value["source"]["ordinal"], 17);
+    assert_eq!(value["source"]["record_type"], Value::Null);
+    assert_eq!(value["source"]["event_type"], Value::Null);
+    assert_eq!(value["groups"], serde_json::json!([]));
 }
 
 #[test]
