@@ -2900,9 +2900,11 @@ def build_arg_parser(default_mode: str) -> argparse.ArgumentParser:
         help="guard telemetry detail for validation runs",
     )
     parser.add_argument(
-        "--keep-going",
-        action="store_true",
-        help="continue verify after command failures",
+        "--fail-fast",
+        dest="keep_going",
+        action="store_false",
+        default=True,
+        help="stop verify after the first command failure instead of collecting all reachable failures",
     )
     parser.add_argument(
         "--resume",

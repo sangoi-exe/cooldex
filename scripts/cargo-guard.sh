@@ -57,6 +57,8 @@ Planner actions:
   - prep: execute the pre-review formatter/generator/lock materialization plan
   - plan: print the deterministic non-mutating cargo-validation plan
   - verify: execute the non-mutating validation plan and write validation receipts
+  - verify collects every reachable command result by default; --fail-fast stops after the first
+    command failure
 
 Planner selectors:
   - --changed: tracked and untracked worktree changes

@@ -3319,8 +3319,10 @@ class CargoValidateTests(unittest.TestCase):
         self.assertEqual(["verify"], [entry["action"] for entry in run_entries])
         self.assertEqual(["validation"], [entry["stage"] for entry in run_entries])
 
-    def test_verify_stops_at_first_failure_and_writes_run_receipt(self) -> None:
-        process, receipt_dir = self.run_verify_fixture()
+    def test_verify_fail_fast_stops_at_first_failure_and_writes_run_receipt(
+        self,
+    ) -> None:
+        process, receipt_dir = self.run_verify_fixture("--fail-fast")
         self.assertEqual(7, process.returncode)
         command_log = (self.repo_root / "command-log.txt").read_text().splitlines()
         self.assertEqual(["ok-one", "fail-two"], command_log)
@@ -3337,8 +3339,8 @@ class CargoValidateTests(unittest.TestCase):
         self.assertEqual("partial", summary["coverage"])
         self.assertEqual(7, summary["status"])
 
-    def test_verify_keep_going_continues_after_failure(self) -> None:
-        process, receipt_dir = self.run_verify_fixture("--keep-going")
+    def test_verify_continues_after_failure_by_default(self) -> None:
+        process, receipt_dir = self.run_verify_fixture()
         self.assertEqual(7, process.returncode)
         command_log = (self.repo_root / "command-log.txt").read_text().splitlines()
         self.assertEqual(["ok-one", "fail-two", "ok-three"], command_log)
@@ -4200,7 +4202,6 @@ class CargoValidateTests(unittest.TestCase):
             metadata_path,
             command_log,
             receipt_dir,
-            "--keep-going",
             fail_labels="cmd-02",
         )
         self.assertEqual(7, first.returncode)
@@ -4240,7 +4241,6 @@ class CargoValidateTests(unittest.TestCase):
             metadata_path,
             command_log,
             receipt_dir,
-            "--keep-going",
             fail_labels="cmd-02",
         )
         self.assertEqual(7, first.returncode)
