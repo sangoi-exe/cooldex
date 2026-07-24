@@ -471,8 +471,7 @@ impl Session {
             previous_id: None,
             id: None,
         });
-        let post_compact_recovery =
-            reconstruct_post_compact_recovery(post_compact_recovery_replay);
+        let post_compact_recovery = reconstruct_post_compact_recovery(post_compact_recovery_replay);
         RolloutReconstruction {
             history: history.into_raw_items(),
             previous_turn_settings,

@@ -108,9 +108,8 @@ fn appends_complete_parallel_batch_in_original_order() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn public_entry_stamps_missing_prompt_turn_ids() {
+async fn public_entry_omits_unprovenanced_trailing_batch() {
     let (_session, turn_context) = crate::session::tests::make_session_and_context().await;
-    let current_turn_id = turn_context.sub_id.clone();
     let user = user_message("continue");
     let compaction = compaction_item();
     let call = unstamped(function_call("call-1"));
@@ -123,12 +122,29 @@ async fn public_entry_stamps_missing_prompt_turn_ids() {
         &turn_context,
     );
 
-    let expected_call = stamped(call, &current_turn_id);
-    let expected_output = stamped(output, &current_turn_id);
-    assert_eq!(
-        history,
-        vec![user, compaction, expected_call, expected_output]
+    assert_eq!(history, vec![user, compaction]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_entry_accepts_explicit_current_turn_provenance() {
+    let (_session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let current_turn_id = turn_context.sub_id.clone();
+    let user = user_message("continue");
+    let compaction = compaction_item();
+    let call = stamped(unstamped(function_call("call-1")), current_turn_id.as_str());
+    let output = stamped(
+        unstamped(function_output("call-1", "ok")),
+        current_turn_id.as_str(),
     );
+
+    let mut history = vec![user.clone(), compaction.clone()];
+    append_remote_v2_mid_turn_continuity_tail(
+        &mut history,
+        &[user.clone(), call.clone(), output.clone()],
+        &turn_context,
+    );
+
+    assert_eq!(history, vec![user, compaction, call, output]);
 }
 
 #[test]

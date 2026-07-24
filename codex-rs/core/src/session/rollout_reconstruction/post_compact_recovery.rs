@@ -74,7 +74,6 @@ pub(super) fn reconstruct_post_compact_recovery(
     if applications.is_empty() {
         return PostCompactRecoveryRuntimeState::pending(identity);
     }
-    let (first_application, _) = applications[0];
     for (applied, containing_turn_id) in applications {
         if applied.compaction_window_id.is_empty()
             || applied.boundary_item_id.is_empty()
@@ -91,14 +90,6 @@ pub(super) fn reconstruct_post_compact_recovery(
         {
             return PostCompactRecoveryRuntimeState::Blocked(
                 PostCompactRecoveryFailureClass::BoundaryMismatch,
-            );
-        }
-        if applied.compaction_window_id != first_application.compaction_window_id
-            || applied.boundary_item_id != first_application.boundary_item_id
-            || applied.turn_id != first_application.turn_id
-        {
-            return PostCompactRecoveryRuntimeState::Blocked(
-                PostCompactRecoveryFailureClass::MalformedApplicationProof,
             );
         }
     }

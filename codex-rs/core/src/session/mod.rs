@@ -371,10 +371,10 @@ use codex_protocol::protocol::ModelRerouteEvent;
 use codex_protocol::protocol::ModelRerouteReason;
 use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::ModelVerificationEvent;
-use codex_protocol::protocol::PostCompactRecoveryMarker;
 use codex_protocol::protocol::NetworkApprovalContext;
 use codex_protocol::protocol::NonSteerableTurnKind;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::PostCompactRecoveryMarker;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RequestUserInputEvent;
 use codex_protocol::protocol::ReviewDecision;
@@ -3160,10 +3160,7 @@ impl Session {
                     "post-compact recovery is blocked: {failure}"
                 )));
             }
-            if !state.can_install_auto_compact_window(
-                metadata.window_number,
-                metadata.window_ids,
-            ) {
+            if !state.can_install_auto_compact_window(metadata.window_number, metadata.window_ids) {
                 return Err(CodexErr::Fatal(
                     "prepared auto-compact window no longer matches live session state".to_string(),
                 ));
@@ -3175,9 +3172,9 @@ impl Session {
             .map_err(|error| CodexErr::Fatal(error.to_string()))?;
         if let Err(error) = live_thread.append_items_durably(&rollout_items).await {
             let mut state = self.state.lock().await;
-            state.post_compact_recovery.block(
-                PostCompactRecoveryFailureClass::CanonicalPersistenceIndeterminate,
-            );
+            state
+                .post_compact_recovery
+                .block(PostCompactRecoveryFailureClass::CanonicalPersistenceIndeterminate);
             return Err(CodexErr::Fatal(format!(
                 "failed to durably install compacted history: {error}"
             )));
@@ -3185,13 +3182,10 @@ impl Session {
 
         {
             let mut state = self.state.lock().await;
-            if !state.install_auto_compact_window(
-                metadata.window_number,
-                metadata.window_ids,
-            ) {
-                state.post_compact_recovery.block(
-                    PostCompactRecoveryFailureClass::CanonicalPersistenceIndeterminate,
-                );
+            if !state.install_auto_compact_window(metadata.window_number, metadata.window_ids) {
+                state
+                    .post_compact_recovery
+                    .block(PostCompactRecoveryFailureClass::CanonicalPersistenceIndeterminate);
                 return Err(CodexErr::Fatal(
                     "durable compaction could not be installed into live session state".to_string(),
                 ));

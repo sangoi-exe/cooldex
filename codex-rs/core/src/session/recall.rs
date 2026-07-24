@@ -1,23 +1,28 @@
-use std::collections::HashMap;
 use std::collections::HashSet;
 
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_thread_store::LoadRolloutTailParams;
-use codex_thread_store::StoredRolloutTail;
+use codex_thread_store::RecallRolloutSourceIssueKind;
+use codex_thread_store::StoredRecallRolloutTail;
 use codex_utils_output_truncation::approx_token_count;
 use serde::Serialize;
 
 use super::Session;
 use super::TurnContext;
 use crate::context::RecallContext;
+use crate::tool_batch::ToolBatchMatch;
+use crate::tool_batch::ToolItemKind;
+use crate::tool_batch::classify_tool_item;
+use crate::tool_batch::tool_batch_at;
 
 pub(crate) const RECALL_SOURCE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const RECALL_SOURCE_MAX_RECORDS: usize = 8_192;
 const RECALL_RESULT_MAX_BYTES: usize = 32 * 1024;
 const RECALL_RESULT_MAX_GROUPS: usize = 64;
 const RECALL_RESULT_MAX_TOKENS: usize = 8_000;
+const RECALL_DIAGNOSTIC_MAX_BYTES: usize = 1_024;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RecallContextError {
@@ -45,6 +50,17 @@ enum RecallAvailability {
     WorkLimit,
     NoCompaction,
     UnsupportedLegacy,
+    SourceError,
+    UnsupportedSchema,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RecallDiagnosticClass {
+    HistoricalSchemaDrift,
+    SourceReadError,
+    ReconstructionError,
+    ThreadMismatch,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -64,13 +80,19 @@ struct RecallBoundary {
     window_id: Option<String>,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Serialize)]
 struct RecallSourceRead {
     reached_start: bool,
     reached_recall_origin: bool,
     bytes_read: u64,
     records_read: usize,
     segments_read: usize,
+    path: Option<String>,
+    line: Option<u64>,
+    byte_offset: Option<u64>,
+    ordinal: Option<u64>,
+    record_type: Option<String>,
+    event_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -84,6 +106,8 @@ struct RecallDocument<'a> {
     availability: RecallAvailability,
     boundary: Option<&'a RecallBoundary>,
     source: RecallSourceRead,
+    diagnostic_class: Option<RecallDiagnosticClass>,
+    diagnostic_message: Option<&'a str>,
     truncated: bool,
     omitted_groups: usize,
     excluded_native_continuity_pairs: usize,
@@ -111,7 +135,7 @@ impl Session {
         let tail = self
             .services
             .thread_store
-            .load_rollout_tail(LoadRolloutTailParams {
+            .load_recall_rollout_tail(LoadRolloutTailParams {
                 thread_id: self.thread_id,
                 include_archived: true,
                 max_bytes: RECALL_SOURCE_MAX_BYTES,
@@ -127,7 +151,7 @@ impl Session {
     pub(crate) async fn build_recall_context(
         &self,
         turn_context: &TurnContext,
-        tail: StoredRolloutTail,
+        tail: StoredRecallRolloutTail,
     ) -> Result<RecallContext, RecallContextError> {
         if tail.thread_id != self.thread_id {
             return Err(RecallContextError::ThreadMismatch {
@@ -142,7 +166,43 @@ impl Session {
             bytes_read: tail.bytes_read,
             records_read: tail.records_read,
             segments_read: tail.segments_read,
+            path: None,
+            line: None,
+            byte_offset: None,
+            ordinal: None,
+            record_type: None,
+            event_type: None,
         };
+        if let Some(issue) = tail.source_issue {
+            source.path = issue
+                .path
+                .as_deref()
+                .map(|path| path.to_string_lossy().into_owned());
+            source.line = issue.line;
+            source.byte_offset = issue.byte_offset;
+            source.ordinal = issue.ordinal;
+            source.record_type = issue.record_type;
+            source.event_type = issue.event_type;
+            let (availability, diagnostic_class) = match issue.kind {
+                RecallRolloutSourceIssueKind::SourceError => (
+                    RecallAvailability::SourceError,
+                    RecallDiagnosticClass::SourceReadError,
+                ),
+                RecallRolloutSourceIssueKind::UnsupportedSchema => (
+                    RecallAvailability::UnsupportedSchema,
+                    RecallDiagnosticClass::HistoricalSchemaDrift,
+                ),
+            };
+            let diagnostic_message = bounded_diagnostic_message(issue.message.as_str());
+            return unavailable_context(
+                &thread_id,
+                availability,
+                source,
+                Some(diagnostic_class),
+                Some(diagnostic_message.as_str()),
+            )
+            .map_err(RecallContextError::from);
+        }
 
         let reconstruction = self
             .reconstruct_history_from_rollout(turn_context, tail.items.as_slice())
@@ -153,7 +213,7 @@ impl Session {
             } else {
                 RecallAvailability::WorkLimit
             };
-            return unavailable_context(&thread_id, availability, source)
+            return unavailable_context(&thread_id, availability, source, None, None)
                 .map_err(RecallContextError::from);
         };
         let compacted = tail
@@ -183,6 +243,8 @@ impl Session {
                             &thread_id,
                             RecallAvailability::WorkLimit,
                             source,
+                            None,
+                            None,
                         )
                         .map_err(RecallContextError::from);
                     }
@@ -219,13 +281,25 @@ impl Session {
             }
         };
         if !source.reached_recall_origin {
-            return unavailable_context(&thread_id, RecallAvailability::WorkLimit, source)
-                .map_err(RecallContextError::from);
+            return unavailable_context(
+                &thread_id,
+                RecallAvailability::WorkLimit,
+                source,
+                None,
+                None,
+            )
+            .map_err(RecallContextError::from);
         }
 
         if compacted.replacement_history.is_none() && tail.segments_read != 1 {
-            return unavailable_context(&thread_id, RecallAvailability::UnsupportedLegacy, source)
-                .map_err(RecallContextError::from);
+            return unavailable_context(
+                &thread_id,
+                RecallAvailability::UnsupportedLegacy,
+                source,
+                None,
+                None,
+            )
+            .map_err(RecallContextError::from);
         }
 
         let native_continuity_pairs = compacted
@@ -277,18 +351,24 @@ fn unavailable_context(
     thread_id: &str,
     availability: RecallAvailability,
     source: RecallSourceRead,
+    diagnostic_class: Option<RecallDiagnosticClass>,
+    diagnostic_message: Option<&str>,
 ) -> anyhow::Result<RecallContext> {
     let document = RecallDocument {
         thread_id,
         availability,
         boundary: None,
         source,
+        diagnostic_class,
+        diagnostic_message,
         truncated: false,
         omitted_groups: 0,
         excluded_native_continuity_pairs: 0,
         groups: &[],
     };
-    Ok(RecallContext::new(serde_json::to_string(&document)?))
+    Ok(RecallContext::unavailable(serde_json::to_string(
+        &document,
+    )?))
 }
 
 fn available_context(
@@ -308,7 +388,9 @@ fn available_context(
             thread_id,
             availability: RecallAvailability::Available,
             boundary: Some(boundary),
-            source,
+            source: source.clone(),
+            diagnostic_class: None,
+            diagnostic_message: None,
             truncated: omitted_groups > 0,
             omitted_groups,
             excluded_native_continuity_pairs,
@@ -330,6 +412,8 @@ fn available_context(
         availability: RecallAvailability::Available,
         boundary: Some(boundary),
         source,
+        diagnostic_class: None,
+        diagnostic_message: None,
         truncated: omitted_groups > 0,
         omitted_groups,
         excluded_native_continuity_pairs,
@@ -342,6 +426,56 @@ fn available_context(
         anyhow::bail!("recall metadata exceeds its result limits");
     }
     Ok(RecallContext::new(serialized))
+}
+
+pub(crate) fn unavailable_recall_context_for_error(
+    thread_id: codex_protocol::ThreadId,
+    error: &RecallLoadError,
+) -> anyhow::Result<RecallContext> {
+    let (diagnostic_class, diagnostic_message) = match error {
+        RecallLoadError::Source(error) => {
+            (RecallDiagnosticClass::SourceReadError, format!("{error:#}"))
+        }
+        RecallLoadError::Context(RecallContextError::ThreadMismatch { .. }) => {
+            (RecallDiagnosticClass::ThreadMismatch, error.to_string())
+        }
+        RecallLoadError::Context(RecallContextError::Build(_)) => (
+            RecallDiagnosticClass::ReconstructionError,
+            error.to_string(),
+        ),
+    };
+    let diagnostic_message = bounded_diagnostic_message(diagnostic_message.as_str());
+    let thread_id = thread_id.to_string();
+    unavailable_context(
+        thread_id.as_str(),
+        RecallAvailability::SourceError,
+        RecallSourceRead {
+            reached_start: false,
+            reached_recall_origin: false,
+            bytes_read: 0,
+            records_read: 0,
+            segments_read: 0,
+            path: None,
+            line: None,
+            byte_offset: None,
+            ordinal: None,
+            record_type: None,
+            event_type: None,
+        },
+        Some(diagnostic_class),
+        Some(diagnostic_message.as_str()),
+    )
+}
+
+fn bounded_diagnostic_message(message: &str) -> String {
+    if message.len() <= RECALL_DIAGNOSTIC_MAX_BYTES {
+        return message.to_string();
+    }
+    let mut end = RECALL_DIAGNOSTIC_MAX_BYTES.saturating_sub(3);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &message[..end])
 }
 
 fn complete_native_continuity_pair_keys(items: &[ResponseItem]) -> HashSet<PairKey> {
@@ -365,57 +499,44 @@ fn complete_native_continuity_pair_keys(items: &[ResponseItem]) -> HashSet<PairK
 }
 
 fn group_history(items: Vec<ResponseItem>) -> anyhow::Result<(Vec<RecallGroup>, usize)> {
-    let mut call_positions = HashMap::new();
-    let mut output_positions = HashMap::new();
-    for (index, item) in items.iter().enumerate() {
-        if let Some(key) = call_pair_key(item)
-            && call_positions.insert(key.clone(), index).is_some()
-        {
-            anyhow::bail!("duplicate historical tool call id: {key:?}");
-        }
-        if let Some(key) = output_pair_key(item)
-            && output_positions.insert(key.clone(), index).is_some()
-        {
-            anyhow::bail!("duplicate historical tool output id: {key:?}");
-        }
-    }
-
-    let mut grouped_indices = HashSet::new();
     let mut groups = Vec::new();
     let mut incomplete_groups = 0_usize;
-    for (index, item) in items.iter().enumerate() {
-        if grouped_indices.contains(&index) {
-            continue;
+    let mut index = 0_usize;
+    while index < items.len() {
+        match classify_tool_item(&items[index]) {
+            ToolItemKind::NonTool => {
+                groups.push(RecallGroup {
+                    items: vec![items[index].clone()],
+                });
+                index += 1;
+            }
+            ToolItemKind::Call | ToolItemKind::UnsupportedCall => {
+                match tool_batch_at(&items, index)
+                    .map_err(|reason| anyhow::anyhow!("invalid historical tool batch: {reason}"))?
+                {
+                    Some(ToolBatchMatch::Complete(batch)) => {
+                        let end = batch.range.end;
+                        groups.push(RecallGroup {
+                            items: items[batch.range].to_vec(),
+                        });
+                        index = end;
+                    }
+                    Some(ToolBatchMatch::Incomplete(batch)) => {
+                        incomplete_groups += 1;
+                        index = batch.end.max(index + 1);
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "tool batch classifier disagreed with the batch grouper"
+                        ));
+                    }
+                }
+            }
+            ToolItemKind::Output | ToolItemKind::UnsupportedOutput => {
+                let key = output_pair_key(&items[index]);
+                anyhow::bail!("historical tool output precedes its batch call: {key:?}");
+            }
         }
-        let key = call_pair_key(item).or_else(|| output_pair_key(item));
-        let Some(key) = key else {
-            groups.push(RecallGroup {
-                items: vec![item.clone()],
-            });
-            continue;
-        };
-        let (Some(call_index), Some(output_index)) =
-            (call_positions.get(&key), output_positions.get(&key))
-        else {
-            grouped_indices.insert(index);
-            incomplete_groups += 1;
-            continue;
-        };
-        if output_index < call_index {
-            anyhow::bail!("historical tool output precedes its call: {key:?}");
-        }
-        let mut pair_indices = [*call_index, *output_index];
-        pair_indices.sort_unstable();
-        if index != pair_indices[0] {
-            continue;
-        }
-        grouped_indices.extend(pair_indices);
-        groups.push(RecallGroup {
-            items: pair_indices
-                .into_iter()
-                .map(|pair_index| items[pair_index].clone())
-                .collect(),
-        });
     }
     Ok((groups, incomplete_groups))
 }

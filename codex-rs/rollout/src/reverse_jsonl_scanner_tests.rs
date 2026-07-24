@@ -44,11 +44,23 @@ fn scans_jsonl_records_from_end() -> std::io::Result<()> {
 {"value":"second"}
 {"value":"third"}
 "#;
+    let second_offset = br#"{"value":"first"}
+"#
+    .len() as u64;
+    let third_offset = second_offset
+        + br#"{"value":"second"}
+"#
+        .len() as u64;
+    let mut scanner = ReverseJsonlScanner::new(Cursor::new(input))?;
 
-    assert_records(
-        &mut ReverseJsonlScanner::new(Cursor::new(input))?,
-        &["third", "second", "first"],
-    )
+    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("third"));
+    assert_eq!(scanner.last_record_start_offset(), Some(third_offset));
+    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("second"));
+    assert_eq!(scanner.last_record_start_offset(), Some(second_offset));
+    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("first"));
+    assert_eq!(scanner.last_record_start_offset(), Some(0));
+    assert!(scanner.scan_next::<TestRecord>()?.is_none());
+    Ok(())
 }
 
 #[test]
@@ -71,11 +83,15 @@ not-json
 #[test]
 fn accepts_valid_json_at_eof() -> std::io::Result<()> {
     let input = b"{\"value\":\"first\"}\n{\"value\":\"second\"}";
+    let second_offset = b"{\"value\":\"first\"}\n".len() as u64;
+    let mut scanner = ReverseJsonlScanner::new(Cursor::new(input))?;
 
-    assert_records(
-        &mut ReverseJsonlScanner::new(Cursor::new(input))?,
-        &["second", "first"],
-    )
+    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("second"));
+    assert_eq!(scanner.last_record_start_offset(), Some(second_offset));
+    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("first"));
+    assert_eq!(scanner.last_record_start_offset(), Some(0));
+    assert!(scanner.scan_next::<TestRecord>()?.is_none());
+    Ok(())
 }
 
 #[test]

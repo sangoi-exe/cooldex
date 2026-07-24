@@ -50,6 +50,7 @@ use crate::ResumeThreadParams;
 use crate::SearchThreadOccurrencesParams;
 use crate::SearchThreadsParams;
 use crate::StoredModelContext;
+use crate::StoredRecallRolloutTail;
 use crate::StoredRolloutTail;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
@@ -358,6 +359,13 @@ impl ThreadStore for LocalThreadStore {
         params: LoadRolloutTailParams,
     ) -> ThreadStoreFuture<'_, StoredRolloutTail> {
         Box::pin(async move { rollout_tail::load_rollout_tail(self, params).await })
+    }
+
+    fn load_recall_rollout_tail(
+        &self,
+        params: LoadRolloutTailParams,
+    ) -> ThreadStoreFuture<'_, StoredRecallRolloutTail> {
+        Box::pin(async move { rollout_tail::load_recall_rollout_tail(self, params).await })
     }
 
     fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread> {

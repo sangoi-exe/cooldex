@@ -253,8 +253,7 @@ fn post_compact_recovery_current_projections_ignore_internal_metadata() {
         "internal recovery metadata must not satisfy a model-context cutoff"
     );
 
-    let builder =
-        builder_from_items(std::slice::from_ref(&item), path.as_path()).expect("builder");
+    let builder = builder_from_items(std::slice::from_ref(&item), path.as_path()).expect("builder");
     let naive = NaiveDateTime::parse_from_str("2026-01-27T12-34-56", "%Y-%m-%dT%H-%M-%S")
         .expect("timestamp");
     let created_at = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)

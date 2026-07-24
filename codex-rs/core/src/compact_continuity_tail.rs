@@ -1,9 +1,8 @@
 //! Preserves one bounded, complete tool-call/tool-output batch across remote V2 compaction.
 
-use std::collections::HashSet;
-
 use crate::context_manager::truncate_function_output_payload;
 use crate::session::turn_context::TurnContext;
+use crate::tool_batch::complete_trailing_tool_batch;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
@@ -25,16 +24,9 @@ pub(crate) fn append_remote_v2_mid_turn_continuity_tail(
     prompt_input: &[ResponseItem],
     turn_context: &TurnContext,
 ) {
-    // The compact request may stamp passthrough turn metadata at the durable
-    // history/serialization boundary. Mirror that missing-ID stamp locally so
-    // current-turn tool output can be selected without mutating the request.
-    let mut prompt_input = prompt_input.to_vec();
-    for item in &mut prompt_input {
-        item.set_turn_id_if_missing(&turn_context.sub_id);
-    }
     append_tail_with_budget(
         new_history,
-        &prompt_input,
+        prompt_input,
         &turn_context.sub_id,
         continuity_tail_budget_tokens(turn_context),
     );
@@ -122,86 +114,18 @@ struct BudgetedTail {
     estimated_tokens: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum PairKind {
-    Function,
-    Custom,
-    ToolSearch,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ToolIdentity {
-    kind: PairKind,
-    call_id: String,
-}
-
-enum ToolItemKind {
-    Call(ToolIdentity),
-    Output(ToolIdentity),
-    UnsupportedTool,
-    NonTool,
-}
-
 fn latest_complete_current_turn_tail(
     prompt_input: &[ResponseItem],
     current_turn_id: &str,
 ) -> Result<TailCandidate, &'static str> {
-    let mut output_start = prompt_input.len();
-    let mut output_identities = HashSet::new();
-    let mut output_call_ids = HashSet::new();
-    while output_start > 0 {
-        let item = &prompt_input[output_start - 1];
-        match classify_tool_item(item) {
-            ToolItemKind::Output(identity) => {
-                ensure_current_turn(item, current_turn_id)?;
-                if !output_call_ids.insert(identity.call_id.clone()) {
-                    return Err("duplicate_output_call_id");
-                }
-                if !output_identities.insert(identity) {
-                    return Err("duplicate_output_identity");
-                }
-                output_start -= 1;
-            }
-            ToolItemKind::UnsupportedTool => return Err("unsupported_trailing_tool_item"),
-            ToolItemKind::Call(_) | ToolItemKind::NonTool => break,
-        }
-    }
-
-    if output_start == prompt_input.len() {
-        return Err("no_trailing_tool_outputs");
-    }
-
-    let mut call_start = output_start;
-    let mut call_identities = HashSet::new();
-    let mut call_ids = HashSet::new();
-    while call_start > 0 {
-        let item = &prompt_input[call_start - 1];
-        match classify_tool_item(item) {
-            ToolItemKind::Call(identity) => {
-                ensure_current_turn(item, current_turn_id)?;
-                if !call_ids.insert(identity.call_id.clone()) {
-                    return Err("duplicate_call_id");
-                }
-                if !call_identities.insert(identity) {
-                    return Err("duplicate_call_identity");
-                }
-                call_start -= 1;
-            }
-            ToolItemKind::UnsupportedTool => return Err("unsupported_call_item"),
-            ToolItemKind::Output(_) | ToolItemKind::NonTool => break,
-        }
-    }
-
-    if call_start == output_start {
-        return Err("no_matching_tool_calls");
-    }
-    if call_identities != output_identities {
-        return Err("incomplete_or_asymmetric_tool_batch");
+    let batch = complete_trailing_tool_batch(prompt_input)?;
+    for item in &prompt_input[batch.range.clone()] {
+        ensure_current_turn(item, current_turn_id)?;
     }
 
     Ok(TailCandidate {
-        items: prompt_input[call_start..].to_vec(),
-        output_count: prompt_input[output_start..].len(),
+        output_count: batch.range.end - batch.output_start,
+        items: prompt_input[batch.range].to_vec(),
     })
 }
 
@@ -211,52 +135,6 @@ fn ensure_current_turn(item: &ResponseItem, current_turn_id: &str) -> Result<(),
     } else {
         Err("wrong_or_missing_turn_id")
     }
-}
-
-fn classify_tool_item(item: &ResponseItem) -> ToolItemKind {
-    match item {
-        ResponseItem::FunctionCall { call_id, .. } => identity(call_id, PairKind::Function)
-            .map_or(ToolItemKind::UnsupportedTool, ToolItemKind::Call),
-        ResponseItem::LocalShellCall { call_id, .. } => call_id
-            .as_deref()
-            .and_then(|call_id| identity(call_id, PairKind::Function))
-            .map_or(ToolItemKind::UnsupportedTool, ToolItemKind::Call),
-        ResponseItem::CustomToolCall { call_id, .. } => identity(call_id, PairKind::Custom)
-            .map_or(ToolItemKind::UnsupportedTool, ToolItemKind::Call),
-        ResponseItem::ToolSearchCall { call_id, .. } => call_id
-            .as_deref()
-            .and_then(|call_id| identity(call_id, PairKind::ToolSearch))
-            .map_or(ToolItemKind::UnsupportedTool, ToolItemKind::Call),
-        ResponseItem::FunctionCallOutput { call_id, .. } => identity(call_id, PairKind::Function)
-            .map_or(ToolItemKind::UnsupportedTool, ToolItemKind::Output),
-        ResponseItem::CustomToolCallOutput { call_id, .. } => identity(call_id, PairKind::Custom)
-            .map_or(ToolItemKind::UnsupportedTool, ToolItemKind::Output),
-        ResponseItem::ToolSearchOutput { call_id, .. } => call_id
-            .as_deref()
-            .and_then(|call_id| identity(call_id, PairKind::ToolSearch))
-            .map_or(ToolItemKind::UnsupportedTool, ToolItemKind::Output),
-        ResponseItem::AdditionalTools { .. }
-        | ResponseItem::Message { .. }
-        | ResponseItem::AgentMessage { .. }
-        | ResponseItem::Reasoning { .. }
-        | ResponseItem::WebSearchCall { .. }
-        | ResponseItem::ImageGenerationCall { .. }
-        | ResponseItem::Compaction { .. }
-        | ResponseItem::CompactionTrigger { .. }
-        | ResponseItem::ContextCompaction { .. }
-        | ResponseItem::Other => ToolItemKind::NonTool,
-    }
-}
-
-fn identity(call_id: &str, kind: PairKind) -> Option<ToolIdentity> {
-    let call_id = call_id.trim();
-    if call_id.is_empty() {
-        return None;
-    }
-    Some(ToolIdentity {
-        kind,
-        call_id: call_id.to_string(),
-    })
 }
 
 fn apply_tail_budget(

@@ -264,14 +264,13 @@ async fn run_remote_compact_task_inner_impl(
         trace_input_history,
     } = attempt;
     let (new_window_number, new_window_ids) = sess.prepare_auto_compact_window().await;
-    let (new_history, world_state_baseline) =
-        process_compacted_history(
-            sess.as_ref(),
-            new_history,
-            &initial_context_injection,
-            new_window_ids,
-        )
-        .await;
+    let (new_history, world_state_baseline) = process_compacted_history(
+        sess.as_ref(),
+        new_history,
+        &initial_context_injection,
+        new_window_ids,
+    )
+    .await;
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,

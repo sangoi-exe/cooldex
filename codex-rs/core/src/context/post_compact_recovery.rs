@@ -69,7 +69,10 @@ impl PostCompactRecoveryContext {
         let json = serde_json::to_string(&document)
             .map_err(PostCompactRecoveryContextError::Serialization)?;
         let body = format!("\n{}\n", escape_historical_delimiters(&json));
-        let recall = recall.map(PostCompactRecallContext::new).transpose()?;
+        let recall = recall
+            .filter(|recall| recall.is_available())
+            .map(PostCompactRecallContext::new)
+            .transpose()?;
         let context = Self { body, recall };
         let mut rendered = context.render();
         if let Some(recall) = context.recall.as_ref() {

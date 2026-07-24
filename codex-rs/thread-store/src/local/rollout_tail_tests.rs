@@ -48,6 +48,16 @@ fn append_line(path: &std::path::Path, ordinal: u64, item: RolloutItem) {
     .expect("append rollout line");
 }
 
+fn append_value(path: &std::path::Path, value: serde_json::Value) -> u64 {
+    let byte_offset = fs::metadata(path).expect("rollout metadata").len();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open rollout");
+    writeln!(file, "{value}").expect("append rollout value");
+    byte_offset
+}
+
 #[tokio::test]
 async fn loads_complete_rollout_in_replay_order() {
     let home = TempDir::new().expect("temp dir");
@@ -301,6 +311,183 @@ async fn rejects_malformed_rollout_records() {
 
     assert!(matches!(err, ThreadStoreError::Internal { .. }));
     assert!(err.to_string().contains("rejected rollout record"));
+}
+
+#[tokio::test]
+async fn recall_projection_ignores_redacted_historical_token_count_record() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 3006);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-02-05",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write rollout");
+    append_value(
+        path.as_path(),
+        // Redacted from the historical token-count record that reproduced the
+        // strict flattened RolloutLine deserialization failure in the operator rollout.
+        serde_json::json!({
+            "timestamp": "2025-01-03T13:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 80,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 10,
+                        "total_tokens": 120
+                    },
+                    "last_token_usage": {
+                        "input_tokens": 10,
+                        "cached_input_tokens": 8,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 2,
+                        "reasoning_output_tokens": 1,
+                        "total_tokens": 12
+                    },
+                    "model_context_window": 272000
+                },
+                "rate_limits": {
+                    "limit_id": "redacted",
+                    "limit_name": null,
+                    "primary": {
+                        "used_percent": 97.5,
+                        "window_minutes": 300,
+                        "resets_at": 1
+                    },
+                    "secondary": null,
+                    "credits": {
+                        "has_credits": true,
+                        "unlimited": false,
+                        "balance": "redacted"
+                    },
+                    "individual_limit": null,
+                    "spend_control_reached": null,
+                    "plan_type": "pro",
+                    "rate_limit_reached_type": null
+                }
+            }
+        }),
+    );
+    append_line(path.as_path(), 2, message("relevant"));
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let strict_error = store
+        .load_rollout_tail(LoadRolloutTailParams {
+            thread_id,
+            include_archived: false,
+            max_bytes: 1024 * 1024,
+            max_records: 16,
+        })
+        .await
+        .expect_err("strict reader should retain full-schema validation");
+    assert!(strict_error.to_string().contains("expected f64"));
+    assert!(strict_error.to_string().contains("byte offset"));
+
+    let projected = store
+        .load_recall_rollout_tail(LoadRolloutTailParams {
+            thread_id,
+            include_archived: false,
+            max_bytes: 1024 * 1024,
+            max_records: 16,
+        })
+        .await
+        .expect("load recall projection");
+
+    assert_eq!(
+        serde_json::to_value(projected.items).expect("serialize projected items"),
+        serde_json::to_value(vec![message("relevant")]).expect("serialize expected items")
+    );
+    assert!(projected.reached_start);
+    assert_eq!(projected.records_read, 3);
+    assert_eq!(projected.source_issue, None);
+}
+
+#[tokio::test]
+async fn recall_projection_reports_relevant_historical_schema_drift() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 3007);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-02-06",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write rollout");
+    let byte_offset = append_value(
+        path.as_path(),
+        serde_json::json!({
+            "timestamp": "2025-01-03T13:00:01Z",
+            "ordinal": 7,
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": {},
+                "content": []
+            }
+        }),
+    );
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let projected = store
+        .load_recall_rollout_tail(LoadRolloutTailParams {
+            thread_id,
+            include_archived: false,
+            max_bytes: 1024 * 1024,
+            max_records: 16,
+        })
+        .await
+        .expect("schema drift should be reported as projection data");
+    let issue = projected.source_issue.expect("projected source issue");
+
+    assert_eq!(
+        issue.kind,
+        crate::RecallRolloutSourceIssueKind::UnsupportedSchema
+    );
+    assert_eq!(issue.path.as_deref(), Some(path.as_path()));
+    assert_eq!(issue.line, None);
+    assert_eq!(issue.byte_offset, Some(byte_offset));
+    assert_eq!(issue.ordinal, Some(7));
+    assert_eq!(issue.record_type.as_deref(), Some("response_item"));
+    assert_eq!(issue.event_type, None);
+    assert!(issue.message.contains("unsupported schema"));
+}
+
+#[test]
+#[ignore = "requires CODEX_RECALL_SMOKE_ROLLOUT_COPY"]
+fn recall_projection_smoke_reads_an_operator_supplied_rollout_copy() {
+    let path = std::env::var_os("CODEX_RECALL_SMOKE_ROLLOUT_COPY")
+        .map(std::path::PathBuf::from)
+        .expect("CODEX_RECALL_SMOKE_ROLLOUT_COPY must name a copied rollout");
+
+    let strict_error = match scan_strict_rollout_segment(
+        path.as_path(),
+        /*end*/ None,
+        16 * 1024 * 1024,
+        8_192,
+    ) {
+        Ok(_) => {
+            panic!("the operator-supplied copy should preserve the strict-reader regression")
+        }
+        Err(error) => error,
+    };
+    assert!(strict_error.to_string().contains("expected f64"));
+    assert!(strict_error.to_string().contains("byte offset"));
+
+    let scan =
+        scan_recall_rollout_segment(path.as_path(), /*end*/ None, 16 * 1024 * 1024, 8_192).expect(
+            "bounded recall projection should not fail on an operator-supplied rollout copy",
+        );
+
+    assert!(scan.records_read > 0);
+    assert_eq!(scan.source_issue, None);
 }
 
 #[tokio::test]

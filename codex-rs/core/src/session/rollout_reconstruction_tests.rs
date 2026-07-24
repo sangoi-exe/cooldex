@@ -296,19 +296,17 @@ async fn post_compact_recovery_rollback_of_consuming_turn_restores_pending() {
         "a durable application proof remains authoritative across a crash before TurnComplete"
     );
 
-    rollout_items.push(
-        RolloutItem::EventMsg(EventMsg::TurnComplete(
-            codex_protocol::protocol::TurnCompleteEvent {
-                turn_id: consuming_turn_id.to_string(),
-                last_agent_message: None,
-                error: None,
-                started_at: None,
-                completed_at: None,
-                duration_ms: None,
-                time_to_first_token_ms: None,
-            },
-        )),
-    );
+    rollout_items.push(RolloutItem::EventMsg(EventMsg::TurnComplete(
+        codex_protocol::protocol::TurnCompleteEvent {
+            turn_id: consuming_turn_id.to_string(),
+            last_agent_message: None,
+            error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+        },
+    )));
 
     let consumed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)

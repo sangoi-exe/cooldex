@@ -26,6 +26,7 @@ pub struct ReverseJsonlScanner<R> {
     record_reversed: Vec<u8>,
     bytes_read: u64,
     reached_start: bool,
+    last_record_start_offset: Option<u64>,
 }
 
 impl<R> ReverseJsonlScanner<R>
@@ -81,6 +82,7 @@ where
             record_reversed: Vec::new(),
             bytes_read: 0,
             reached_start: end_byte_offset == 0,
+            last_record_start_offset: None,
         })
     }
 
@@ -94,6 +96,11 @@ where
         self.reached_start
     }
 
+    /// Returns the absolute byte offset of the last nonblank record returned by the scanner.
+    pub fn last_record_start_offset(&self) -> Option<u64> {
+        self.last_record_start_offset
+    }
+
     /// Scans the next nonblank record.
     ///
     /// I/O failures are returned as [`Err`]. Invalid JSON records are returned as
@@ -105,7 +112,7 @@ where
         loop {
             let Some(byte) = self.read_previous_byte()? else {
                 if self.reached_start {
-                    return Ok(self.finish_record());
+                    return Ok(self.finish_record(/*record_start_offset*/ 0));
                 }
                 self.record_reversed.clear();
                 return Ok(None);
@@ -116,7 +123,8 @@ where
                 continue;
             }
 
-            if let Some(outcome) = self.finish_record() {
+            let record_start_offset = self.next_chunk_end + self.chunk_position as u64 + 1;
+            if let Some(outcome) = self.finish_record(record_start_offset) {
                 return Ok(Some(outcome));
             }
         }
@@ -143,7 +151,7 @@ where
         Ok(Some(self.chunk[self.chunk_position]))
     }
 
-    fn finish_record<T>(&mut self) -> Option<ScanOutcome<T>>
+    fn finish_record<T>(&mut self, record_start_offset: u64) -> Option<ScanOutcome<T>>
     where
         T: DeserializeOwned,
     {
@@ -151,6 +159,7 @@ where
         let outcome = if self.record_reversed.iter().all(u8::is_ascii_whitespace) {
             None
         } else {
+            self.last_record_start_offset = Some(record_start_offset);
             Some(match serde_json::from_slice::<T>(&self.record_reversed) {
                 Ok(value) => ScanOutcome::Parsed(value),
                 Err(error) => ScanOutcome::Rejected(error),

@@ -114,3 +114,25 @@ fn post_compact_recovery_packet_cap_fails_closed() {
 
     assert!(matches!(error, PostCompactRecoveryContextError::PacketCap));
 }
+
+#[test]
+fn unavailable_recall_keeps_the_fixed_boundary_without_a_recall_item() {
+    let recall = RecallContext::unavailable(
+        json!({
+            "thread_id": "019f-recovery-thread",
+            "availability": "unsupported_schema",
+            "groups": []
+        })
+        .to_string(),
+    );
+
+    let context = PostCompactRecoveryContext::new(
+        "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
+        "msg_boundary",
+        Some(&recall),
+    )
+    .expect("unavailable recall should not block the fixed recovery boundary");
+
+    assert_eq!(context.role(), "developer");
+    assert_eq!(context.recall(), None);
+}

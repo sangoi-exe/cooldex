@@ -10,7 +10,9 @@ use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
-use codex_thread_store::StoredRolloutTail;
+use codex_thread_store::RecallRolloutSourceIssue;
+use codex_thread_store::RecallRolloutSourceIssueKind;
+use codex_thread_store::StoredRecallRolloutTail;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 
@@ -32,6 +34,26 @@ fn message(role: &str, text: &str) -> ResponseItem {
         role: role.to_string(),
         content: vec![content],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn function_call(call_id: &str) -> ResponseItem {
+    ResponseItem::FunctionCall {
+        id: None,
+        name: "shell".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: call_id.to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn function_output(call_id: &str, output: &str) -> ResponseItem {
+    ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload::from_text(output.to_string()),
         internal_chat_message_metadata_passthrough: None,
     }
 }
@@ -67,14 +89,15 @@ fn compacted_window(
     })
 }
 
-fn tail(thread_id: codex_protocol::ThreadId, items: Vec<RolloutItem>) -> StoredRolloutTail {
-    StoredRolloutTail {
+fn tail(thread_id: codex_protocol::ThreadId, items: Vec<RolloutItem>) -> StoredRecallRolloutTail {
+    StoredRecallRolloutTail {
         thread_id,
         items,
         reached_start: true,
         bytes_read: 1_024,
         records_read: 8,
         segments_read: 1,
+        source_issue: None,
     }
 }
 
@@ -118,20 +141,8 @@ fn turn_complete(turn_id: &str) -> RolloutItem {
 #[tokio::test]
 async fn returns_paired_chronological_groups_before_the_surviving_boundary() {
     let (session, turn_context) = make_session_and_context().await;
-    let call = ResponseItem::FunctionCall {
-        id: None,
-        name: "shell".to_string(),
-        namespace: None,
-        arguments: "{}".to_string(),
-        call_id: "call-1".to_string(),
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let output = ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: "call-1".to_string(),
-        output: FunctionCallOutputPayload::from_text("done".to_string()),
-        internal_chat_message_metadata_passthrough: None,
-    };
+    let call = function_call("call-1");
+    let output = function_output("call-1", "done");
     let tool_search_call = ResponseItem::ToolSearchCall {
         id: None,
         call_id: Some("search-1".to_string()),
@@ -187,6 +198,91 @@ async fn returns_paired_chronological_groups_before_the_surviving_boundary() {
     );
     assert_eq!(value["omitted_groups"], 0);
     assert_eq!(value["truncated"], false);
+}
+
+#[tokio::test]
+async fn preserves_parallel_tool_batch_order_and_atomicity() {
+    let (session, turn_context) = make_session_and_context().await;
+    let context = session
+        .build_recall_context(
+            &turn_context,
+            tail(
+                session.thread_id,
+                vec![
+                    RolloutItem::ResponseItem(function_call("call-a")),
+                    RolloutItem::ResponseItem(function_call("call-b")),
+                    RolloutItem::ResponseItem(function_output("call-b", "second")),
+                    RolloutItem::ResponseItem(function_output("call-a", "first")),
+                    compacted("summary", Some(Vec::new())),
+                ],
+            ),
+        )
+        .await
+        .expect("build atomic recall batch");
+    let value = parsed(&context);
+    let groups = value["groups"].as_array().expect("groups");
+    let items = groups[0]["items"].as_array().expect("batch items");
+
+    assert_eq!(groups.len(), 1);
+    assert_eq!(items.len(), 4);
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item["call_id"].as_str().expect("call id"))
+            .collect::<Vec<_>>(),
+        vec!["call-a", "call-b", "call-b", "call-a"]
+    );
+    assert_eq!(value["omitted_groups"], 0);
+}
+
+#[tokio::test]
+async fn omits_an_incomplete_tool_batch_as_one_group() {
+    let (session, turn_context) = make_session_and_context().await;
+    let context = session
+        .build_recall_context(
+            &turn_context,
+            tail(
+                session.thread_id,
+                vec![
+                    RolloutItem::ResponseItem(function_call("call-a")),
+                    RolloutItem::ResponseItem(function_call("call-b")),
+                    RolloutItem::ResponseItem(function_output("call-a", "only one")),
+                    compacted("summary", Some(Vec::new())),
+                ],
+            ),
+        )
+        .await
+        .expect("omit incomplete recall batch");
+    let value = parsed(&context);
+
+    assert_eq!(value["groups"].as_array().expect("groups").len(), 0);
+    assert_eq!(value["omitted_groups"], 1);
+    assert_eq!(value["truncated"], true);
+}
+
+#[tokio::test]
+async fn omits_an_unidentified_call_with_its_parallel_batch() {
+    let (session, turn_context) = make_session_and_context().await;
+    let context = session
+        .build_recall_context(
+            &turn_context,
+            tail(
+                session.thread_id,
+                vec![
+                    RolloutItem::ResponseItem(function_call("")),
+                    RolloutItem::ResponseItem(function_call("call-b")),
+                    RolloutItem::ResponseItem(function_output("call-b", "second")),
+                    compacted("summary", Some(Vec::new())),
+                ],
+            ),
+        )
+        .await
+        .expect("omit unidentified call and its complete parallel follower");
+    let value = parsed(&context);
+
+    assert_eq!(value["groups"].as_array().expect("groups").len(), 0);
+    assert_eq!(value["omitted_groups"], 1);
+    assert_eq!(value["truncated"], true);
 }
 
 #[tokio::test]
@@ -362,6 +458,7 @@ async fn reports_unavailable_source_and_missing_compaction() {
         .await
         .expect("work limit result");
     assert_eq!(parsed(&work_limit)["availability"], "work_limit");
+    assert!(!work_limit.is_available());
 
     let no_compaction = session
         .build_recall_context(
@@ -374,6 +471,69 @@ async fn reports_unavailable_source_and_missing_compaction() {
         .await
         .expect("no compaction result");
     assert_eq!(parsed(&no_compaction)["availability"], "no_compaction");
+    assert!(!no_compaction.is_available());
+}
+
+#[tokio::test]
+async fn reports_projected_historical_schema_drift_without_reconstruction() {
+    let (session, turn_context) = make_session_and_context().await;
+    let mut stored_tail = tail(
+        session.thread_id,
+        vec![RolloutItem::ResponseItem(message(
+            "assistant",
+            "must not be reconstructed",
+        ))],
+    );
+    stored_tail.reached_start = false;
+    stored_tail.source_issue = Some(RecallRolloutSourceIssue {
+        kind: RecallRolloutSourceIssueKind::UnsupportedSchema,
+        path: Some("/tmp/copied-rollout.jsonl".into()),
+        line: None,
+        byte_offset: Some(1234),
+        ordinal: Some(17),
+        record_type: Some("response_item".to_string()),
+        event_type: None,
+        message: "historical response item drift".to_string(),
+    });
+
+    let context = session
+        .build_recall_context(&turn_context, stored_tail)
+        .await
+        .expect("schema drift should become a bounded recall result");
+    let value = parsed(&context);
+
+    assert!(!context.is_available());
+    assert_eq!(value["availability"], "unsupported_schema");
+    assert_eq!(value["diagnostic_class"], "historical_schema_drift");
+    assert_eq!(value["source"]["path"], "/tmp/copied-rollout.jsonl");
+    assert_eq!(value["source"]["line"], Value::Null);
+    assert_eq!(value["source"]["byte_offset"], 1234);
+    assert_eq!(value["source"]["ordinal"], 17);
+    assert_eq!(value["source"]["record_type"], "response_item");
+    assert_eq!(value["groups"].as_array().expect("groups").len(), 0);
+}
+
+#[test]
+fn renders_source_failures_as_bounded_nonfatal_recall_results() {
+    let thread_id = codex_protocol::ThreadId::new();
+    let error = RecallLoadError::Source(anyhow::anyhow!(
+        "historical source failed: {}",
+        "x".repeat(RECALL_DIAGNOSTIC_MAX_BYTES * 2)
+    ));
+
+    let context = unavailable_recall_context_for_error(thread_id, &error)
+        .expect("render bounded source diagnostic");
+    let value = parsed(&context);
+    let diagnostic = value["diagnostic_message"]
+        .as_str()
+        .expect("diagnostic message");
+
+    assert!(!context.is_available());
+    assert_eq!(value["availability"], "source_error");
+    assert_eq!(value["diagnostic_class"], "source_read_error");
+    assert!(diagnostic.len() <= RECALL_DIAGNOSTIC_MAX_BYTES);
+    assert!(diagnostic.ends_with("..."));
+    assert_eq!(value["groups"], serde_json::json!([]));
 }
 
 #[tokio::test]

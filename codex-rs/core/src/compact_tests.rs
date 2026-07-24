@@ -2,6 +2,7 @@ use super::*;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::ResponseItemId;
+use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use pretty_assertions::assert_eq;
@@ -50,6 +51,18 @@ fn user_message(text: &str) -> ResponseItem {
             text: text.to_string(),
         }],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn agent_message(text: &str) -> ResponseItem {
+    ResponseItem::AgentMessage {
+        id: None,
+        author: "agent".to_string(),
+        recipient: "user".to_string(),
+        content: vec![AgentMessageInputContent::InputText {
+            text: text.to_string(),
+        }],
         internal_chat_message_metadata_passthrough: None,
     }
 }
@@ -749,6 +762,49 @@ fn insert_initial_context_moves_to_front_when_assistant_precedes_user_anchor() {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
+    let user = user_message("retained user");
+    let developer = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "fresh instructions".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let refreshed = insert_initial_context_before_last_real_user_or_summary(
+        vec![assistant.clone(), user.clone()],
+        vec![developer.clone()],
+    );
+
+    assert_eq!(refreshed, vec![developer, assistant, user]);
+}
+
+#[test]
+fn insert_initial_context_precedes_agent_message_only_compacted_history() {
+    let assistant = agent_message("assistant compact note");
+    let developer = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "fresh instructions".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let refreshed = insert_initial_context_before_last_real_user_or_summary(
+        vec![assistant.clone()],
+        vec![developer.clone()],
+    );
+
+    assert_eq!(refreshed, vec![developer, assistant]);
+}
+
+#[test]
+fn insert_initial_context_moves_to_front_when_agent_message_precedes_user_anchor() {
+    let assistant = agent_message("assistant compact note");
     let user = user_message("retained user");
     let developer = ResponseItem::Message {
         id: None,

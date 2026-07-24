@@ -21,6 +21,7 @@ use crate::ResumeThreadParams;
 use crate::SearchThreadOccurrencesParams;
 use crate::SearchThreadsParams;
 use crate::StoredModelContext;
+use crate::StoredRecallRolloutTail;
 use crate::StoredRolloutTail;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
@@ -105,6 +106,21 @@ pub trait ThreadStore: Any + Send + Sync {
             Err(ThreadStoreError::Unsupported {
                 operation: "load_rollout_tail",
             })
+        })
+    }
+
+    /// Reads the reconstruction-relevant projection of a bounded canonical rollout tail.
+    ///
+    /// Stores without a specialized persisted-schema projection may delegate to their ordinary
+    /// bounded reader.
+    fn load_recall_rollout_tail(
+        &self,
+        params: LoadRolloutTailParams,
+    ) -> ThreadStoreFuture<'_, StoredRecallRolloutTail> {
+        Box::pin(async move {
+            self.load_rollout_tail(params)
+                .await
+                .map(StoredRecallRolloutTail::from)
         })
     }
 

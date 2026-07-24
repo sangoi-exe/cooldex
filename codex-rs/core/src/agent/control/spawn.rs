@@ -104,10 +104,7 @@ pub(super) fn drop_unowned_recovery_applications(items: &mut Vec<RolloutItem>) {
                         .id()
                         .map(|item_id| item_id.as_str())
                 })?;
-            Some((
-                compaction_window_id.clone(),
-                boundary_item_id.to_string(),
-            ))
+            Some((compaction_window_id.clone(), boundary_item_id.to_string()))
         })
         .collect::<HashSet<_>>();
     items.retain(|item| match item {

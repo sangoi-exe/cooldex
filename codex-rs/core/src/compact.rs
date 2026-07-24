@@ -542,6 +542,14 @@ pub(crate) fn is_summary_message(message: &str) -> bool {
     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
 }
 
+fn is_assistant_generated_history(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message { role, .. } => role == "assistant",
+        ResponseItem::AgentMessage { .. } => true,
+        _ => false,
+    }
+}
+
 /// Inserts canonical initial context into compacted replacement history at the
 /// model-expected boundary.
 ///
@@ -552,6 +560,8 @@ pub(crate) fn is_summary_message(message: &str) -> bool {
 /// - If there are no user messages, insert before the last compaction item so
 ///   that item remains last (remote compaction may return only compaction items).
 /// - If there are no user messages or compaction items, append the context.
+/// - Move the context to index zero whenever assistant-generated history would
+///   otherwise precede it.
 pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
     mut compacted_history: Vec<ResponseItem>,
     initial_context: Vec<ResponseItem>,
@@ -586,17 +596,13 @@ pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
         .or(last_user_or_summary_index)
         .or(last_compaction_index);
 
-    if insertion_index.is_none()
-        && compacted_history
-            .iter()
-            .any(|item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"))
-    {
+    if insertion_index.is_none() && compacted_history.iter().any(is_assistant_generated_history) {
         insertion_index = Some(0);
     }
     if insertion_index.is_some_and(|index| {
         compacted_history[..index]
             .iter()
-            .any(|item| matches!(item, ResponseItem::Message { role, .. } if role == "assistant"))
+            .any(is_assistant_generated_history)
     }) {
         insertion_index = Some(0);
     }

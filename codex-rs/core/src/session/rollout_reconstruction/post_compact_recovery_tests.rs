@@ -54,7 +54,18 @@ fn application(window_id: &str, boundary_item_id: &str, turn_id: &str) -> Rollou
 }
 
 fn reconstruct(items_chronological: &[RolloutItem]) -> PostCompactRecoveryRuntimeState {
-    reconstruct_with_application_turn(items_chronological, Some(TURN_ID))
+    let replay = items_chronological
+        .iter()
+        .rev()
+        .map(|item| {
+            let turn_id = match item {
+                RolloutItem::PostCompactRecoveryApplied(applied) => Some(applied.turn_id.clone()),
+                _ => None,
+            };
+            PostCompactRecoveryReplayItem::new(item, turn_id)
+        })
+        .collect();
+    reconstruct_post_compact_recovery(replay)
 }
 
 fn reconstruct_with_application_turn(
@@ -158,6 +169,16 @@ fn duplicate_matching_application_is_idempotent_but_mismatch_blocks() {
         application(WINDOW_ID, BOUNDARY_ID, TURN_ID),
     ]);
     assert_eq!(duplicate, PostCompactRecoveryRuntimeState::Absent);
+
+    let retry_in_another_turn = reconstruct(&[
+        marked_compaction(),
+        application(WINDOW_ID, BOUNDARY_ID, TURN_ID),
+        application(WINDOW_ID, BOUNDARY_ID, "turn_retry"),
+    ]);
+    assert_eq!(
+        retry_in_another_turn,
+        PostCompactRecoveryRuntimeState::Absent
+    );
 
     let mismatched = reconstruct(&[
         marked_compaction(),

@@ -92,7 +92,11 @@ impl Session {
             Some(packet) => packet,
             None => {
                 let recall = match self.load_current_thread_recall_context(turn_context).await {
-                    Ok(recall) => Some(recall),
+                    Ok(recall) if recall.is_available() => Some(recall),
+                    Ok(_) => {
+                        warn!("post-compact recall unavailable; injecting fixed boundary only");
+                        None
+                    }
                     Err(RecallLoadError::Source(error)) => {
                         warn!(
                             %error,

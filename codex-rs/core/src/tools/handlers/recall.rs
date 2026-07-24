@@ -11,6 +11,7 @@ use serde_json::Value as JsonValue;
 use crate::context::ContextualUserFragment;
 use crate::context::RecallContext;
 use crate::function_tool::FunctionCallError;
+use crate::session::recall::unavailable_recall_context_for_error;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -90,14 +91,22 @@ impl ToolExecutor<ToolInvocation> for RecallHandler {
                 }
             };
             let _: RecallArgs = parse_arguments(arguments.as_str())?;
-            let context = session
+            let context = match session
                 .load_current_thread_recall_context(turn.as_ref())
                 .await
-                .map_err(|err| {
-                    FunctionCallError::Fatal(format!("failed to build recall result: {err:#}"))
-                })?;
+            {
+                Ok(context) => context,
+                Err(error) => unavailable_recall_context_for_error(session.thread_id, &error)
+                    .map_err(|render_error| {
+                        FunctionCallError::RespondToModel(format!(
+                            "recall was unavailable and its bounded diagnostic could not be rendered: {render_error}"
+                        ))
+                    })?,
+            };
             let code_mode_result = serde_json::from_str(context.json()).map_err(|err| {
-                FunctionCallError::Fatal(format!("failed to parse recall result: {err}"))
+                FunctionCallError::RespondToModel(format!(
+                    "recall produced an invalid bounded result: {err}"
+                ))
             })?;
             Ok(boxed_tool_output(RecallToolOutput {
                 context,

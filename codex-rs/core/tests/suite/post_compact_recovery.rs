@@ -167,8 +167,8 @@ async fn seed_and_compact(codex: &codex_core::CodexThread) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn post_compact_recovery_transport_failure_before_response_records_no_sampling_success()
--> Result<()> {
+async fn post_compact_recovery_stream_closes_after_created_without_sampling_success() -> Result<()>
+{
     skip_if_no_network!(Ok(()));
     let (server, _) = start_streaming_sse_server(vec![
         vec![StreamingSseChunk {
@@ -184,6 +184,10 @@ async fn post_compact_recovery_transport_failure_before_response_records_no_samp
                 ev_assistant_message("compact-message", SUMMARY),
                 ev_completed("compact"),
             ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_response_created("created-without-completed")]),
         }],
     ])
     .await;
@@ -201,7 +205,6 @@ async fn post_compact_recovery_transport_failure_before_response_records_no_samp
         .expect("rollout path");
 
     seed_and_compact(&test.codex).await?;
-    server.shutdown().await;
     test.codex.submit(user_turn(LIVE_USER)).await?;
     wait_for_failed_turn_complete(&test.codex).await;
 

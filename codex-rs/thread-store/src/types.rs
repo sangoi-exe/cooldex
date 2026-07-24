@@ -205,6 +205,55 @@ pub struct StoredRolloutTail {
     pub segments_read: usize,
 }
 
+/// Failure class reported by the recall-specific rollout projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallRolloutSourceIssueKind {
+    /// The source could not be parsed as a JSONL rollout envelope.
+    SourceError,
+    /// A reconstruction-relevant record uses an unsupported historical schema.
+    UnsupportedSchema,
+}
+
+/// Bounded source diagnostic produced by the recall-specific rollout projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecallRolloutSourceIssue {
+    pub kind: RecallRolloutSourceIssueKind,
+    pub path: Option<PathBuf>,
+    pub line: Option<u64>,
+    pub byte_offset: Option<u64>,
+    pub ordinal: Option<u64>,
+    pub record_type: Option<String>,
+    pub event_type: Option<String>,
+    pub message: String,
+}
+
+/// Bounded reconstruction projection returned for explicit and automatic recall.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StoredRecallRolloutTail {
+    pub thread_id: ThreadId,
+    pub items: Vec<RolloutItem>,
+    pub reached_start: bool,
+    pub bytes_read: u64,
+    pub records_read: usize,
+    pub segments_read: usize,
+    pub source_issue: Option<RecallRolloutSourceIssue>,
+}
+
+impl From<StoredRolloutTail> for StoredRecallRolloutTail {
+    fn from(tail: StoredRolloutTail) -> Self {
+        Self {
+            thread_id: tail.thread_id,
+            items: tail.items,
+            reached_start: tail.reached_start,
+            bytes_read: tail.bytes_read,
+            records_read: tail.records_read,
+            segments_read: tail.segments_read,
+            source_issue: None,
+        }
+    }
+}
+
 /// Parameters for reading a thread summary and optionally its replay history.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadThreadParams {
