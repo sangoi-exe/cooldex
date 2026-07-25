@@ -6,7 +6,9 @@ RELEASE="${CODEX_RELEASE:-latest}"
 NON_INTERACTIVE="${CODEX_NON_INTERACTIVE:-false}"
 DEFAULT_PREFER_RELEASES_OPENAI_COM="false"
 PREFER_RELEASES_OPENAI_COM="${CODEX_INSTALLER_USE_RELEASES_OPENAI_COM:-$DEFAULT_PREFER_RELEASES_OPENAI_COM}"
-GITHUB_REPOSITORY="sangoi-exe/cooldex"
+COOLDEX_GITHUB_REPOSITORY="sangoi-exe/cooldex"
+UPSTREAM_GITHUB_REPOSITORY="openai/codex"
+github_repository="$COOLDEX_GITHUB_REPOSITORY"
 RELEASES_BASE_URL="https://releases.openai.com/codex"
 release_source="github"
 
@@ -260,7 +262,7 @@ release_url_for_asset() {
   resolved_version="$2"
 
   printf 'https://github.com/%s/releases/download/rust-v%s/%s\n' \
-    "$GITHUB_REPOSITORY" "$resolved_version" "$asset"
+    "$github_repository" "$resolved_version" "$asset"
 }
 
 releases_url_for_asset() {
@@ -274,7 +276,7 @@ release_metadata_url() {
   resolved_version="$1"
 
   printf 'https://api.github.com/repos/%s/releases/tags/rust-v%s\n' \
-    "$GITHUB_REPOSITORY" "$resolved_version"
+    "$github_repository" "$resolved_version"
 }
 
 parse_downloaded_release_metadata() {
@@ -301,9 +303,10 @@ resolve_metadata_version() {
 
 resolve_release_from_github() {
   normalized_version="$1"
+  github_repository="$2"
   if [ "$normalized_version" = "latest" ]; then
     requested_release="latest"
-    metadata_url="https://api.github.com/repos/$GITHUB_REPOSITORY/releases/latest"
+    metadata_url="https://api.github.com/repos/$github_repository/releases/latest"
   else
     resolved_version="$normalized_version"
     requested_release="$resolved_version"
@@ -327,6 +330,7 @@ resolve_release_from_github() {
 
 resolve_release_from_releases() {
   normalized_version="$1"
+  github_repository="$UPSTREAM_GITHUB_REPOSITORY"
 
   if [ "$normalized_version" = "latest" ]; then
     requested_release="latest"
@@ -360,10 +364,12 @@ resolve_release() {
         return
       fi
       warn "releases.openai.com is unavailable; falling back to GitHub Releases."
+      resolve_release_from_github "$normalized_version" "$UPSTREAM_GITHUB_REPOSITORY"
+      return
       ;;
   esac
 
-  resolve_release_from_github "$normalized_version"
+  resolve_release_from_github "$normalized_version" "$COOLDEX_GITHUB_REPOSITORY"
 }
 
 release_asset_digest_or_empty() {

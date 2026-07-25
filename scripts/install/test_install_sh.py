@@ -178,10 +178,10 @@ class InstallShTest(unittest.TestCase):
                 [
                     "https://releases.openai.com/codex/channels/latest",
                     f"https://releases.openai.com/codex/releases/{VERSION}/codex-package_SHA256SUMS",
-                    "https://github.com/sangoi-exe/cooldex/releases/download/"
+                    "https://github.com/openai/codex/releases/download/"
                     f"rust-v{VERSION}/codex-package_SHA256SUMS",
                     f"https://releases.openai.com/codex/releases/{VERSION}/codex-package-aarch64-apple-darwin.tar.gz",
-                    "https://github.com/sangoi-exe/cooldex/releases/download/"
+                    "https://github.com/openai/codex/releases/download/"
                     f"rust-v{VERSION}/codex-package-aarch64-apple-darwin.tar.gz",
                 ],
             )
@@ -240,9 +240,9 @@ class InstallShTest(unittest.TestCase):
                 first_requests,
                 [
                     f"https://releases.openai.com/codex/releases/{VERSION}/release.json",
-                    "https://api.github.com/repos/sangoi-exe/cooldex/releases/tags/"
+                    "https://api.github.com/repos/openai/codex/releases/tags/"
                     f"rust-v{VERSION}",
-                    "https://github.com/sangoi-exe/cooldex/releases/download/"
+                    "https://github.com/openai/codex/releases/download/"
                     f"rust-v{VERSION}/codex-npm-darwin-arm64-{VERSION}.tgz",
                 ],
             )
@@ -262,7 +262,7 @@ class InstallShTest(unittest.TestCase):
                 second_requests,
                 [
                     f"https://releases.openai.com/codex/releases/{VERSION}/release.json",
-                    "https://api.github.com/repos/sangoi-exe/cooldex/releases/tags/"
+                    "https://api.github.com/repos/openai/codex/releases/tags/"
                     f"rust-v{VERSION}",
                 ],
             )
@@ -353,21 +353,24 @@ def run_installer_in(
                   exit 22
                 fi
                 ;;
-              https://github.com/sangoi-exe/cooldex/releases/download/*/codex-package_SHA256SUMS)
+              https://github.com/sangoi-exe/cooldex/releases/download/*/codex-package_SHA256SUMS|\
+              https://github.com/openai/codex/releases/download/*/codex-package_SHA256SUMS)
                 if [ -n "$CODEX_TEST_CHECKSUM_PATH" ]; then
                   cp "$CODEX_TEST_CHECKSUM_PATH" "$output"
                 else
                   exit 22
                 fi
                 ;;
-              https://github.com/sangoi-exe/cooldex/releases/download/*/codex-package-*.tar.gz)
+              https://github.com/sangoi-exe/cooldex/releases/download/*/codex-package-*.tar.gz|\
+              https://github.com/openai/codex/releases/download/*/codex-package-*.tar.gz)
                 if [ -n "$CODEX_TEST_ARCHIVE_PATH" ]; then
                   cp "$CODEX_TEST_ARCHIVE_PATH" "$output"
                 else
                   exit 22
                 fi
                 ;;
-              https://github.com/sangoi-exe/cooldex/releases/download/*/codex-npm-*.tgz)
+              https://github.com/sangoi-exe/cooldex/releases/download/*/codex-npm-*.tgz|\
+              https://github.com/openai/codex/releases/download/*/codex-npm-*.tgz)
                 if [ -n "$CODEX_TEST_LEGACY_ARCHIVE_PATH" ]; then
                   cp "$CODEX_TEST_LEGACY_ARCHIVE_PATH" "$output"
                 else
