@@ -1,6 +1,6 @@
 # Scripts Atlas
 
-Last reviewed: 2026-07-23.
+Last reviewed: 2026-07-25.
 
 ## Purpose
 
@@ -15,12 +15,17 @@ Last reviewed: 2026-07-23.
 - `scripts/cooldex/rust-blast-radius-guard.py` - Rust reachability/impact-map helper required by root policy.
 - `scripts/cooldex/test-rust-blast-radius-guard-items.py` - Python regression coverage for blast-radius item resolution and report-summary behavior.
 - `scripts/codex_package/` - Python package/release layout helpers and tests.
+- `scripts/install/install.sh` and `scripts/install/test_install_sh.py` - standalone GitHub Release resolution, checksum-verified installation, and regression coverage.
 - `scripts/run_bazel_with_buildbuddy.py`, `scripts/run-bazel-query.sh`, `scripts/list-bazel-*.sh` - Bazel execution/query helpers.
-- `scripts/install/`, `scripts/macos-signing/`, and release/archive scripts - platform packaging and installation helpers.
+- `scripts/macos-signing/` and release/archive scripts - remaining platform packaging and signing helpers.
 
 ## Durable Notes
 
 - Keep Cargo/build-like validation behavior centralized in `cargo-guard.sh`, `cargo-validate.py`, and `cargo-validation.toml`; do not add parallel ad hoc validation wrappers.
+- The standalone installer's default GitHub Release repository is
+  `sangoi-exe/cooldex`. The `releases.openai.com` source remains an explicit
+  opt-in path; keep its upstream URLs and behavior separate from the Cooldex
+  GitHub owner.
 - The retired `scripts/cooldex/native-diff-budget.sh` is intentionally absent and is not a validation gate, proof owner, seam selector, or progress metric.
 - `scripts/cargo-validation.toml` resource profiles own build-job bounds and runtime-thread caps. Official profiles keep runtime tests serialized at one thread, restore the historical build-job max/hard caps, and set `cargo_jobs_default = "min"` so ordinary runs use the profile minimum unless a lower/equal inline Cargo/nextest build-job override is explicit.
 - `cargo-guard.sh` rejects inline Cargo/nextest build-job values above the selected cap, but inline values below or equal to that cap are allowed and should not require temporary profile edits.
