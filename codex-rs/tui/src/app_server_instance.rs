@@ -654,7 +654,8 @@ fn rename_noreplace(source: &Path, target: &Path) -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid target path")
     })?;
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             source.as_ptr(),
             libc::AT_FDCWD,
