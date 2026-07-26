@@ -37,26 +37,35 @@ Bookkeeping topology: `split`
 ## Active Plan Mirror
 
 <!-- task-bookkeeping:mirror:begin -->
-- Status: no active plan.
-- Completed mode: `Doctrine`.
+- Status: active
+- Mode: `Doctrine`.
 - Root branch: `master-refactor-v2`.
 - `.sangoi` branch: `master-refactor-v2`.
-- Completed plan: `.sangoi/planning/2026-07-25-publish-cooldex-fork-and-linux-release.md`.
-- Completed outcome: A public GitHub fork at `sangoi-exe/cooldex` whose default branch
-  is the current Cooldex branch, while retaining an upstream-owned `main`; a private
-  legacy repository at `sangoi-exe/cooldex-legacy`; a reproducible WSL/Linux x86_64
-  release package; and a stable one-line installer backed by GitHub Releases. The
-  release remains a narrow fork-owned operation. It reuses the upstream standalone
-  package layout and installer, changes only the GitHub release owner, and does not add
-  a GitHub Actions release pipeline.
-- Completed user-request summary: Rename the current private repository to
-  `sangoi-exe/cooldex-legacy` and keep it private only as a reference; create
-  `sangoi-exe/cooldex` as a true public fork of `openai/codex`; preserve `main` as the
-  upstream branch and publish `master-refactor-v2` with its current ancestry, without an
-  orphan branch, history rewrite, or `.sangoi` transfer; converge local remotes to
-  `origin`/`upstream`/`legacy`; add a reproducible release and installer path only for
-  WSL/Linux x86_64; publish a release package rather than the `cdx-dev` debug binary;
-  and prove installation on a clean environment with no Rust toolchain.
+- Canonical plan: `.sangoi/planning/2026-07-26-disable-sol-responses-lite-and-batch-code-mode.md`.
+- What we are creating: A narrow Cooldex runtime correction that always resolves the
+  `gpt-5.6-sol` model family to the full Responses transport, even when a bundled,
+  configured, cached, or remotely refreshed model catalog advertises Responses Lite. The
+  same change strengthens the model-visible `exec` tool description so Code Mode
+  explicitly batches known-independent, read-only nested tool calls with bounded
+  `Promise.all` concurrency while keeping dependent, mutating, approval-sensitive, and
+  wait operations sequential.
+- Confirmed paraphrased user-request summary: Correct the severe GPT-5.6 Sol
+  token/context amplification path locally in the Cooldex fork instead of leaving it
+  only as an upstream report: prevent Sol from using Responses Lite, allow its
+  already-supported top-level parallel tool-call request contract to reach the full
+  Responses API, and update the Code Mode `exec` description so the model is directly
+  instructed to batch safe, independent nested calls. Keep Responses Lite available for
+  every unrelated model, do not add a user-facing compatibility toggle, and accept that
+  Sol will use the full Responses default reasoning context rather than Lite's
+  `all_turns`.
+- Major stop conditions:
+  - Stop if unrelated separate `.sangoi` dirty state cannot be excluded with exact path
+    staging.
+  - Stop if implementing the correction requires editing the generic client serializer,
+    adding a config toggle, disabling Lite globally, or introducing a
+    fallback/compatibility path.
+  - Stop if the prompt needs unbounded concurrency, automatic mutation batching, or
+    retry semantics to achieve the requested outcome.
 <!-- task-bookkeeping:mirror:end -->
 
 ## Planned Fork Requirements — Not Shipped
