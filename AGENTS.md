@@ -37,19 +37,19 @@ Bookkeeping topology: `split`
 ## Active Plan Mirror
 
 <!-- task-bookkeeping:mirror:begin -->
-- Status: active
-- Mode: `Doctrine`.
+- Status: no active plan.
+- Completed mode: `Doctrine`.
 - Root branch: `master-refactor-v2`.
 - `.sangoi` branch: `master-refactor-v2`.
-- Canonical plan: `.sangoi/planning/2026-07-25-publish-cooldex-fork-and-linux-release.md`.
-- What we are creating: A public GitHub fork at `sangoi-exe/cooldex` whose default
-  branch is the current Cooldex branch, while retaining an upstream-owned `main`; a
-  private legacy repository at `sangoi-exe/cooldex-legacy`; a reproducible WSL/Linux
-  x86_64 release package; and a stable one-line installer backed by GitHub Releases. The
+- Completed plan: `.sangoi/planning/2026-07-25-publish-cooldex-fork-and-linux-release.md`.
+- Completed outcome: A public GitHub fork at `sangoi-exe/cooldex` whose default branch
+  is the current Cooldex branch, while retaining an upstream-owned `main`; a private
+  legacy repository at `sangoi-exe/cooldex-legacy`; a reproducible WSL/Linux x86_64
+  release package; and a stable one-line installer backed by GitHub Releases. The
   release remains a narrow fork-owned operation. It reuses the upstream standalone
   package layout and installer, changes only the GitHub release owner, and does not add
   a GitHub Actions release pipeline.
-- Confirmed paraphrased user-request summary: Rename the current private repository to
+- Completed user-request summary: Rename the current private repository to
   `sangoi-exe/cooldex-legacy` and keep it private only as a reference; create
   `sangoi-exe/cooldex` as a true public fork of `openai/codex`; preserve `main` as the
   upstream branch and publish `master-refactor-v2` with its current ancestry, without an
@@ -57,15 +57,6 @@ Bookkeeping topology: `split`
   `origin`/`upstream`/`legacy`; add a reproducible release and installer path only for
   WSL/Linux x86_64; publish a release package rather than the `cdx-dev` debug binary;
   and prove installation on a clean environment with no Rust toolchain.
-- Major stop conditions:
-  - Stop if the old repository is not private or its repository ID cannot be preserved
-    under `cooldex-legacy`.
-  - Stop if GitHub cannot create a true public fork at `sangoi-exe/cooldex` or reports a
-    parent other than `openai/codex`.
-  - Stop if any unexpected fork-owned secret finding or reachable `.sangoi` path
-    appears.
-  - Stop before publishing a release whose package, checksum, GitHub digest, or
-    clean-install proof fails.
 <!-- task-bookkeeping:mirror:end -->
 
 ## Planned Fork Requirements — Not Shipped
