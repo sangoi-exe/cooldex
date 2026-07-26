@@ -7,9 +7,11 @@ Bookkeeping topology: `split`
 - When the operator says `main`, use the local branch named `main`.
 - The supported operator path is WSL with ChatGPT Pro authentication through ordinary
   `codex`/`cdx` TUI or exec sessions.
-- Until the active installation plan completes, the live pre-install topology remains
-  `/home/lucas/.cargo/bin/codex -> cdx-pro` plus the matching interactive Bash alias.
-  Treat that mapping as transitional current state, not the supported target.
+- Until the active installation plan completes, the live P2 topology is
+  `/home/lucas/.cargo/bin/codex` as the reviewed regular Cooldex build, no interactive
+  Bash `codex` alias, and the reviewed `/home/lucas/.cargo/bin/cdx-pro` still present
+  pending exact deletion. Treat that mapping as transitional current state, not the
+  supported target.
 - The post-install supported topology is `/home/lucas/.cargo/bin/codex` for the reviewed
   Cooldex fork build, `/home/lucas/.local/bin/cdx-dev` for development sessions, and
   `cdx` selecting `/home/lucas/.local/bin/codex` for the standalone release. `cdx-pro`
@@ -60,10 +62,11 @@ Bookkeeping topology: `split`
   reviewed Cooldex binary is then built through the guarded workspace recipe, copied to
   one same-directory unique staging file, fully validated and live-smoked through that
   staging path while the operator command remains untouched, and committed as
-  `/home/lucas/.cargo/bin/codex` by one no-copy atomic rename over the current `codex ->
-  cdx-pro` symlink. The obsolete `cdx-pro` binary and its interactive-shell alias are
-  then removed. The current session continues running `/home/lucas/.local/bin/cdx-dev`,
-  and `cdx` continues to select the standalone `/home/lucas/.local/bin/codex`.
+  `/home/lucas/.cargo/bin/codex` by one no-copy atomic rename over the pre-install
+  `codex -> cdx-pro` symlink. The obsolete `cdx-pro` binary and its interactive-shell
+  alias are then removed. The current session continues running
+  `/home/lucas/.local/bin/cdx-dev`, and `cdx` continues to select the standalone
+  `/home/lucas/.local/bin/codex`.
 - Confirmed paraphrased user-request summary: Correct the severe GPT-5.6 Sol
   token/context amplification path locally in the Cooldex fork instead of leaving it
   only as an upstream report: prevent Sol from using Responses Lite, allow its
@@ -87,7 +90,7 @@ Bookkeeping topology: `split`
     fallback/compatibility path.
   - Stop if the prompt needs unbounded concurrency, automatic mutation batching, or
     retry semantics to achieve the requested outcome.
-  - Stop if any command would follow the current `codex -> cdx-pro` symlink and
+  - Stop if any command would follow the pre-install `codex -> cdx-pro` symlink and
     overwrite `cdx-pro`, alter `cdx-dev`/`cdx`, mutate PATH ordering, or remove anything
     except the exact authorized `cdx-pro` file and exact `.bashrc` alias.
 <!-- task-bookkeeping:mirror:end -->
@@ -483,11 +486,13 @@ Last reviewed: 2026-07-26 on `master-refactor-v2` at upstream base
   Cursor inputs; they are not active product authority or runtime dependencies.
 - `/home/lucas/work/codex/codex-rs/tui/src/bottom_pane/AGENTS.md` — current subtree
   instruction owner.
-- Command transition — current live pre-install state:
-  `/home/lucas/.cargo/bin/codex -> cdx-pro` plus its interactive Bash alias; target
-  state after the active plan succeeds: `/home/lucas/.cargo/bin/codex` as the reviewed
-  Cooldex fork command, `/home/lucas/.local/bin/cdx-dev` as the development-session
-  binary, and `cdx` selecting the standalone release through
-  `/home/lucas/.local/bin/codex`. `cdx-pro` is not part of that supported target.
+- Command transition — current live P2 state:
+  `/home/lucas/.cargo/bin/codex` is the reviewed regular Cooldex build, the interactive
+  Bash `codex` alias is absent, and `/home/lucas/.cargo/bin/cdx-pro` remains pending
+  exact deletion. The target after the active plan succeeds keeps
+  `/home/lucas/.cargo/bin/codex` as the reviewed Cooldex command,
+  `/home/lucas/.local/bin/cdx-dev` as the development-session binary, and `cdx`
+  selecting the standalone release through `/home/lucas/.local/bin/codex`; `cdx-pro`
+  is not part of that supported target.
 
 This Atlas is an owner index, not a call graph or a claim that planned behavior ships.
