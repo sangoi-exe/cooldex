@@ -26,7 +26,7 @@ fn sol_forces_full_responses_after_catalog_resolution() {
         construct_model_info_from_candidates("gpt-5.6-codex-2026-07-20", &candidates, &config),
     ];
 
-    let mut expected_exact = sol.clone();
+    let mut expected_exact = sol;
     expected_exact.use_responses_lite = false;
     let mut expected_versioned = expected_exact.clone();
     expected_versioned.slug = "gpt-5.6-sol-2026-07-20".to_string();
