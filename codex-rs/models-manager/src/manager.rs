@@ -624,7 +624,10 @@ pub(crate) fn construct_model_info_from_candidates(
     // retry for namespaced slugs like `custom/gpt-5.3-codex`.
     let remote = find_model_by_longest_prefix(model, candidates)
         .or_else(|| find_model_by_namespaced_suffix(model, candidates));
-    let model_info = if let Some(remote) = remote {
+    let model_info = if let Some(mut remote) = remote {
+        if remote.slug == "gpt-5.6-sol" {
+            remote.use_responses_lite = false;
+        }
         ModelInfo {
             slug: model.to_string(),
             used_fallback_model_metadata: false,

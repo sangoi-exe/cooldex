@@ -14,6 +14,7 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - All nested tools are available on the global `tools` object, for example `await tools.exec_command(...)`. Tool names are exposed as normalized JavaScript identifiers, for example `await tools.mcp__ologs__get_profile(...)`.
 - Nested tool methods take either a string or an object as their input argument.
 - Nested tools return either an object or a string, based on the description.
+- Use `Promise.all` for batches of at most 4 known-independent, read-only nested tool calls. Split larger independent read-only sets into sequential batches. Keep dependent, mutating, approval-sensitive, and `wait` calls sequential.
 - Runs raw JavaScript -- no Node, no file system, no network access, no console.
 - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.

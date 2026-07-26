@@ -742,6 +742,9 @@ if (!tool) {
             })
         })
         .expect("exec description should be present");
+    assert!(exec_description.contains(
+        "- Use `Promise.all` for batches of at most 4 known-independent, read-only nested tool calls. Split larger independent read-only sets into sequential batches. Keep dependent, mutating, approval-sensitive, and `wait` calls sequential."
+    ));
     assert!(exec_description.contains("filter `ALL_TOOLS` by `name` and `description`"));
     assert!(exec_description.contains("Shared MCP Types:"));
     assert!(!exec_description.contains("calendar_timezone_option_99"));
