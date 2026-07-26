@@ -48,7 +48,11 @@ Bookkeeping topology: `split`
   same change strengthens the model-visible `exec` tool description with the exact rule:
   `Use Promise.all for batches of at most 4 known-independent, read-only nested tool
   calls. Split larger independent read-only sets into sequential batches. Keep
-  dependent, mutating, approval-sensitive, and wait calls sequential.`
+  dependent, mutating, approval-sensitive, and wait calls sequential.` The final
+  reviewed Cooldex binary is then built through the guarded workspace recipe and
+  atomically installed as `/home/lucas/.cargo/bin/codex`, replacing only the current
+  `codex -> cdx-pro` symlink. The `cdx-pro` binary and the independent `cdx` command
+  remain unchanged, and the pre-install state is recorded for an exact rollback.
 - Confirmed paraphrased user-request summary: Correct the severe GPT-5.6 Sol
   token/context amplification path locally in the Cooldex fork instead of leaving it
   only as an upstream report: prevent Sol from using Responses Lite, allow its
@@ -57,7 +61,11 @@ Bookkeeping topology: `split`
   instructed to batch safe, independent nested calls. Keep Responses Lite available for
   every unrelated model, do not add a user-facing compatibility toggle, and accept that
   Sol will omit the Lite-only `reasoning.context=all_turns` request field and use the
-  backend-selected full Responses default.
+  backend-selected full Responses default. Treat the exact 27 non-Sol failures exposed
+  by the complete `codex-core` integration target as pre-existing Firebreak-session debt
+  rather than part of this fix, do not repeat them in the complete workspace suite, and
+  install the reviewed fork binary as the ordinary `codex` command for operator testing
+  while preserving `cdx-pro` and `cdx`.
 - Major stop conditions:
   - Stop if unrelated separate `.sangoi` dirty state cannot be excluded with exact path
     staging.
@@ -66,6 +74,9 @@ Bookkeeping topology: `split`
     fallback/compatibility path.
   - Stop if the prompt needs unbounded concurrency, automatic mutation batching, or
     retry semantics to achieve the requested outcome.
+  - Stop if any command would follow the current `codex -> cdx-pro` symlink and
+    overwrite `cdx-pro`, alter `cdx`, or replace a path other than
+    `/home/lucas/.cargo/bin/codex`.
 <!-- task-bookkeeping:mirror:end -->
 
 ## Planned Fork Requirements — Not Shipped
