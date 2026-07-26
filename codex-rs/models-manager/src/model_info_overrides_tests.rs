@@ -11,10 +11,10 @@ use super::remote_model;
 
 #[test]
 fn sol_forces_full_responses_after_catalog_resolution() {
-    let mut sol = remote_model("gpt-5.6-sol", "GPT-5.6 Sol", 10);
+    let mut sol = remote_model("gpt-5.6-sol", "GPT-5.6 Sol", /*priority*/ 10);
     sol.use_responses_lite = true;
     sol.supports_parallel_tool_calls = true;
-    let mut unrelated = remote_model("gpt-5.6-codex", "GPT-5.6 Codex", 9);
+    let mut unrelated = remote_model("gpt-5.6-codex", "GPT-5.6 Codex", /*priority*/ 9);
     unrelated.use_responses_lite = true;
     let candidates = [sol.clone(), unrelated.clone()];
     let config = ModelsManagerConfig::default();
