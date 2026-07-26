@@ -50,9 +50,10 @@ Bookkeeping topology: `split`
   calls. Split larger independent read-only sets into sequential batches. Keep
   dependent, mutating, approval-sensitive, and wait calls sequential.` The final
   reviewed Cooldex binary is then built through the guarded workspace recipe and
-  atomically installed as `/home/lucas/.cargo/bin/codex`, replacing only the current
-  `codex -> cdx-pro` symlink. The `cdx-pro` binary and the independent `cdx` command
-  remain unchanged, and the pre-install state is recorded for an exact rollback.
+  transactionally installed as `/home/lucas/.cargo/bin/codex`, replacing only the
+  current `codex -> cdx-pro` symlink. The exact original directory entry remains
+  transaction-owned until the installed smoke and post-smoke preservation checks pass.
+  The `cdx-pro` binary and the independent `cdx` command remain unchanged.
 - Confirmed paraphrased user-request summary: Correct the severe GPT-5.6 Sol
   token/context amplification path locally in the Cooldex fork instead of leaving it
   only as an upstream report: prevent Sol from using Responses Lite, allow its
