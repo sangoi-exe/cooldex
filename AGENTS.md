@@ -7,11 +7,14 @@ Bookkeeping topology: `split`
 - When the operator says `main`, use the local branch named `main`.
 - The supported operator path is WSL with ChatGPT Pro authentication through ordinary
   `codex`/`cdx` TUI or exec sessions.
-- The supported local command topology for the active transition is:
-  `/home/lucas/.cargo/bin/codex` for the reviewed Cooldex fork build,
-  `/home/lucas/.local/bin/cdx-dev` for development sessions, and `cdx` selecting
-  `/home/lucas/.local/bin/codex` for the standalone release. `cdx-pro` is retired and
-  must not be recreated as an alias, wrapper, or compatibility path.
+- Until the active installation plan completes, the live pre-install topology remains
+  `/home/lucas/.cargo/bin/codex -> cdx-pro` plus the matching interactive Bash alias.
+  Treat that mapping as transitional current state, not the supported target.
+- The post-install supported topology is `/home/lucas/.cargo/bin/codex` for the reviewed
+  Cooldex fork build, `/home/lucas/.local/bin/cdx-dev` for development sessions, and
+  `cdx` selecting `/home/lucas/.local/bin/codex` for the standalone release. `cdx-pro`
+  is retired in that target state and must not be recreated as an alias, wrapper, or
+  compatibility path.
 - Current upstream structure and behavior are the baseline. Add only approved fork-owned
   islands and the smallest native seams required to reach them.
 - Keep `.github/**` and upstream API/wire behavior upstream-owned unless the current user
@@ -480,9 +483,11 @@ Last reviewed: 2026-07-26 on `master-refactor-v2` at upstream base
   Cursor inputs; they are not active product authority or runtime dependencies.
 - `/home/lucas/work/codex/codex-rs/tui/src/bottom_pane/AGENTS.md` — current subtree
   instruction owner.
-- `/home/lucas/.cargo/bin/codex` — reviewed Cooldex fork command;
-  `/home/lucas/.local/bin/cdx-dev` — development-session binary; and `cdx` —
-  standalone release selected through `/home/lucas/.local/bin/codex`. `cdx-pro` is not
-  part of the supported command topology.
+- Command transition — current live pre-install state:
+  `/home/lucas/.cargo/bin/codex -> cdx-pro` plus its interactive Bash alias; target
+  state after the active plan succeeds: `/home/lucas/.cargo/bin/codex` as the reviewed
+  Cooldex fork command, `/home/lucas/.local/bin/cdx-dev` as the development-session
+  binary, and `cdx` selecting the standalone release through
+  `/home/lucas/.local/bin/codex`. `cdx-pro` is not part of that supported target.
 
 This Atlas is an owner index, not a call graph or a claim that planned behavior ships.
