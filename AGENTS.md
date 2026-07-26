@@ -7,6 +7,11 @@ Bookkeeping topology: `split`
 - When the operator says `main`, use the local branch named `main`.
 - The supported operator path is WSL with ChatGPT Pro authentication through ordinary
   `codex`/`cdx` TUI or exec sessions.
+- The supported local command topology for the active transition is:
+  `/home/lucas/.cargo/bin/codex` for the reviewed Cooldex fork build,
+  `/home/lucas/.local/bin/cdx-dev` for development sessions, and `cdx` selecting
+  `/home/lucas/.local/bin/codex` for the standalone release. `cdx-pro` is retired and
+  must not be recreated as an alias, wrapper, or compatibility path.
 - Current upstream structure and behavior are the baseline. Add only approved fork-owned
   islands and the smallest native seams required to reach them.
 - Keep `.github/**` and upstream API/wire behavior upstream-owned unless the current user
@@ -49,11 +54,13 @@ Bookkeeping topology: `split`
   `Use Promise.all for batches of at most 4 known-independent, read-only nested tool
   calls. Split larger independent read-only sets into sequential batches. Keep
   dependent, mutating, approval-sensitive, and wait calls sequential.` The final
-  reviewed Cooldex binary is then built through the guarded workspace recipe and
-  transactionally installed as `/home/lucas/.cargo/bin/codex`, replacing only the
-  current `codex -> cdx-pro` symlink. The exact original directory entry remains
-  transaction-owned until the installed smoke and post-smoke preservation checks pass.
-  The `cdx-pro` binary and the independent `cdx` command remain unchanged.
+  reviewed Cooldex binary is then built through the guarded workspace recipe, copied to
+  one same-directory unique staging file, fully validated and live-smoked through that
+  staging path while the operator command remains untouched, and committed as
+  `/home/lucas/.cargo/bin/codex` by one no-copy atomic rename over the current `codex ->
+  cdx-pro` symlink. The obsolete `cdx-pro` binary and its interactive-shell alias are
+  then removed. The current session continues running `/home/lucas/.local/bin/cdx-dev`,
+  and `cdx` continues to select the standalone `/home/lucas/.local/bin/codex`.
 - Confirmed paraphrased user-request summary: Correct the severe GPT-5.6 Sol
   token/context amplification path locally in the Cooldex fork instead of leaving it
   only as an upstream report: prevent Sol from using Responses Lite, allow its
@@ -65,8 +72,10 @@ Bookkeeping topology: `split`
   backend-selected full Responses default. Treat the exact 27 non-Sol failures exposed
   by the complete `codex-core` integration target as pre-existing Firebreak-session debt
   rather than part of this fix, do not repeat them in the complete workspace suite, and
-  install the reviewed fork binary as the ordinary `codex` command for operator testing
-  while preserving `cdx-pro` and `cdx`.
+  install the reviewed fork binary as the ordinary `codex` command for operator testing.
+  Keep the currently executing `cdx-dev` binary and the independent `cdx` route from
+  `~/.local`, remove obsolete `cdx-pro` plus its shell alias, and update the command
+  topology documented in root `AGENTS.md`.
 - Major stop conditions:
   - Stop if unrelated separate `.sangoi` dirty state cannot be excluded with exact path
     staging.
@@ -76,8 +85,8 @@ Bookkeeping topology: `split`
   - Stop if the prompt needs unbounded concurrency, automatic mutation batching, or
     retry semantics to achieve the requested outcome.
   - Stop if any command would follow the current `codex -> cdx-pro` symlink and
-    overwrite `cdx-pro`, alter `cdx`, or replace a path other than
-    `/home/lucas/.cargo/bin/codex`.
+    overwrite `cdx-pro`, alter `cdx-dev`/`cdx`, mutate PATH ordering, or remove anything
+    except the exact authorized `cdx-pro` file and exact `.bashrc` alias.
 <!-- task-bookkeeping:mirror:end -->
 
 ## Planned Fork Requirements — Not Shipped
@@ -455,7 +464,7 @@ Codex supports running connected app-server and exec-server on different operati
 
 ## Cooldex Root Atlas
 
-Last reviewed: 2026-07-25 on `master-refactor-v2` at upstream base
+Last reviewed: 2026-07-26 on `master-refactor-v2` at upstream base
 `44d76c6a6dd04fa2efc302b906ac8774267a1272`.
 
 - `/home/lucas/work/codex/AGENTS.md` — local policy, exact upstream core, active mirror,
@@ -471,5 +480,9 @@ Last reviewed: 2026-07-25 on `master-refactor-v2` at upstream base
   Cursor inputs; they are not active product authority or runtime dependencies.
 - `/home/lucas/work/codex/codex-rs/tui/src/bottom_pane/AGENTS.md` — current subtree
   instruction owner.
+- `/home/lucas/.cargo/bin/codex` — reviewed Cooldex fork command;
+  `/home/lucas/.local/bin/cdx-dev` — development-session binary; and `cdx` —
+  standalone release selected through `/home/lucas/.local/bin/codex`. `cdx-pro` is not
+  part of the supported command topology.
 
 This Atlas is an owner index, not a call graph or a claim that planned behavior ships.
