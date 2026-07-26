@@ -45,10 +45,10 @@ Bookkeeping topology: `split`
 - What we are creating: A narrow Cooldex runtime correction that always resolves the
   `gpt-5.6-sol` model family to the full Responses transport, even when a bundled,
   configured, cached, or remotely refreshed model catalog advertises Responses Lite. The
-  same change strengthens the model-visible `exec` tool description so Code Mode
-  explicitly batches known-independent, read-only nested tool calls with bounded
-  `Promise.all` concurrency while keeping dependent, mutating, approval-sensitive, and
-  wait operations sequential.
+  same change strengthens the model-visible `exec` tool description with the exact rule:
+  `Use Promise.all for batches of at most 4 known-independent, read-only nested tool
+  calls. Split larger independent read-only sets into sequential batches. Keep
+  dependent, mutating, approval-sensitive, and wait calls sequential.`
 - Confirmed paraphrased user-request summary: Correct the severe GPT-5.6 Sol
   token/context amplification path locally in the Cooldex fork instead of leaving it
   only as an upstream report: prevent Sol from using Responses Lite, allow its
@@ -56,8 +56,8 @@ Bookkeeping topology: `split`
   Responses API, and update the Code Mode `exec` description so the model is directly
   instructed to batch safe, independent nested calls. Keep Responses Lite available for
   every unrelated model, do not add a user-facing compatibility toggle, and accept that
-  Sol will use the full Responses default reasoning context rather than Lite's
-  `all_turns`.
+  Sol will omit the Lite-only `reasoning.context=all_turns` request field and use the
+  backend-selected full Responses default.
 - Major stop conditions:
   - Stop if unrelated separate `.sangoi` dirty state cannot be excluded with exact path
     staging.
