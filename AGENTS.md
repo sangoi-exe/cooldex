@@ -7,16 +7,11 @@ Bookkeeping topology: `split`
 - When the operator says `main`, use the local branch named `main`.
 - The supported operator path is WSL with ChatGPT Pro authentication through ordinary
   `codex`/`cdx` TUI or exec sessions.
-- Until the active installation plan completes, the live P2 topology is
-  `/home/lucas/.cargo/bin/codex` as the reviewed regular Cooldex build, no interactive
-  Bash `codex` alias, and the reviewed `/home/lucas/.cargo/bin/cdx-pro` still present
-  pending exact deletion. Treat that mapping as transitional current state, not the
-  supported target.
-- The post-install supported topology is `/home/lucas/.cargo/bin/codex` for the reviewed
-  Cooldex fork build, `/home/lucas/.local/bin/cdx-dev` for development sessions, and
-  `cdx` selecting `/home/lucas/.local/bin/codex` for the standalone release. `cdx-pro`
-  is retired in that target state and must not be recreated as an alias, wrapper, or
-  compatibility path.
+- The supported command topology is `/home/lucas/.cargo/bin/codex` as the reviewed
+  regular Cooldex executable, `/home/lucas/.local/bin/cdx-dev` for development sessions,
+  and `cdx` selecting `/home/lucas/.local/bin/codex` for the standalone release. The
+  interactive Bash `codex` alias is absent. `cdx-pro` is retired and absent; do not
+  recreate it as an alias, wrapper, or compatibility path.
 - Current upstream structure and behavior are the baseline. Add only approved fork-owned
   islands and the smallest native seams required to reach them.
 - Keep `.github/**` and upstream API/wire behavior upstream-owned unless the current user
@@ -47,52 +42,35 @@ Bookkeeping topology: `split`
 ## Active Plan Mirror
 
 <!-- task-bookkeeping:mirror:begin -->
-- Status: active
-- Mode: `Doctrine`.
+- Status: no active plan.
+- Completed mode: `Doctrine`.
 - Root branch: `master-refactor-v2`.
 - `.sangoi` branch: `master-refactor-v2`.
-- Canonical plan: `.sangoi/planning/2026-07-26-disable-sol-responses-lite-and-batch-code-mode.md`.
-- What we are creating: A narrow Cooldex runtime correction that always resolves the
-  `gpt-5.6-sol` model family to the full Responses transport, even when a bundled,
-  configured, cached, or remotely refreshed model catalog advertises Responses Lite. The
-  same change strengthens the model-visible `exec` tool description with the exact rule:
-  `Use Promise.all for batches of at most 4 known-independent, read-only nested tool
-  calls. Split larger independent read-only sets into sequential batches. Keep
-  dependent, mutating, approval-sensitive, and wait calls sequential.` The final
-  reviewed Cooldex binary is then built through the guarded workspace recipe, copied to
-  one same-directory unique staging file, fully validated and live-smoked through that
-  staging path while the operator command remains untouched, and committed as
-  `/home/lucas/.cargo/bin/codex` by one no-copy atomic rename over the pre-install
-  `codex -> cdx-pro` symlink. The obsolete `cdx-pro` binary and its interactive-shell
-  alias are then removed. The current session continues running
-  `/home/lucas/.local/bin/cdx-dev`, and `cdx` continues to select the standalone
-  `/home/lucas/.local/bin/codex`.
-- Confirmed paraphrased user-request summary: Correct the severe GPT-5.6 Sol
-  token/context amplification path locally in the Cooldex fork instead of leaving it
-  only as an upstream report: prevent Sol from using Responses Lite, allow its
-  already-supported top-level parallel tool-call request contract to reach the full
-  Responses API, and update the Code Mode `exec` description so the model is directly
-  instructed to batch safe, independent nested calls. Keep Responses Lite available for
-  every unrelated model, do not add a user-facing compatibility toggle, and accept that
-  Sol will omit the Lite-only `reasoning.context=all_turns` request field and use the
-  backend-selected full Responses default. Treat the exact 27 non-Sol failures exposed
-  by the complete `codex-core` integration target as pre-existing Firebreak-session debt
-  rather than part of this fix, do not repeat them in the complete workspace suite, and
-  install the reviewed fork binary as the ordinary `codex` command for operator testing.
-  Keep the currently executing `cdx-dev` binary and the independent `cdx` route from
-  `~/.local`, remove obsolete `cdx-pro` plus its shell alias, and update the command
-  topology documented in root `AGENTS.md`.
-- Major stop conditions:
-  - Stop if unrelated separate `.sangoi` dirty state cannot be excluded with exact path
-    staging.
-  - Stop if implementing the correction requires editing the generic client serializer,
-    adding a config toggle, disabling Lite globally, or introducing a
-    fallback/compatibility path.
-  - Stop if the prompt needs unbounded concurrency, automatic mutation batching, or
-    retry semantics to achieve the requested outcome.
-  - Stop if any command would follow the pre-install `codex -> cdx-pro` symlink and
-    overwrite `cdx-pro`, alter `cdx-dev`/`cdx`, mutate PATH ordering, or remove anything
-    except the exact authorized `cdx-pro` file and exact `.bashrc` alias.
+- Completed plan: `.sangoi/planning/2026-07-26-disable-sol-responses-lite-and-batch-code-mode.md`.
+- Completed outcome: Cooldex now always resolves the `gpt-5.6-sol` model family to the
+  full Responses transport, even when model-catalog metadata advertises Responses Lite.
+  Code Mode's model-visible `exec` description now instructs bounded `Promise.all`
+  batching for at most four known-independent, read-only nested calls while keeping
+  dependent, mutating, approval-sensitive, and wait calls sequential. The reviewed build
+  is installed as the regular `/home/lucas/.cargo/bin/codex` executable. The obsolete
+  `cdx-pro` executable and interactive Bash alias are removed. The active session binary
+  remains `/home/lucas/.local/bin/cdx-dev`, and `cdx` continues to select the standalone
+  release through `/home/lucas/.local/bin/codex`.
+- Completed user-request summary: Correct the severe GPT-5.6 Sol token/context
+  amplification path locally in the Cooldex fork instead of leaving it only as an
+  upstream report: prevent Sol from using Responses Lite, allow its already-supported
+  top-level parallel tool-call request contract to reach the full Responses API, and
+  update the Code Mode `exec` description so the model is directly instructed to batch
+  safe, independent nested calls. Keep Responses Lite available for every unrelated
+  model, do not add a user-facing compatibility toggle, and accept that Sol will omit
+  the Lite-only `reasoning.context=all_turns` request field and use the backend-selected
+  full Responses default. Treat the exact 27 non-Sol failures exposed by the complete
+  `codex-core` integration target as pre-existing Firebreak-session debt rather than
+  part of this fix, do not repeat them in the complete workspace suite, and install the
+  reviewed fork binary as the ordinary `codex` command for operator testing. Keep the
+  currently executing `cdx-dev` binary and the independent `cdx` route from `~/.local`,
+  remove obsolete `cdx-pro` plus its shell alias, and update the command topology
+  documented in root `AGENTS.md`.
 <!-- task-bookkeeping:mirror:end -->
 
 ## Planned Fork Requirements — Not Shipped
@@ -473,26 +451,23 @@ Codex supports running connected app-server and exec-server on different operati
 Last reviewed: 2026-07-26 on `master-refactor-v2` at upstream base
 `44d76c6a6dd04fa2efc302b906ac8774267a1272`.
 
-- `/home/lucas/work/codex/AGENTS.md` — local policy, exact upstream core, active mirror,
-  and root map.
-- `/home/lucas/work/codex/.sangoi/planning/2026-07-25-publish-cooldex-fork-and-linux-release.md`
-  — canonical active repository-publication and Linux-release plan.
+- `/home/lucas/work/codex/AGENTS.md` — local policy, exact upstream core, completed-plan
+  mirror, and root map.
+- `/home/lucas/work/codex/.sangoi/planning/2026-07-26-disable-sol-responses-lite-and-batch-code-mode.md`
+  — completed Sol full-Responses, Code Mode batching, and local command-transition plan.
 - `/home/lucas/work/codex/.sangoi/reference/areas/master-refactor-v2-prd-rfc.md` — current
   product requirements and architecture boundary.
 - `/home/lucas/work/codex/scripts/install/install.sh` and
-  `/home/lucas/work/codex/scripts/codex_package/` — existing installer and package owners
-  selected by the active release plan; they do not imply that the planned release ships.
+  `/home/lucas/work/codex/scripts/codex_package/` — existing release installer and
+  package owners; they are independent of the local reviewed-build command topology.
 - `/home/lucas/work/codex/.sangoi/chatgpt-pro/cursor-artefatos/` — deferred historical
   Cursor inputs; they are not active product authority or runtime dependencies.
 - `/home/lucas/work/codex/codex-rs/tui/src/bottom_pane/AGENTS.md` — current subtree
   instruction owner.
-- Command transition — current live P2 state:
-  `/home/lucas/.cargo/bin/codex` is the reviewed regular Cooldex build, the interactive
-  Bash `codex` alias is absent, and `/home/lucas/.cargo/bin/cdx-pro` remains pending
-  exact deletion. The target after the active plan succeeds keeps
-  `/home/lucas/.cargo/bin/codex` as the reviewed Cooldex command,
-  `/home/lucas/.local/bin/cdx-dev` as the development-session binary, and `cdx`
-  selecting the standalone release through `/home/lucas/.local/bin/codex`; `cdx-pro`
-  is not part of that supported target.
+- Supported command topology:
+  `/home/lucas/.cargo/bin/codex` is the reviewed regular Cooldex executable,
+  `/home/lucas/.local/bin/cdx-dev` is the development-session binary, and `cdx`
+  selects the standalone release through `/home/lucas/.local/bin/codex`. The
+  interactive Bash `codex` alias and obsolete `cdx-pro` executable are absent.
 
 This Atlas is an owner index, not a call graph or a claim that planned behavior ships.
