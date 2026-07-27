@@ -1,6 +1,19 @@
 # Cooldex Workspace Rules
 
-Bookkeeping topology: `split`
+## Instruction Scope
+
+- This file and `.sangoi/local/subagents/**` contain only durable Cooldex
+  workspace rules and stable navigation. Task-, session-, machine-, review-, and
+  history-specific values belong in the current thread, canonical plan, review
+  bundle, receipt, or task log rather than in prompt-resident workspace
+  instructions.
+- Stable owner paths and normative contracts may remain here. Do not record a
+  particular plan path or status, branch or Git object, review state, live
+  alias/symlink/binary identity, temporary path, validation receipt or hash, or
+  last-reviewed timestamp.
+- `/home/lucas/.codex/config.toml` remains the owner of Codex-global lifecycle,
+  Scope, Gate, evidence, taxonomy, role, and instruction-corpus contracts. Use
+  narrow pointers instead of copying those rule bodies into this workspace.
 
 ## Local Baseline
 
@@ -10,8 +23,12 @@ Bookkeeping topology: `split`
 - The supported command topology is `/home/lucas/.cargo/bin/codex` as the reviewed
   regular Cooldex executable, `/home/lucas/.local/bin/cdx-dev` for development sessions,
   and `cdx` selecting `/home/lucas/.local/bin/codex` for the standalone release. The
-  interactive Bash `codex` alias is absent. `cdx-pro` is retired and absent; do not
-  recreate it as an alias, wrapper, or compatibility path.
+  supported topology has no interactive Bash `codex` alias. `cdx-pro` is retired and
+  must not be recreated as an alias, wrapper, or compatibility path.
+- Before installing, promoting, removing, or publishing command surfaces, inspect the
+  live resolution, aliases, symlink targets, executable identities, and hashes with
+  `type -a`, `alias -p`, `readlink -f`, and `sha256sum` as applicable. This file defines
+  supported topology; it does not attest current machine state.
 - Current upstream structure and behavior are the baseline. Add only approved fork-owned
   islands and the smallest native seams required to reach them.
 - Keep `.github/**` and upstream API/wire behavior upstream-owned unless the current user
@@ -19,8 +36,10 @@ Bookkeeping topology: `split`
 - Resolve upstream conflicts manually from the canonical owner outward. Do not use
   whole-side conflict selection or preserve obsolete local paths through aliases,
   wrappers, dual reads, or fallback adapters.
-- Stop when branch identity, locked Git objects, the separate `.sangoi` repository,
-  upstream instruction bytes, or review authority differs from the active plan.
+- When the current thread explicitly attaches a plan, verify its root branch and Git
+  object, separate `.sangoi` branch and Git object, upstream instruction blob, and review
+  anchors before mutation. Do not infer plan attachment from workspace files, completed
+  plans, task logs, rollout markers, or recency.
 - The delimited upstream core below must remain byte-identical to the blob named by its
   opening marker. Local policy belongs outside that core.
 
@@ -29,33 +48,30 @@ Bookkeeping topology: `split`
 - Do not fix an upstream bug or suspected upstream bug in this fork unless direct causal
   evidence shows that it affects the local harness, an approved island or its minimal
   seam, agent runtime performance, or token/context consumption.
-- Outside those four exceptions, first reproduce or otherwise verify the suspected defect
-  on current upstream without relying on fork-owned behavior. Then search the upstream
-  issue tracker: react with a thumbs-up to an existing matching issue, or file a new issue
-  with the current matching template under `.github/ISSUE_TEMPLATE/`, a redacted
-  reproduction, and the required environment/version evidence. If current upstream does
-  not reproduce the defect, reclassify it before any action instead of reporting it as an
-  upstream bug. Do not add a local workaround, backport, or regression-test owner.
+- When a failure materially blocks or invalidates the current fork task, classify it as
+  upstream-owned only after direct evidence reproduces the same defect on the exact
+  current upstream baseline without relying on fork-owned behavior. If upstream does not
+  reproduce it, reclassify the failure before further action.
+- After upstream reproduction, search the upstream issue tracker. React to an adequate
+  existing report, or file a new issue using the current repository template, a redacted
+  minimal reproduction, the exact upstream commit or version, environment evidence, and
+  the demonstrated impact on the current task. Apply
+  `/home/lucas/.codex/skills/external-mutation-safety/SKILL.md` before the external
+  mutation.
+- The issue or reaction URL is admissible disposition evidence, not proof of causality.
+  Filing or reacting does not authorize a local workaround, backport, compatibility path,
+  regression-test owner, or scope expansion. Do not wait for an upstream response when
+  ownership and the required local disposition are already proven.
+- If authentication or external mutation is unavailable, prepare the complete issue body
+  and record the exact blocker instead of weakening the ownership proof or inventing a
+  local fix.
 - Meeting an exception makes a local fix eligible for scoped planning; it does not widen
   the current task automatically.
 
-## Planned Fork Requirements — Not Shipped
+## Product Architecture
 
-This inventory does not claim that unreviewed local checkpoints are shipped. The current
-six-requirement set is:
-
-1. bounded context continuity, including an args-less bounded `recall` surface;
-2. canonical prompt rebasing plus bounded post-compaction boundary, recall, and native
-   tool-batch continuity across compact, resume, full-history fork, and rollback;
-3. explicit MultiAgentV2 policy, tool-contract parity, and atomic full-history parent
-   identity;
-4. one instance-owned local app-server child lifecycle for each eligible TUI instance;
-5. one V2-only `subagent_instructions_file` configuration seam; and
-6. one `include_global_agents_md` gate over the complete global instruction provider.
-
-The PRD/RFC in the separate `.sangoi` repository owns requirement detail. The canonical
-active plan owns implementation status, evidence, Gates, and publication. Do not infer
-shipped behavior from this inventory.
+- `.sangoi/reference/areas/master-refactor-v2-prd-rfc.md` owns planned
+  requirements, architecture boundaries, and shipped-status interpretation.
 
 ## Repository Boundaries
 
@@ -77,11 +93,20 @@ shipped behavior from this inventory.
 - For every Rust code change, run
   `scripts/cooldex/rust-blast-radius-guard.py` from the workspace root against each
   changed symbol or owning file/line before editing when possible and again after each
-  changed Rust file. Final evidence uses uncapped output. Treat the report as an impact
-  inventory, not behavioral proof, and manually account for followers it misses.
-- Run targeted guarded compile/tests before final review so the reviewer evaluates a
-  compiled, targeted-green object. Cumulative validation remains post-review unless the
-  active task explicitly requires otherwise.
+  changed Rust file. Preserve the complete uncapped report outside model context and
+  consume a compact owner/follower-slice summary plus unresolved hits. Treat the report
+  as an impact inventory, not behavioral proof, and manually account for followers it
+  misses.
+- Before completion-class Code Review, materialize the actual review object and complete
+  every targeted, finite-closure, and repository-input-provenance validation needed to
+  establish that object. Earlier advisory review is non-final.
+- For release or publication work, the review object includes the real staged package,
+  asset set, checksums, executable identity, metadata, and staged version. Do not request
+  completion-class review before those artifacts exist.
+- Expensive cumulative suites may remain post-review only when they do not define the
+  reviewed object. Apply
+  `/home/lucas/.codex/config.toml#evidence-efficient-execution` when remediation or
+  proof-only corrections may reuse unchanged evidence.
 - The first ordinary validation of a review object must run the complete collector before
   ordinary failures are fixed. `verify` keeps going by default; use `--fail-fast` only for
   an explicit diagnostic reason, then use `--resume`, `--from-index`, or `--only-failed`
@@ -90,10 +115,19 @@ shipped behavior from this inventory.
 <!-- cooldex-wsl-release-procedure:begin -->
 ## WSL Release Procedure
 
+- This procedure applies only when the current user explicitly requests creation or
+  publication of a reusable Cooldex release. It does not apply to one-shot local
+  installation or promotion of an existing reviewed artifact. Historical release plans
+  and task logs do not activate or select this route.
 - Build standalone Cooldex releases directly on the supported WSL host for
   `x86_64-unknown-linux-musl`; Docker is not the Cooldex release route.
-- Keep Rust, Cargo, the musl target, Zig, build targets, temporary files, and validation
-  receipts under a release-scoped directory in `/home/lucas/.cache/codex/`.
+- Keep mutable Rustup and Cargo state, target installation, Zig bootstrap, build targets,
+  temporary files, staged assets, and validation receipts under a release-scoped
+  directory in `/home/lucas/.cache/codex/`.
+- Reuse outside that directory only verified host proxy executables and immutable or
+  content-addressed caches whose identity is bound to the release evidence. When
+  isolated Rustup state is required, use the proven `--no-self-update` bootstrap and
+  validate the toolchain and musl target before the long build.
 - Route every Cargo invocation through `./scripts/cargo-guard.sh`, and construct the
   standalone package through `scripts/build_codex_package.py` and
   `scripts/codex_package/`.
@@ -101,8 +135,17 @@ shipped behavior from this inventory.
   bootstrap.
 - Notify the user immediately before the first command that requires `sudo`, and state the exact dependency-bootstrap purpose.
 - Never echo, store, commit, or embed the user password in a command, receipt, plan, log, or repository artifact.
-- Before publication, verify the archive layout, checksums, executable identity, ELF
+- Build, package, locally validate, and freeze the exact staged release object before
+  final Code Review. Verify archive layout, checksums, executable identity, ELF
   properties, package metadata, and staged executable version.
+- Final Code Review covers the actual source commit plus staged asset hashes and local
+  validation results.
+- Apply `/home/lucas/.codex/config.toml#evidence-efficient-execution` to proof-only
+  corrections. When source and staged-asset hashes are unchanged, rerun the corrected
+  mechanical proof against the same object; do not rebuild or reopen semantic review
+  unless an accepted claim was explicitly invalidated.
+- After review, reread remote branch, tag, release, workflow, and asset preconditions
+  immediately before the first remote mutation.
 - Immediately after publication, run the public latest-release installer in an isolated
   Rust-free WSL user environment and require the released version.
 <!-- cooldex-wsl-release-procedure:end -->
@@ -434,25 +477,20 @@ Codex supports running connected app-server and exec-server on different operati
 
 ## Cooldex Root Atlas
 
-Last reviewed: 2026-07-26 on `master-refactor-v2` at upstream base
-`44d76c6a6dd04fa2efc302b906ac8774267a1272`.
-
-- `/home/lucas/work/codex/AGENTS.md` — local policy, exact upstream core, completed-plan
-  mirror, and root map.
-- `/home/lucas/work/codex/.sangoi/planning/2026-07-26-disable-sol-responses-lite-and-batch-code-mode.md`
-  — completed Sol full-Responses, Code Mode batching, and local command-transition plan.
-- `/home/lucas/work/codex/.sangoi/reference/areas/master-refactor-v2-prd-rfc.md` — current
-  product requirements and architecture boundary.
+- `/home/lucas/work/codex/AGENTS.md` — durable workspace policy, exact upstream core,
+  and stable root owner map.
+- `/home/lucas/work/codex/.sangoi/reference/areas/master-refactor-v2-prd-rfc.md` —
+  product requirements, architecture boundaries, and shipped-status interpretation.
+- `/home/lucas/work/codex/scripts/cargo-guard.sh`,
+  `/home/lucas/work/codex/scripts/cargo-validation.toml`, and
+  `/home/lucas/work/codex/scripts/cooldex/rust-blast-radius-guard.py` — guarded Rust
+  execution, validation policy, and impact-inventory owners.
 - `/home/lucas/work/codex/scripts/install/install.sh` and
-  `/home/lucas/work/codex/scripts/codex_package/` — existing release installer and
-  package owners; they are independent of the local reviewed-build command topology.
-- `/home/lucas/work/codex/.sangoi/chatgpt-pro/cursor-artefatos/` — deferred historical
-  Cursor inputs; they are not active product authority or runtime dependencies.
-- `/home/lucas/work/codex/codex-rs/tui/src/bottom_pane/AGENTS.md` — current subtree
-  instruction owner.
-- Supported command topology:
-  `/home/lucas/.cargo/bin/codex` is the reviewed regular Cooldex executable,
-  `/home/lucas/.local/bin/cdx-dev` is the development-session binary, and `cdx`
-  selects the standalone release through `/home/lucas/.local/bin/codex`.
+  `/home/lucas/work/codex/scripts/build_codex_package.py` and
+  `/home/lucas/work/codex/scripts/codex_package/` — release installer and package
+  construction owners.
+- `/home/lucas/work/codex/codex-rs/tui/src/bottom_pane/AGENTS.md` — TUI bottom-pane
+  subtree instruction owner.
 
-This Atlas is an owner index, not a call graph or a claim that planned behavior ships.
+This Atlas is a stable owner index, not a call graph, task attachment surface, or
+shipped-state ledger.
