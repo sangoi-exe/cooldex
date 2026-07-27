@@ -39,40 +39,6 @@ Bookkeeping topology: `split`
 - Meeting an exception makes a local fix eligible for scoped planning; it does not widen
   the current task automatically.
 
-## Active Plan Mirror
-
-<!-- task-bookkeeping:mirror:begin -->
-- Status: no active plan.
-- Completed mode: `Doctrine`.
-- Root branch: `master-refactor-v2`.
-- `.sangoi` branch: `master-refactor-v2`.
-- Completed plan: `.sangoi/planning/2026-07-26-disable-sol-responses-lite-and-batch-code-mode.md`.
-- Completed outcome: Cooldex now always resolves the `gpt-5.6-sol` model family to the
-  full Responses transport, even when model-catalog metadata advertises Responses Lite.
-  Code Mode's model-visible `exec` description now instructs bounded `Promise.all`
-  batching for at most four known-independent, read-only nested calls while keeping
-  dependent, mutating, approval-sensitive, and wait calls sequential. The reviewed build
-  is installed as the regular `/home/lucas/.cargo/bin/codex` executable. The obsolete
-  `cdx-pro` executable and interactive Bash alias are removed. The active session binary
-  remains `/home/lucas/.local/bin/cdx-dev`, and `cdx` continues to select the standalone
-  release through `/home/lucas/.local/bin/codex`.
-- Completed user-request summary: Correct the severe GPT-5.6 Sol token/context
-  amplification path locally in the Cooldex fork instead of leaving it only as an
-  upstream report: prevent Sol from using Responses Lite, allow its already-supported
-  top-level parallel tool-call request contract to reach the full Responses API, and
-  update the Code Mode `exec` description so the model is directly instructed to batch
-  safe, independent nested calls. Keep Responses Lite available for every unrelated
-  model, do not add a user-facing compatibility toggle, and accept that Sol will omit
-  the Lite-only `reasoning.context=all_turns` request field and use the backend-selected
-  full Responses default. Treat the exact 27 non-Sol failures exposed by the complete
-  `codex-core` integration target as pre-existing Firebreak-session debt rather than
-  part of this fix, do not repeat them in the complete workspace suite, and install the
-  reviewed fork binary as the ordinary `codex` command for operator testing. Keep the
-  currently executing `cdx-dev` binary and the independent `cdx` route from `~/.local`,
-  remove obsolete `cdx-pro` plus its shell alias, and update the command topology
-  documented in root `AGENTS.md`.
-<!-- task-bookkeeping:mirror:end -->
-
 ## Planned Fork Requirements — Not Shipped
 
 This inventory does not claim that unreviewed local checkpoints are shipped. The current
@@ -120,6 +86,26 @@ shipped behavior from this inventory.
   ordinary failures are fixed. `verify` keeps going by default; use `--fail-fast` only for
   an explicit diagnostic reason, then use `--resume`, `--from-index`, or `--only-failed`
   for subsequent iterations.
+
+<!-- cooldex-wsl-release-procedure:begin -->
+## WSL Release Procedure
+
+- Build standalone Cooldex releases directly on the supported WSL host for
+  `x86_64-unknown-linux-musl`; Docker is not the Cooldex release route.
+- Keep Rust, Cargo, the musl target, Zig, build targets, temporary files, and validation
+  receipts under a release-scoped directory in `/home/lucas/.cache/codex/`.
+- Route every Cargo invocation through `./scripts/cargo-guard.sh`, and construct the
+  standalone package through `scripts/build_codex_package.py` and
+  `scripts/codex_package/`.
+- Use `.github/scripts/install-musl-build-tools.sh` only for its exact dependency
+  bootstrap.
+- Notify the user immediately before the first command that requires `sudo`, and state the exact dependency-bootstrap purpose.
+- Never echo, store, commit, or embed the user password in a command, receipt, plan, log, or repository artifact.
+- Before publication, verify the archive layout, checksums, executable identity, ELF
+  properties, package metadata, and local installed version.
+- Immediately after publication, run the public latest-release installer in an isolated
+  Rust-free WSL user environment and require the released version.
+<!-- cooldex-wsl-release-procedure:end -->
 
 <!-- upstream-agents-core:begin blob=faa57cc0db48123e1011f1eb47692cd3bbbcfc3a source=upstream/main -->
 # Rust/codex-rs
@@ -467,7 +453,6 @@ Last reviewed: 2026-07-26 on `master-refactor-v2` at upstream base
 - Supported command topology:
   `/home/lucas/.cargo/bin/codex` is the reviewed regular Cooldex executable,
   `/home/lucas/.local/bin/cdx-dev` is the development-session binary, and `cdx`
-  selects the standalone release through `/home/lucas/.local/bin/codex`. The
-  interactive Bash `codex` alias and obsolete `cdx-pro` executable are absent.
+  selects the standalone release through `/home/lucas/.local/bin/codex`.
 
 This Atlas is an owner index, not a call graph or a claim that planned behavior ships.
