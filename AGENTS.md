@@ -102,7 +102,7 @@ shipped behavior from this inventory.
 - Notify the user immediately before the first command that requires `sudo`, and state the exact dependency-bootstrap purpose.
 - Never echo, store, commit, or embed the user password in a command, receipt, plan, log, or repository artifact.
 - Before publication, verify the archive layout, checksums, executable identity, ELF
-  properties, package metadata, and local installed version.
+  properties, package metadata, and staged executable version.
 - Immediately after publication, run the public latest-release installer in an isolated
   Rust-free WSL user environment and require the released version.
 <!-- cooldex-wsl-release-procedure:end -->

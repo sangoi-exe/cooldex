@@ -13,7 +13,7 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 ### Installing and running Cooldex
 
-Cooldex standalone releases currently support WSL or x86_64 Linux.
+Cooldex standalone releases currently support x86_64 Linux, including WSL on x86_64.
 
 ```shell
 curl -fsSL https://github.com/sangoi-exe/cooldex/releases/latest/download/install.sh | sh
