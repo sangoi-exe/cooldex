@@ -10,6 +10,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
+use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -29,6 +30,8 @@ const FIRST_USER: &str = "historical user request";
 const FIRST_REPLY: &str = "historical assistant response";
 const SUMMARY: &str = "bounded compact summary";
 const LIVE_USER: &str = "continue only the live work";
+const PRE_STOP_REPLY: &str = "draft before stop hook";
+const STOP_CONTINUATION_PROMPT: &str = "continue after the blocking stop hook";
 const AFTER_RECOVERY_USER: &str = "start a genuinely new turn";
 
 fn user_turn(text: &str) -> Op {
@@ -235,7 +238,11 @@ async fn post_compact_recovery_retry_reuses_fragments_and_sampling_success_consu
                 ev_completed("tool-request"),
             ]),
             sse(vec![
-                ev_assistant_message("final-message", "continued after tool output"),
+                ev_assistant_message("pre-stop-message", PRE_STOP_REPLY),
+                ev_completed("pre-stop"),
+            ]),
+            sse(vec![
+                ev_assistant_message("final-message", "continued after stop hook"),
                 ev_completed("final"),
             ]),
             sse(vec![
@@ -245,12 +252,50 @@ async fn post_compact_recovery_retry_reuses_fragments_and_sampling_success_consu
         ],
     )
     .await;
-    let mut builder = test_codex().with_config(|config| {
-        config.model_provider.name = "OpenAI-compatible test provider".to_string();
-        config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
-        config.model_provider.request_max_retries = Some(0);
-        config.model_provider.stream_max_retries = Some(1);
-    });
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            let script_path = home.join("recovery_stop_hook.py");
+            let marker_path = home.join("recovery_stop_hook_blocked");
+            let pre_stop_reply =
+                serde_json::to_string(PRE_STOP_REPLY).expect("serialize pre-stop reply");
+            let continuation_prompt = serde_json::to_string(STOP_CONTINUATION_PROMPT)
+                .expect("serialize stop continuation prompt");
+            let script = format!(
+                r#"import json
+from pathlib import Path
+import sys
+
+payload = json.load(sys.stdin)
+marker_path = Path(r"{marker_path}")
+if payload.get("last_assistant_message") == {pre_stop_reply} and not marker_path.exists():
+    marker_path.write_text("blocked", encoding="utf-8")
+    print(json.dumps({{"decision": "block", "reason": {continuation_prompt}}}))
+else:
+    print(json.dumps({{"systemMessage": "stop hook passed"}}))
+"#,
+                marker_path = marker_path.display(),
+            );
+            let hooks = serde_json::json!({
+                "hooks": {
+                    "Stop": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": format!("python3 {}", script_path.display()),
+                        }]
+                    }]
+                }
+            });
+            fs::write(&script_path, script).expect("write targeted stop hook fixture");
+            fs::write(home.join("hooks.json"), hooks.to_string())
+                .expect("write targeted hooks.json");
+        })
+        .with_config(|config| {
+            trust_discovered_hooks(config);
+            config.model_provider.name = "OpenAI-compatible test provider".to_string();
+            config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(1);
+        });
     let test = builder.build(&server).await?;
     let rollout_path = test
         .session_configured
@@ -265,17 +310,21 @@ async fn post_compact_recovery_retry_reuses_fragments_and_sampling_success_consu
     wait_for_successful_turn_complete(&test.codex).await;
 
     let requests = requests.requests();
-    assert_eq!(requests.len(), 6);
+    assert_eq!(requests.len(), 7);
     let ((failed_recovery_index, failed_recovery), failed_recall) =
         recovery_fragments(&requests[2]);
     let ((retry_recovery_index, retry_recovery), retry_recall) = recovery_fragments(&requests[3]);
     let ((follow_up_recovery_index, follow_up_recovery), follow_up_recall) =
         recovery_fragments(&requests[4]);
+    let ((stop_hook_recovery_index, stop_hook_recovery), stop_hook_recall) =
+        recovery_fragments(&requests[5]);
     assert_eq!(failed_recovery, retry_recovery);
     assert_eq!(failed_recovery, follow_up_recovery);
+    assert_eq!(failed_recovery, stop_hook_recovery);
     assert_eq!(failed_recall, retry_recall);
     assert_eq!(failed_recall, follow_up_recall);
-    assert_no_recovery_fragments(&requests[5]);
+    assert_eq!(failed_recall, stop_hook_recall);
+    assert_no_recovery_fragments(&requests[6]);
 
     let items = read_rollout_items(&rollout_path);
     assert!(
@@ -314,9 +363,14 @@ async fn post_compact_recovery_retry_reuses_fragments_and_sampling_success_consu
             follow_up_recovery_index,
             follow_up_recall.as_ref().map(|(index, _)| *index),
         ),
+        (
+            &requests[5],
+            stop_hook_recovery_index,
+            stop_hook_recall.as_ref().map(|(index, _)| *index),
+        ),
     ] {
-        let boundary_index = request
-            .input()
+        let input = request.input();
+        let boundary_index = input
             .iter()
             .position(|item| {
                 item.get("id").and_then(serde_json::Value::as_str)
@@ -329,7 +383,42 @@ async fn post_compact_recovery_retry_reuses_fragments_and_sampling_success_consu
         } else {
             assert_eq!(recovery_index, boundary_index + 1);
         }
+        let live_user_index = input
+            .iter()
+            .position(|item| {
+                item.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                    && item
+                        .get("content")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|content| content.first())
+                        .and_then(|content| content.get("text"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(LIVE_USER)
+            })
+            .expect("genuinely new user input after standalone compact");
+        assert!(
+            recovery_index < live_user_index,
+            "the recovery directive must precede genuinely new user input"
+        );
     }
+    let stop_hook_prompt_index = requests[5]
+        .input()
+        .iter()
+        .position(|item| {
+            item.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                && item
+                    .get("content")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|content| content.first())
+                    .and_then(|content| content.get("text"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| text.contains(STOP_CONTINUATION_PROMPT))
+        })
+        .expect("stop hook continuation prompt");
+    assert!(
+        stop_hook_recovery_index < stop_hook_prompt_index,
+        "the recovery directive must remain before stop-hook continuation input"
+    );
 
     let application_items = items
         .iter()

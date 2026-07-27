@@ -3904,7 +3904,8 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
         harness.server(),
         vec![
             responses::sse_response(responses::sse(vec![
-                responses::ev_function_call("call-before-compact", DUMMY_FUNCTION_NAME, "{}"),
+                responses::ev_function_call("call-before-compact-1", DUMMY_FUNCTION_NAME, "{}"),
+                responses::ev_function_call("call-before-compact-2", DUMMY_FUNCTION_NAME, "{}"),
                 responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
             ]))
             .insert_header(TURN_STATE_HEADER, "sampling-state"),
@@ -4009,20 +4010,6 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
                 && item_text(item).is_some_and(|text| text.starts_with("<post_compact_recovery>"))
         })
         .expect("developer recovery directive");
-    let tool_call_index = post_compact_input
-        .iter()
-        .position(|item| {
-            item.get("type").and_then(Value::as_str) == Some("function_call")
-                && item.get("call_id").and_then(Value::as_str) == Some("call-before-compact")
-        })
-        .expect("native continuity tool call");
-    let tool_output_index = post_compact_input
-        .iter()
-        .position(|item| {
-            item.get("type").and_then(Value::as_str) == Some("function_call_output")
-                && item.get("call_id").and_then(Value::as_str) == Some("call-before-compact")
-        })
-        .expect("native continuity tool output");
 
     assert!(
         retained_user_index < compaction_index
@@ -4030,12 +4017,45 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
                 compaction_index < recall_index && recall_index < recovery_index
             })
             && compaction_index < recovery_index
-            && recovery_index < tool_call_index
-            && tool_call_index < tool_output_index,
+            && recovery_index + 1 < post_compact_input.len(),
         "expected historical user < compaction < optional recall < recovery directive < native tool batch"
     );
-    assert_eq!(tool_call_index, recovery_index + 1);
-    assert_eq!(tool_output_index, tool_call_index + 1);
+    let native_batch = &post_compact_input[recovery_index + 1..];
+    assert_eq!(native_batch.len(), 4);
+    assert_eq!(
+        native_batch
+            .iter()
+            .take(2)
+            .map(|item| (
+                item.get("type").and_then(Value::as_str),
+                item.get("call_id").and_then(Value::as_str),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("function_call"), Some("call-before-compact-1")),
+            (Some("function_call"), Some("call-before-compact-2")),
+        ],
+        "parallel native calls should remain ordered and contiguous after the directive"
+    );
+    let mut output_call_ids = native_batch
+        .iter()
+        .skip(2)
+        .map(|item| {
+            assert_eq!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call_output")
+            );
+            item.get("call_id")
+                .and_then(Value::as_str)
+                .expect("native continuity tool output call id")
+        })
+        .collect::<Vec<_>>();
+    output_call_ids.sort_unstable();
+    assert_eq!(
+        output_call_ids,
+        vec!["call-before-compact-1", "call-before-compact-2"],
+        "parallel native outputs should remain complete and contiguous after the directive"
+    );
     assert!(
         !post_compact_input[recovery_index + 1..]
             .iter()

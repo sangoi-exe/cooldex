@@ -347,13 +347,6 @@ pub(crate) async fn run_turn(
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                 .await;
                 let needs_follow_up = model_needs_follow_up || has_pending_input;
-                if !needs_follow_up && let Some(recovery) = post_compact_recovery.as_ref() {
-                    sess.record_post_compact_recovery_sampling_success(
-                        recovery,
-                        &turn_context.sub_id,
-                    )
-                    .await?;
-                }
                 let token_limit_reached = token_status.token_limit_reached;
 
                 trace!(
@@ -465,6 +458,13 @@ pub(crate) async fn run_turn(
                             )
                             .await;
                         }
+                    }
+                    if let Some(recovery) = post_compact_recovery.as_ref() {
+                        sess.record_post_compact_recovery_sampling_success(
+                            recovery,
+                            &turn_context.sub_id,
+                        )
+                        .await?;
                     }
                     if stop_outcome.should_stop {
                         break;
