@@ -625,7 +625,10 @@ pub(crate) fn construct_model_info_from_candidates(
     let remote = find_model_by_longest_prefix(model, candidates)
         .or_else(|| find_model_by_namespaced_suffix(model, candidates));
     let model_info = if let Some(mut remote) = remote {
-        if remote.slug == "gpt-5.6-sol" {
+        if matches!(
+            remote.slug.as_str(),
+            "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+        ) {
             remote.use_responses_lite = false;
         }
         ModelInfo {

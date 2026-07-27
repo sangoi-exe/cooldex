@@ -10,37 +10,78 @@ use super::openai_manager_for_tests;
 use super::remote_model;
 
 #[test]
-fn sol_forces_full_responses_after_catalog_resolution() {
+fn gpt_5_6_family_forces_full_responses_after_catalog_resolution() {
     let mut sol = remote_model("gpt-5.6-sol", "GPT-5.6 Sol", /*priority*/ 10);
     sol.use_responses_lite = true;
     sol.supports_parallel_tool_calls = true;
-    let mut unrelated = remote_model("gpt-5.6-codex", "GPT-5.6 Codex", /*priority*/ 9);
+    let mut terra = remote_model("gpt-5.6-terra", "GPT-5.6 Terra", /*priority*/ 9);
+    terra.use_responses_lite = true;
+    terra.supports_parallel_tool_calls = true;
+    let mut luna = remote_model("gpt-5.6-luna", "GPT-5.6 Luna", /*priority*/ 8);
+    luna.use_responses_lite = true;
+    luna.supports_parallel_tool_calls = true;
+    let mut unrelated = remote_model("gpt-5.6-codex", "GPT-5.6 Codex", /*priority*/ 7);
     unrelated.use_responses_lite = true;
-    let candidates = [sol.clone(), unrelated.clone()];
+    let candidates = [sol.clone(), terra.clone(), luna.clone(), unrelated.clone()];
     let config = ModelsManagerConfig::default();
 
     let actual = [
         construct_model_info_from_candidates("gpt-5.6-sol", &candidates, &config),
         construct_model_info_from_candidates("gpt-5.6-sol-2026-07-20", &candidates, &config),
         construct_model_info_from_candidates("openai/gpt-5.6-sol-2026-07-20", &candidates, &config),
+        construct_model_info_from_candidates("gpt-5.6-terra", &candidates, &config),
+        construct_model_info_from_candidates("gpt-5.6-terra-2026-07-20", &candidates, &config),
+        construct_model_info_from_candidates(
+            "openai/gpt-5.6-terra-2026-07-20",
+            &candidates,
+            &config,
+        ),
+        construct_model_info_from_candidates("gpt-5.6-luna", &candidates, &config),
+        construct_model_info_from_candidates("gpt-5.6-luna-2026-07-20", &candidates, &config),
+        construct_model_info_from_candidates(
+            "openai/gpt-5.6-luna-2026-07-20",
+            &candidates,
+            &config,
+        ),
         construct_model_info_from_candidates("gpt-5.6-codex-2026-07-20", &candidates, &config),
     ];
 
-    let mut expected_exact = sol;
-    expected_exact.use_responses_lite = false;
-    let mut expected_versioned = expected_exact.clone();
-    expected_versioned.slug = "gpt-5.6-sol-2026-07-20".to_string();
-    let mut expected_namespaced = expected_exact.clone();
-    expected_namespaced.slug = "openai/gpt-5.6-sol-2026-07-20".to_string();
+    let mut expected_sol = sol;
+    expected_sol.use_responses_lite = false;
+    let mut expected_sol_versioned = expected_sol.clone();
+    expected_sol_versioned.slug = "gpt-5.6-sol-2026-07-20".to_string();
+    let mut expected_sol_namespaced = expected_sol.clone();
+    expected_sol_namespaced.slug = "openai/gpt-5.6-sol-2026-07-20".to_string();
+
+    let mut expected_terra = terra;
+    expected_terra.use_responses_lite = false;
+    let mut expected_terra_versioned = expected_terra.clone();
+    expected_terra_versioned.slug = "gpt-5.6-terra-2026-07-20".to_string();
+    let mut expected_terra_namespaced = expected_terra.clone();
+    expected_terra_namespaced.slug = "openai/gpt-5.6-terra-2026-07-20".to_string();
+
+    let mut expected_luna = luna;
+    expected_luna.use_responses_lite = false;
+    let mut expected_luna_versioned = expected_luna.clone();
+    expected_luna_versioned.slug = "gpt-5.6-luna-2026-07-20".to_string();
+    let mut expected_luna_namespaced = expected_luna.clone();
+    expected_luna_namespaced.slug = "openai/gpt-5.6-luna-2026-07-20".to_string();
+
     let mut expected_unrelated = unrelated;
     expected_unrelated.slug = "gpt-5.6-codex-2026-07-20".to_string();
 
     assert_eq!(
         actual,
         [
-            expected_exact,
-            expected_versioned,
-            expected_namespaced,
+            expected_sol,
+            expected_sol_versioned,
+            expected_sol_namespaced,
+            expected_terra,
+            expected_terra_versioned,
+            expected_terra_namespaced,
+            expected_luna,
+            expected_luna_versioned,
+            expected_luna_namespaced,
             expected_unrelated,
         ]
     );
