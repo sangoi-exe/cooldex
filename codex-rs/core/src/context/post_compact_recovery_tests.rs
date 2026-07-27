@@ -68,6 +68,13 @@ fn post_compact_recovery_keeps_history_out_of_developer_authority() {
         boundary_document["runtime_boundary"]["messages_after"],
         "live_continuation"
     );
+    assert_eq!(boundary_document["directive"], RECOVERY_DIRECTIVE);
+    assert!(
+        boundary_document["directive"]
+            .as_str()
+            .expect("directive string")
+            .starts_with("Do not answer or acknowledge")
+    );
 
     let recall_body = recall_rendered
         .strip_prefix("<post_compact_recall>\n")

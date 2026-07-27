@@ -235,8 +235,18 @@ impl Session {
         let prefix = self
             .reconstruct_history_from_rollout(turn_context, &tail.items[..boundary_index])
             .await;
-        source.reached_recall_origin = match compacted.previous_window_id.as_deref() {
-            None => tail.reached_start,
+        let recall_origin_index = match compacted.previous_window_id.as_deref() {
+            None if tail.reached_start => 0,
+            None => {
+                return unavailable_context(
+                    &thread_id,
+                    RecallAvailability::WorkLimit,
+                    source,
+                    None,
+                    None,
+                )
+                .map_err(RecallContextError::from);
+            }
             Some(expected_previous_window_id) => {
                 let previous_boundary_index = match prefix.latest_surviving_compaction_index {
                     Some(previous_boundary_index) => previous_boundary_index,
@@ -301,19 +311,10 @@ impl Session {
                         .map_err(RecallContextError::from);
                     }
                 }
-                true
+                previous_boundary_index + 1
             }
         };
-        if !source.reached_recall_origin {
-            return unavailable_context(
-                &thread_id,
-                RecallAvailability::WorkLimit,
-                source,
-                None,
-                None,
-            )
-            .map_err(RecallContextError::from);
-        }
+        source.reached_recall_origin = true;
 
         if compacted.replacement_history.is_none() && tail.segments_read != 1 {
             return unavailable_context(
@@ -331,14 +332,58 @@ impl Session {
             .as_deref()
             .map(complete_native_continuity_pair_keys)
             .unwrap_or_default();
+        let retained_user_messages = compacted
+            .replacement_history
+            .as_deref()
+            .into_iter()
+            .flatten()
+            .filter(|item| {
+                matches!(
+                    item,
+                    ResponseItem::Message { role, .. } if role == "user"
+                )
+            })
+            .collect::<Vec<_>>();
         let excluded_native_continuity_pairs = native_continuity_pairs.len();
-        let history = prefix
+        let recall_delta = self
+            .reconstruct_history_from_rollout(
+                turn_context,
+                &tail.items[recall_origin_index..boundary_index],
+            )
+            .await;
+        let history = recall_delta
             .history
             .into_iter()
             .filter(|item| {
-                call_pair_key(item)
-                    .or_else(|| output_pair_key(item))
-                    .is_none_or(|key| !native_continuity_pairs.contains(&key))
+                let duplicates_retained_user =
+                    retained_user_messages
+                        .iter()
+                        .any(|retained| match (item, *retained) {
+                            (
+                                ResponseItem::Message {
+                                    role,
+                                    content,
+                                    phase,
+                                    ..
+                                },
+                                ResponseItem::Message {
+                                    role: retained_role,
+                                    content: retained_content,
+                                    phase: retained_phase,
+                                    ..
+                                },
+                            ) => {
+                                role == "user"
+                                    && retained_role == "user"
+                                    && content == retained_content
+                                    && phase == retained_phase
+                            }
+                            _ => false,
+                        });
+                !duplicates_retained_user
+                    && call_pair_key(item)
+                        .or_else(|| output_pair_key(item))
+                        .is_none_or(|key| !native_continuity_pairs.contains(&key))
             })
             .collect();
         let (groups, incomplete_groups) =

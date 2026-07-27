@@ -3978,6 +3978,243 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
         Some("sampling-state")
     );
 
+    let post_compact_input = requests[2].input();
+    let item_text = |item: &Value| {
+        item.get("content")
+            .and_then(Value::as_array)
+            .and_then(|content| content.first())
+            .and_then(|content| content.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let retained_user_index = post_compact_input
+        .iter()
+        .position(|item| {
+            item.get("role").and_then(Value::as_str) == Some("user")
+                && item_text(item).as_deref() == Some("RUN_WITH_MID_TURN_COMPACT_V2")
+        })
+        .expect("retained historical user");
+    let compaction_index = post_compact_input
+        .iter()
+        .position(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+        .expect("compaction checkpoint");
+    let recall_index = post_compact_input.iter().position(|item| {
+        item.get("role").and_then(Value::as_str) == Some("user")
+            && item_text(item).is_some_and(|text| text.starts_with("<post_compact_recall>"))
+    });
+    let recovery_index = post_compact_input
+        .iter()
+        .position(|item| {
+            item.get("role").and_then(Value::as_str) == Some("developer")
+                && item_text(item).is_some_and(|text| text.starts_with("<post_compact_recovery>"))
+        })
+        .expect("developer recovery directive");
+    let tool_call_index = post_compact_input
+        .iter()
+        .position(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call")
+                && item.get("call_id").and_then(Value::as_str) == Some("call-before-compact")
+        })
+        .expect("native continuity tool call");
+    let tool_output_index = post_compact_input
+        .iter()
+        .position(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some("call-before-compact")
+        })
+        .expect("native continuity tool output");
+
+    assert!(
+        retained_user_index < compaction_index
+            && recall_index.is_none_or(|recall_index| {
+                compaction_index < recall_index && recall_index < recovery_index
+            })
+            && compaction_index < recovery_index
+            && recovery_index < tool_call_index
+            && tool_call_index < tool_output_index,
+        "expected historical user < compaction < optional recall < recovery directive < native tool batch"
+    );
+    assert_eq!(tool_call_index, recovery_index + 1);
+    assert_eq!(tool_output_index, tool_call_index + 1);
+    assert!(
+        !post_compact_input[recovery_index + 1..]
+            .iter()
+            .any(|item| item.get("role").and_then(Value::as_str) == Some("user")),
+        "no historical user-authority item may follow the recovery directive"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_mid_turn_compact_v2_keeps_three_successive_recoveries_structural() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const RETAINED_USER: &str = "RUN_THREE_MID_TURN_COMPACTS_V2";
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                let _ = config.features.enable(Feature::RemoteCompactionV2);
+                config.model_auto_compact_token_limit = Some(200);
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+    let responses_mock = responses::mount_sse_sequence(
+        harness.server(),
+        vec![
+            responses::sse(vec![
+                responses::ev_function_call("call-before-compact-1", DUMMY_FUNCTION_NAME, "{}"),
+                responses::ev_completed_with_tokens("sampling-1", /*total_tokens*/ 500),
+            ]),
+            responses::sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "V2_COMPACT_SUMMARY_1",
+                    }
+                }),
+                responses::ev_completed("compact-1"),
+            ]),
+            responses::sse(vec![
+                responses::ev_function_call("call-before-compact-2", DUMMY_FUNCTION_NAME, "{}"),
+                responses::ev_completed_with_tokens("sampling-2", /*total_tokens*/ 500),
+            ]),
+            responses::sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "V2_COMPACT_SUMMARY_2",
+                    }
+                }),
+                responses::ev_completed("compact-2"),
+            ]),
+            responses::sse(vec![
+                responses::ev_function_call("call-before-compact-3", DUMMY_FUNCTION_NAME, "{}"),
+                responses::ev_completed_with_tokens("sampling-3", /*total_tokens*/ 500),
+            ]),
+            responses::sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "V2_COMPACT_SUMMARY_3",
+                    }
+                }),
+                responses::ev_completed("compact-3"),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("final", "FINISHED_AFTER_THREE_COMPACTS"),
+                responses::ev_completed_with_tokens("final", /*total_tokens*/ 80),
+            ]),
+        ],
+    )
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: RETAINED_USER.to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_turn_complete(&codex).await;
+
+    let requests = responses_mock.requests();
+    assert_eq!(requests.len(), 7);
+    for compact_index in [1, 3, 5] {
+        assert!(
+            requests[compact_index]
+                .body_json()
+                .to_string()
+                .contains("\"type\":\"compaction_trigger\""),
+            "request {compact_index} should be a remote V2 compaction"
+        );
+    }
+
+    let item_text = |item: &Value| {
+        item.get("content")
+            .and_then(Value::as_array)
+            .and_then(|content| content.first())
+            .and_then(|content| content.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    for (request_index, call_id) in [
+        (2, "call-before-compact-1"),
+        (4, "call-before-compact-2"),
+        (6, "call-before-compact-3"),
+    ] {
+        let input = requests[request_index].input();
+        let retained_user_index = input
+            .iter()
+            .position(|item| {
+                item.get("role").and_then(Value::as_str) == Some("user")
+                    && item_text(item).as_deref() == Some(RETAINED_USER)
+            })
+            .expect("retained historical user");
+        let compaction_index = input
+            .iter()
+            .rposition(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+            .expect("latest compaction checkpoint");
+        let recall = input.iter().enumerate().find_map(|(index, item)| {
+            (item.get("role").and_then(Value::as_str) == Some("user"))
+                .then(|| item_text(item))
+                .flatten()
+                .filter(|text| text.starts_with("<post_compact_recall>"))
+                .map(|text| (index, text))
+        });
+        let recovery_index = input
+            .iter()
+            .position(|item| {
+                item.get("role").and_then(Value::as_str) == Some("developer")
+                    && item_text(item)
+                        .is_some_and(|text| text.starts_with("<post_compact_recovery>"))
+            })
+            .expect("developer recovery directive");
+        let tool_call_index = input
+            .iter()
+            .position(|item| {
+                item.get("type").and_then(Value::as_str) == Some("function_call")
+                    && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+            })
+            .expect("native continuity tool call");
+        let tool_output_index = input
+            .iter()
+            .position(|item| {
+                item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                    && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+            })
+            .expect("native continuity tool output");
+
+        assert!(retained_user_index < compaction_index);
+        if let Some((recall_index, recall_text)) = recall {
+            assert!(compaction_index < recall_index && recall_index < recovery_index);
+            assert!(
+                !recall_text.contains(RETAINED_USER),
+                "request {request_index} repeated the natively retained user inside recall"
+            );
+        } else {
+            assert!(compaction_index < recovery_index);
+        }
+        assert_eq!(tool_call_index, recovery_index + 1);
+        assert_eq!(tool_output_index, tool_call_index + 1);
+        assert!(
+            !input[recovery_index + 1..]
+                .iter()
+                .any(|item| item.get("role").and_then(Value::as_str) == Some("user")),
+            "request {request_index} placed historical user authority after the directive"
+        );
+    }
+
     Ok(())
 }
 

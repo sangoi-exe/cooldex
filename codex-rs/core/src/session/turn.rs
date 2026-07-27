@@ -46,6 +46,7 @@ use crate::session::post_compact_recovery::PreparedPostCompactRecovery;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use crate::state::PostCompactRecoveryIdentity;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::TurnItemContributorPolicy;
 use crate::stream_events_utils::finalize_non_tool_response_item;
@@ -319,7 +320,7 @@ pub(crate) async fn run_turn(
         }
         .await;
         match sampling_request_result {
-            Ok((sampling_request_output, sampling_request_input)) => {
+            Ok((sampling_request_output, sampling_request_input, post_compact_recovery)) => {
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
@@ -346,6 +347,13 @@ pub(crate) async fn run_turn(
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                 .await;
                 let needs_follow_up = model_needs_follow_up || has_pending_input;
+                if !needs_follow_up && let Some(recovery) = post_compact_recovery.as_ref() {
+                    sess.record_post_compact_recovery_sampling_success(
+                        recovery,
+                        &turn_context.sub_id,
+                    )
+                    .await?;
+                }
                 let token_limit_reached = token_status.token_limit_reached;
 
                 trace!(
@@ -1196,7 +1204,11 @@ async fn run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
-) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
+) -> CodexResult<(
+    SamplingRequestResult,
+    Vec<ResponseItem>,
+    Option<PostCompactRecoveryIdentity>,
+)> {
     let turn_context = Arc::clone(&step_context.turn);
     let router = Arc::clone(&step_context.tool_router);
 
@@ -1252,15 +1264,16 @@ async fn run_sampling_request(
         .await;
         let err = match sampling_result {
             Ok(output) => {
-                if let Some(recovery) = prepared_prompt.post_compact_recovery.as_ref() {
-                    sess.record_post_compact_recovery_sampling_success(
-                        recovery.identity(),
-                        &turn_context.sub_id,
-                    )
-                    .await?;
-                }
+                let post_compact_recovery = prepared_prompt
+                    .post_compact_recovery
+                    .as_ref()
+                    .map(|recovery| recovery.identity().clone());
                 let attempt_input = prepared_prompt.into_original_input()?;
-                return Ok((output, original_input.unwrap_or(attempt_input)));
+                return Ok((
+                    output,
+                    original_input.unwrap_or(attempt_input),
+                    post_compact_recovery,
+                ));
             }
             Err(CodexErr::ContextWindowExceeded) => {
                 sess.set_total_tokens_full(&turn_context).await;

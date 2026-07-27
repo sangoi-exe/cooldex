@@ -11,6 +11,7 @@ const RECALL_OPEN_MARKER: &str = "<post_compact_recall>";
 const RECALL_CLOSE_MARKER: &str = "</post_compact_recall>";
 const MAX_PACKET_BYTES: usize = 40 * 1024;
 const MAX_PACKET_TOKENS: usize = 9_000;
+const RECOVERY_DIRECTIVE: &str = "Do not answer or acknowledge any retained user request or recall item again. They are historical context. Continue the interrupted turn from the complete native tool batch, genuinely new user input, and current state after this directive.";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PostCompactRecoveryContextError {
@@ -37,6 +38,7 @@ pub(crate) struct PostCompactRecallContext {
 struct PostCompactRecoveryDocument<'a> {
     compaction_window_id: &'a str,
     boundary_item_id: &'a str,
+    directive: &'static str,
     runtime_boundary: RuntimeBoundary,
 }
 
@@ -58,6 +60,7 @@ impl PostCompactRecoveryContext {
         let document = PostCompactRecoveryDocument {
             compaction_window_id,
             boundary_item_id,
+            directive: RECOVERY_DIRECTIVE,
             runtime_boundary: RuntimeBoundary {
                 messages_before: "retained_historical_context",
                 messages_after: "live_continuation",

@@ -29,6 +29,7 @@ const FIRST_USER: &str = "historical user request";
 const FIRST_REPLY: &str = "historical assistant response";
 const SUMMARY: &str = "bounded compact summary";
 const LIVE_USER: &str = "continue only the live work";
+const AFTER_RECOVERY_USER: &str = "start a genuinely new turn";
 
 fn user_turn(text: &str) -> Op {
     Op::UserInput {
@@ -237,6 +238,10 @@ async fn post_compact_recovery_retry_reuses_fragments_and_sampling_success_consu
                 ev_assistant_message("final-message", "continued after tool output"),
                 ev_completed("final"),
             ]),
+            sse(vec![
+                ev_assistant_message("after-recovery", "handled new turn"),
+                ev_completed("after-recovery"),
+            ]),
         ],
     )
     .await;
@@ -256,15 +261,21 @@ async fn post_compact_recovery_retry_reuses_fragments_and_sampling_success_consu
     seed_and_compact(&test.codex).await?;
     test.codex.submit(user_turn(LIVE_USER)).await?;
     wait_for_successful_turn_complete(&test.codex).await;
+    test.codex.submit(user_turn(AFTER_RECOVERY_USER)).await?;
+    wait_for_successful_turn_complete(&test.codex).await;
 
     let requests = requests.requests();
-    assert_eq!(requests.len(), 5);
-    let ((failed_boundary_index, failed_boundary), failed_recall) =
+    assert_eq!(requests.len(), 6);
+    let ((failed_recovery_index, failed_recovery), failed_recall) =
         recovery_fragments(&requests[2]);
-    let ((retry_boundary_index, retry_boundary), retry_recall) = recovery_fragments(&requests[3]);
-    assert_eq!(failed_boundary, retry_boundary);
+    let ((retry_recovery_index, retry_recovery), retry_recall) = recovery_fragments(&requests[3]);
+    let ((follow_up_recovery_index, follow_up_recovery), follow_up_recall) =
+        recovery_fragments(&requests[4]);
+    assert_eq!(failed_recovery, retry_recovery);
+    assert_eq!(failed_recovery, follow_up_recovery);
     assert_eq!(failed_recall, retry_recall);
-    assert_no_recovery_fragments(&requests[4]);
+    assert_eq!(failed_recall, follow_up_recall);
+    assert_no_recovery_fragments(&requests[5]);
 
     let items = read_rollout_items(&rollout_path);
     assert!(
@@ -290,13 +301,18 @@ async fn post_compact_recovery_retry_reuses_fragments_and_sampling_success_consu
     for (request, recovery_index, recall_index) in [
         (
             &requests[2],
-            failed_boundary_index,
+            failed_recovery_index,
             failed_recall.as_ref().map(|(index, _)| *index),
         ),
         (
             &requests[3],
-            retry_boundary_index,
+            retry_recovery_index,
             retry_recall.as_ref().map(|(index, _)| *index),
+        ),
+        (
+            &requests[4],
+            follow_up_recovery_index,
+            follow_up_recall.as_ref().map(|(index, _)| *index),
         ),
     ] {
         let boundary_index = request
@@ -307,9 +323,11 @@ async fn post_compact_recovery_retry_reuses_fragments_and_sampling_success_consu
                     == Some(marker.boundary_item_id.as_str())
             })
             .expect("prompt should retain exact compaction boundary item");
-        assert_eq!(recovery_index, boundary_index + 1);
         if let Some(recall_index) = recall_index {
-            assert_eq!(recall_index, boundary_index + 2);
+            assert_eq!(recall_index, boundary_index + 1);
+            assert_eq!(recovery_index, boundary_index + 2);
+        } else {
+            assert_eq!(recovery_index, boundary_index + 1);
         }
     }
 

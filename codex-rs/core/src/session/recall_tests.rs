@@ -367,6 +367,83 @@ async fn selects_the_latest_of_multiple_surviving_compactions() {
 }
 
 #[tokio::test]
+async fn excludes_the_predecessor_replacement_history_from_the_next_recall_window() {
+    const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
+    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
+    const RETAINED_USER: &str = "retained historical request";
+    const INTERCOMPACT_DELTA: &str = "work completed after the predecessor compact";
+    let (session, turn_context) = make_session_and_context().await;
+    let retained_user = message("user", RETAINED_USER);
+    let context = session
+        .build_recall_context(
+            &turn_context,
+            tail(
+                session.thread_id,
+                vec![
+                    compacted_window(
+                        "first",
+                        vec![retained_user.clone()],
+                        1,
+                        FIRST_WINDOW_ID,
+                        None,
+                        FIRST_WINDOW_ID,
+                    ),
+                    RolloutItem::ResponseItem(message("assistant", INTERCOMPACT_DELTA)),
+                    compacted_window(
+                        "latest",
+                        vec![retained_user],
+                        2,
+                        FIRST_WINDOW_ID,
+                        Some(FIRST_WINDOW_ID),
+                        CURRENT_WINDOW_ID,
+                    ),
+                ],
+            ),
+        )
+        .await
+        .expect("build intercompact recall delta");
+    let value = parsed(&context);
+
+    assert_eq!(value["groups"].as_array().expect("groups").len(), 1);
+    assert_eq!(
+        value["groups"][0]["items"][0]["content"][0]["text"],
+        INTERCOMPACT_DELTA
+    );
+    assert!(
+        !context.json().contains(RETAINED_USER),
+        "the predecessor replacement history must not be serialized into the next recall"
+    );
+}
+
+#[tokio::test]
+async fn excludes_a_user_message_already_retained_by_the_current_replacement() {
+    const RETAINED_USER: &str = "retained historical request";
+    const UNRETAINED_HISTORY: &str = "historical work omitted from the replacement";
+    let (session, turn_context) = make_session_and_context().await;
+    let retained_user = message("user", RETAINED_USER);
+    let context = session
+        .build_recall_context(
+            &turn_context,
+            tail(
+                session.thread_id,
+                vec![
+                    RolloutItem::ResponseItem(retained_user.clone()),
+                    RolloutItem::ResponseItem(message("assistant", UNRETAINED_HISTORY)),
+                    compacted("summary", Some(vec![retained_user])),
+                ],
+            ),
+        )
+        .await
+        .expect("build first-window recall");
+
+    assert!(
+        !context.json().contains(RETAINED_USER),
+        "a natively retained user message must not be repeated in automatic recall"
+    );
+    assert!(context.json().contains(UNRETAINED_HISTORY));
+}
+
+#[tokio::test]
 async fn bounded_tail_reaches_previous_compaction_without_reaching_session_start() {
     const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
     const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";

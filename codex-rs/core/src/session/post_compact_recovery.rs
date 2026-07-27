@@ -14,6 +14,9 @@ use crate::context::PostCompactRecoveryContext;
 use crate::context::PostCompactRecoveryContextError;
 use crate::state::PostCompactRecoveryFailureClass;
 use crate::state::PostCompactRecoveryIdentity;
+use crate::tool_batch::ToolItemKind;
+use crate::tool_batch::classify_tool_item;
+use crate::tool_batch::complete_trailing_tool_batch;
 
 #[derive(Debug)]
 pub(super) struct PreparedPostCompactRecovery {
@@ -28,22 +31,8 @@ impl PreparedPostCompactRecovery {
     }
 
     pub(super) fn remove_from_input(self, input: &mut Vec<ResponseItem>) -> CodexResult<()> {
-        let has_recovery_item = input.get(self.insertion_index).is_some_and(|item| {
-            matches!(
-                item,
-                ResponseItem::Message { role, content, .. }
-                    if role == "developer"
-                        && content.iter().any(|content| {
-                            matches!(
-                                content,
-                                codex_protocol::models::ContentItem::InputText { text }
-                                    if PostCompactRecoveryContext::matches_text(text)
-                            )
-                        })
-            )
-        });
         let has_recall_item = self.item_count == 1
-            || input.get(self.insertion_index + 1).is_some_and(|item| {
+            || input.get(self.insertion_index).is_some_and(|item| {
                 matches!(
                     item,
                     ResponseItem::Message { role, content, .. }
@@ -57,6 +46,21 @@ impl PreparedPostCompactRecovery {
                             })
                 )
             });
+        let recovery_index = self.insertion_index + usize::from(self.item_count == 2);
+        let has_recovery_item = input.get(recovery_index).is_some_and(|item| {
+            matches!(
+                item,
+                ResponseItem::Message { role, content, .. }
+                    if role == "developer"
+                        && content.iter().any(|content| {
+                            matches!(
+                                content,
+                                codex_protocol::models::ContentItem::InputText { text }
+                                    if PostCompactRecoveryContext::matches_text(text)
+                            )
+                        })
+            )
+        });
         if !has_recovery_item || !has_recall_item {
             return Err(CodexErr::Fatal(
                 "post-compact recovery prompt carrier lost a transient item".to_string(),
@@ -169,14 +173,11 @@ impl Session {
             if item
                 .id()
                 .is_some_and(|item_id| item_id.as_str() == identity.boundary_item_id.as_str())
+                && boundary_index.replace(index).is_some()
             {
-                if boundary_index.replace(index).is_some() {
-                    return Err(self
-                        .block_post_compact_recovery(
-                            PostCompactRecoveryFailureClass::BoundaryMismatch,
-                        )
-                        .await);
-                }
+                return Err(self
+                    .block_post_compact_recovery(PostCompactRecoveryFailureClass::BoundaryMismatch)
+                    .await);
             }
         }
         let Some(boundary_index) = boundary_index else {
@@ -184,16 +185,40 @@ impl Session {
                 .block_post_compact_recovery(PostCompactRecoveryFailureClass::BoundaryMismatch)
                 .await);
         };
-        let insertion_index = boundary_index + 1;
+        let insertion_index = match classify_tool_item(&input[boundary_index]) {
+            ToolItemKind::Output => match complete_trailing_tool_batch(&input[..=boundary_index]) {
+                Ok(batch) => batch.range.start,
+                Err(reason) => {
+                    warn!(
+                        %reason,
+                        "post-compact recovery boundary ends an invalid native tool batch"
+                    );
+                    return Err(self
+                        .block_post_compact_recovery(
+                            PostCompactRecoveryFailureClass::BoundaryMismatch,
+                        )
+                        .await);
+                }
+            },
+            ToolItemKind::UnsupportedOutput => {
+                return Err(self
+                    .block_post_compact_recovery(PostCompactRecoveryFailureClass::BoundaryMismatch)
+                    .await);
+            }
+            ToolItemKind::Call | ToolItemKind::UnsupportedCall | ToolItemKind::NonTool => {
+                boundary_index + 1
+            }
+        };
         let recall = packet.recall().cloned();
-        input.insert(insertion_index, Box::new(packet).into_boxed_response_item());
         let item_count = if let Some(recall) = recall {
+            input.insert(insertion_index, Box::new(recall).into_boxed_response_item());
             input.insert(
                 insertion_index + 1,
-                Box::new(recall).into_boxed_response_item(),
+                Box::new(packet).into_boxed_response_item(),
             );
             2
         } else {
+            input.insert(insertion_index, Box::new(packet).into_boxed_response_item());
             1
         };
         Ok(Some(PreparedPostCompactRecovery {
