@@ -15,6 +15,7 @@ use tracing::trace_span;
 
 use super::SessionTask;
 use super::SessionTaskContext;
+use super::SessionTaskOutput;
 use super::SessionTaskResult;
 
 #[derive(Default)]
@@ -65,7 +66,7 @@ impl SessionTask for RegularTask {
         let prewarmed_client_session = match prewarmed_client_session {
             SessionStartupPrewarmResolution::Cancelled => {
                 run_hooks_and_record_inputs(&sess, &ctx, &input).await;
-                return Ok(None);
+                return Ok(SessionTaskOutput::default());
             }
             SessionStartupPrewarmResolution::Unavailable { .. } => None,
             SessionStartupPrewarmResolution::Ready(prewarmed_client_session) => {
@@ -75,7 +76,7 @@ impl SessionTask for RegularTask {
         let mut next_input = input;
         let mut prewarmed_client_session = prewarmed_client_session;
         loop {
-            let last_agent_message = run_turn(
+            let turn_output = run_turn(
                 Arc::clone(&sess),
                 Arc::clone(&ctx),
                 Arc::clone(&turn_extension_data),
@@ -86,7 +87,10 @@ impl SessionTask for RegularTask {
             .instrument(run_turn_span.clone())
             .await?;
             if !sess.input_queue.has_pending_input(&sess.active_turn).await {
-                return Ok(last_agent_message);
+                return Ok(SessionTaskOutput {
+                    last_agent_message: turn_output.last_agent_message,
+                    post_compact_recovery: turn_output.post_compact_recovery,
+                });
             }
             next_input = Vec::new();
         }

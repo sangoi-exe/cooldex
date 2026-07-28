@@ -6943,7 +6943,7 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *trace = current_span_w3c_trace_context();
-            Ok(None)
+            Ok(Default::default())
         }
     }
 
@@ -9331,7 +9331,7 @@ impl SessionTask for CompletingTask {
         _input: Vec<TurnInput>,
         _cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
-        Ok(None)
+        Ok(Default::default())
     }
 }
 
@@ -9479,7 +9479,7 @@ impl SessionTask for NeverEndingTask {
     ) -> SessionTaskResult {
         if self.listen_to_cancellation_token {
             cancellation_token.cancelled().await;
-            return Ok(None);
+            return Ok(Default::default());
         }
         loop {
             sleep(Duration::from_secs(60)).await;
@@ -9512,7 +9512,7 @@ impl SessionTask for GuardianDeniedApprovalTask {
         }
 
         cancellation_token.cancelled().await;
-        Ok(None)
+        Ok(Default::default())
     }
 }
 
@@ -9866,7 +9866,7 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     .await
     .expect("steer pending input into active turn");
 
-    sess.on_task_finished(Arc::clone(&tc), /*task_result*/ Ok(None))
+    sess.on_task_finished(Arc::clone(&tc), /*task_result*/ Ok(Default::default()))
         .await;
 
     let history = sess.clone_history().await;

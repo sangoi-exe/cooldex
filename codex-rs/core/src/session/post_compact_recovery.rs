@@ -228,7 +228,7 @@ impl Session {
         }))
     }
 
-    pub(super) async fn record_post_compact_recovery_sampling_success(
+    pub(crate) async fn record_post_compact_recovery_sampling_success(
         &self,
         identity: &PostCompactRecoveryIdentity,
         turn_id: &str,

@@ -1,6 +1,7 @@
 use super::compact::COMPACT_WARNING_MESSAGE;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Result;
 use codex_core::compact::SUMMARIZATION_PROMPT;
@@ -8,8 +9,10 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
+use core_test_support::fs_wait;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
@@ -22,6 +25,7 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::start_streaming_sse_server;
+use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
@@ -33,6 +37,7 @@ const LIVE_USER: &str = "continue only the live work";
 const PRE_STOP_REPLY: &str = "draft before stop hook";
 const STOP_CONTINUATION_PROMPT: &str = "continue after the blocking stop hook";
 const AFTER_RECOVERY_USER: &str = "start a genuinely new turn";
+const STEER_DURING_STOP: &str = "steer while the stop hook is waiting";
 
 fn user_turn(text: &str) -> Op {
     Op::UserInput {
@@ -436,5 +441,146 @@ else:
         application_items[0].boundary_item_id,
         marker.boundary_item_id
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_compact_recovery_steer_during_stop_hook_waits_for_task_terminal_boundary()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("first-message", FIRST_REPLY),
+                ev_completed("first"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", SUMMARY),
+                ev_completed("compact"),
+            ]),
+            sse(vec![
+                ev_assistant_message("pre-stop-message", PRE_STOP_REPLY),
+                ev_completed("pre-stop"),
+            ]),
+            sse(vec![
+                ev_assistant_message("after-steer", "handled steer after stop hook"),
+                ev_completed("after-steer"),
+            ]),
+        ],
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            let script_path = home.join("recovery_waiting_stop_hook.py");
+            let started_path = home.join("recovery_waiting_stop_hook_started");
+            let release_path = home.join("recovery_waiting_stop_hook_release");
+            let pre_stop_reply =
+                serde_json::to_string(PRE_STOP_REPLY).expect("serialize pre-stop reply");
+            let script = format!(
+                r#"import json
+from pathlib import Path
+import sys
+import time
+
+payload = json.load(sys.stdin)
+started_path = Path(r"{started_path}")
+release_path = Path(r"{release_path}")
+if payload.get("last_assistant_message") == {pre_stop_reply}:
+    started_path.write_text("waiting", encoding="utf-8")
+    deadline = time.monotonic() + 10
+    while not release_path.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("timed out waiting to release stop hook")
+        time.sleep(0.01)
+print(json.dumps({{"systemMessage": "stop hook passed"}}))
+"#,
+                release_path = release_path.display(),
+                started_path = started_path.display(),
+            );
+            let hooks = serde_json::json!({
+                "hooks": {
+                    "Stop": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": format!("python3 {}", script_path.display()),
+                        }]
+                    }]
+                }
+            });
+            fs::write(&script_path, script).expect("write waiting stop hook fixture");
+            fs::write(home.join("hooks.json"), hooks.to_string())
+                .expect("write waiting hooks.json");
+        })
+        .with_config(|config| {
+            trust_discovered_hooks(config);
+            config.model_provider.name = "OpenAI-compatible test provider".to_string();
+            config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        });
+    let test = builder.build(&server).await?;
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+    let started_path = test
+        .codex_home_path()
+        .join("recovery_waiting_stop_hook_started");
+    let release_path = test
+        .codex_home_path()
+        .join("recovery_waiting_stop_hook_release");
+
+    seed_and_compact(&test.codex).await?;
+    test.codex.submit(user_turn(LIVE_USER)).await?;
+    fs_wait::wait_for_path_exists(&started_path, Duration::from_secs(5)).await?;
+
+    test.codex.submit(user_turn(STEER_DURING_STOP)).await?;
+    submit_thread_settings(
+        &test.codex,
+        ThreadSettingsOverrides {
+            service_tier: Some(None),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_pending_marker_without_application(&read_rollout_items(&rollout_path));
+
+    fs::write(&release_path, "release").expect("release waiting stop hook");
+    wait_for_successful_turn_complete(&test.codex).await;
+
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 4);
+    let ((_first_recovery_index, first_recovery), first_recall) = recovery_fragments(&requests[2]);
+    let ((steer_recovery_index, steer_recovery), steer_recall) = recovery_fragments(&requests[3]);
+    assert_eq!(first_recovery, steer_recovery);
+    assert_eq!(first_recall, steer_recall);
+
+    let steer_input = requests[3].input();
+    let steer_user_index = steer_input
+        .iter()
+        .position(|item| {
+            item.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                && item
+                    .get("content")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|content| content.first())
+                    .and_then(|content| content.get("text"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(STEER_DURING_STOP)
+        })
+        .expect("steered user input should be sampled before task completion");
+    assert!(
+        steer_recovery_index < steer_user_index,
+        "the recovery directive must survive until the steered continuation request"
+    );
+
+    let application_count = read_rollout_items(&rollout_path)
+        .into_iter()
+        .filter(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_)))
+        .count();
+    assert_eq!(application_count, 1);
     Ok(())
 }

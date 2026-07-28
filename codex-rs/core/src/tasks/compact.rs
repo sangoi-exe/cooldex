@@ -35,7 +35,7 @@ impl SessionTask for CompactTask {
         let _profile_guard = ctx.turn_timing_state.begin_compaction();
         if ctx.config.features.enabled(Feature::TokenBudget) {
             crate::compact_token_budget::run_manual_compact_task(session, ctx).await?;
-            return Ok(None);
+            return Ok(Default::default());
         }
 
         let result = if crate::compact::should_use_remote_compact_task(ctx.provider.info()) {
@@ -79,6 +79,6 @@ impl SessionTask for CompactTask {
         if let Err(err @ CodexErr::TurnAborted) = result {
             return Err(err);
         }
-        Ok(None)
+        Ok(Default::default())
     }
 }

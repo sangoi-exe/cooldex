@@ -32,6 +32,7 @@ use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
+use crate::state::PostCompactRecoveryIdentity;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
 use codex_analytics::TurnProfileFact;
@@ -67,7 +68,13 @@ pub(crate) use user_shell::execute_user_shell_command;
 const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100;
 const TASK_COMPACT_METRIC: &str = "codex.task.compact";
 
-pub(crate) type SessionTaskResult = CodexResult<Option<String>>;
+#[derive(Debug, Default)]
+pub(crate) struct SessionTaskOutput {
+    pub(crate) last_agent_message: Option<String>,
+    pub(crate) post_compact_recovery: Option<PostCompactRecoveryIdentity>,
+}
+
+pub(crate) type SessionTaskResult = CodexResult<SessionTaskOutput>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InterruptedTurnHistoryMarker {
@@ -222,11 +229,11 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
     /// Executes the task until completion or cancellation.
     ///
     /// Implementations typically stream protocol events using `session` and
-    /// `ctx`, returning an optional final agent message when finished. The
+    /// `ctx`, returning task completion output when finished. The
     /// provided `cancellation_token` is cancelled when the session requests an
     /// abort; implementers should watch for it and terminate quickly once it
-    /// fires. Returning [`Some`] yields a final message that
-    /// [`Session::on_task_finished`] will emit to the client. Returning
+    /// fires. A populated [`SessionTaskOutput::last_agent_message`] is emitted
+    /// to the client by [`Session::on_task_finished`]. Returning
     /// [`CodexErr::TurnAborted`] completes the task through the aborted-turn
     /// lifecycle instead.
     fn run(
@@ -577,17 +584,24 @@ impl Session {
         true
     }
 
+    #[allow(
+        clippy::await_holding_invalid_type,
+        reason = "task removal and recovery application must remain atomic with respect to steer input"
+    )]
     pub async fn on_task_finished(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         task_result: SessionTaskResult,
     ) {
-        let (last_agent_message, abort_reason) = match task_result {
-            Ok(last_agent_message) => (last_agent_message, None),
-            Err(CodexErr::TurnAborted) => (None, Some(TurnAbortReason::Interrupted)),
+        let (mut task_output, abort_reason) = match task_result {
+            Ok(task_output) => (task_output, None),
+            Err(CodexErr::TurnAborted) => (
+                SessionTaskOutput::default(),
+                Some(TurnAbortReason::Interrupted),
+            ),
             Err(err) => {
                 warn!(%err, "session task returned an unexpected error");
-                (None, None)
+                (SessionTaskOutput::default(), None)
             }
         };
         turn_context
@@ -596,15 +610,27 @@ impl Session {
 
         let turn_state = {
             let mut active = self.active_turn.lock().await;
-            active.as_mut().and_then(|active_turn| {
-                let task = active_turn.task.take()?;
-                task.handle.detach();
-                Some(Arc::clone(&active_turn.turn_state))
-            })
+            let Some(active_turn) = active.as_mut() else {
+                return;
+            };
+            // Seal the task while holding the same lock used by `steer_input`. Recovery stays
+            // pending until no further sampling can be admitted for this task, and a new task
+            // cannot start before the durable application proof is recorded.
+            let Some(task) = active_turn.task.take() else {
+                return;
+            };
+            task.handle.detach();
+            if let Some(recovery) = task_output.post_compact_recovery.take()
+                && let Err(err) = self
+                    .record_post_compact_recovery_sampling_success(&recovery, &turn_context.sub_id)
+                    .await
+            {
+                warn!(%err, "failed to record post-compact recovery application");
+                task_output.last_agent_message = None;
+            }
+            Arc::clone(&active_turn.turn_state)
         };
-        let Some(turn_state) = turn_state else {
-            return;
-        };
+        let last_agent_message = task_output.last_agent_message;
         let pending_input = self
             .input_queue
             .take_pending_input_for_turn_state(turn_state.as_ref())

@@ -135,6 +135,12 @@ use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
 
+#[derive(Debug, Default)]
+pub(crate) struct RunTurnOutput {
+    pub(crate) last_agent_message: Option<String>,
+    pub(crate) post_compact_recovery: Option<PostCompactRecoveryIdentity>,
+}
+
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
 ///
@@ -156,7 +162,7 @@ pub(crate) async fn run_turn(
     input: Vec<TurnInput>,
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
-) -> CodexResult<Option<String>> {
+) -> CodexResult<RunTurnOutput> {
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
@@ -179,7 +185,7 @@ pub(crate) async fn run_turn(
         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
             .await;
         error!("Failed to run pre-sampling compact");
-        return Ok(None);
+        return Ok(RunTurnOutput::default());
     }
 
     // run_turn owns the step used to seed context and make the first sampling request.
@@ -208,15 +214,15 @@ pub(crate) async fn run_turn(
     )
     .await
     else {
-        return Ok(None);
+        return Ok(RunTurnOutput::default());
     };
 
     if run_pending_session_start_hooks(&sess, &turn_context).await {
-        return Ok(None);
+        return Ok(RunTurnOutput::default());
     }
     let mut can_drain_pending_input = input.is_empty();
     if run_hooks_and_record_inputs(&sess, &turn_context, &input).await {
-        return Ok(None);
+        return Ok(RunTurnOutput::default());
     }
 
     sess.merge_connector_selection(explicitly_enabled_connectors.clone())
@@ -235,6 +241,7 @@ pub(crate) async fn run_turn(
     track_turn_resolved_config_analytics(&sess, &turn_context, &input).await;
 
     let mut last_agent_message: Option<String> = None;
+    let mut completed_post_compact_recovery = None;
     let mut stop_hook_active = false;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
@@ -414,10 +421,10 @@ pub(crate) async fn run_turn(
                         let error = err.to_codex_protocol_error();
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
                             .await;
-                        return Ok(None);
+                        return Ok(RunTurnOutput::default());
                     }
                     if run_pending_session_start_hooks(&sess, &turn_context).await {
-                        return Ok(None);
+                        return Ok(RunTurnOutput::default());
                     }
                     can_drain_pending_input = !model_needs_follow_up;
                     continue;
@@ -459,13 +466,7 @@ pub(crate) async fn run_turn(
                             .await;
                         }
                     }
-                    if let Some(recovery) = post_compact_recovery.as_ref() {
-                        sess.record_post_compact_recovery_sampling_success(
-                            recovery,
-                            &turn_context.sub_id,
-                        )
-                        .await?;
-                    }
+                    completed_post_compact_recovery = post_compact_recovery;
                     if stop_outcome.should_stop {
                         break;
                     }
@@ -477,7 +478,10 @@ pub(crate) async fn run_turn(
                     )
                     .await
                     {
-                        return Ok(None);
+                        return Ok(RunTurnOutput {
+                            last_agent_message: None,
+                            post_compact_recovery: completed_post_compact_recovery,
+                        });
                     }
                     break;
                 }
@@ -513,7 +517,10 @@ pub(crate) async fn run_turn(
         }
     }
 
-    Ok(last_agent_message)
+    Ok(RunTurnOutput {
+        last_agent_message,
+        post_compact_recovery: completed_post_compact_recovery,
+    })
 }
 
 #[instrument(level = "trace", skip_all)]
