@@ -68,6 +68,7 @@ const PROJECT_LOCAL_CONFIG_DENYLIST: &[&str] = &[
     "model_provider",
     "model_providers",
     "notify",
+    "post_compact_recovery_instructions",
     "profile",
     "profiles",
     "experimental_realtime_webrtc_call_base_url",

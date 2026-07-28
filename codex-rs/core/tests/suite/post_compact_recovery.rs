@@ -38,6 +38,7 @@ const PRE_STOP_REPLY: &str = "draft before stop hook";
 const STOP_CONTINUATION_PROMPT: &str = "continue after the blocking stop hook";
 const AFTER_RECOVERY_USER: &str = "start a genuinely new turn";
 const STEER_DURING_STOP: &str = "steer while the stop hook is waiting";
+const CUSTOM_RECOVERY_INSTRUCTIONS: &str = "Use the configured post-compact recovery instructions.";
 
 type RecoveryFragment = (usize, (String, String));
 
@@ -301,6 +302,8 @@ else:
             trust_discovered_hooks(config);
             config.model_provider.name = "OpenAI-compatible test provider".to_string();
             config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+            config.post_compact_recovery_instructions =
+                Some(CUSTOM_RECOVERY_INSTRUCTIONS.to_string());
             config.model_provider.request_max_retries = Some(0);
             config.model_provider.stream_max_retries = Some(1);
         });
@@ -329,6 +332,7 @@ else:
     assert_eq!(failed_recovery, retry_recovery);
     assert_eq!(failed_recovery, follow_up_recovery);
     assert_eq!(failed_recovery, stop_hook_recovery);
+    assert!(failed_recovery.1.contains(CUSTOM_RECOVERY_INSTRUCTIONS));
     assert_eq!(failed_recall, retry_recall);
     assert_eq!(failed_recall, follow_up_recall);
     assert_eq!(failed_recall, stop_hook_recall);

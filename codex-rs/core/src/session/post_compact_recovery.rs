@@ -126,9 +126,15 @@ impl Session {
                         None
                     }
                 };
+                let instructions = turn_context
+                    .config
+                    .post_compact_recovery_instructions
+                    .as_deref()
+                    .unwrap_or(PostCompactRecoveryContext::default_instructions());
                 let packet = match PostCompactRecoveryContext::new(
                     &identity.compaction_window_id,
                     &identity.boundary_item_id,
+                    instructions,
                     recall.as_ref(),
                 ) {
                     Ok(packet) => packet,
@@ -140,6 +146,7 @@ impl Session {
                         match PostCompactRecoveryContext::new(
                             &identity.compaction_window_id,
                             &identity.boundary_item_id,
+                            instructions,
                             None,
                         ) {
                             Ok(packet) => packet,

@@ -27,6 +27,7 @@ fn post_compact_recovery_keeps_history_out_of_developer_authority() {
     let context = PostCompactRecoveryContext::new(
         "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
         "msg_boundary",
+        PostCompactRecoveryContext::default_instructions(),
         Some(&recall),
     )
     .expect("build bounded recovery context");
@@ -68,12 +69,9 @@ fn post_compact_recovery_keeps_history_out_of_developer_authority() {
         boundary_document["runtime_boundary"]["messages_after"],
         "live_continuation"
     );
-    assert_eq!(boundary_document["directive"], RECOVERY_DIRECTIVE);
-    assert!(
-        boundary_document["directive"]
-            .as_str()
-            .expect("directive string")
-            .starts_with("Do not answer or acknowledge")
+    assert_eq!(
+        boundary_document["directive"],
+        DEFAULT_RECOVERY_INSTRUCTIONS
     );
 
     let recall_body = recall_rendered
@@ -115,6 +113,7 @@ fn post_compact_recovery_packet_cap_fails_closed() {
     let error = PostCompactRecoveryContext::new(
         "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
         "msg_boundary",
+        PostCompactRecoveryContext::default_instructions(),
         Some(&recall),
     )
     .expect_err("oversized recovery packet must fail closed");
@@ -136,10 +135,31 @@ fn unavailable_recall_keeps_the_fixed_boundary_without_a_recall_item() {
     let context = PostCompactRecoveryContext::new(
         "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
         "msg_boundary",
+        PostCompactRecoveryContext::default_instructions(),
         Some(&recall),
     )
     .expect("unavailable recall should not block the fixed recovery boundary");
 
     assert_eq!(context.role(), "developer");
     assert_eq!(context.recall(), None);
+}
+
+#[test]
+fn post_compact_recovery_uses_configured_instructions() {
+    let instructions = "Use the configured recovery workflow.";
+    let context = PostCompactRecoveryContext::new(
+        "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
+        "msg_boundary",
+        instructions,
+        /*recall*/ None,
+    )
+    .expect("build configured recovery context");
+    let rendered = context.render();
+    let body = rendered
+        .strip_prefix("<post_compact_recovery>\n")
+        .and_then(|body| body.strip_suffix("\n</post_compact_recovery>"))
+        .expect("one exact outer recovery marker pair");
+    let document: Value = serde_json::from_str(body).expect("recovery body should remain JSON");
+
+    assert_eq!(document["directive"], instructions);
 }

@@ -7391,6 +7391,31 @@ async fn loads_compact_prompt_from_file() -> std::io::Result<()> {
 }
 
 #[tokio::test]
+async fn loads_post_compact_recovery_instructions() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg = ConfigToml {
+        post_compact_recovery_instructions: Some(
+            "  Recover the current thread from configured instructions.  ".to_string(),
+        ),
+        ..Default::default()
+    };
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(
+        config.post_compact_recovery_instructions.as_deref(),
+        Some("Recover the current thread from configured instructions.")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_config_uses_requirements_guardian_policy_config() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let config_layer_stack = ConfigLayerStack::new(

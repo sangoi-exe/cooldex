@@ -721,6 +721,9 @@ pub struct Config {
     /// Compact prompt override.
     pub compact_prompt: Option<String>,
 
+    /// Model-visible developer instructions included in post-compact recovery context.
+    pub post_compact_recovery_instructions: Option<String>,
+
     /// Optional external notifier command. When set, Codex will spawn this
     /// program after each completed *turn* (i.e. when the agent finishes
     /// processing a user submission). The value must be the full command
@@ -3870,6 +3873,12 @@ impl Config {
                 Some(trimmed.to_string())
             }
         });
+        let post_compact_recovery_instructions = cfg
+            .post_compact_recovery_instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
 
         // Load base instructions override from a file if specified. If the
         // path is relative, resolve it against the effective cwd so the
@@ -4094,6 +4103,7 @@ impl Config {
             personality,
             developer_instructions,
             compact_prompt,
+            post_compact_recovery_instructions,
             include_permissions_instructions,
             include_apps_instructions,
             include_collaboration_mode_instructions,
