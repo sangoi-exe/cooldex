@@ -988,6 +988,10 @@ impl Session {
         }
 
         task.handle.abort();
+        // A forced abort can destroy the wrapper before its trailing notification runs. The task
+        // is already absent from `active_turn`, so release every sealed steer waiter now; each
+        // waiter will recheck the active turn and reject the retired task.
+        task.done.notify_waiters();
 
         let session_ctx = Arc::new(SessionTaskContext::new(
             Arc::clone(self),

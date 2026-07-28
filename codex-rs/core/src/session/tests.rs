@@ -9841,6 +9841,79 @@ async fn post_compact_recovery_sealed_task_defers_late_steer_until_completion() 
     assert_eq!(application_count, 1);
 }
 
+async fn assert_forced_abort_releases_sealed_steer(reason: TurnAbortReason) {
+    let (mut session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    attach_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    let identity = install_test_post_compact_recovery(session.as_ref()).await;
+    let (sealed_tx, sealed_rx) = async_channel::bounded(1);
+    let (_release_tx, release_rx) = async_channel::bounded(1);
+
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            SealedRecoveryTask {
+                recovery: identity.clone(),
+                sealed_tx,
+                release_rx,
+            },
+        )
+        .await;
+    timeout(Duration::from_secs(2), sealed_rx.recv())
+        .await
+        .expect("task should seal steer admission")
+        .expect("sealed-task observer should remain open");
+
+    let late_input = vec![UserInput::Text {
+        text: "late steer waiting across forced task abort".to_string(),
+        text_elements: Vec::new(),
+    }];
+    let steer = session.steer_input(
+        late_input.clone(),
+        /*additional_context*/ Default::default(),
+        Some(&turn_context.sub_id),
+        /*client_user_message_id*/ None,
+        /*responsesapi_client_metadata*/ None,
+    );
+    tokio::pin!(steer);
+    tokio::select! {
+        biased;
+        result = &mut steer => panic!("sealed steer completed before task abort: {result:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+
+    session.abort_all_tasks(reason).await;
+
+    let error = timeout(Duration::from_secs(2), steer)
+        .await
+        .expect("forced task abort should release the sealed steer")
+        .expect_err("aborted task should no longer accept same-turn steering");
+    assert_eq!(error, SteerInputError::NoActiveTurn(late_input));
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .pending_identity(),
+        Some(&identity)
+    );
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_compact_recovery_forced_interrupt_releases_sealed_steer() {
+    assert_forced_abort_releases_sealed_steer(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_compact_recovery_forced_replacement_releases_sealed_steer() {
+    assert_forced_abort_releases_sealed_steer(TurnAbortReason::Replaced).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_compact_recovery_application_persistence_failure_fails_the_turn() {
     let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
