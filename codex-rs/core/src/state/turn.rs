@@ -76,7 +76,8 @@ pub(crate) enum SteerAdmission {
 }
 
 pub(crate) struct RunningTask {
-    pub(crate) done: Arc<Notify>,
+    pub(crate) task_done: Arc<Notify>,
+    pub(crate) steer_release: Arc<Notify>,
     pub(crate) kind: TaskKind,
     pub(crate) steer_admission: SteerAdmission,
     pub(crate) task: Arc<dyn AnySessionTask>,

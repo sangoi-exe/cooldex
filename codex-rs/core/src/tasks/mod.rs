@@ -324,6 +324,39 @@ where
     }
 }
 
+/// Releases steer waiters only after the retired task's terminal lifecycle is complete.
+///
+/// Replacement keeps this guard alive until the successor task is installed. If that
+/// installation future is cancelled, dropping the guard still prevents a lost wakeup after the
+/// retired lifecycle has already completed.
+struct DeferredSteerWaiterRelease {
+    steer_release: Option<Arc<Notify>>,
+}
+
+impl DeferredSteerWaiterRelease {
+    fn new(steer_release: Arc<Notify>) -> Self {
+        Self {
+            steer_release: Some(steer_release),
+        }
+    }
+
+    fn release(mut self) {
+        self.notify_waiters();
+    }
+
+    fn notify_waiters(&mut self) {
+        if let Some(steer_release) = self.steer_release.take() {
+            steer_release.notify_waiters();
+        }
+    }
+}
+
+impl Drop for DeferredSteerWaiterRelease {
+    fn drop(&mut self) {
+        self.notify_waiters();
+    }
+}
+
 impl Session {
     pub async fn spawn_task<T: SessionTask>(
         self: &Arc<Self>,
@@ -331,9 +364,12 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
-        self.abort_all_tasks(TurnAbortReason::Replaced).await;
+        let retired_task_waiters = self.abort_active_turn(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
         self.start_task(turn_context, input, task).await;
+        if let Some(retired_task_waiters) = retired_task_waiters {
+            retired_task_waiters.release();
+        }
     }
 
     pub(crate) async fn start_task<T: SessionTask>(
@@ -356,7 +392,8 @@ impl Session {
         let token_usage_at_turn_start = self.total_token_usage().await.unwrap_or_default();
 
         let cancellation_token = CancellationToken::new();
-        let done = Arc::new(Notify::new());
+        let task_done = Arc::new(Notify::new());
+        let steer_release = Arc::new(Notify::new());
 
         self.services
             .guardian_rejection_circuit_breaker
@@ -386,7 +423,7 @@ impl Session {
             turn_context.multi_agent_version,
             &turn_context.session_source,
         );
-        let done_clone = Arc::clone(&done);
+        let task_done_clone = Arc::clone(&task_done);
         let session_ctx = Arc::new(SessionTaskContext::new(
             Arc::clone(self),
             Arc::clone(&turn_extension_data),
@@ -443,7 +480,7 @@ impl Session {
                     sess.on_task_finished(Arc::clone(&ctx_for_finish), task_result)
                         .await;
                 }
-                done_clone.notify_waiters();
+                task_done_clone.notify_waiters();
             }
             .instrument(task_span),
         );
@@ -452,7 +489,8 @@ impl Session {
             .start_timer(TURN_E2E_DURATION_METRIC, &[])
             .ok();
         let running_task = RunningTask {
-            done,
+            task_done,
+            steer_release,
             handle: AbortOnDropHandle::new(handle),
             kind: task_kind,
             steer_admission: SteerAdmission::Open,
@@ -478,7 +516,7 @@ impl Session {
         let Some(active_turn) = active.as_mut() else {
             return Err(CodexErr::TurnAborted);
         };
-        let Some(task) = active_turn.task.as_ref() else {
+        let Some(task) = active_turn.task.as_mut() else {
             return Err(CodexErr::TurnAborted);
         };
         if task.turn_context.sub_id != turn_id {
@@ -504,10 +542,6 @@ impl Session {
             return Ok(RegularTaskContinuation::Continue);
         }
 
-        let task = active_turn
-            .task
-            .as_mut()
-            .expect("active regular task should remain installed while its admission is sealed");
         task.steer_admission = SteerAdmission::Sealed;
         Ok(RegularTaskContinuation::Sealed)
     }
@@ -568,32 +602,12 @@ impl Session {
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
-        let mut aborted_turn = false;
-        let mut active_turn_to_clear = None;
-        let mut turn_context = None;
-        if let Some(mut active_turn) = self.take_active_turn().await {
-            let task = active_turn.task.take();
-            aborted_turn = task.is_some();
-            turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
-            if let Some(task) = task {
-                self.handle_task_abort(task, reason.clone()).await;
-            }
-            if aborted_turn {
-                active_turn_to_clear = Some(active_turn);
-            }
-        }
-
-        if let Some(turn_context) = turn_context.as_deref() {
-            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
-                .await;
-        }
-        if let Some(active_turn) = active_turn_to_clear {
-            // Let interrupted tasks observe cancellation before dropping pending approvals, or an
-            // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
-            self.input_queue.clear_pending(&active_turn).await;
-        }
-        if reason == TurnAbortReason::Interrupted && aborted_turn {
+        let retired_task_waiters = self.abort_active_turn(reason.clone()).await;
+        if reason == TurnAbortReason::Interrupted && retired_task_waiters.is_some() {
             self.maybe_start_turn_for_pending_work().await;
+        }
+        if let Some(retired_task_waiters) = retired_task_waiters {
+            retired_task_waiters.release();
         }
     }
 
@@ -614,28 +628,44 @@ impl Session {
                 None
             }
         };
-        let Some(mut active_turn) = active_turn else {
+        let Some(active_turn) = active_turn else {
             return false;
         };
 
-        let task = active_turn.task.take();
-        let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
-        if let Some(task) = task {
-            self.handle_task_abort(task, reason.clone()).await;
-        }
-        if let Some(turn_context) = turn_context.as_deref() {
-            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
-                .await;
-        }
-        // Let interrupted tasks observe cancellation before dropping pending approvals, or an
-        // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
-        self.input_queue.clear_pending(&active_turn).await;
-
-        if reason == TurnAbortReason::Interrupted {
+        let retired_task_waiters = self.abort_taken_turn(active_turn, reason.clone()).await;
+        if reason == TurnAbortReason::Interrupted && retired_task_waiters.is_some() {
             self.maybe_start_turn_for_pending_work().await;
+        }
+        if let Some(retired_task_waiters) = retired_task_waiters {
+            retired_task_waiters.release();
         }
 
         true
+    }
+
+    async fn abort_active_turn(
+        self: &Arc<Self>,
+        reason: TurnAbortReason,
+    ) -> Option<DeferredSteerWaiterRelease> {
+        let active_turn = self.take_active_turn().await?;
+        self.abort_taken_turn(active_turn, reason).await
+    }
+
+    async fn abort_taken_turn(
+        self: &Arc<Self>,
+        mut active_turn: ActiveTurn,
+        reason: TurnAbortReason,
+    ) -> Option<DeferredSteerWaiterRelease> {
+        let task = active_turn.task.take()?;
+        let turn_context = Arc::clone(&task.turn_context);
+        let steer_release = Arc::clone(&task.steer_release);
+        self.handle_task_abort(task, reason.clone()).await;
+        self.emit_turn_abort_lifecycle(reason, turn_context.extension_data.as_ref())
+            .await;
+        // Let interrupted tasks observe cancellation before dropping pending approvals, or an
+        // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
+        self.input_queue.clear_pending(&active_turn).await;
+        Some(DeferredSteerWaiterRelease::new(steer_release))
     }
 
     #[allow(
@@ -663,7 +693,7 @@ impl Session {
             .cancel_git_enrichment_task();
 
         let mut recovery_application_error = None;
-        let turn_state = {
+        let (turn_state, steer_release) = {
             let mut active = self.active_turn.lock().await;
             let Some(active_turn) = active.as_mut() else {
                 return;
@@ -675,6 +705,7 @@ impl Session {
                 return;
             };
             let steer_admission = task.steer_admission;
+            let steer_release = Arc::clone(&task.steer_release);
             task.handle.detach();
             if let Some(recovery) = task_output.post_compact_recovery.take() {
                 let result = if steer_admission == SteerAdmission::Sealed {
@@ -695,7 +726,7 @@ impl Session {
                     recovery_application_error = Some(err);
                 }
             }
-            Arc::clone(&active_turn.turn_state)
+            (Arc::clone(&active_turn.turn_state), steer_release)
         };
         if let Some(error) = recovery_application_error.as_ref() {
             self.emit_turn_error_lifecycle(turn_context.as_ref(), error.to_codex_protocol_error())
@@ -941,6 +972,7 @@ impl Session {
         if cleared_active_turn {
             self.maybe_start_turn_for_pending_work().await;
         }
+        steer_release.notify_waiters();
     }
 
     async fn take_active_turn(&self) -> Option<ActiveTurn> {
@@ -980,7 +1012,7 @@ impl Session {
         let session_task = task.task;
 
         select! {
-            _ = task.done.notified() => {
+            _ = task.task_done.notified() => {
             },
             _ = tokio::time::sleep(Duration::from_millis(GRACEFULL_INTERRUPTION_TIMEOUT_MS)) => {
                 warn!("task {sub_id} didn't complete gracefully after {}ms", GRACEFULL_INTERRUPTION_TIMEOUT_MS);
@@ -988,10 +1020,6 @@ impl Session {
         }
 
         task.handle.abort();
-        // A forced abort can destroy the wrapper before its trailing notification runs. The task
-        // is already absent from `active_turn`, so release every sealed steer waiter now; each
-        // waiter will recheck the active turn and reject the retired task.
-        task.done.notify_waiters();
 
         let session_ctx = Arc::new(SessionTaskContext::new(
             Arc::clone(self),

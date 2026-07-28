@@ -4023,8 +4023,8 @@ impl Session {
             }
 
             if active_task.steer_admission == SteerAdmission::Sealed {
-                let done = Arc::clone(&active_task.done);
-                let notified = done.notified();
+                let steer_release = Arc::clone(&active_task.steer_release);
+                let notified = steer_release.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
                 drop(active);

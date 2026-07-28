@@ -9382,6 +9382,71 @@ impl SessionTask for SealedRecoveryTask {
     }
 }
 
+enum SealedAbortMode {
+    Cooperative,
+    Forced {
+        release_rx: async_channel::Receiver<()>,
+    },
+}
+
+struct SealedAbortBarrierTask {
+    mode: SealedAbortMode,
+    sealed_tx: async_channel::Sender<()>,
+    abort_started_tx: async_channel::Sender<()>,
+    abort_release_rx: async_channel::Receiver<()>,
+}
+
+impl SessionTask for SealedAbortBarrierTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.sealed_abort_barrier"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<SessionTaskContext>,
+        ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        let session = session.clone_session();
+        assert_eq!(
+            session
+                .seal_regular_task_if_no_pending_input(&ctx.sub_id)
+                .await?,
+            RegularTaskContinuation::Sealed
+        );
+        self.sealed_tx
+            .send(())
+            .await
+            .expect("sealed-task observer should remain open");
+        match &self.mode {
+            SealedAbortMode::Cooperative => cancellation_token.cancelled().await,
+            SealedAbortMode::Forced { release_rx } => {
+                release_rx
+                    .recv()
+                    .await
+                    .expect("forced task should remain blocked until its wrapper is aborted");
+            }
+        }
+        Ok(Default::default())
+    }
+
+    async fn abort(&self, _session: Arc<SessionTaskContext>, _ctx: Arc<TurnContext>) {
+        self.abort_started_tx
+            .send(())
+            .await
+            .expect("abort observer should remain open");
+        self.abort_release_rx
+            .recv()
+            .await
+            .expect("abort hook should be released by the test");
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalEventKind {
     TurnComplete,
@@ -9885,7 +9950,19 @@ async fn assert_forced_abort_releases_sealed_steer(reason: TurnAbortReason) {
         _ = tokio::task::yield_now() => {}
     }
 
-    session.abort_all_tasks(reason).await;
+    match reason {
+        TurnAbortReason::Interrupted => {
+            assert!(
+                session
+                    .abort_turn_if_active(&turn_context.sub_id, reason)
+                    .await
+            );
+        }
+        TurnAbortReason::Replaced => session.abort_all_tasks(reason).await,
+        TurnAbortReason::ReviewEnded | TurnAbortReason::BudgetLimited => {
+            panic!("unsupported forced-abort test reason: {reason:?}");
+        }
+    }
 
     let error = timeout(Duration::from_secs(2), steer)
         .await
@@ -9905,13 +9982,284 @@ async fn assert_forced_abort_releases_sealed_steer(reason: TurnAbortReason) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn post_compact_recovery_forced_interrupt_releases_sealed_steer() {
+async fn post_compact_recovery_forced_targeted_interrupt_releases_sealed_steer() {
     assert_forced_abort_releases_sealed_steer(TurnAbortReason::Interrupted).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_compact_recovery_forced_replacement_releases_sealed_steer() {
     assert_forced_abort_releases_sealed_steer(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_compact_recovery_cooperative_interrupt_defers_no_id_steer_until_terminal() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    attach_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    let identity = install_test_post_compact_recovery(session.as_ref()).await;
+    let (sealed_tx, sealed_rx) = async_channel::bounded(1);
+    let (abort_started_tx, abort_started_rx) = async_channel::bounded(1);
+    let (abort_release_tx, abort_release_rx) = async_channel::bounded(1);
+
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            SealedAbortBarrierTask {
+                mode: SealedAbortMode::Cooperative,
+                sealed_tx,
+                abort_started_tx,
+                abort_release_rx,
+            },
+        )
+        .await;
+    timeout(Duration::from_secs(2), sealed_rx.recv())
+        .await
+        .expect("task should seal steer admission")
+        .expect("sealed-task observer should remain open");
+
+    let late_input = vec![UserInput::Text {
+        text: "late no-id steer across cooperative interrupt".to_string(),
+        text_elements: Vec::new(),
+    }];
+    let steer = session.steer_input(
+        late_input.clone(),
+        /*additional_context*/ Default::default(),
+        /*expected_turn_id*/ None,
+        /*client_user_message_id*/ None,
+        /*responsesapi_client_metadata*/ None,
+    );
+    tokio::pin!(steer);
+    tokio::select! {
+        biased;
+        result = &mut steer => panic!("sealed steer completed before interrupt: {result:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+
+    let abort_task = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+        }
+    });
+    timeout(Duration::from_secs(2), abort_started_rx.recv())
+        .await
+        .expect("cooperative task should enter its abort hook")
+        .expect("abort observer should remain open");
+    tokio::select! {
+        biased;
+        result = &mut steer => {
+            panic!("sealed no-id steer escaped before terminal cleanup: {result:?}")
+        }
+        _ = tokio::task::yield_now() => {}
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "TurnAborted must remain blocked behind the abort hook"
+    );
+
+    abort_release_tx
+        .send(())
+        .await
+        .expect("abort hook should still be waiting");
+    timeout(Duration::from_secs(2), abort_task)
+        .await
+        .expect("interrupt transition should complete")
+        .expect("interrupt task should not panic");
+
+    let marker = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("interrupt marker should be emitted")
+        .expect("event channel should remain open");
+    assert!(matches!(marker.msg, EventMsg::RawResponseItem(_)));
+    let aborted = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("old turn should emit TurnAborted")
+        .expect("event channel should remain open");
+    assert!(matches!(
+        aborted.msg,
+        EventMsg::TurnAborted(TurnAbortedEvent {
+            ref turn_id,
+            reason: TurnAbortReason::Interrupted,
+            ..
+        }) if turn_id.as_deref() == Some(turn_context.sub_id.as_str())
+    ));
+
+    let error = timeout(Duration::from_secs(2), steer)
+        .await
+        .expect("terminal interrupt should release the sealed no-id steer")
+        .expect_err("an interrupted turn should no longer accept steering");
+    assert_eq!(error, SteerInputError::NoActiveTurn(late_input));
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .pending_identity(),
+        Some(&identity)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_compact_recovery_forced_replacement_defers_no_id_steer_until_successor() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    attach_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    let identity = install_test_post_compact_recovery(session.as_ref()).await;
+    let (sealed_tx, sealed_rx) = async_channel::bounded(1);
+    let (_run_release_tx, run_release_rx) = async_channel::bounded(1);
+    let (abort_started_tx, abort_started_rx) = async_channel::bounded(1);
+    let (abort_release_tx, abort_release_rx) = async_channel::bounded(1);
+
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            SealedAbortBarrierTask {
+                mode: SealedAbortMode::Forced {
+                    release_rx: run_release_rx,
+                },
+                sealed_tx,
+                abort_started_tx,
+                abort_release_rx,
+            },
+        )
+        .await;
+    timeout(Duration::from_secs(2), sealed_rx.recv())
+        .await
+        .expect("task should seal steer admission")
+        .expect("sealed-task observer should remain open");
+
+    let late_input = vec![UserInput::Text {
+        text: "late no-id steer across forced replacement".to_string(),
+        text_elements: Vec::new(),
+    }];
+    let steer = session.steer_input(
+        late_input,
+        /*additional_context*/ Default::default(),
+        /*expected_turn_id*/ None,
+        /*client_user_message_id*/ None,
+        /*responsesapi_client_metadata*/ None,
+    );
+    tokio::pin!(steer);
+    tokio::select! {
+        biased;
+        result = &mut steer => panic!("sealed steer completed before replacement: {result:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+
+    let replacement_context = session
+        .new_default_turn_with_sub_id("replacement-turn".to_string())
+        .await;
+    let (_startup_prewarm_tx, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
+    let startup_prewarm_handle = tokio::spawn(async move {
+        let _ = startup_prewarm_rx.await;
+        Ok(test_model_client_session())
+    });
+    session
+        .set_session_startup_prewarm(
+            crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+                startup_prewarm_handle,
+                std::time::Instant::now(),
+                crate::client::WEBSOCKET_CONNECT_TIMEOUT,
+            ),
+        )
+        .await;
+    let replacement_task = tokio::spawn({
+        let session = Arc::clone(&session);
+        let replacement_context = Arc::clone(&replacement_context);
+        async move {
+            session
+                .spawn_task(
+                    replacement_context,
+                    Vec::new(),
+                    crate::tasks::RegularTask::new(),
+                )
+                .await;
+        }
+    });
+    timeout(Duration::from_secs(2), abort_started_rx.recv())
+        .await
+        .expect("forced task should enter its abort hook")
+        .expect("abort observer should remain open");
+    tokio::select! {
+        biased;
+        result = &mut steer => {
+            panic!("sealed no-id steer escaped before successor installation: {result:?}")
+        }
+        _ = tokio::task::yield_now() => {}
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "neither TurnAborted nor successor TurnStarted may precede abort-hook completion"
+    );
+
+    abort_release_tx
+        .send(())
+        .await
+        .expect("abort hook should still be waiting");
+    timeout(Duration::from_secs(2), replacement_task)
+        .await
+        .expect("replacement transition should complete")
+        .expect("replacement task should not panic");
+
+    let aborted = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("old turn should emit TurnAborted")
+        .expect("event channel should remain open");
+    assert!(matches!(
+        aborted.msg,
+        EventMsg::TurnAborted(TurnAbortedEvent {
+            ref turn_id,
+            reason: TurnAbortReason::Replaced,
+            ..
+        }) if turn_id.as_deref() == Some(turn_context.sub_id.as_str())
+    ));
+    let replacement_started = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("successor should emit TurnStarted")
+        .expect("event channel should remain open");
+    assert!(matches!(
+        replacement_started.msg,
+        EventMsg::TurnStarted(TurnStartedEvent { ref turn_id, .. })
+            if turn_id == &replacement_context.sub_id
+    ));
+
+    let accepted_turn_id = timeout(Duration::from_secs(2), steer)
+        .await
+        .expect("successor installation should release the sealed no-id steer")
+        .expect("no-id steer should be accepted by the installed successor");
+    assert_eq!(accepted_turn_id, replacement_context.sub_id.clone());
+    assert!(
+        session
+            .input_queue
+            .has_pending_input(&session.active_turn)
+            .await
+    );
+    {
+        let active = session.active_turn.lock().await;
+        let active_task = active
+            .as_ref()
+            .and_then(|active_turn| active_turn.task.as_ref())
+            .expect("successor task should remain active");
+        assert_eq!(active_task.turn_context.sub_id, replacement_context.sub_id);
+    }
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .pending_identity(),
+        Some(&identity)
+    );
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
