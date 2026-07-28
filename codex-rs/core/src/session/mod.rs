@@ -324,6 +324,7 @@ use crate::state::PostCompactRecoveryIdentity;
 use crate::state::PostCompactRecoveryRuntimeState;
 use crate::state::SessionServices;
 use crate::state::SessionState;
+use crate::state::SteerAdmission;
 #[cfg(test)]
 use crate::stream_events_utils::HandleOutputCtx;
 #[cfg(test)]
@@ -3987,71 +3988,83 @@ impl Session {
         client_user_message_id: Option<String>,
         responsesapi_client_metadata: Option<HashMap<String, String>>,
     ) -> Result<String, SteerInputError> {
-        let mut active = self.active_turn.lock().await;
-        let Some(active_turn) = active.as_mut() else {
-            return Err(SteerInputError::NoActiveTurn(input));
-        };
+        loop {
+            let mut active = self.active_turn.lock().await;
+            let Some(active_turn) = active.as_mut() else {
+                return Err(SteerInputError::NoActiveTurn(input));
+            };
 
-        let Some(active_task) = active_turn.task.as_ref() else {
-            return Err(SteerInputError::NoActiveTurn(input));
-        };
-        let active_turn_id = &active_task.turn_context.sub_id;
+            let Some(active_task) = active_turn.task.as_ref() else {
+                return Err(SteerInputError::NoActiveTurn(input));
+            };
+            let active_turn_id = &active_task.turn_context.sub_id;
 
-        if let Some(expected_turn_id) = expected_turn_id
-            && expected_turn_id != active_turn_id
-        {
-            return Err(SteerInputError::ExpectedTurnMismatch {
-                expected: expected_turn_id.to_string(),
-                actual: active_turn_id.clone(),
+            if let Some(expected_turn_id) = expected_turn_id
+                && expected_turn_id != active_turn_id
+            {
+                return Err(SteerInputError::ExpectedTurnMismatch {
+                    expected: expected_turn_id.to_string(),
+                    actual: active_turn_id.clone(),
+                });
+            }
+
+            match active_task.kind {
+                crate::state::TaskKind::Regular => {}
+                crate::state::TaskKind::Review => {
+                    return Err(SteerInputError::ActiveTurnNotSteerable {
+                        turn_kind: NonSteerableTurnKind::Review,
+                    });
+                }
+                crate::state::TaskKind::Compact => {
+                    return Err(SteerInputError::ActiveTurnNotSteerable {
+                        turn_kind: NonSteerableTurnKind::Compact,
+                    });
+                }
+            }
+
+            if active_task.steer_admission == SteerAdmission::Sealed {
+                let done = Arc::clone(&active_task.done);
+                let notified = done.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                drop(active);
+                notified.await;
+                continue;
+            }
+
+            if input.is_empty() {
+                return Err(SteerInputError::EmptyInput);
+            }
+
+            let additional_context_input = {
+                let mut state = self.state.lock().await;
+                state.additional_context.merge(additional_context)
+            };
+
+            if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
+                active_task
+                    .turn_context
+                    .turn_metadata_state
+                    .set_responsesapi_client_metadata(responsesapi_client_metadata);
+            }
+
+            let mut pending_input = additional_context_input
+                .into_iter()
+                .map(ResponseItem::from)
+                .map(TurnInput::ResponseItem)
+                .collect::<Vec<_>>();
+            pending_input.push(TurnInput::UserInput {
+                content: input,
+                client_id: client_user_message_id,
             });
+            self.input_queue
+                .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                    active_turn.turn_state.as_ref(),
+                    pending_input,
+                )
+                .await;
+            return Ok(active_turn_id.clone());
         }
-
-        match active_task.kind {
-            crate::state::TaskKind::Regular => {}
-            crate::state::TaskKind::Review => {
-                return Err(SteerInputError::ActiveTurnNotSteerable {
-                    turn_kind: NonSteerableTurnKind::Review,
-                });
-            }
-            crate::state::TaskKind::Compact => {
-                return Err(SteerInputError::ActiveTurnNotSteerable {
-                    turn_kind: NonSteerableTurnKind::Compact,
-                });
-            }
-        }
-
-        if input.is_empty() {
-            return Err(SteerInputError::EmptyInput);
-        }
-
-        let additional_context_input = {
-            let mut state = self.state.lock().await;
-            state.additional_context.merge(additional_context)
-        };
-
-        if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
-            active_task
-                .turn_context
-                .turn_metadata_state
-                .set_responsesapi_client_metadata(responsesapi_client_metadata);
-        }
-
-        let mut pending_input = additional_context_input
-            .into_iter()
-            .map(ResponseItem::from)
-            .map(TurnInput::ResponseItem)
-            .collect::<Vec<_>>();
-        pending_input.push(TurnInput::UserInput {
-            content: input,
-            client_id: client_user_message_id,
-        });
-        self.input_queue
-            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
-                active_turn.turn_state.as_ref(),
-                pending_input,
-            )
-            .await;
-        Ok(active_turn_id.clone())
     }
 
     pub(crate) async fn record_memory_citation_for_turn(&self, sub_id: &str) {

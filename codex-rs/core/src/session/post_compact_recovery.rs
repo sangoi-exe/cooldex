@@ -1,3 +1,4 @@
+use codex_protocol::ResponseItemId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
@@ -210,15 +211,28 @@ impl Session {
             }
         };
         let recall = packet.recall().cloned();
+        let compaction_window_id = &identity.compaction_window_id;
         let item_count = if let Some(recall) = recall {
-            input.insert(insertion_index, Box::new(recall).into_boxed_response_item());
-            input.insert(
-                insertion_index + 1,
-                Box::new(packet).into_boxed_response_item(),
-            );
+            let mut recall_item = Box::new(recall).into_boxed_response_item();
+            recall_item.set_id(Some(ResponseItemId::with_suffix(
+                "msg",
+                format_args!("{compaction_window_id}-recall"),
+            )));
+            let mut recovery_item = Box::new(packet).into_boxed_response_item();
+            recovery_item.set_id(Some(ResponseItemId::with_suffix(
+                "msg",
+                format_args!("{compaction_window_id}-recovery"),
+            )));
+            input.insert(insertion_index, recall_item);
+            input.insert(insertion_index + 1, recovery_item);
             2
         } else {
-            input.insert(insertion_index, Box::new(packet).into_boxed_response_item());
+            let mut recovery_item = Box::new(packet).into_boxed_response_item();
+            recovery_item.set_id(Some(ResponseItemId::with_suffix(
+                "msg",
+                format_args!("{compaction_window_id}-recovery"),
+            )));
+            input.insert(insertion_index, recovery_item);
             1
         };
         Ok(Some(PreparedPostCompactRecovery {
@@ -248,22 +262,18 @@ impl Session {
         {
             Ok(live_thread) => live_thread,
             Err(error) => {
-                warn!(
-                    %error,
-                    "post-compact recovery application was not persisted; leaving it pending"
-                );
-                return Ok(());
+                return Err(CodexErr::Fatal(format!(
+                    "failed to persist post-compact recovery application proof: {error}"
+                )));
             }
         };
         if let Err(error) = live_thread
             .append_items_durably(&[RolloutItem::PostCompactRecoveryApplied(application.clone())])
             .await
         {
-            warn!(
-                %error,
-                "post-compact recovery application was not persisted; leaving it pending"
-            );
-            return Ok(());
+            return Err(CodexErr::Fatal(format!(
+                "failed to persist post-compact recovery application proof: {error}"
+            )));
         }
         let mut state = self.state.lock().await;
         if let Err(failure) = state

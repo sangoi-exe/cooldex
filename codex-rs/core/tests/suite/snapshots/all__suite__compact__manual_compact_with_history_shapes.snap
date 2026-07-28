@@ -14,6 +14,7 @@ Scenario: Manual /compact with prior user history compacts existing history and 
 ## Local Post-Compaction History Layout
 00:message/user:first manual turn
 01:message/user:<COMPACTION_SUMMARY>\nFIRST_MANUAL_SUMMARY
-02:message/developer:<PERMISSIONS_INSTRUCTIONS>
-03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-04:message/user:second manual turn
+02:message/developer:<POST_COMPACT_RECOVERY>
+03:message/developer:<PERMISSIONS_INSTRUCTIONS>
+04:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+05:message/user:second manual turn

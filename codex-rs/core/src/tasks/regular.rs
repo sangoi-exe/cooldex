@@ -13,6 +13,7 @@ use codex_protocol::protocol::TurnStartedEvent;
 use tracing::Instrument;
 use tracing::trace_span;
 
+use super::RegularTaskContinuation;
 use super::SessionTask;
 use super::SessionTaskContext;
 use super::SessionTaskOutput;
@@ -86,13 +87,20 @@ impl SessionTask for RegularTask {
             )
             .instrument(run_turn_span.clone())
             .await?;
-            if !sess.input_queue.has_pending_input(&sess.active_turn).await {
-                return Ok(SessionTaskOutput {
-                    last_agent_message: turn_output.last_agent_message,
-                    post_compact_recovery: turn_output.post_compact_recovery,
-                });
+            match sess
+                .seal_regular_task_if_no_pending_input(&ctx.sub_id)
+                .await?
+            {
+                RegularTaskContinuation::Continue => {
+                    next_input = Vec::new();
+                }
+                RegularTaskContinuation::Sealed => {
+                    return Ok(SessionTaskOutput {
+                        last_agent_message: turn_output.last_agent_message,
+                        post_compact_recovery: turn_output.post_compact_recovery,
+                    });
+                }
             }
-            next_input = Vec::new();
         }
     }
 }

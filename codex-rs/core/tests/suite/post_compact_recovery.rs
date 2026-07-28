@@ -39,6 +39,8 @@ const STOP_CONTINUATION_PROMPT: &str = "continue after the blocking stop hook";
 const AFTER_RECOVERY_USER: &str = "start a genuinely new turn";
 const STEER_DURING_STOP: &str = "steer while the stop hook is waiting";
 
+type RecoveryFragment = (usize, (String, String));
+
 fn user_turn(text: &str) -> Op {
     Op::UserInput {
         items: vec![UserInput::Text {
@@ -65,12 +67,13 @@ fn matching_recovery_fragments(
     request: &ResponsesRequest,
     expected_role: &str,
     marker: &str,
-) -> Vec<(usize, String)> {
+) -> Vec<RecoveryFragment> {
     request
         .input()
         .into_iter()
         .enumerate()
         .filter_map(|(index, item)| {
+            let id = item.get("id").and_then(serde_json::Value::as_str)?;
             let text = item
                 .get("content")
                 .and_then(serde_json::Value::as_array)
@@ -79,7 +82,7 @@ fn matching_recovery_fragments(
                 .and_then(serde_json::Value::as_str)?;
             (item.get("role").and_then(serde_json::Value::as_str) == Some(expected_role)
                 && text.starts_with(marker))
-            .then(|| (index, text.to_string()))
+            .then(|| (index, (id.to_string(), text.to_string())))
         })
         .collect()
 }
@@ -88,7 +91,7 @@ fn recovery_fragment(
     request: &ResponsesRequest,
     expected_role: &str,
     marker: &str,
-) -> (usize, String) {
+) -> RecoveryFragment {
     let matches = matching_recovery_fragments(request, expected_role, marker);
     assert_eq!(
         matches.len(),
@@ -98,7 +101,7 @@ fn recovery_fragment(
     matches.into_iter().next().expect("one recovery fragment")
 }
 
-fn recovery_fragments(request: &ResponsesRequest) -> ((usize, String), Option<(usize, String)>) {
+fn recovery_fragments(request: &ResponsesRequest) -> (RecoveryFragment, Option<RecoveryFragment>) {
     let mut recall = matching_recovery_fragments(request, "user", "<post_compact_recall>");
     assert!(
         recall.len() <= 1,

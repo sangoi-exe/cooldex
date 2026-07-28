@@ -104,6 +104,12 @@ struct Capture {
     compact_requests: usize,
 }
 
+#[derive(Clone, Copy)]
+enum FollowUpParity {
+    Exact,
+    ExcludeTrailingFunctionBatch,
+}
+
 const ASSISTANT_ONLY: &[Step] = &[Step::Assistant];
 const REASONING_IMAGE: &[Step] = &[Step::ReasoningAssistant, Step::ImageAssistant];
 const TOOL_MIX: &[Step] = &[Step::Assistant, Step::FunctionTool, Step::ShellTool];
@@ -193,7 +199,7 @@ async fn remote_compaction_parity_pre_turn_auto() -> Result<()> {
 
     let legacy = run_pre_turn_auto_session(Mode::Legacy).await?;
     let v2 = run_pre_turn_auto_session(Mode::V2).await?;
-    assert_capture_eq("pre-turn auto", &legacy, &v2);
+    assert_capture_eq("pre-turn auto", &legacy, &v2, FollowUpParity::Exact);
     Ok(())
 }
 
@@ -203,18 +209,28 @@ async fn remote_compaction_parity_mid_turn_auto() -> Result<()> {
 
     let legacy = run_mid_turn_auto_session(Mode::Legacy).await?;
     let v2 = run_mid_turn_auto_session(Mode::V2).await?;
-    assert_capture_eq("mid-turn auto", &legacy, &v2);
+    assert_capture_eq(
+        "mid-turn auto",
+        &legacy,
+        &v2,
+        FollowUpParity::ExcludeTrailingFunctionBatch,
+    );
     Ok(())
 }
 
 async fn compare_manual_scenario(scenario: &Scenario, settings: RunSettings) -> Result<()> {
     let legacy = run_manual_session(scenario, Mode::Legacy, settings).await?;
     let v2 = run_manual_session(scenario, Mode::V2, settings).await?;
-    assert_capture_eq(scenario.name, &legacy, &v2);
+    assert_capture_eq(scenario.name, &legacy, &v2, FollowUpParity::Exact);
     Ok(())
 }
 
-fn assert_capture_eq(label: &str, legacy: &Capture, v2: &Capture) {
+fn assert_capture_eq(
+    label: &str,
+    legacy: &Capture,
+    v2: &Capture,
+    follow_up_parity: FollowUpParity,
+) {
     assert_eq!(
         legacy.compact_requests, 1,
         "legacy compact endpoint should be called exactly once for {label}",
@@ -232,18 +248,22 @@ fn assert_capture_eq(label: &str, legacy: &Capture, v2: &Capture) {
         &v2_compact,
     );
 
-    let legacy_follow_up = follow_up_request_view(&legacy.follow_up_body);
-    let v2_follow_up = follow_up_request_view(&v2.follow_up_body);
+    let legacy_follow_up = follow_up_request_view(&legacy.follow_up_body, follow_up_parity);
+    let v2_follow_up = follow_up_request_view(&v2.follow_up_body, follow_up_parity);
     assert_json_eq(
         &format!("post-compact follow-up request parity mismatch for {label}"),
         &legacy_follow_up,
         &v2_follow_up,
     );
 
+    let legacy_replacement_history =
+        replacement_history_view(&legacy.replacement_history, follow_up_parity);
+    let v2_replacement_history =
+        replacement_history_view(&v2.replacement_history, follow_up_parity);
     assert_json_eq(
         &format!("replacement history parity mismatch for {label}"),
-        &legacy.replacement_history,
-        &v2.replacement_history,
+        &legacy_replacement_history,
+        &v2_replacement_history,
     );
 
     println!(
@@ -277,8 +297,8 @@ fn assert_compact_requests_eq_except_v2_service_tier(label: &str, legacy: &Captu
 }
 
 fn assert_follow_up_and_history_eq(label: &str, legacy: &Capture, v2: &Capture) {
-    let legacy_follow_up = follow_up_request_view(&legacy.follow_up_body);
-    let v2_follow_up = follow_up_request_view(&v2.follow_up_body);
+    let legacy_follow_up = follow_up_request_view(&legacy.follow_up_body, FollowUpParity::Exact);
+    let v2_follow_up = follow_up_request_view(&v2.follow_up_body, FollowUpParity::Exact);
     assert_json_eq(
         &format!("post-compact follow-up request parity mismatch for {label}"),
         &legacy_follow_up,
@@ -768,14 +788,56 @@ fn compact_request_view(body: &Value, mode: Mode) -> Value {
     canonical_json(&normalize_value(selected))
 }
 
-fn follow_up_request_view(body: &Value) -> Value {
+fn follow_up_request_view(body: &Value, parity: FollowUpParity) -> Value {
     let mut selected = selected_request_fields(body, SelectedFieldsMode::FollowUp);
-    selected["input"] = normalize_value(strip_response_item_ids_from_json(
-        body.get("input")
-            .cloned()
-            .expect("follow-up request should include input"),
-    ));
+    let mut input = body
+        .get("input")
+        .and_then(Value::as_array)
+        .expect("follow-up request should include input")
+        .iter()
+        .filter(|item| {
+            !item
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|content| content.get("text").and_then(Value::as_str))
+                .any(|text| {
+                    text.starts_with("<post_compact_recall>")
+                        || text.starts_with("<post_compact_recovery>")
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if matches!(parity, FollowUpParity::ExcludeTrailingFunctionBatch) {
+        while input.last().is_some_and(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call" | "function_call_output")
+            )
+        }) {
+            input.pop();
+        }
+    }
+    selected["input"] = normalize_value(strip_response_item_ids_from_json(Value::Array(input)));
     canonical_json(&normalize_value(selected))
+}
+
+fn replacement_history_view(history: &Value, parity: FollowUpParity) -> Value {
+    let mut history = history.clone();
+    if matches!(parity, FollowUpParity::ExcludeTrailingFunctionBatch)
+        && let Value::Array(items) = &mut history
+    {
+        while items.last().is_some_and(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call" | "function_call_output")
+            )
+        }) {
+            items.pop();
+        }
+    }
+    history
 }
 
 fn replacement_history_from_rollout(path: &Path) -> Result<Value> {

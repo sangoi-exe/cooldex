@@ -77,9 +77,12 @@ use tracing::Span;
 use crate::connectors::AppInfo;
 use crate::rollout::recorder::RolloutRecorder;
 use crate::state::ActiveTurn;
+use crate::state::PostCompactRecoveryIdentity;
 use crate::state::TaskKind;
+use crate::tasks::RegularTaskContinuation;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
+use crate::tasks::SessionTaskOutput;
 use crate::tasks::SessionTaskResult;
 use crate::tasks::UserShellCommandMode;
 use crate::tasks::execute_user_shell_command;
@@ -9335,6 +9338,50 @@ impl SessionTask for CompletingTask {
     }
 }
 
+struct SealedRecoveryTask {
+    recovery: PostCompactRecoveryIdentity,
+    sealed_tx: async_channel::Sender<()>,
+    release_rx: async_channel::Receiver<()>,
+}
+
+impl SessionTask for SealedRecoveryTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.sealed_recovery"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<SessionTaskContext>,
+        ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        let session = session.clone_session();
+        assert_eq!(
+            session
+                .seal_regular_task_if_no_pending_input(&ctx.sub_id)
+                .await?,
+            RegularTaskContinuation::Sealed
+        );
+        self.sealed_tx
+            .send(())
+            .await
+            .expect("sealed-task observer should remain open");
+        self.release_rx
+            .recv()
+            .await
+            .expect("sealed task should be released");
+        Ok(SessionTaskOutput {
+            last_agent_message: Some("sealed recovery completed".to_string()),
+            post_compact_recovery: Some(self.recovery.clone()),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalEventKind {
     TurnComplete,
@@ -9695,6 +9742,179 @@ async fn post_compact_recovery_successful_task_without_sampling_response_does_no
 
     let calls = wait_for_flush_count(&store, /*expected_flushes*/ 3).await;
     assert_eq!(3, calls.flush_thread);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_compact_recovery_sealed_task_defers_late_steer_until_completion() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    attach_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    let identity = install_test_post_compact_recovery(session.as_ref()).await;
+    let (sealed_tx, sealed_rx) = async_channel::bounded(1);
+    let (release_tx, release_rx) = async_channel::bounded(1);
+
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            SealedRecoveryTask {
+                recovery: identity.clone(),
+                sealed_tx,
+                release_rx,
+            },
+        )
+        .await;
+    timeout(Duration::from_secs(2), sealed_rx.recv())
+        .await
+        .expect("task should seal steer admission")
+        .expect("sealed-task observer should remain open");
+
+    let late_input = vec![UserInput::Text {
+        text: "late steer after the final queue decision".to_string(),
+        text_elements: Vec::new(),
+    }];
+    let steer = session.steer_input(
+        late_input.clone(),
+        /*additional_context*/ Default::default(),
+        Some(&turn_context.sub_id),
+        /*client_user_message_id*/ None,
+        /*responsesapi_client_metadata*/ None,
+    );
+    tokio::pin!(steer);
+    tokio::select! {
+        biased;
+        result = &mut steer => panic!("sealed steer completed before task completion: {result:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .pending_identity(),
+        Some(&identity)
+    );
+    release_tx
+        .send(())
+        .await
+        .expect("sealed task should still be waiting");
+
+    let completed = recv_terminal_event(&rx, TerminalEventKind::TurnComplete).await;
+    assert!(matches!(
+        completed.msg,
+        EventMsg::TurnComplete(TurnCompleteEvent {
+            last_agent_message: Some(ref message),
+            error: None,
+            ..
+        }) if message == "sealed recovery completed"
+    ));
+
+    let error = timeout(Duration::from_secs(2), steer)
+        .await
+        .expect("late steer should resume after task completion")
+        .expect_err("completed task should no longer accept same-turn steering");
+    assert_eq!(error, SteerInputError::NoActiveTurn(late_input));
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .pending_identity(),
+        None
+    );
+
+    let application_count = session
+        .live_thread()
+        .expect("test live thread")
+        .load_history(/*include_archived*/ false)
+        .await
+        .expect("load persisted history")
+        .items
+        .into_iter()
+        .filter(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_)))
+        .count();
+    assert_eq!(application_count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_compact_recovery_application_persistence_failure_fails_the_turn() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    attach_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    let identity = install_test_post_compact_recovery(session.as_ref()).await;
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .services
+        .live_thread = None;
+    let (sealed_tx, sealed_rx) = async_channel::bounded(1);
+    let (release_tx, release_rx) = async_channel::bounded(1);
+
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            SealedRecoveryTask {
+                recovery: identity.clone(),
+                sealed_tx,
+                release_rx,
+            },
+        )
+        .await;
+    timeout(Duration::from_secs(2), sealed_rx.recv())
+        .await
+        .expect("task should seal steer admission")
+        .expect("sealed-task observer should remain open");
+    release_tx
+        .send(())
+        .await
+        .expect("sealed task should still be waiting");
+
+    let error = timeout(Duration::from_secs(2), async {
+        loop {
+            if let EventMsg::Error(error) = rx.recv().await.expect("event").msg {
+                break error;
+            }
+        }
+    })
+    .await
+    .expect("persistence failure should emit an error");
+    assert_eq!(
+        error,
+        ErrorEvent {
+            message: "Fatal error: failed to persist post-compact recovery application proof: \
+                Session persistence is disabled; cannot append the post-compact recovery \
+                application proof."
+                .to_string(),
+            codex_error_info: Some(CodexErrorInfo::Other),
+        }
+    );
+
+    let completed = recv_terminal_event(&rx, TerminalEventKind::TurnComplete).await;
+    assert!(matches!(
+        completed.msg,
+        EventMsg::TurnComplete(TurnCompleteEvent {
+            last_agent_message: None,
+            error: Some(ref completed_error),
+            ..
+        }) if completed_error == &error
+    ));
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .pending_identity(),
+        Some(&identity)
+    );
+    assert!(session.active_turn.lock().await.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

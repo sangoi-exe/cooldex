@@ -69,9 +69,16 @@ pub(crate) enum TaskKind {
     Compact,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SteerAdmission {
+    Open,
+    Sealed,
+}
+
 pub(crate) struct RunningTask {
     pub(crate) done: Arc<Notify>,
     pub(crate) kind: TaskKind,
+    pub(crate) steer_admission: SteerAdmission,
     pub(crate) task: Arc<dyn AnySessionTask>,
     pub(crate) cancellation_token: CancellationToken,
     pub(crate) handle: AbortOnDropHandle<()>,

@@ -17,5 +17,6 @@ pub(crate) use turn::ActiveTurn;
 pub(crate) use turn::MailboxDeliveryPhase;
 pub(crate) use turn::PendingRequestPermissions;
 pub(crate) use turn::RunningTask;
+pub(crate) use turn::SteerAdmission;
 pub(crate) use turn::TaskKind;
 pub(crate) use turn::TurnState;

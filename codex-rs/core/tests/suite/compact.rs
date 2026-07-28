@@ -164,6 +164,15 @@ fn body_contains_text(body: &str, text: &str) -> bool {
     body.contains(&json_fragment(text))
 }
 
+fn response_item_text_starts_with(item: &Value, marker: &str) -> bool {
+    item.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .any(|text| text.starts_with(marker))
+}
+
 fn json_fragment(text: &str) -> String {
     serde_json::to_string(text)
         .expect("serialize text to JSON")
@@ -1246,6 +1255,12 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                 {
                     return None;
                 }
+                if response_item_text_starts_with(&value, "<post_compact_recovery>") {
+                    return None;
+                }
+                if response_item_text_starts_with(&value, "<post_compact_recall>") {
+                    return None;
+                }
 
                 let texts = value
                     .get("content")
@@ -1285,6 +1300,43 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     for (i, expected_summary) in compaction_indices.into_iter().zip(expected_summaries) {
         let body = requests_payloads.clone()[i].body_json();
         let input = body.get("input").and_then(|v| v.as_array()).unwrap();
+        let recovery_indices = input
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                response_item_text_starts_with(item, "<post_compact_recovery>").then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recovery_indices.len(),
+            1,
+            "request after compaction at index {i} should contain one recovery directive"
+        );
+        let summary_index = input
+            .iter()
+            .position(|item| response_item_text_starts_with(item, expected_summary))
+            .expect("request after compaction should include the expected summary");
+        let recall_indices = input
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                response_item_text_starts_with(item, "<post_compact_recall>").then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            recall_indices.len() <= 1,
+            "request after compaction at index {i} should contain at most one recall carrier"
+        );
+        if let Some(recall_index) = recall_indices.first() {
+            assert!(
+                summary_index < *recall_index && *recall_index < recovery_indices[0],
+                "request after compaction at index {i} should order history before recall before recovery"
+            );
+        }
+        assert!(
+            summary_index < recovery_indices[0],
+            "request after compaction at index {i} should place recovery after retained history"
+        );
         let input = normalize_inputs(input);
         assert_eq!(input.len(), 3);
         let environment_message = input[0]["content"][0]["text"].as_str().unwrap();
@@ -4013,7 +4065,14 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         "compact requests should consistently include or omit the summarization prompt"
     );
 
-    let first_request_user_texts = requests[0].message_input_texts("user");
+    let native_user_input_texts = |request: &core_test_support::responses::ResponsesRequest| {
+        request
+            .message_input_texts("user")
+            .into_iter()
+            .filter(|text| !text.starts_with("<post_compact_recall>"))
+            .collect::<Vec<_>>()
+    };
+    let first_request_user_texts = native_user_input_texts(&requests[0]);
     let first_turn_user_index = first_request_user_texts
         .len()
         .checked_sub(1)
@@ -4024,10 +4083,48 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
     );
     let initial_seeded_user_prefix = &first_request_user_texts[..first_turn_user_index];
 
-    let final_request_user_texts = requests
-        .last()
-        .expect("final turn request missing")
-        .message_input_texts("user");
+    let final_request = requests.last().expect("final turn request missing");
+    let final_request_input = final_request.input();
+    let recall_indices = final_request_input
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            response_item_text_starts_with(item, "<post_compact_recall>").then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let recovery_indices = final_request_input
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            response_item_text_starts_with(item, "<post_compact_recovery>").then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recall_indices.len(),
+        1,
+        "final request should contain exactly one transient recall carrier"
+    );
+    assert_eq!(
+        recovery_indices.len(),
+        1,
+        "final request should contain exactly one recovery directive"
+    );
+    let summary_index = final_request_input
+        .iter()
+        .position(|item| response_item_text_starts_with(item, &expected_second_summary))
+        .expect("final request should include the second compact summary");
+    let final_user_index = final_request_input
+        .iter()
+        .position(|item| response_item_text_starts_with(item, final_user_message))
+        .expect("final request should include the submitted user message");
+    assert!(
+        summary_index < recall_indices[0]
+            && recall_indices[0] < recovery_indices[0]
+            && recovery_indices[0] < final_user_index,
+        "final request should order retained history before recall before recovery before new user input"
+    );
+
+    let final_request_user_texts = native_user_input_texts(final_request);
     assert!(
         !initial_seeded_user_prefix.is_empty(),
         "first turn should include seeded user prefix before the submitted user message"
@@ -5446,10 +5543,25 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
         "remote-v2 cold resume should replay persisted replacement history verbatim"
     );
     let post_compact_input = requests[2].input();
+    let durable_post_compact_input = post_compact_input
+        .iter()
+        .filter(|item| {
+            !response_item_text_starts_with(item, "<post_compact_recovery>")
+                && !response_item_text_starts_with(item, "<post_compact_recall>")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     assert_eq!(
-        resumed_input.get(..post_compact_input.len()),
-        Some(post_compact_input.as_slice()),
-        "remote-v2 cold resume should replay the complete post-compaction structured prefix"
+        resumed_input.get(..durable_post_compact_input.len()),
+        Some(durable_post_compact_input.as_slice()),
+        "remote-v2 cold resume should replay the durable post-compaction structured prefix"
+    );
+    assert!(
+        resumed_input.iter().all(|item| {
+            !response_item_text_starts_with(item, "<post_compact_recovery>")
+                && !response_item_text_starts_with(item, "<post_compact_recall>")
+        }),
+        "remote-v2 cold resume must not persist transient recovery carriers"
     );
     assert_eq!(
         resumed.codex.instruction_sources().await,

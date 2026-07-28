@@ -34,6 +34,7 @@ use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
 use crate::state::PostCompactRecoveryIdentity;
 use crate::state::RunningTask;
+use crate::state::SteerAdmission;
 use crate::state::TaskKind;
 use codex_analytics::TurnProfileFact;
 use codex_analytics::TurnTokenUsageFact;
@@ -75,6 +76,12 @@ pub(crate) struct SessionTaskOutput {
 }
 
 pub(crate) type SessionTaskResult = CodexResult<SessionTaskOutput>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegularTaskContinuation {
+    Continue,
+    Sealed,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InterruptedTurnHistoryMarker {
@@ -448,6 +455,7 @@ impl Session {
             done,
             handle: AbortOnDropHandle::new(handle),
             kind: task_kind,
+            steer_admission: SteerAdmission::Open,
             task,
             cancellation_token,
             turn_context: Arc::clone(&turn_context),
@@ -456,6 +464,52 @@ impl Session {
             _timer: timer,
         };
         turn.task = Some(running_task);
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the final pending-input decision and steer-admission seal must be atomic"
+    )]
+    pub(crate) async fn seal_regular_task_if_no_pending_input(
+        &self,
+        turn_id: &str,
+    ) -> CodexResult<RegularTaskContinuation> {
+        let mut active = self.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return Err(CodexErr::TurnAborted);
+        };
+        let Some(task) = active_turn.task.as_ref() else {
+            return Err(CodexErr::TurnAborted);
+        };
+        if task.turn_context.sub_id != turn_id {
+            return Err(CodexErr::TurnAborted);
+        }
+        if task.kind != TaskKind::Regular {
+            return Err(CodexErr::Fatal(
+                "only a regular task can seal steer admission after its final input check"
+                    .to_string(),
+            ));
+        }
+
+        let (has_turn_pending_input, accepts_mailbox_delivery) = {
+            let turn_state = active_turn.turn_state.lock().await;
+            (
+                !turn_state.pending_input.is_empty(),
+                turn_state.accepts_mailbox_delivery_for_current_turn(),
+            )
+        };
+        if accepts_mailbox_delivery
+            && (has_turn_pending_input || self.input_queue.has_pending_mailbox_items().await)
+        {
+            return Ok(RegularTaskContinuation::Continue);
+        }
+
+        let task = active_turn
+            .task
+            .as_mut()
+            .expect("active regular task should remain installed while its admission is sealed");
+        task.steer_admission = SteerAdmission::Sealed;
+        Ok(RegularTaskContinuation::Sealed)
     }
 
     /// Returns whether an extension has marked this thread as durably asleep.
@@ -608,6 +662,7 @@ impl Session {
             .turn_metadata_state
             .cancel_git_enrichment_task();
 
+        let mut recovery_application_error = None;
         let turn_state = {
             let mut active = self.active_turn.lock().await;
             let Some(active_turn) = active.as_mut() else {
@@ -619,17 +674,39 @@ impl Session {
             let Some(task) = active_turn.task.take() else {
                 return;
             };
+            let steer_admission = task.steer_admission;
             task.handle.detach();
-            if let Some(recovery) = task_output.post_compact_recovery.take()
-                && let Err(err) = self
-                    .record_post_compact_recovery_sampling_success(&recovery, &turn_context.sub_id)
+            if let Some(recovery) = task_output.post_compact_recovery.take() {
+                let result = if steer_admission == SteerAdmission::Sealed {
+                    self.record_post_compact_recovery_sampling_success(
+                        &recovery,
+                        &turn_context.sub_id,
+                    )
                     .await
-            {
-                warn!(%err, "failed to record post-compact recovery application");
-                task_output.last_agent_message = None;
+                } else {
+                    Err(CodexErr::Fatal(
+                        "post-compact recovery reached task completion before steer admission was sealed"
+                            .to_string(),
+                    ))
+                };
+                if let Err(err) = result {
+                    warn!(%err, "failed to record post-compact recovery application");
+                    task_output.last_agent_message = None;
+                    recovery_application_error = Some(err);
+                }
             }
             Arc::clone(&active_turn.turn_state)
         };
+        if let Some(error) = recovery_application_error.as_ref() {
+            self.emit_turn_error_lifecycle(turn_context.as_ref(), error.to_codex_protocol_error())
+                .await;
+            self.track_turn_codex_error(turn_context.as_ref(), error);
+            self.send_event(
+                turn_context.as_ref(),
+                EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
+            )
+            .await;
+        }
         let last_agent_message = task_output.last_agent_message;
         let pending_input = self
             .input_queue
