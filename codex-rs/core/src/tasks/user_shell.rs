@@ -34,13 +34,13 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandSource;
-use codex_protocol::protocol::TurnStartedEvent;
 use codex_sandboxing::SandboxType;
 use codex_shell_command::parse_command::parse_command;
 
 use super::SessionTask;
 use super::SessionTaskContext;
 use super::SessionTaskResult;
+use super::emit_standard_turn_started;
 use crate::session::session::Session;
 use codex_protocol::models::PermissionProfile;
 
@@ -48,8 +48,8 @@ const USER_SHELL_TIMEOUT_MS: u64 = 60 * 60 * 1000; // 1 hour
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserShellCommandMode {
-    /// Executes as an independent turn lifecycle (emits TurnStarted/TurnComplete
-    /// via task lifecycle plumbing).
+    /// Executes as an independent turn whose task startup barrier owns
+    /// `TurnStarted`.
     StandaloneTurn,
     /// Executes while another turn is already active. This mode must not emit a
     /// second TurnStarted/TurnComplete pair for the same active turn.
@@ -74,6 +74,14 @@ impl SessionTask for UserShellCommandTask {
 
     fn span_name(&self) -> &'static str {
         "session_task.user_shell"
+    }
+
+    fn emit_turn_started(
+        &self,
+        session: Arc<SessionTaskContext>,
+        turn_context: Arc<TurnContext>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        emit_standard_turn_started(session, turn_context)
     }
 
     async fn run(
@@ -106,24 +114,6 @@ pub(crate) async fn execute_user_shell_command(
         .services
         .session_telemetry
         .counter("codex.task.user_shell", /*inc*/ 1, &[]);
-
-    if mode == UserShellCommandMode::StandaloneTurn {
-        // Auxiliary mode runs within an existing active turn. That turn already
-        // emitted TurnStarted, so emitting another TurnStarted here would create
-        // duplicate turn lifecycle events and confuse clients.
-        // TODO(ccunningham): After TurnStarted, emit model-visible turn context diffs for
-        // standalone lifecycle tasks (for example /shell, and review once it emits TurnStarted).
-        // `/compact` is an intentional exception because compaction requests should not include
-        // freshly reinjected context before the summary/replacement history is applied.
-        let event = EventMsg::TurnStarted(TurnStartedEvent {
-            turn_id: turn_context.sub_id.clone(),
-            trace_id: turn_context.trace_id.clone(),
-            started_at: turn_context.turn_timing_state.started_at_unix_secs().await,
-            model_context_window: turn_context.model_context_window(),
-            collaboration_mode_kind: turn_context.mode,
-        });
-        session.send_event(turn_context.as_ref(), event).await;
-    }
 
     let Some((turn_environment, environment_shell)) = turn_context
         .environments
@@ -448,19 +438,21 @@ async fn persist_user_shell_output(
 ) {
     let output_item = user_shell_command_record_item(raw_command, exec_output, turn_context);
 
-    if mode == UserShellCommandMode::StandaloneTurn {
-        session
-            .record_conversation_items(turn_context, std::slice::from_ref(&output_item))
-            .await;
-        // Standalone shell turns can run before any regular user turn, so
-        // explicitly materialize rollout persistence after recording output.
-        session.ensure_rollout_materialized().await;
-        return;
+    match mode {
+        UserShellCommandMode::StandaloneTurn => {
+            session
+                .record_conversation_items(turn_context, std::slice::from_ref(&output_item))
+                .await;
+            // Standalone shell turns can run before any regular user turn, so
+            // explicitly materialize rollout persistence after recording output.
+            session.ensure_rollout_materialized().await;
+        }
+        UserShellCommandMode::ActiveTurnAuxiliary => {
+            session
+                .inject_no_new_turn(vec![output_item], Some(turn_context))
+                .await;
+        }
     }
-
-    session
-        .inject_no_new_turn(vec![output_item], Some(turn_context))
-        .await;
 }
 
 #[cfg(all(test, unix))]

@@ -91,7 +91,7 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
     .await;
 
     let (mut session, mut turn_context_raw) = make_session_and_context().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    *session.active_turn.lock().await = claimed_turn_slot();
     turn_context_raw
         .approval_policy
         .set(AskForApproval::OnRequest)
@@ -178,7 +178,7 @@ async fn request_permissions_guardian_review_stops_when_cancelled() {
     .await;
 
     let (mut session, mut turn_context, rx_event) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    *session.active_turn.lock().await = claimed_turn_slot();
     let turn_context_raw = Arc::get_mut(&mut turn_context).expect("single turn context ref");
     turn_context_raw
         .approval_policy
@@ -392,9 +392,8 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
     .await;
 
     let (mut session, mut turn_context_raw) = make_session_and_context().await;
-    let active_turn = crate::state::ActiveTurn::default();
-    let originating_turn_state = Arc::clone(&active_turn.turn_state);
-    *session.active_turn.lock().await = Some(active_turn);
+    let (active_turn, originating_turn_state) = claimed_turn_slot_with_state();
+    *session.active_turn.lock().await = active_turn;
     session
         .record_granted_request_permissions_for_turn(
             &RequestPermissionsResponse {
@@ -605,11 +604,11 @@ async fn shell_command_allows_sticky_turn_permissions_without_inline_request_per
         .features
         .enable(Feature::RequestPermissionsTool)
         .expect("test setup should allow enabling request permissions tool");
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    *session.active_turn.lock().await = claimed_turn_slot();
     {
-        let mut active_turn = session.active_turn.lock().await;
-        let active_turn = active_turn.as_mut().expect("active turn");
-        let mut turn_state = active_turn.turn_state.lock().await;
+        let active_turn = session.active_turn.lock().await;
+        let turn_state = active_turn.turn_state().expect("active turn state");
+        let mut turn_state = turn_state.lock().await;
         turn_state.record_granted_permissions(
             codex_exec_server::LOCAL_ENVIRONMENT_ID,
             PermissionProfile {

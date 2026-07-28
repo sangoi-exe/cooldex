@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -26,12 +25,6 @@ use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsage;
 
-/// Metadata about the currently running turn.
-pub(crate) struct ActiveTurn {
-    pub(crate) task: Option<RunningTask>,
-    pub(crate) turn_state: Arc<Mutex<TurnState>>,
-}
-
 /// Whether mailbox deliveries should still be folded into the current turn.
 ///
 /// State machine:
@@ -53,15 +46,6 @@ pub(crate) enum MailboxDeliveryPhase {
     NextTurn,
 }
 
-impl Default for ActiveTurn {
-    fn default() -> Self {
-        Self {
-            task: None,
-            turn_state: Arc::new(Mutex::new(TurnState::default())),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskKind {
     Regular,
@@ -71,13 +55,13 @@ pub(crate) enum TaskKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SteerAdmission {
+    Starting,
     Open,
     Sealed,
 }
 
 pub(crate) struct RunningTask {
     pub(crate) task_done: Arc<Notify>,
-    pub(crate) steer_release: Arc<Notify>,
     pub(crate) kind: TaskKind,
     pub(crate) steer_admission: SteerAdmission,
     pub(crate) task: Arc<dyn AnySessionTask>,

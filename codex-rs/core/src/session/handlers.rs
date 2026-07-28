@@ -10,8 +10,6 @@ use tracing::Instrument;
 use tracing::debug_span;
 use tracing::info_span;
 
-use crate::session::SteerInputError;
-use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::session::SessionSettingsUpdate;
 
@@ -212,52 +210,16 @@ pub(super) async fn user_input_or_turn_inner(
     sess.maybe_emit_model_warnings_for_turn(current_context.as_ref())
         .await;
     match sess
-        .steer_input(
-            items.clone(),
-            additional_context.clone(),
-            /*expected_turn_id*/ None,
-            client_user_message_id.clone(),
-            responsesapi_client_metadata.clone(),
+        .route_user_input(
+            Arc::clone(&current_context),
+            items,
+            additional_context,
+            client_user_message_id,
+            responsesapi_client_metadata,
         )
         .await
     {
-        Ok(_) => {
-            current_context.session_telemetry.user_prompt(&items);
-        }
-        Err(SteerInputError::NoActiveTurn(items)) => {
-            if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
-                current_context
-                    .turn_metadata_state
-                    .set_responsesapi_client_metadata(responsesapi_client_metadata);
-            }
-            current_context.session_telemetry.user_prompt(&items);
-            sess.refresh_mcp_servers_if_requested(
-                &current_context,
-                Some(sess.mcp_elicitation_reviewer()),
-            )
-            .await;
-            let additional_context_input = {
-                let mut state = sess.state.lock().await;
-                state.additional_context.merge(additional_context)
-            };
-            let mut task_input = additional_context_input
-                .into_iter()
-                .map(ResponseItem::from)
-                .map(TurnInput::ResponseItem)
-                .collect::<Vec<_>>();
-            if !items.is_empty() {
-                task_input.push(TurnInput::UserInput {
-                    content: items,
-                    client_id: client_user_message_id,
-                });
-            }
-            sess.spawn_task(
-                Arc::clone(&current_context),
-                task_input,
-                crate::tasks::RegularTask::new(),
-            )
-            .await;
-        }
+        Ok(_) => {}
         Err(err) => {
             sess.send_event_raw(Event {
                 id: sub_id,
@@ -456,17 +418,52 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         return;
     }
 
-    let has_active_turn = { sess.active_turn.lock().await.is_some() };
-    if has_active_turn {
-        sess.send_event_raw(Event {
-            id: sub_id,
-            msg: EventMsg::Error(ErrorEvent {
-                message: "Cannot rollback while a turn is in progress.".to_string(),
-                codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
-            }),
-        })
-        .await;
-        return;
+    enum RollbackAdmission {
+        Ready,
+        Wait(tokio::sync::watch::Receiver<u64>),
+        Busy,
+    }
+
+    loop {
+        let admission = {
+            let slot = sess.active_turn.lock().await;
+            if slot.is_idle() {
+                RollbackAdmission::Ready
+            } else if slot.is_transitioning() {
+                RollbackAdmission::Wait(slot.subscribe_generation())
+            } else {
+                RollbackAdmission::Busy
+            }
+        };
+        match admission {
+            RollbackAdmission::Ready => break,
+            RollbackAdmission::Wait(mut generation_rx) => {
+                if generation_rx.changed().await.is_ok() {
+                    continue;
+                }
+                sess.send_event_raw(Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "turn-slot generation channel closed while waiting to rollback"
+                            .to_string(),
+                        codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
+                    }),
+                })
+                .await;
+                return;
+            }
+            RollbackAdmission::Busy => {
+                sess.send_event_raw(Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "Cannot rollback while a turn is in progress.".to_string(),
+                        codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
+                    }),
+                })
+                .await;
+                return;
+            }
+        }
     }
 
     let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;

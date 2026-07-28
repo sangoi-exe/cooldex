@@ -1016,6 +1016,12 @@ impl TurnRequestProcessor {
                         None,
                         Some(AnalyticsJsonRpcError::Input(InputError::Empty)),
                     ),
+                    SteerInputError::TurnSlotInvariant(message) => {
+                        let error =
+                            internal_error(format!("turn-slot invariant violation: {message}"));
+                        self.track_error_response(request_id, &error, /*error_type*/ None);
+                        return error;
+                    }
                 };
                 let mut error = invalid_request(message);
                 error.data = data;

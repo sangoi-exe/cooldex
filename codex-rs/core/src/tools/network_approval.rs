@@ -487,10 +487,8 @@ impl NetworkApprovalService {
     async fn active_turn_context(
         session: &Session,
     ) -> Option<Arc<crate::session::turn_context::TurnContext>> {
-        let active_turn = session.active_turn.lock().await;
-        active_turn
-            .as_ref()
-            .and_then(|turn| turn.task.as_ref())
+        let slot = session.active_turn.lock().await;
+        slot.running_task()
             .map(|task| Arc::clone(&task.turn_context))
     }
 

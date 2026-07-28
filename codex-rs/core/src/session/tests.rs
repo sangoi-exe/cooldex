@@ -76,9 +76,9 @@ use tracing::Span;
 
 use crate::connectors::AppInfo;
 use crate::rollout::recorder::RolloutRecorder;
-use crate::state::ActiveTurn;
 use crate::state::PostCompactRecoveryIdentity;
 use crate::state::TaskKind;
+use crate::state::TurnSlot;
 use crate::tasks::RegularTaskContinuation;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
@@ -118,6 +118,21 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::items::HookPromptFragment;
 use codex_protocol::items::build_hook_prompt_message;
+
+pub(crate) fn claimed_turn_slot() -> TurnSlot {
+    let mut slot = TurnSlot::default();
+    slot.claim_start("test-turn".to_string())
+        .expect("idle test slot should accept a start claim");
+    slot
+}
+
+fn claimed_turn_slot_with_state() -> (TurnSlot, Arc<Mutex<crate::state::TurnState>>) {
+    let mut slot = TurnSlot::default();
+    let claim = slot
+        .claim_start("test-turn".to_string())
+        .expect("idle test slot should accept a start claim");
+    (slot, claim.turn_state)
+}
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
@@ -218,6 +233,10 @@ impl StepContext {
 }
 
 mod guardian_tests;
+#[path = "tests/turn_slot_lifecycle_tests.rs"]
+mod turn_slot_lifecycle_tests;
+#[path = "tests/turn_slot_start_order_tests.rs"]
+mod turn_slot_start_order_tests;
 
 struct InstructionsTestCase {
     slug: &'static str,
@@ -3793,7 +3812,7 @@ async fn thread_rollback_fails_when_turn_in_progress() {
         .await;
     let history_before_rollback = sess.clone_history().await;
 
-    *sess.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+    *sess.active_turn.lock().await = claimed_turn_slot();
     handlers::thread_rollback(&sess, "sub-1".to_string(), /*num_turns*/ 1).await;
 
     let error_event = wait_for_thread_rollback_failed(&rx).await;
@@ -5567,7 +5586,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
         pending_mcp_server_refresh_config: Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
-        active_turn: Mutex::new(None),
+        active_turn: Mutex::new(TurnSlot::default()),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -5888,7 +5907,7 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
 #[tokio::test]
 async fn notify_request_permissions_response_ignores_unmatched_call_id() {
     let (session, _turn_context) = make_session_and_context().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    *session.active_turn.lock().await = claimed_turn_slot();
 
     session
         .notify_request_permissions_response(
@@ -5917,13 +5936,11 @@ async fn notify_request_permissions_response_ignores_unmatched_call_id() {
 #[tokio::test]
 async fn record_granted_request_permissions_for_turn_uses_originating_turn() {
     let (session, _turn_context) = make_session_and_context().await;
-    let originating_active_turn = ActiveTurn::default();
-    let originating_turn_state = Arc::clone(&originating_active_turn.turn_state);
-    *session.active_turn.lock().await = Some(originating_active_turn);
+    let (originating_active_turn, originating_turn_state) = claimed_turn_slot_with_state();
+    *session.active_turn.lock().await = originating_active_turn;
 
-    let current_active_turn = ActiveTurn::default();
-    let current_turn_state = Arc::clone(&current_active_turn.turn_state);
-    *session.active_turn.lock().await = Some(current_active_turn);
+    let (current_active_turn, current_turn_state) = claimed_turn_slot_with_state();
+    *session.active_turn.lock().await = current_active_turn;
 
     let requested_permissions = RequestPermissionProfile {
         network: Some(codex_protocol::models::NetworkPermissions {
@@ -5968,9 +5985,8 @@ async fn record_granted_request_permissions_for_turn_uses_originating_turn() {
 #[tokio::test]
 async fn request_permission_grants_are_environment_keyed() {
     let (session, _turn_context) = make_session_and_context().await;
-    let originating_active_turn = ActiveTurn::default();
-    let originating_turn_state = Arc::clone(&originating_active_turn.turn_state);
-    *session.active_turn.lock().await = Some(originating_active_turn);
+    let (originating_active_turn, originating_turn_state) = claimed_turn_slot_with_state();
+    *session.active_turn.lock().await = originating_active_turn;
 
     let requested_permissions = RequestPermissionProfile {
         network: Some(codex_protocol::models::NetworkPermissions {
@@ -6021,9 +6037,8 @@ async fn request_permission_grants_are_environment_keyed() {
 #[tokio::test]
 async fn enable_strict_auto_review_for_turn_uses_originating_turn() {
     let (session, _turn_context) = make_session_and_context().await;
-    let originating_active_turn = ActiveTurn::default();
-    let originating_turn_state = Arc::clone(&originating_active_turn.turn_state);
-    *session.active_turn.lock().await = Some(originating_active_turn);
+    let (originating_active_turn, originating_turn_state) = claimed_turn_slot_with_state();
+    *session.active_turn.lock().await = originating_active_turn;
 
     let requested_permissions = RequestPermissionProfile {
         network: Some(codex_protocol::models::NetworkPermissions {
@@ -6083,7 +6098,7 @@ fn strict_auto_review_session_scope_grants_no_permissions() {
 #[tokio::test]
 async fn request_permissions_emits_event_when_granular_policy_allows_requests() {
     let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    *session.active_turn.lock().await = claimed_turn_slot();
     Arc::get_mut(&mut turn_context)
         .expect("single thread settings ref")
         .approval_policy
@@ -6172,7 +6187,7 @@ async fn request_permissions_emits_event_when_granular_policy_allows_requests() 
 #[tokio::test]
 async fn request_permissions_tool_resolves_relative_paths_against_selected_environment() {
     let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    *session.active_turn.lock().await = claimed_turn_slot();
     let environment_cwd = {
         #[allow(deprecated)]
         let legacy_cwd = turn_context.cwd.clone();
@@ -6326,7 +6341,7 @@ async fn request_permissions_tool_rejects_unknown_environment_id() {
 #[tokio::test]
 async fn request_permissions_response_materializes_session_cwd_grants_before_recording() {
     let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    *session.active_turn.lock().await = claimed_turn_slot();
     Arc::get_mut(&mut turn_context)
         .expect("single thread settings ref")
         .approval_policy
@@ -6437,7 +6452,7 @@ async fn request_permissions_response_materializes_session_cwd_grants_before_rec
 #[tokio::test]
 async fn request_permissions_is_auto_denied_when_granular_policy_blocks_tool_requests() {
     let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    *session.active_turn.lock().await = claimed_turn_slot();
     Arc::get_mut(&mut turn_context)
         .expect("single thread settings ref")
         .approval_policy
@@ -7729,7 +7744,7 @@ where
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
         pending_mcp_server_refresh_config: Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
-        active_turn: Mutex::new(None),
+        active_turn: Mutex::new(TurnSlot::default()),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -9978,7 +9993,7 @@ async fn assert_forced_abort_releases_sealed_steer(reason: TurnAbortReason) {
             .pending_identity(),
         Some(&identity)
     );
-    assert!(session.active_turn.lock().await.is_none());
+    assert!(session.active_turn.lock().await.is_idle());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10242,10 +10257,9 @@ async fn post_compact_recovery_forced_replacement_defers_no_id_steer_until_succe
             .await
     );
     {
-        let active = session.active_turn.lock().await;
-        let active_task = active
-            .as_ref()
-            .and_then(|active_turn| active_turn.task.as_ref())
+        let slot = session.active_turn.lock().await;
+        let active_task = slot
+            .running_task()
             .expect("successor task should remain active");
         assert_eq!(active_task.turn_context.sub_id, replacement_context.sub_id);
     }
@@ -10335,7 +10349,16 @@ async fn post_compact_recovery_application_persistence_failure_fails_the_turn() 
             .pending_identity(),
         Some(&identity)
     );
-    assert!(session.active_turn.lock().await.is_none());
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if session.active_turn.lock().await.is_idle() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal recovery failure should finish the turn transition");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10636,7 +10659,7 @@ async fn task_finish_emits_thread_idle_lifecycle_after_active_turn_clears() {
         .expect("thread idle lifecycle")
         .expect("idle receiver open");
     assert_eq!(1, calls.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(session.active_turn.lock().await.is_none());
+    assert!(session.active_turn.lock().await.is_idle());
 }
 
 #[tokio::test]
@@ -10726,7 +10749,7 @@ async fn try_start_turn_if_idle_rejects_plan_mode_without_injecting() {
 
     assert_eq!(TryStartTurnIfIdleRejectionReason::PlanMode, err.reason());
     assert_eq!(vec![item], err.into_input());
-    assert!(sess.active_turn.lock().await.is_none());
+    assert!(sess.active_turn.lock().await.is_idle());
     assert_eq!(
         Vec::<TurnInput>::new(),
         sess.input_queue.get_pending_input(&sess.active_turn).await
@@ -10757,7 +10780,7 @@ async fn try_start_turn_if_idle_rejects_pending_trigger_turn_without_injecting()
         err.reason()
     );
     assert_eq!(vec![item], err.into_input());
-    assert!(sess.active_turn.lock().await.is_none());
+    assert!(sess.active_turn.lock().await.is_idle());
     assert!(sess.input_queue.has_trigger_turn_mailbox_items().await);
 }
 
@@ -10941,41 +10964,6 @@ async fn steer_input_returns_active_turn_id() {
 
     assert_eq!(turn_id, tc.sub_id);
     assert!(sess.input_queue.has_pending_input(&sess.active_turn).await);
-}
-
-#[tokio::test]
-async fn abort_empty_active_turn_preserves_pending_input() {
-    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
-    let pending_item = ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "late pending input".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let turn_state = {
-        let mut active = sess.active_turn.lock().await;
-        let active_turn = active.get_or_insert_with(ActiveTurn::default);
-        Arc::clone(&active_turn.turn_state)
-    };
-    sess.input_queue
-        .extend_pending_input_for_turn_state(
-            turn_state.as_ref(),
-            vec![TurnInput::ResponseItem(pending_item.clone())],
-        )
-        .await;
-
-    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
-
-    assert!(sess.active_turn.lock().await.is_none());
-    assert_eq!(
-        sess.input_queue
-            .take_pending_input_for_turn_state(turn_state.as_ref())
-            .await,
-        vec![TurnInput::ResponseItem(pending_item)]
-    );
 }
 
 async fn set_total_token_usage(sess: &Session, total_token_usage: TokenUsage) {

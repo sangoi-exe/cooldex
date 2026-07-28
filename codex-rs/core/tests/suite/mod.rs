@@ -146,6 +146,7 @@ mod tool_harness;
 mod tool_parallelism;
 mod tools;
 mod truncation;
+mod turn_slot_lifecycle;
 mod turn_state;
 mod unified_exec;
 mod unified_exec_process_events;

@@ -192,5 +192,5 @@ async fn mark_thread_interrupted(thread: &CodexThread) {
 
 async fn clear_active_turn(thread: &CodexThread) {
     // The fixture has no task runner to clear the turn after the terminal event.
-    *thread.session.active_turn.lock().await = None;
+    *thread.session.active_turn.lock().await = crate::state::TurnSlot::default();
 }

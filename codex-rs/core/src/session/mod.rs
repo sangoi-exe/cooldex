@@ -172,6 +172,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use toml::Value as TomlValue;
 use tracing::Instrument;
+use tracing::Span;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -257,6 +258,7 @@ pub enum SteerInputError {
     ExpectedTurnMismatch { expected: String, actual: String },
     ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind },
     EmptyInput,
+    TurnSlotInvariant(String),
 }
 
 impl SteerInputError {
@@ -285,6 +287,10 @@ impl SteerInputError {
             Self::EmptyInput => ErrorEvent {
                 message: "input must not be empty".to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
+            },
+            Self::TurnSlotInvariant(message) => ErrorEvent {
+                message: format!("turn-slot invariant violation: {message}"),
+                codex_error_info: None,
             },
         }
     }
@@ -2103,10 +2109,8 @@ impl Session {
     }
 
     pub(crate) async fn turn_context_for_sub_id(&self, sub_id: &str) -> Option<Arc<TurnContext>> {
-        let active = self.active_turn.lock().await;
-        active
-            .as_ref()
-            .and_then(|turn| turn.task.as_ref())
+        let slot = self.active_turn.lock().await;
+        slot.running_task()
             .filter(|task| task.turn_context.sub_id == sub_id)
             .map(|task| Arc::clone(&task.turn_context))
     }
@@ -2114,8 +2118,8 @@ impl Session {
     async fn active_turn_context_and_cancellation_token(
         &self,
     ) -> Option<(Arc<TurnContext>, CancellationToken)> {
-        let active = self.active_turn.lock().await;
-        let task = active.as_ref()?.task.as_ref()?;
+        let slot = self.active_turn.lock().await;
+        let task = slot.running_task()?;
         Some((
             Arc::clone(&task.turn_context),
             task.cancellation_token.child_token(),
@@ -2254,10 +2258,10 @@ impl Session {
         // Add the tx_approve callback to the map before sending the request.
         let (tx_approve, rx_approve) = oneshot::channel();
         let prev_entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let slot = self.active_turn.lock().await;
+            match slot.turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     ts.insert_pending_approval(effective_approval_id.clone(), tx_approve)
                 }
                 None => None,
@@ -2325,10 +2329,10 @@ impl Session {
         let (tx_approve, rx_approve) = oneshot::channel();
         let approval_id = call_id.clone();
         let prev_entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let slot = self.active_turn.lock().await;
+            match slot.turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     ts.insert_pending_approval(approval_id.clone(), tx_approve)
                 }
                 None => None,
@@ -2400,8 +2404,8 @@ impl Session {
 
         if crate::guardian::routes_approval_to_guardian(turn_context.as_ref()) {
             let originating_turn_state = {
-                let active = self.active_turn.lock().await;
-                active.as_ref().map(|active| Arc::clone(&active.turn_state))
+                let slot = self.active_turn.lock().await;
+                slot.turn_state().cloned()
             };
             let review_id = crate::guardian::new_guardian_review_id();
             let session = Arc::clone(self);
@@ -2480,10 +2484,10 @@ impl Session {
         let _elicitation = self.services.elicitations.register();
         let (tx_response, rx_response) = oneshot::channel();
         let prev_entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let slot = self.active_turn.lock().await;
+            match slot.turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     ts.insert_pending_request_permissions(
                         call_id.clone(),
                         PendingRequestPermissions {
@@ -2513,9 +2517,9 @@ impl Session {
         tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
-                let mut active = self.active_turn.lock().await;
-                if let Some(at) = active.as_mut() {
-                    let mut ts = at.turn_state.lock().await;
+                let slot = self.active_turn.lock().await;
+                if let Some(turn_state) = slot.turn_state() {
+                    let mut ts = turn_state.lock().await;
                     let _ = ts.remove_pending_request_permissions(&call_id);
                 }
                 None
@@ -2573,10 +2577,10 @@ impl Session {
         let (tx_response, rx_response) = oneshot::channel();
         let event_id = sub_id.clone();
         let prev_entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let slot = self.active_turn.lock().await;
+            match slot.turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     ts.insert_pending_user_input(sub_id, tx_response)
                 }
                 None => None,
@@ -2609,10 +2613,10 @@ impl Session {
         response: RequestUserInputResponse,
     ) {
         let entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let slot = self.active_turn.lock().await;
+            match slot.turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     ts.remove_pending_user_input(sub_id)
                 }
                 None => None,
@@ -2638,12 +2642,12 @@ impl Session {
         response: RequestPermissionsResponse,
     ) {
         let (entry, originating_turn_state) = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let slot = self.active_turn.lock().await;
+            match slot.turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     let entry = ts.remove_pending_request_permissions(call_id);
-                    let originating_turn_state = entry.as_ref().map(|_| Arc::clone(&at.turn_state));
+                    let originating_turn_state = entry.as_ref().map(|_| Arc::clone(turn_state));
                     (entry, originating_turn_state)
                 }
                 None => (None, None),
@@ -2753,9 +2757,9 @@ impl Session {
         &self,
         environment_id: &str,
     ) -> Option<AdditionalPermissionProfile> {
-        let active = self.active_turn.lock().await;
-        let active = active.as_ref()?;
-        let ts = active.turn_state.lock().await;
+        let slot = self.active_turn.lock().await;
+        let turn_state = slot.turn_state()?;
+        let ts = turn_state.lock().await;
         ts.granted_permissions(environment_id)
     }
 
@@ -2764,11 +2768,11 @@ impl Session {
         reason = "active turn reads must stay consistent with the matching turn state"
     )]
     pub(crate) async fn strict_auto_review_enabled_for_turn(&self) -> bool {
-        let active = self.active_turn.lock().await;
-        let Some(active) = active.as_ref() else {
+        let slot = self.active_turn.lock().await;
+        let Some(turn_state) = slot.turn_state() else {
             return false;
         };
-        let ts = active.turn_state.lock().await;
+        let ts = turn_state.lock().await;
         ts.strict_auto_review_enabled()
     }
 
@@ -2786,10 +2790,10 @@ impl Session {
     )]
     pub async fn notify_dynamic_tool_response(&self, call_id: &str, response: DynamicToolResponse) {
         let entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let slot = self.active_turn.lock().await;
+            match slot.turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     ts.remove_pending_dynamic_tool(call_id)
                 }
                 None => None,
@@ -2811,10 +2815,10 @@ impl Session {
     )]
     pub async fn notify_approval(&self, approval_id: &str, decision: ReviewDecision) {
         let entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let slot = self.active_turn.lock().await;
+            match slot.turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     ts.remove_pending_approval(approval_id)
                 }
                 None => None,
@@ -3989,22 +3993,47 @@ impl Session {
         responsesapi_client_metadata: Option<HashMap<String, String>>,
     ) -> Result<String, SteerInputError> {
         loop {
-            let mut active = self.active_turn.lock().await;
-            let Some(active_turn) = active.as_mut() else {
+            let slot = self.active_turn.lock().await;
+            if slot.is_idle() {
                 return Err(SteerInputError::NoActiveTurn(input));
-            };
+            }
 
-            let Some(active_task) = active_turn.task.as_ref() else {
-                return Err(SteerInputError::NoActiveTurn(input));
-            };
-            let active_turn_id = &active_task.turn_context.sub_id;
+            if let Some(starting_turn_id) = slot.starting_turn_id()
+                && let Some(expected_turn_id) = expected_turn_id
+                && expected_turn_id != starting_turn_id
+            {
+                return Err(SteerInputError::ExpectedTurnMismatch {
+                    expected: expected_turn_id.to_string(),
+                    actual: starting_turn_id.to_string(),
+                });
+            }
+            if slot.is_starting_or_transitioning()
+                || slot
+                    .running_task()
+                    .is_some_and(|task| task.steer_admission != SteerAdmission::Open)
+            {
+                let mut generation_rx = slot.subscribe_generation();
+                drop(slot);
+                generation_rx.changed().await.map_err(|_| {
+                    SteerInputError::TurnSlotInvariant(
+                        "generation channel closed while steering input".to_string(),
+                    )
+                })?;
+                continue;
+            }
 
+            let active_task = slot.running_task().ok_or_else(|| {
+                SteerInputError::TurnSlotInvariant(
+                    "non-idle turn slot has no running task".to_string(),
+                )
+            })?;
+            let active_turn_id = active_task.turn_context.sub_id.clone();
             if let Some(expected_turn_id) = expected_turn_id
                 && expected_turn_id != active_turn_id
             {
                 return Err(SteerInputError::ExpectedTurnMismatch {
                     expected: expected_turn_id.to_string(),
-                    actual: active_turn_id.clone(),
+                    actual: active_turn_id,
                 });
             }
 
@@ -4022,49 +4051,184 @@ impl Session {
                 }
             }
 
-            if active_task.steer_admission == SteerAdmission::Sealed {
-                let steer_release = Arc::clone(&active_task.steer_release);
-                let notified = steer_release.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                drop(active);
-                notified.await;
-                continue;
-            }
-
             if input.is_empty() {
                 return Err(SteerInputError::EmptyInput);
             }
 
-            let additional_context_input = {
-                let mut state = self.state.lock().await;
-                state.additional_context.merge(additional_context)
-            };
-
-            if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
-                active_task
-                    .turn_context
-                    .turn_metadata_state
-                    .set_responsesapi_client_metadata(responsesapi_client_metadata);
-            }
-
-            let mut pending_input = additional_context_input
-                .into_iter()
-                .map(ResponseItem::from)
-                .map(TurnInput::ResponseItem)
-                .collect::<Vec<_>>();
-            pending_input.push(TurnInput::UserInput {
-                content: input,
-                client_id: client_user_message_id,
-            });
-            self.input_queue
-                .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
-                    active_turn.turn_state.as_ref(),
-                    pending_input,
+            let turn_state = slot.turn_state().cloned().ok_or_else(|| {
+                SteerInputError::TurnSlotInvariant(
+                    "running turn slot has no turn state".to_string(),
+                )
+            })?;
+            return self
+                .queue_user_input(
+                    Arc::clone(&active_task.turn_context),
+                    turn_state,
+                    input,
+                    additional_context,
+                    client_user_message_id,
+                    responsesapi_client_metadata,
                 )
                 .await;
-            return Ok(active_turn_id.clone());
         }
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "routing and turn-local queue admission must remain atomic"
+    )]
+    pub(crate) async fn route_user_input(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<UserInput>,
+        additional_context: BTreeMap<String, AdditionalContextEntry>,
+        client_user_message_id: Option<String>,
+        responsesapi_client_metadata: Option<HashMap<String, String>>,
+    ) -> Result<String, SteerInputError> {
+        loop {
+            let mut slot = self.active_turn.lock().await;
+            if slot.is_idle() {
+                let claim = slot
+                    .claim_start(turn_context.sub_id.clone())
+                    .map_err(|err| SteerInputError::TurnSlotInvariant(err.to_string()))?;
+                drop(slot);
+
+                turn_context.session_telemetry.user_prompt(&input);
+                let accepted_turn_id = turn_context.sub_id.clone();
+                let session = Arc::clone(self);
+                let startup = tokio::spawn(
+                    async move {
+                        if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
+                            turn_context
+                                .turn_metadata_state
+                                .set_responsesapi_client_metadata(responsesapi_client_metadata);
+                        }
+                        session
+                            .refresh_mcp_servers_if_requested(
+                                &turn_context,
+                                Some(session.mcp_elicitation_reviewer()),
+                            )
+                            .await;
+                        let additional_context_input = {
+                            let mut state = session.state.lock().await;
+                            state.additional_context.merge(additional_context)
+                        };
+                        let mut task_input = additional_context_input
+                            .into_iter()
+                            .map(ResponseItem::from)
+                            .map(TurnInput::ResponseItem)
+                            .collect::<Vec<_>>();
+                        if !input.is_empty() {
+                            task_input.push(TurnInput::UserInput {
+                                content: input,
+                                client_id: client_user_message_id,
+                            });
+                        }
+                        session
+                            .start_claimed_regular_task(claim, turn_context, task_input)
+                            .await
+                    }
+                    .instrument(Span::current()),
+                );
+                return match startup.await {
+                    Ok(Ok(())) => Ok(accepted_turn_id),
+                    Ok(Err(err)) => Err(SteerInputError::TurnSlotInvariant(err.to_string())),
+                    Err(err) => Err(SteerInputError::TurnSlotInvariant(format!(
+                        "user-input startup task failed: {err}"
+                    ))),
+                };
+            }
+
+            if slot.is_starting_or_transitioning()
+                || slot
+                    .running_task()
+                    .is_some_and(|task| task.steer_admission != SteerAdmission::Open)
+            {
+                let mut generation_rx = slot.subscribe_generation();
+                drop(slot);
+                generation_rx.changed().await.map_err(|_| {
+                    SteerInputError::TurnSlotInvariant(
+                        "generation channel closed while routing user input".to_string(),
+                    )
+                })?;
+                continue;
+            }
+
+            let active_task = slot.running_task().ok_or_else(|| {
+                SteerInputError::TurnSlotInvariant(
+                    "non-idle turn slot has no running task".to_string(),
+                )
+            })?;
+            match active_task.kind {
+                crate::state::TaskKind::Regular => {}
+                crate::state::TaskKind::Review => {
+                    return Err(SteerInputError::ActiveTurnNotSteerable {
+                        turn_kind: NonSteerableTurnKind::Review,
+                    });
+                }
+                crate::state::TaskKind::Compact => {
+                    return Err(SteerInputError::ActiveTurnNotSteerable {
+                        turn_kind: NonSteerableTurnKind::Compact,
+                    });
+                }
+            }
+            if input.is_empty() {
+                return Err(SteerInputError::EmptyInput);
+            }
+            turn_context.session_telemetry.user_prompt(&input);
+            let active_context = Arc::clone(&active_task.turn_context);
+            let turn_state = slot.turn_state().cloned().ok_or_else(|| {
+                SteerInputError::TurnSlotInvariant(
+                    "running turn slot has no turn state".to_string(),
+                )
+            })?;
+            return self
+                .queue_user_input(
+                    active_context,
+                    turn_state,
+                    input,
+                    additional_context,
+                    client_user_message_id,
+                    responsesapi_client_metadata,
+                )
+                .await;
+        }
+    }
+
+    async fn queue_user_input(
+        &self,
+        active_turn_context: Arc<TurnContext>,
+        turn_state: Arc<Mutex<crate::state::TurnState>>,
+        input: Vec<UserInput>,
+        additional_context: BTreeMap<String, AdditionalContextEntry>,
+        client_user_message_id: Option<String>,
+        responsesapi_client_metadata: Option<HashMap<String, String>>,
+    ) -> Result<String, SteerInputError> {
+        let additional_context_input = {
+            let mut state = self.state.lock().await;
+            state.additional_context.merge(additional_context)
+        };
+        if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
+            active_turn_context
+                .turn_metadata_state
+                .set_responsesapi_client_metadata(responsesapi_client_metadata);
+        }
+        let mut pending_input = additional_context_input
+            .into_iter()
+            .map(ResponseItem::from)
+            .map(TurnInput::ResponseItem)
+            .collect::<Vec<_>>();
+        pending_input.push(TurnInput::UserInput {
+            content: input,
+            client_id: client_user_message_id,
+        });
+        self.input_queue
+            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                turn_state.as_ref(),
+                pending_input,
+            )
+            .await;
+        Ok(active_turn_context.sub_id.clone())
     }
 
     pub(crate) async fn record_memory_citation_for_turn(&self, sub_id: &str) {
@@ -4080,7 +4244,7 @@ impl Session {
 
     pub async fn interrupt_task(self: &Arc<Self>) {
         info!("interrupt received: abort current task, if any");
-        let had_active_turn = self.active_turn.lock().await.is_some();
+        let had_active_turn = self.active_turn.lock().await.is_active();
         self.abort_all_tasks(TurnAbortReason::Interrupted).await;
         if !had_active_turn {
             self.cancel_mcp_startup().await;

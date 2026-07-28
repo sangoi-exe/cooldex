@@ -8,8 +8,6 @@ use crate::session::turn::run_turn;
 use crate::session::turn_context::TurnContext;
 use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
 use crate::state::TaskKind;
-use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::TurnStartedEvent;
 use tracing::Instrument;
 use tracing::trace_span;
 
@@ -18,6 +16,7 @@ use super::SessionTask;
 use super::SessionTaskContext;
 use super::SessionTaskOutput;
 use super::SessionTaskResult;
+use super::emit_standard_turn_started;
 
 #[derive(Default)]
 pub(crate) struct RegularTask;
@@ -37,6 +36,14 @@ impl SessionTask for RegularTask {
         "session_task.turn"
     }
 
+    fn emit_turn_started(
+        &self,
+        session: Arc<SessionTaskContext>,
+        ctx: Arc<TurnContext>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        emit_standard_turn_started(session, ctx)
+    }
+
     async fn run(
         self: Arc<Self>,
         session: Arc<SessionTaskContext>,
@@ -47,17 +54,7 @@ impl SessionTask for RegularTask {
         let sess = session.clone_session();
         let turn_extension_data = session.turn_extension_data();
         let run_turn_span = trace_span!("run_turn");
-        // Regular turns emit `TurnStarted` inline so first-turn lifecycle does
-        // not wait on startup prewarm resolution.
         let prewarmed_client_session = async {
-            let event = EventMsg::TurnStarted(TurnStartedEvent {
-                turn_id: ctx.sub_id.clone(),
-                trace_id: ctx.trace_id.clone(),
-                started_at: ctx.turn_timing_state.started_at_unix_secs().await,
-                model_context_window: ctx.model_context_window(),
-                collaboration_mode_kind: ctx.mode,
-            });
-            sess.send_event(ctx.as_ref(), event).await;
             sess.set_server_reasoning_included(/*included*/ false).await;
             sess.consume_startup_prewarm_for_regular_turn(&cancellation_token)
                 .await

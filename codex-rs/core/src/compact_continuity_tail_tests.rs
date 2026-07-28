@@ -118,7 +118,7 @@ async fn public_entry_omits_unprovenanced_trailing_batch() {
     let mut history = vec![user.clone(), compaction.clone()];
     append_remote_v2_mid_turn_continuity_tail(
         &mut history,
-        &[user.clone(), call.clone(), output.clone()],
+        &[user.clone(), call, output],
         &turn_context,
     );
 

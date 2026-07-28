@@ -3,12 +3,11 @@ use super::session::Session;
 use super::turn_context::TurnContext;
 use crate::codex_thread::TryStartTurnIfIdleError;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
-use crate::state::ActiveTurn;
-use crate::state::TurnState;
-use crate::tasks::RegularTask;
+use crate::state::TurnStartClaim;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ResponseItem;
 use std::sync::Arc;
+use tracing::Instrument;
 
 impl Session {
     /// Returns the input if there is no active turn to inject into.
@@ -20,19 +19,20 @@ impl Session {
         &self,
         input: Vec<ResponseItem>,
     ) -> Result<(), Vec<ResponseItem>> {
-        let mut active = self.active_turn.lock().await;
-        match active.as_mut() {
-            Some(active_turn) => {
-                self.input_queue
-                    .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
-                        active_turn.turn_state.as_ref(),
-                        input.into_iter().map(TurnInput::ResponseItem).collect(),
-                    )
-                    .await;
-                Ok(())
-            }
-            None => Err(input),
+        let slot = self.active_turn.lock().await;
+        if slot.running_task().is_none() {
+            return Err(input);
         }
+        let Some(turn_state) = slot.turn_state() else {
+            return Err(input);
+        };
+        self.input_queue
+            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                turn_state.as_ref(),
+                input.into_iter().map(TurnInput::ResponseItem).collect(),
+            )
+            .await;
+        Ok(())
     }
 
     /// Starts a regular turn with the provided items only if automatic idle work
@@ -62,20 +62,50 @@ impl Session {
             ));
         }
 
-        let turn_state = {
-            let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
+        let sub_id = uuid::Uuid::new_v4().to_string();
+        let claim = {
+            let mut slot = self.active_turn.lock().await;
+            if !slot.is_idle() {
                 return Err(TryStartTurnIfIdleError::new(
                     TryStartTurnIfIdleRejectionReason::Busy,
                     input,
                 ));
             }
-            let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-            Arc::clone(&active_turn.turn_state)
+            slot.claim_start(sub_id.clone()).map_err(|_| {
+                TryStartTurnIfIdleError::new(TryStartTurnIfIdleRejectionReason::Busy, input.clone())
+            })?
         };
 
+        let failed_start_input = input.clone();
+        let session = Arc::clone(self);
+        let startup = tokio::spawn(
+            async move {
+                session
+                    .try_start_claimed_idle_turn(claim, sub_id, input)
+                    .await
+            }
+            .instrument(tracing::Span::current()),
+        );
+        match startup.await {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(%err, "idle turn startup task failed");
+                Err(TryStartTurnIfIdleError::new(
+                    TryStartTurnIfIdleRejectionReason::Busy,
+                    failed_start_input,
+                ))
+            }
+        }
+    }
+
+    async fn try_start_claimed_idle_turn(
+        self: &Arc<Self>,
+        claim: TurnStartClaim,
+        sub_id: String,
+        input: Vec<ResponseItem>,
+    ) -> Result<(), TryStartTurnIfIdleError> {
         if self.input_queue.has_trigger_turn_mailbox_items().await {
-            self.clear_reserved_idle_turn(&turn_state).await;
+            self.cancel_claimed_start(&claim).await;
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
@@ -83,11 +113,9 @@ impl Session {
             ));
         }
 
-        let turn_context = self
-            .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
-            .await;
+        let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
         if turn_context.mode == ModeKind::Plan {
-            self.clear_reserved_idle_turn(&turn_state).await;
+            self.cancel_claimed_start(&claim).await;
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PlanMode,
@@ -97,45 +125,39 @@ impl Session {
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
         if self.input_queue.has_trigger_turn_mailbox_items().await {
-            self.clear_reserved_idle_turn(&turn_state).await;
+            self.cancel_claimed_start(&claim).await;
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
                 input,
             ));
         }
-        let still_reserved = {
-            let active_turn = self.active_turn.lock().await;
-            active_turn.as_ref().is_some_and(|active_turn| {
-                active_turn.task.is_none() && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
-            })
-        };
-        if !still_reserved {
-            self.clear_reserved_idle_turn(&turn_state).await;
-            return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::Busy,
-                input,
-            ));
-        }
-
+        let failed_start_input = input.clone();
         self.input_queue
             .extend_pending_input_for_turn_state(
-                turn_state.as_ref(),
+                claim.turn_state.as_ref(),
                 input.into_iter().map(TurnInput::ResponseItem).collect(),
             )
             .await;
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
-            .await;
-        Ok(())
+        match self
+            .start_claimed_regular_task(claim, turn_context, Vec::new())
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                tracing::warn!(%err, "failed to install claimed idle turn");
+                Err(TryStartTurnIfIdleError::new(
+                    TryStartTurnIfIdleRejectionReason::Busy,
+                    failed_start_input,
+                ))
+            }
+        }
     }
 
-    async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {
-        let mut active_turn_guard = self.active_turn.lock().await;
-        if let Some(active_turn) = active_turn_guard.as_ref()
-            && active_turn.task.is_none()
-            && Arc::ptr_eq(&active_turn.turn_state, turn_state)
-        {
-            *active_turn_guard = None;
+    pub(crate) async fn cancel_claimed_start(&self, claim: &TurnStartClaim) {
+        let mut slot = self.active_turn.lock().await;
+        if let Err(err) = slot.cancel_start(claim) {
+            tracing::warn!(%err, "failed to cancel claimed turn startup");
         }
     }
 
