@@ -1,0 +1,58 @@
+name: Agent merge workspace exporter
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches:
+      - master-refactor-v2
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: master-refactor-v2
+
+      - name: Build verified Git bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --detach
+          git fetch --force origin \
+            '+refs/heads/main:refs/remotes/origin/main' \
+            '+refs/heads/master-refactor-v2:refs/remotes/origin/master-refactor-v2' \
+            '+refs/heads/agent/merge-main-into-master-refactor-v2-20260728:refs/remotes/origin/agent/merge-main-into-master-refactor-v2-20260728'
+          git update-ref refs/heads/main refs/remotes/origin/main
+          git update-ref refs/heads/master-refactor-v2 refs/remotes/origin/master-refactor-v2
+          git update-ref refs/heads/agent/merge-main-into-master-refactor-v2-20260728 refs/remotes/origin/agent/merge-main-into-master-refactor-v2-20260728
+          git bundle create cooldex.bundle \
+            refs/heads/main \
+            refs/heads/master-refactor-v2 \
+            refs/heads/agent/merge-main-into-master-refactor-v2-20260728
+          git bundle verify cooldex.bundle
+          {
+            printf 'main=%s\n' "$(git rev-parse refs/heads/main)"
+            printf 'master-refactor-v2=%s\n' "$(git rev-parse refs/heads/master-refactor-v2)"
+            printf 'integration=%s\n' "$(git rev-parse refs/heads/agent/merge-main-into-master-refactor-v2-20260728)"
+            printf 'merge-base=%s\n' "$(git merge-base refs/heads/main refs/heads/master-refactor-v2)"
+            sha256sum cooldex.bundle
+          } > merge-inputs.txt
+
+      - name: Upload merge workspace
+        uses: actions/upload-artifact@v4
+        with:
+          name: cooldex-merge-workspace
+          path: |
+            cooldex.bundle
+            merge-inputs.txt
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
