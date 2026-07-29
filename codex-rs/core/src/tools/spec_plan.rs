@@ -1,6 +1,7 @@
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::session::McpRuntimeSnapshot;
 use crate::session::turn_context::TurnContext;
 use crate::tools::code_mode::default_exec_yield_time_override_ms;
 use crate::tools::code_mode::execute_spec::create_code_mode_tool;
@@ -48,7 +49,6 @@ use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHand
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
-use crate::tools::handlers::tool_search_spec::ToolSearchSourceListing;
 use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
 use crate::tools::hosted_spec::WebSearchToolOptions;
 use crate::tools::hosted_spec::create_web_search_tool;
@@ -143,11 +143,10 @@ impl PlannedTools {
 struct CoreToolPlanContext<'a> {
     turn_context: &'a TurnContext,
     environments: &'a TurnEnvironmentSnapshot,
-    mcp: &'a codex_mcp::McpBinding,
+    mcp: &'a McpRuntimeSnapshot,
     tool_runtimes: &'a [PlannedRuntime],
     tool_suggest_candidates: Option<&'a crate::tools::router::ToolSuggestCandidates>,
     extension_tool_executors: &'a [Arc<dyn ToolExecutor<ExtensionToolCall>>],
-    wait_for_environment_tool_config: Option<&'a Arc<crate::WaitForEnvironmentToolConfig>>,
     dynamic_tools: &'a [DynamicToolSpec],
     tool_search_handler_cache: &'a ToolSearchHandlerCache,
     default_agent_type_description: &'a str,
@@ -158,7 +157,7 @@ struct CoreToolPlanContext<'a> {
 pub(crate) fn build_tool_router(
     turn_context: &TurnContext,
     environments: &TurnEnvironmentSnapshot,
-    mcp: &codex_mcp::McpBinding,
+    mcp: &McpRuntimeSnapshot,
     params: ToolRouterParams<'_>,
     tool_search_handler_cache: &ToolSearchHandlerCache,
 ) -> ToolRouter {
@@ -176,7 +175,7 @@ pub(crate) fn build_tool_router(
 fn build_tool_specs_and_registry(
     turn_context: &TurnContext,
     environments: &TurnEnvironmentSnapshot,
-    mcp: &codex_mcp::McpBinding,
+    mcp: &McpRuntimeSnapshot,
     params: ToolRouterParams<'_>,
     tool_search_handler_cache: &ToolSearchHandlerCache,
 ) -> (Vec<ToolSpec>, ToolRegistry) {
@@ -184,7 +183,6 @@ fn build_tool_specs_and_registry(
         tool_runtimes,
         tool_suggest_candidates,
         extension_tool_executors,
-        wait_for_environment_tool_config,
         dynamic_tools,
     } = params;
     let default_agent_type_description =
@@ -196,7 +194,6 @@ fn build_tool_specs_and_registry(
         tool_runtimes: &tool_runtimes,
         tool_suggest_candidates: tool_suggest_candidates.as_ref(),
         extension_tool_executors: &extension_tool_executors,
-        wait_for_environment_tool_config: wait_for_environment_tool_config.as_ref(),
         dynamic_tools,
         tool_search_handler_cache,
         default_agent_type_description: &default_agent_type_description,
@@ -493,22 +490,6 @@ fn build_code_mode_executors(
         code_mode_nested_tool_specs.push(spec);
     }
 
-    if turn_context.model_info.use_responses_lite {
-        let code_mode_tool_names =
-            collect_code_mode_exec_prompt_tool_definitions(code_mode_nested_tool_specs.iter())
-                .into_iter()
-                .map(|tool| {
-                    (
-                        codex_code_mode::normalize_code_mode_identifier(&tool.name),
-                        tool.tool_name,
-                    )
-                })
-                .collect();
-        turn_context
-            .turn_metadata_state
-            .set_code_mode_tool_names(code_mode_tool_names);
-    }
-
     let namespace_descriptions = code_mode_namespace_descriptions(&exec_prompt_tool_specs);
     let mut enabled_tools =
         collect_code_mode_exec_prompt_tool_definitions(exec_prompt_tool_specs.iter());
@@ -720,7 +701,7 @@ fn unified_exec_should_include_shell_parameter(
 
 #[instrument(level = "trace", skip_all)]
 fn add_mcp_resource_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
-    if context.mcp.has_servers() {
+    if context.mcp.manager().has_servers() {
         planned_tools.add(ListMcpResourcesHandler);
         planned_tools.add(ListMcpResourceTemplatesHandler);
         planned_tools.add(ReadMcpResourceHandler);
@@ -733,20 +714,10 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.environments);
 
-    if turn_context.config.update_plan_enabled {
-        planned_tools.add(PlanHandler);
-    }
+    planned_tools.add(PlanHandler);
 
     if features.enabled(Feature::DeferredExecutor) {
-        planned_tools.add(
-            context
-                .wait_for_environment_tool_config
-                .map(Arc::as_ref)
-                .map_or_else(
-                    WaitForEnvironmentHandler::default,
-                    WaitForEnvironmentHandler::new,
-                ),
-        );
+        planned_tools.add(WaitForEnvironmentHandler);
     }
 
     if turn_context.config.experimental_request_user_input_enabled {
@@ -864,15 +835,13 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                 multi_agent_v2_handler(FollowupTaskHandlerV2, tool_namespace),
                 exposure,
             ));
-            if turn_context.config.multi_agent_v2.wait_agent_enabled {
-                planned_tools.add_arc(override_tool_exposure(
-                    multi_agent_v2_handler(
-                        WaitAgentHandlerV2::new(context.wait_agent_timeouts),
-                        tool_namespace,
-                    ),
-                    exposure,
-                ));
-            }
+            planned_tools.add_arc(override_tool_exposure(
+                multi_agent_v2_handler(
+                    WaitAgentHandlerV2::new(context.wait_agent_timeouts),
+                    tool_namespace,
+                ),
+                exposure,
+            ));
             planned_tools.add_arc(override_tool_exposure(
                 multi_agent_v2_handler(InterruptAgentHandler, tool_namespace),
                 exposure,
@@ -978,18 +947,7 @@ fn append_tool_search_executor(
         return;
     }
 
-    let source_listing = if turn_context
-        .config
-        .features
-        .enabled(Feature::DeferredToolWorldState)
-    {
-        ToolSearchSourceListing::Omit
-    } else {
-        ToolSearchSourceListing::Include
-    };
-    let handler: PlannedRuntime = context
-        .tool_search_handler_cache
-        .get_or_build(search_infos, source_listing);
+    let handler: PlannedRuntime = context.tool_search_handler_cache.get_or_build(search_infos);
     planned_tools.add_arc(handler);
 }
 
