@@ -30,6 +30,50 @@ jobs:
     uses: ./.github/workflows/codespell.yml
     secrets: inherit
 
+  connector-checkout-export:
+    name: Connector checkout export
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.ref == 'agent/connector-checkout-bootstrap-20260729'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Materialize requested refs and bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force origin \
+            '+refs/heads/main:refs/remotes/origin/main' \
+            '+refs/heads/master-refactor-v2:refs/remotes/origin/master-refactor-v2'
+          git branch --force main refs/remotes/origin/main
+          git branch --force master-refactor-v2 refs/remotes/origin/master-refactor-v2
+          git bundle create cooldex.bundle main master-refactor-v2
+          git bundle verify cooldex.bundle
+          {
+            printf 'main=%s\n' "$(git rev-parse main)"
+            printf 'master-refactor-v2=%s\n' "$(git rev-parse master-refactor-v2)"
+            printf 'merge-base=%s\n' "$(git merge-base main master-refactor-v2)"
+            sha256sum cooldex.bundle
+          } > merge-inputs.txt
+
+      - name: Upload checkout bundle
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: cooldex-connector-checkout
+          path: |
+            cooldex.bundle
+            merge-inputs.txt
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
   repo-checks:
     name: repo-checks
     uses: ./.github/workflows/repo-checks.yml
