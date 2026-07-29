@@ -1,0 +1,51 @@
+name: Connector checkout bootstrap
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches:
+      - master-refactor-v2
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    if: github.event.pull_request.head.ref == 'agent/connector-checkout-bootstrap-20260729'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Materialize requested refs and bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force origin \
+            '+refs/heads/main:refs/remotes/origin/main' \
+            '+refs/heads/master-refactor-v2:refs/remotes/origin/master-refactor-v2'
+          git branch --force main refs/remotes/origin/main
+          git branch --force master-refactor-v2 refs/remotes/origin/master-refactor-v2
+          git bundle create cooldex.bundle main master-refactor-v2
+          git bundle verify cooldex.bundle
+          {
+            printf 'main=%s\n' "$(git rev-parse main)"
+            printf 'master-refactor-v2=%s\n' "$(git rev-parse master-refactor-v2)"
+            printf 'merge-base=%s\n' "$(git merge-base main master-refactor-v2)"
+            sha256sum cooldex.bundle
+          } > merge-inputs.txt
+
+      - name: Upload checkout bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: cooldex-connector-checkout
+          path: |
+            cooldex.bundle
+            merge-inputs.txt
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
