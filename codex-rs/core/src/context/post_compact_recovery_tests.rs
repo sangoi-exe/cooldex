@@ -34,9 +34,22 @@ fn post_compact_recovery_keeps_history_out_of_developer_authority() {
     let boundary_rendered = context.render();
     let recall_context = context.recall().expect("separate recall context");
     let recall_rendered = recall_context.render();
+    let recall_item = Box::new(recall_context.clone()).into_boxed_response_item();
 
     assert_eq!(context.role(), "developer");
-    assert_eq!(recall_context.role(), "user");
+    assert_eq!(recall_context.role(), "assistant");
+    assert_eq!(
+        recall_item,
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: recall_rendered.clone(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    );
     assert_eq!(
         boundary_rendered.matches("<post_compact_recovery>").count(),
         1

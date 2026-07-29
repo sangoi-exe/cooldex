@@ -37,11 +37,11 @@ impl PreparedPostCompactRecovery {
                 matches!(
                     item,
                     ResponseItem::Message { role, content, .. }
-                        if role == "user"
+                        if role == "assistant"
                             && content.iter().any(|content| {
                                 matches!(
                                     content,
-                                    codex_protocol::models::ContentItem::InputText { text }
+                                    codex_protocol::models::ContentItem::OutputText { text }
                                         if PostCompactRecallContext::matches_text(text)
                                 )
                             })

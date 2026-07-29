@@ -1,3 +1,6 @@
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_token_count;
 use serde::Serialize;
 use serde_json::Value;
@@ -107,6 +110,12 @@ impl PostCompactRecallContext {
             body: format!("\n{}\n", escape_historical_delimiters(&json)),
         })
     }
+
+    fn output_content(&self) -> Vec<ContentItem> {
+        vec![ContentItem::OutputText {
+            text: self.render(),
+        }]
+    }
 }
 
 impl ContextualUserFragment for PostCompactRecoveryContext {
@@ -129,7 +138,7 @@ impl ContextualUserFragment for PostCompactRecoveryContext {
 
 impl ContextualUserFragment for PostCompactRecallContext {
     fn role(&self) -> &'static str {
-        "user"
+        "assistant"
     }
 
     fn markers(&self) -> (&'static str, &'static str) {
@@ -142,6 +151,40 @@ impl ContextualUserFragment for PostCompactRecallContext {
 
     fn body(&self) -> String {
         self.body.clone()
+    }
+
+    fn into(self) -> ResponseItem
+    where
+        Self: Sized,
+    {
+        ResponseItem::Message {
+            id: None,
+            role: self.role().to_string(),
+            content: self.output_content(),
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn into_boxed_response_item(self: Box<Self>) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: self.role().to_string(),
+            content: self.output_content(),
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn into_response_input_item(self) -> ResponseInputItem
+    where
+        Self: Sized,
+    {
+        ResponseInputItem::Message {
+            role: self.role().to_string(),
+            content: self.output_content(),
+            phase: None,
+        }
     }
 }
 

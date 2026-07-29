@@ -67,6 +67,7 @@ fn read_rollout_items(path: &Path) -> Vec<RolloutItem> {
 fn matching_recovery_fragments(
     request: &ResponsesRequest,
     expected_role: &str,
+    expected_content_type: &str,
     marker: &str,
 ) -> Vec<RecoveryFragment> {
     request
@@ -75,13 +76,14 @@ fn matching_recovery_fragments(
         .enumerate()
         .filter_map(|(index, item)| {
             let id = item.get("id").and_then(serde_json::Value::as_str)?;
-            let text = item
+            let content = item
                 .get("content")
                 .and_then(serde_json::Value::as_array)
-                .and_then(|content| content.first())
-                .and_then(|content| content.get("text"))
-                .and_then(serde_json::Value::as_str)?;
+                .and_then(|content| content.first())?;
+            let text = content.get("text").and_then(serde_json::Value::as_str)?;
             (item.get("role").and_then(serde_json::Value::as_str) == Some(expected_role)
+                && content.get("type").and_then(serde_json::Value::as_str)
+                    == Some(expected_content_type)
                 && text.starts_with(marker))
             .then(|| (index, (id.to_string(), text.to_string())))
         })
@@ -91,25 +93,50 @@ fn matching_recovery_fragments(
 fn recovery_fragment(
     request: &ResponsesRequest,
     expected_role: &str,
+    expected_content_type: &str,
     marker: &str,
 ) -> RecoveryFragment {
-    let matches = matching_recovery_fragments(request, expected_role, marker);
+    let matches =
+        matching_recovery_fragments(request, expected_role, expected_content_type, marker);
     assert_eq!(
         matches.len(),
         1,
-        "request should contain exactly one {expected_role} item starting with {marker}"
+        "request should contain exactly one {expected_role}/{expected_content_type} item starting with {marker}"
     );
     matches.into_iter().next().expect("one recovery fragment")
 }
 
 fn recovery_fragments(request: &ResponsesRequest) -> (RecoveryFragment, Option<RecoveryFragment>) {
-    let mut recall = matching_recovery_fragments(request, "user", "<post_compact_recall>");
+    let mut recall =
+        matching_recovery_fragments(request, "assistant", "output_text", "<post_compact_recall>");
+    let recall_carrier_count = request
+        .input()
+        .iter()
+        .filter(|item| {
+            item.get("content")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|content| content.first())
+                .and_then(|content| content.get("text"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.starts_with("<post_compact_recall>"))
+        })
+        .count();
+    assert_eq!(
+        recall.len(),
+        recall_carrier_count,
+        "every post-compact recall carrier must use assistant/output_text"
+    );
     assert!(
         recall.len() <= 1,
         "request should contain at most one post-compact recall item"
     );
     (
-        recovery_fragment(request, "developer", "<post_compact_recovery>"),
+        recovery_fragment(
+            request,
+            "developer",
+            "input_text",
+            "<post_compact_recovery>",
+        ),
         recall.pop(),
     )
 }

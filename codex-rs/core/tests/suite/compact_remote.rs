@@ -4000,9 +4000,26 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
         .position(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
         .expect("compaction checkpoint");
     let recall_index = post_compact_input.iter().position(|item| {
-        item.get("role").and_then(Value::as_str) == Some("user")
-            && item_text(item).is_some_and(|text| text.starts_with("<post_compact_recall>"))
+        item_text(item).is_some_and(|text| text.starts_with("<post_compact_recall>"))
     });
+    if let Some(recall_index) = recall_index {
+        let recall = &post_compact_input[recall_index];
+        assert_eq!(
+            recall.get("role").and_then(Value::as_str),
+            Some("assistant"),
+            "post-compact recall must not create a new user-authority item"
+        );
+        assert_eq!(
+            recall
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|content| content.first())
+                .and_then(|content| content.get("type"))
+                .and_then(Value::as_str),
+            Some("output_text"),
+            "assistant recall must use native assistant message content"
+        );
+    }
     let recovery_index = post_compact_input
         .iter()
         .position(|item| {
@@ -4186,11 +4203,9 @@ async fn remote_mid_turn_compact_v2_keeps_three_successive_recoveries_structural
             .rposition(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
             .expect("latest compaction checkpoint");
         let recall = input.iter().enumerate().find_map(|(index, item)| {
-            (item.get("role").and_then(Value::as_str) == Some("user"))
-                .then(|| item_text(item))
-                .flatten()
+            item_text(item)
                 .filter(|text| text.starts_with("<post_compact_recall>"))
-                .map(|text| (index, text))
+                .map(|text| (index, item, text))
         });
         let recovery_index = input
             .iter()
@@ -4216,8 +4231,23 @@ async fn remote_mid_turn_compact_v2_keeps_three_successive_recoveries_structural
             .expect("native continuity tool output");
 
         assert!(retained_user_index < compaction_index);
-        if let Some((recall_index, recall_text)) = recall {
+        if let Some((recall_index, recall_item, recall_text)) = recall {
             assert!(compaction_index < recall_index && recall_index < recovery_index);
+            assert_eq!(
+                recall_item.get("role").and_then(Value::as_str),
+                Some("assistant"),
+                "request {request_index} must carry recall as assistant history"
+            );
+            assert_eq!(
+                recall_item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .and_then(|content| content.first())
+                    .and_then(|content| content.get("type"))
+                    .and_then(Value::as_str),
+                Some("output_text"),
+                "request {request_index} must use native assistant message content"
+            );
             assert!(
                 !recall_text.contains(RETAINED_USER),
                 "request {request_index} repeated the natively retained user inside recall"
