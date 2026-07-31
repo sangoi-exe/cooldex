@@ -7,9 +7,11 @@ use std::sync::Arc;
 use codex_api::ApiError;
 use codex_api::Provider;
 use codex_api::SharedAuthProvider;
+use codex_cursor_agent_service::CursorAgentServiceBackend;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::WireApi;
 use codex_models_manager::manager::OpenAiModelsManager;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_models_manager::manager::StaticModelsManager;
@@ -23,6 +25,7 @@ use crate::auth::ResolvedProviderAuth;
 use crate::auth::auth_manager_for_provider;
 use crate::auth::resolve_provider_auth;
 use crate::auth::resolve_provider_auth_for_scope;
+use crate::cursor_agent_service::CursorAgentServiceModelProvider;
 use crate::models_endpoint::OpenAiModelsEndpoint;
 
 /// Optional provider-backed features that Codex may expose at runtime.
@@ -133,6 +136,11 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
         false
     }
 
+    /// Returns the dedicated Cursor AgentService backend, when this provider owns one.
+    fn cursor_agent_service_backend(&self) -> Option<Arc<CursorAgentServiceBackend>> {
+        None
+    }
+
     /// Returns the provider-scoped auth manager, when this provider uses one.
     ///
     /// TODO(celia-oai): Make auth manager access internal to this crate so callers
@@ -233,7 +241,9 @@ pub fn create_model_provider(
     provider_info: ModelProviderInfo,
     auth_manager: Option<Arc<AuthManager>>,
 ) -> SharedModelProvider {
-    if provider_info.is_amazon_bedrock() {
+    if provider_info.wire_api == WireApi::CursorAgentService {
+        Arc::new(CursorAgentServiceModelProvider::new(provider_info))
+    } else if provider_info.is_amazon_bedrock() {
         Arc::new(AmazonBedrockModelProvider::new(provider_info, auth_manager))
     } else {
         Arc::new(ConfiguredModelProvider::new(provider_info, auth_manager))
@@ -431,6 +441,7 @@ mod tests {
             experimental_bearer_token: None,
             auth: None,
             aws: None,
+            cursor_agent_service: None,
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: None,

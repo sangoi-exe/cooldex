@@ -19,6 +19,7 @@ base_url = "http://localhost:11434/v1"
         experimental_bearer_token: None,
         auth: None,
         aws: None,
+        cursor_agent_service: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -52,6 +53,7 @@ query_params = { api-version = "2025-04-01-preview" }
         experimental_bearer_token: None,
         auth: None,
         aws: None,
+        cursor_agent_service: None,
         wire_api: WireApi::Responses,
         query_params: Some(maplit::hashmap! {
             "api-version".to_string() => "2025-04-01-preview".to_string(),
@@ -89,6 +91,7 @@ supports_standalone_web_search = true
         experimental_bearer_token: None,
         auth: None,
         aws: None,
+        cursor_agent_service: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: Some(maplit::hashmap! {
@@ -171,6 +174,7 @@ fn test_supports_remote_compaction_for_azure_name() {
         experimental_bearer_token: None,
         auth: None,
         aws: None,
+        cursor_agent_service: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -197,6 +201,7 @@ fn test_supports_remote_compaction_for_non_openai_non_azure_provider() {
         experimental_bearer_token: None,
         auth: None,
         aws: None,
+        cursor_agent_service: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -303,6 +308,7 @@ fn test_create_amazon_bedrock_provider() {
                 profile: None,
                 region: None,
             }),
+            cursor_agent_service: None,
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: Some(maplit::hashmap! {
@@ -380,6 +386,25 @@ fn test_merge_configured_model_providers_adds_custom_provider() {
             configured_model_providers,
         ),
         Ok(expected)
+    );
+}
+
+#[test]
+fn test_merge_configured_model_providers_rejects_invalid_cursor_provider() {
+    let mut cursor_provider = cursor_agent_service_provider();
+    cursor_provider.env_key = Some("CURSOR_TOKEN".to_string());
+    let configured_model_providers =
+        std::collections::HashMap::from([("cursor-corporate".to_string(), cursor_provider)]);
+
+    assert_eq!(
+        merge_configured_model_providers(
+            built_in_model_providers(/*openai_base_url*/ None),
+            configured_model_providers,
+        ),
+        Err(
+            "model_providers.cursor-corporate: provider cursor_agent_service cannot be combined with env_key"
+                .to_string()
+        )
     );
 }
 
@@ -561,4 +586,306 @@ refresh_interval_ms = 0
     let auth = provider.auth.expect("auth config should deserialize");
     assert_eq!(auth.refresh_interval_ms, 0);
     assert_eq!(auth.refresh_interval(), None);
+}
+
+#[test]
+fn deserialize_cursor_agent_service_provider_requires_the_nested_contract() {
+    let provider_toml = r#"
+name = "Cursor Corporate"
+wire_api = "cursor_agent_service"
+requires_openai_auth = false
+
+[cursor_agent_service]
+expected_user_id = 390777501
+expected_team_id = 12565657
+expected_service_origin = "https://agentn.global.api5.cursor.sh"
+context_window_tokens = 65536
+effective_context_window_percent = 75
+max_pending_tool_actions = 8
+        "#;
+
+    let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
+
+    assert_eq!(provider, cursor_agent_service_provider());
+    assert_eq!(provider.validate(), Ok(()));
+    assert_eq!(provider.request_max_retries(), 0);
+    assert_eq!(provider.stream_max_retries(), 0);
+    let explicit_zero_retries = ModelProviderInfo {
+        request_max_retries: Some(0),
+        stream_max_retries: Some(0),
+        ..provider.clone()
+    };
+    assert_eq!(explicit_zero_retries.validate(), Ok(()));
+    assert!(
+        toml::to_string(&provider)
+            .unwrap()
+            .contains("wire_api = \"cursor_agent_service\"")
+    );
+}
+
+#[test]
+fn cursor_agent_service_provider_rejects_each_generic_provider_surface() {
+    let provider = cursor_agent_service_provider();
+    let conflicting_providers = vec![
+        (
+            "base_url",
+            ModelProviderInfo {
+                base_url: Some("https://example.com".to_string()),
+                ..provider.clone()
+            },
+        ),
+        (
+            "env_key",
+            ModelProviderInfo {
+                env_key: Some("CURSOR_TOKEN".to_string()),
+                ..provider.clone()
+            },
+        ),
+        (
+            "env_key_instructions",
+            ModelProviderInfo {
+                env_key_instructions: Some("export a token".to_string()),
+                ..provider.clone()
+            },
+        ),
+        (
+            "experimental_bearer_token",
+            ModelProviderInfo {
+                experimental_bearer_token: Some("secret".to_string()),
+                ..provider.clone()
+            },
+        ),
+        (
+            "auth",
+            ModelProviderInfo {
+                auth: Some(provider_auth_for_test()),
+                ..provider.clone()
+            },
+        ),
+        (
+            "aws",
+            ModelProviderInfo {
+                aws: Some(ModelProviderAwsAuthInfo {
+                    profile: None,
+                    region: None,
+                }),
+                ..provider.clone()
+            },
+        ),
+        (
+            "query_params",
+            ModelProviderInfo {
+                query_params: Some(HashMap::from([("trace".to_string(), "1".to_string())])),
+                ..provider.clone()
+            },
+        ),
+        (
+            "http_headers",
+            ModelProviderInfo {
+                http_headers: Some(HashMap::from([(
+                    "authorization".to_string(),
+                    "Bearer secret".to_string(),
+                )])),
+                ..provider.clone()
+            },
+        ),
+        (
+            "env_http_headers",
+            ModelProviderInfo {
+                env_http_headers: Some(HashMap::from([(
+                    "authorization".to_string(),
+                    "CURSOR_TOKEN".to_string(),
+                )])),
+                ..provider.clone()
+            },
+        ),
+        (
+            "requires_openai_auth",
+            ModelProviderInfo {
+                requires_openai_auth: true,
+                ..provider.clone()
+            },
+        ),
+        (
+            "supports_websockets",
+            ModelProviderInfo {
+                supports_websockets: true,
+                ..provider.clone()
+            },
+        ),
+        (
+            "supports_standalone_web_search",
+            ModelProviderInfo {
+                supports_standalone_web_search: true,
+                ..provider.clone()
+            },
+        ),
+        (
+            "request_max_retries",
+            ModelProviderInfo {
+                request_max_retries: Some(1),
+                ..provider.clone()
+            },
+        ),
+        (
+            "stream_max_retries",
+            ModelProviderInfo {
+                stream_max_retries: Some(1),
+                ..provider
+            },
+        ),
+    ];
+
+    assert_eq!(conflicting_providers.len(), 14);
+    for (field, conflicting_provider) in conflicting_providers {
+        assert_eq!(
+            conflicting_provider.validate(),
+            Err(format!(
+                "provider cursor_agent_service cannot be combined with {field}"
+            ))
+        );
+    }
+}
+
+#[test]
+fn cursor_agent_service_provider_rejects_missing_or_mismatched_nested_config() {
+    let missing = ModelProviderInfo {
+        name: "Cursor Corporate".to_string(),
+        wire_api: WireApi::CursorAgentService,
+        ..ModelProviderInfo::default()
+    };
+    assert_eq!(
+        missing.validate(),
+        Err(
+            "wire_api cursor_agent_service requires cursor_agent_service configuration".to_string()
+        )
+    );
+
+    let mismatched = ModelProviderInfo {
+        cursor_agent_service: cursor_agent_service_provider().cursor_agent_service,
+        ..ModelProviderInfo::default()
+    };
+    assert_eq!(
+        mismatched.validate(),
+        Err(
+            "cursor_agent_service configuration requires wire_api cursor_agent_service".to_string()
+        )
+    );
+}
+
+#[test]
+fn cursor_agent_service_provider_rejects_invalid_nested_values() {
+    let provider = cursor_agent_service_provider();
+    let config = provider.cursor_agent_service.clone().unwrap();
+    let invalid_configs = vec![
+        (
+            "expected_user_id must be greater than zero",
+            CursorAgentServiceProviderInfo {
+                expected_user_id: 0,
+                ..config.clone()
+            },
+        ),
+        (
+            "expected_team_id must be greater than zero",
+            CursorAgentServiceProviderInfo {
+                expected_team_id: 0,
+                ..config.clone()
+            },
+        ),
+        (
+            "expected_service_origin must be an exact HTTPS origin",
+            CursorAgentServiceProviderInfo {
+                expected_service_origin: "http://agentn.global.api5.cursor.sh".to_string(),
+                ..config.clone()
+            },
+        ),
+        (
+            "expected_service_origin must be an exact HTTPS origin",
+            CursorAgentServiceProviderInfo {
+                expected_service_origin: "https://agentn.global.api5.cursor.sh/path".to_string(),
+                ..config.clone()
+            },
+        ),
+        (
+            "context_window_tokens must be greater than zero",
+            CursorAgentServiceProviderInfo {
+                context_window_tokens: 0,
+                ..config.clone()
+            },
+        ),
+        (
+            "context_window_tokens must be at most 65536",
+            CursorAgentServiceProviderInfo {
+                context_window_tokens: 65_537,
+                ..config.clone()
+            },
+        ),
+        (
+            "effective_context_window_percent must be between 1 and 75",
+            CursorAgentServiceProviderInfo {
+                effective_context_window_percent: 0,
+                ..config.clone()
+            },
+        ),
+        (
+            "effective_context_window_percent must be between 1 and 75",
+            CursorAgentServiceProviderInfo {
+                effective_context_window_percent: 76,
+                ..config.clone()
+            },
+        ),
+        (
+            "max_pending_tool_actions must be greater than zero",
+            CursorAgentServiceProviderInfo {
+                max_pending_tool_actions: 0,
+                ..config.clone()
+            },
+        ),
+        (
+            "max_pending_tool_actions must be at most 8",
+            CursorAgentServiceProviderInfo {
+                max_pending_tool_actions: 9,
+                ..config
+            },
+        ),
+    ];
+
+    assert_eq!(invalid_configs.len(), 10);
+    for (expected_error, cursor_agent_service) in invalid_configs {
+        let invalid_provider = ModelProviderInfo {
+            cursor_agent_service: Some(cursor_agent_service),
+            ..provider.clone()
+        };
+        assert_eq!(
+            invalid_provider.validate(),
+            Err(format!("cursor_agent_service.{expected_error}"))
+        );
+    }
+}
+
+#[test]
+fn cursor_agent_service_provider_does_not_build_an_openai_api_provider() {
+    assert_eq!(
+        cursor_agent_service_provider()
+            .to_api_provider(/*auth_mode*/ None)
+            .unwrap_err()
+            .to_string(),
+        "cursor_agent_service providers do not use the OpenAI-compatible API client"
+    );
+}
+
+fn cursor_agent_service_provider() -> ModelProviderInfo {
+    ModelProviderInfo {
+        name: "Cursor Corporate".to_string(),
+        wire_api: WireApi::CursorAgentService,
+        cursor_agent_service: Some(CursorAgentServiceProviderInfo {
+            expected_user_id: 390777501,
+            expected_team_id: 12565657,
+            expected_service_origin: "https://agentn.global.api5.cursor.sh".to_string(),
+            context_window_tokens: 65_536,
+            effective_context_window_percent: 75,
+            max_pending_tool_actions: 8,
+        }),
+        ..ModelProviderInfo::default()
+    }
 }

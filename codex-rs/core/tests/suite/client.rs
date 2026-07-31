@@ -1440,6 +1440,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
         experimental_bearer_token: None,
         auth: Some(auth),
         aws: None,
+        cursor_agent_service: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -3177,6 +3178,7 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
         experimental_bearer_token: None,
         auth: None,
         aws: None,
+        cursor_agent_service: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -3828,6 +3830,7 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
         experimental_bearer_token: None,
         auth: None,
         aws: None,
+        cursor_agent_service: None,
         query_params: Some(std::collections::HashMap::from([(
             "api-version".to_string(),
             "2025-04-01-preview".to_string(),
@@ -3923,6 +3926,7 @@ async fn env_var_overrides_loaded_auth() {
         experimental_bearer_token: None,
         auth: None,
         aws: None,
+        cursor_agent_service: None,
         wire_api: WireApi::Responses,
         http_headers: Some(std::collections::HashMap::from([(
             "Custom-Header".to_string(),

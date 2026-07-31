@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 #[path = "support/fake_peer.rs"]
 mod fake_peer;
 

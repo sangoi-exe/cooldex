@@ -904,6 +904,47 @@
       ],
       "type": "string"
     },
+    "CursorAgentServiceProviderInfo": {
+      "additionalProperties": false,
+      "description": "Configuration for the fork-owned Cursor AgentService provider.",
+      "properties": {
+        "context_window_tokens": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "effective_context_window_percent": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "expected_service_origin": {
+          "type": "string"
+        },
+        "expected_team_id": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "expected_user_id": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_pending_tool_actions": {
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "context_window_tokens",
+        "effective_context_window_percent",
+        "expected_service_origin",
+        "expected_team_id",
+        "expected_user_id",
+        "max_pending_tool_actions"
+      ],
+      "type": "object"
+    },
     "DebugConfigLockToml": {
       "additionalProperties": false,
       "properties": {
@@ -1693,6 +1734,14 @@
         "base_url": {
           "description": "Base URL for the provider's OpenAI-compatible API.",
           "type": "string"
+        },
+        "cursor_agent_service": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CursorAgentServiceProviderInfo"
+            }
+          ],
+          "description": "Cursor AgentService-specific configuration."
         },
         "env_http_headers": {
           "additionalProperties": {
@@ -4757,6 +4806,13 @@
           "description": "The Responses API exposed by OpenAI at `/v1/responses`.",
           "enum": [
             "responses"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Cursor's private bidirectional `AgentService.Run` protocol.",
+          "enum": [
+            "cursor_agent_service"
           ],
           "type": "string"
         }

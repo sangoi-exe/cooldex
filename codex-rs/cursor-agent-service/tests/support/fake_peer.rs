@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use codex_cursor_agent_service::proto::AgentClientMessage;
 use codex_cursor_agent_service::proto::AgentServerMessage;
 use codex_cursor_agent_service::proto::agent_service_server::AgentService;

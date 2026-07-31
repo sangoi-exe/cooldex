@@ -2859,12 +2859,18 @@ dependencies = [
 name = "codex-cursor-agent-service"
 version = "0.0.0"
 dependencies = [
+ "codex-models-manager",
+ "codex-protocol",
  "http 1.4.0",
+ "libc",
  "pretty_assertions",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -2872,6 +2878,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "zeroize",
 ]
 
 [[package]]
@@ -3583,6 +3590,7 @@ dependencies = [
  "codex-agent-identity",
  "codex-api",
  "codex-aws-auth",
+ "codex-cursor-agent-service",
  "codex-feedback",
  "codex-http-client",
  "codex-login",
@@ -15605,6 +15613,7 @@ version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 

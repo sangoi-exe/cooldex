@@ -1841,6 +1841,10 @@ impl ModelClientSession {
                 )
                 .await
             }
+            WireApi::CursorAgentService => Err(CodexErr::UnsupportedOperation(
+                "Cursor AgentService sampling is not integrated into the core stream yet"
+                    .to_string(),
+            )),
         }
     }
 
