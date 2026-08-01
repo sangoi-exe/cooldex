@@ -606,10 +606,7 @@ mod tests {
                 .expect("response stream test channel should have capacity");
         }
         drop(tx_event);
-        ResponseStream {
-            rx_event,
-            consumer_dropped: CancellationToken::new(),
-        }
+        ResponseStream::next_sampling_request(rx_event, CancellationToken::new())
     }
 
     #[test]

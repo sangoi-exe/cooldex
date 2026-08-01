@@ -1,3 +1,6 @@
+use crate::CursorCredentials;
+use crate::CursorRequestAuthError;
+use crate::auth::CursorRequestKind;
 use crate::proto::AgentClientMessage;
 use crate::proto::AgentRunRequest;
 use crate::proto::AgentServerMessage;
@@ -14,8 +17,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tonic::Request;
 use tonic::Streaming;
+use tonic::Code;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 
@@ -28,8 +31,10 @@ pub enum AgentServiceTransportError {
     InvalidOrigin(String),
     #[error("failed to connect to Cursor AgentService: {0}")]
     Connect(String),
-    #[error("Cursor AgentService Run failed: {0}")]
-    Rpc(String),
+    #[error(transparent)]
+    RequestAuth(#[from] CursorRequestAuthError),
+    #[error("Cursor AgentService Run failed with gRPC status {0:?}")]
+    Rpc(Code),
     #[error("Cursor AgentService closed the client side of Run")]
     OutboundClosed,
     #[error("Cursor AgentService ended the stream before turnEnded")]
@@ -72,6 +77,7 @@ impl AgentServiceTransport {
     pub async fn start_run(
         &mut self,
         run_request: AgentRunRequest,
+        credentials: &CursorCredentials,
     ) -> Result<AgentServiceRun, AgentServiceTransportError> {
         let (outbound, outbound_rx) = mpsc::channel(OUTBOUND_MESSAGE_CAPACITY);
         outbound
@@ -81,11 +87,15 @@ impl AgentServiceTransport {
             .await
             .map_err(|_| AgentServiceTransportError::OutboundClosed)?;
 
+        let request = credentials.authenticated_request(
+            ReceiverStream::new(outbound_rx),
+            CursorRequestKind::AgentRun,
+        )?;
         let response = self
             .client
-            .run(Request::new(ReceiverStream::new(outbound_rx)))
+            .run(request)
             .await
-            .map_err(|status| AgentServiceTransportError::Rpc(status.to_string()))?;
+            .map_err(|status| AgentServiceTransportError::Rpc(status.code()))?;
         let heartbeat_cancel = CancellationToken::new();
         let heartbeat_task = spawn_heartbeat(outbound.clone(), heartbeat_cancel.clone());
 
@@ -134,7 +144,7 @@ impl AgentServiceRun {
             Ok(Some(message)) => message,
             Ok(None) => return self.fail(AgentServiceTransportError::UnexpectedEof),
             Err(status) => {
-                return self.fail(AgentServiceTransportError::Rpc(status.to_string()));
+                return self.fail(AgentServiceTransportError::Rpc(status.code()));
             }
         };
         if let Err(error) = validate_server_message(&message) {
@@ -154,6 +164,12 @@ impl AgentServiceRun {
         self.state = RunState::Failed;
         self.heartbeat_cancel.cancel();
         Err(error)
+    }
+}
+
+impl AgentServiceTransportError {
+    pub fn is_unauthenticated(&self) -> bool {
+        matches!(self, Self::Rpc(Code::Unauthenticated))
     }
 }
 

@@ -14,7 +14,6 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::EnvVarError;
 use codex_protocol::error::Result as CodexResult;
 use http::HeaderMap;
-use http::Uri;
 use http::header::HeaderName;
 use http::header::HeaderValue;
 use schemars::JsonSchema;
@@ -35,6 +34,7 @@ const MAX_REQUEST_MAX_RETRIES: u64 = 100;
 const CURSOR_AGENT_SERVICE_MAX_CONTEXT_WINDOW_TOKENS: i64 = 65_536;
 const CURSOR_AGENT_SERVICE_MAX_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 75;
 const CURSOR_AGENT_SERVICE_MAX_PENDING_TOOL_ACTIONS: usize = 8;
+pub const CURSOR_AGENT_SERVICE_ORIGIN: &str = "https://agentn.global.api5.cursor.sh";
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 const OPENAI_ACTOR_AUTHORIZATION_HEADER: &str = "x-openai-actor-authorization";
@@ -187,8 +187,10 @@ impl CursorAgentServiceProviderInfo {
         if self.expected_team_id == 0 {
             return Err("expected_team_id must be greater than zero".to_string());
         }
-        if !is_exact_https_origin(&self.expected_service_origin) {
-            return Err("expected_service_origin must be an exact HTTPS origin".to_string());
+        if self.expected_service_origin != CURSOR_AGENT_SERVICE_ORIGIN {
+            return Err(format!(
+                "expected_service_origin must equal {CURSOR_AGENT_SERVICE_ORIGIN}"
+            ));
         }
         if self.context_window_tokens <= 0 {
             return Err("context_window_tokens must be greater than zero".to_string());
@@ -215,18 +217,6 @@ impl CursorAgentServiceProviderInfo {
         }
         Ok(())
     }
-}
-
-fn is_exact_https_origin(value: &str) -> bool {
-    let Ok(uri) = value.parse::<Uri>() else {
-        return false;
-    };
-    let Some(authority) = uri.authority() else {
-        return false;
-    };
-    uri.scheme_str() == Some("https")
-        && !authority.as_str().contains('@')
-        && value == format!("https://{authority}")
 }
 
 impl ModelProviderInfo {

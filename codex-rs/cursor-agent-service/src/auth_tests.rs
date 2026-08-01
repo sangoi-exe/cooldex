@@ -9,6 +9,10 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tempfile::TempDir;
+use tonic::Code;
+
+use crate::test_support::DashboardReply;
+use crate::test_support::FakeCursorServices;
 
 const ACCESS_TOKEN: &str = "fake-access-token";
 const REFRESH_TOKEN: &str = "fake-refresh-token";
@@ -155,6 +159,110 @@ fn rejects_an_oversized_store() {
         CursorCredentialStore::new(path).load(),
         Err(CursorCredentialStoreError::TooLarge { .. })
     ));
+}
+
+#[tokio::test]
+async fn verifies_the_pinned_identity_with_control_request_metadata() {
+    let credentials: CursorCredentials = serde_json::from_str(valid_store_json()).unwrap();
+    let mut services = FakeCursorServices::spawn(
+        vec![DashboardReply::Identity {
+            user_id: 390_777_501,
+            team_id: Some(12_565_657),
+        }],
+        Vec::new(),
+    )
+    .await;
+
+    verify_cursor_identity_at(
+        services.endpoint(),
+        &credentials,
+        390_777_501,
+        12_565_657,
+    )
+    .await
+    .unwrap();
+
+    let metadata = services.next_dashboard_request().await;
+    assert_eq!(
+        metadata.get("authorization").unwrap().to_str().unwrap(),
+        "Bearer fake-access-token"
+    );
+    assert_eq!(
+        metadata.get("x-cursor-client-version").unwrap(),
+        "cli-2026.07.23-e383d2b"
+    );
+    assert_eq!(metadata.get("x-cursor-client-type").unwrap(), "cli");
+    assert_eq!(metadata.get("x-ghost-mode").unwrap(), "true");
+    assert!(metadata.get("x-request-id").is_some());
+    assert!(metadata.get("x-cursor-streaming").is_none());
+    services.shutdown().await;
+}
+
+#[tokio::test]
+async fn rejects_identity_and_authenticated_control_failures() {
+    let cases = [
+        (
+            DashboardReply::Identity {
+                user_id: 390_777_502,
+                team_id: Some(12_565_657),
+            },
+            CursorIdentityError::UserMismatch {
+                expected: 390_777_501,
+                actual: 390_777_502,
+            },
+        ),
+        (
+            DashboardReply::Identity {
+                user_id: 390_777_501,
+                team_id: Some(12_565_658),
+            },
+            CursorIdentityError::TeamMismatch {
+                expected: 12_565_657,
+                actual: 12_565_658,
+            },
+        ),
+        (
+            DashboardReply::Identity {
+                user_id: 390_777_501,
+                team_id: None,
+            },
+            CursorIdentityError::MissingTeamId,
+        ),
+        (
+            DashboardReply::Identity {
+                user_id: -1,
+                team_id: Some(12_565_657),
+            },
+            CursorIdentityError::InvalidUserId(-1),
+        ),
+        (
+            DashboardReply::Identity {
+                user_id: 390_777_501,
+                team_id: Some(-1),
+            },
+            CursorIdentityError::InvalidTeamId(-1),
+        ),
+        (
+            DashboardReply::Error(Code::Unauthenticated),
+            CursorIdentityError::Rpc(Code::Unauthenticated),
+        ),
+    ];
+
+    for (reply, expected_error) in cases {
+        let credentials: CursorCredentials = serde_json::from_str(valid_store_json()).unwrap();
+        let mut services = FakeCursorServices::spawn(vec![reply], Vec::new()).await;
+        let error = verify_cursor_identity_at(
+            services.endpoint(),
+            &credentials,
+            390_777_501,
+            12_565_657,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, expected_error);
+        let _ = services.next_dashboard_request().await;
+        services.shutdown().await;
+    }
 }
 
 fn valid_store_json() -> &'static str {

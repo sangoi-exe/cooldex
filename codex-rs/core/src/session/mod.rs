@@ -218,6 +218,7 @@ pub(crate) mod recall;
 mod review;
 mod rollout_budget;
 mod rollout_reconstruction;
+pub(crate) mod same_stream_tools;
 #[allow(clippy::module_inception)]
 pub(crate) mod session;
 pub(crate) mod step_context;

@@ -793,16 +793,23 @@ fn cursor_agent_service_provider_rejects_invalid_nested_values() {
             },
         ),
         (
-            "expected_service_origin must be an exact HTTPS origin",
+            "expected_service_origin must equal https://agentn.global.api5.cursor.sh",
             CursorAgentServiceProviderInfo {
                 expected_service_origin: "http://agentn.global.api5.cursor.sh".to_string(),
                 ..config.clone()
             },
         ),
         (
-            "expected_service_origin must be an exact HTTPS origin",
+            "expected_service_origin must equal https://agentn.global.api5.cursor.sh",
             CursorAgentServiceProviderInfo {
                 expected_service_origin: "https://agentn.global.api5.cursor.sh/path".to_string(),
+                ..config.clone()
+            },
+        ),
+        (
+            "expected_service_origin must equal https://agentn.global.api5.cursor.sh",
+            CursorAgentServiceProviderInfo {
+                expected_service_origin: "https://attacker.example".to_string(),
                 ..config.clone()
             },
         ),
@@ -850,7 +857,7 @@ fn cursor_agent_service_provider_rejects_invalid_nested_values() {
         ),
     ];
 
-    assert_eq!(invalid_configs.len(), 10);
+    assert_eq!(invalid_configs.len(), 11);
     for (expected_error, cursor_agent_service) in invalid_configs {
         let invalid_provider = ModelProviderInfo {
             cursor_agent_service: Some(cursor_agent_service),

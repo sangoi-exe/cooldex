@@ -10,7 +10,7 @@ use crate::proto::ExecClientMessage;
 use crate::proto::McpArgs;
 use crate::proto::exec_client_message;
 use codex_protocol::ToolName;
-use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -20,9 +20,10 @@ pub struct CursorToolCallTracker {
     snapshot: CursorToolSnapshot,
     max_pending: usize,
     pending: HashMap<String, PendingLiveCall>,
+    pending_by_cooldex_call_id: HashMap<String, String>,
     seen_action_ids: HashSet<String>,
     seen_cooldex_call_ids: HashSet<String>,
-    completed_action_ids: HashSet<String>,
+    completed_cooldex_call_ids: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -30,6 +31,7 @@ struct PendingLiveCall {
     exec_message_id: u32,
     exec_id: String,
     cooldex_call_id: String,
+    kind: FrozenToolKind,
 }
 
 #[derive(Debug, PartialEq)]
@@ -52,9 +54,10 @@ impl CursorToolCallTracker {
             snapshot,
             max_pending,
             pending: HashMap::new(),
+            pending_by_cooldex_call_id: HashMap::new(),
             seen_action_ids: HashSet::new(),
             seen_cooldex_call_ids: HashSet::new(),
-            completed_action_ids: HashSet::new(),
+            completed_cooldex_call_ids: HashSet::new(),
         }
     }
 
@@ -111,12 +114,15 @@ impl CursorToolCallTracker {
         let cursor_action_id = args.tool_call_id;
         self.seen_action_ids.insert(cursor_action_id.clone());
         self.seen_cooldex_call_ids.insert(cooldex_call_id.clone());
+        self.pending_by_cooldex_call_id
+            .insert(cooldex_call_id.clone(), cursor_action_id.clone());
         self.pending.insert(
             cursor_action_id.clone(),
             PendingLiveCall {
                 exec_message_id,
                 exec_id,
                 cooldex_call_id: cooldex_call_id.clone(),
+                kind: frozen_tool.kind,
             },
         );
         Ok(AcceptedLiveToolCall {
@@ -127,29 +133,59 @@ impl CursorToolCallTracker {
         })
     }
 
-    pub fn complete_mcp_call(
+    pub fn complete_cooldex_call(
         &mut self,
-        cursor_action_id: &str,
-        output: &FunctionCallOutputPayload,
+        result: &ResponseInputItem,
     ) -> Result<CompletedLiveToolCall, CursorMappingError> {
-        if self.completed_action_ids.contains(cursor_action_id) {
+        let (cooldex_call_id, output, result_kind) = match result {
+            ResponseInputItem::FunctionCallOutput { call_id, output } => {
+                (call_id, output, FrozenToolKind::Function)
+            }
+            ResponseInputItem::CustomToolCallOutput {
+                call_id,
+                name,
+                output,
+            } => {
+                if name.is_some() {
+                    return Err(CursorMappingError::NonCanonicalCustomToolResult(
+                        call_id.clone(),
+                    ));
+                }
+                (call_id, output, FrozenToolKind::ApplyPatch)
+            }
+            ResponseInputItem::Message { .. }
+            | ResponseInputItem::McpToolCallOutput { .. }
+            | ResponseInputItem::ToolSearchOutput { .. } => {
+                return Err(CursorMappingError::UnsupportedToolResultItem);
+            }
+        };
+        if self.completed_cooldex_call_ids.contains(cooldex_call_id) {
             return Err(CursorMappingError::DuplicateToolResult(
-                cursor_action_id.to_string(),
+                cooldex_call_id.clone(),
             ));
         }
-        if !self.pending.contains_key(cursor_action_id) {
-            return Err(CursorMappingError::UnknownActionId(
-                cursor_action_id.to_string(),
+        let cursor_action_id = self
+            .pending_by_cooldex_call_id
+            .get(cooldex_call_id)
+            .cloned()
+            .ok_or_else(|| CursorMappingError::UnknownCooldexCallId(cooldex_call_id.clone()))?;
+        let pending = self
+            .pending
+            .get(&cursor_action_id)
+            .ok_or_else(|| CursorMappingError::UnknownCooldexCallId(cooldex_call_id.clone()))?;
+        if pending.kind != result_kind {
+            return Err(CursorMappingError::ToolResultKindMismatch(
+                cooldex_call_id.clone(),
             ));
         }
         let mapped_output = map_tool_output(output)?;
-        let Some(pending) = self.pending.remove(cursor_action_id) else {
-            return Err(CursorMappingError::UnknownActionId(
-                cursor_action_id.to_string(),
-            ));
-        };
-        self.completed_action_ids
-            .insert(cursor_action_id.to_string());
+        let pending = self
+            .pending
+            .remove(&cursor_action_id)
+            .ok_or_else(|| CursorMappingError::UnknownCooldexCallId(cooldex_call_id.clone()))?;
+        self.pending_by_cooldex_call_id.remove(cooldex_call_id);
+        self.completed_cooldex_call_ids
+            .insert(cooldex_call_id.clone());
         Ok(CompletedLiveToolCall {
             cooldex_call_id: pending.cooldex_call_id,
             exec_client_message: ExecClientMessage {

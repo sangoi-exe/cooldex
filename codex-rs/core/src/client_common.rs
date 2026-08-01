@@ -3,6 +3,7 @@ use codex_protocol::error::Result;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_tools::ToolSpec;
 use futures::Stream;
@@ -106,6 +107,48 @@ pub struct ResponseStream {
     /// Signals the mapper task that the consumer stopped polling before the
     /// provider stream reached its own terminal event.
     pub(crate) consumer_dropped: CancellationToken,
+    continuation: ResponseStreamContinuation,
+}
+
+enum ResponseStreamContinuation {
+    NextSamplingRequest,
+    SameStream {
+        tool_results: mpsc::Sender<ResponseInputItem>,
+    },
+}
+
+impl ResponseStream {
+    pub(crate) fn next_sampling_request(
+        rx_event: mpsc::Receiver<Result<ResponseEvent>>,
+        consumer_dropped: CancellationToken,
+    ) -> Self {
+        Self {
+            rx_event,
+            consumer_dropped,
+            continuation: ResponseStreamContinuation::NextSamplingRequest,
+        }
+    }
+
+    pub(crate) fn same_stream(
+        rx_event: mpsc::Receiver<Result<ResponseEvent>>,
+        consumer_dropped: CancellationToken,
+        tool_results: mpsc::Sender<ResponseInputItem>,
+    ) -> Self {
+        Self {
+            rx_event,
+            consumer_dropped,
+            continuation: ResponseStreamContinuation::SameStream { tool_results },
+        }
+    }
+
+    pub(crate) fn same_stream_tool_results(&self) -> Option<mpsc::Sender<ResponseInputItem>> {
+        match &self.continuation {
+            ResponseStreamContinuation::NextSamplingRequest => None,
+            ResponseStreamContinuation::SameStream { tool_results } => {
+                Some(tool_results.clone())
+            }
+        }
+    }
 }
 
 impl Stream for ResponseStream {

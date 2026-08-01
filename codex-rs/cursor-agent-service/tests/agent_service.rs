@@ -2,9 +2,14 @@
 
 #[path = "support/fake_peer.rs"]
 mod fake_peer;
+#[path = "support/credentials.rs"]
+mod credentials;
 
 use codex_cursor_agent_service::AgentServiceTransport;
 use codex_cursor_agent_service::AgentServiceTransportError;
+use codex_cursor_agent_service::CursorSamplingRequest;
+use codex_cursor_agent_service::CursorSamplingSession;
+use codex_cursor_agent_service::map_sampling_request;
 use codex_cursor_agent_service::proto::AGENT_SERVICE_TYPE_NAME;
 use codex_cursor_agent_service::proto::AgentClientMessage;
 use codex_cursor_agent_service::proto::AgentRunRequest;
@@ -13,6 +18,7 @@ use codex_cursor_agent_service::proto::ClientHeartbeat;
 use codex_cursor_agent_service::proto::ExecServerMessage;
 use codex_cursor_agent_service::proto::HEARTBEAT_INTERVAL_SECONDS;
 use codex_cursor_agent_service::proto::InteractionUpdate;
+use codex_cursor_agent_service::proto::McpArgs;
 use codex_cursor_agent_service::proto::PINNED_CURSOR_CLI_SHA256;
 use codex_cursor_agent_service::proto::PINNED_CURSOR_CLI_VERSION;
 use codex_cursor_agent_service::proto::PINNED_SCHEMA_SHA256;
@@ -25,15 +31,30 @@ use codex_cursor_agent_service::proto::agent_client_message;
 use codex_cursor_agent_service::proto::agent_server_message;
 use codex_cursor_agent_service::proto::exec_server_message;
 use codex_cursor_agent_service::proto::interaction_update;
+use codex_api::ResponseEvent;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
+use codex_tools::AdditionalProperties;
+use codex_tools::JsonSchema;
+use codex_tools::ResponsesApiTool;
+use codex_tools::ToolSpec;
 use fake_peer::FakePeer;
+use credentials::ACCESS_TOKEN;
+use credentials::start_run;
 use pretty_assertions::assert_eq;
 use prost::Message as _;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 const EXPECTED_CURSOR_CLI_SHA256: &str =
     "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831";
 const EXPECTED_SCHEMA_SHA256: &str =
-    "9117b3cfd5c5f903ec42e74c81312d9392dbb09b6fedc4be429f6b18437a931d";
+    "eac12505afd2b0b15fa8d416c4ae4d65a4534ee31a465ab37e1e3f105a943413";
 
 #[test]
 fn generated_protocol_records_the_pinned_snapshot() {
@@ -138,8 +159,37 @@ async fn opens_one_bidirectional_run_and_observes_the_explicit_terminal() {
         .await
         .unwrap();
     let request = minimal_run_request();
-    let mut run = transport.start_run(request.clone()).await.unwrap();
+    let mut run = start_run(&mut transport, request.clone()).await.unwrap();
     let mut server_run = peer.next_run().await;
+    assert_eq!(
+        server_run
+            .metadata()
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        format!("Bearer {ACCESS_TOKEN}")
+    );
+    assert_eq!(
+        server_run
+            .metadata()
+            .get("x-cursor-client-version")
+            .unwrap(),
+        "cli-2026.07.23-e383d2b"
+    );
+    assert_eq!(
+        server_run
+            .metadata()
+            .get("x-cursor-client-type")
+            .unwrap(),
+        "cli"
+    );
+    assert_eq!(
+        server_run.metadata().get("x-cursor-streaming").unwrap(),
+        "true"
+    );
+    assert_eq!(server_run.metadata().get("x-ghost-mode").unwrap(), "true");
+    assert!(server_run.metadata().get("x-request-id").is_some());
 
     assert_eq!(
         server_run.next_client_message().await,
@@ -162,12 +212,123 @@ async fn opens_one_bidirectional_run_and_observes_the_explicit_terminal() {
 }
 
 #[tokio::test]
+async fn session_returns_a_tool_result_on_the_same_run_before_terminal() {
+    let input = vec![user_message("Use echo")];
+    let tools = vec![function_spec("echo")];
+    let mapped = map_sampling_request(CursorSamplingRequest {
+        conversation_id: "cooldex-run-1",
+        model_id: "composer-2.5",
+        model_display_name: "Composer 2.5",
+        base_instructions: "exact Cooldex instructions",
+        input: &input,
+        tools: &tools,
+        current_message_id: "current-message",
+        synthesized_user_message: None,
+    })
+    .expect("sampling request should map");
+    let expected_request = mapped.request.clone();
+    let definition = expected_request
+        .mcp_tools
+        .as_ref()
+        .expect("mapped request should advertise tools")
+        .mcp_tools[0]
+        .clone();
+
+    let mut peer = FakePeer::spawn().await;
+    let mut transport = AgentServiceTransport::connect(peer.endpoint())
+        .await
+        .unwrap();
+    let run = start_run(&mut transport, mapped.request).await.unwrap();
+    let mut server_run = peer.next_run().await;
+    assert_eq!(
+        server_run.next_client_message().await,
+        AgentClientMessage {
+            message: Some(agent_client_message::Message::RunRequest(expected_request)),
+        }
+    );
+
+    let mut session = CursorSamplingSession::start(
+        run,
+        mapped.tool_snapshot,
+        "exact Cooldex instructions".to_string(),
+        "cursor-response-1".to_string(),
+        8,
+        CancellationToken::new(),
+    );
+    assert!(matches!(
+        session.next_event().await,
+        Some(Ok(ResponseEvent::Created))
+    ));
+
+    server_run
+        .send(mcp_server_message(41, "exec-41", McpArgs {
+            name: definition.name,
+            args: HashMap::new(),
+            tool_call_id: "cursor-action-1".to_string(),
+            provider_identifier: definition.provider_identifier,
+            tool_name: definition.tool_name,
+            smart_mode_approval: None,
+            smart_mode_approval_only: false,
+            skip_approval: false,
+            server_identifier: "cooldex".to_string(),
+        }))
+        .await;
+
+    let call_id = match session.next_event().await {
+        Some(Ok(ResponseEvent::OutputItemAdded(ResponseItem::FunctionCall {
+            call_id,
+            ..
+        }))) => call_id,
+        other => panic!("expected added function call, got {other:?}"),
+    };
+    assert!(matches!(
+        session.next_event().await,
+        Some(Ok(ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { call_id: ref done_call_id, .. })))
+            if done_call_id == &call_id
+    ));
+
+    session
+        .send_tool_result(ResponseInputItem::FunctionCallOutput {
+            call_id: call_id.clone(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("done".to_string()),
+                success: Some(true),
+            },
+        })
+        .await
+        .expect("same-stream result should be accepted");
+    let result = server_run.next_client_message().await;
+    let Some(agent_client_message::Message::ExecClientMessage(result)) = result.message else {
+        panic!("expected same-Run exec result");
+    };
+    assert_eq!(result.id, 41);
+    assert_eq!(result.exec_id, "exec-41");
+
+    server_run.send(turn_ended()).await;
+    assert!(matches!(
+        session.next_event().await,
+        Some(Ok(ResponseEvent::Completed { ref response_id, .. }))
+            if response_id == "cursor-response-1"
+    ));
+    assert!(session.next_event().await.is_none());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), peer.next_run())
+            .await
+            .is_err(),
+        "same-stream tool completion must not open a second Run"
+    );
+
+    server_run.close();
+    peer.shutdown().await;
+}
+
+#[tokio::test]
 async fn sends_a_client_heartbeat_while_the_run_is_open() {
     let mut peer = FakePeer::spawn().await;
     let mut transport = AgentServiceTransport::connect(peer.endpoint())
         .await
         .unwrap();
-    let run = transport.start_run(minimal_run_request()).await.unwrap();
+    let run = start_run(&mut transport, minimal_run_request()).await.unwrap();
     let mut server_run = peer.next_run().await;
     let _initial_request = server_run.next_client_message().await;
 
@@ -197,7 +358,7 @@ async fn rejects_eof_before_turn_ended() {
     let mut transport = AgentServiceTransport::connect(peer.endpoint())
         .await
         .unwrap();
-    let mut run = transport.start_run(minimal_run_request()).await.unwrap();
+    let mut run = start_run(&mut transport, minimal_run_request()).await.unwrap();
     let mut server_run = peer.next_run().await;
     let _initial_request = server_run.next_client_message().await;
     server_run.close();
@@ -217,7 +378,7 @@ async fn rejects_an_empty_server_envelope() {
     let mut transport = AgentServiceTransport::connect(peer.endpoint())
         .await
         .unwrap();
-    let mut run = transport.start_run(minimal_run_request()).await.unwrap();
+    let mut run = start_run(&mut transport, minimal_run_request()).await.unwrap();
     let mut server_run = peer.next_run().await;
     let _initial_request = server_run.next_client_message().await;
     server_run.send(AgentServerMessage { message: None }).await;
@@ -275,7 +436,7 @@ async fn assert_rejected_messages(
         .unwrap();
 
     for message in messages {
-        let mut run = transport.start_run(minimal_run_request()).await.unwrap();
+        let mut run = start_run(&mut transport, minimal_run_request()).await.unwrap();
         let mut server_run = peer.next_run().await;
         let _initial_request = server_run.next_client_message().await;
         server_run.send(message).await;
@@ -444,4 +605,41 @@ fn exec_server_message(message: exec_server_message::Message) -> AgentServerMess
             message: Some(message),
         },
     ))
+}
+
+fn mcp_server_message(id: u32, exec_id: &str, args: McpArgs) -> AgentServerMessage {
+    server_message(agent_server_message::Message::ExecServerMessage(
+        ExecServerMessage {
+            id,
+            exec_id: exec_id.to_string(),
+            message: Some(exec_server_message::Message::McpArgs(args)),
+        },
+    ))
+}
+
+fn user_message(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn function_spec(name: &str) -> ToolSpec {
+    ToolSpec::Function(ResponsesApiTool {
+        name: name.to_string(),
+        description: "A test function".to_string(),
+        strict: true,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            BTreeMap::new(),
+            Some(Vec::new()),
+            Some(AdditionalProperties::Boolean(false)),
+        ),
+        output_schema: None,
+    })
 }

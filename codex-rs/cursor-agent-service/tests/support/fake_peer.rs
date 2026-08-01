@@ -14,6 +14,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tonic::Streaming;
+use tonic::metadata::MetadataMap;
 use tonic::transport::Server;
 
 pub struct FakePeer {
@@ -63,9 +64,14 @@ impl FakePeer {
 pub struct FakeRun {
     inbound: Streaming<AgentClientMessage>,
     outbound: mpsc::Sender<Result<AgentServerMessage, Status>>,
+    metadata: MetadataMap,
 }
 
 impl FakeRun {
+    pub fn metadata(&self) -> &MetadataMap {
+        &self.metadata
+    }
+
     pub async fn next_client_message(&mut self) -> AgentClientMessage {
         self.inbound
             .message()
@@ -95,10 +101,12 @@ impl AgentService for FakeAgentService {
         request: Request<Streaming<AgentClientMessage>>,
     ) -> Result<Response<Self::RunStream>, Status> {
         let (outbound, outbound_rx) = mpsc::channel(16);
+        let metadata = request.metadata().clone();
         self.run_tx
             .send(FakeRun {
                 inbound: request.into_inner(),
                 outbound,
+                metadata,
             })
             .await
             .map_err(|_| Status::unavailable("fake peer receiver closed"))?;

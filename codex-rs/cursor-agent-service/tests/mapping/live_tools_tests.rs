@@ -12,6 +12,7 @@ use codex_cursor_agent_service::proto::mcp_result;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 
@@ -24,12 +25,15 @@ const DECLARED_LIVE_REJECTIONS: &[&str] = &[
     "duplicate_result",
     "empty_action_id",
     "malformed_value",
+    "noncanonical_custom_result_name",
     "pending_ninth",
+    "result_kind_mismatch",
     "skip_approval",
     "smart_mode_approval",
     "smart_mode_approval_only",
     "terminal_with_pending",
     "unknown_result",
+    "unsupported_result_item",
     "unsupported_output",
     "wrong_provider",
     "wrong_server",
@@ -104,7 +108,7 @@ fn maps_live_function_and_apply_patch_calls_to_canonical_cooldex_items() {
 }
 
 #[test]
-fn maps_text_structured_and_error_results_on_the_same_cursor_action_id() {
+fn maps_text_structured_and_error_results_by_cooldex_call_id() {
     let snapshot = live_snapshot();
     let mut tracker = CursorToolCallTracker::new(snapshot.clone(), 8);
     tracker
@@ -117,7 +121,10 @@ fn maps_text_structured_and_error_results_on_the_same_cursor_action_id() {
         .expect("valid function call should map");
 
     let completed = tracker
-        .complete_mcp_call("cursor-action-1", &output(r#"{"answer":42}"#, Some(false)))
+        .complete_cooldex_call(&function_result(
+            "cool-call-1",
+            output(r#"{"answer":42}"#, Some(false)),
+        ))
         .expect("valid result should map");
     assert_eq!(completed.cooldex_call_id, "cool-call-1");
     assert_eq!(completed.exec_client_message.id, 21);
@@ -239,16 +246,36 @@ fn run_live_rejection_case(case: &str) -> CursorMappingError {
                 .accept_mcp_call(1, "exec".to_string(), args, "cool-call-1".to_string())
                 .expect("seed action should map");
             tracker
-                .complete_mcp_call("cursor-action-1", &output("done", Some(true)))
+                .complete_cooldex_call(&function_result(
+                    "cool-call-1",
+                    output("done", Some(true)),
+                ))
                 .expect("first result should map");
             return tracker
-                .complete_mcp_call("cursor-action-1", &output("again", Some(true)))
+                .complete_cooldex_call(&function_result(
+                    "cool-call-1",
+                    output("again", Some(true)),
+                ))
                 .expect_err("second result should reject");
         }
         "empty_action_id" => args.tool_call_id.clear(),
         "malformed_value" => {
             args.args
                 .insert("value".to_string(), prost_types::Value { kind: None });
+        }
+        "noncanonical_custom_result_name" => {
+            args = valid_mcp_args(&snapshot, 1, "cursor-action-1");
+            args.args.insert("patch".to_string(), prost_string("patch"));
+            tracker
+                .accept_mcp_call(1, "exec".to_string(), args, "cool-call-1".to_string())
+                .expect("seed apply_patch action should map");
+            return tracker
+                .complete_cooldex_call(&ResponseInputItem::CustomToolCallOutput {
+                    call_id: "cool-call-1".to_string(),
+                    name: Some("apply_patch".to_string()),
+                    output: output("done", Some(true)),
+                })
+                .expect_err("named custom result should reject");
         }
         "pending_ninth" => {
             for index in 0..8 {
@@ -270,6 +297,18 @@ fn run_live_rejection_case(case: &str) -> CursorMappingError {
                 )
                 .expect_err("ninth pending action should reject");
         }
+        "result_kind_mismatch" => {
+            tracker
+                .accept_mcp_call(1, "exec".to_string(), args, "cool-call-1".to_string())
+                .expect("seed function action should map");
+            return tracker
+                .complete_cooldex_call(&ResponseInputItem::CustomToolCallOutput {
+                    call_id: "cool-call-1".to_string(),
+                    name: None,
+                    output: output("done", Some(true)),
+                })
+                .expect_err("custom result for function action should reject");
+        }
         "skip_approval" => args.skip_approval = true,
         "smart_mode_approval" => {
             args.smart_mode_approval = Some(SmartModeApproval {
@@ -288,17 +327,29 @@ fn run_live_rejection_case(case: &str) -> CursorMappingError {
         }
         "unknown_result" => {
             return tracker
-                .complete_mcp_call("missing", &output("done", Some(true)))
+                .complete_cooldex_call(&function_result("missing", output("done", Some(true))))
                 .expect_err("unknown result id should reject");
+        }
+        "unsupported_result_item" => {
+            tracker
+                .accept_mcp_call(1, "exec".to_string(), args, "cool-call-1".to_string())
+                .expect("seed action should map");
+            return tracker
+                .complete_cooldex_call(&ResponseInputItem::Message {
+                    role: "tool".to_string(),
+                    content: Vec::new(),
+                    phase: None,
+                })
+                .expect_err("message result should reject");
         }
         "unsupported_output" => {
             tracker
                 .accept_mcp_call(1, "exec".to_string(), args, "cool-call-1".to_string())
                 .expect("seed action should map");
             return tracker
-                .complete_mcp_call(
-                    "cursor-action-1",
-                    &FunctionCallOutputPayload {
+                .complete_cooldex_call(&function_result(
+                    "cool-call-1",
+                    FunctionCallOutputPayload {
                         body: FunctionCallOutputBody::ContentItems(vec![
                             FunctionCallOutputContentItem::InputImage {
                                 image_url: "data:image/png;base64,AA==".to_string(),
@@ -307,7 +358,7 @@ fn run_live_rejection_case(case: &str) -> CursorMappingError {
                         ]),
                         success: Some(true),
                     },
-                )
+                ))
                 .expect_err("multimodal tool output should reject");
         }
         "wrong_provider" => args.provider_identifier = "wrong".to_string(),
@@ -338,7 +389,15 @@ fn assert_live_error(case: &str, error: &CursorMappingError) {
             error,
             CursorMappingError::InvalidToolArguments { .. }
         )),
+        "noncanonical_custom_result_name" => assert!(matches!(
+            error,
+            CursorMappingError::NonCanonicalCustomToolResult(_)
+        )),
         "pending_ninth" => assert_eq!(error, &CursorMappingError::PendingToolLimit(8)),
+        "result_kind_mismatch" => assert!(matches!(
+            error,
+            CursorMappingError::ToolResultKindMismatch(_)
+        )),
         "skip_approval" => assert_eq!(
             error,
             &CursorMappingError::ApprovalBypassRequested("skip_approval")
@@ -351,7 +410,13 @@ fn assert_live_error(case: &str, error: &CursorMappingError) {
         "terminal_with_pending" => {
             assert_eq!(error, &CursorMappingError::PendingToolsAtTerminal(1))
         }
-        "unknown_result" => assert!(matches!(error, CursorMappingError::UnknownActionId(_))),
+        "unknown_result" => assert!(matches!(
+            error,
+            CursorMappingError::UnknownCooldexCallId(_)
+        )),
+        "unsupported_result_item" => {
+            assert_eq!(error, &CursorMappingError::UnsupportedToolResultItem)
+        }
         "unsupported_output" => assert_eq!(error, &CursorMappingError::UnsupportedToolOutput),
         "wrong_provider" | "wrong_tool_name" | "wrong_wire_name" => {
             assert_eq!(error, &CursorMappingError::InvalidToolIdentity)
@@ -364,4 +429,11 @@ fn assert_live_error(case: &str, error: &CursorMappingError) {
 fn live_snapshot() -> CursorToolSnapshot {
     CursorToolSnapshot::from_specs(&[function_spec("echo"), apply_patch_spec()])
         .expect("live test snapshot should map")
+}
+
+fn function_result(call_id: &str, output: FunctionCallOutputPayload) -> ResponseInputItem {
+    ResponseInputItem::FunctionCallOutput {
+        call_id: call_id.to_string(),
+        output,
+    }
 }

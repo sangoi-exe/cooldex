@@ -19,6 +19,8 @@ use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::ResponseEvent;
 use codex_api::TransportError;
+use codex_cursor_agent_service::static_model_catalog;
+use codex_cursor_agent_service::CursorAgentServiceSessionError;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_login::AuthCredentialsStoreMode;
@@ -30,14 +32,21 @@ use codex_model_provider::BearerAuthProvider;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::CHATGPT_CODEX_BASE_URL;
+use codex_model_provider_info::CursorAgentServiceProviderInfo;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
+use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::Verbosity;
+use codex_protocol::error::CodexErr;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -66,7 +75,9 @@ use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::sync::mpsc;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::Event;
 use tracing::Subscriber;
 use tracing::field::Visit;
@@ -86,6 +97,193 @@ const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
 fn test_model_client(session_source: SessionSource) -> ModelClient {
     test_model_client_with_thread_id(ThreadId::new(), session_source)
+}
+
+fn cursor_model_client(model_verbosity: Option<Verbosity>) -> ModelClient {
+    ModelClient::new(
+        /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        ModelProviderInfo {
+            name: "Cursor Corporate".to_string(),
+            wire_api: WireApi::CursorAgentService,
+            cursor_agent_service: Some(CursorAgentServiceProviderInfo {
+                expected_user_id: 390_777_501,
+                expected_team_id: 12_565_657,
+                expected_service_origin: "https://agentn.global.api5.cursor.sh".to_string(),
+                context_window_tokens: 65_536,
+                effective_context_window_percent: 75,
+                max_pending_tool_actions: 8,
+            }),
+            ..ModelProviderInfo::default()
+        },
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        model_verbosity,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    )
+}
+
+#[tokio::test]
+async fn cursor_sampling_rejects_every_unmapped_control_before_authentication() {
+    struct Case {
+        effort: Option<ReasoningEffort>,
+        summary: ReasoningSummary,
+        service_tier: Option<String>,
+        verbosity: Option<Verbosity>,
+        output_schema: Option<serde_json::Value>,
+        expected_error: &'static str,
+    }
+
+    let cases = [
+        Case {
+            effort: Some(ReasoningEffort::High),
+            summary: ReasoningSummary::None,
+            service_tier: None,
+            verbosity: None,
+            output_schema: None,
+            expected_error: "Cursor AgentService does not support reasoning effort controls",
+        },
+        Case {
+            effort: None,
+            summary: ReasoningSummary::Detailed,
+            service_tier: None,
+            verbosity: None,
+            output_schema: None,
+            expected_error: "Cursor AgentService does not support reasoning summary controls",
+        },
+        Case {
+            effort: None,
+            summary: ReasoningSummary::None,
+            service_tier: Some("fast".to_string()),
+            verbosity: None,
+            output_schema: None,
+            expected_error: "Cursor AgentService does not support service tiers",
+        },
+        Case {
+            effort: None,
+            summary: ReasoningSummary::None,
+            service_tier: None,
+            verbosity: Some(Verbosity::High),
+            output_schema: None,
+            expected_error: "Cursor AgentService does not support verbosity controls",
+        },
+        Case {
+            effort: None,
+            summary: ReasoningSummary::None,
+            service_tier: None,
+            verbosity: None,
+            output_schema: Some(json!({"type": "object"})),
+            expected_error: "Cursor AgentService does not support response output schemas",
+        },
+    ];
+
+    assert_eq!(cases.len(), 5);
+    for case in cases {
+        let Case {
+            effort,
+            summary,
+            service_tier,
+            verbosity,
+            output_schema,
+            expected_error,
+        } = case;
+        let client = cursor_model_client(verbosity);
+        let model_info = static_model_catalog(65_536, 75).models.remove(0);
+        let prompt = Prompt {
+            input: vec![ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "fail before touching Cursor credentials".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }],
+            base_instructions: BaseInstructions {
+                text: "exact Cooldex instructions".to_string(),
+            },
+            output_schema,
+            ..Default::default()
+        };
+        let responses_metadata = test_responses_metadata_for_client(
+            &client,
+            /*turn_id*/ None,
+            format!("{}:0", client.state.thread_id),
+            /*parent_thread_id*/ None,
+            TestCodexResponsesRequestKind::Turn,
+        );
+        let mut session = client.new_session();
+        let error = match session
+            .stream(
+                &prompt,
+                &model_info,
+                &test_session_telemetry(),
+                effort,
+                summary,
+                service_tier,
+                &responses_metadata,
+                &InferenceTraceContext::disabled(),
+            )
+            .await
+        {
+            Ok(_) => panic!("unsupported Cursor control unexpectedly opened a stream"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            CodexErr::InvalidRequest(message) if message == expected_error
+        ));
+    }
+}
+
+#[tokio::test]
+async fn cursor_session_parts_preserve_same_stream_results_errors_and_cancellation() {
+    let (cursor_event_tx, cursor_events) = mpsc::channel(/*buffer*/ 4);
+    let (tool_result_tx, mut tool_results) = mpsc::channel(/*buffer*/ 4);
+    let consumer_dropped = CancellationToken::new();
+    let mut stream = super::response_stream_from_cursor_parts(
+        cursor_events,
+        tool_result_tx,
+        consumer_dropped.clone(),
+    );
+    let result = ResponseInputItem::FunctionCallOutput {
+        call_id: "call-1".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text("done".to_string()),
+            success: Some(true),
+        },
+    };
+
+    stream
+        .same_stream_tool_results()
+        .expect("Cursor stream should expose the same-Run result sink")
+        .send(result.clone())
+        .await
+        .unwrap();
+    assert_eq!(tool_results.recv().await.unwrap(), result);
+
+    cursor_event_tx.send(Ok(ResponseEvent::Created)).await.unwrap();
+    assert!(matches!(stream.next().await, Some(Ok(ResponseEvent::Created))));
+    cursor_event_tx
+        .send(Err(
+            CursorAgentServiceSessionError::ToolResultChannelClosed,
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(CodexErr::Fatal(message)))
+            if message == "Cursor AgentService session failed: Cursor AgentService tool-result channel is closed"
+    ));
+
+    drop(stream);
+    assert!(consumer_dropped.is_cancelled());
 }
 
 fn test_model_client_with_thread_id(

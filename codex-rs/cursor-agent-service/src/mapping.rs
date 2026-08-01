@@ -96,10 +96,16 @@ pub enum CursorMappingError {
     DuplicateCooldexCallId(String),
     #[error("Cursor AgentService exceeded the pending tool action limit {0}")]
     PendingToolLimit(usize),
-    #[error("Cursor AgentService result references unknown action id {0}")]
-    UnknownActionId(String),
-    #[error("Cursor AgentService action already received a result: {0}")]
+    #[error("Cursor AgentService result references unknown Cooldex tool call id {0}")]
+    UnknownCooldexCallId(String),
+    #[error("Cursor AgentService Cooldex tool call already received a result: {0}")]
     DuplicateToolResult(String),
+    #[error("Cursor AgentService result kind does not match Cooldex tool call {0}")]
+    ToolResultKindMismatch(String),
+    #[error("Cursor AgentService custom tool result is not canonical apply_patch: {0}")]
+    NonCanonicalCustomToolResult(String),
+    #[error("Cursor AgentService cannot consume this Cooldex tool result item")]
+    UnsupportedToolResultItem,
     #[error("Cursor AgentService terminal arrived with {0} pending tool actions")]
     PendingToolsAtTerminal(usize),
     #[error("Cursor AgentService cannot represent tool output content")]

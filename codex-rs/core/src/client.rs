@@ -71,14 +71,18 @@ use codex_login::RefreshTokenError;
 use codex_login::UnauthorizedRecovery;
 use codex_login::default_client::add_originator_header;
 use codex_login::default_client::create_client_for_route;
+use codex_cursor_agent_service::CursorAgentServiceSessionError;
+use codex_cursor_agent_service::CursorSamplingRequest;
 use codex_otel::SessionTelemetry;
 use codex_otel::current_span_w3c_trace_context;
 use codex_protocol::auth::AuthMode;
 
 use codex_protocol::ThreadId;
+use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -163,6 +167,7 @@ const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
 // period between stream events.
 const COMPACT_REQUEST_TIMEOUT_IDLE_MULTIPLIER: u32 = 4;
 const MEMORIES_SUMMARIZE_ENDPOINT: &str = "/memories/trace_summarize";
+const CURSOR_EVENT_CAPACITY: usize = 64;
 #[cfg(test)]
 pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS);
@@ -1841,11 +1846,90 @@ impl ModelClientSession {
                 )
                 .await
             }
-            WireApi::CursorAgentService => Err(CodexErr::UnsupportedOperation(
-                "Cursor AgentService sampling is not integrated into the core stream yet"
-                    .to_string(),
-            )),
+            WireApi::CursorAgentService => {
+                self.stream_cursor_agent_service(
+                    prompt,
+                    model_info,
+                    effort,
+                    summary,
+                    service_tier,
+                )
+                .await
+            }
         }
+    }
+
+    async fn stream_cursor_agent_service(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+    ) -> Result<ResponseStream> {
+        if effort.is_some() {
+            return Err(CodexErr::InvalidRequest(
+                "Cursor AgentService does not support reasoning effort controls".to_string(),
+            ));
+        }
+        if summary != ReasoningSummaryConfig::None {
+            return Err(CodexErr::InvalidRequest(
+                "Cursor AgentService does not support reasoning summary controls".to_string(),
+            ));
+        }
+        if service_tier.is_some() {
+            return Err(CodexErr::InvalidRequest(
+                "Cursor AgentService does not support service tiers".to_string(),
+            ));
+        }
+        if self.client.state.model_verbosity.is_some() {
+            return Err(CodexErr::InvalidRequest(
+                "Cursor AgentService does not support verbosity controls".to_string(),
+            ));
+        }
+        if prompt.output_schema.is_some() {
+            return Err(CodexErr::InvalidRequest(
+                "Cursor AgentService does not support response output schemas".to_string(),
+            ));
+        }
+
+        let backend = self
+            .client
+            .state
+            .provider
+            .cursor_agent_service_backend()
+            .ok_or_else(|| {
+                CodexErr::Fatal(
+                    "Cursor AgentService provider did not expose its sampling backend".to_string(),
+                )
+            })?;
+        let conversation_id = ResponseItemId::new("conversation").to_string();
+        let current_message_id = ResponseItemId::new("message").to_string();
+        let consumer_dropped = CancellationToken::new();
+        let session = backend
+            .start_sampling(
+                CursorSamplingRequest {
+                    conversation_id: &conversation_id,
+                    model_id: &model_info.slug,
+                    model_display_name: &model_info.display_name,
+                    base_instructions: &prompt.base_instructions.text,
+                    input: &prompt.input,
+                    tools: &prompt.tools,
+                    current_message_id: &current_message_id,
+                    synthesized_user_message: None,
+                },
+                consumer_dropped,
+            )
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!("Cursor AgentService sampling failed: {error}"))
+            })?;
+        let (cursor_events, tool_results, consumer_dropped) = session.into_parts();
+        Ok(response_stream_from_cursor_parts(
+            cursor_events,
+            tool_results,
+            consumer_dropped,
+        ))
     }
 
     /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
@@ -1865,6 +1949,29 @@ impl ModelClientSession {
         self.websocket_session = WebsocketSession::default();
         activated
     }
+}
+
+fn response_stream_from_cursor_parts(
+    mut cursor_events: mpsc::Receiver<
+        std::result::Result<ResponseEvent, CursorAgentServiceSessionError>,
+    >,
+    tool_results: mpsc::Sender<ResponseInputItem>,
+    consumer_dropped: CancellationToken,
+) -> ResponseStream {
+    let (event_tx, event_rx) = mpsc::channel(CURSOR_EVENT_CAPACITY);
+    let mapper_cancel = consumer_dropped.clone();
+    tokio::spawn(async move {
+        while let Some(event) = cursor_events.recv().await {
+            let event = event.map_err(|error| {
+                CodexErr::Fatal(format!("Cursor AgentService session failed: {error}"))
+            });
+            if event_tx.send(event).await.is_err() {
+                mapper_cancel.cancel();
+                return;
+            }
+        }
+    });
+    ResponseStream::same_stream(event_rx, consumer_dropped, tool_results)
 }
 
 /// Stamp a ResponsesWsRequest with the current time.
@@ -2083,10 +2190,7 @@ where
     });
 
     (
-        ResponseStream {
-            rx_event,
-            consumer_dropped: consumer_dropped_for_stream,
-        },
+        ResponseStream::next_sampling_request(rx_event, consumer_dropped_for_stream),
         rx_last_response,
     )
 }

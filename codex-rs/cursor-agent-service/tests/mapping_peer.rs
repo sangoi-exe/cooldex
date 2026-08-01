@@ -2,6 +2,8 @@
 
 #[path = "support/fake_peer.rs"]
 mod fake_peer;
+#[path = "support/credentials.rs"]
+mod credentials;
 
 use codex_cursor_agent_service::AgentServiceTransport;
 use codex_cursor_agent_service::CursorMappingError;
@@ -25,6 +27,7 @@ use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
 use fake_peer::FakePeer;
+use credentials::start_run;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -58,7 +61,9 @@ async fn fake_peer_observes_exact_mapped_request_and_smart_approval_rejects_with
     let mut transport = AgentServiceTransport::connect(peer.endpoint())
         .await
         .unwrap();
-    let mut run = transport.start_run(expected_request.clone()).await.unwrap();
+    let mut run = start_run(&mut transport, expected_request.clone())
+        .await
+        .unwrap();
     let mut server_run = peer.next_run().await;
     assert_eq!(
         server_run.next_client_message().await,
@@ -128,7 +133,7 @@ async fn request_context_query_is_answered_on_the_same_fake_peer_run() {
     let mut transport = AgentServiceTransport::connect(peer.endpoint())
         .await
         .unwrap();
-    let mut run = transport.start_run(mapped.request).await.unwrap();
+    let mut run = start_run(&mut transport, mapped.request).await.unwrap();
     let mut server_run = peer.next_run().await;
     let _initial_request = server_run.next_client_message().await;
     let args = RequestContextArgs {

@@ -1,40 +1,25 @@
 //! Fork-owned transport for the pinned Cursor AgentService sampling protocol.
 
 mod auth;
+mod backend;
 mod client;
 mod mapping;
 mod models;
+mod session;
+#[cfg(test)]
+mod test_support;
 
-/// Immutable provider configuration owned by the Cursor AgentService backend.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CursorAgentServiceBackendConfig {
-    pub expected_user_id: u64,
-    pub expected_team_id: u64,
-    pub expected_service_origin: String,
-    pub context_window_tokens: i64,
-    pub effective_context_window_percent: i64,
-    pub max_pending_tool_actions: usize,
-}
-
-/// Fork-owned runtime entry point for Cursor AgentService sampling.
-#[derive(Debug)]
-pub struct CursorAgentServiceBackend {
-    config: CursorAgentServiceBackendConfig,
-}
-
-impl CursorAgentServiceBackend {
-    pub fn new(config: CursorAgentServiceBackendConfig) -> Self {
-        Self { config }
-    }
-
-    pub fn config(&self) -> &CursorAgentServiceBackendConfig {
-        &self.config
-    }
-}
-
+pub use auth::CURSOR_AGENT_SERVICE_ORIGIN;
+pub use auth::CURSOR_DASHBOARD_ORIGIN;
 pub use auth::CursorCredentialStore;
 pub use auth::CursorCredentialStoreError;
 pub use auth::CursorCredentials;
+pub use auth::CursorIdentityError;
+pub use auth::CursorRequestAuthError;
+use auth::verify_cursor_identity_at;
+pub use backend::CursorAgentServiceBackend;
+pub use backend::CursorAgentServiceBackendConfig;
+pub use backend::CursorAgentServiceBackendError;
 pub use client::AgentServiceRun;
 pub use client::AgentServiceTransport;
 pub use client::AgentServiceTransportError;
@@ -54,4 +39,6 @@ pub use mapping::map_sampling_request;
 pub use models::COMPOSER_2_5_MODEL_ID;
 pub use models::GROK_4_5_HIGH_FAST_MODEL_ID;
 pub use models::static_model_catalog;
+pub use session::CursorAgentServiceSessionError;
+pub use session::CursorSamplingSession;
 pub mod proto;

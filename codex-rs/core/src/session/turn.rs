@@ -43,6 +43,8 @@ use crate::session::McpRuntimeSnapshot;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::post_compact_recovery::PreparedPostCompactRecovery;
+use crate::session::same_stream_tools::SameStreamToolCompletion;
+use crate::session::same_stream_tools::SameStreamTools;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
@@ -85,6 +87,7 @@ use codex_features::Feature;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_mcp::ToolInfo;
+use codex_model_provider_info::WireApi;
 use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
@@ -1368,7 +1371,8 @@ pub(crate) async fn built_tools(
     } else {
         None
     };
-    let tool_suggest_is_enabled = tool_suggest_enabled(turn_context);
+    let tool_suggest_is_enabled = tool_suggest_enabled(turn_context)
+        && turn_context.provider.info().wire_api != WireApi::CursorAgentService;
     let auth = if tool_suggest_is_enabled {
         sess.services.auth_manager.auth().await
     } else {
@@ -2012,15 +2016,7 @@ async fn drain_in_flight(
     while let Some(res) = in_flight.next().await {
         match res {
             Ok(response_input) => {
-                let response_item = response_input.into();
-                sess.record_conversation_items(&turn_context, std::slice::from_ref(&response_item))
-                    .await;
-                mark_thread_memory_mode_polluted_if_external_context(
-                    sess.as_ref(),
-                    turn_context.as_ref(),
-                    &response_item,
-                )
-                .await;
+                record_tool_result(&sess, &turn_context, response_input).await;
             }
             Err(err) => {
                 return Err(err);
@@ -2028,6 +2024,40 @@ async fn drain_in_flight(
         }
     }
     Ok(())
+}
+
+async fn handle_same_stream_completion(
+    completion: SameStreamToolCompletion,
+    tools: &mut SameStreamTools,
+    tool_results: &tokio::sync::mpsc::Sender<ResponseInputItem>,
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+) -> CodexResult<()> {
+    let (sequence, result) = completion.into_parts();
+    let result = result?;
+    tool_results.send(result.clone()).await.map_err(|_| {
+        CodexErr::Fatal("Cursor AgentService tool-result sink closed before delivery".to_string())
+    })?;
+    for ready in tools.record_sent(sequence, result)? {
+        record_tool_result(sess, turn_context, ready).await;
+    }
+    Ok(())
+}
+
+async fn record_tool_result(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    response_input: ResponseInputItem,
+) {
+    let response_item = response_input.into();
+    sess.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
+        .await;
+    mark_thread_memory_mode_polluted_if_external_context(
+        sess.as_ref(),
+        turn_context.as_ref(),
+        &response_item,
+    )
+    .await;
 }
 
 fn assign_missing_streamed_response_item_id(
@@ -2043,6 +2073,11 @@ fn assign_missing_streamed_response_item_id(
         .filter(|item_id| !item_id.is_empty());
     item.set_id(active_item_id);
     Session::assign_missing_response_item_id(item);
+}
+
+enum SamplingLoopInput {
+    Response(Option<CodexResult<ResponseEvent>>),
+    Tool(SameStreamToolCompletion),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2064,14 +2099,25 @@ async fn try_run_sampling_request(
     prompt: &Prompt,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
-    feedback_tags!(
-        model = turn_context.model_info.slug.clone(),
-        approval_policy = turn_context.approval_policy.value(),
-        sandbox_policy = &turn_context.sandbox_policy(),
-        effort = turn_context.reasoning_effort,
-        auth_mode = sess.services.auth_manager.auth_mode(),
-        features = sess.features.enabled_features(),
-    );
+    if turn_context.provider.info().wire_api == WireApi::CursorAgentService {
+        feedback_tags!(
+            model = turn_context.model_info.slug.clone(),
+            approval_policy = turn_context.approval_policy.value(),
+            sandbox_policy = &turn_context.sandbox_policy(),
+            effort = turn_context.reasoning_effort,
+            auth_mode = "cursor_login",
+            features = sess.features.enabled_features(),
+        );
+    } else {
+        feedback_tags!(
+            model = turn_context.model_info.slug.clone(),
+            approval_policy = turn_context.approval_policy.value(),
+            sandbox_policy = &turn_context.sandbox_policy(),
+            effort = turn_context.reasoning_effort,
+            auth_mode = sess.services.auth_manager.auth_mode(),
+            features = sess.features.enabled_features(),
+        );
+    }
     let inference_trace = sess.services.rollout_thread_trace.inference_trace_context(
         turn_context.sub_id.as_str(),
         turn_context.model_info.slug.as_str(),
@@ -2097,6 +2143,10 @@ async fn try_run_sampling_request(
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
         .await??;
+    let same_stream_tool_results = stream.same_stream_tool_results();
+    let mut same_stream_tools = same_stream_tool_results
+        .as_ref()
+        .map(|_| SameStreamTools::new());
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
     let mut needs_follow_up = false;
@@ -2132,14 +2182,59 @@ async fn try_run_sampling_request(
             codex.usage.total_tokens = field::Empty,
         );
 
-        let event = match stream
-            .next()
-            .instrument(trace_span!(parent: &handle_responses, "receiving"))
-            .or_cancel(&cancellation_token)
-            .await
+        let input = if let Some(tools) = same_stream_tools
+            .as_mut()
+            .filter(|tools| !tools.is_empty())
         {
-            Ok(event) => event,
-            Err(codex_async_utils::CancelErr::Cancelled) => break Err(CodexErr::TurnAborted),
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break Err(CodexErr::TurnAborted),
+                event = stream.next().instrument(trace_span!(parent: &handle_responses, "receiving")) => {
+                    SamplingLoopInput::Response(event)
+                }
+                completion = tools.next_completed().instrument(trace_span!(parent: &handle_responses, "tool_completion")) => {
+                    let Some(completion) = completion else {
+                        break Err(CodexErr::Fatal(
+                            "same-stream tool scheduler ended with pending work".to_string(),
+                        ));
+                    };
+                    SamplingLoopInput::Tool(completion)
+                }
+            }
+        } else {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break Err(CodexErr::TurnAborted),
+                event = stream.next().instrument(trace_span!(parent: &handle_responses, "receiving")) => {
+                    SamplingLoopInput::Response(event)
+                }
+            }
+        };
+
+        let event = match input {
+            SamplingLoopInput::Tool(completion) => {
+                let Some(tools) = same_stream_tools.as_mut() else {
+                    break Err(CodexErr::Fatal(
+                        "same-stream tool completion arrived without a scheduler".to_string(),
+                    ));
+                };
+                let Some(tool_results) = same_stream_tool_results.as_ref() else {
+                    break Err(CodexErr::Fatal(
+                        "same-stream tool completion arrived without a result sink".to_string(),
+                    ));
+                };
+                if let Err(error) = handle_same_stream_completion(
+                    completion,
+                    tools,
+                    tool_results,
+                    &sess,
+                    &turn_context,
+                )
+                .await
+                {
+                    break Err(error);
+                }
+                continue;
+            }
+            SamplingLoopInput::Response(event) => event,
         };
 
         let event = match event {
@@ -2240,13 +2335,27 @@ async fn try_run_sampling_request(
                         Ok(output_result) => output_result,
                         Err(err) => break Err(err),
                     };
+                let has_tool_future = output_result.tool_future.is_some();
                 if let Some(tool_future) = output_result.tool_future {
-                    in_flight.push_back(tool_future);
+                    if let Some(tools) = same_stream_tools.as_mut() {
+                        tools.push(tool_future);
+                    } else {
+                        in_flight.push_back(tool_future);
+                    }
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
                     last_agent_message = Some(agent_message);
                 }
-                needs_follow_up |= output_result.needs_follow_up;
+                if same_stream_tool_results.is_some() {
+                    if output_result.needs_follow_up && !has_tool_future {
+                        break Err(CodexErr::Fatal(
+                            "Cursor AgentService tool call did not produce an executable Cooldex future"
+                                .to_string(),
+                        ));
+                    }
+                } else {
+                    needs_follow_up |= output_result.needs_follow_up;
+                }
                 // todo: remove before stabilizing multi-agent v2
                 if preempt_for_mailbox_mail && sess.input_queue.has_pending_mailbox_items().await {
                     break Ok(SamplingRequestResult {
@@ -2583,13 +2692,19 @@ async fn try_run_sampling_request(
     )
     .await;
 
-    let tool_blocking_timing_guard = if in_flight.is_empty() {
-        None
-    } else {
-        Some(turn_context.turn_timing_state.begin_tool_blocking())
-    };
-    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
-    drop(tool_blocking_timing_guard);
+    if same_stream_tool_results.is_none() {
+        let tool_blocking_timing_guard = if in_flight.is_empty() {
+            None
+        } else {
+            Some(turn_context.turn_timing_state.begin_tool_blocking())
+        };
+        drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+        drop(tool_blocking_timing_guard);
+    } else if !in_flight.is_empty() {
+        return Err(CodexErr::Fatal(
+            "same-stream sampling queued a next-request tool future".to_string(),
+        ));
+    }
 
     if should_emit_token_count {
         // A tool call such as request_user_input can intentionally pause the turn. Emit token
