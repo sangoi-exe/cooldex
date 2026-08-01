@@ -12,8 +12,10 @@ path = "examples/generate-proto.rs"
 workspace = true
 
 [dependencies]
+codex-api = { workspace = true }
 codex-models-manager = { workspace = true }
 codex-protocol = { workspace = true }
+codex-tools = { workspace = true }
 http = { workspace = true }
 libc = { workspace = true }
 prost = "0.14.3"

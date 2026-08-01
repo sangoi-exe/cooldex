@@ -5,7 +5,7 @@ pub const PINNED_CURSOR_CLI_VERSION: &str = "2026.07.23-e383d2b";
 pub const PINNED_CURSOR_CLI_SHA256: &str =
     "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831";
 pub const PINNED_SCHEMA_SHA256: &str =
-    "5be413912f18326a1557e233e661d0ecf8cdd8c13739d88c2c9ca5fcbfe586cb";
+    "9117b3cfd5c5f903ec42e74c81312d9392dbb09b6fedc4be429f6b18437a931d";
 pub const AGENT_SERVICE_TYPE_NAME: &str = "agent.v1.AgentService";
 pub const HEARTBEAT_INTERVAL_SECONDS: u64 = 5;
 
@@ -97,6 +97,52 @@ pub struct ConversationStateStructure {
     pub turns: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
     #[prost(enumeration = "AgentMode", optional, tag = "10")]
     pub mode: ::core::option::Option<i32>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ConversationTurnStructure {
+    #[prost(oneof = "conversation_turn_structure::Turn", tags = "1")]
+    pub turn: ::core::option::Option<conversation_turn_structure::Turn>,
+}
+/// Nested message and enum types in `ConversationTurnStructure`.
+pub mod conversation_turn_structure {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Turn {
+        #[prost(message, tag = "1")]
+        AgentConversationTurn(super::AgentConversationTurnStructure),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AgentConversationTurnStructure {
+    #[prost(bytes = "vec", tag = "1")]
+    pub user_message: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    pub steps: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    #[prost(string, optional, tag = "3")]
+    pub request_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub encrypted_model: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint32, optional, tag = "5")]
+    pub dynamic_tool_count: ::core::option::Option<u32>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConversationStep {
+    #[prost(oneof = "conversation_step::Message", tags = "1, 2")]
+    pub message: ::core::option::Option<conversation_step::Message>,
+}
+/// Nested message and enum types in `ConversationStep`.
+pub mod conversation_step {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Message {
+        #[prost(message, tag = "1")]
+        AssistantMessage(super::AssistantMessage),
+        #[prost(message, tag = "2")]
+        ToolCall(super::ToolCall),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AssistantMessage {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ConversationAction {
@@ -325,6 +371,13 @@ pub struct RequestContextRejected {
     #[prost(string, tag = "1")]
     pub reason: ::prost::alloc::string::String,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SmartModeApproval {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct McpArgs {
     #[prost(string, tag = "1")]
@@ -337,6 +390,8 @@ pub struct McpArgs {
     pub provider_identifier: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
     pub tool_name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub smart_mode_approval: ::core::option::Option<SmartModeApproval>,
     #[prost(bool, tag = "7")]
     pub smart_mode_approval_only: bool,
     #[prost(bool, tag = "8")]
@@ -439,6 +494,56 @@ pub struct McpPermissionDenied {
     pub error: ::prost::alloc::string::String,
     #[prost(bool, tag = "2")]
     pub is_readonly: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct McpToolError {
+    #[prost(string, tag = "1")]
+    pub error: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub read_tool_def_reminder: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct McpToolResult {
+    #[prost(oneof = "mcp_tool_result::Result", tags = "1, 2, 3, 4")]
+    pub result: ::core::option::Option<mcp_tool_result::Result>,
+}
+/// Nested message and enum types in `McpToolResult`.
+pub mod mcp_tool_result {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag = "1")]
+        Success(super::McpSuccess),
+        #[prost(message, tag = "2")]
+        Error(super::McpToolError),
+        #[prost(message, tag = "3")]
+        Rejected(super::McpRejected),
+        #[prost(message, tag = "4")]
+        PermissionDenied(super::McpPermissionDenied),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct McpToolCall {
+    #[prost(message, optional, tag = "1")]
+    pub args: ::core::option::Option<McpArgs>,
+    #[prost(message, optional, tag = "2")]
+    pub result: ::core::option::Option<McpToolResult>,
+    #[prost(string, optional, tag = "3")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ToolCall {
+    #[prost(string, optional, tag = "57")]
+    pub tool_call_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(oneof = "tool_call::Tool", tags = "15")]
+    pub tool: ::core::option::Option<tool_call::Tool>,
+}
+/// Nested message and enum types in `ToolCall`.
+pub mod tool_call {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Tool {
+        #[prost(message, tag = "15")]
+        McpToolCall(super::McpToolCall),
+    }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecServerMessage {

@@ -2859,8 +2859,10 @@ dependencies = [
 name = "codex-cursor-agent-service"
 version = "0.0.0"
 dependencies = [
+ "codex-api",
  "codex-models-manager",
  "codex-protocol",
+ "codex-tools",
  "http 1.4.0",
  "libc",
  "pretty_assertions",

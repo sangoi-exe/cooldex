@@ -27,12 +27,13 @@ use codex_cursor_agent_service::proto::exec_server_message;
 use codex_cursor_agent_service::proto::interaction_update;
 use fake_peer::FakePeer;
 use pretty_assertions::assert_eq;
+use prost::Message as _;
 use std::time::Duration;
 
 const EXPECTED_CURSOR_CLI_SHA256: &str =
     "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831";
 const EXPECTED_SCHEMA_SHA256: &str =
-    "5be413912f18326a1557e233e661d0ecf8cdd8c13739d88c2c9ca5fcbfe586cb";
+    "9117b3cfd5c5f903ec42e74c81312d9392dbb09b6fedc4be429f6b18437a931d";
 
 #[test]
 fn generated_protocol_records_the_pinned_snapshot() {
@@ -41,6 +42,93 @@ fn generated_protocol_records_the_pinned_snapshot() {
     assert_eq!(PINNED_SCHEMA_SHA256, EXPECTED_SCHEMA_SHA256);
     assert_eq!(AGENT_SERVICE_TYPE_NAME, "agent.v1.AgentService");
     assert_eq!(HEARTBEAT_INTERVAL_SECONDS, 5);
+}
+
+#[test]
+fn generated_protocol_preserves_the_wp3_security_and_history_field_numbers() {
+    use codex_cursor_agent_service::proto::AgentConversationTurnStructure;
+    use codex_cursor_agent_service::proto::AssistantMessage;
+    use codex_cursor_agent_service::proto::ConversationStep;
+    use codex_cursor_agent_service::proto::ConversationTurnStructure;
+    use codex_cursor_agent_service::proto::McpArgs;
+    use codex_cursor_agent_service::proto::McpSuccess;
+    use codex_cursor_agent_service::proto::McpToolCall;
+    use codex_cursor_agent_service::proto::McpToolResult;
+    use codex_cursor_agent_service::proto::SmartModeApproval;
+    use codex_cursor_agent_service::proto::ToolCall;
+    use codex_cursor_agent_service::proto::conversation_step;
+    use codex_cursor_agent_service::proto::conversation_turn_structure;
+    use codex_cursor_agent_service::proto::mcp_tool_result;
+    use codex_cursor_agent_service::proto::tool_call;
+
+    let approval = SmartModeApproval {
+        request_id: "r".to_string(),
+        reason: "x".to_string(),
+    };
+    assert_eq!(approval.encode_to_vec(), b"\x0a\x01r\x12\x01x");
+    assert_eq!(
+        McpArgs {
+            smart_mode_approval: Some(approval),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        b"\x32\x06\x0a\x01r\x12\x01x"
+    );
+
+    let agent_turn = AgentConversationTurnStructure {
+        user_message: b"u".to_vec(),
+        steps: vec![b"s".to_vec()],
+        request_id: Some("r".to_string()),
+        encrypted_model: Some("e".to_string()),
+        dynamic_tool_count: Some(1),
+    };
+    assert_eq!(
+        agent_turn.encode_to_vec(),
+        b"\x0a\x01u\x12\x01s\x1a\x01r\x22\x01e\x28\x01"
+    );
+    assert_eq!(
+        ConversationTurnStructure {
+            turn: Some(conversation_turn_structure::Turn::AgentConversationTurn(
+                AgentConversationTurnStructure::default(),
+            )),
+        }
+        .encode_to_vec(),
+        b"\x0a\x00"
+    );
+    assert_eq!(
+        ConversationStep {
+            message: Some(conversation_step::Message::AssistantMessage(
+                AssistantMessage {
+                    text: "a".to_string(),
+                },
+            )),
+        }
+        .encode_to_vec(),
+        b"\x0a\x03\x0a\x01a"
+    );
+    assert_eq!(
+        ToolCall {
+            tool: Some(tool_call::Tool::McpToolCall(McpToolCall::default())),
+            tool_call_id: None,
+        }
+        .encode_to_vec(),
+        b"\x7a\x00"
+    );
+    assert_eq!(
+        ToolCall {
+            tool: None,
+            tool_call_id: Some("c".to_string()),
+        }
+        .encode_to_vec(),
+        b"\xca\x03\x01c"
+    );
+    assert_eq!(
+        McpToolResult {
+            result: Some(mcp_tool_result::Result::Success(McpSuccess::default())),
+        }
+        .encode_to_vec(),
+        b"\x0a\x00"
+    );
 }
 
 #[tokio::test]

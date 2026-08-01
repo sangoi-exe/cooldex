@@ -64,6 +64,31 @@ message ConversationStateStructure {
   optional AgentMode mode = 10;
 }
 
+message ConversationTurnStructure {
+  oneof turn {
+    AgentConversationTurnStructure agent_conversation_turn = 1;
+  }
+}
+
+message AgentConversationTurnStructure {
+  bytes user_message = 1;
+  repeated bytes steps = 2;
+  optional string request_id = 3;
+  optional string encrypted_model = 4;
+  optional uint32 dynamic_tool_count = 5;
+}
+
+message ConversationStep {
+  oneof message {
+    AssistantMessage assistant_message = 1;
+    ToolCall tool_call = 2;
+  }
+}
+
+message AssistantMessage {
+  string text = 1;
+}
+
 enum AgentMode {
   AGENT_MODE_UNSPECIFIED = 0;
 }
@@ -211,12 +236,18 @@ message RequestContextRejected {
   string reason = 1;
 }
 
+message SmartModeApproval {
+  string request_id = 1;
+  string reason = 2;
+}
+
 message McpArgs {
   string name = 1;
   map<string, google.protobuf.Value> args = 2;
   string tool_call_id = 3;
   string provider_identifier = 4;
   string tool_name = 5;
+  optional SmartModeApproval smart_mode_approval = 6;
   bool smart_mode_approval_only = 7;
   bool skip_approval = 8;
   string server_identifier = 9;
@@ -280,6 +311,34 @@ message McpRejected {
 message McpPermissionDenied {
   string error = 1;
   bool is_readonly = 2;
+}
+
+message McpToolError {
+  string error = 1;
+  string read_tool_def_reminder = 2;
+}
+
+message McpToolResult {
+  oneof result {
+    McpSuccess success = 1;
+    McpToolError error = 2;
+    McpRejected rejected = 3;
+    McpPermissionDenied permission_denied = 4;
+  }
+}
+
+message McpToolCall {
+  McpArgs args = 1;
+  McpToolResult result = 2;
+  optional string description = 3;
+}
+
+message ToolCall {
+  oneof tool {
+    McpToolCall mcp_tool_call = 15;
+  }
+
+  optional string tool_call_id = 57;
 }
 
 message ExecServerMessage {
