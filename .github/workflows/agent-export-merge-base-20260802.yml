@@ -1,0 +1,56 @@
+name: Agent export exact merge-base snapshot
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches:
+      - agent/export-merge-base-20260802
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'agent/export-merge-base-trigger-20260802'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact upstream merge base
+        uses: actions/checkout@v4
+        with:
+          repository: openai/codex
+          ref: 44d76c6a6dd04fa2efc302b906ac8774267a1272
+          fetch-depth: 1
+          path: merge-base
+          persist-credentials: false
+
+      - name: Build and verify source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git -C merge-base rev-parse HEAD)"
+          expected='44d76c6a6dd04fa2efc302b906ac8774267a1272'
+          test "$actual" = "$expected"
+          git -C merge-base archive \
+            --format=zip \
+            --prefix=codex-merge-base/ \
+            --output="$GITHUB_WORKSPACE/codex-merge-base.zip" \
+            HEAD
+          unzip -t "$GITHUB_WORKSPACE/codex-merge-base.zip"
+          {
+            printf 'merge_base=%s\n' "$actual"
+            sha256sum "$GITHUB_WORKSPACE/codex-merge-base.zip"
+          } > "$GITHUB_WORKSPACE/merge-base-manifest.txt"
+
+      - name: Upload exact merge-base snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: cooldex-merge-base-44d76c6
+          path: |
+            codex-merge-base.zip
+            merge-base-manifest.txt
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
