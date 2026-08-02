@@ -19,3 +19,4 @@ jobs:
         run: |
           set -euo pipefail
           printf 'connector-actions-probe=%s\n' "$GITHUB_SHA"
+          printf 'ready-pr-synchronize=true\n'
