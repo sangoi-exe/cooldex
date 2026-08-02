@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - agent/connector-actions-probe-20260802
+  pull_request:
+    branches:
+      - master-refactor-v2
 
 permissions:
   contents: read
@@ -12,7 +15,7 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Confirm connector-created pushes run workflows
+      - name: Confirm connector-created PRs run workflows
         run: |
           set -euo pipefail
           printf 'connector-actions-probe=%s\n' "$GITHUB_SHA"
