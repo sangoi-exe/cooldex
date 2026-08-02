@@ -18,14 +18,13 @@ async fn process_compacted_history_with_test_session(
         .await;
     let step_context =
         crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
-    let world_state = Arc::new(
-        session
-            .build_world_state_for_step(&step_context)
-            .await
-            .expect("world state should build"),
-    );
+    let world_state = Arc::new(session.build_world_state_for_step(&step_context).await);
     let initial_context = session
-        .build_initial_context_with_world_state(&turn_context, world_state.as_ref())
+        .build_initial_context_with_world_state_and_mcp(
+            &turn_context,
+            world_state.as_ref(),
+            step_context.mcp.as_ref(),
+        )
         .await;
     let initial_context_injection = InitialContextInjection::BeforeLastUserMessage {
         world_state,
@@ -255,7 +254,6 @@ fn build_compacted_history_preserves_user_message_passthrough_metadata() {
             internal_chat_message_metadata_passthrough: Some(
                 InternalChatMessageMetadataPassthrough {
                     turn_id: Some("turn-1".to_string()),
-                    ..Default::default()
                 },
             ),
         }],
@@ -588,15 +586,6 @@ async fn process_compacted_history_reinjects_model_switch_message() {
 
 #[test]
 fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() {
-    let agent_completion = ResponseItem::AgentMessage {
-        id: None,
-        author: "child".to_string(),
-        recipient: "parent".to_string(),
-        content: vec![AgentMessageInputContent::InputText {
-            text: "Message Type: FINAL_ANSWER\nPayload:\nchild completion".to_string(),
-        }],
-        internal_chat_message_metadata_passthrough: None,
-    };
     let compacted_history = vec![
         ResponseItem::Message {
             id: None,
@@ -616,7 +605,6 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
-        agent_completion.clone(),
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -667,7 +655,6 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
-        agent_completion,
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -683,21 +670,11 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
 
 #[test]
 fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last() {
-    let agent_task = ResponseItem::AgentMessage {
+    let compacted_history = vec![ResponseItem::Compaction {
         id: None,
-        author: "parent".to_string(),
-        recipient: "child".to_string(),
-        content: Vec::new(),
+        encrypted_content: "encrypted".to_string(),
         internal_chat_message_metadata_passthrough: None,
-    };
-    let compacted_history = vec![
-        agent_task.clone(),
-        ResponseItem::Compaction {
-            id: None,
-            encrypted_content: "encrypted".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
+    }];
     let initial_context = vec![ResponseItem::Message {
         id: None,
         role: "developer".to_string(),
@@ -720,7 +697,6 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
-        agent_task,
         ResponseItem::Compaction {
             id: None,
             encrypted_content: "encrypted".to_string(),

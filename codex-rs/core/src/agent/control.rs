@@ -22,7 +22,6 @@ use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
-use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
@@ -70,7 +69,6 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_parent_spawn_call_id: Option<String>,
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
     pub(crate) parent_thread_id: Option<ThreadId>,
-    pub(crate) parent_turn_id: Option<String>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
 }
 
@@ -144,12 +142,11 @@ impl AgentControl {
         &self,
         agent_id: ThreadId,
         input: Vec<UserInput>,
-        parent_turn_id: Option<String>,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
         self.ensure_execution_capacity_for_turn_start(agent_id, /*starts_turn*/ true)
             .await?;
-        self.send_input_after_capacity_check(agent_id, &state, input, parent_turn_id)
+        self.send_input_after_capacity_check(agent_id, &state, input)
             .await
     }
 
@@ -158,12 +155,11 @@ impl AgentControl {
         agent_id: ThreadId,
         state: &Arc<ThreadManagerState>,
         input: Vec<UserInput>,
-        parent_turn_id: Option<String>,
     ) -> CodexResult<String> {
         self.handle_thread_request_result(
             agent_id,
             state,
-            state.send_op(agent_id, input.into(), parent_turn_id).await,
+            state.send_op(agent_id, input.into()).await,
         )
         .await
     }
@@ -173,7 +169,6 @@ impl AgentControl {
         agent_id: ThreadId,
         communication: InterAgentCommunication,
         agent_communication_context: AgentCommunicationContext,
-        parent_turn_id: Option<String>,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
         self.ensure_execution_capacity_for_turn_start(agent_id, communication.trigger_turn)
@@ -183,7 +178,6 @@ impl AgentControl {
             &state,
             communication,
             agent_communication_context,
-            parent_turn_id,
         )
         .await
     }
@@ -194,16 +188,9 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
-        parent_turn_id: Option<String>,
     ) -> CodexResult<String> {
-        self.submit_inter_agent_communication(
-            agent_id,
-            state,
-            communication,
-            context,
-            parent_turn_id,
-        )
-        .await
+        self.submit_inter_agent_communication(agent_id, state, communication, context)
+            .await
     }
 
     async fn submit_inter_agent_communication(
@@ -212,21 +199,15 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
-        parent_turn_id: Option<String>,
     ) -> CodexResult<String> {
         let communication_for_log =
             crate::agent_communication::logging_enabled().then(|| communication.clone());
-        let parent_turn_id = parent_turn_id.filter(|_| communication.trigger_turn);
         let result = self
             .handle_thread_request_result(
                 agent_id,
                 state,
                 state
-                    .send_op(
-                        agent_id,
-                        Op::InterAgentCommunication { communication },
-                        parent_turn_id,
-                    )
+                    .send_op(agent_id, Op::InterAgentCommunication { communication })
                     .await,
             )
             .await;
@@ -249,9 +230,7 @@ impl AgentControl {
         self.handle_thread_request_result(
             agent_id,
             &state,
-            state
-                .send_op(agent_id, Op::Interrupt, /*parent_turn_id*/ None)
-                .await,
+            state.send_op(agent_id, Op::Interrupt).await,
         )
         .await
     }
@@ -262,10 +241,7 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         result: CodexResult<String>,
     ) -> CodexResult<String> {
-        if result
-            .as_ref()
-            .is_err_and(|err| matches!(err.details(), CodexErrorDetails::InternalAgentDied))
-        {
+        if matches!(result, Err(CodexErr::InternalAgentDied)) {
             let _ = state.remove_thread(&agent_id).await;
             self.forget_v2_residency(agent_id);
             self.state.release_spawned_thread(agent_id);
@@ -302,7 +278,7 @@ impl AgentControl {
     pub(crate) fn ensure_agent_known(&self, agent_id: ThreadId) -> CodexResult<AgentMetadata> {
         self.state
             .agent_metadata_for_thread(agent_id)
-            .ok_or_else(|| CodexErr::ThreadNotFound(agent_id))
+            .ok_or(CodexErr::ThreadNotFound(agent_id))
     }
 
     pub(crate) async fn list_live_agent_subtree_thread_ids(
@@ -527,12 +503,7 @@ impl AgentControl {
                 let context =
                     AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
                 let _ = control
-                    .send_inter_agent_communication(
-                        parent_thread_id,
-                        communication,
-                        context,
-                        /*parent_turn_id*/ None,
-                    )
+                    .send_inter_agent_communication(parent_thread_id, communication, context)
                     .await;
                 return;
             }
