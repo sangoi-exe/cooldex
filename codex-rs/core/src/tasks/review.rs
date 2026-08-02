@@ -29,6 +29,7 @@ use codex_features::Feature;
 use codex_protocol::user_input::UserInput;
 
 use super::SessionTask;
+use super::SessionTaskContext;
 use super::SessionTaskResult;
 
 #[derive(Clone, Copy)]
@@ -51,15 +52,16 @@ impl SessionTask for ReviewTask {
 
     async fn run(
         self: Arc<Self>,
-        session: Arc<Session>,
+        session: Arc<SessionTaskContext>,
         ctx: Arc<TurnContext>,
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
-        session
-            .services
-            .session_telemetry
-            .counter("codex.task.review", /*inc*/ 1, &[]);
+        session.session.services.session_telemetry.counter(
+            "codex.task.review",
+            /*inc*/ 1,
+            &[],
+        );
 
         let mut user_input = Vec::new();
         for item in input {
@@ -82,18 +84,18 @@ impl SessionTask for ReviewTask {
             None => None,
         };
         if !cancellation_token.is_cancelled() {
-            exit_review_mode(Arc::clone(&session), output.clone(), ctx.clone()).await;
+            exit_review_mode(session.clone_session(), output.clone(), ctx.clone()).await;
         }
         Ok(None)
     }
 
-    async fn abort(&self, session: Arc<Session>, ctx: Arc<TurnContext>) {
-        exit_review_mode(session, /*review_output*/ None, ctx).await;
+    async fn abort(&self, session: Arc<SessionTaskContext>, ctx: Arc<TurnContext>) {
+        exit_review_mode(session.clone_session(), /*review_output*/ None, ctx).await;
     }
 }
 
 async fn start_review_conversation(
-    session: Arc<Session>,
+    session: Arc<SessionTaskContext>,
     ctx: Arc<TurnContext>,
     input: Vec<UserInput>,
     cancellation_token: CancellationToken,
@@ -122,10 +124,10 @@ async fn start_review_conversation(
     sub_agent_config.model = Some(model);
     (run_codex_thread_one_shot(
         sub_agent_config,
-        Arc::clone(&session.services.auth_manager),
-        Arc::clone(&session.services.models_manager),
+        session.auth_manager(),
+        session.models_manager(),
         input,
-        Arc::clone(&session),
+        session.clone_session(),
         ctx.clone(),
         cancellation_token,
         SubAgentSource::Review,
@@ -138,7 +140,7 @@ async fn start_review_conversation(
 }
 
 async fn process_review_events(
-    session: Arc<Session>,
+    session: Arc<SessionTaskContext>,
     ctx: Arc<TurnContext>,
     receiver: async_channel::Receiver<Event>,
 ) -> Option<ReviewOutputEvent> {
@@ -147,7 +149,10 @@ async fn process_review_events(
         match event.clone().msg {
             EventMsg::AgentMessage(_) => {
                 if let Some(prev) = prev_agent_message.take() {
-                    session.send_event(ctx.as_ref(), prev.msg).await;
+                    session
+                        .clone_session()
+                        .send_event(ctx.as_ref(), prev.msg)
+                        .await;
                 }
                 prev_agent_message = Some(event);
             }
@@ -172,7 +177,10 @@ async fn process_review_events(
                 return None;
             }
             other => {
-                session.send_event(ctx.as_ref(), other).await;
+                session
+                    .clone_session()
+                    .send_event(ctx.as_ref(), other)
+                    .await;
             }
         }
     }

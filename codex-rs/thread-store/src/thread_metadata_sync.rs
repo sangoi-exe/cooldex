@@ -16,7 +16,6 @@ use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::strip_user_message_prefix;
 use codex_protocol::protocol::user_message_preview;
-use codex_state::ThreadMetadata;
 
 use crate::CreateThreadParams;
 use crate::GitInfoPatch;
@@ -91,10 +90,7 @@ impl ThreadMetadataSync {
         }
     }
 
-    pub(crate) fn for_resume(
-        params: &ResumeThreadParams,
-        metadata: Option<&ThreadMetadata>,
-    ) -> Self {
+    pub(crate) fn for_resume(params: &ResumeThreadParams) -> Self {
         let mut sync = Self {
             thread_id: params.thread_id,
             cwd_seen: params
@@ -102,12 +98,9 @@ impl ThreadMetadataSync {
                 .cwd
                 .as_ref()
                 .is_some_and(|cwd| !cwd.as_os_str().is_empty()),
-            preview_seen: metadata
-                .and_then(|metadata| metadata.preview.as_deref())
-                .is_some_and(|preview| !preview.is_empty()),
-            first_user_message_seen: metadata
-                .is_some_and(|metadata| metadata.first_user_message.is_some()),
-            title_seen: metadata.is_some_and(|metadata| !metadata.title.is_empty()),
+            preview_seen: false,
+            first_user_message_seen: false,
+            title_seen: false,
             pending_update: None,
             pending_update_generation: 0,
             last_touch_persisted_at: None,
@@ -433,13 +426,13 @@ mod tests {
     #[test]
     fn resume_history_keeps_derived_metadata_pending_until_applied() {
         let thread_id = ThreadId::new();
-        let mut sync = resume_sync(
+        let mut sync = ThreadMetadataSync::for_resume(&resume_params(
             thread_id,
             vec![
                 RolloutItem::SessionMeta(session_meta(thread_id)),
                 RolloutItem::EventMsg(EventMsg::UserMessage(user_message("hello metadata"))),
             ],
-        );
+        ));
 
         let update = sync.take_pending_update().expect("pending metadata update");
         assert_eq!(
@@ -469,7 +462,7 @@ mod tests {
     #[test]
     fn goal_update_sets_preview_without_overriding_existing_preview() {
         let thread_id = ThreadId::new();
-        let sync = resume_sync(
+        let sync = ThreadMetadataSync::for_resume(&resume_params(
             thread_id,
             vec![
                 RolloutItem::EventMsg(EventMsg::ThreadGoalUpdated(goal_update(
@@ -478,26 +471,26 @@ mod tests {
                 ))),
                 RolloutItem::EventMsg(EventMsg::UserMessage(user_message("first user text"))),
             ],
-        );
+        ));
 
         let update = sync.take_pending_update().expect("pending metadata update");
         assert_eq!(update.patch.preview.as_deref(), Some("ship the refactor"));
-        assert_eq!(update.patch.title.as_deref(), Some("first user text"));
         assert_eq!(
             update.patch.first_user_message.as_deref(),
             Some("first user text")
         );
+        assert_eq!(update.patch.title.as_deref(), Some("first user text"));
     }
 
     #[test]
     fn later_user_messages_do_not_emit_existing_preview_fields() {
         let thread_id = ThreadId::new();
-        let mut sync = resume_sync(
+        let mut sync = ThreadMetadataSync::for_resume(&resume_params(
             thread_id,
             vec![RolloutItem::EventMsg(EventMsg::UserMessage(user_message(
                 "first user text",
             )))],
-        );
+        ));
         let pending = sync.take_pending_update().expect("pending resume metadata");
         sync.mark_pending_update_applied(&pending);
 
@@ -516,7 +509,7 @@ mod tests {
     #[test]
     fn completed_user_message_items_emit_metadata_fields() {
         let thread_id = ThreadId::new();
-        let mut sync = resume_sync(thread_id, Vec::new());
+        let mut sync = ThreadMetadataSync::for_resume(&resume_params(thread_id, Vec::new()));
         let update = sync
             .observe_appended_items(&[RolloutItem::EventMsg(EventMsg::ItemCompleted(
                 ItemCompletedEvent {
@@ -526,7 +519,6 @@ mod tests {
                         text: "first user text".to_string(),
                         text_elements: Vec::new(),
                     }])),
-                    started_at_ms: Some(0),
                     completed_at_ms: 0,
                 },
             ))])
@@ -543,7 +535,7 @@ mod tests {
     #[test]
     fn metadata_irrelevant_items_coalesce_updated_at_touches() {
         let thread_id = ThreadId::new();
-        let mut sync = resume_sync(thread_id, Vec::new());
+        let mut sync = ThreadMetadataSync::for_resume(&resume_params(thread_id, Vec::new()));
         let item = RolloutItem::Compacted(CompactedItem {
             message: "compacted".to_string(),
             replacement_history: None,
@@ -573,7 +565,7 @@ mod tests {
     #[test]
     fn turn_start_advances_recency_at_without_changing_updated_at_behavior() {
         let thread_id = ThreadId::new();
-        let mut sync = resume_sync(thread_id, Vec::new());
+        let mut sync = ThreadMetadataSync::for_resume(&resume_params(thread_id, Vec::new()));
 
         let update = sync
             .observe_appended_items(&[RolloutItem::EventMsg(EventMsg::TurnStarted(
@@ -594,7 +586,7 @@ mod tests {
     #[test]
     fn thread_settings_applied_updates_live_metadata() {
         let thread_id = ThreadId::new();
-        let mut sync = resume_sync(thread_id, Vec::new());
+        let mut sync = ThreadMetadataSync::for_resume(&resume_params(thread_id, Vec::new()));
         let permission_profile = PermissionProfile::workspace_write();
         let cwd = std::env::current_dir()
             .expect("current directory")
@@ -662,13 +654,13 @@ mod tests {
     #[test]
     fn resume_history_waits_for_append_before_flushing_metadata() {
         let thread_id = ThreadId::new();
-        let mut sync = resume_sync(
+        let mut sync = ThreadMetadataSync::for_resume(&resume_params(
             thread_id,
             vec![
                 RolloutItem::SessionMeta(session_meta(thread_id)),
                 RolloutItem::EventMsg(EventMsg::UserMessage(user_message("hello metadata"))),
             ],
-        );
+        ));
 
         assert!(
             sync.take_pending_update_for_existing_history().is_none(),
@@ -694,52 +686,18 @@ mod tests {
             branch: Some("stale-branch".to_string()),
             repository_url: None,
         });
-        let sync = resume_sync(
+        let sync = ThreadMetadataSync::for_resume(&resume_params(
             thread_id,
             vec![
                 RolloutItem::SessionMeta(meta),
                 RolloutItem::EventMsg(EventMsg::UserMessage(user_message("hello metadata"))),
             ],
-        );
+        ));
 
         let update = sync.take_pending_update().expect("pending metadata update");
         assert_eq!(update.patch.git_info, None);
         assert_eq!(update.patch.memory_mode, None);
         assert_eq!(update.patch.preview.as_deref(), Some("hello metadata"));
-    }
-
-    #[test]
-    fn resume_preserves_existing_display_metadata_and_initializes_missing_title() {
-        let thread_id = ThreadId::new();
-        let mut metadata = codex_state::ThreadMetadataBuilder::new(
-            thread_id,
-            Default::default(),
-            Utc::now(),
-            SessionSource::Exec,
-        )
-        .build("test-provider");
-        metadata.preview = Some("goal-first preview".to_string());
-        metadata.first_user_message = Some("[Image]".to_string());
-        let params = resume_params(
-            thread_id,
-            vec![RolloutItem::EventMsg(EventMsg::UserMessage(user_message(
-                "first textual user message",
-            )))],
-        );
-
-        let sync = ThreadMetadataSync::for_resume(&params, Some(&metadata));
-        let update = sync.take_pending_update().expect("pending metadata update");
-
-        assert_eq!(update.patch.preview, None);
-        assert_eq!(update.patch.first_user_message, None);
-        assert_eq!(
-            update.patch.title.as_deref(),
-            Some("first textual user message")
-        );
-    }
-
-    fn resume_sync(thread_id: ThreadId, history: Vec<RolloutItem>) -> ThreadMetadataSync {
-        ThreadMetadataSync::for_resume(&resume_params(thread_id, history), /*metadata*/ None)
     }
 
     fn resume_params(thread_id: ThreadId, history: Vec<RolloutItem>) -> ResumeThreadParams {

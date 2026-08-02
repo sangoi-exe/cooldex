@@ -47,7 +47,6 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
-use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::user_input::UserInput;
@@ -67,7 +66,6 @@ use crate::responses::output_value_to_text;
 use crate::responses::start_mock_server;
 use crate::streaming_sse::StreamingSseServer;
 use crate::test_environment;
-use crate::wait_for_event;
 use crate::wait_for_event_match;
 use crate::wait_for_event_with_timeout;
 use wiremock::Match;
@@ -549,21 +547,6 @@ impl TestCodexBuilder {
         .await
     }
 
-    pub async fn restart(
-        &mut self,
-        server: &MockServer,
-        previous: &TestCodex,
-    ) -> Result<TestCodex> {
-        let rollout_path = previous
-            .session_configured
-            .rollout_path
-            .clone()
-            .context("rollout path")?;
-        previous.codex.shutdown_and_wait().await?;
-        self.resume(server, Arc::clone(&previous.home), rollout_path)
-            .await
-    }
-
     async fn build_with_home_and_base_url(
         &mut self,
         base_url: String,
@@ -667,7 +650,6 @@ impl TestCodexBuilder {
             codex_core::test_support::with_code_mode_host_program(
                 thread_manager,
                 code_mode_host_program,
-                &config,
             )
         } else {
             thread_manager
@@ -848,25 +830,6 @@ impl TestCodex {
             .await
     }
 
-    /// Submits a text turn without changing the current thread settings.
-    pub async fn submit_text_turn(&self, prompt: &str) -> Result<()> {
-        self.codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: prompt.into(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: ThreadSettingsOverrides::default(),
-            })
-            .await?;
-
-        wait_for_event(&self.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-        Ok(())
-    }
-
     pub async fn submit_turn_with_permission_profile(
         &self,
         prompt: &str,
@@ -996,7 +959,7 @@ impl TestCodex {
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
                 additional_context: Default::default(),
-                thread_settings: ThreadSettingsOverrides {
+                thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
                     environments: turn_environment_selections,
                     approval_policy: Some(approval_policy),
                     sandbox_policy: Some(sandbox_policy),
