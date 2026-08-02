@@ -42,9 +42,11 @@ use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::McpRuntimeSnapshot;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
+use crate::session::post_compact_recovery::PreparedPostCompactRecovery;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use crate::state::PostCompactRecoveryIdentity;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::TurnItemContributorPolicy;
 use crate::stream_events_utils::finalize_non_tool_response_item;
@@ -133,6 +135,12 @@ use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
 
+#[derive(Debug, Default)]
+pub(crate) struct RunTurnOutput {
+    pub(crate) last_agent_message: Option<String>,
+    pub(crate) post_compact_recovery: Option<PostCompactRecoveryIdentity>,
+}
+
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
 ///
@@ -154,7 +162,7 @@ pub(crate) async fn run_turn(
     input: Vec<TurnInput>,
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
-) -> CodexResult<Option<String>> {
+) -> CodexResult<RunTurnOutput> {
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
@@ -177,7 +185,7 @@ pub(crate) async fn run_turn(
         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
             .await;
         error!("Failed to run pre-sampling compact");
-        return Ok(None);
+        return Ok(RunTurnOutput::default());
     }
 
     // run_turn owns the step used to seed context and make the first sampling request.
@@ -206,15 +214,15 @@ pub(crate) async fn run_turn(
     )
     .await
     else {
-        return Ok(None);
+        return Ok(RunTurnOutput::default());
     };
 
     if run_pending_session_start_hooks(&sess, &turn_context).await {
-        return Ok(None);
+        return Ok(RunTurnOutput::default());
     }
     let mut can_drain_pending_input = input.is_empty();
     if run_hooks_and_record_inputs(&sess, &turn_context, &input).await {
-        return Ok(None);
+        return Ok(RunTurnOutput::default());
     }
 
     sess.merge_connector_selection(explicitly_enabled_connectors.clone())
@@ -233,6 +241,7 @@ pub(crate) async fn run_turn(
     track_turn_resolved_config_analytics(&sess, &turn_context, &input).await;
 
     let mut last_agent_message: Option<String> = None;
+    let mut completed_post_compact_recovery = None;
     let mut stop_hook_active = false;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
@@ -318,7 +327,7 @@ pub(crate) async fn run_turn(
         }
         .await;
         match sampling_request_result {
-            Ok((sampling_request_output, sampling_request_input)) => {
+            Ok((sampling_request_output, sampling_request_input, post_compact_recovery)) => {
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
@@ -412,10 +421,10 @@ pub(crate) async fn run_turn(
                         let error = err.to_codex_protocol_error();
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
                             .await;
-                        return Ok(None);
+                        return Ok(RunTurnOutput::default());
                     }
                     if run_pending_session_start_hooks(&sess, &turn_context).await {
-                        return Ok(None);
+                        return Ok(RunTurnOutput::default());
                     }
                     can_drain_pending_input = !model_needs_follow_up;
                     continue;
@@ -457,6 +466,7 @@ pub(crate) async fn run_turn(
                             .await;
                         }
                     }
+                    completed_post_compact_recovery = post_compact_recovery;
                     if stop_outcome.should_stop {
                         break;
                     }
@@ -468,7 +478,10 @@ pub(crate) async fn run_turn(
                     )
                     .await
                     {
-                        return Ok(None);
+                        return Ok(RunTurnOutput {
+                            last_agent_message: None,
+                            post_compact_recovery: completed_post_compact_recovery,
+                        });
                     }
                     break;
                 }
@@ -504,7 +517,10 @@ pub(crate) async fn run_turn(
         }
     }
 
-    Ok(last_agent_message)
+    Ok(RunTurnOutput {
+        last_agent_message,
+        post_compact_recovery: completed_post_compact_recovery,
+    })
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -1162,6 +1178,20 @@ pub(crate) fn build_prompt(
     }
 }
 
+struct PreparedSamplingPrompt {
+    prompt: Prompt,
+    post_compact_recovery: Option<PreparedPostCompactRecovery>,
+}
+
+impl PreparedSamplingPrompt {
+    fn into_original_input(mut self) -> CodexResult<Vec<ResponseItem>> {
+        if let Some(recovery) = self.post_compact_recovery {
+            recovery.remove_from_input(&mut self.prompt.input)?;
+        }
+        Ok(self.prompt.input)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(deprecated)]
 #[instrument(level = "trace",
@@ -1181,7 +1211,11 @@ async fn run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
-) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
+) -> CodexResult<(
+    SamplingRequestResult,
+    Vec<ResponseItem>,
+    Option<PostCompactRecoveryIdentity>,
+)> {
     let turn_context = Arc::clone(&step_context.turn);
     let router = Arc::clone(&step_context.tool_router);
 
@@ -1204,20 +1238,26 @@ async fn run_sampling_request(
     let mut initial_input = Some(input);
     let mut original_input = None;
     loop {
-        let prompt_input = if let Some(input) = initial_input.take() {
+        let mut prompt_input = if let Some(input) = initial_input.take() {
             input
         } else {
             sess.clone_history()
                 .await
                 .for_prompt(&turn_context.model_info.input_modalities)
         };
-        let prompt = build_prompt(
-            prompt_input,
-            router.as_ref(),
-            turn_context.as_ref(),
-            base_instructions.clone(),
-        );
-        let err = match try_run_sampling_request(
+        let post_compact_recovery = sess
+            .prepare_post_compact_recovery(turn_context.as_ref(), &mut prompt_input)
+            .await?;
+        let prepared_prompt = PreparedSamplingPrompt {
+            prompt: build_prompt(
+                prompt_input,
+                router.as_ref(),
+                turn_context.as_ref(),
+                base_instructions.clone(),
+            ),
+            post_compact_recovery,
+        };
+        let sampling_result = try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
             Arc::clone(&turn_context),
@@ -1225,13 +1265,22 @@ async fn run_sampling_request(
             client_session,
             responses_metadata,
             Arc::clone(&turn_diff_tracker),
-            &prompt,
+            &prepared_prompt.prompt,
             cancellation_token.child_token(),
         )
-        .await
-        {
+        .await;
+        let err = match sampling_result {
             Ok(output) => {
-                return Ok((output, original_input.unwrap_or(prompt.input)));
+                let post_compact_recovery = prepared_prompt
+                    .post_compact_recovery
+                    .as_ref()
+                    .map(|recovery| recovery.identity().clone());
+                let attempt_input = prepared_prompt.into_original_input()?;
+                return Ok((
+                    output,
+                    original_input.unwrap_or(attempt_input),
+                    post_compact_recovery,
+                ));
             }
             Err(CodexErr::ContextWindowExceeded) => {
                 sess.set_total_tokens_full(&turn_context).await;
@@ -1248,7 +1297,7 @@ async fn run_sampling_request(
         };
 
         if original_input.is_none() {
-            original_input = Some(prompt.input);
+            original_input = Some(prepared_prompt.into_original_input()?);
         }
 
         if !err.is_retryable() {
@@ -1974,7 +2023,7 @@ async fn drain_in_flight(
                 .await;
             }
             Err(err) => {
-                error_or_panic(format!("in-flight tool future failed during drain: {err}"));
+                return Err(err);
             }
         }
     }
