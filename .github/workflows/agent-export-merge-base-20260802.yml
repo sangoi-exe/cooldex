@@ -1,6 +1,9 @@
 name: Agent export exact merge-base snapshot
 
 on:
+  push:
+    branches:
+      - agent/export-merge-base-trigger-20260802
   pull_request:
     types: [opened, reopened, synchronize]
     branches:
@@ -12,8 +15,11 @@ permissions:
 jobs:
   export:
     if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'agent/export-merge-base-trigger-20260802'
+      (github.event_name == 'push' &&
+       github.ref == 'refs/heads/agent/export-merge-base-trigger-20260802') ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.head.ref == 'agent/export-merge-base-trigger-20260802')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
