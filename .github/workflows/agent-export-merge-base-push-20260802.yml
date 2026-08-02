@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - agent/export-merge-base-push-20260802
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches:
+      - agent/export-merge-base-push-20260802
 
 permissions:
   contents: read
@@ -11,7 +15,10 @@ permissions:
 
 jobs:
   export:
-    if: github.ref == 'refs/heads/agent/export-merge-base-push-20260802'
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -60,9 +67,10 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           HEAD_SHA: ${{ github.sha }}
           JOB_STATUS: ${{ job.status }}
+          EVENT_NAME: ${{ github.event_name }}
         shell: bash
         run: |
           set -euo pipefail
           gh api --method POST \
             "repos/${GITHUB_REPOSITORY}/issues/13/comments" \
-            -f body="merge-base-export run_id=${RUN_ID} head_sha=${HEAD_SHA} job_status=${JOB_STATUS} artifact=cooldex-merge-base-44d76c6"
+            -f body="merge-base-export run_id=${RUN_ID} head_sha=${HEAD_SHA} event=${EVENT_NAME} job_status=${JOB_STATUS} artifact=cooldex-merge-base-44d76c6"
