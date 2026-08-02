@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   export:
@@ -51,3 +52,15 @@ jobs:
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
+
+      - name: Report run ID to diagnostic PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          HEAD_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/issues/13/comments" \
+            -f body="merge-base-export run_id=${RUN_ID} head_sha=${HEAD_SHA} artifact=cooldex-merge-base-44d76c6"
