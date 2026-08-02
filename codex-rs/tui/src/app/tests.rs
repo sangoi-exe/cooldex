@@ -2,8 +2,6 @@
 
 #[path = "tests/advanced_reasoning_tests.rs"]
 mod advanced_reasoning_tests;
-#[path = "tests/key_chords.rs"]
-mod key_chords;
 mod model_catalog;
 mod plugin_catalog;
 mod rate_limits;
@@ -20,7 +18,6 @@ use crate::app_backtrack::BacktrackSelection;
 use crate::app_backtrack::BacktrackState;
 use crate::app_backtrack::user_count;
 use crate::app_event::HistoryBatchEntryResponse;
-use codex_utils_absolute_path::test_support::PathExt;
 
 use crate::chatwidget::ChatWidgetInit;
 use crate::chatwidget::create_initial_user_message;
@@ -200,8 +197,9 @@ async fn next_thread_settings_updated(
         .await
         .expect("app-server should emit an event")
         .expect("app-server event stream should remain open");
-        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event
-            && let ServerNotification::ThreadSettingsUpdated(notification) = *notification
+        if let codex_app_server_client::AppServerEvent::ServerNotification(
+            ServerNotification::ThreadSettingsUpdated(notification),
+        ) = event
             && notification.thread_id == thread_id.to_string()
         {
             return notification;
@@ -290,12 +288,10 @@ async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach()
 
     assert!(matches!(
         &event,
-        ThreadBufferedEvent::Request(request)
-            if matches!(
-                request.as_ref(),
-                ServerRequest::CommandExecutionRequestApproval { params, .. }
-                    if params.turn_id == "turn-1"
-            )
+        ThreadBufferedEvent::Request(ServerRequest::CommandExecutionRequestApproval {
+            params,
+            ..
+        }) if params.turn_id == "turn-1"
     ));
 
     app.handle_thread_event_now(event);
@@ -356,12 +352,10 @@ async fn resolved_buffered_approval_does_not_become_actionable_after_drain() -> 
 
     assert!(matches!(
         &event,
-        ThreadBufferedEvent::Request(request)
-            if matches!(
-                request.as_ref(),
-                ServerRequest::CommandExecutionRequestApproval { params, .. }
-                    if params.turn_id == "turn-1"
-            )
+        ThreadBufferedEvent::Request(ServerRequest::CommandExecutionRequestApproval {
+            params,
+            ..
+        }) if params.turn_id == "turn-1"
     ));
 
     app.handle_thread_event_now(event);
@@ -806,9 +800,9 @@ async fn replayed_turn_complete_submits_restored_queued_follow_up() {
         ThreadEventSnapshot {
             session: None,
             turns: Vec::new(),
-            events: vec![ThreadBufferedEvent::Notification(Box::new(
+            events: vec![ThreadBufferedEvent::Notification(
                 turn_completed_notification(thread_id, "turn-1", TurnStatus::Completed),
-            ))],
+            )],
             input_state: Some(input_state),
         },
         /*resume_restored_queue*/ true,
@@ -859,9 +853,9 @@ async fn replay_only_thread_keeps_restored_queue_visible() {
         ThreadEventSnapshot {
             session: None,
             turns: Vec::new(),
-            events: vec![ThreadBufferedEvent::Notification(Box::new(
+            events: vec![ThreadBufferedEvent::Notification(
                 turn_completed_notification(thread_id, "turn-1", TurnStatus::Completed),
-            ))],
+            )],
             input_state: Some(input_state),
         },
         /*resume_restored_queue*/ false,
@@ -1031,14 +1025,12 @@ async fn replay_thread_snapshot_does_not_submit_queue_before_replay_catches_up()
             session: None,
             turns: Vec::new(),
             events: vec![
-                ThreadBufferedEvent::Notification(Box::new(turn_completed_notification(
+                ThreadBufferedEvent::Notification(turn_completed_notification(
                     thread_id,
                     "turn-0",
                     TurnStatus::Completed,
-                ))),
-                ThreadBufferedEvent::Notification(Box::new(turn_started_notification(
-                    thread_id, "turn-1",
-                ))),
+                )),
+                ThreadBufferedEvent::Notification(turn_started_notification(thread_id, "turn-1")),
             ],
             input_state: Some(input_state),
         },
@@ -1301,9 +1293,9 @@ async fn replayed_interrupted_turn_restores_queued_input_to_composer() {
         ThreadEventSnapshot {
             session: None,
             turns: Vec::new(),
-            events: vec![ThreadBufferedEvent::Notification(Box::new(
+            events: vec![ThreadBufferedEvent::Notification(
                 turn_completed_notification(thread_id, "turn-1", TurnStatus::Interrupted),
-            ))],
+            )],
             input_state: Some(input_state),
         },
         /*resume_restored_queue*/ true,
@@ -1330,8 +1322,10 @@ async fn token_usage_update_refreshes_status_line_with_runtime_context_window() 
 
     assert_eq!(app.chat_widget.status_line_text(), None);
 
-    app.handle_thread_event_now(ThreadBufferedEvent::Notification(Box::new(
-        token_usage_notification(ThreadId::new(), "turn-1", Some(950_000)),
+    app.handle_thread_event_now(ThreadBufferedEvent::Notification(token_usage_notification(
+        ThreadId::new(),
+        "turn-1",
+        Some(950_000),
     )));
 
     assert_eq!(
@@ -1346,7 +1340,7 @@ async fn collab_receiver_notification_caches_thread_without_app_server_read() {
     let receiver_thread_id =
         ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread id");
 
-    app.handle_thread_event_now(ThreadBufferedEvent::Notification(Box::new(
+    app.handle_thread_event_now(ThreadBufferedEvent::Notification(
         ServerNotification::ItemStarted(ItemStartedNotification {
             thread_id: ThreadId::new().to_string(),
             turn_id: "turn-1".to_string(),
@@ -1363,7 +1357,7 @@ async fn collab_receiver_notification_caches_thread_without_app_server_read() {
                 agents_states: HashMap::new(),
             },
         }),
-    )));
+    ));
 
     assert_eq!(
         app.agent_navigation.get(&receiver_thread_id),
@@ -1383,7 +1377,7 @@ async fn collab_receiver_notification_does_not_cache_not_found_thread() {
     let receiver_thread_id =
         ThreadId::from_string("00000000-0000-0000-0000-000000000124").expect("valid thread id");
 
-    app.handle_thread_event_now(ThreadBufferedEvent::Notification(Box::new(
+    app.handle_thread_event_now(ThreadBufferedEvent::Notification(
         ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
             thread_id: ThreadId::new().to_string(),
             turn_id: "turn-1".to_string(),
@@ -1406,7 +1400,7 @@ async fn collab_receiver_notification_does_not_cache_not_found_thread() {
                 )]),
             },
         }),
-    )));
+    ));
 
     assert_eq!(app.agent_navigation.get(&receiver_thread_id), None);
 }
@@ -2126,8 +2120,9 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         .await
         .expect("app-server should emit an event")
         .expect("app-server event stream should remain open");
-        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event
-            && let ServerNotification::ThreadStarted(notification) = notification.as_ref()
+        if let codex_app_server_client::AppServerEvent::ServerNotification(
+            ServerNotification::ThreadStarted(notification),
+        ) = event
             && notification.thread.id == side_thread_id.to_string()
         {
             saw_thread_started = true;
@@ -2254,7 +2249,7 @@ fn update_memory_settings_updates_current_thread_memory_mode() -> Result<()> {
         let (mut app, _app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
         let codex_home = tempdir()?;
         app.config.codex_home = codex_home.path().to_path_buf().abs();
-        app.config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+        app.config.sqlite_home = codex_home.path().to_path_buf();
         // Seed the previous setting so this test exercises the thread-mode update path.
         app.config.memories.generate_memories = true;
 
@@ -2272,7 +2267,7 @@ fn update_memory_settings_updates_current_thread_memory_mode() -> Result<()> {
         .await;
 
         let state_db = codex_state::StateRuntime::init(
-            codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+            codex_home.path().to_path_buf(),
             app.config.model_provider_id.clone(),
         )
         .await
@@ -2294,7 +2289,7 @@ async fn reset_memories_clears_local_memory_directories() -> Result<()> {
         let (mut app, _app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
         let codex_home = tempdir()?;
         app.config.codex_home = codex_home.path().to_path_buf().abs();
-        app.config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+        app.config.sqlite_home = codex_home.path().to_path_buf();
 
         let memory_root = codex_home.path().join("memories");
         let extensions_root = memory_root.join("extensions");
@@ -2921,18 +2916,18 @@ async fn replay_snapshot_with_pending_request_suppresses_replay_notices() {
             session: Some(test_thread_session(thread_id, test_path_buf("/tmp/main"))),
             turns: Vec::new(),
             events: vec![
-                ThreadBufferedEvent::Notification(Box::new(ServerNotification::Warning(
+                ThreadBufferedEvent::Notification(ServerNotification::Warning(
                     WarningNotification {
                         thread_id: Some(thread_id.to_string()),
                         message: stale_warning.to_string(),
                     },
-                ))),
-                ThreadBufferedEvent::Request(Box::new(exec_approval_request(
+                )),
+                ThreadBufferedEvent::Request(exec_approval_request(
                     thread_id,
                     "turn-approval",
                     "call-approval",
                     /*approval_id*/ None,
-                ))),
+                )),
             ],
             input_state: None,
         },
@@ -2965,8 +2960,6 @@ async fn side_defers_subagent_approval_overlay_until_side_exits() -> Result<()> 
         ThreadId::from_string("00000000-0000-0000-0000-000000000022").expect("valid thread");
     let agent_thread_id =
         ThreadId::from_string("00000000-0000-0000-0000-000000000033").expect("valid thread");
-    let quiet_thread_id =
-        ThreadId::from_string("00000000-0000-0000-0000-000000000044").expect("valid thread");
 
     app.primary_thread_id = Some(main_thread_id);
     app.active_thread_id = Some(side_thread_id);
@@ -2992,27 +2985,14 @@ async fn side_defers_subagent_approval_overlay_until_side_exits() -> Result<()> 
         /*is_closed*/ false,
     );
 
-    let pending_approval = exec_approval_request(
-        agent_thread_id,
-        "turn-approval",
-        "call-approval",
-        /*approval_id*/ None,
-    );
-    app.enqueue_thread_request(agent_thread_id, pending_approval.clone())
-        .await?;
     app.enqueue_thread_request(
-        quiet_thread_id,
-        ServerRequest::DynamicToolCall {
-            request_id: AppServerRequestId::Integer(99),
-            params: codex_app_server_protocol::DynamicToolCallParams {
-                thread_id: quiet_thread_id.to_string(),
-                turn_id: "turn-quiet".to_string(),
-                call_id: "call-quiet".to_string(),
-                namespace: None,
-                tool: "ignored-tool".to_string(),
-                arguments: serde_json::json!({}),
-            },
-        },
+        agent_thread_id,
+        exec_approval_request(
+            agent_thread_id,
+            "turn-approval",
+            "call-approval",
+            /*approval_id*/ None,
+        ),
     )
     .await?;
 
@@ -3024,10 +3004,6 @@ async fn side_defers_subagent_approval_overlay_until_side_exits() -> Result<()> 
 
     app.side_threads.remove(&side_thread_id);
     app.active_thread_id = Some(main_thread_id);
-    assert_eq!(
-        app.pending_inactive_thread_requests().await,
-        vec![(agent_thread_id, pending_approval)]
-    );
     app.surface_pending_inactive_thread_interactive_requests()
         .await?;
 
@@ -3463,8 +3439,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
                 parent_thread_id: None,
                 preview: "agent thread".to_string(),
                 ephemeral: false,
-                section: None,
-                section_entered_at: None,
+                is_pinned: false,
                 history_mode: Default::default(),
                 model_provider: "agent-provider".to_string(),
                 created_at: 1,
@@ -3561,8 +3536,7 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
                 parent_thread_id: None,
                 preview: "agent thread".to_string(),
                 ephemeral: false,
-                section: None,
-                section_entered_at: None,
+                is_pinned: false,
                 history_mode: Default::default(),
                 model_provider: "agent-provider".to_string(),
                 created_at: 1,
@@ -3626,8 +3600,7 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
         parent_thread_id: None,
         preview: "read thread".to_string(),
         ephemeral: false,
-        section: None,
-        section_entered_at: None,
+        is_pinned: false,
         history_mode: Default::default(),
         model_provider: "read-provider".to_string(),
         created_at: 1,
@@ -3814,7 +3787,7 @@ async fn side_fork_config_inherits_parent_thread_runtime_settings() {
 }
 
 #[tokio::test]
-async fn side_start_block_message_allows_replacing_open_side_conversation() {
+async fn side_start_block_message_tracks_open_side_conversation() {
     let mut app = make_test_app().await;
     assert_eq!(
         app.side_start_block_message(),
@@ -3829,14 +3802,10 @@ async fn side_start_block_message_allows_replacing_open_side_conversation() {
     app.side_threads
         .insert(side_thread_id, SideThreadState::new(parent_thread_id));
 
-    app.active_thread_id = Some(parent_thread_id);
-    assert_eq!(app.side_start_block_message(), None);
-
-    app.active_thread_id = Some(side_thread_id);
     assert_eq!(
         app.side_start_block_message(),
         Some(
-            "A side conversation is already open. Press ctrl + c to return before starting another."
+            "A side conversation is already open. Press Ctrl+C to return before starting another."
         )
     );
 
@@ -4089,7 +4058,7 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
 
     app.handle_app_server_event(
         &app_server,
-        codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
+        codex_app_server_client::AppServerEvent::ServerNotification(
             ServerNotification::McpServerStatusUpdated(McpServerStatusUpdatedNotification {
                 thread_id: Some(child_thread_id.to_string()),
                 name: "sentry".to_string(),
@@ -4097,7 +4066,7 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
                 error: Some("sentry is not logged in".to_string()),
                 failure_reason: None,
             }),
-        )),
+        ),
     )
     .await;
 
@@ -4113,11 +4082,9 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
     assert!(
         matches!(
             child_snapshot.events.as_slice(),
-            [ThreadBufferedEvent::Notification(notification)]
-                if matches!(
-                    notification.as_ref(),
-                    ServerNotification::McpServerStatusUpdated(_)
-                )
+            [ThreadBufferedEvent::Notification(
+                ServerNotification::McpServerStatusUpdated(_)
+            )]
         ),
         "child MCP startup notification should be buffered for the child thread"
     );
@@ -4164,7 +4131,7 @@ async fn app_scoped_mcp_startup_notifications_do_not_render_in_active_thread() {
 
     app.handle_app_server_event(
         &app_server,
-        codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
+        codex_app_server_client::AppServerEvent::ServerNotification(
             ServerNotification::McpServerStatusUpdated(McpServerStatusUpdatedNotification {
                 thread_id: None,
                 name: "sentry".to_string(),
@@ -4172,7 +4139,7 @@ async fn app_scoped_mcp_startup_notifications_do_not_render_in_active_thread() {
                 error: Some("sentry is not logged in".to_string()),
                 failure_reason: None,
             }),
-        )),
+        ),
     )
     .await;
 
@@ -4228,7 +4195,7 @@ async fn active_side_thread_renders_live_mcp_startup_notifications() {
     ] {
         app.handle_app_server_event(
             &app_server,
-            codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
+            codex_app_server_client::AppServerEvent::ServerNotification(
                 ServerNotification::McpServerStatusUpdated(McpServerStatusUpdatedNotification {
                     thread_id: Some(side_thread_id.to_string()),
                     name: "sentry".to_string(),
@@ -4237,7 +4204,7 @@ async fn active_side_thread_renders_live_mcp_startup_notifications() {
                         .then(|| "sentry is not logged in".to_string()),
                     failure_reason: None,
                 }),
-            )),
+            ),
         )
         .await;
     }
@@ -4300,16 +4267,6 @@ async fn side_discard_selection_keeps_current_side_thread() {
     assert_eq!(
         app.side_thread_to_discard_after_switch(parent_thread_id),
         Some(side_thread_id)
-    );
-
-    app.active_thread_id = Some(parent_thread_id);
-    assert_eq!(
-        app.side_thread_to_discard_after_switch(ThreadId::new()),
-        Some(side_thread_id)
-    );
-    assert_eq!(
-        app.side_thread_to_discard_after_switch(side_thread_id),
-        None
     );
 }
 
@@ -4378,62 +4335,6 @@ async fn discard_side_thread_keeps_local_state_when_server_close_fails() -> Resu
         Ok(())
     })
     .await
-}
-
-#[tokio::test]
-async fn background_side_cleanup_removes_local_state_and_ignores_late_events() -> Result<()> {
-    let mut app = make_test_app().await;
-    let mut app_server =
-        crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
-    let parent_thread_id = ThreadId::new();
-    let side_thread_id = ThreadId::new();
-    app.active_thread_id = Some(parent_thread_id);
-    app.side_threads
-        .insert(side_thread_id, SideThreadState::new(parent_thread_id));
-    app.thread_event_channels
-        .insert(side_thread_id, ThreadEventChannel::new(/*capacity*/ 4));
-    app.agent_navigation.upsert(
-        side_thread_id,
-        Some("Side".to_string()),
-        Some("side".to_string()),
-        /*is_closed*/ false,
-    );
-    app.discard_side_thread_in_background(&mut app_server, side_thread_id)
-        .await;
-
-    assert_eq!(app.active_thread_id, Some(parent_thread_id));
-    assert!(!app.side_threads.contains_key(&side_thread_id));
-    assert!(!app.thread_event_channels.contains_key(&side_thread_id));
-    assert_eq!(app.agent_navigation.get(&side_thread_id), None);
-    assert!(app.abandoned_side_threads.contains(&side_thread_id));
-
-    app.enqueue_thread_notification(
-        side_thread_id,
-        agent_message_delta_notification(side_thread_id, "turn-1", "item-1", "late"),
-    )
-    .await?;
-    assert!(!app.thread_event_channels.contains_key(&side_thread_id));
-
-    app.handle_app_server_event(
-        &app_server,
-        codex_app_server_client::AppServerEvent::ServerRequest(Box::new(exec_approval_request(
-            side_thread_id,
-            "turn-1",
-            "item-1",
-            Some("approval-1"),
-        ))),
-    )
-    .await;
-    let resolution = app
-        .pending_app_server_requests
-        .take_resolution(Op::ExecApproval {
-            id: "approval-1".to_string(),
-            turn_id: None,
-            decision: codex_app_server_protocol::CommandExecutionApprovalDecision::Accept,
-        })
-        .expect("approval resolution should serialize");
-    assert_eq!(resolution, None);
-    Ok(())
 }
 
 #[tokio::test]
@@ -4742,7 +4643,6 @@ async fn make_test_app() -> App {
         initial_history_replay_buffer: None,
         enhanced_keys_supported: false,
         keymap: crate::keymap::RuntimeKeymap::defaults(),
-        key_chord_matcher: crate::keymap::KeyChordMatcher::default(),
         commit_anim_running: Arc::new(AtomicBool::new(false)),
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
@@ -4760,7 +4660,6 @@ async fn make_test_app() -> App {
         thread_event_listener_tasks: HashMap::new(),
         agent_navigation: AgentNavigationState::default(),
         side_threads: HashMap::new(),
-        abandoned_side_threads: HashSet::new(),
         active_thread_id: None,
         active_thread_rx: None,
         primary_thread_id: None,
@@ -4811,7 +4710,6 @@ async fn make_test_app_with_channels() -> (
             initial_history_replay_buffer: None,
             enhanced_keys_supported: false,
             keymap: crate::keymap::RuntimeKeymap::defaults(),
-            key_chord_matcher: crate::keymap::KeyChordMatcher::default(),
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
             terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
@@ -4829,7 +4727,6 @@ async fn make_test_app_with_channels() -> (
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
             side_threads: HashMap::new(),
-            abandoned_side_threads: HashSet::new(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
@@ -5361,8 +5258,7 @@ async fn required_stream_reflow_during_capped_initial_replay_survives_transcript
     assert!(app.initial_history_replay_buffer.is_none());
     assert!(app.transcript_reflow.has_pending_reflow());
 
-    let screen_size = tui.terminal.last_known_screen_size;
-    app.maybe_run_resize_reflow(&mut tui, screen_size)?;
+    app.maybe_run_resize_reflow(&mut tui)?;
     assert!(app.transcript_reflow.has_pending_reflow());
 
     app.close_transcript_overlay(&mut tui);
@@ -5425,27 +5321,6 @@ async fn height_shrink_schedules_resize_reflow() {
         &frame_requester,
     ));
     assert!(app.transcript_reflow.has_pending_reflow());
-}
-
-#[tokio::test]
-async fn resizing_empty_transcript_schedules_settled_size_recheck() {
-    let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    let mut tui = crate::tui::test_support::make_test_tui().expect("test tui");
-    let frame_requester = crate::tui::FrameRequester::test_dummy();
-    let initial_size = ratatui::layout::Size::new(/*width*/ 80, /*height*/ 24);
-    let resized_size = ratatui::layout::Size::new(/*width*/ 100, /*height*/ 24);
-
-    assert!(!app.handle_draw_size_change(initial_size, initial_size, &frame_requester));
-    tui.screen_size_for_event(&TuiEvent::Resize(resized_size))
-        .expect("resolve resize event");
-    tui.terminal.resize(resized_size).expect("apply event size");
-    assert!(app.handle_draw_size_change(resized_size, initial_size, &frame_requester));
-    tokio::time::sleep(crate::transcript_reflow::TRANSCRIPT_REFLOW_DEBOUNCE).await;
-    assert_eq!(
-        tui.screen_size_for_event(&TuiEvent::Draw)
-            .expect("resolve settled size"),
-        initial_size
-    );
 }
 
 fn test_turn(turn_id: &str, status: TurnStatus, items: Vec<ThreadItem>) -> Turn {
@@ -5572,7 +5447,6 @@ fn request_user_input_request(thread_id: ThreadId, turn_id: &str, item_id: &str)
             turn_id: turn_id.to_string(),
             item_id: item_id.to_string(),
             questions: Vec::new(),
-            is_blocking: true,
             auto_resolution_ms: None,
         },
     }
@@ -6319,12 +6193,9 @@ async fn in_app_resume_uses_configured_or_explicit_cwd() -> Result<()> {
         ));
         assert_eq!(app.chat_widget.thread_id(), Some(thread_id));
 
-        let control = Box::pin(app.handle_event(
-            &mut tui,
-            &mut app_server,
-            AppEvent::ForkCurrentSession { name: None },
-        ))
-        .await?;
+        let control =
+            Box::pin(app.handle_event(&mut tui, &mut app_server, AppEvent::ForkCurrentSession))
+                .await?;
 
         assert!(matches!(control, AppRunControl::Continue));
         assert!(!crate::session_resume::cwds_differ(
@@ -6801,7 +6672,7 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
         ThreadEventSnapshot {
             session: None,
             turns: Vec::new(),
-            events: vec![ThreadBufferedEvent::Notification(Box::new(
+            events: vec![ThreadBufferedEvent::Notification(
                 ServerNotification::ItemStarted(
                     codex_app_server_protocol::ItemStartedNotification {
                         thread_id: "thread-1".to_string(),
@@ -6821,7 +6692,7 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
                         },
                     },
                 ),
-            ))],
+            )],
             input_state: None,
         },
         /*resume_restored_queue*/ false,
@@ -7049,7 +6920,6 @@ async fn interrupt_without_active_turn_is_treated_as_handled() {
         app.enqueue_primary_thread_session(started.session, started.turns)
             .await
             .expect("primary thread should be registered");
-        app.backtrack.primed = true;
         let op = AppCommand::interrupt();
 
         let handled = Box::pin(app.try_submit_active_thread_op_via_app_server(
@@ -7061,7 +6931,6 @@ async fn interrupt_without_active_turn_is_treated_as_handled() {
         .expect("interrupt submission should not fail");
 
         assert_eq!(handled, true);
-        assert!(!app.backtrack.primed);
     })
     .await;
 }
@@ -7160,9 +7029,9 @@ async fn override_turn_context_sends_thread_settings_update() {
 
         app.handle_app_server_event(
             &app_server,
-            codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
+            codex_app_server_client::AppServerEvent::ServerNotification(
                 ServerNotification::ThreadSettingsUpdated(notification),
-            )),
+            ),
         )
         .await;
         let updated_session = app
