@@ -4,19 +4,25 @@ on:
   push:
     branches:
       - agent/connector-actions-probe-20260802
-  pull_request:
-    branches:
-      - master-refactor-v2
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   probe:
+    if: ${{ github.actor != 'github-actions[bot]' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Confirm connector-created PRs run workflows
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Commit an observable one-shot marker
         run: |
           set -euo pipefail
-          printf 'connector-actions-probe=%s\n' "$GITHUB_SHA"
-          printf 'ready-pr-synchronize=true\n'
+          marker=.github/connector-actions-probe-ran.txt
+          printf 'source_sha=%s\nrun_id=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > "$marker"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add "$marker"
+          git commit -m 'Record connector Actions probe result'
+          git push origin "HEAD:${GITHUB_REF_NAME}"
