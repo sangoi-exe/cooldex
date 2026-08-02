@@ -55,8 +55,8 @@ pub struct ThreadItem {
     pub first_user_message: Option<String>,
     /// Best available user-facing preview for discovery and list display.
     pub preview: Option<String>,
-    /// The user-selected section in SQLite-owned metadata.
-    pub section: Option<codex_state::ThreadSection>,
+    /// Whether the thread is pinned in SQLite-owned metadata.
+    pub is_pinned: bool,
     /// Working directory from session metadata.
     pub cwd: Option<PathBuf>,
     /// Git branch from session metadata.
@@ -832,7 +832,7 @@ async fn build_thread_item(
             thread_id,
             first_user_message,
             preview,
-            section: None,
+            is_pinned: false,
             cwd,
             git_branch,
             git_sha,
